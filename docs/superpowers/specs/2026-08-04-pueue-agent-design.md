@@ -105,6 +105,8 @@ wake_agent.sh が唯一の agent 起動口であり、ガードレール(停止�
 agent:
   command: "claude -p {prompt} --permission-mode acceptEdits"
   # command: "codex exec {prompt}"
+  timeout_minutes: 60         # agent 実行のタイムアウト
+  max_retries: 2              # agent 自体の起動失敗(APIエラー等)のリトライ上限
 
 check:
   interval_minutes: 10        # sentinel の起動間隔
@@ -120,7 +122,6 @@ check:
 guardrails:
   max_consecutive_failures: 3 # 連続失敗でこの数に達したら停止して人を待つ
   max_experiments: 20         # 通算実験数の上限
-  agent_max_retries: 2        # agent 自体の起動失敗(APIエラー等)のリトライ上限
 
 # 通知はターミナル上(logs/notifications.log + `pueue-agent status`)のため設定不要
 ```
@@ -150,7 +151,7 @@ guardrails:
 3. 連続失敗カウンタが `max_consecutive_failures` 到達 → agent を起動せず停止状態にして通知
 4. 通算実験数が `max_experiments` 到達 → 同様に停止・通知
 5. 通過したら、モード別プロンプト + instructions.md + STATE.md への参照を組み立てて agent を起動
-6. agent の exit code / 出力を `logs/` に記録。agent 自体の失敗は `agent_max_retries` までリトライ、超えたら通知して停止
+6. agent の exit code / 出力を `logs/` に記録。agent 自体の失敗は `agent.max_retries` までリトライ、超えたら通知して停止
 
 ### モード別の agent への指示(要点)
 
@@ -196,7 +197,7 @@ guardrails:
 
 ## エラー処理
 
-- agent の API エラー・タイムアウト: `agent_max_retries` までリトライ → 超過で通知・停止
+- agent の API エラー・タイムアウト: `agent.max_retries` までリトライ → 超過で通知・停止
 - sentinel / wake の実行ログは `.pueue-agent/logs/` に保存し、`pueue-agent status` で参照
 - ロックファイルには PID を記録し、プロセス死亡時の stale lock は自動回収
 - config.yml のパース失敗・必須項目欠落は明示的にエラー終了し通知
