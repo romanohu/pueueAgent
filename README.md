@@ -7,25 +7,35 @@ Gemini CLI など headless 実行できる任意の CLI)が自律的に監視・
 ## 仕組み
 
 ```
-┌─ GPU サーバー ──────────────────────────────────────────┐
-│  pueued ── 実験タスクを実行                               │
-│    │                                                    │
-│    ├─ [タスク終了時] callback ──→ wake_agent.sh ─┐       │
-│    │                                            │       │
-│  cron (interval_minutes ごと)                    │       │
-│    └─→ sentinel.sh (bash・トークン消費ゼロ)       │       │
-│         ├─ 正常 & 通常回 → 何もせず終了            │       │
-│         ├─ 正常 & N回目 → deep_check モードで ─────┤       │
-│         └─ 異常検知 ──────────────────────────→ wake_agent.sh
-│                                                 ▼       │
-│                                     coding agent (headless)
-│                                       読む: STATE.md, ログ, コード
-│                                       やる: 分析・実装修正・ハイパラ調整
-│                                       書く: STATE.md 更新, コード編集
-│                                       └─ pueue add で(再)投入
-│                                                         │
-│  notify.sh ──→ logs/notifications.log(status/notifications で確認)│
-└─────────────────────────────────────────────────────────┘
+人 or agent
+  │  pueue-agent submit -- <実験コマンド>
+  ▼
+pueued ── 実験タスクをプロジェクト専用の pueue group で実行
+  │
+  │  トリガーは 2 系統
+  ├─ (1) タスク終了時: pueue callback → callback.sh
+  │        group からプロジェクトを逆引きし、結果に応じて wake へ
+  │
+  └─ (2) 定期: cron(interval_minutes ごと)→ sentinel.sh
+           bash のみの機械チェック(トークン消費ゼロ)
+           ├─ 正常(通常回)→ 何もせず終了(agent 起動なし)
+           ├─ 正常(N 回に 1 回)→ deep_check として wake へ
+           ├─ 失敗 / 停滞 / エラーパターン検知 → crash / stalled として wake へ
+           └─ callback が取りこぼした完了タスク → task_finished として wake へ
+  ▼
+wake_agent.sh ── 唯一の agent 起動口
+  │  起動前に bash 側でガードレールを判定(agent 任せにしない):
+  │  連続失敗上限 / 通算実験数上限 / lock(多重起動防止)/ halted
+  ▼  通過時のみ agent を起動
+coding agent(headless・agent.command で自由に差し替え)
+  │  読む: .pueue-agent/STATE.md, pueue log <id>, コード
+  │  やる: 原因分析・実装修正・ハイパラ調整・次実験の設計
+  │  書く: STATE.md 更新, コード編集
+  ▼
+pueue add -g <group> で(再)投入 ──→ pueued へ戻る(ループ)
+
+通知: 各イベントで notify.sh が logs/notifications.log に追記
+      (pueue-agent status / pueue-agent notifications -f で確認)
 ```
 
 トリガーは 2 系統:
