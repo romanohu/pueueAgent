@@ -42,7 +42,7 @@ pueue(タスク管理デーモン)で実行される長時間の ML 実験を、
 │                                       書く: STATE.md 更新, コード編集
 │                                       └─ pueue add で(再)投入
 │                                                         │
-│  notify.sh ──→ Slack など(節目の通知)                    │
+│  notify.sh ──→ logs/notifications.log(status/notifications で確認)│
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -149,7 +149,8 @@ guardrails:
 1. ロックファイルで多重起動防止(前回の agent が作業中なら skip、ログに記録)
 2. 停止状態(`logs/halted`)なら何もしない
 3. 連続失敗カウンタが `max_consecutive_failures` 到達 → agent を起動せず停止状態にして通知
-4. 通算実験数が `max_experiments` 到達 → 同様に停止・通知
+4. 通算実験数が `max_experiments` を超えると → 同様に停止・通知
+   (上限回数分の実験は処理される。例: 上限 20 なら 20 件目までは処理し、21 件目で停止)
 5. 通過したら、モード別プロンプト + instructions.md + STATE.md への参照を組み立てて agent を起動
 6. agent の exit code / 出力を `logs/` に記録。agent 自体の失敗は `agent.max_retries` までリトライ、超えたら通知して停止
 

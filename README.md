@@ -24,7 +24,7 @@ Gemini CLI など headless 実行できる任意の CLI)が自律的に監視・
 │                                       書く: STATE.md 更新, コード編集
 │                                       └─ pueue add で(再)投入
 │                                                         │
-│  notify.sh ──→ Slack など(節目の通知)                    │
+│  notify.sh ──→ logs/notifications.log(status/notifications で確認)│
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -97,8 +97,9 @@ wake_agent.sh は agent を起動する**前**に、必ず bash 側でこれら�
 - **連続失敗 3 回で停止**: crash/stalled による介入が、間に成功
   (task_finished での正常完了)を挟まず `guardrails.max_consecutive_failures`
   回連続したら、agent を起動せず停止状態にして通知する
-- **通算実験数 20 で停止**: 通算実験数が `guardrails.max_experiments` に
-  達したら、同様に agent を起動せず停止・通知する
+- **通算実験数の上限を超えると停止**: 通算実験数が `guardrails.max_experiments`
+  を超えると、同様に agent を起動せず停止・通知する(上限回数分の実験は処理される。
+  例: 上限 20 なら 20 件目までは処理し、21 件目で停止)
 - **agent リトライ 2 回超過で停止**: agent 自体の起動失敗(API エラー・
   タイムアウト等)は `agent.max_retries` までリトライし、超過したら通知して
   停止する
