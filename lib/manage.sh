@@ -19,6 +19,13 @@ pa_cron_get() { ${PA_CRONTAB_BIN:-crontab} -l 2>/dev/null || true; }
 # shellcheck disable=SC2086  # 同上
 pa_cron_set() { echo "$1" | ${PA_CRONTAB_BIN:-crontab} -; }
 
+# クロンタブ(stdin)から、行末が "# pueue-agent:<proj>" マーカーと一致する行を除去する。
+# プロジェクトパス同士が前方一致する場合(例: /a と /ab)に部分一致で誤除去しないよう、
+# 部分文字列一致ではなく行末一致で判定する。
+pa_cron_without_marker() {  # $1=marker
+  awk -v m="$1" 'substr($0, length($0) - length(m) + 1) != m'
+}
+
 pa_cmd_enable() {
   local proj group interval marker current newline callback_cmd cfg
   proj="$(pa_find_project "${1-}")" || pa_die "no .pueue-agent found (run: pueue-agent init)"
@@ -37,8 +44,8 @@ pa_cmd_enable() {
   # 3) cron(冪等)。既存クロンタブが空のとき先頭に空行が入らないよう
   #    printf で組み立ててから連結する。
   marker="# pueue-agent:$proj"
-  current="$(pa_cron_get | grep -vF "$marker" || true)"
-  newline="*/$interval * * * * '$PA_ROOT/bin/pueue-agent' sentinel $proj >> '$PA_DIR/logs/cron.log' 2>&1 $marker"
+  current="$(pa_cron_get | pa_cron_without_marker "$marker")"
+  newline="*/$interval * * * * '$PA_ROOT/bin/pueue-agent' sentinel '$proj' >> '$PA_DIR/logs/cron.log' 2>&1 $marker"
   if [ -n "$current" ]; then
     pa_cron_set "$(printf '%s\n%s' "$current" "$newline")"
   else
@@ -69,7 +76,7 @@ pa_cmd_disable() {
   group="$(pa_config pueue.group)"
 
   marker="# pueue-agent:$proj"
-  current="$(pa_cron_get | grep -vF "$marker" || true)"
+  current="$(pa_cron_get | pa_cron_without_marker "$marker")"
   pa_cron_set "$current"
   pa_registry_remove "$group"
   # shellcheck disable=SC2086  # PA_PUEUE_BIN は意図的に非クォート展開
