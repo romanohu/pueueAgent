@@ -37,7 +37,17 @@ EOF
   grep -q "\*/10 \* \* \* \*" "$MOCK_CRONTAB_FILE"
   grep -q $'^pa-proj\t' "$PA_REGISTRY"
   grep -q "pueue-agent' callback {{ id }} {{ group }}" "$PA_PUEUE_CONFIG"
-  [[ "$output" == *"pueued"*  ]]   # 再起動の案内
+  echo "$output" | grep -qF "pueued"   # 再起動の案内
+}
+
+@test "enable embeds enable-time PATH in the cron line so cron's minimal PATH doesn't break sentinel" {
+  run "$PA_BIN" enable "$proj"
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -qF "pueued" # sanity: same run as above still works
+  grep -qF "PATH='" "$MOCK_CRONTAB_FILE"
+  grep -qF "$PATH" "$MOCK_CRONTAB_FILE"
+  # マーカーは依然として行末に残っている(pa_cron_without_marker の前方一致判定用)
+  grep -q "pueue-agent:$proj\$" "$MOCK_CRONTAB_FILE"
 }
 
 @test "enable is idempotent (no duplicate cron lines)" {
@@ -50,7 +60,7 @@ EOF
   sed -i.bak 's|callback: null|callback: "notify-send hi"|' "$PA_PUEUE_CONFIG"
   run "$PA_BIN" enable "$proj"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"warning"* ]]
+  echo "$output" | grep -qF "warning"
   grep -q 'callback: "notify-send hi"' "$PA_PUEUE_CONFIG"   # 上書きしない
 }
 

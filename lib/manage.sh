@@ -19,6 +19,11 @@ pa_cron_get() { ${PA_CRONTAB_BIN:-crontab} -l 2>/dev/null || true; }
 # shellcheck disable=SC2086  # 同上
 pa_cron_set() { echo "$1" | ${PA_CRONTAB_BIN:-crontab} -; }
 
+# 単一引用符で囲んで安全にシェル展開できるようにエスケープする ('\''  イディオム)
+pa_shquote() {  # $1 → 中身だけをエスケープして返す(呼び出し側で '...' に包む)
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+}
+
 # クロンタブ(stdin)から、行末が "# pueue-agent:<proj>" マーカーと一致する行を除去する。
 # プロジェクトパス同士が前方一致する場合(例: /a と /ab)に部分一致で誤除去しないよう、
 # 部分文字列一致ではなく行末一致で判定する。
@@ -43,9 +48,15 @@ pa_cmd_enable() {
 
   # 3) cron(冪等)。既存クロンタブが空のとき先頭に空行が入らないよう
   #    printf で組み立ててから連結する。
+  # cron は PATH=/usr/bin:/bin 相当の最小 PATH で実行されるため、pueue/jq/agent CLI
+  # (cargo/homebrew/nvm 等で入る) が見つからず sentinel が pa_die したり agent 起動が
+  # 失敗して halt することがある。enable 実行時点の $PATH をコマンドの前に埋め込んで
+  # 継承させる。
+  local path_quoted
+  path_quoted="$(pa_shquote "$PATH")"
   marker="# pueue-agent:$proj"
   current="$(pa_cron_get | pa_cron_without_marker "$marker")"
-  newline="*/$interval * * * * '$PA_ROOT/bin/pueue-agent' sentinel '$proj' >> '$PA_DIR/logs/cron.log' 2>&1 $marker"
+  newline="*/$interval * * * * PATH='$path_quoted' '$PA_ROOT/bin/pueue-agent' sentinel '$proj' >> '$PA_DIR/logs/cron.log' 2>&1 $marker"
   if [ -n "$current" ]; then
     pa_cron_set "$(printf '%s\n%s' "$current" "$newline")"
   else
