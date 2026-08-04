@@ -59,21 +59,40 @@ pa_cmd_sentinel() {
   # shellcheck disable=SC2086
   tasks_json="$(${PA_PUEUE_BIN:-pueue} status --json)" || pa_die "pueue status failed"
 
-  # 1) failed / killed タスク(未処理のもの)→ crash wake
-  local failed_ids id
-  failed_ids="$(echo "$tasks_json" | jq -r --arg g "$group" '
+  # 1) 完了(Done)タスクのうち未処理のもの(失敗/kill/成功いずれも)→ backstop 処理。
+  #    callback が呼ばれなかった(pueued 未再起動)場合や、wake が lock busy / halted で
+  #    未消費だった場合の取りこぼしをここで拾う。1 パスにつき最大1件、昇順 id で決定的に。
+  local done_tasks id res wake_mode wake_status
+  done_tasks="$(echo "$tasks_json" | jq -r --arg g "$group" '
     .tasks | to_entries[] | .value
     | select(.group == $g)
-    | select((.status.Done.result? // empty) | type == "object" or . == "Killed")
-    | .id')"
-  for id in $failed_ids; do
-    if ! grep -qx "$id" "$PA_DIR/logs/handled_tasks" 2>/dev/null; then
-      echo "$id" >> "$PA_DIR/logs/handled_tasks"
+    | select(.status.Done?)
+    | (.status.Done.result) as $r
+    | select(($r | type == "object") or $r == "Killed" or $r == "Success")
+    | [(.id | tostring), (if ($r | type == "object") then "Failed:\($r.Failed)" else $r end)]
+    | @tsv
+  ' | sort -t "$(printf '\t')" -k1,1n)"
+  while IFS="$(printf '\t')" read -r id res; do
+    [ -n "$id" ] || continue
+    grep -qx "$id" "$PA_DIR/logs/handled_tasks" 2>/dev/null && continue
+    if [ "$res" = "Success" ]; then
+      wake_mode="task_finished"
+      pa_log "sentinel: task $id done (Success, unhandled) -> wake task_finished"
+    else
+      wake_mode="crash"
       pa_log "sentinel: task $id failed -> wake crash"
-      pa_wake crash "$PA_PROJECT" "$id" "Failed"
-      return 0
     fi
-  done
+    pa_wake "$wake_mode" "$PA_PROJECT" "$id" "$res"
+    wake_status=$?
+    if [ "$wake_status" -eq 0 ]; then
+      echo "$id" >> "$PA_DIR/logs/handled_tasks"
+    else
+      pa_log "sentinel: wake($wake_mode) for task $id not consumed (status=$wake_status), will retry next pass"
+    fi
+    return 0
+  done <<EOF
+$done_tasks
+EOF
 
   # 2) 実行中タスクの出力チェック
   local running_ids verdict
@@ -110,7 +129,7 @@ PATEOF
 $(pa_config_list check.extra_log_paths)
 EXTRAEOF
 
-  # 3) 実行中タスクが無ければ何もしない(完了処理は callback の担当)
+  # 3) 実行中タスクが無ければ何もしない(完了タスクの処理は上の 1) と callback が担う)
   [ -n "$running_ids" ] || { pa_log "sentinel: idle"; return 0; }
 
   # 4) 正常 → deep check 判定

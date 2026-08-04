@@ -19,9 +19,10 @@ setup() {
   [ "$(cat "$logs/consec_failures")" = "1" ]
 }
 
-@test "halts without launching agent when failures reach max" {
+@test "halts without launching agent when failures reach max, but reports event as consumed (0)" {
   echo 2 > "$logs/consec_failures"   # max は 3 (template default)
   run "$PA_BIN" wake crash "$proj" 8 "Failed:1"
+  [ "$status" -eq 0 ]                # ガードレール停止発火 = イベントは消費された
   [ ! -f "$MOCK_AGENT_LOG" ]         # agent は起動されない
   [ -f "$logs/halted" ]
   grep -q "halted" "$logs/../logs/notifications.log"
@@ -42,18 +43,18 @@ setup() {
   [ -f "$logs/halted" ]
 }
 
-@test "does nothing when halted" {
+@test "does nothing when halted, and reports the event as not-consumed (3)" {
   echo "manual" > "$logs/halted"
   run "$PA_BIN" wake deep_check "$proj"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
   [ ! -f "$MOCK_AGENT_LOG" ]
 }
 
-@test "lock prevents concurrent wake" {
+@test "lock prevents concurrent wake, and reports the event as not-consumed (3)" {
   mkdir -p "$logs/lock"
   echo $$ > "$logs/lock/pid"         # 生きている PID = agent 稼働中とみなす
   run "$PA_BIN" wake deep_check "$proj"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
   [ ! -f "$MOCK_AGENT_LOG" ]
 }
 

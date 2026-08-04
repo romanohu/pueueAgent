@@ -74,6 +74,8 @@ pa_run_agent() {  # $1=prompt → 0/1
 }
 
 pa_cmd_wake() {
+  # 戻り値: 0=イベント消費(agent 起動 or ガードレール停止発火), 3=未消費(halted/lock でスキップ、
+  #   呼び出し側は再試行のため handled_tasks に記録してはならない), 1=呼び出しエラー(pa_die)
   local mode="${1-}" proj="${2-}" task_id="${3-}" result="${4-}"
   case "$mode" in
     crash|stalled|deep_check|task_finished) : ;;
@@ -82,13 +84,13 @@ pa_cmd_wake() {
   [ -n "$proj" ] || pa_die "wake: project dir required"
   pa_set_project "$proj"
 
-  # 1. 停止状態なら何もしない
-  [ -f "$PA_DIR/logs/halted" ] && { pa_log "wake($mode) skipped: halted"; return 0; }
+  # 1. 停止状態なら何もしない(イベントは未消費: 3)
+  [ -f "$PA_DIR/logs/halted" ] && { pa_log "wake($mode) skipped: halted"; return 3; }
 
-  # 2. 多重起動防止
+  # 2. 多重起動防止(イベントは未消費: 3)
   if ! pa_acquire_lock; then
     pa_log "wake($mode) skipped: another agent is running"
-    return 0
+    return 3
   fi
   trap pa_release_lock EXIT
 
@@ -116,7 +118,8 @@ pa_cmd_wake() {
       ;;
   esac
 
-  # 4. agent 起動
+  # 4. agent 起動(起動した時点でイベントは消費済み。agent 自体が失敗してリトライ後に
+  #    halt する場合も、起動を試みた=イベントは処理された、として 0 を返す)
   local prompt
   prompt="$(pa_build_prompt "$mode" "$task_id" "$result")"
   if pa_run_agent "$prompt"; then
@@ -129,4 +132,5 @@ pa_cmd_wake() {
     pa_halt "agent の起動が $(pa_config agent.max_retries 2) 回のリトライ後も失敗"
     pa_notify agent_error "agent 実行が失敗しました。logs/agent_*.log を確認してください"
   fi
+  return 0
 }

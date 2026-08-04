@@ -27,6 +27,12 @@ failed_status() {   # $1=task_id
 EOF
 }
 empty_status() { echo '{"tasks":{}}' > "$MOCK_PUEUE_STATUS_JSON"; }
+success_status() {  # $1=task_id
+  cat > "$MOCK_PUEUE_STATUS_JSON" <<EOF
+{"tasks":{"$1":{"id":$1,"group":"pa-proj","command":"python train.py",
+ "status":{"Done":{"enqueued_at":"x","start":"x","end":"x","result":"Success"}}}}}
+EOF
+}
 
 @test "healthy running task: no agent launch, counter increments" {
   running_status 3
@@ -54,6 +60,32 @@ empty_status() { echo '{"tasks":{}}' > "$MOCK_PUEUE_STATUS_JSON"; }
   rm "$MOCK_AGENT_LOG"
   "$PA_BIN" sentinel "$proj"
   [ ! -f "$MOCK_AGENT_LOG" ]
+}
+
+@test "backstop processes an unhandled Success-Done task via task_finished wake (callback never ran)" {
+  success_status 11
+  run "$PA_BIN" sentinel "$proj"
+  [ "$status" -eq 0 ]
+  grep -q "mode: task_finished" "$MOCK_AGENT_LOG"
+  grep -q "task id: 11" "$MOCK_AGENT_LOG"
+  grep -qx "11" "$logs/handled_tasks"
+}
+
+@test "backstop does not record handled_tasks when wake is not consumed (lock busy), retries next pass" {
+  failed_status 12
+  echo "Traceback ..." > "$PA_TASK_LOG_DIR/12.log"
+  mkdir -p "$logs/lock"
+  echo $$ > "$logs/lock/pid"       # 生きている PID = 別 agent が稼働中とみなす
+  run "$PA_BIN" sentinel "$proj"
+  [ "$status" -eq 0 ]              # sentinel 自体は正常終了
+  [ ! -f "$MOCK_AGENT_LOG" ]       # wake は lock busy でイベント未消費のため agent は起動されない
+  ! grep -qx "12" "$logs/handled_tasks" 2>/dev/null   # 未消費なので記録されていない
+  # lock 解放後の次パスで処理される
+  rm -rf "$logs/lock"
+  run "$PA_BIN" sentinel "$proj"
+  [ "$status" -eq 0 ]
+  grep -q "mode: crash" "$MOCK_AGENT_LOG"
+  grep -qx "12" "$logs/handled_tasks"
 }
 
 @test "error pattern in running task output triggers crash wake" {

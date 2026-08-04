@@ -125,7 +125,11 @@ rm -f "$MOCK_AGENT_LOG"
 "$REPO_ROOT/bin/pueue-agent" wake crash "$proj" 99 "Failed:1"
 [ -f "$proj/.pueue-agent/logs/halted" ] || fail "did not halt after 3 consecutive failures"
 [ ! -f "$MOCK_AGENT_LOG" ] || fail "agent was launched despite hitting the halt threshold"
-"$REPO_ROOT/bin/pueue-agent" wake deep_check "$proj"
+# halted 中の wake は「イベント未消費」を意味する終了コード 3 を返す(set -eu 下では
+# 素の呼び出しだと即座にスクリプトが終了してしまうため || で捕捉する)。
+halted_wake_status=0
+"$REPO_ROOT/bin/pueue-agent" wake deep_check "$proj" || halted_wake_status=$?
+[ "$halted_wake_status" -eq 3 ] || fail "halted wake should return 3 (event not consumed), got $halted_wake_status"
 [ ! -f "$MOCK_AGENT_LOG" ] || fail "halted state did not block wake"
 
 # --- ⑤ resume で復帰 ---

@@ -12,7 +12,7 @@ setup() {
   printf 'pa-proj\t%s\n' "$proj" > "$PA_REGISTRY"
 }
 
-@test "successful task dispatches task_finished wake" {
+@test "successful task dispatches task_finished wake and records handled_tasks" {
   cat > "$MOCK_PUEUE_STATUS_JSON" <<'EOF'
 {"tasks":{"5":{"id":5,"group":"pa-proj",
  "status":{"Done":{"result":"Success"}}}}}
@@ -21,6 +21,20 @@ EOF
   [ "$status" -eq 0 ]
   grep -q "mode: task_finished" "$MOCK_AGENT_LOG"
   grep -q "result: Success" "$MOCK_AGENT_LOG"
+  grep -qx "5" "$proj/.pueue-agent/logs/handled_tasks"
+}
+
+@test "wake not consumed (lock busy) does not record handled_tasks" {
+  cat > "$MOCK_PUEUE_STATUS_JSON" <<'EOF'
+{"tasks":{"7":{"id":7,"group":"pa-proj",
+ "status":{"Done":{"result":"Success"}}}}}
+EOF
+  mkdir -p "$proj/.pueue-agent/logs/lock"
+  echo $$ > "$proj/.pueue-agent/logs/lock/pid"   # 生きている PID = 稼働中とみなす
+  run "$PA_BIN" callback 7 pa-proj
+  [ "$status" -eq 0 ]
+  [ ! -f "$MOCK_AGENT_LOG" ]
+  ! grep -qx "7" "$proj/.pueue-agent/logs/handled_tasks" 2>/dev/null
 }
 
 @test "failed task dispatches crash wake and dedupes with sentinel" {
