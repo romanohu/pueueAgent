@@ -96,3 +96,52 @@ pa_cmd_submit() {
   # shellcheck disable=SC2086  # PA_PUEUE_BIN は意図的に非クォート展開
   ${PA_PUEUE_BIN:-pueue} add -g "$group" -- "$@"
 }
+
+pa_cmd_status() {
+  local proj group
+  proj="$(pa_find_project "${1-}")" || pa_die "no .pueue-agent found"
+  pa_set_project "$proj"
+  group="$(pa_config pueue.group)"
+
+  echo "=== pueue tasks (group: $group) ==="
+  ${PA_PUEUE_BIN:-pueue} status -g "$group" 2>/dev/null || echo "(pueue not reachable)"
+  echo
+
+  if [ -f "$PA_DIR/logs/halted" ]; then
+    echo "=== HALTED ==="
+    cat "$PA_DIR/logs/halted"
+    echo "(resume: pueue-agent resume)"
+    echo
+  fi
+
+  echo "=== counters ==="
+  echo "consecutive failures: $( [ -f "$PA_DIR/logs/consec_failures" ] && cat "$PA_DIR/logs/consec_failures" || echo 0 )"
+  echo "experiments: $( [ -f "$PA_DIR/logs/experiment_count" ] && cat "$PA_DIR/logs/experiment_count" || echo 0 )"
+  echo
+
+  local unread
+  unread="$(pa_unread_notifications)"
+  if [ -n "$unread" ]; then
+    echo "=== 未読通知 ==="
+    echo "$unread"
+    pa_mark_notifications_seen
+    echo
+  fi
+
+  echo "=== recent activity ==="
+  tail -5 "$PA_DIR/logs/runtime.log" 2>/dev/null || echo "(no activity)"
+}
+
+pa_cmd_resume() {
+  local proj
+  proj="$(pa_find_project "${1-}")" || pa_die "no .pueue-agent found"
+  pa_set_project "$proj"
+  if [ ! -f "$PA_DIR/logs/halted" ]; then
+    echo "not halted"
+    return 0
+  fi
+  rm -f "$PA_DIR/logs/halted"
+  echo 0 > "$PA_DIR/logs/consec_failures"
+  pa_log "resumed by user"
+  echo "resumed. 監視を再開しました"
+}
