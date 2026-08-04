@@ -6,9 +6,10 @@ PA_BIN="$REPO_ROOT/bin/pueue-agent"
 make_project() {
   local dir="$BATS_TEST_TMPDIR/proj"
   mkdir -p "$dir/.pueue-agent/logs"
-  if [ -f "$REPO_ROOT/templates/config.yml" ]; then
-    sed 's/^  group: .*/  group: "pa-proj"/' "$REPO_ROOT/templates/config.yml" \
-      > "$dir/.pueue-agent/config.yml"
-  fi
+  sed 's/^  group: .*/  group: "pa-proj"/' "$REPO_ROOT/templates/config.yml" \
+    > "$dir/.pueue-agent/config.yml"
+  cp "$REPO_ROOT/templates/STATE.md" "$dir/.pueue-agent/STATE.md"
+  sed 's/{{GROUP}}/pa-proj/g' "$REPO_ROOT/templates/instructions.md" \
+    > "$dir/.pueue-agent/instructions.md"
   echo "$dir"
 }
