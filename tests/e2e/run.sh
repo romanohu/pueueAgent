@@ -39,10 +39,19 @@ EOF
 # stdout/stderr をそのまま引き継ぐことがあり、後続のログ(WARN/ERROR 等)が
 # このスクリプトの標準出力に紛れ込むことがあるため明示的に捨てる。
 pueued --config "$WORK/pueue.yml" -d >/dev/null 2>&1
-sleep 1
 export PA_PUEUE_BIN="pueue --config $WORK/pueue.yml"
 export PA_TASK_LOG_DIR="$WORK/pueue/task_logs"
 export PA_REGISTRY="$WORK/registry"
+
+# 固定 sleep ではなく、デーモンが実際に応答するまでポーリングする(高負荷機での
+# 起動遅延に対して脆いため)。
+up=""
+for _ in $(seq 100); do
+  # shellcheck disable=SC2086
+  if $PA_PUEUE_BIN status --json >/dev/null 2>&1; then up=1; break; fi
+  sleep 0.1
+done
+[ -n "$up" ] || fail "isolated pueued did not come up in time"
 
 # --- プロジェクト init(モック agent) ---
 proj="$WORK/proj"
@@ -73,7 +82,13 @@ grep -q "result: Success" "$MOCK_AGENT_LOG" || fail "success result not passed"
 rm -f "$MOCK_AGENT_LOG"
 # shellcheck disable=SC2086
 $PA_PUEUE_BIN add -g pa-e2e -- "$REPO_ROOT/tests/e2e/fake_experiments/train_fail.sh" >/dev/null
-sleep 3
+for _ in $(seq 20); do
+  # shellcheck disable=SC2086
+  st="$($PA_PUEUE_BIN status --json | jq -r '.tasks["1"].status | keys[0]')"
+  [ "$st" = "Done" ] && break
+  sleep 1
+done
+[ "$st" = "Done" ] || fail "train_fail.sh did not finish in time"
 "$REPO_ROOT/bin/pueue-agent" sentinel "$proj"
 grep -q "mode: crash" "$MOCK_AGENT_LOG" || fail "crash wake did not fire for failed task"
 
@@ -81,7 +96,20 @@ grep -q "mode: crash" "$MOCK_AGENT_LOG" || fail "crash wake did not fire for fai
 rm -f "$MOCK_AGENT_LOG"
 # shellcheck disable=SC2086
 $PA_PUEUE_BIN add -g pa-e2e -- "$REPO_ROOT/tests/e2e/fake_experiments/train_nan.sh" >/dev/null
-sleep 3
+# タスクが Running になり、かつ NaN 出力がログに現れるまでポーリングする(両方揃うまで
+# sentinel を呼ぶと、まだ Queued だったり出力がまだ無かったりして正当に no-op してしまう)。
+nan_log="$PA_TASK_LOG_DIR/2.log"
+ready=""
+for _ in $(seq 50); do
+  # shellcheck disable=SC2086
+  st="$($PA_PUEUE_BIN status --json | jq -r '.tasks["2"].status | keys[0]' 2>/dev/null || echo "")"
+  if [ "$st" = "Running" ] && [ -f "$nan_log" ] && grep -q "NaN" "$nan_log"; then
+    ready=1
+    break
+  fi
+  sleep 0.2
+done
+[ -n "$ready" ] || fail "train_nan.sh did not reach Running with NaN output in time"
 "$REPO_ROOT/bin/pueue-agent" sentinel "$proj"
 grep -q "mode: crash" "$MOCK_AGENT_LOG" || fail "crash wake did not fire for NaN output"
 # shellcheck disable=SC2086
@@ -90,13 +118,24 @@ $PA_PUEUE_BIN kill 2 >/dev/null 2>&1 || true
 # --- ④ 連続失敗で halt (max=3, ①②③で crash 2回済み → もう1回) ---
 # ①(task_finished/Success)は consec_failures を 0 にリセット、②で 1、③で 2。
 # ここで手動 wake crash すると 3 に達して halt する。
+# halt する呼び出しでは agent は起動されないはずなので、呼び出し前にログを空にしておき、
+# 呼び出し後もログが作られていないことまで直接確認する(stale な③の内容で
+# 見かけ上パスしてしまわないように)。
+rm -f "$MOCK_AGENT_LOG"
 "$REPO_ROOT/bin/pueue-agent" wake crash "$proj" 99 "Failed:1"
 [ -f "$proj/.pueue-agent/logs/halted" ] || fail "did not halt after 3 consecutive failures"
-rm -f "$MOCK_AGENT_LOG"
+[ ! -f "$MOCK_AGENT_LOG" ] || fail "agent was launched despite hitting the halt threshold"
 "$REPO_ROOT/bin/pueue-agent" wake deep_check "$proj"
 [ ! -f "$MOCK_AGENT_LOG" ] || fail "halted state did not block wake"
 
 # --- ⑤ resume で復帰 ---
 "$REPO_ROOT/bin/pueue-agent" resume "$proj" | grep -q resumed || fail "resume failed"
+[ ! -f "$proj/.pueue-agent/logs/halted" ] || fail "halted marker still present after resume"
+[ "$(cat "$proj/.pueue-agent/logs/consec_failures" 2>/dev/null || echo "")" = "0" ] \
+  || fail "consec_failures not reset after resume"
+# 実際に監視が復帰していることまで証明する: resume 後に wake が agent を起動できるか。
+rm -f "$MOCK_AGENT_LOG"
+"$REPO_ROOT/bin/pueue-agent" wake deep_check "$proj"
+grep -q "mode: deep_check" "$MOCK_AGENT_LOG" || fail "agent was not launched after resume"
 
 echo "E2E PASS"
