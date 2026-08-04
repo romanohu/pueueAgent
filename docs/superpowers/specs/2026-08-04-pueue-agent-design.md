@@ -77,8 +77,10 @@ wake_agent.sh が唯一の agent 起動口であり、ガードレール(停止�
       config.yml               ← agent コマンド・チェック間隔・停止条件・通知先
       STATE.md                 ← agent の記憶(実験履歴・方針)
       instructions.md          ← agent への指示書(プロジェクト固有に編集可)
-      experiments/             ← 実験ごとのログ・結果
       logs/                    ← sentinel / wake の実行ログ, カウンタ, ロック
+
+実験自体のログ・結果は扱わない(pueue が捕捉するタスク出力と、
+ライブラリ固有の出力先(wandb 等)に任せる)。
 ```
 
 ### CLI サブコマンド
@@ -86,7 +88,7 @@ wake_agent.sh が唯一の agent 起動口であり、ガードレール(停止�
 - `pueue-agent init` — `.pueue-agent/` を対話式で生成。git 管理の選択肢を提示:
   - すべてコミット(実験履歴を git で追う)
   - すべて `.gitignore` に追記(履歴に残さない)
-  - 中間: config / instructions はコミット、STATE.md / experiments / logs は ignore
+  - 中間: config / instructions はコミット、STATE.md / logs は ignore
 - `pueue-agent enable` — cron 登録 + pueue callback 設定 + プロジェクト専用 pueue group(例: `pa-<repo名>`)作成
 - `pueue-agent disable` — cron / callback / group を綺麗に撤去
 - `pueue-agent status` — 実行中タスク、agent の最終アクション、失敗カウンタ、停止状態を表示
@@ -108,7 +110,8 @@ check:
   interval_minutes: 10        # sentinel の起動間隔
   deep_check_every: 6         # N回に1回、正常でも agent を deep_check で起動
   # deep_check_interval_minutes: 60   # 回数ではなく時間で指定も可(どちらか一方)
-  stall_minutes: 30           # ログ更新がこの時間止まったら「停滞」
+  stall_minutes: 30           # タスク出力がこの時間増えなかったら「停滞」
+  extra_log_paths: []         # pueue のタスク出力に加えて監視するパス(任意)
   error_patterns:             # ログ末尾に対する異常判定の正規表現(追加可)
     - "NaN"
     - "Traceback"
@@ -128,10 +131,10 @@ notify:
 ### sentinel.sh(定期・トークンゼロ)
 
 1. `pueue status --json` から対象 group のタスク状態を取得
-2. 機械判定:
+2. 機械判定(監視対象は pueue が捕捉するタスク出力 + `extra_log_paths`):
    - タスクが failed / killed → `crash` モードで wake
-   - ログファイルが `stall_minutes` 以上更新なし → `stalled` モードで wake
-   - ログ末尾に `error_patterns` がマッチ → `crash` モードで wake
+   - タスク出力が `stall_minutes` 以上増えていない → `stalled` モードで wake
+   - 出力末尾に `error_patterns` がマッチ → `crash` モードで wake
 3. すべて正常の場合:
    - チェックカウンタ(`logs/check_count`)をインクリメント
    - `deep_check_every` 回目なら `deep_check` モードで wake、カウンタをリセット
