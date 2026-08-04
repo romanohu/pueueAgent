@@ -15,14 +15,14 @@ in_proj() { bash -c "source '$REPO_ROOT/lib/common.sh' && source '$REPO_ROOT/lib
   in_proj "pa_mark_notifications_seen"
   in_proj "pa_notify halted 'stop'"
   run in_proj "pa_unread_notifications"
-  [[ "$output" == *"[halted] stop"* ]]
-  [[ "$output" != *"exp1 done"* ]]
+  echo "$output" | grep -qF "[halted] stop"
+  ! echo "$output" | grep -qF "exp1 done"
 }
 
 @test "notifications subcommand prints log" {
   in_proj "pa_notify task_finished 'exp1 done'"
   run bash -c "cd '$proj' && '$PA_BIN' notifications"
-  [[ "$output" == *"exp1 done"* ]]
+  echo "$output" | grep -qF "exp1 done"
 }
 
 @test "unread with no log file is empty and exit 0" {

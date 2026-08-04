@@ -14,19 +14,19 @@ setup() {
   echo "連続失敗" > "$logs/halted"
   run "$PA_BIN" status "$proj"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"HALTED"* ]]
-  [[ "$output" == *"連続失敗"* ]]
-  [[ "$output" == *"consecutive failures: 2"* ]]
-  [[ "$output" == *"experiments: 5"* ]]
+  echo "$output" | grep -qF "HALTED"
+  echo "$output" | grep -qF "連続失敗"
+  echo "$output" | grep -qF "consecutive failures: 2"
+  echo "$output" | grep -qF "experiments: 5"
 }
 
 @test "status shows unread notifications and marks them seen" {
   bash -c "source '$REPO_ROOT/lib/common.sh' && source '$REPO_ROOT/lib/notify.sh' && \
     pa_set_project '$proj' && pa_notify task_finished 'exp done'"
   run "$PA_BIN" status "$proj"
-  [[ "$output" == *"exp done"* ]]
+  echo "$output" | grep -qF "exp done"
   run "$PA_BIN" status "$proj"
-  [[ "$output" != *"exp done"* ]]
+  ! echo "$output" | grep -qF "exp done"
 }
 
 @test "resume clears halted state and failure counter" {
@@ -39,5 +39,5 @@ setup() {
 
 @test "resume when not halted says so" {
   run "$PA_BIN" resume "$proj"
-  [[ "$output" == *"not halted"* ]]
+  echo "$output" | grep -qF "not halted"
 }
