@@ -122,8 +122,7 @@ guardrails:
   max_experiments: 20         # 通算実験数の上限
   agent_max_retries: 2        # agent 自体の起動失敗(APIエラー等)のリトライ上限
 
-notify:
-  slack_webhook_url: ""       # 空なら通知なし。他手段は notify.sh を差し替え
+# 通知はターミナル上(logs/notifications.log + `pueue-agent status`)のため設定不要
 ```
 
 ## 動作フロー
@@ -183,14 +182,17 @@ notify:
 
 ## 通知(notify.sh)
 
-Slack webhook(config で URL 設定)。発火点:
+通知はターミナル上で確認する方式。notify.sh はイベントをタイムスタンプ付きで
+`.pueue-agent/logs/notifications.log` に追記し、`pueue-agent status` が未読分を
+ハイライト表示する。リアルタイムに見たい場合は `pueue-agent notifications -f`
+(tail -f 相当)を使う。外部サービス(Slack 等)への送信は行わない。
+
+発火点:
 
 1. 実験完了(結果サマリ付き)
 2. 異常検知で agent が修正介入したとき(何をしたかの要約)
 3. ガードレール発動で停止したとき(人の介入待ち)
 4. agent 自体の失敗がリトライ上限を超えたとき
-
-他の通知手段はプロジェクト側で notify.sh をオーバーライド可能にする。
 
 ## エラー処理
 
