@@ -6,7 +6,8 @@ use pueue_agent::{
     AppError,
 };
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -20,7 +21,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(cli) {
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}", error.render());
@@ -29,12 +30,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), AppError> {
+async fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Init(args) => commands::init(args),
         Command::Enable(args) => commands::enable(args),
         Command::Disable(args) => commands::disable(args),
-        Command::Submit(args) => commands::submit(args),
+        Command::Submit(args) => commands::submit(args).await,
         Command::Event(args) => commands::event(args),
         Command::Status(args) => commands::status(args),
         Command::Pause(args) => commands::pause(args),
@@ -44,9 +45,11 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 mod commands {
+    use std::env;
+
     use pueue_agent::{
         cli::{DaemonArgs, EventArgs, InitArgs, ProjectArgs, SubmitArgs},
-        AppError,
+        project, submit as submit_command, AppError,
     };
 
     pub fn init(_args: InitArgs) -> Result<(), AppError> {
@@ -61,7 +64,16 @@ mod commands {
         Ok(())
     }
 
-    pub fn submit(_args: SubmitArgs) -> Result<(), AppError> {
+    pub async fn submit(args: SubmitArgs) -> Result<(), AppError> {
+        let current_dir = env::current_dir().map_err(|source| AppError::Io {
+            operation: "read current directory",
+            source,
+        })?;
+        let project_root = project::find_root(&current_dir)?;
+        let submission = submit_command::run(&project_root, &args.command).await?;
+        if let Some(task_id) = submission.pueue_task_id {
+            println!("{task_id}");
+        }
         Ok(())
     }
 

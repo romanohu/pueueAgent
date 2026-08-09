@@ -32,6 +32,9 @@ pub enum AppError {
         source: serde_json::Error,
     },
 
+    #[error(transparent)]
+    Pueue(#[from] crate::pueue::PueueError),
+
     #[error("{operation} failed; inspect pueue-agent logs for details")]
     Runtime { operation: &'static str },
 }
