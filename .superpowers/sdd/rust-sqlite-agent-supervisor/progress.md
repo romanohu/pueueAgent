@@ -113,3 +113,15 @@ Base: `6ca1e2b`
 
 - Commits: `ba10544 feat: add supervisor daemon and user service integration`, `5da23fc fix: harden task 9 daemon service integration`, `7126d69 fix: make pueue group provisioning idempotent`
 - Review clean after two fix rounds. Graceful daemon shutdown, service templates, callback installation, shell-free group provisioning, and recoverable enable flow are implemented.
+
+## Task 10 — fix round 1/5
+
+- Reviewer findings: state transitions lacked durable runtime logs, and disable ignored actual Pueue task state when deciding group reservation behavior.
+- Fix commit: `3697cd6 fix: add operator logs for project transitions`
+- Re-review: approve; operator logs are inserted in the same transactions, and task-aware disable/remove behavior is explicit.
+- Verification: operator 7, database/operator 25, full offline Rust 127, fmt, Clippy, and diff check passed.
+
+## Task 10 — complete
+
+- Commits: `5f2f04b feat: add supervisor status and pause controls`, `3697cd6 fix: add operator logs for project transitions`
+- Review clean after one fix round. Status visibility, pause/resume transitions, durable operator logs, and safe disable/remove semantics are implemented.
