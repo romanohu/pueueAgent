@@ -1654,6 +1654,7 @@ impl<'db> TerminationRequestRepository<'db> {
     pub fn mark_dispatched_if_current(
         &self,
         request_id: i64,
+        dispatch_lease_until: i64,
         grace_until: i64,
     ) -> Result<Option<TerminationRequest>, AppError> {
         let mut connection = self.db.connect()?;
@@ -1666,12 +1667,13 @@ impl<'db> TerminationRequestRepository<'db> {
             .execute(
                 "UPDATE termination_requests
                  SET status = ?1, dispatch_lease_until = NULL, grace_until = ?2
-                 WHERE request_id = ?3 AND status = ?4",
+                 WHERE request_id = ?3 AND status = ?4 AND dispatch_lease_until = ?5",
                 params![
                     TerminationRequestStatus::Sent,
                     grace_until,
                     request_id,
                     TerminationRequestStatus::Dispatching,
+                    dispatch_lease_until,
                 ],
             )
             .map_err(database_error("mark termination request as dispatched"))?;
@@ -1683,6 +1685,43 @@ impl<'db> TerminationRequestRepository<'db> {
         transaction.commit().map_err(database_error(
             "commit termination request dispatch confirmation",
         ))?;
+        Ok(stored)
+    }
+
+    pub fn finish_dispatch_if_current(
+        &self,
+        request_id: i64,
+        dispatch_lease_until: i64,
+        status: TerminationRequestStatus,
+        last_error: Option<&str>,
+    ) -> Result<Option<TerminationRequest>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin termination dispatch result update"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET status = ?1, dispatch_lease_until = NULL,
+                     confirmed_at = NULL, last_error = ?2
+                 WHERE request_id = ?3 AND status = ?4 AND dispatch_lease_until = ?5",
+                params![
+                    status,
+                    last_error,
+                    request_id,
+                    TerminationRequestStatus::Dispatching,
+                    dispatch_lease_until,
+                ],
+            )
+            .map_err(database_error("update termination dispatch result"))?;
+        let stored = if changed == 0 {
+            None
+        } else {
+            Some(read_termination_request(&transaction, request_id)?)
+        };
+        transaction
+            .commit()
+            .map_err(database_error("commit termination dispatch result update"))?;
         Ok(stored)
     }
 

@@ -1042,6 +1042,70 @@ fn termination_request_repository_transitions_and_filters_pending_requests() {
 }
 
 #[test]
+fn expired_dispatch_claim_cannot_complete_a_reclaimed_request() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let incident = IncidentRepository::new(&test.db)
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-a"),
+            "dispatch-lease",
+            100,
+        ))
+        .unwrap()
+        .incident;
+    let repository = TerminationRequestRepository::new(&test.db);
+    let request = repository
+        .insert_idempotent(&NewTerminationRequest::new(
+            incident.incident_id,
+            "project-a",
+            "signature-a",
+            "fatal pattern",
+            100,
+            None,
+        ))
+        .unwrap();
+    let first_claim = repository
+        .claim_for_dispatch(request.request_id, 100, 200)
+        .unwrap()
+        .unwrap();
+    let second_claim = repository
+        .claim_for_dispatch(request.request_id, 201, 301)
+        .unwrap()
+        .unwrap();
+
+    assert!(repository
+        .mark_dispatched_if_current(
+            request.request_id,
+            first_claim.dispatch_lease_until.unwrap(),
+            320
+        )
+        .unwrap()
+        .is_none());
+    assert!(repository
+        .finish_dispatch_if_current(
+            request.request_id,
+            first_claim.dispatch_lease_until.unwrap(),
+            TerminationRequestStatus::Failed,
+            Some("stale failure"),
+        )
+        .unwrap()
+        .is_none());
+    let sent = repository
+        .mark_dispatched_if_current(
+            request.request_id,
+            second_claim.dispatch_lease_until.unwrap(),
+            321,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(sent.status, TerminationRequestStatus::Sent);
+    assert_eq!(sent.grace_until, Some(321));
+}
+
+#[test]
 fn all_event_kind_and_status_values_round_trip_through_sqlite() {
     let test = TestDatabase::new();
     let connection = test.db.connect().unwrap();

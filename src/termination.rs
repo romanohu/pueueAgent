@@ -168,13 +168,23 @@ where
         else {
             return Ok(TerminationOutcome::PendingConfirmation);
         };
+        let claimed_lease_until =
+            claimed_request
+                .dispatch_lease_until
+                .ok_or(AppError::Runtime {
+                    operation: "read termination dispatch lease",
+                })?;
 
         let kill_result = self.pueue.kill(task.id).await;
         match kill_result {
             Ok(()) => {
                 let grace_until = confirmation_grace_until()?;
                 if repository
-                    .mark_dispatched_if_current(claimed_request.request_id, grace_until)?
+                    .mark_dispatched_if_current(
+                        claimed_request.request_id,
+                        claimed_lease_until,
+                        grace_until,
+                    )?
                     .is_some()
                 {
                     Ok(TerminationOutcome::PendingConfirmation)
@@ -189,11 +199,10 @@ where
             }
             Err(error) => {
                 let message = error.to_string();
-                if let Some(failed_request) = repository.update_result_if_current(
+                if let Some(failed_request) = repository.finish_dispatch_if_current(
                     claimed_request.request_id,
-                    TerminationRequestStatus::Dispatching,
+                    claimed_lease_until,
                     TerminationRequestStatus::Failed,
-                    None,
                     Some(&message),
                 )? {
                     let now = unix_timestamp()?;
