@@ -160,6 +160,145 @@ async fn command_adapter_provisions_group_without_shell() {
 }
 
 #[tokio::test]
+async fn command_adapter_skips_group_add_when_group_already_exists() {
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[r#"{"default":{"parallel_tasks":1},"pa-project with spaces":{"parallel_tasks":1}}"#],
+        None,
+    );
+    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+
+    adapter
+        .ensure_group("pa-project with spaces")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![vec!["--config", "profile path.yml", "group", "-j"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_adds_missing_group_after_json_list_check() {
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[r#"{"default":{"parallel_tasks":1}}"#],
+        None,
+    );
+    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+
+    adapter
+        .ensure_group("pa-project with spaces")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![
+            vec!["--config", "profile path.yml", "group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec![
+                "--config",
+                "profile path.yml",
+                "group",
+                "add",
+                "pa-project with spaces",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_treats_racing_group_add_as_success_when_group_appears() {
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[
+            r#"{"default":{"parallel_tasks":1}}"#,
+            r#"{"default":{"parallel_tasks":1},"pa-project":{"parallel_tasks":1}}"#,
+        ],
+        Some("group-add"),
+    );
+    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+
+    adapter.ensure_group("pa-project").await.unwrap();
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![
+            vec!["group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["group", "add", "pa-project"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_preserves_group_add_error_when_group_remains_absent() {
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[r#"{"default":{"parallel_tasks":1}}"#],
+        Some("group-add"),
+    );
+    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+
+    let error = adapter.ensure_group("pa-project").await.unwrap_err();
+
+    match error {
+        AppError::Pueue(PueueError::CommandFailed {
+            operation,
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            assert_eq!(operation, "group");
+            assert_eq!(exit_code, Some(7));
+            assert_eq!(stdout, b"partial output");
+            assert_eq!(stderr, b"daemon unavailable");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![
+            vec!["group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["group", "add", "pa-project"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn status_json_preserves_task_identity_timestamps_and_result() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());

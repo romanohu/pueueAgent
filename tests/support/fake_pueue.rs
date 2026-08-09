@@ -130,13 +130,36 @@ pub struct FakePueueCommand {
 
 impl FakePueueCommand {
     pub fn new(status_stdout: &str, add_stdout: &str, fail_operation: Option<&str>) -> Self {
+        Self::new_with_group_lists(
+            status_stdout,
+            add_stdout,
+            &[r#"{"default":{"parallel_tasks":1}}"#],
+            fail_operation,
+        )
+    }
+
+    pub fn new_with_group_lists(
+        status_stdout: &str,
+        add_stdout: &str,
+        group_lists: &[&str],
+        fail_operation: Option<&str>,
+    ) -> Self {
         let temp = TempDir::new().unwrap();
         let executable = temp.path().join("fake-pueue");
         let capture_path = temp.path().join("args.bin");
         let status_path = temp.path().join("status.json");
         let add_path = temp.path().join("add.txt");
+        let group_index_path = temp.path().join("group-list-index.txt");
+        let group_list_dir = temp.path().join("group-lists");
         fs::write(&status_path, status_stdout).unwrap();
         fs::write(&add_path, add_stdout).unwrap();
+        fs::write(&capture_path, "").unwrap();
+        fs::write(&group_index_path, "0").unwrap();
+        fs::create_dir_all(&group_list_dir).unwrap();
+        for (index, group_list) in group_lists.iter().enumerate() {
+            fs::write(group_list_dir.join(format!("{index}.json")), group_list).unwrap();
+        }
+        let last_group_list_index = group_lists.len().saturating_sub(1);
 
         let script = format!(
             r#"#!/bin/sh
@@ -144,19 +167,28 @@ set -eu
 capture_path={capture_path}
 status_path={status_path}
 add_path={add_path}
+group_index_path={group_index_path}
+group_list_dir={group_list_dir}
+last_group_list_index={last_group_list_index}
 fail_operation={fail_operation}
-: > "$capture_path"
 operation=""
+group_subcommand=""
 for argument in "$@"; do
     printf '%s\0' "$argument" >> "$capture_path"
-    case "$argument" in
-        status|add|group|kill)
-            if [ -z "$operation" ]; then
+    if [ -z "$operation" ]; then
+        case "$argument" in
+            status|add|group|kill)
                 operation="$argument"
-            fi
-            ;;
-    esac
+                ;;
+        esac
+    elif [ "$operation" = "group" ] && [ -z "$group_subcommand" ]; then
+        case "$argument" in
+            -j|--json) ;;
+            *) group_subcommand="$argument" ;;
+        esac
+    fi
 done
+printf '\n' >> "$capture_path"
 if [ "$operation" = "$fail_operation" ]; then
     printf 'partial output'
     printf 'daemon unavailable' >&2
@@ -165,7 +197,22 @@ fi
 case "$operation" in
     status) /bin/cat "$status_path" ;;
     add) /bin/cat "$add_path" ;;
-    group) : ;;
+    group)
+        if [ "$group_subcommand" = "add" ]; then
+            if [ "$fail_operation" = "group-add" ]; then
+                printf 'partial output'
+                printf 'daemon unavailable' >&2
+                exit 7
+            fi
+            exit 0
+        fi
+        index=$(/bin/cat "$group_index_path")
+        /bin/cat "$group_list_dir/$index.json"
+        if [ "$index" -lt "$last_group_list_index" ]; then
+            next_index=$((index + 1))
+            printf '%s' "$next_index" > "$group_index_path"
+        fi
+        ;;
     kill) : ;;
     *) printf 'missing operation' >&2; exit 9 ;;
 esac
@@ -173,6 +220,9 @@ esac
             capture_path = shell_quote(&capture_path),
             status_path = shell_quote(&status_path),
             add_path = shell_quote(&add_path),
+            group_index_path = shell_quote(&group_index_path),
+            group_list_dir = shell_quote(&group_list_dir),
+            last_group_list_index = last_group_list_index,
             fail_operation = shell_quote(Path::new(fail_operation.unwrap_or(""))),
         );
         fs::write(&executable, script).unwrap();
@@ -190,11 +240,24 @@ esac
     }
 
     pub fn captured_args(&self) -> Vec<OsString> {
+        self.captured_invocations()
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn captured_invocations(&self) -> Vec<Vec<OsString>> {
         let bytes = fs::read(&self.capture_path).unwrap();
         bytes
-            .split(|byte| *byte == 0)
-            .filter(|argument| !argument.is_empty())
-            .map(|argument| String::from_utf8(argument.to_vec()).unwrap().into())
+            .split(|byte| *byte == b'\n')
+            .filter(|invocation| !invocation.is_empty())
+            .map(|invocation| {
+                invocation
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .map(|argument| String::from_utf8(argument.to_vec()).unwrap().into())
+                    .collect()
+            })
             .collect()
     }
 }

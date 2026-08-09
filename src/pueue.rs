@@ -31,6 +31,12 @@ pub enum PueueError {
         source: serde_json::Error,
     },
 
+    #[error("Pueue group JSON is invalid: {source}")]
+    InvalidGroupJson {
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("Pueue status JSON has an invalid task shape: {reason}")]
     InvalidStatusTask { reason: &'static str },
 
@@ -177,9 +183,40 @@ impl PueueApi for CommandPueue {
     }
 
     async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
-        self.execute("group", &[OsString::from("add"), OsString::from(group)])
-            .await?;
+        if self.group_exists(group).await? {
+            return Ok(());
+        }
+
+        let add_result = self
+            .execute("group", &[OsString::from("add"), OsString::from(group)])
+            .await;
+        if let Err(error) = add_result {
+            if matches!(
+                &error,
+                AppError::Pueue(PueueError::CommandFailed {
+                    operation: "group",
+                    ..
+                })
+            ) && matches!(self.group_exists(group).await, Ok(true))
+            {
+                return Ok(());
+            }
+
+            return Err(error);
+        }
+
         Ok(())
+    }
+}
+
+impl CommandPueue {
+    async fn group_exists(&self, group: &str) -> Result<bool, AppError> {
+        let output = self.execute("group", &[OsString::from("-j")]).await?;
+        let groups: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|source| PueueError::InvalidGroupJson { source })?;
+        Ok(groups
+            .as_object()
+            .is_some_and(|groups| groups.contains_key(group)))
     }
 }
 

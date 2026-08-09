@@ -140,3 +140,63 @@ Risks / follow-ups:
   already-exists response.
 - The callback registry intentionally performs a narrow indentation-aware update
   instead of full YAML round-tripping, to preserve existing config formatting.
+
+## Fix Round 2
+
+Reviewer finding addressed:
+
+- Made Rust Pueue group provisioning idempotent. `CommandPueue::ensure_group`
+  now checks `pueue group -j` before adding the configured group. If the add
+  command returns nonzero, it re-lists groups and treats the result as success
+  only when the exact configured group exists; otherwise it preserves the
+  original add error.
+- Kept the command adapter shell-free and argument-vector based:
+  `group -j` and `group add <group>` are executed through `tokio::process::Command`
+  with fixed arguments kept separate from operation arguments.
+- Group detection depends only on the top-level group-name keys from Pueue's
+  group JSON map and does not inspect or normalize group values.
+
+TDD:
+
+```text
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --test pueue_adapter
+```
+
+RED result: failed as expected. New failures covered already-existing group,
+missing group add, racing add failure followed by group appearance, and add
+failure when the group remains absent.
+
+GREEN result: passed, 14 tests.
+
+Verification results:
+
+```text
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --test service --test pueue_adapter --test daemon
+```
+
+Result: passed, 30 tests.
+
+```text
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --all-targets --all-features
+```
+
+Result: passed, all Rust targets.
+
+```text
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo fmt --all -- --check
+```
+
+Result: passed.
+
+```text
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo clippy --offline --all-targets --all-features -- -D warnings
+```
+
+Result: passed.
+
+Risks / follow-ups:
+
+- Invalid `pueue group -j` output is surfaced as a typed Pueue integration
+  error instead of being treated as absence.
+- If `pueue group add` fails and the follow-up list also fails, the follow-up
+  list cannot prove idempotent success, so the original add error is preserved.
