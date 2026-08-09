@@ -8,7 +8,8 @@ use crate::{
     models::{
         path_text, AgentRun, AgentRunEvent, Event, Incident, IncidentTransition, IncidentUpdate,
         NewAgentRun, NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
-        NewTerminationRequest, Project, Submission, TaskObservation, TerminationRequest,
+        NewTerminationRequest, Project, Submission, SubmissionStatus, TaskObservation,
+        TerminationRequest, TerminationRequestStatus,
     },
     AppError,
 };
@@ -459,6 +460,83 @@ impl<'db> SubmissionRepository<'db> {
             .optional()
             .map_err(database_error("find submission by ID"))
     }
+
+    pub fn mark_accepted(
+        &self,
+        submission_id: &str,
+        pueue_task_id: i64,
+        task_signature: &str,
+    ) -> Result<Submission, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin submission acceptance"))?;
+        transaction
+            .execute(
+                "UPDATE submissions
+                 SET pueue_task_id = ?1, task_signature = ?2, status = ?3
+                 WHERE submission_id = ?4",
+                params![
+                    pueue_task_id,
+                    task_signature,
+                    SubmissionStatus::Accepted,
+                    submission_id,
+                ],
+            )
+            .map_err(database_error("mark submission accepted"))?;
+        let stored = read_submission(&transaction, submission_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit submission acceptance"))?;
+        Ok(stored)
+    }
+
+    pub fn transition_status(
+        &self,
+        submission_id: &str,
+        status: SubmissionStatus,
+    ) -> Result<Submission, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin submission status transition"))?;
+        transaction
+            .execute(
+                "UPDATE submissions SET status = ?1 WHERE submission_id = ?2",
+                params![status, submission_id],
+            )
+            .map_err(database_error("transition submission status"))?;
+        let stored = read_submission(&transaction, submission_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit submission status transition"))?;
+        Ok(stored)
+    }
+
+    pub fn find_unreconciled(&self, project_id: &str) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                    AND (pueue_task_id IS NULL OR status NOT IN (?2, ?3, ?4))
+                 ORDER BY created_at, submission_id",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare unreconciled submission query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    SubmissionStatus::Accepted,
+                    SubmissionStatus::Adopted,
+                    SubmissionStatus::Failed,
+                ],
+                submission_from_row,
+            )
+            .map_err(database_error("find unreconciled submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read unreconciled submissions"))
+    }
 }
 
 pub struct AgentRunRepository<'db> {
@@ -606,6 +684,79 @@ impl<'db> TerminationRequestRepository<'db> {
             )
             .optional()
             .map_err(database_error("find termination request by ID"))
+    }
+
+    pub fn transition_status(
+        &self,
+        request_id: i64,
+        status: TerminationRequestStatus,
+    ) -> Result<TerminationRequest, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin termination request status transition",
+            ))?;
+        transaction
+            .execute(
+                "UPDATE termination_requests SET status = ?1 WHERE request_id = ?2",
+                params![status, request_id],
+            )
+            .map_err(database_error("transition termination request status"))?;
+        let stored = read_termination_request(&transaction, request_id)?;
+        transaction.commit().map_err(database_error(
+            "commit termination request status transition",
+        ))?;
+        Ok(stored)
+    }
+
+    pub fn update_result(
+        &self,
+        request_id: i64,
+        status: TerminationRequestStatus,
+        confirmed_at: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<TerminationRequest, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin termination request result update"))?;
+        transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET status = ?1, confirmed_at = ?2, last_error = ?3
+                 WHERE request_id = ?4",
+                params![status, confirmed_at, last_error, request_id],
+            )
+            .map_err(database_error("update termination request result"))?;
+        let stored = read_termination_request(&transaction, request_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit termination request result update"))?;
+        Ok(stored)
+    }
+
+    pub fn find_pending(&self, project_id: &str) -> Result<Vec<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND status IN (?2, ?3)
+                 ORDER BY requested_at, request_id",
+                TERMINATION_REQUEST_SELECT
+            ))
+            .map_err(database_error("prepare pending termination request query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    TerminationRequestStatus::Requested,
+                    TerminationRequestStatus::Sent,
+                ],
+                termination_request_from_row,
+            )
+            .map_err(database_error("find pending termination requests"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read pending termination requests"))
     }
 }
 
@@ -832,6 +983,19 @@ fn read_agent_run(connection: &Connection, run_id: i64) -> Result<AgentRun, AppE
             agent_run_from_row,
         )
         .map_err(database_error("read agent run"))
+}
+
+fn read_termination_request(
+    connection: &Connection,
+    request_id: i64,
+) -> Result<TerminationRequest, AppError> {
+    connection
+        .query_row(
+            &format!("{} WHERE request_id = ?1", TERMINATION_REQUEST_SELECT),
+            [request_id],
+            termination_request_from_row,
+        )
+        .map_err(database_error("read termination request"))
 }
 
 fn termination_request_from_row(row: &Row<'_>) -> rusqlite::Result<TerminationRequest> {

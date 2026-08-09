@@ -7,8 +7,11 @@ use super::database_error;
 const LATEST_SCHEMA_VERSION: i64 = 1;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
-    let version: i64 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error("begin SQLite migration"))?;
+    let version: i64 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(database_error("read SQLite schema version"))?;
     if version > LATEST_SCHEMA_VERSION {
         return Err(AppError::Runtime {
@@ -16,12 +19,12 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         });
     }
     if version == LATEST_SCHEMA_VERSION {
+        transaction
+            .commit()
+            .map_err(database_error("commit SQLite migration check"))?;
         return Ok(());
     }
 
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(database_error("begin SQLite migration"))?;
     transaction
         .execute_batch(
             r#"

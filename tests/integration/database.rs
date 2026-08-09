@@ -119,6 +119,34 @@ fn open_configures_sqlite_and_installs_all_tables() {
 }
 
 #[test]
+fn concurrent_first_opens_apply_migration_once() {
+    let temp = TempDir::new().unwrap();
+    let path = Arc::new(temp.path().join("fresh.sqlite3"));
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let path = Arc::clone(&path);
+            thread::spawn(move || {
+                barrier.wait();
+                Db::open(path.as_ref()).map(|_| ())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let connection = db.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+}
+
+#[test]
 fn project_registration_rejects_duplicate_canonical_root_and_group() {
     let test = TestDatabase::new();
     let first_root = test.project_root("first");
@@ -639,6 +667,100 @@ fn typed_repositories_round_trip_future_task_records() {
             .observed_at,
         102
     );
+}
+
+#[test]
+fn submission_repository_tracks_acceptance_and_unreconciled_rows() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let repository = SubmissionRepository::new(&test.db);
+
+    repository
+        .insert_idempotent(&NewSubmission::new(
+            "submission-pending",
+            "project-a",
+            vec!["python".to_owned(), "pending.py".to_owned()],
+            100,
+        ))
+        .unwrap();
+    repository
+        .insert_idempotent(&NewSubmission::new(
+            "submission-accepted",
+            "project-a",
+            vec!["python".to_owned(), "accepted.py".to_owned()],
+            101,
+        ))
+        .unwrap();
+    let accepted = repository
+        .mark_accepted("submission-accepted", 41, "project-a:41")
+        .unwrap();
+    assert_eq!(accepted.status, SubmissionStatus::Accepted);
+    assert_eq!(accepted.pueue_task_id, Some(41));
+    assert_eq!(accepted.task_signature.as_deref(), Some("project-a:41"));
+
+    repository
+        .transition_status("submission-accepted", SubmissionStatus::Unreconciled)
+        .unwrap();
+    let unreconciled = repository.find_unreconciled("project-a").unwrap();
+    assert_eq!(
+        unreconciled
+            .iter()
+            .map(|submission| submission.submission_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["submission-pending", "submission-accepted"]
+    );
+
+    repository
+        .transition_status("submission-pending", SubmissionStatus::Adopted)
+        .unwrap();
+    assert_eq!(repository.find_unreconciled("project-a").unwrap().len(), 2);
+}
+
+#[test]
+fn termination_request_repository_transitions_and_filters_pending_requests() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let incident = IncidentRepository::new(&test.db)
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-a"),
+            "termination-lifecycle",
+            100,
+        ))
+        .unwrap()
+        .incident;
+    let repository = TerminationRequestRepository::new(&test.db);
+
+    let request = repository
+        .insert_idempotent(&NewTerminationRequest::new(
+            incident.incident_id,
+            "project-a",
+            "signature-a",
+            "fatal pattern",
+            100,
+            Some(110),
+        ))
+        .unwrap();
+    let sent = repository
+        .transition_status(request.request_id, TerminationRequestStatus::Sent)
+        .unwrap();
+    assert_eq!(sent.status, TerminationRequestStatus::Sent);
+    assert_eq!(repository.find_pending("project-a").unwrap().len(), 1);
+
+    let confirmed = repository
+        .update_result(
+            request.request_id,
+            TerminationRequestStatus::Confirmed,
+            Some(120),
+            None,
+        )
+        .unwrap();
+    assert_eq!(confirmed.status, TerminationRequestStatus::Confirmed);
+    assert_eq!(confirmed.confirmed_at, Some(120));
+    assert!(repository.find_pending("project-a").unwrap().is_empty());
 }
 
 #[test]
