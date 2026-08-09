@@ -1,7 +1,7 @@
 use std::{
     fs,
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -491,6 +491,39 @@ async fn dispatching_request_retries_kill_after_restart_before_dispatch() {
         .unwrap()
         .unwrap();
     assert!(request.grace_until.is_some());
+}
+
+#[tokio::test]
+async fn active_dispatching_claim_prevents_duplicate_kill() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    harness.fake_pueue.block_next_kill();
+    let request_id = harness.pending_request_ids()[0];
+    let db = harness.db.clone();
+    let fake_pueue = harness.fake_pueue.clone();
+    let first = tokio::spawn(async move {
+        TerminationManager::new(&db, fake_pueue)
+            .execute(request_id)
+            .await
+            .unwrap()
+    });
+    harness.fake_pueue.wait_until_kill_started().await;
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        TerminationManager::new(&harness.db, harness.fake_pueue.clone()).execute(request_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second, TerminationOutcome::PendingConfirmation);
+
+    harness.fake_pueue.release_blocked_kill();
+    assert_eq!(
+        first.await.unwrap(),
+        TerminationOutcome::PendingConfirmation
+    );
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
 }
 
 #[tokio::test]

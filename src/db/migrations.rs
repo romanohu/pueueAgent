@@ -161,6 +161,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                     'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
                 )),
                 requested_at INTEGER NOT NULL,
+                dispatch_lease_until INTEGER,
                 grace_until INTEGER,
                 confirmed_at INTEGER,
                 last_error TEXT,
@@ -317,6 +318,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                     'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
                 )),
                 requested_at INTEGER NOT NULL,
+                dispatch_lease_until INTEGER,
                 grace_until INTEGER,
                 confirmed_at INTEGER,
                 last_error TEXT,
@@ -327,10 +329,10 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
 
             INSERT INTO termination_requests_v5 (
                 request_id, incident_id, project_id, task_signature, reason, status,
-                requested_at, grace_until, confirmed_at, last_error
+                requested_at, dispatch_lease_until, grace_until, confirmed_at, last_error
             )
             SELECT request_id, incident_id, project_id, task_signature, reason, status,
-                   requested_at, grace_until, confirmed_at, last_error
+                   requested_at, NULL, grace_until, confirmed_at, last_error
             FROM termination_requests;
 
             DROP TABLE termination_requests;

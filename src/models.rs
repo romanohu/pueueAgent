@@ -490,6 +490,7 @@ pub struct TerminationRequest {
     pub reason: String,
     pub status: TerminationRequestStatus,
     pub requested_at: i64,
+    pub dispatch_lease_until: Option<i64>,
     pub grace_until: Option<i64>,
     pub confirmed_at: Option<i64>,
     pub last_error: Option<String>,

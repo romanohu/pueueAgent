@@ -15,6 +15,7 @@ use crate::{
 pub type TerminationRequestId = i64;
 
 pub const DEFAULT_CONFIRMATION_GRACE_SECONDS: i64 = 120;
+pub const DISPATCH_LEASE_SECONDS: i64 = 120;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TerminationPolicy;
@@ -160,21 +161,12 @@ where
             );
         }
 
-        let claimed_request = if request.status == TerminationRequestStatus::Dispatching {
-            request.clone()
-        } else if let Some(claimed_request) = repository.transition_status_if_current(
-            request.request_id,
-            TerminationRequestStatus::Requested,
-            TerminationRequestStatus::Dispatching,
-        )? {
-            claimed_request
-        } else {
-            let current = repository
-                .find_by_id(request.request_id)?
-                .ok_or(AppError::Runtime {
-                    operation: "reload concurrently claimed termination request",
-                })?;
-            return outcome_for_non_requested(self.db, &repository, &current);
+        let now = unix_timestamp()?;
+        let lease_until = dispatch_lease_until(now)?;
+        let Some(claimed_request) =
+            repository.claim_for_dispatch(request.request_id, now, lease_until)?
+        else {
+            return Ok(TerminationOutcome::PendingConfirmation);
         };
 
         let kill_result = self.pueue.kill(task.id).await;
@@ -327,6 +319,13 @@ fn confirmation_grace_until() -> Result<i64, AppError> {
         .checked_add(DEFAULT_CONFIRMATION_GRACE_SECONDS)
         .ok_or(AppError::Runtime {
             operation: "calculate termination confirmation grace",
+        })
+}
+
+fn dispatch_lease_until(now: i64) -> Result<i64, AppError> {
+    now.checked_add(DISPATCH_LEASE_SECONDS)
+        .ok_or(AppError::Runtime {
+            operation: "calculate termination dispatch lease",
         })
 }
 

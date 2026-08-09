@@ -1495,7 +1495,7 @@ impl<'db> TerminationRequestRepository<'db> {
         let changed = transaction
             .execute(
                 "UPDATE termination_requests
-                 SET status = ?1
+                 SET status = ?1, dispatch_lease_until = NULL
                  WHERE request_id = ?2 AND status = ?3",
                 params![next, request_id, current],
             )
@@ -1513,6 +1513,52 @@ impl<'db> TerminationRequestRepository<'db> {
         Ok(stored)
     }
 
+    pub fn claim_for_dispatch(
+        &self,
+        request_id: i64,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<Option<TerminationRequest>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin termination request dispatch claim"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET status = ?1, dispatch_lease_until = ?2
+                 WHERE request_id = ?3
+                   AND (
+                       status = ?4
+                       OR (
+                           status = ?5
+                           AND (
+                               dispatch_lease_until IS NULL
+                               OR dispatch_lease_until <= ?6
+                           )
+                       )
+                   )",
+                params![
+                    TerminationRequestStatus::Dispatching,
+                    lease_until,
+                    request_id,
+                    TerminationRequestStatus::Requested,
+                    TerminationRequestStatus::Dispatching,
+                    now,
+                ],
+            )
+            .map_err(database_error("claim termination request dispatch"))?;
+        let stored = if changed == 0 {
+            None
+        } else {
+            Some(read_termination_request(&transaction, request_id)?)
+        };
+        transaction
+            .commit()
+            .map_err(database_error("commit termination request dispatch claim"))?;
+        Ok(stored)
+    }
+
     pub fn update_result(
         &self,
         request_id: i64,
@@ -1527,7 +1573,8 @@ impl<'db> TerminationRequestRepository<'db> {
         transaction
             .execute(
                 "UPDATE termination_requests
-                 SET status = ?1, confirmed_at = ?2, last_error = ?3
+                 SET status = ?1, dispatch_lease_until = NULL,
+                     confirmed_at = ?2, last_error = ?3
                  WHERE request_id = ?4",
                 params![status, confirmed_at, last_error, request_id],
             )
@@ -1556,7 +1603,8 @@ impl<'db> TerminationRequestRepository<'db> {
         let changed = transaction
             .execute(
                 "UPDATE termination_requests
-                 SET status = ?1, confirmed_at = ?2, last_error = ?3
+                 SET status = ?1, dispatch_lease_until = NULL,
+                     confirmed_at = ?2, last_error = ?3
                  WHERE request_id = ?4 AND status = ?5",
                 params![next, confirmed_at, last_error, request_id, current],
             )
@@ -1617,7 +1665,7 @@ impl<'db> TerminationRequestRepository<'db> {
         let changed = transaction
             .execute(
                 "UPDATE termination_requests
-                 SET status = ?1, grace_until = ?2
+                 SET status = ?1, dispatch_lease_until = NULL, grace_until = ?2
                  WHERE request_id = ?3 AND status = ?4",
                 params![
                     TerminationRequestStatus::Sent,
@@ -1788,7 +1836,8 @@ const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid
      FROM agent_runs";
 
 const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, project_id,
-            task_signature, reason, status, requested_at, grace_until, confirmed_at, last_error
+            task_signature, reason, status, requested_at, dispatch_lease_until,
+            grace_until, confirmed_at, last_error
      FROM termination_requests";
 
 const TASK_OBSERVATION_SELECT: &str = "SELECT project_id, task_signature, pueue_task_id,
@@ -2004,9 +2053,10 @@ fn termination_request_from_row(row: &Row<'_>) -> rusqlite::Result<TerminationRe
         reason: row.get(4)?,
         status: row.get(5)?,
         requested_at: row.get(6)?,
-        grace_until: row.get(7)?,
-        confirmed_at: row.get(8)?,
-        last_error: row.get(9)?,
+        dispatch_lease_until: row.get(7)?,
+        grace_until: row.get(8)?,
+        confirmed_at: row.get(9)?,
+        last_error: row.get(10)?,
     })
 }
 
