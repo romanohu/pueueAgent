@@ -63,7 +63,12 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
             "project-a",
             EventKind::TaskFailed,
             "fixture-event",
-            json!({"transcript": "hidden transcript payload", "raw": {"large": "payload"}}),
+            json!({
+                "prompt": "hidden prompt payload",
+                "transcript": "hidden transcript payload",
+                "log_path": "/tmp/hidden-event.log",
+                "raw": {"large": "payload"}
+            }),
             100,
             100,
         ))
@@ -74,13 +79,13 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
             EventStatus::Failed,
             102,
             None,
-            Some("agent command failed after a bounded diagnostic"),
+            Some("short failure"),
         )
         .unwrap();
     let incident = IncidentRepository::new(&harness.db)
         .upsert_active(&NewIncident::new(
             "project-a",
-            "fatal-pattern",
+            "é".repeat(200),
             Some("task-signature"),
             "fixture-incident",
             103,
@@ -102,7 +107,7 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
             request.request_id,
             TerminationRequestStatus::Failed,
             None,
-            Some("Pueue kill failed because the task already exited"),
+            Some("Pueue kill failed at /Users/secret/project --token very-secret prompt hidden"),
         )
         .unwrap();
     AgentRunRepository::new(&harness.db)
@@ -145,6 +150,10 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
         value["incidents"]["recent"][0]["incident_id"],
         incident.incident_id
     );
+    let incident_kind = value["incidents"]["recent"][0]["kind"].as_str().unwrap();
+    assert!(incident_kind.len() <= 240);
+    assert!(incident_kind.is_char_boundary(incident_kind.len()));
+    assert!(incident_kind.ends_with("..."));
     assert_eq!(value["termination"]["counts"]["failed"], 1);
     assert_eq!(
         value["termination"]["recent"][0]["request_id"],
@@ -152,23 +161,46 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
     );
     assert_eq!(value["agent_runs"]["counts"]["active"], 1);
     assert_eq!(value["agent_runs"]["recent"][0]["status"], "running");
-    assert_eq!(value["policy"]["status"], "not_configured");
-    assert_eq!(value["resource"]["status"], "not_configured");
+    assert_eq!(value["policy"], json!({}));
+    assert_eq!(value["resource"], json!({}));
     assert!(value["events"]["recent"][0].get("payload").is_none());
     assert!(value["termination"]["recent"][0].get("reason").is_none());
     assert!(value["agent_runs"]["recent"][0]
         .get("context_lineage")
         .is_none());
-    assert!(
-        value["pueue"]["active_tasks"][0]["command_summary"]
-            .as_str()
-            .unwrap()
-            .len()
-            <= 240
+    assert_eq!(
+        value["pueue"]["active_tasks"][0]["command_summary"],
+        "python"
     );
+    assert_eq!(
+        value["events"]["recent"][0]["error_category"],
+        "event_processing"
+    );
+    assert_eq!(
+        value["termination"]["recent"][0]["error_category"],
+        "termination_dispatch"
+    );
+    assert_ne!(
+        value["events"]["recent"][0]["error_summary"],
+        "short failure"
+    );
+    for summary in [
+        &value["events"]["recent"][0]["error_summary"],
+        &value["termination"]["recent"][0]["error_summary"],
+    ] {
+        let summary = summary.as_str().unwrap();
+        assert!(summary.len() <= 240);
+        assert!(!summary.contains("very-secret"));
+        assert!(!summary.contains("/Users/secret"));
+        assert!(!summary.contains("prompt hidden"));
+    }
     assert!(!rendered.contains("hidden transcript payload"));
+    assert!(!rendered.contains("hidden prompt payload"));
+    assert!(!rendered.contains("hidden-event.log"));
     assert!(!rendered.contains("hidden termination payload"));
     assert!(!rendered.contains("hidden-codex-transcript"));
+    assert!(!rendered.contains("very-secret"));
+    assert!(!rendered.contains("/Users/secret"));
 }
 
 #[test]
@@ -178,13 +210,58 @@ fn status_json_marks_pueue_errors_without_reporting_idle_tasks() {
     let rendered = render_project_status_json(
         &harness.db,
         &harness.project(),
-        &harness.input(PueueSnapshot::Error("Pueue status unavailable".to_owned())),
+        &harness.input(PueueSnapshot::Error(format!(
+            "Pueue status failed at /Users/secret --token very-secret {}",
+            "é".repeat(200)
+        ))),
     )
     .unwrap();
     let value: Value = serde_json::from_str(&rendered).unwrap();
 
     assert_eq!(value["pueue"]["status"], "error");
-    assert_eq!(value["pueue"]["error_summary"], "Pueue status unavailable");
+    assert_eq!(value["pueue"]["error_category"], "pueue_status");
+    let error_summary = value["pueue"]["error_summary"].as_str().unwrap();
+    assert!(error_summary.len() <= 240);
+    assert!(error_summary.is_char_boundary(error_summary.len()));
+    assert_eq!(error_summary, "Pueue status command failed");
+    assert!(!error_summary.contains("very-secret"));
+    assert!(!error_summary.contains("/Users/secret"));
     assert!(value["pueue"].get("active_task_count").is_none());
     assert!(value["pueue"].get("active_tasks").is_none());
+}
+
+#[test]
+fn status_json_limits_active_tasks_after_deterministic_sorting() {
+    let harness = DiagnosticsHarness::new();
+    let tasks = (1..=12)
+        .map(|task_id| PueueTask {
+            id: task_id,
+            group: "pa-project".to_owned(),
+            command: format!("/opt/secret/python --token secret-{task_id}"),
+            state: "Running".to_owned(),
+            enqueued_at: Some(task_id.to_string()),
+            started_at: Some(task_id.to_string()),
+            ended_at: None,
+            result: None,
+        })
+        .collect();
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(tasks)),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let active_tasks = value["pueue"]["active_tasks"].as_array().unwrap();
+
+    assert_eq!(value["pueue"]["active_task_count"], 12);
+    assert_eq!(value["pueue"]["returned_count"], 8);
+    assert_eq!(value["pueue"]["truncated"], true);
+    assert_eq!(active_tasks.len(), 8);
+    assert_eq!(active_tasks[0]["task_id"], 12);
+    assert_eq!(active_tasks[7]["task_id"], 5);
+    assert!(active_tasks
+        .iter()
+        .all(|task| task["command_summary"] == "python"));
 }

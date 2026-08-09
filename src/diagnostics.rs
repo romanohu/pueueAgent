@@ -21,6 +21,7 @@ pub const JSON_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_SUMMARY_LIMIT: usize = 8;
 pub const DEFAULT_EVENT_LIST_LIMIT: usize = 100;
 pub const MAX_EVENT_LIST_LIMIT: usize = 1_000;
+pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 
 const MAX_SUMMARY_TEXT_BYTES: usize = 240;
 
@@ -80,12 +81,8 @@ pub fn render_project_status_json(
             counts: agent_run_counts(db, &project.project_id)?,
             recent: agent_runs.iter().map(AgentRunSummary::from).collect(),
         },
-        policy: FutureSection {
-            status: "not_configured",
-        },
-        resource: FutureSection {
-            status: "not_configured",
-        },
+        policy: FutureSection::default(),
+        resource: FutureSection::default(),
     };
 
     serde_json::to_string(&report).map_err(|source| AppError::Serialization {
@@ -142,7 +139,13 @@ struct PueueSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     active_task_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    returned_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     active_tasks: Option<Vec<PueueTaskSummary>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_category: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_summary: Option<String>,
 }
@@ -180,6 +183,7 @@ struct EventSummary {
     lease_until: Option<i64>,
     created_at: i64,
     completed_at: Option<i64>,
+    error_category: Option<&'static str>,
     error_summary: Option<String>,
 }
 
@@ -193,7 +197,11 @@ impl From<&Event> for EventSummary {
             lease_until: event.lease_until,
             created_at: event.created_at,
             completed_at: event.completed_at,
-            error_summary: event.last_error.as_deref().map(bounded_summary),
+            error_category: event.last_error.as_ref().map(|_| "event_processing"),
+            error_summary: event
+                .last_error
+                .as_ref()
+                .map(|_| safe_error_summary("event_processing")),
         }
     }
 }
@@ -263,6 +271,7 @@ struct TerminationSummary {
     status: TerminationRequestStatus,
     requested_at: i64,
     confirmed_at: Option<i64>,
+    error_category: Option<&'static str>,
     error_summary: Option<String>,
 }
 
@@ -275,7 +284,11 @@ impl From<&TerminationRequest> for TerminationSummary {
             status: request.status,
             requested_at: request.requested_at,
             confirmed_at: request.confirmed_at,
-            error_summary: request.last_error.as_deref().map(bounded_summary),
+            error_category: request.last_error.as_ref().map(|_| "termination_dispatch"),
+            error_summary: request
+                .last_error
+                .as_ref()
+                .map(|_| safe_error_summary("termination_dispatch")),
         }
     }
 }
@@ -307,6 +320,7 @@ struct AgentRunSummary {
     started_at: i64,
     finished_at: Option<i64>,
     exit_code: Option<i64>,
+    error_category: Option<&'static str>,
     error_summary: Option<String>,
 }
 
@@ -320,15 +334,17 @@ impl From<&AgentRun> for AgentRunSummary {
             started_at: run.started_at,
             finished_at: run.finished_at,
             exit_code: run.exit_code,
-            error_summary: run.last_error.as_deref().map(bounded_summary),
+            error_category: run.last_error.as_ref().map(|_| "agent_run"),
+            error_summary: run
+                .last_error
+                .as_ref()
+                .map(|_| safe_error_summary("agent_run")),
         }
     }
 }
 
-#[derive(Serialize)]
-struct FutureSection {
-    status: &'static str,
-}
+#[derive(Default, Serialize)]
+struct FutureSection {}
 
 fn pueue_summary(project: &Project, snapshot: &PueueSnapshot) -> PueueSummary {
     match snapshot {
@@ -342,18 +358,28 @@ fn pueue_summary(project: &Project, snapshot: &PueueSnapshot) -> PueueSummary {
                 })
                 .collect::<Vec<_>>();
             active.sort_unstable_by(|left, right| compare_pueue_tasks(left, right));
+            let active_task_count = active.len();
+            let task_limit = DEFAULT_SUMMARY_LIMIT.min(MAX_TASK_SUMMARY_LIMIT);
+            active.truncate(task_limit);
+            let returned_count = active.len();
             PueueSummary {
                 status: "ok",
-                active_task_count: Some(active.len()),
+                active_task_count: Some(active_task_count),
+                returned_count: Some(returned_count),
+                truncated: Some(returned_count < active_task_count),
                 active_tasks: Some(active.into_iter().map(PueueTaskSummary::from).collect()),
+                error_category: None,
                 error_summary: None,
             }
         }
-        PueueSnapshot::Error(error) => PueueSummary {
+        PueueSnapshot::Error(_error) => PueueSummary {
             status: "error",
             active_task_count: None,
+            returned_count: None,
+            truncated: None,
             active_tasks: None,
-            error_summary: Some(bounded_summary(error)),
+            error_category: Some("pueue_status"),
+            error_summary: Some(safe_error_summary("pueue_status")),
         },
     }
 }
@@ -363,7 +389,7 @@ impl From<&PueueTask> for PueueTaskSummary {
         Self {
             task_id: task.id,
             state: task.state.to_ascii_lowercase(),
-            command_summary: bounded_summary(&task.command),
+            command_summary: executable_summary(&task.command),
             enqueued_at: task.enqueued_at.clone(),
             started_at: task.started_at.clone(),
         }
@@ -486,6 +512,26 @@ fn count(counts: &BTreeMap<String, i64>, status: &str) -> i64 {
 }
 
 fn bounded_summary(value: &str) -> String {
+    let redacted = value
+        .split_whitespace()
+        .map(redact_sensitive_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded_text(&redacted)
+}
+
+fn safe_error_summary(category: &'static str) -> String {
+    let summary = match category {
+        "pueue_status" => "Pueue status command failed",
+        "event_processing" => "event processing failed",
+        "termination_dispatch" => "termination dispatch failed",
+        "agent_run" => "agent run failed",
+        _ => "diagnostic operation failed",
+    };
+    bounded_text(summary)
+}
+
+fn bounded_text(value: &str) -> String {
     let normalized = value
         .chars()
         .map(|character| {
@@ -508,5 +554,65 @@ fn bounded_summary(value: &str) -> String {
             prefix.push(character);
         }
         format!("{prefix}...")
+    }
+}
+
+fn redact_sensitive_token(token: &str) -> String {
+    let lower = token.to_ascii_lowercase();
+    if is_sensitive_token(&lower) {
+        "[redacted]".to_owned()
+    } else if is_path_token(token) {
+        "[path]".to_owned()
+    } else {
+        token.to_owned()
+    }
+}
+
+fn is_sensitive_token(lower: &str) -> bool {
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "prompt",
+        "transcript",
+        "log_path",
+        "apikey",
+        "api_key",
+        "authorization",
+        "bearer",
+        "credential",
+        "cookie",
+        "private_key",
+        "session_id",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_path_token(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.contains('/')
+        || token.contains('\\')
+        || token
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+}
+
+fn executable_summary(command: &str) -> String {
+    let executable = command.split_whitespace().next().unwrap_or("unknown");
+    let executable = executable.rsplit('/').next().unwrap_or("unknown");
+    let executable = executable.rsplit('\\').next().unwrap_or("unknown");
+    let executable = executable.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '+' | '-')
+    });
+    if executable.is_empty() || executable.len() > 64 {
+        "unknown".to_owned()
+    } else {
+        executable.to_owned()
     }
 }
