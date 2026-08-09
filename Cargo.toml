@@ -19,6 +19,10 @@ path = "tests/integration/database.rs"
 name = "pueue_adapter"
 path = "tests/integration/pueue_adapter.rs"
 
+[[test]]
+name = "reconciliation"
+path = "tests/integration/reconciliation.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

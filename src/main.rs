@@ -49,6 +49,7 @@ mod commands {
 
     use pueue_agent::{
         cli::{DaemonArgs, EventArgs, InitArgs, ProjectArgs, SubmitArgs},
+        events::{record_callback, CallbackMetadata},
         project, submit as submit_command, AppError,
     };
 
@@ -77,7 +78,25 @@ mod commands {
         Ok(())
     }
 
-    pub fn event(_args: EventArgs) -> Result<(), AppError> {
+    pub fn event(args: EventArgs) -> Result<(), AppError> {
+        if args.event != "callback" {
+            return Ok(());
+        }
+        let group = args.group.as_deref().ok_or(AppError::Configuration {
+            field: "callback.group",
+        })?;
+        let task_id = args.task_id.ok_or(AppError::Configuration {
+            field: "callback.task_id",
+        })?;
+        let metadata =
+            serde_json::from_str::<CallbackMetadata>(&args.metadata).map_err(|source| {
+                AppError::Serialization {
+                    operation: "parse callback metadata",
+                    source,
+                }
+            })?;
+        let event_id = record_callback(group, task_id, metadata)?;
+        println!("{event_id}");
         Ok(())
     }
 

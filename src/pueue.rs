@@ -50,6 +50,15 @@ pub struct PueueTask {
     pub result: Option<Value>,
 }
 
+impl PueueTask {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state.to_ascii_lowercase().as_str(),
+            "done" | "failed" | "killed" | "finished" | "success"
+        )
+    }
+}
+
 #[async_trait]
 pub trait PueueApi: Send + Sync {
     async fn status_json(&self) -> Result<Vec<PueueTask>, AppError>;

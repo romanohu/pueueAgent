@@ -110,6 +110,23 @@ impl<'db> ProjectRepository<'db> {
             .map_err(database_error("find project by Pueue group"))
     }
 
+    pub fn list_enabled(&self) -> Result<Vec<Project>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE enabled = 1 ORDER BY project_id",
+            )
+            .map_err(database_error("prepare enabled project query"))?;
+        let projects = statement
+            .query_map([], project_from_row)
+            .map_err(database_error("list enabled projects"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read enabled projects"))?;
+        Ok(projects)
+    }
+
     pub fn find_by_root(&self, root: &std::path::Path) -> Result<Option<Project>, AppError> {
         let canonical_root = match fs::canonicalize(root) {
             Ok(path) => path,
@@ -183,6 +200,100 @@ impl<'db> EventRepository<'db> {
             .commit()
             .map_err(database_error("commit idempotent event insert"))?;
         Ok(stored)
+    }
+
+    pub fn find_by_id(&self, event_id: i64) -> Result<Option<Event>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{} WHERE event_id = ?1", EVENT_SELECT),
+                [event_id],
+                event_from_row,
+            )
+            .optional()
+            .map_err(database_error("find event by ID"))
+    }
+
+    pub fn find_by_dedup_key(
+        &self,
+        project_id: &str,
+        dedup_key: &str,
+    ) -> Result<Option<Event>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{} WHERE project_id = ?1 AND dedup_key = ?2", EVENT_SELECT),
+                params![project_id, dedup_key],
+                event_from_row,
+            )
+            .optional()
+            .map_err(database_error("find event by deduplication key"))
+    }
+
+    pub fn replace_pending(
+        &self,
+        event_id: i64,
+        event: &NewEvent,
+    ) -> Result<Option<Event>, AppError> {
+        let payload_json =
+            serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
+                operation: "serialize replacement event payload",
+                source,
+            })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin pending event replacement"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE events
+                 SET kind = ?1, dedup_key = ?2, payload_json = ?3,
+                     not_before = ?4, created_at = ?5
+                 WHERE event_id = ?6 AND status = 'pending'",
+                params![
+                    event.kind,
+                    event.dedup_key,
+                    payload_json,
+                    event.not_before,
+                    event.created_at,
+                    event_id,
+                ],
+            )
+            .map_err(database_error("replace pending event"))?;
+        let stored = if changed == 0 {
+            None
+        } else {
+            Some(
+                transaction
+                    .query_row(
+                        &format!("{} WHERE event_id = ?1", EVENT_SELECT),
+                        [event_id],
+                        event_from_row,
+                    )
+                    .map_err(database_error("read replaced event"))?,
+            )
+        };
+        transaction
+            .commit()
+            .map_err(database_error("commit pending event replacement"))?;
+        Ok(stored)
+    }
+
+    pub fn discard_pending(&self, event_id: i64) -> Result<bool, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin pending callback cleanup"))?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM events WHERE event_id = ?1 AND status = 'pending'",
+                [event_id],
+            )
+            .map_err(database_error("discard duplicate pending callback"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit pending callback cleanup"))?;
+        Ok(removed == 1)
     }
 
     pub fn claim_batch(
@@ -488,6 +599,36 @@ impl<'db> SubmissionRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit submission acceptance"))?;
+        Ok(stored)
+    }
+
+    pub fn adopt(
+        &self,
+        submission_id: &str,
+        pueue_task_id: i64,
+        task_signature: &str,
+    ) -> Result<Submission, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin submission adoption"))?;
+        transaction
+            .execute(
+                "UPDATE submissions
+                 SET pueue_task_id = ?1, task_signature = ?2, status = ?3
+                 WHERE submission_id = ?4",
+                params![
+                    pueue_task_id,
+                    task_signature,
+                    SubmissionStatus::Adopted,
+                    submission_id,
+                ],
+            )
+            .map_err(database_error("adopt Pueue task for submission"))?;
+        let stored = read_submission(&transaction, submission_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit submission adoption"))?;
         Ok(stored)
     }
 

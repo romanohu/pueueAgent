@@ -49,6 +49,12 @@ pub struct SubmitArgs {
 pub struct EventArgs {
     #[arg(value_name = "EVENT")]
     pub event: String,
+    #[arg(long, value_name = "GROUP")]
+    pub group: Option<String>,
+    #[arg(long, value_name = "TASK_ID")]
+    pub task_id: Option<i64>,
+    #[arg(long, default_value = "{}", value_name = "JSON")]
+    pub metadata: String,
 }
 
 #[derive(Debug, Args, Default)]

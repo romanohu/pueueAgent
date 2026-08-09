@@ -25,6 +25,9 @@ pub enum AppError {
     #[error("database conflict on {field}; the value is already registered")]
     DatabaseConflict { field: &'static str },
 
+    #[error("unknown Pueue group `{group}`; callback was not associated with a project")]
+    UnknownPueueGroup { group: String },
+
     #[error("failed to {operation}: {source}")]
     Serialization {
         operation: &'static str,
