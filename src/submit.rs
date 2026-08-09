@@ -85,8 +85,19 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     add_args.extend_from_slice(args);
 
     let task_id = pueue.add(&add_args).await?;
-    let task_signature = format!("{}:{task_id}", registered.pueue_group);
+    let task_signature =
+        provisional_task_signature(&registered.pueue_group, task_id, &submission_id);
     repository.mark_accepted(&submission_id, task_id, &task_signature)
+}
+
+/// Builds the submit-time task identity placeholder.
+///
+/// This signature is deliberately provisional: reconciliation replaces it with
+/// the authoritative enqueue/start/end Pueue task signature once a status
+/// observation is available. Include the submission intent ID so two accepted
+/// submissions cannot collide if Pueue reuses a numeric task ID.
+fn provisional_task_signature(group: &str, task_id: i64, submission_id: &str) -> String {
+    format!("provisional-submit:v1:group={group}:task-id={task_id}:intent={submission_id}")
 }
 
 fn unix_timestamp() -> Result<i64, AppError> {

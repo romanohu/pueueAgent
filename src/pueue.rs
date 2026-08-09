@@ -134,9 +134,16 @@ impl PueueApi for CommandPueue {
     }
 
     async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
-        let mut operation_args = Vec::with_capacity(args.len() + 1);
+        let mut operation_args = Vec::with_capacity(args.len() + 2);
         operation_args.push(OsString::from("--print-task-id"));
-        operation_args.extend_from_slice(args);
+        if let Some(separator_index) = args.iter().position(|argument| argument == "--") {
+            operation_args.extend_from_slice(&args[..separator_index]);
+            operation_args.push(OsString::from("--escape"));
+            operation_args.extend_from_slice(&args[separator_index..]);
+        } else {
+            operation_args.push(OsString::from("--escape"));
+            operation_args.extend_from_slice(args);
+        }
         let output = self.execute("add", &operation_args).await?;
         let task_id = std::str::from_utf8(&output.stdout)
             .ok()
@@ -210,24 +217,48 @@ impl TryFrom<RawTask> for PueueTask {
             .ok_or(PueueError::InvalidStatusTask {
                 reason: "status must contain a state",
             })?;
-        let details = details.as_object();
+        let details = details.as_object().ok_or(PueueError::InvalidStatusTask {
+            reason: "state details must be an object",
+        })?;
 
         Ok(Self {
             id: raw.id.into_i64()?,
             group: raw.group,
             command: raw.command,
             state: state.clone(),
-            enqueued_at: string_field(details, "enqueued_at"),
-            started_at: string_field(details, "start"),
-            ended_at: string_field(details, "end"),
+            enqueued_at: timestamp_field(
+                details,
+                "enqueued_at",
+                "enqueued_at timestamp must be a string when present",
+            )?,
+            started_at: timestamp_field(
+                details,
+                "start",
+                "start timestamp must be a string when present",
+            )?,
+            ended_at: timestamp_field(
+                details,
+                "end",
+                "end timestamp must be a string when present",
+            )?,
             result: details
-                .and_then(|details| details.get("result"))
+                .get("result")
                 .filter(|result| !result.is_null())
                 .cloned(),
         })
     }
 }
 
-fn string_field(object: Option<&serde_json::Map<String, Value>>, field: &str) -> Option<String> {
-    object?.get(field)?.as_str().map(ToOwned::to_owned)
+fn timestamp_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    invalid_reason: &'static str,
+) -> Result<Option<String>, PueueError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(PueueError::InvalidStatusTask {
+            reason: invalid_reason,
+        }),
+    }
 }

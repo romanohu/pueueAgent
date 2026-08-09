@@ -91,6 +91,10 @@ max_experiments = 20
     }
 }
 
+fn expected_provisional_signature(group: &str, task_id: i64, submission_id: &str) -> String {
+    format!("provisional-submit:v1:group={group}:task-id={task_id}:intent={submission_id}")
+}
+
 #[tokio::test]
 async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
@@ -117,6 +121,7 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
             "--print-task-id",
             "-g",
             "pa-project",
+            "--escape",
             "--",
             "python",
             "train.py",
@@ -150,6 +155,63 @@ async fn status_json_preserves_task_identity_timestamps_and_result() {
         }]
     );
     assert_eq!(fixture.captured_args(), vec!["status", "--json"]);
+}
+
+#[tokio::test]
+async fn status_json_rejects_state_details_that_are_not_objects() {
+    let status_json = r#"{
+      "tasks": {
+        "41": {
+          "id": "41",
+          "group": "pa-project",
+          "command": "python train.py",
+          "status": {
+            "Done": "Success"
+          }
+        }
+      }
+    }"#;
+    let fixture = FakePueueCommand::new(status_json, "73\n", None);
+    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+
+    let error = adapter.status_json().await.unwrap_err();
+
+    match error {
+        AppError::Pueue(PueueError::InvalidStatusTask { reason }) => {
+            assert_eq!(reason, "state details must be an object");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn status_json_rejects_wrong_typed_optional_timestamps() {
+    let status_json = r#"{
+      "tasks": {
+        "41": {
+          "id": "41",
+          "group": "pa-project",
+          "command": "python train.py",
+          "status": {
+            "Running": {
+              "enqueued_at": "2026-08-09T10:00:00Z",
+              "start": 123
+            }
+          }
+        }
+      }
+    }"#;
+    let fixture = FakePueueCommand::new(status_json, "73\n", None);
+    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+
+    let error = adapter.status_json().await.unwrap_err();
+
+    match error {
+        AppError::Pueue(PueueError::InvalidStatusTask { reason }) => {
+            assert_eq!(reason, "start timestamp must be a string when present");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -234,7 +296,10 @@ async fn submit_records_intent_before_add_and_preserves_arguments() {
     let accepted = submit_task.await.unwrap().unwrap();
     assert_eq!(accepted.status, SubmissionStatus::Accepted);
     assert_eq!(accepted.pueue_task_id, Some(73));
-    assert_eq!(accepted.task_signature.as_deref(), Some("pa-project:73"));
+    assert_eq!(
+        accepted.task_signature.as_deref(),
+        Some(expected_provisional_signature("pa-project", 73, &accepted.submission_id).as_str())
+    );
 }
 
 #[tokio::test]
@@ -270,5 +335,31 @@ async fn submit_keeps_pending_intent_when_add_fails() {
     assert_eq!(
         pending[0].argv,
         vec!["python", "train.py", "--name", "a b; echo bad"]
+    );
+}
+
+#[tokio::test]
+async fn submit_provisional_signature_uses_submission_intent_to_avoid_task_id_collisions() {
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let args = vec![OsString::from("python"), OsString::from("train.py")];
+
+    let first = submit::run_with(&harness.db, &harness.root, &args, &fake)
+        .await
+        .unwrap();
+    let second = submit::run_with(&harness.db, &harness.root, &args, &fake)
+        .await
+        .unwrap();
+
+    assert_eq!(first.pueue_task_id, Some(73));
+    assert_eq!(second.pueue_task_id, Some(73));
+    assert_ne!(first.task_signature, second.task_signature);
+    assert_eq!(
+        first.task_signature.as_deref(),
+        Some(expected_provisional_signature("pa-project", 73, &first.submission_id).as_str())
+    );
+    assert_eq!(
+        second.task_signature.as_deref(),
+        Some(expected_provisional_signature("pa-project", 73, &second.submission_id).as_str())
     );
 }
