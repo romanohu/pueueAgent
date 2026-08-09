@@ -237,7 +237,7 @@ fn status_json_limits_active_tasks_after_deterministic_sorting() {
         .map(|task_id| PueueTask {
             id: task_id,
             group: "pa-project".to_owned(),
-            command: format!("/opt/secret/python --token secret-{task_id}"),
+            command: format!("TOKEN=abc123-{task_id} /opt/secret/python --token secret-{task_id}"),
             state: "Running".to_owned(),
             enqueued_at: Some(task_id.to_string()),
             started_at: Some(task_id.to_string()),
@@ -264,4 +264,50 @@ fn status_json_limits_active_tasks_after_deterministic_sorting() {
     assert!(active_tasks
         .iter()
         .all(|task| task["command_summary"] == "python"));
+    assert!(!rendered.contains("abc123"));
+    assert!(!rendered.contains("/opt/secret"));
+}
+
+#[test]
+fn status_json_hides_shell_wrappers_and_options_when_executable_is_ambiguous() {
+    let harness = DiagnosticsHarness::new();
+    let tasks = vec![
+        PueueTask {
+            id: 50,
+            group: "pa-project".to_owned(),
+            command: "env TOKEN=abc123 /opt/secret/python --token secret".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("50".to_owned()),
+            started_at: Some("50".to_owned()),
+            ended_at: None,
+            result: None,
+        },
+        PueueTask {
+            id: 51,
+            group: "pa-project".to_owned(),
+            command: "--shell /opt/secret/python --token secret".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("51".to_owned()),
+            started_at: Some("51".to_owned()),
+            ended_at: None,
+            result: None,
+        },
+    ];
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(tasks)),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+
+    assert!(value["pueue"]["active_tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|task| task["command_summary"] == "unknown"));
+    assert!(!rendered.contains("abc123"));
+    assert!(!rendered.contains("/opt/secret"));
+    assert!(!rendered.contains("secret"));
 }

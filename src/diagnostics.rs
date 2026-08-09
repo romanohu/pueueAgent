@@ -604,15 +604,64 @@ fn is_path_token(token: &str) -> bool {
 }
 
 fn executable_summary(command: &str) -> String {
-    let executable = command.split_whitespace().next().unwrap_or("unknown");
-    let executable = executable.rsplit('/').next().unwrap_or("unknown");
+    let token = command
+        .split_whitespace()
+        .find(|token| !is_environment_assignment(token));
+    let Some(token) = token else {
+        return "unknown".to_owned();
+    };
+    let executable = token.rsplit('/').next().unwrap_or("unknown");
     let executable = executable.rsplit('\\').next().unwrap_or("unknown");
-    let executable = executable.trim_matches(|character: char| {
-        !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '+' | '-')
-    });
-    if executable.is_empty() || executable.len() > 64 {
+    let lower = executable.to_ascii_lowercase();
+    if token.starts_with('-')
+        || executable.contains('=')
+        || is_shell_wrapper(&lower)
+        || executable.is_empty()
+        || executable.len() > 64
+        || !executable.chars().all(is_safe_executable_character)
+    {
         "unknown".to_owned()
     } else {
         executable.to_owned()
     }
+}
+
+fn is_environment_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn is_shell_wrapper(executable: &str) -> bool {
+    matches!(
+        executable,
+        "ash"
+            | "bash"
+            | "busybox"
+            | "cmd"
+            | "command"
+            | "csh"
+            | "dash"
+            | "doas"
+            | "env"
+            | "exec"
+            | "fish"
+            | "ksh"
+            | "powershell"
+            | "pwsh"
+            | "sh"
+            | "sudo"
+            | "tcsh"
+            | "zsh"
+    )
+}
+
+fn is_safe_executable_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
 }
