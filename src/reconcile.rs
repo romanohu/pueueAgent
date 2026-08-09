@@ -104,7 +104,7 @@ where
                 let _ = event;
                 let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(
                     project.project_id.as_str(),
-                    &signature,
+                    task_incident_key(task),
                     now,
                 ))?;
             }
@@ -130,6 +130,22 @@ pub fn task_signature(task: &PueueTask) -> TaskSignature {
     format!(
         "pueue-task:v1:{}",
         serde_json::to_string(&identity).expect("task identity JSON is serializable")
+    )
+}
+
+pub fn task_incident_key(task: &PueueTask) -> TaskSignature {
+    // Task-scoped incidents must survive lifecycle transitions from running to
+    // terminal, but numeric Pueue IDs can be reused. Use the stable run
+    // identity fields and exclude state, ended_at, and result.
+    let identity = json!({
+        "group": task.group,
+        "id": task.id,
+        "enqueued_at": task.enqueued_at,
+        "started_at": task.started_at,
+    });
+    format!(
+        "pueue-task-incident:v1:{}",
+        serde_json::to_string(&identity).expect("task incident identity JSON is serializable")
     )
 }
 

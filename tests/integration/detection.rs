@@ -13,7 +13,7 @@ use pueue_agent::{
     logs::LogSnapshot,
     models::{IncidentStatus, IncidentTransition, NewProject},
     pueue::PueueTask,
-    reconcile::task_signature,
+    reconcile::task_incident_key,
 };
 use tempfile::TempDir;
 
@@ -113,6 +113,13 @@ fn task() -> PueueTask {
     }
 }
 
+fn terminal_task() -> PueueTask {
+    let mut task = task();
+    task.state = "Done".to_owned();
+    task.ended_at = Some("300".to_owned());
+    task
+}
+
 fn task_log_path(log_dir: &Path, task_id: i64) -> PathBuf {
     log_dir.join(format!("{task_id}.log"))
 }
@@ -120,7 +127,7 @@ fn task_log_path(log_dir: &Path, task_id: i64) -> PathBuf {
 fn nan_observation(task: &PueueTask) -> Observation {
     Observation::pattern(
         "project-a",
-        task_signature(task),
+        task_incident_key(task),
         "nan-loss",
         PatternAction::Wake,
         3,
@@ -141,6 +148,30 @@ fn identical_nan_observations_update_one_incident() {
     assert_eq!(first, IncidentTransition::Opened);
     assert_eq!(second, IncidentTransition::Unchanged);
     assert_eq!(harness.active_count(), 1);
+}
+
+#[test]
+fn terminal_task_observation_resolves_incident_opened_while_running() {
+    let harness = Harness::new();
+    let running = task();
+    let terminal = terminal_task();
+    let store = harness.store();
+
+    assert_eq!(
+        store.observe(nan_observation(&running)).unwrap(),
+        IncidentTransition::Opened
+    );
+    let terminal_recovery = store
+        .observe(Observation::task_terminal(
+            "project-a",
+            task_incident_key(&terminal),
+            300,
+        ))
+        .unwrap();
+
+    assert_eq!(terminal_recovery, IncidentTransition::Resolved);
+    assert_eq!(harness.active_count(), 0);
+    assert_eq!(harness.resolved_count(), 1);
 }
 
 #[test]
@@ -187,7 +218,7 @@ fn repeated_stalled_snapshot_is_unchanged_but_log_growth_resolves_it() {
     let opened = store
         .observe(Observation::stalled(
             "project-a",
-            task_signature(&task),
+            task_incident_key(&task),
             first_snapshot.clone(),
             PatternAction::Notify,
             200,
@@ -196,7 +227,7 @@ fn repeated_stalled_snapshot_is_unchanged_but_log_growth_resolves_it() {
     let unchanged = store
         .observe(Observation::stalled(
             "project-a",
-            task_signature(&task),
+            task_incident_key(&task),
             first_snapshot,
             PatternAction::Notify,
             201,
@@ -209,7 +240,7 @@ fn repeated_stalled_snapshot_is_unchanged_but_log_growth_resolves_it() {
     let resolved = store
         .observe(Observation::stalled_recovered(
             "project-a",
-            task_signature(&task),
+            task_incident_key(&task),
             grown_snapshot,
             202,
         ))
@@ -262,7 +293,51 @@ fn extra_logs_are_project_relative_and_reject_path_traversal_after_canonicalizat
 }
 
 #[test]
-fn task_id_reuse_keeps_incidents_separate_by_full_task_signature() {
+fn taskless_recovery_does_not_resolve_unrelated_extra_log_incident() {
+    let harness = Harness::new();
+    let store = harness.store();
+    let active_snapshot = LogSnapshot {
+        byte_size: 19,
+        modified_at_nanos: Some(1),
+        fingerprint: "log:v1:active-extra".to_owned(),
+        evidence: "CUDA out of memory\n".to_owned(),
+    };
+    let unrelated_recovered_snapshot = LogSnapshot {
+        byte_size: 11,
+        modified_at_nanos: Some(2),
+        fingerprint: "log:v1:other-extra".to_owned(),
+        evidence: "loss normal\n".to_owned(),
+    };
+
+    let opened = store
+        .observe(Observation::extra_log_pattern(
+            "project-a",
+            PathBuf::from("logs/train.log"),
+            "cuda-oom",
+            PatternAction::Kill,
+            1,
+            active_snapshot,
+            200,
+        ))
+        .unwrap();
+    let unrelated_recovery = store
+        .observe(Observation::extra_log_pattern_recovered(
+            "project-a",
+            PathBuf::from("logs/other.log"),
+            "cuda-oom",
+            unrelated_recovered_snapshot,
+            201,
+        ))
+        .unwrap();
+
+    assert_eq!(opened, IncidentTransition::Opened);
+    assert_eq!(unrelated_recovery, IncidentTransition::Unchanged);
+    assert_eq!(harness.active_count(), 1);
+    assert_eq!(harness.resolved_count(), 0);
+}
+
+#[test]
+fn task_id_reuse_keeps_incidents_separate_by_stable_task_incident_key() {
     let harness = Harness::new();
     let first_task = task();
     let mut reused_task = task();
@@ -275,7 +350,7 @@ fn task_id_reuse_keeps_incidents_separate_by_full_task_signature() {
     );
     let reused = Observation::pattern(
         "project-a",
-        task_signature(&reused_task),
+        task_incident_key(&reused_task),
         "nan-loss",
         PatternAction::Wake,
         3,

@@ -10,7 +10,7 @@ use crate::{
     config::{CheckConfig, PatternAction},
     logs::LogSnapshot,
     pueue::PueueTask,
-    reconcile::task_signature,
+    reconcile::task_incident_key,
     AppError,
 };
 
@@ -76,21 +76,44 @@ impl Observation {
     ) -> Self {
         let relative_path = relative_path.into();
         let pattern_name = pattern_name.into();
+        let fingerprint =
+            extra_log_pattern_fingerprint(&relative_path, &pattern_name, &snapshot.fingerprint);
         Self {
             project_id: project_id.into(),
             kind: "pattern".to_owned(),
             task_key: None,
-            fingerprint: format!(
-                "extra-log-pattern:v1:path={}:name={}:snapshot={}",
-                relative_path.display(),
-                pattern_name,
-                snapshot.fingerprint
-            ),
+            fingerprint,
             seen_at,
             state: ObservationState::Active,
             pattern_name: Some(pattern_name),
             action,
             confirmation_count: Some(confirmation_count),
+            evidence: snapshot.evidence,
+            source_path: Some(relative_path),
+        }
+    }
+
+    pub fn extra_log_pattern_recovered(
+        project_id: impl Into<String>,
+        relative_path: impl Into<PathBuf>,
+        pattern_name: impl Into<String>,
+        snapshot: LogSnapshot,
+        seen_at: i64,
+    ) -> Self {
+        let relative_path = relative_path.into();
+        let pattern_name = pattern_name.into();
+        let fingerprint =
+            extra_log_pattern_fingerprint(&relative_path, &pattern_name, &snapshot.fingerprint);
+        Self {
+            project_id: project_id.into(),
+            kind: "pattern".to_owned(),
+            task_key: None,
+            fingerprint,
+            seen_at,
+            state: ObservationState::Recovered,
+            pattern_name: Some(pattern_name),
+            action: PatternAction::Notify,
+            confirmation_count: None,
             evidence: snapshot.evidence,
             source_path: Some(relative_path),
         }
@@ -209,6 +232,19 @@ impl Observation {
     }
 }
 
+fn extra_log_pattern_fingerprint(
+    relative_path: &Path,
+    pattern_name: &str,
+    snapshot_fingerprint: &str,
+) -> String {
+    format!(
+        "extra-log-pattern:v1:path={}:name={}:snapshot={}",
+        relative_path.display(),
+        pattern_name,
+        snapshot_fingerprint
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Detector {
     project_id: Option<String>,
@@ -244,12 +280,12 @@ impl Detector {
     ) -> Result<Vec<Observation>, AppError> {
         let mut observations = Vec::new();
         let project_id = self.project_id.as_deref().unwrap_or(task.group.as_str());
-        let task_signature = task_signature(task);
+        let task_key = task_incident_key(task);
         let seen_at = unix_timestamp()?;
         if let Some(snapshot) = self.read_task_snapshot(task.id, config.log_tail_bytes)? {
             observations.extend(pattern_observations(
                 project_id,
-                Some(task_signature.as_str()),
+                Some(task_key.as_str()),
                 None,
                 &snapshot,
                 config,

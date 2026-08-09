@@ -64,23 +64,36 @@ impl<'db> IncidentStore<'db> {
 
     fn resolve_active(&self, observation: &Observation) -> Result<IncidentTransition, AppError> {
         let connection = self.db.connect()?;
-        let incident_id = connection
-            .query_row(
+        let incident_id = if let Some(task_key) = observation.task_key() {
+            connection.query_row(
                 "SELECT incident_id FROM incidents
                  WHERE project_id = ?1 AND kind = ?2
-                   AND (?3 IS NULL OR task_key = ?3)
+                   AND task_key = ?3
+                   AND status IN ('open', 'acknowledged')
+                 ORDER BY last_seen_at DESC, incident_id DESC
+                 LIMIT 1",
+                params![observation.project_id(), observation.kind(), task_key],
+                |row| row.get::<_, i64>(0),
+            )
+        } else {
+            connection.query_row(
+                "SELECT incident_id FROM incidents
+                 WHERE project_id = ?1 AND kind = ?2
+                   AND task_key IS NULL
+                   AND fingerprint = ?3
                    AND status IN ('open', 'acknowledged')
                  ORDER BY last_seen_at DESC, incident_id DESC
                  LIMIT 1",
                 params![
                     observation.project_id(),
                     observation.kind(),
-                    observation.task_key(),
+                    observation.fingerprint(),
                 ],
                 |row| row.get::<_, i64>(0),
             )
-            .optional()
-            .map_err(database_error("find active incident for recovery"))?;
+        }
+        .optional()
+        .map_err(database_error("find active incident for recovery"))?;
         if let Some(incident_id) = incident_id {
             IncidentRepository::new(self.db).resolve(incident_id, observation.seen_at())
         } else {
