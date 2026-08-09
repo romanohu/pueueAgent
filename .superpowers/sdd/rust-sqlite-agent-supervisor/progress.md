@@ -27,3 +27,15 @@ Base: `6ca1e2b`
 - Commits: `e3c4f3a feat: add safe Pueue adapter and submit command`, `b57aef7 fix: harden Pueue command and task identity`
 - Initial review found missing `--escape`, lenient status JSON typing, and a weak task signature. Final review: PASS with no findings after all three were fixed.
 - Verification: focused Pueue adapter tests (9 passed), offline all-target/all-feature tests (51 passed), formatting, Clippy with `-D warnings`, and `git diff --check`.
+
+## Task 5 — fix round 1/5
+
+- Reviewer findings: unknown callback groups were not durable, terminal events could duplicate after a callback left `pending`, and submission recovery used lossy whitespace matching.
+- Fix commit: `09f46e1 fix: harden callback reconciliation idempotency`
+- Re-review: PASS; all three findings addressed and no new Critical/Important breakage.
+- Verification: focused reconciliation 13 passed, database 17 passed, full offline Rust 64 passed, formatting, Clippy with `-D warnings`, and `git diff --check`.
+
+## Task 5 — complete
+
+- Commits: `f91cbb3 feat: add durable callback and Pueue reconciliation`, `09f46e1 fix: harden callback reconciliation idempotency`
+- Review clean after fix round 1. Unknown groups are stored in the global integration-event table; callback/reconciliation is lifecycle-idempotent; task-ID reuse remains signature-separated; command recovery preserves argument boundaries.
