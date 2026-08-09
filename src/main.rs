@@ -1,11 +1,10 @@
-mod cli;
-mod error;
-
 use std::process::ExitCode;
 
 use clap::Parser;
-use cli::{Cli, Command};
-use error::AppError;
+use pueue_agent::{
+    cli::{Cli, Command},
+    AppError,
+};
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -45,9 +44,9 @@ fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 mod commands {
-    use crate::{
+    use pueue_agent::{
         cli::{DaemonArgs, EventArgs, InitArgs, ProjectArgs, SubmitArgs},
-        error::AppError,
+        AppError,
     };
 
     pub fn init(_args: InitArgs) -> Result<(), AppError> {

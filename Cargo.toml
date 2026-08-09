@@ -7,6 +7,10 @@ edition = "2021"
 name = "cli_help"
 path = "tests/integration/cli_help.rs"
 
+[[test]]
+name = "config"
+path = "tests/integration/config.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
