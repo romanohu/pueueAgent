@@ -25,6 +25,8 @@ use pueue_agent::{
 use serde_json::json;
 use tempfile::TempDir;
 
+const CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
+
 #[derive(Clone)]
 struct OperatorPueue {
     tasks: Arc<Mutex<Result<Vec<PueueTask>, String>>>,
@@ -89,19 +91,20 @@ impl OperatorHarness {
         .unwrap();
         fs::write(
             root.join(".pueue-agent/config.toml"),
-            r#"
+            format!(
+                r#"
 project_id = "project-a"
 pueue_group = "pa-project"
 
 [agent]
 program = "codex"
-args = ["exec", "{prompt}"]
+args = ["exec", "{{prompt}}"]
 timeout_minutes = 10
 max_retries = 2
 
 [agent.context]
 mode = "resume"
-session_id = "session-123"
+session_id = "{CODEX_SESSION_ID}"
 
 [check]
 interval_minutes = 10
@@ -120,7 +123,8 @@ kill_after_minutes = 0
 max_consecutive_failures = 3
 max_experiments = 20
 max_agent_runs = 10
-"#,
+"#
+            ),
         )
         .unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
@@ -264,9 +268,9 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
             harness.now,
             harness.temp.path().join("active-agent.log"),
             AgentContextMode::Resume {
-                session_id: "session-123".to_owned(),
+                session_id: CODEX_SESSION_ID.to_owned(),
             },
-            Some("session-123".to_owned()),
+            Some(CODEX_SESSION_ID.to_owned()),
             vec!["session-prev".to_owned(), "session-current".to_owned()],
         ))
         .unwrap();
@@ -297,7 +301,9 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
     assert!(
         output.contains("guardrails: consecutive_failures=2/3 experiments=0/20 agent_runs=2/10")
     );
-    assert!(output.contains("codex_context: mode=resume session=session-123"));
+    assert!(output.contains(&format!(
+        "codex_context: mode=resume session={CODEX_SESSION_ID}"
+    )));
     assert!(output.contains("last_lineage: session-prev -> session-current"));
     assert!(!output.contains("idle"));
     assert!(!output.contains("hidden transcript"));

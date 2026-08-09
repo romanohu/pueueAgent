@@ -199,6 +199,7 @@ command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required"
 
 export HOME="$WORK/home"
 export CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}"
+export CODEX_HOME="$WORK/codex-home"
 export XDG_STATE_HOME="$WORK/state"
 export PUEUE_AGENT_STATE_DIR="$WORK/state/pueue-agent"
 export PUEUE_CONFIG_PATH="$WORK/pueue.yml"
@@ -208,7 +209,7 @@ export PUEUE_AGENT_TEST_CODEX_LOG="$WORK/codex-calls.log"
 export PUEUE_AGENT_E2E_REAL_PUEUE="$REAL_PUEUE"
 export PUEUE_AGENT_E2E_KILL_LOG="$WORK/pueue-kills.log"
 export PUEUE_AGENT_E2E_DEFER_KILL=1
-mkdir -p "$HOME" "$WORK/bin" "$WORK/pueue"
+mkdir -p "$HOME" "$CODEX_HOME" "$WORK/bin" "$WORK/pueue"
 
 cat > "$WORK/bin/pueue" <<'EOF'
 #!/usr/bin/env bash
@@ -413,7 +414,16 @@ wait_for_sql "SELECT status FROM events WHERE dedup_key = '$restart_key'" "pendi
 stop_daemon
 
 # Explicit Codex continuation reaches the process boundary and is recorded in SQLite.
-context_session_id="019-task-11-existing-context"
+context_session_id="019f9f30-5f31-7a40-8e28-bd95e1f6c537"
+context_session_store="$CODEX_HOME/sessions/2026/08/09"
+mkdir -p "$context_session_store"
+{
+  jq -cn \
+    --arg session_id "$context_session_id" \
+    --arg cwd "$PROJECT_A_CANONICAL" \
+    '{timestamp:"2026-08-09T00:00:00Z",type:"session_meta",payload:{id:$session_id,cwd:$cwd}}'
+  printf '%s\n' '{"type":"response_item","payload":{}}'
+} > "$context_session_store/rollout-e2e-$context_session_id.jsonl"
 write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "codex" 20 "resume" "$context_session_id"
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 904 \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
@@ -432,6 +442,8 @@ grep -qx 'ARG_4=resume' "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation silently used a fresh execution"
 grep -qx "ARG_5=$context_session_id" "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation used the wrong session ID"
+grep -qx "CODEX_HOME=$CODEX_HOME" "$PUEUE_AGENT_TEST_CODEX_LOG" \
+  || fail "Codex continuation did not inherit the fixture CODEX_HOME"
 
 PA_INSTALL_PREFIX="$WORK/install" "$REPO_ROOT/install.sh" >/dev/null
 [ -L "$WORK/install/pueue-agent" ] || fail "install did not create pueue-agent symlink"

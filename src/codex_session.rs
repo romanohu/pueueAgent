@@ -10,6 +10,8 @@ use uuid::Uuid;
 use crate::AppError;
 
 const SESSION_STORES: [&str; 2] = ["sessions", "archived_sessions"];
+const MAX_SESSION_STORE_DEPTH: usize = 32;
+const MAX_SESSION_STORE_ENTRIES: usize = 4096;
 const MAX_SESSION_METADATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -101,14 +103,36 @@ pub fn verify_project_ownership(
 }
 
 fn locate_metadata(codex_home: &Path, session_id: &str) -> Result<PathBuf, AppError> {
-    let suffix = format!("-{session_id}.jsonl");
-    let mut matches = Vec::new();
+    locate_metadata_in_stores(
+        codex_home,
+        session_id,
+        &SESSION_STORES,
+        MAX_SESSION_STORE_ENTRIES,
+    )
+}
 
-    for store_name in SESSION_STORES {
+fn locate_metadata_in_stores(
+    codex_home: &Path,
+    session_id: &str,
+    store_names: &[&str],
+    max_entries: usize,
+) -> Result<PathBuf, AppError> {
+    let suffix = format!("-{session_id}.jsonl");
+    let mut matched_path = None;
+    let mut remaining_entries = max_entries;
+
+    for store_name in store_names {
         let store = codex_home.join(store_name);
         match fs::metadata(&store) {
             Ok(metadata) if metadata.is_dir() => {
-                collect_matching_metadata(&store, &suffix, session_id, &mut matches)?;
+                collect_matching_metadata(
+                    &store,
+                    &suffix,
+                    session_id,
+                    0,
+                    &mut remaining_entries,
+                    &mut matched_path,
+                )?;
             }
             Ok(_) => {
                 return Err(metadata_error(
@@ -123,51 +147,65 @@ fn locate_metadata(codex_home: &Path, session_id: &str) -> Result<PathBuf, AppEr
         }
     }
 
-    match matches.len() {
-        0 => Err(metadata_error(
-            session_id,
-            "metadata was not found in CODEX_HOME",
-        )),
-        1 => Ok(matches.remove(0)),
-        _ => Err(metadata_error(
-            session_id,
-            "metadata is ambiguous across local session stores",
-        )),
-    }
+    matched_path.ok_or_else(|| metadata_error(session_id, "metadata was not found in CODEX_HOME"))
 }
 
 fn collect_matching_metadata(
     directory: &Path,
     suffix: &str,
     session_id: &str,
-    matches: &mut Vec<PathBuf>,
+    depth: usize,
+    remaining_entries: &mut usize,
+    matched_path: &mut Option<PathBuf>,
 ) -> Result<(), AppError> {
-    let mut pending = vec![directory.to_owned()];
-    while let Some(directory) = pending.pop() {
-        let entries = fs::read_dir(directory)
-            .map_err(|_| metadata_error(session_id, "session store is unreadable"))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|_| metadata_error(session_id, "session store is unreadable"))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|_| metadata_error(session_id, "session metadata type is unreadable"))?;
-            let path = entry.path();
+    let entries = fs::read_dir(directory)
+        .map_err(|_| metadata_error(session_id, "session store is unreadable"))?;
+    for entry in entries {
+        if *remaining_entries == 0 {
+            return Err(metadata_error(
+                session_id,
+                "metadata discovery exceeded the traversal limit",
+            ));
+        }
+        *remaining_entries -= 1;
 
-            if file_type.is_dir() {
-                pending.push(path);
-            } else if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(suffix))
-            {
-                if !file_type.is_file() {
-                    return Err(metadata_error(
-                        session_id,
-                        "metadata path is not a regular file",
-                    ));
-                }
-                matches.push(path);
+        let entry = entry.map_err(|_| metadata_error(session_id, "session store is unreadable"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| metadata_error(session_id, "session metadata type is unreadable"))?;
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            if depth == MAX_SESSION_STORE_DEPTH {
+                return Err(metadata_error(
+                    session_id,
+                    "metadata discovery exceeded the traversal limit",
+                ));
+            }
+            collect_matching_metadata(
+                &path,
+                suffix,
+                session_id,
+                depth + 1,
+                remaining_entries,
+                matched_path,
+            )?;
+        } else if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(suffix))
+        {
+            if !file_type.is_file() {
+                return Err(metadata_error(
+                    session_id,
+                    "metadata path is not a regular file",
+                ));
+            }
+            if matched_path.replace(path).is_some() {
+                return Err(metadata_error(
+                    session_id,
+                    "metadata is ambiguous across local session stores",
+                ));
             }
         }
     }
@@ -221,12 +259,12 @@ mod tests {
     const OTHER_SESSION_ID: &str = "019f9f30-a553-7e21-b108-16a5c341f728";
 
     #[test]
-    fn finds_session_metadata_at_any_nested_depth() {
+    fn finds_session_metadata_at_the_maximum_discovery_depth() {
         let temp = TempDir::new().unwrap();
         let project_root = temp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
         let mut metadata_dir = temp.path().join("codex-home/sessions");
-        for depth in 0..10 {
+        for depth in 0..MAX_SESSION_STORE_DEPTH {
             metadata_dir = metadata_dir.join(format!("level-{depth}"));
         }
         write_metadata(&metadata_dir, SESSION_ID, SESSION_ID, &project_root);
@@ -236,6 +274,101 @@ mod tests {
                 .unwrap();
 
         assert_eq!(verified, SESSION_ID);
+    }
+
+    #[test]
+    fn rejects_metadata_discovery_beyond_the_depth_limit() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let mut metadata_dir = temp.path().join("codex-home/sessions");
+        for depth in 0..=MAX_SESSION_STORE_DEPTH {
+            metadata_dir = metadata_dir.join(format!("level-{depth}"));
+        }
+        write_metadata(&metadata_dir, SESSION_ID, SESSION_ID, &project_root);
+
+        let error =
+            verify_project_ownership(&temp.path().join("codex-home"), &project_root, SESSION_ID)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::CodexSessionMetadata {
+                session_id,
+                reason: "metadata discovery exceeded the traversal limit",
+            } if session_id == SESSION_ID
+        ));
+    }
+
+    #[test]
+    fn shares_metadata_discovery_entry_limit_across_session_stores() {
+        let temp = TempDir::new().unwrap();
+        for (store_name, entry_names) in [
+            ("sessions", &["one"][..]),
+            ("archived_sessions", &["two", "three"][..]),
+        ] {
+            let store = temp.path().join("codex-home").join(store_name);
+            fs::create_dir_all(&store).unwrap();
+            for name in entry_names {
+                fs::write(store.join(name), "not metadata").unwrap();
+            }
+        }
+
+        let error = locate_metadata_in_stores(
+            &temp.path().join("codex-home"),
+            SESSION_ID,
+            &SESSION_STORES,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::CodexSessionMetadata {
+                session_id,
+                reason: "metadata discovery exceeded the traversal limit",
+            } if session_id == SESSION_ID
+        ));
+    }
+
+    #[test]
+    fn stops_discovery_when_the_second_metadata_candidate_is_found() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        write_metadata(
+            &temp.path().join("codex-home/sessions"),
+            SESSION_ID,
+            SESSION_ID,
+            &project_root,
+        );
+        write_metadata(
+            &temp.path().join("codex-home/archived_sessions"),
+            SESSION_ID,
+            SESSION_ID,
+            &project_root,
+        );
+        fs::write(
+            temp.path().join("codex-home/must-not-be-read"),
+            "not a store",
+        )
+        .unwrap();
+
+        let error = locate_metadata_in_stores(
+            &temp.path().join("codex-home"),
+            SESSION_ID,
+            &["sessions", "archived_sessions", "must-not-be-read"],
+            MAX_SESSION_STORE_ENTRIES,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::CodexSessionMetadata {
+                session_id,
+                reason: "metadata is ambiguous across local session stores",
+            } if session_id == SESSION_ID
+        ));
     }
 
     #[test]
