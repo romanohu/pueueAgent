@@ -4,7 +4,9 @@ use serde_json::json;
 
 use crate::{
     db::{Db, EventRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository},
+    detect::Observation,
     events::{callback_dedup_key, result_is_failure},
+    incidents::IncidentStore,
     models::{EventKind, NewEvent, NewTaskObservation, Submission, SubmissionStatus},
     pueue::{PueueApi, PueueTask},
     AppError,
@@ -100,6 +102,11 @@ where
                     _ => unreachable!("terminal event kind is limited to task completion/failure"),
                 }
                 let _ = event;
+                let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(
+                    project.project_id.as_str(),
+                    &signature,
+                    now,
+                ))?;
             }
         }
 
