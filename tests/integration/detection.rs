@@ -8,12 +8,12 @@ use std::{
 use pueue_agent::{
     config::{CheckConfig, PatternAction, PatternConfig, StallConfig},
     db::{Db, EventRepository, ProjectRepository},
-    detect::{Detector, Observation},
+    detect::{Detector, Observation, ObservationState},
     incidents::IncidentStore,
     logs::LogSnapshot,
     models::{EventKind, IncidentStatus, IncidentTransition, NewProject},
     pueue::PueueTask,
-    reconcile::task_incident_key,
+    reconcile::{task_incident_key, task_signature},
 };
 use tempfile::TempDir;
 
@@ -50,7 +50,11 @@ impl Harness {
     }
 
     fn detector(&self) -> Detector {
-        Detector::new(&self.project_root, &self.task_log_dir)
+        Detector::for_project("project-a", &self.project_root, &self.task_log_dir)
+    }
+
+    fn persistent_detector(&self) -> Detector {
+        self.detector().with_incident_db(self.db.clone())
     }
 
     fn store(&self) -> IncidentStore<'_> {
@@ -122,6 +126,11 @@ fn terminal_task() -> PueueTask {
 
 fn task_log_path(log_dir: &Path, task_id: i64) -> PathBuf {
     log_dir.join(format!("{task_id}.log"))
+}
+
+fn snapshot_modified_seconds(path: &Path) -> i64 {
+    let snapshot = LogSnapshot::read_tail(path, 64).unwrap();
+    i64::try_from(snapshot.modified_at_nanos.unwrap() / 1_000_000_000).unwrap()
 }
 
 fn nan_observation(task: &PueueTask) -> Observation {
@@ -225,6 +234,190 @@ fn pattern_requires_configured_confirmation_count_and_bounded_evidence() {
     assert_eq!(observation.action(), PatternAction::Wake);
     assert_eq!(observation.confirmation_count(), Some(3));
     assert!(observation.evidence().len() <= usize::try_from(config.log_tail_bytes).unwrap());
+}
+
+#[test]
+fn unchanged_running_task_emits_notify_at_stall_threshold() {
+    let harness = Harness::new();
+    let task = task();
+    let log_path = task_log_path(&harness.task_log_dir, task.id);
+    fs::write(&log_path, "epoch 1\n").unwrap();
+    let modified_at = snapshot_modified_seconds(&log_path);
+    let config = check_config(64);
+
+    let before_threshold = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 5 * 60 - 1)
+        .unwrap();
+    let at_threshold = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 5 * 60)
+        .unwrap();
+
+    assert!(before_threshold.is_empty());
+    assert_eq!(at_threshold.len(), 1);
+    assert_eq!(at_threshold[0].kind(), "stalled");
+    assert_eq!(at_threshold[0].state(), &ObservationState::Active);
+    assert_eq!(at_threshold[0].action(), PatternAction::Notify);
+    assert_eq!(
+        at_threshold[0].task_signature(),
+        Some(task_signature(&task).as_str())
+    );
+    assert!(at_threshold[0].evidence().len() <= 64);
+}
+
+#[test]
+fn stalled_wake_policy_creates_one_durable_agent_event() {
+    let harness = Harness::new();
+    let task = task();
+    let log_path = task_log_path(&harness.task_log_dir, task.id);
+    fs::write(&log_path, "epoch 1\n").unwrap();
+    let modified_at = snapshot_modified_seconds(&log_path);
+    let mut config = check_config(64);
+    config.stall.action = PatternAction::Wake;
+
+    let observation = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 5 * 60)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    harness.store().observe(observation).unwrap();
+
+    let events = EventRepository::new(&harness.db)
+        .recent_events("project-a", 10)
+        .unwrap();
+    let stalled_events = events
+        .iter()
+        .filter(|event| event.kind == EventKind::Stalled)
+        .collect::<Vec<_>>();
+    assert_eq!(stalled_events.len(), 1);
+    assert_eq!(stalled_events[0].payload["action"], "wake");
+}
+
+#[test]
+fn default_stall_policy_never_creates_a_termination_request() {
+    let harness = Harness::new();
+    let task = task();
+    let log_path = task_log_path(&harness.task_log_dir, task.id);
+    fs::write(&log_path, "epoch 1\n").unwrap();
+    let modified_at = snapshot_modified_seconds(&log_path);
+    let config = check_config(64);
+
+    let observation = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 5 * 60)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    harness.store().observe(observation).unwrap();
+
+    let request_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM termination_requests", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(request_count, 0);
+}
+
+#[test]
+fn stalled_kill_policy_waits_for_additional_delay() {
+    let harness = Harness::new();
+    let task = task();
+    let log_path = task_log_path(&harness.task_log_dir, task.id);
+    fs::write(&log_path, "epoch 1\n").unwrap();
+    let modified_at = snapshot_modified_seconds(&log_path);
+    let mut config = check_config(64);
+    config.stall.action = PatternAction::Kill;
+    config.stall.kill_after_minutes = 3;
+
+    let at_stall_threshold = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 5 * 60)
+        .unwrap();
+    let before_kill_delay = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 8 * 60 - 1)
+        .unwrap();
+    let at_kill_delay = harness
+        .detector()
+        .inspect_task_at(&task, &config, modified_at + 8 * 60)
+        .unwrap();
+
+    assert!(at_stall_threshold.is_empty());
+    assert!(before_kill_delay.is_empty());
+    assert_eq!(at_kill_delay.len(), 1);
+    assert_eq!(at_kill_delay[0].kind(), "stalled");
+    assert_eq!(at_kill_delay[0].action(), PatternAction::Kill);
+    assert_eq!(
+        at_kill_delay[0].task_signature(),
+        Some(task_signature(&task).as_str())
+    );
+
+    harness
+        .store()
+        .observe(at_kill_delay.into_iter().next().unwrap())
+        .unwrap();
+    let request_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM termination_requests", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(request_count, 1);
+}
+
+#[test]
+fn changed_snapshot_emits_recovery_after_detector_restart() {
+    let harness = Harness::new();
+    let task = task();
+    let log_path = task_log_path(&harness.task_log_dir, task.id);
+    fs::write(&log_path, "epoch 1\n").unwrap();
+    let first_modified_at = snapshot_modified_seconds(&log_path);
+    let config = check_config(64);
+
+    let stalled = harness
+        .persistent_detector()
+        .inspect_task_at(&task, &config, first_modified_at + 5 * 60)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        harness.store().observe(stalled).unwrap(),
+        IncidentTransition::Opened
+    );
+
+    fs::write(&log_path, "epoch 1\nepoch 2\n").unwrap();
+    let changed_modified_at = snapshot_modified_seconds(&log_path);
+    let recovered = harness
+        .persistent_detector()
+        .inspect_task_at(&task, &config, changed_modified_at + 1)
+        .unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].kind(), "stalled");
+    assert_eq!(recovered[0].state(), &ObservationState::Recovered);
+    assert_eq!(
+        recovered[0].task_signature(),
+        Some(task_signature(&task).as_str())
+    );
+    assert_eq!(
+        harness
+            .store()
+            .observe(recovered.into_iter().next().unwrap())
+            .unwrap(),
+        IncidentTransition::Resolved
+    );
+    assert_eq!(harness.active_count(), 0);
+    assert_eq!(harness.resolved_count(), 1);
 }
 
 #[test]

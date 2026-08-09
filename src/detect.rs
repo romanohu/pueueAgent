@@ -5,9 +5,11 @@ use std::{
 };
 
 use regex_automata::meta::Regex;
+use rusqlite::{params, OptionalExtension};
 
 use crate::{
     config::{CheckConfig, PatternAction},
+    db::{database_error, Db},
     logs::LogSnapshot,
     pueue::PueueTask,
     reconcile::task_incident_key,
@@ -160,17 +162,34 @@ impl Observation {
         seen_at: i64,
     ) -> Self {
         let task_signature = task_signature.as_ref().to_owned();
+        Self::task_stalled(
+            project_id,
+            &task_signature,
+            task_signature.clone(),
+            snapshot,
+            action,
+            seen_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_stalled(
+        project_id: impl Into<String>,
+        task_key: impl Into<String>,
+        task_signature: impl Into<String>,
+        snapshot: LogSnapshot,
+        action: PatternAction,
+        seen_at: i64,
+    ) -> Self {
+        let task_key = task_key.into();
         Self {
             project_id: project_id.into(),
             kind: "stalled".to_owned(),
-            task_key: Some(task_signature.clone()),
-            fingerprint: format!(
-                "stalled:v1:task={task_signature}:snapshot={}",
-                snapshot.fingerprint
-            ),
+            task_key: Some(task_key.clone()),
+            fingerprint: stalled_observation_fingerprint(&task_key, &snapshot),
             seen_at,
             state: ObservationState::Active,
-            task_signature: Some(task_signature),
+            task_signature: Some(task_signature.into()),
             pattern_name: None,
             action,
             confirmation_count: None,
@@ -186,14 +205,30 @@ impl Observation {
         seen_at: i64,
     ) -> Self {
         let task_signature = task_signature.as_ref().to_owned();
+        Self::task_stalled_recovered(
+            project_id,
+            &task_signature,
+            task_signature.clone(),
+            snapshot,
+            seen_at,
+        )
+    }
+
+    pub fn task_stalled_recovered(
+        project_id: impl Into<String>,
+        task_key: impl Into<String>,
+        task_signature: impl Into<String>,
+        snapshot: LogSnapshot,
+        seen_at: i64,
+    ) -> Self {
         Self {
             project_id: project_id.into(),
             kind: "stalled".to_owned(),
-            task_key: Some(task_signature.clone()),
+            task_key: Some(task_key.into()),
             fingerprint: format!("stalled-recovered:v1:snapshot={}", snapshot.fingerprint),
             seen_at,
             state: ObservationState::Recovered,
-            task_signature: Some(task_signature),
+            task_signature: Some(task_signature.into()),
             pattern_name: None,
             action: PatternAction::Notify,
             confirmation_count: None,
@@ -285,11 +320,30 @@ fn extra_log_pattern_fingerprint(
     )
 }
 
+fn stall_progress_fingerprint(snapshot: &LogSnapshot) -> String {
+    format!(
+        "size={}:mtime={}",
+        snapshot.byte_size,
+        snapshot
+            .modified_at_nanos
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned())
+    )
+}
+
+fn stalled_observation_fingerprint(task_key: &str, snapshot: &LogSnapshot) -> String {
+    format!(
+        "stalled:v2:task={task_key}:snapshot={}",
+        stall_progress_fingerprint(snapshot)
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Detector {
     project_id: Option<String>,
     project_root: PathBuf,
     task_log_dir: PathBuf,
+    incident_db: Option<Db>,
 }
 
 impl Detector {
@@ -298,6 +352,7 @@ impl Detector {
             project_id: None,
             project_root: project_root.into(),
             task_log_dir: task_log_dir.into(),
+            incident_db: None,
         }
     }
 
@@ -310,7 +365,13 @@ impl Detector {
             project_id: Some(project_id.into()),
             project_root: project_root.into(),
             task_log_dir: task_log_dir.into(),
+            incident_db: None,
         }
+    }
+
+    pub fn with_incident_db(mut self, db: Db) -> Self {
+        self.incident_db = Some(db);
+        self
     }
 
     pub fn inspect_task(
@@ -318,11 +379,19 @@ impl Detector {
         task: &PueueTask,
         config: &CheckConfig,
     ) -> Result<Vec<Observation>, AppError> {
+        self.inspect_task_at(task, config, unix_timestamp()?)
+    }
+
+    pub fn inspect_task_at(
+        &self,
+        task: &PueueTask,
+        config: &CheckConfig,
+        seen_at: i64,
+    ) -> Result<Vec<Observation>, AppError> {
         let mut observations = Vec::new();
         let project_id = self.project_id.as_deref().unwrap_or(task.group.as_str());
         let task_key = task_incident_key(task);
         let signature = crate::reconcile::task_signature(task);
-        let seen_at = unix_timestamp()?;
         if let Some(snapshot) = self.read_task_snapshot(task.id, config.log_tail_bytes)? {
             observations.extend(task_pattern_observations(
                 project_id,
@@ -332,6 +401,24 @@ impl Detector {
                 config,
                 seen_at,
             )?);
+            let active_stall = self.active_stall_fingerprint(project_id, &task_key)?;
+            let current_stall_fingerprint = stalled_observation_fingerprint(&task_key, &snapshot);
+            if active_stall
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint != current_stall_fingerprint)
+            {
+                observations.push(Observation::task_stalled_recovered(
+                    project_id,
+                    &task_key,
+                    &signature,
+                    snapshot.clone(),
+                    seen_at,
+                ));
+            } else if let Some(stalled) = task_stall_observation(
+                project_id, &task_key, &signature, task, &snapshot, config, seen_at,
+            ) {
+                observations.push(stalled);
+            }
         }
 
         for relative_path in &config.extra_log_paths {
@@ -369,6 +456,28 @@ impl Detector {
         Ok(None)
     }
 
+    fn active_stall_fingerprint(
+        &self,
+        project_id: &str,
+        task_key: &str,
+    ) -> Result<Option<String>, AppError> {
+        let Some(db) = &self.incident_db else {
+            return Ok(None);
+        };
+        db.connect()?
+            .query_row(
+                "SELECT fingerprint FROM incidents
+                 WHERE project_id = ?1 AND kind = 'stalled' AND task_key = ?2
+                   AND status IN ('open', 'acknowledged')
+                 ORDER BY last_seen_at DESC, incident_id DESC
+                 LIMIT 1",
+                params![project_id, task_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("find active stalled incident"))
+    }
+
     fn canonical_extra_log_path(&self, relative_path: &Path) -> Result<PathBuf, AppError> {
         if relative_path.is_absolute() {
             return Err(AppError::Configuration {
@@ -390,6 +499,42 @@ impl Detector {
         }
         Ok(path)
     }
+}
+
+fn task_stall_observation(
+    project_id: &str,
+    task_key: &str,
+    task_signature: &str,
+    task: &PueueTask,
+    snapshot: &LogSnapshot,
+    config: &CheckConfig,
+    seen_at: i64,
+) -> Option<Observation> {
+    if !task.is_running() {
+        return None;
+    }
+    let modified_at = snapshot.modified_at_nanos? / 1_000_000_000;
+    let seen_at = u128::try_from(seen_at).ok()?;
+    let unchanged_seconds = seen_at.saturating_sub(modified_at);
+    let action_delay_minutes = if config.stall.action == PatternAction::Kill {
+        config.stall.kill_after_minutes
+    } else {
+        0
+    };
+    let observation_threshold_seconds =
+        (u128::from(config.stall_minutes) + u128::from(action_delay_minutes)) * 60;
+    if unchanged_seconds < observation_threshold_seconds {
+        return None;
+    }
+
+    Some(Observation::task_stalled(
+        project_id,
+        task_key,
+        task_signature,
+        snapshot.clone(),
+        config.stall.action,
+        i64::try_from(seen_at).ok()?,
+    ))
 }
 
 fn task_pattern_observations(
