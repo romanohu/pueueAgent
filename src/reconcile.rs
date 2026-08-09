@@ -9,7 +9,10 @@ use crate::{
     incidents::IncidentStore,
     models::{EventKind, NewEvent, NewTaskObservation, Submission, SubmissionStatus},
     pueue::{PueueApi, PueueTask},
-    termination::{auto_kill_request_for_terminal_task, confirm_auto_kill_terminal_observation},
+    termination::{
+        auto_kill_request_for_terminal_task, confirm_auto_kill_terminal_observation,
+        AutoKillConfirmation,
+    },
     AppError,
 };
 
@@ -90,10 +93,20 @@ where
             if task.is_terminal() {
                 let auto_kill_request =
                     auto_kill_request_for_terminal_task(self.db, &project.project_id, task)?;
-                let event_kind = if auto_kill_request.is_some() {
-                    EventKind::AutoKilled
-                } else {
-                    terminal_event_kind(task)
+                let auto_kill_confirmation = auto_kill_request
+                    .as_ref()
+                    .map(|request| {
+                        confirm_auto_kill_terminal_observation(
+                            self.db,
+                            request.request_id,
+                            now,
+                        )
+                    })
+                    .transpose()?;
+                let event_kind = match auto_kill_confirmation {
+                    Some(AutoKillConfirmation::Confirmed)
+                    | Some(AutoKillConfirmation::AlreadyConfirmed) => EventKind::AutoKilled,
+                    Some(AutoKillConfirmation::NotSent) | None => terminal_event_kind(task),
                 };
                 let event = materialize_terminal_event(
                     self.db,
@@ -110,9 +123,6 @@ where
                     _ => unreachable!(
                         "terminal event kind is limited to task completion/failure/auto-kill"
                     ),
-                }
-                if let Some(request) = auto_kill_request {
-                    confirm_auto_kill_terminal_observation(self.db, request.request_id, now)?;
                 }
                 let _ = event;
                 let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(

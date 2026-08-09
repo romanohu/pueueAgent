@@ -12,10 +12,14 @@ use pueue_agent::{
     models::{EventKind, EventStatus, NewProject, TerminationRequestStatus},
     pueue::{PueueApi, PueueTask},
     reconcile::{task_incident_key, task_signature, Reconciler},
-    termination::{TerminationManager, TerminationOutcome, TerminationPolicy},
+    termination::{
+        confirm_auto_kill_terminal_observation, TerminationManager, TerminationOutcome,
+        TerminationPolicy,
+    },
     AppError,
 };
 use tempfile::TempDir;
+use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 struct FakePueue {
@@ -23,6 +27,9 @@ struct FakePueue {
     kill_calls: Arc<Mutex<Vec<i64>>>,
     kill_error: Arc<Mutex<Option<String>>>,
     mark_killed_on_kill: Arc<Mutex<bool>>,
+    block_kill: Arc<Mutex<bool>>,
+    kill_started: Arc<Semaphore>,
+    release_kill: Arc<Semaphore>,
 }
 
 impl FakePueue {
@@ -32,6 +39,9 @@ impl FakePueue {
             kill_calls: Arc::new(Mutex::new(Vec::new())),
             kill_error: Arc::new(Mutex::new(None)),
             mark_killed_on_kill: Arc::new(Mutex::new(true)),
+            block_kill: Arc::new(Mutex::new(false)),
+            kill_started: Arc::new(Semaphore::new(0)),
+            release_kill: Arc::new(Semaphore::new(0)),
         }
     }
 
@@ -49,6 +59,19 @@ impl FakePueue {
 
     fn keep_running_after_kill(&self) {
         *self.mark_killed_on_kill.lock().unwrap() = false;
+    }
+
+    fn block_next_kill(&self) {
+        *self.block_kill.lock().unwrap() = true;
+    }
+
+    async fn wait_until_kill_started(&self) {
+        let permit = self.kill_started.acquire().await.unwrap();
+        permit.forget();
+    }
+
+    fn release_blocked_kill(&self) {
+        self.release_kill.add_permits(1);
     }
 
     fn kill_calls(&self) -> Vec<i64> {
@@ -74,6 +97,11 @@ impl PueueApi for FakePueue {
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
         self.kill_calls.lock().unwrap().push(task_id);
+        if *self.block_kill.lock().unwrap() {
+            self.kill_started.add_permits(1);
+            let permit = self.release_kill.acquire().await.unwrap();
+            permit.forget();
+        }
         if self.kill_error.lock().unwrap().is_some() {
             return Err(AppError::Runtime {
                 operation: "fake Pueue kill",
@@ -252,6 +280,31 @@ impl Harness {
             .unwrap();
         request_id
     }
+
+    fn set_request_grace_until(&self, request_id: i64, grace_until: i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE termination_requests
+                 SET grace_until = ?1
+                 WHERE request_id = ?2",
+                rusqlite::params![grace_until, request_id],
+            )
+            .unwrap();
+    }
+
+    fn set_request_result(
+        &self,
+        request_id: i64,
+        status: TerminationRequestStatus,
+        confirmed_at: Option<i64>,
+        last_error: Option<&str>,
+    ) {
+        TerminationRequestRepository::new(&self.db)
+            .update_result(request_id, status, confirmed_at, last_error)
+            .unwrap();
+    }
 }
 
 #[test]
@@ -296,6 +349,7 @@ async fn explicit_kill_policy_kills_only_the_matching_running_task_once() {
     assert!(second_outcomes.is_empty());
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 1);
+    assert_eq!(harness.pending_event_count(EventKind::TaskFailed), 0);
 }
 
 #[tokio::test]
@@ -388,6 +442,27 @@ async fn sent_request_past_grace_until_times_out_without_second_kill() {
     assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
 }
 
+#[test]
+fn terminal_confirmation_does_not_overwrite_concurrent_timeout() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    let request_id = harness.make_pending_request_sent(None);
+    harness.set_request_result(
+        request_id,
+        TerminationRequestStatus::TimedOut,
+        None,
+        Some("Pueue kill was not confirmed before grace timeout"),
+    );
+
+    confirm_auto_kill_terminal_observation(&harness.db, request_id, 300).unwrap();
+
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::TimedOut)
+    );
+    assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
+}
+
 #[tokio::test]
 async fn terminal_fallback_does_not_match_reused_id_without_lifecycle_timestamps() {
     let harness = Harness::running_task_without_lifecycle_timestamps("project-a", 41);
@@ -440,6 +515,84 @@ async fn failed_pueue_kill_stays_visible_without_auto_killed_event() {
     assert_eq!(outcomes, vec![TerminationOutcome::Failed]);
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(harness.request_status(), Some(TerminationRequestStatus::Failed));
+    assert_eq!(harness.pending_event_count(EventKind::TerminationFailed), 1);
+    assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
+}
+
+#[tokio::test]
+async fn kill_error_does_not_overwrite_concurrent_auto_kill_confirmation() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    harness.fake_pueue.block_next_kill();
+    let request_id = harness.pending_request_ids()[0];
+    let db = harness.db.clone();
+    let fake_pueue = harness.fake_pueue.clone();
+    let execute = tokio::spawn(async move {
+        TerminationManager::new(&db, fake_pueue)
+            .execute(request_id)
+            .await
+            .unwrap()
+    });
+    harness.fake_pueue.wait_until_kill_started().await;
+
+    let terminal_task = PueueTask {
+        state: "Killed".to_owned(),
+        ended_at: Some("201".to_owned()),
+        ..harness.task.clone()
+    };
+    harness.fake_pueue.set_tasks(vec![terminal_task]);
+    Reconciler::new(&harness.db, harness.fake_pueue.clone())
+        .run_once()
+        .await
+        .unwrap();
+    harness.fake_pueue.set_kill_error("late kill failure");
+    harness.fake_pueue.release_blocked_kill();
+
+    let outcome = execute.await.unwrap();
+
+    assert_eq!(outcome, TerminationOutcome::Confirmed);
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Confirmed)
+    );
+    assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 1);
+    assert_eq!(harness.pending_event_count(EventKind::TerminationFailed), 0);
+}
+
+#[tokio::test]
+async fn kill_error_does_not_overwrite_concurrent_timeout() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    harness.fake_pueue.block_next_kill();
+    let request_id = harness.pending_request_ids()[0];
+    let db = harness.db.clone();
+    let fake_pueue = harness.fake_pueue.clone();
+    let execute = tokio::spawn(async move {
+        TerminationManager::new(&db, fake_pueue)
+            .execute(request_id)
+            .await
+            .unwrap()
+    });
+    harness.fake_pueue.wait_until_kill_started().await;
+
+    harness.set_request_grace_until(request_id, 0);
+    let timeout_outcome = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+    harness.fake_pueue.set_kill_error("late kill failure");
+    harness.fake_pueue.release_blocked_kill();
+
+    let late_kill_outcome = execute.await.unwrap();
+
+    assert_eq!(timeout_outcome, TerminationOutcome::TimedOut);
+    assert_eq!(late_kill_outcome, TerminationOutcome::TimedOut);
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::TimedOut)
+    );
     assert_eq!(harness.pending_event_count(EventKind::TerminationFailed), 1);
     assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
 }

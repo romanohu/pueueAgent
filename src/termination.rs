@@ -31,6 +31,13 @@ pub enum TerminationOutcome {
     AlreadyTerminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoKillConfirmation {
+    Confirmed,
+    AlreadyConfirmed,
+    NotSent,
+}
+
 pub struct TerminationManager<'db, P = NoPueue> {
     db: &'db Db,
     pueue: P,
@@ -127,25 +134,23 @@ where
             .cloned();
         let Some(task) = matching else {
             let now = unix_timestamp()?;
-            repository.update_result_if_current(
+            return confirm_requested_already_terminal(
+                self.db,
+                &repository,
                 request.request_id,
-                TerminationRequestStatus::Requested,
-                TerminationRequestStatus::Confirmed,
-                Some(now),
-                Some("task signature is no longer active"),
-            )?;
-            return Ok(TerminationOutcome::AlreadyTerminal);
+                now,
+                "task signature is no longer active",
+            );
         };
         if !task.is_running() {
             let now = unix_timestamp()?;
-            repository.update_result_if_current(
+            return confirm_requested_already_terminal(
+                self.db,
+                &repository,
                 request.request_id,
-                TerminationRequestStatus::Requested,
-                TerminationRequestStatus::Confirmed,
-                Some(now),
-                Some("task is already terminal or non-running"),
-            )?;
-            return Ok(TerminationOutcome::AlreadyTerminal);
+                now,
+                "task is already terminal or non-running",
+            );
         }
 
         let Some(claimed_request) = repository.transition_status_if_current(
@@ -167,18 +172,60 @@ where
             Ok(()) => Ok(TerminationOutcome::Confirmed),
             Err(error) => {
                 let message = error.to_string();
-                let now = unix_timestamp()?;
-                repository.update_result(
+                if let Some(failed_request) = repository.update_result_if_current(
                     claimed_request.request_id,
+                    TerminationRequestStatus::Sent,
                     TerminationRequestStatus::Failed,
                     None,
                     Some(&message),
-                )?;
-                insert_termination_failed_event(self.db, &claimed_request, &task, &message, now)?;
-                Ok(TerminationOutcome::Failed)
+                )? {
+                    let now = unix_timestamp()?;
+                    insert_termination_failed_event(
+                        self.db,
+                        &failed_request,
+                        &task,
+                        &message,
+                        now,
+                    )?;
+                    return Ok(TerminationOutcome::Failed);
+                }
+                let current =
+                    repository
+                        .find_by_id(claimed_request.request_id)?
+                        .ok_or(AppError::Runtime {
+                            operation: "reload concurrently completed termination request",
+                        })?;
+                outcome_for_non_requested(self.db, &repository, &current)
             }
         }
     }
+}
+
+fn confirm_requested_already_terminal(
+    db: &Db,
+    repository: &TerminationRequestRepository<'_>,
+    request_id: i64,
+    confirmed_at: i64,
+    message: &str,
+) -> Result<TerminationOutcome, AppError> {
+    if repository
+        .update_result_if_current(
+            request_id,
+            TerminationRequestStatus::Requested,
+            TerminationRequestStatus::Confirmed,
+            Some(confirmed_at),
+            Some(message),
+        )?
+        .is_some()
+    {
+        return Ok(TerminationOutcome::AlreadyTerminal);
+    }
+    let current = repository
+        .find_by_id(request_id)?
+        .ok_or(AppError::Runtime {
+            operation: "reload concurrently completed termination request",
+        })?;
+    outcome_for_non_requested(db, repository, &current)
 }
 
 fn outcome_for_non_requested(
@@ -227,7 +274,9 @@ pub fn auto_kill_request_for_terminal_task(
 ) -> Result<Option<crate::models::TerminationRequest>, AppError> {
     let requests = TerminationRequestRepository::new(db).find_by_project(project_id)?;
     Ok(requests.into_iter().find(|request| {
-        request.status == TerminationRequestStatus::Sent
+        (request.status == TerminationRequestStatus::Sent
+            || (request.status == TerminationRequestStatus::Confirmed
+                && request.last_error.is_none()))
             && request_matches_terminal_task(request, task)
     }))
 }
@@ -236,22 +285,31 @@ pub fn confirm_auto_kill_terminal_observation(
     db: &Db,
     request_id: TerminationRequestId,
     confirmed_at: i64,
-) -> Result<(), AppError> {
+) -> Result<AutoKillConfirmation, AppError> {
     let repository = TerminationRequestRepository::new(db);
+    if repository
+        .update_result_if_current(
+            request_id,
+            TerminationRequestStatus::Sent,
+            TerminationRequestStatus::Confirmed,
+            Some(confirmed_at),
+            None,
+        )?
+        .is_some()
+    {
+        return Ok(AutoKillConfirmation::Confirmed);
+    }
+
     let request = repository
         .find_by_id(request_id)?
         .ok_or(AppError::Runtime {
             operation: "confirm missing termination request",
         })?;
-    if request.status != TerminationRequestStatus::Confirmed {
-        repository.update_result(
-            request.request_id,
-            TerminationRequestStatus::Confirmed,
-            Some(confirmed_at),
-            None,
-        )?;
+    if request.status == TerminationRequestStatus::Confirmed {
+        Ok(AutoKillConfirmation::AlreadyConfirmed)
+    } else {
+        Ok(AutoKillConfirmation::NotSent)
     }
-    Ok(())
 }
 
 fn request_matches_terminal_task(

@@ -197,3 +197,79 @@ The `tokio::process::Command` match is the existing Pueue adapter boundary. No r
 
 - The new tests, formatting, and clippy need to be run in an environment with the Rust toolchain.
 - `TerminationOutcome::Confirmed` still represents "kill accepted or sent request still awaiting reconciliation" in `execute`; durable `auto_killed` confirmation remains reconciliation-owned.
+
+## Fix round 2: sent-only result transitions
+
+### Summary
+
+Addressed the scoped re-review race around confirmation/failure result updates:
+
+- Changed terminal auto-kill confirmation to use `sent -> confirmed` compare-and-set.
+- Changed reconciliation to confirm the request before materializing `auto_killed`; if timeout/failure wins the CAS race, reconciliation falls back to the normal terminal event instead of emitting `auto_killed`.
+- Preserved idempotency for already-confirmed auto-kill reconciliation by treating matching `confirmed` requests with no `last_error` as prior successful auto-kill confirmations.
+- Changed the kill-error path to use `sent -> failed` compare-and-set after the external `pueue kill` await. If a concurrent timeout or confirmation wins while kill is awaiting, the late kill error no longer overwrites that state and no inconsistent `termination_failed` event is inserted.
+- Kept timeout handling on guarded `sent -> timed_out`.
+- Kept `pueue kill` outside SQLite transactions, and did not add raw signals, shell execution, process-group termination, or agent starts.
+
+### Changed files
+
+- `src/termination.rs`
+  - Added `AutoKillConfirmation` to distinguish fresh confirmation, already-confirmed idempotency, and stale non-sent requests.
+  - Guarded auto-kill confirmation with `update_result_if_current(sent, confirmed, ...)`.
+  - Guarded late kill failure with `update_result_if_current(sent, failed, ...)`.
+  - Reloaded the current request state when guarded transitions lose a race.
+  - Included only `sent` or prior successful `confirmed` matching requests in terminal auto-kill reconciliation candidates.
+- `src/reconcile.rs`
+  - Reordered terminal handling so auto-kill confirmation happens before `auto_killed` event materialization.
+  - Emits `auto_killed` only when confirmation wins or is already confirmed idempotently; emits normal terminal events when a stale sent request lost to timeout/failure.
+- `tests/integration/termination.rs`
+  - Added a regression that `confirm_auto_kill_terminal_observation` does not overwrite a concurrently timed-out request.
+  - Added a deterministic async race where `execute` is blocked in external kill, reconciliation confirms the sent request, and a late kill error cannot overwrite confirmation or create `termination_failed`.
+  - Added a deterministic async race where `execute` is blocked in external kill, timeout wins the sent request, and a late kill error cannot overwrite `timed_out` or create an extra failure transition.
+  - Extended the existing duplicate-cycle regression to assert a confirmed auto-kill does not later create a generic `task_failed` event.
+
+### Tests and command results
+
+The Rust toolchain is still not available in this execution environment (`cargo`, `rustfmt`, and `rustup` are not installed or not on PATH), so Rust tests, formatting, and clippy could not be executed here.
+
+Attempted:
+
+```text
+cargo test --test termination
+zsh:1: command not found: cargo
+
+cargo test --offline --test termination
+zsh:1: command not found: cargo
+
+cargo test --offline --all-targets
+zsh:1: command not found: cargo
+
+cargo test --all-targets
+zsh:1: command not found: cargo
+
+cargo fmt --check
+zsh:1: command not found: cargo
+
+cargo clippy --offline --all-targets --all-features -- -D warnings
+zsh:1: command not found: cargo
+
+rustfmt --check src/termination.rs src/reconcile.rs tests/integration/termination.rs
+zsh:1: command not found: rustfmt
+```
+
+Static checks that did run:
+
+```text
+git diff --check
+exit 0
+
+rg -n "std::process::Command|tokio::process::Command|libc::kill|nix::sys::signal|killpg|process_group|sh -c|bash -c|zsh -c|AgentRunRepository|start_agent|spawn_agent" src/termination.rs src/incidents.rs src/reconcile.rs src/pueue.rs tests/integration/termination.rs
+src/pueue.rs:7:use tokio::process::Command;
+```
+
+The `tokio::process::Command` match is the existing Pueue adapter boundary. No raw OS signal, process-group kill, shell execution, or agent-start path was added.
+
+### Remaining risks
+
+- The new concurrency regressions and formatting need to be run in an environment with the Rust toolchain before merging.
+- The fix relies on `last_error IS NULL` to distinguish prior successful auto-kill confirmation from requested-stage already-terminal confirmation; current requested-stage confirmations write a non-null explanatory `last_error`.
