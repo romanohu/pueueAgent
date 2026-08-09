@@ -16,6 +16,7 @@ pub mod pueue;
 pub mod reconcile;
 pub mod scheduler;
 pub mod service;
+pub mod status;
 pub mod submit;
 pub mod termination;
 

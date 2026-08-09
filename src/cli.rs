@@ -13,7 +13,7 @@ pub struct Cli {
 pub enum Command {
     Init(InitArgs),
     Enable(ProjectArgs),
-    Disable(ProjectArgs),
+    Disable(DisableArgs),
     Submit(SubmitArgs),
     Event(EventArgs),
     Status(ProjectArgs),
@@ -30,6 +30,16 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct ProjectArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct DisableArgs {
+    #[arg(long)]
+    pub remove: bool,
     #[arg(long, value_name = "PUEUE_CONFIG")]
     pub pueue_config: Option<PathBuf>,
     #[arg(value_name = "PROJECT_ROOT")]

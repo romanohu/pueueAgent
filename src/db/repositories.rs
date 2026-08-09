@@ -142,15 +142,37 @@ impl<'db> ProjectRepository<'db> {
         Ok(projects)
     }
 
-    pub fn pause(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+    pub fn list_active(&self) -> Result<Vec<Project>, AppError> {
         let connection = self.db.connect()?;
-        connection
+        let mut statement = connection
+            .prepare(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects
+                 WHERE enabled = 1 AND paused = 0 AND halted_reason IS NULL
+                 ORDER BY project_id",
+            )
+            .map_err(database_error("prepare active project query"))?;
+        let projects = statement
+            .query_map([], project_from_row)
+            .map_err(database_error("list active projects"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read active projects"))?;
+        Ok(projects)
+    }
+
+    pub fn pause(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin project pause"))?;
+        transaction
             .execute(
                 "UPDATE projects SET paused = 1, updated_at = ?1 WHERE project_id = ?2",
                 params![now, project_id],
             )
             .map_err(database_error("pause project"))?;
-        connection
+        let project = transaction
             .query_row(
                 "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
                         halted_reason, created_at, updated_at
@@ -158,12 +180,47 @@ impl<'db> ProjectRepository<'db> {
                 [project_id],
                 project_from_row,
             )
-            .map_err(database_error("read paused project"))
+            .map_err(database_error("read paused project"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit project pause"))?;
+        Ok(project)
+    }
+
+    pub fn resume(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin project resume"))?;
+        transaction
+            .execute(
+                "UPDATE projects
+                 SET paused = 0, halted_reason = NULL, updated_at = ?1
+                 WHERE project_id = ?2",
+                params![now, project_id],
+            )
+            .map_err(database_error("resume project"))?;
+        let project = transaction
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE project_id = ?1",
+                [project_id],
+                project_from_row,
+            )
+            .map_err(database_error("read resumed project"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit project resume"))?;
+        Ok(project)
     }
 
     pub fn halt(&self, project_id: &str, reason: &str, now: i64) -> Result<Project, AppError> {
-        let connection = self.db.connect()?;
-        connection
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin project halt"))?;
+        transaction
             .execute(
                 "UPDATE projects
                  SET paused = 1, halted_reason = ?1, updated_at = ?2
@@ -171,7 +228,7 @@ impl<'db> ProjectRepository<'db> {
                 params![reason, now, project_id],
             )
             .map_err(database_error("halt project"))?;
-        connection
+        let project = transaction
             .query_row(
                 "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
                         halted_reason, created_at, updated_at
@@ -179,7 +236,62 @@ impl<'db> ProjectRepository<'db> {
                 [project_id],
                 project_from_row,
             )
-            .map_err(database_error("read halted project"))
+            .map_err(database_error("read halted project"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit project halt"))?;
+        Ok(project)
+    }
+
+    pub fn disable(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin project disable"))?;
+        transaction
+            .execute(
+                "UPDATE projects
+                 SET enabled = 0, paused = 1, updated_at = ?1
+                 WHERE project_id = ?2",
+                params![now, project_id],
+            )
+            .map_err(database_error("disable project"))?;
+        let project = transaction
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE project_id = ?1",
+                [project_id],
+                project_from_row,
+            )
+            .map_err(database_error("read disabled project"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit project disable"))?;
+        Ok(project)
+    }
+
+    pub fn remove(&self, project_id: &str) -> Result<Project, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin project removal"))?;
+        let project = transaction
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE project_id = ?1",
+                [project_id],
+                project_from_row,
+            )
+            .map_err(database_error("read project before removal"))?;
+        transaction
+            .execute("DELETE FROM projects WHERE project_id = ?1", [project_id])
+            .map_err(database_error("remove project"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit project removal"))?;
+        Ok(project)
     }
 
     pub fn find_by_root(&self, root: &std::path::Path) -> Result<Option<Project>, AppError> {

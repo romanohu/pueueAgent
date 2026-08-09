@@ -152,7 +152,7 @@ where
 
     async fn run_termination(&self) -> Result<Vec<TerminationOutcome>, AppError> {
         let mut outcomes = Vec::new();
-        for project in ProjectRepository::new(&self.db).list_enabled()? {
+        for project in ProjectRepository::new(&self.db).list_active()? {
             for request in
                 TerminationRequestRepository::new(&self.db).find_pending(&project.project_id)?
             {

@@ -43,6 +43,10 @@ path = "tests/integration/daemon.rs"
 name = "service"
 path = "tests/integration/service.rs"
 
+[[test]]
+name = "operator_commands"
+path = "tests/integration/operator_commands.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
