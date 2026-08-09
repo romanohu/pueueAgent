@@ -75,3 +75,22 @@ Base: `6ca1e2b`
 
 - Commits: `5c156d8 feat: add policy-controlled Pueue task termination`, `540923b fix: harden termination request lifecycle`, `57acff0 fix: close termination result races`, `80461c6 style: format task 7 termination changes`
 - Review clean after three fix rounds. Explicit kill policy, pre-kill full-signature revalidation, single-kill CAS, timeout visibility, terminal confirmation, and Pueue-only task control are implemented.
+
+## Task 8 — fix round 1/5
+
+- Reviewer findings: timeout cleanup did not cover the agent process tree; invalid resume config could strand a claimed event; migrated databases did not recreate the active-agent unique index.
+- Fix commit: `6954d5d fix: harden task 8 scheduler agent lifecycle`
+- Re-review: two findings addressed; a multi-project claim-batch error path remained open.
+- Verification: scheduler 11, config 26, database 18, full offline Rust 98, Clippy, fmt, and diff check passed.
+
+## Task 8 — fix round 2/5
+
+- Finding: one project config error returned before later claimed project groups were resolved.
+- Fix commit: `f32f1ed fix: resolve claimed scheduler groups after batch errors`
+- Re-review: Pass; all claimed groups resolve before return, valid later groups schedule, and invalid groups clear leases with preserved errors.
+- Verification: scheduler 12, full offline Rust 99, Clippy, fmt, and diff check passed.
+
+## Task 8 — complete
+
+- Commits: `589ad35 feat: add leased agent scheduler and guardrails`, `6954d5d fix: harden task 8 scheduler agent lifecycle`, `f32f1ed fix: resolve claimed scheduler groups after batch errors`
+- Review clean after two fix rounds. Guardrails, leased scheduler, agent lifecycle, explicit Codex fresh/resume/resume_latest launch, bounded context prompts, SQLite context lineage, and migration invariants are implemented.
