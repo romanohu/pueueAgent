@@ -48,3 +48,47 @@ fn events_rejects_limits_outside_the_diagnostic_bound() {
     assert!(String::from_utf8_lossy(&too_large.stderr)
         .contains("diagnostic event limit must be between 1 and 1000"));
 }
+
+#[test]
+fn steer_help_describes_enqueue_and_bounded_list_options() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("steer"));
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["steer", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("list"));
+    assert!(text.contains("MESSAGE"));
+    assert!(text.contains("--json"));
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["steer", "list", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--json"));
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .arg("steer")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("required arguments were not provided")
+    );
+}

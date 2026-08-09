@@ -25,6 +25,7 @@ pub enum Command {
     Doctor(DoctorArgs),
     Pause(ProjectArgs),
     Resume(ProjectArgs),
+    Steer(SteerArgs),
     Daemon(DaemonArgs),
 }
 
@@ -122,6 +123,34 @@ pub struct SubmitArgs {
     )]
     pub command: Vec<OsString>,
 }
+
+#[derive(Debug, Args)]
+#[command(subcommand_negates_reqs = true)]
+pub struct SteerArgs {
+    #[command(subcommand)]
+    pub action: Option<SteerAction>,
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "MESSAGE"
+    )]
+    pub message: Vec<String>,
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long, value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SteerAction {
+    List(SteerListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SteerListArgs {}
 
 #[derive(Debug, Args)]
 pub struct EventArgs {

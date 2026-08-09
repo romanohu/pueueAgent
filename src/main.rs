@@ -44,6 +44,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Doctor(args) => commands::doctor(args),
         Command::Pause(args) => commands::pause(args),
         Command::Resume(args) => commands::resume(args),
+        Command::Steer(args) => commands::steer(args),
         Command::Daemon(args) => commands::daemon(args).await,
     }
 }
@@ -55,12 +56,13 @@ mod commands {
         agent::{AgentRunner, AgentRunnerConfig},
         cli::{
             DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, StatusArgs, SubmitArgs,
+            InspectArgs, ProjectArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
-        db::{Db, ProjectRepository},
+        db::{Db, InterventionRepository, ProjectRepository},
         diagnostics::{render_project_status_json, EventFilter, MAX_EVENT_LIST_LIMIT},
         events::{record_callback, CallbackMetadata},
+        interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
         paths, project,
         pueue::{CommandPueue, PueueApi},
@@ -253,6 +255,82 @@ mod commands {
         let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
         let project = status_command::resume_project(&db, &project.project_id, unix_timestamp()?)?;
         println!("resumed: {}", project.project_id);
+        Ok(())
+    }
+
+    pub fn steer(args: SteerArgs) -> Result<(), AppError> {
+        let SteerArgs {
+            action,
+            message,
+            json,
+            pueue_config,
+            project_root,
+        } = args;
+        let (db, project, _) = resolve_project(project_root, pueue_config)?;
+
+        match action {
+            Some(SteerAction::List(_)) => {
+                let interventions = InterventionRepository::new(&db).list(
+                    &project.project_id,
+                    InterventionStatus::Pending,
+                    MAX_INTERVENTIONS_PER_RUN,
+                )?;
+                if json {
+                    let interventions = interventions
+                        .into_iter()
+                        .map(|intervention| {
+                            serde_json::json!({
+                                "intervention_id": intervention.intervention_id,
+                                "status": intervention.status.as_str(),
+                                "created_at": intervention.created_at,
+                                "message": intervention.message,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "project_id": project.project_id,
+                            "interventions": interventions,
+                        })
+                    );
+                } else {
+                    for intervention in interventions {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            intervention.intervention_id,
+                            intervention.status,
+                            intervention.created_at,
+                            intervention.message
+                        );
+                    }
+                }
+            }
+            None => {
+                let message = message.join(" ");
+                validate_message(&message)?;
+                let intervention = InterventionRepository::new(&db).insert_pending(
+                    &project.project_id,
+                    &message,
+                    unix_timestamp()?,
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "intervention_id": intervention.intervention_id,
+                            "project_id": intervention.project_id,
+                            "status": intervention.status.as_str(),
+                        })
+                    );
+                } else {
+                    println!("queued intervention: {}", intervention.intervention_id);
+                }
+            }
+        }
+
         Ok(())
     }
 
