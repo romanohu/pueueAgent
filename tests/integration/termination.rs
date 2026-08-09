@@ -362,6 +362,7 @@ async fn duplicate_execute_on_sent_request_does_not_kill_again() {
     harness.fake_pueue.keep_running_after_kill();
     harness.observe_fatal_pattern("cuda-oom");
     let request_id = harness.pending_request_ids()[0];
+    harness.set_request_grace_until(request_id, i64::MAX);
 
     let first = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
         .execute(request_id)
@@ -379,6 +380,44 @@ async fn duplicate_execute_on_sent_request_does_not_kill_again() {
         harness.request_status(),
         Some(TerminationRequestStatus::Sent)
     );
+}
+
+#[tokio::test]
+async fn explicit_kill_times_out_after_default_confirmation_grace_without_second_kill() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.fake_pueue.keep_running_after_kill();
+    harness.observe_fatal_pattern("cuda-oom");
+    let request_id = harness.pending_request_ids()[0];
+    let request = TerminationRequestRepository::new(&harness.db)
+        .find_by_id(request_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(request.requested_at, 200);
+    assert_eq!(request.grace_until, Some(320));
+
+    let first_outcomes = harness.run_termination_cycle().await;
+
+    assert_eq!(first_outcomes, vec![TerminationOutcome::Confirmed]);
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Sent)
+    );
+
+    harness.set_request_grace_until(request_id, 0);
+    let timed_out_outcomes = harness.run_termination_cycle().await;
+    let final_outcomes = harness.run_termination_cycle().await;
+
+    assert_eq!(timed_out_outcomes, vec![TerminationOutcome::TimedOut]);
+    assert!(final_outcomes.is_empty());
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::TimedOut)
+    );
+    assert_eq!(harness.pending_event_count(EventKind::TerminationFailed), 1);
+    assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
 }
 
 #[tokio::test]

@@ -14,6 +14,8 @@ use crate::{
 
 pub type TerminationRequestId = i64;
 
+pub(crate) const DEFAULT_CONFIRMATION_GRACE_SECONDS: i64 = 120;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TerminationPolicy;
 
