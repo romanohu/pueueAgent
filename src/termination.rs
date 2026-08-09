@@ -106,7 +106,10 @@ where
             TerminationRequestStatus::Confirmed => return Ok(TerminationOutcome::Confirmed),
             TerminationRequestStatus::TimedOut => return Ok(TerminationOutcome::TimedOut),
             TerminationRequestStatus::Failed => return Ok(TerminationOutcome::Failed),
-            TerminationRequestStatus::Requested | TerminationRequestStatus::Sent => {}
+            TerminationRequestStatus::Sent => {
+                return finish_sent_request(self.db, &repository, &request);
+            }
+            TerminationRequestStatus::Requested => {}
         }
 
         let project = ProjectRepository::new(self.db)
@@ -123,25 +126,42 @@ where
             })
             .cloned();
         let Some(task) = matching else {
-            repository.update_result(
+            let now = unix_timestamp()?;
+            repository.update_result_if_current(
                 request.request_id,
+                TerminationRequestStatus::Requested,
                 TerminationRequestStatus::Confirmed,
-                Some(unix_timestamp()?),
+                Some(now),
                 Some("task signature is no longer active"),
             )?;
             return Ok(TerminationOutcome::AlreadyTerminal);
         };
         if !task.is_running() {
-            repository.update_result(
+            let now = unix_timestamp()?;
+            repository.update_result_if_current(
                 request.request_id,
+                TerminationRequestStatus::Requested,
                 TerminationRequestStatus::Confirmed,
-                Some(unix_timestamp()?),
+                Some(now),
                 Some("task is already terminal or non-running"),
             )?;
             return Ok(TerminationOutcome::AlreadyTerminal);
         }
 
-        repository.transition_status(request.request_id, TerminationRequestStatus::Sent)?;
+        let Some(claimed_request) = repository.transition_status_if_current(
+            request.request_id,
+            TerminationRequestStatus::Requested,
+            TerminationRequestStatus::Sent,
+        )?
+        else {
+            let current = repository
+                .find_by_id(request.request_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "reload concurrently claimed termination request",
+                })?;
+            return outcome_for_non_requested(self.db, &repository, &current);
+        };
+
         let kill_result = self.pueue.kill(task.id).await;
         match kill_result {
             Ok(()) => Ok(TerminationOutcome::Confirmed),
@@ -149,16 +169,55 @@ where
                 let message = error.to_string();
                 let now = unix_timestamp()?;
                 repository.update_result(
-                    request.request_id,
+                    claimed_request.request_id,
                     TerminationRequestStatus::Failed,
                     None,
                     Some(&message),
                 )?;
-                insert_termination_failed_event(self.db, &request, &task, &message, now)?;
+                insert_termination_failed_event(self.db, &claimed_request, &task, &message, now)?;
                 Ok(TerminationOutcome::Failed)
             }
         }
     }
+}
+
+fn outcome_for_non_requested(
+    db: &Db,
+    repository: &TerminationRequestRepository<'_>,
+    request: &crate::models::TerminationRequest,
+) -> Result<TerminationOutcome, AppError> {
+    match request.status {
+        TerminationRequestStatus::Confirmed => Ok(TerminationOutcome::Confirmed),
+        TerminationRequestStatus::TimedOut => Ok(TerminationOutcome::TimedOut),
+        TerminationRequestStatus::Failed => Ok(TerminationOutcome::Failed),
+        TerminationRequestStatus::Sent => finish_sent_request(db, repository, request),
+        TerminationRequestStatus::Requested => Ok(TerminationOutcome::AlreadyTerminal),
+    }
+}
+
+fn finish_sent_request(
+    db: &Db,
+    repository: &TerminationRequestRepository<'_>,
+    request: &crate::models::TerminationRequest,
+) -> Result<TerminationOutcome, AppError> {
+    let now = unix_timestamp()?;
+    if request
+        .grace_until
+        .is_some_and(|grace_until| grace_until <= now)
+    {
+        let message = "Pueue kill was not confirmed before grace timeout";
+        if let Some(timed_out) = repository.update_result_if_current(
+            request.request_id,
+            TerminationRequestStatus::Sent,
+            TerminationRequestStatus::TimedOut,
+            None,
+            Some(message),
+        )? {
+            insert_termination_failed_event_for_request(db, &timed_out, message, now)?;
+        }
+        return Ok(TerminationOutcome::TimedOut);
+    }
+    Ok(TerminationOutcome::Confirmed)
 }
 
 pub fn auto_kill_request_for_terminal_task(
@@ -168,10 +227,8 @@ pub fn auto_kill_request_for_terminal_task(
 ) -> Result<Option<crate::models::TerminationRequest>, AppError> {
     let requests = TerminationRequestRepository::new(db).find_by_project(project_id)?;
     Ok(requests.into_iter().find(|request| {
-        matches!(
-            request.status,
-            TerminationRequestStatus::Sent | TerminationRequestStatus::Confirmed
-        ) && request_matches_terminal_task(request, task)
+        request.status == TerminationRequestStatus::Sent
+            && request_matches_terminal_task(request, task)
     }))
 }
 
@@ -213,18 +270,20 @@ fn request_matches_terminal_task(
     };
     identity.get("group").and_then(|value| value.as_str()) == Some(task.group.as_str())
         && identity.get("id").and_then(|value| value.as_i64()) == Some(task.id)
-        && optional_string(identity.get("enqueued_at")) == task.enqueued_at.as_deref()
-        && optional_string(identity.get("started_at")) == task.started_at.as_deref()
+        && required_matching_string(identity.get("enqueued_at"), task.enqueued_at.as_deref())
+        && required_matching_string(identity.get("started_at"), task.started_at.as_deref())
 }
 
-fn optional_string(value: Option<&serde_json::Value>) -> Option<&str> {
-    value.and_then(|value| {
-        if value.is_null() {
-            None
-        } else {
-            value.as_str()
-        }
-    })
+fn required_matching_string(value: Option<&serde_json::Value>, candidate: Option<&str>) -> bool {
+    value
+        .and_then(|value| {
+            if value.is_null() {
+                None
+            } else {
+                value.as_str()
+            }
+        })
+        .is_some_and(|value| Some(value) == candidate)
 }
 
 pub fn insert_termination_failed_event(
@@ -257,6 +316,49 @@ pub fn insert_termination_failed_event(
     );
     let _ = EventRepository::new(db).insert_idempotent(&event)?;
     Ok(())
+}
+
+pub fn insert_termination_failed_event_for_request(
+    db: &Db,
+    request: &crate::models::TerminationRequest,
+    error: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let identity = task_signature_identity(&request.task_signature);
+    let event = NewEvent::new(
+        &request.project_id,
+        EventKind::TerminationFailed,
+        format!(
+            "termination:{}:v1:request={}:signature={}",
+            EventKind::TerminationFailed,
+            request.request_id, request.task_signature
+        ),
+        json!({
+            "source": "termination_manager",
+            "request_id": request.request_id,
+            "incident_id": request.incident_id,
+            "task_signature": &request.task_signature,
+            "task_id": identity
+                .as_ref()
+                .and_then(|identity| identity.get("id"))
+                .and_then(|value| value.as_i64()),
+            "group": identity
+                .as_ref()
+                .and_then(|identity| identity.get("group"))
+                .and_then(|value| value.as_str()),
+            "error": error,
+        }),
+        now,
+        now,
+    );
+    let _ = EventRepository::new(db).insert_idempotent(&event)?;
+    Ok(())
+}
+
+fn task_signature_identity(task_signature: &str) -> Option<serde_json::Value> {
+    task_signature
+        .strip_prefix("pueue-task:v1:")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
 }
 
 fn unix_timestamp() -> Result<i64, AppError> {

@@ -1002,6 +1002,39 @@ impl<'db> TerminationRequestRepository<'db> {
         Ok(stored)
     }
 
+    pub fn transition_status_if_current(
+        &self,
+        request_id: i64,
+        current: TerminationRequestStatus,
+        next: TerminationRequestStatus,
+    ) -> Result<Option<TerminationRequest>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin guarded termination request status transition",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET status = ?1
+                 WHERE request_id = ?2 AND status = ?3",
+                params![next, request_id, current],
+            )
+            .map_err(database_error(
+                "guarded transition termination request status",
+            ))?;
+        let stored = if changed == 0 {
+            None
+        } else {
+            Some(read_termination_request(&transaction, request_id)?)
+        };
+        transaction.commit().map_err(database_error(
+            "commit guarded termination request status transition",
+        ))?;
+        Ok(stored)
+    }
+
     pub fn update_result(
         &self,
         request_id: i64,
@@ -1025,6 +1058,41 @@ impl<'db> TerminationRequestRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit termination request result update"))?;
+        Ok(stored)
+    }
+
+    pub fn update_result_if_current(
+        &self,
+        request_id: i64,
+        current: TerminationRequestStatus,
+        next: TerminationRequestStatus,
+        confirmed_at: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<Option<TerminationRequest>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin guarded termination request result update",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET status = ?1, confirmed_at = ?2, last_error = ?3
+                 WHERE request_id = ?4 AND status = ?5",
+                params![next, confirmed_at, last_error, request_id, current],
+            )
+            .map_err(database_error(
+                "guarded update termination request result",
+            ))?;
+        let stored = if changed == 0 {
+            None
+        } else {
+            Some(read_termination_request(&transaction, request_id)?)
+        };
+        transaction
+            .commit()
+            .map_err(database_error("commit guarded termination request result update"))?;
         Ok(stored)
     }
 
