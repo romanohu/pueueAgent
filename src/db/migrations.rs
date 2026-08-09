@@ -308,6 +308,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_termination_requests_to_v5(&transaction)?;
     }
     if (1..=3).contains(&version) {
+        ensure_agent_run_event_project_id(&transaction)?;
         migrate_termination_requests_to_v5(&transaction)?;
     }
     ensure_invariant_indexes(&transaction)?;
@@ -339,6 +340,13 @@ fn migrate_termination_requests_to_v5(
             .map_err(database_error("finish legacy SQLite migration"))?;
         return Ok(());
     }
+
+    transaction
+        .execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS incidents_project_incident_migration_idx
+             ON incidents(project_id, incident_id);",
+        )
+        .map_err(database_error("prepare incident key for migration"))?;
 
     transaction
         .execute_batch(
@@ -379,6 +387,49 @@ fn migrate_termination_requests_to_v5(
         "#,
         )
         .map_err(database_error("apply SQLite v5 migration"))?;
+    Ok(())
+}
+
+fn ensure_agent_run_event_project_id(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_table: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_run_events'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run event table for migration"))?;
+    if !has_table {
+        return Ok(());
+    }
+    let has_project_id: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('agent_run_events')
+                 WHERE name = 'project_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run event project column"))?;
+    if has_project_id {
+        return Ok(());
+    }
+
+    transaction
+        .execute_batch(
+            "ALTER TABLE agent_run_events ADD COLUMN project_id TEXT;
+             UPDATE agent_run_events
+             SET project_id = (
+                 SELECT project_id FROM agent_runs
+                 WHERE agent_runs.run_id = agent_run_events.run_id
+             );",
+        )
+        .map_err(database_error("add agent run event project column"))?;
     Ok(())
 }
 

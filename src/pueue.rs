@@ -115,6 +115,7 @@ impl CommandPueue {
             .args(&self.fixed_args)
             .arg(operation)
             .args(operation_args)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|source| PueueError::Spawn { operation, source })?;
