@@ -6,10 +6,11 @@ use rusqlite::{
 
 use crate::{
     models::{
-        path_text, AgentRun, AgentRunEvent, Event, Incident, IncidentTransition, IncidentUpdate,
-        IntegrationEvent, NewAgentRun, NewEvent, NewIncident, NewIntegrationEvent, NewProject,
-        NewSubmission, NewTaskObservation, NewTerminationRequest, Project, Submission,
-        SubmissionStatus, TaskObservation, TerminationRequest, TerminationRequestStatus,
+        path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, Event, EventKind,
+        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent, NewAgentRun,
+        NewEvent, NewIncident, NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation,
+        NewTerminationRequest, Project, Submission, SubmissionStatus, TaskObservation,
+        TerminationRequest, TerminationRequestStatus,
     },
     AppError,
 };
@@ -139,6 +140,46 @@ impl<'db> ProjectRepository<'db> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read enabled projects"))?;
         Ok(projects)
+    }
+
+    pub fn pause(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .execute(
+                "UPDATE projects SET paused = 1, updated_at = ?1 WHERE project_id = ?2",
+                params![now, project_id],
+            )
+            .map_err(database_error("pause project"))?;
+        connection
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE project_id = ?1",
+                [project_id],
+                project_from_row,
+            )
+            .map_err(database_error("read paused project"))
+    }
+
+    pub fn halt(&self, project_id: &str, reason: &str, now: i64) -> Result<Project, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .execute(
+                "UPDATE projects
+                 SET paused = 1, halted_reason = ?1, updated_at = ?2
+                 WHERE project_id = ?3",
+                params![reason, now, project_id],
+            )
+            .map_err(database_error("halt project"))?;
+        connection
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE project_id = ?1",
+                [project_id],
+                project_from_row,
+            )
+            .map_err(database_error("read halted project"))
     }
 
     pub fn find_by_root(&self, root: &std::path::Path) -> Result<Option<Project>, AppError> {
@@ -409,6 +450,18 @@ impl<'db> EventRepository<'db> {
                 .prepare(
                     "SELECT event_id FROM events
                      WHERE status IN ('pending', 'retry_wait') AND not_before <= ?1
+                       AND EXISTS (
+                           SELECT 1 FROM projects
+                           WHERE projects.project_id = events.project_id
+                             AND enabled = 1
+                             AND paused = 0
+                             AND halted_reason IS NULL
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM agent_runs
+                           WHERE agent_runs.project_id = events.project_id
+                             AND status IN ('starting', 'running')
+                       )
                      ORDER BY created_at, event_id
                      LIMIT ?2",
                 )
@@ -469,6 +522,81 @@ impl<'db> EventRepository<'db> {
             .commit()
             .map_err(database_error("commit expired claim recovery"))?;
         Ok(recovered)
+    }
+
+    pub fn transition_many(
+        &self,
+        event_ids: &[i64],
+        status: EventStatus,
+        now: i64,
+        not_before: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<usize, AppError> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin event status transition"))?;
+        let mut changed = 0;
+        for event_id in event_ids {
+            changed += transaction
+                .execute(
+                    "UPDATE events
+                     SET status = ?1,
+                         lease_until = NULL,
+                         not_before = COALESCE(?2, not_before),
+                         completed_at = CASE WHEN ?1 IN ('completed', 'failed') THEN ?3 ELSE completed_at END,
+                         last_error = ?4
+                     WHERE event_id = ?5",
+                    params![status, not_before, now, last_error, event_id],
+                )
+                .map_err(database_error("transition event status"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit event status transition"))?;
+        Ok(changed)
+    }
+
+    pub fn recent_events(&self, project_id: &str, limit: usize) -> Result<Vec<Event>, AppError> {
+        let limit = i64::try_from(limit).map_err(|_| AppError::Configuration {
+            field: "event_query_limit",
+        })?;
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT ?2",
+                EVENT_SELECT
+            ))
+            .map_err(database_error("prepare recent event query"))?;
+        let rows = statement
+            .query_map(params![project_id, limit], event_from_row)
+            .map_err(database_error("query recent events"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read recent events"))
+    }
+
+    pub fn count_consecutive_failures(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<u32, AppError> {
+        let mut count = 0;
+        for event in self.recent_events(project_id, limit)? {
+            match event.kind {
+                EventKind::Crash
+                | EventKind::TaskFailed
+                | EventKind::Stalled
+                | EventKind::AutoKilled
+                | EventKind::TerminationFailed => count += 1,
+                EventKind::TaskFinished | EventKind::DeepCheck => break,
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -829,6 +957,25 @@ impl<'db> SubmissionRepository<'db> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read unreconciled submissions"))
     }
+
+    pub fn count_started_or_accepted(&self, project_id: &str) -> Result<u32, AppError> {
+        let connection = self.db.connect()?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM submissions
+                 WHERE project_id = ?1
+                   AND (
+                       pueue_task_id IS NOT NULL
+                       OR status IN ('accepted', 'adopted', 'unreconciled')
+                   )",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count accepted submissions"))?;
+        u32::try_from(count).map_err(|_| AppError::Runtime {
+            operation: "count accepted submissions",
+        })
+    }
 }
 
 pub struct AgentRunRepository<'db> {
@@ -842,13 +989,19 @@ impl<'db> AgentRunRepository<'db> {
 
     pub fn insert(&self, run: &NewAgentRun) -> Result<AgentRun, AppError> {
         let log_path = path_text(&run.log_path, "log_path")?;
+        let context_lineage_json =
+            serde_json::to_string(&run.context_lineage).map_err(|source| AppError::Serialization {
+                operation: "serialize agent context lineage",
+                source,
+            })?;
         let connection = self.db.connect()?;
         connection
             .execute(
                 "INSERT INTO agent_runs (
                     project_id, primary_event_id, pid, status, started_at,
-                    finished_at, exit_code, log_path, last_error
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL)",
+                    finished_at, exit_code, log_path, last_error, context_mode,
+                    context_session_id, context_lineage_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9)",
                 params![
                     run.project_id,
                     run.primary_event_id,
@@ -856,6 +1009,9 @@ impl<'db> AgentRunRepository<'db> {
                     run.status,
                     run.started_at,
                     log_path,
+                    run.context_mode.as_str(),
+                    run.context_session_id.as_deref(),
+                    context_lineage_json,
                 ],
             )
             .map_err(database_error("insert agent run"))?;
@@ -905,6 +1061,51 @@ impl<'db> AgentRunRepository<'db> {
             project_id,
             run_id,
             event_id,
+        })
+    }
+
+    pub fn mark_running(&self, run_id: i64, pid: i64) -> Result<AgentRun, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .execute(
+                "UPDATE agent_runs SET pid = ?1, status = 'running' WHERE run_id = ?2",
+                params![pid, run_id],
+            )
+            .map_err(database_error("mark agent run running"))?;
+        read_agent_run(&connection, run_id)
+    }
+
+    pub fn finish(
+        &self,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .execute(
+                "UPDATE agent_runs
+                 SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4
+                 WHERE run_id = ?5",
+                params![status, finished_at, exit_code, last_error, run_id],
+            )
+            .map_err(database_error("finish agent run"))?;
+        read_agent_run(&connection, run_id)
+    }
+
+    pub fn count_by_project(&self, project_id: &str) -> Result<u32, AppError> {
+        let connection = self.db.connect()?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count agent runs"))?;
+        u32::try_from(count).map_err(|_| AppError::Runtime {
+            operation: "count agent runs",
         })
     }
 }
@@ -1238,7 +1439,8 @@ const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, cr
      FROM submissions";
 
 const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid, status,
-            started_at, finished_at, exit_code, log_path, last_error
+            started_at, finished_at, exit_code, log_path, last_error,
+            context_mode, context_session_id, context_lineage_json
      FROM agent_runs";
 
 const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, project_id,
@@ -1352,6 +1554,18 @@ fn read_submission(connection: &Connection, submission_id: &str) -> Result<Submi
 }
 
 fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
+    let context_mode_value: String = row.get(10)?;
+    let context_session_id: Option<String> = row.get(11)?;
+    let context_mode =
+        AgentContextMode::from_db_parts(&context_mode_value, context_session_id.clone()).map_err(
+            |source| {
+                rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(source))
+            },
+        )?;
+    let context_lineage_json: String = row.get(12)?;
+    let context_lineage = serde_json::from_str(&context_lineage_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(12, Type::Text, Box::new(source))
+    })?;
     Ok(AgentRun {
         run_id: row.get(0)?,
         project_id: row.get(1)?,
@@ -1363,6 +1577,9 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
         exit_code: row.get(7)?,
         log_path: PathBuf::from(row.get::<_, String>(8)?),
         last_error: row.get(9)?,
+        context_mode,
+        context_session_id,
+        context_lineage,
     })
 }
 

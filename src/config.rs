@@ -5,7 +5,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::AppError;
+use crate::{models::AgentContextMode, AppError};
 
 pub const DEFAULT_LOG_TAIL_BYTES: u32 = 64 * 1024;
 pub const DEFAULT_MAX_AGENT_RUNS: u32 = 100;
@@ -25,6 +25,7 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     pub timeout_minutes: u32,
     pub max_retries: u32,
+    pub context: AgentContextMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,18 +131,80 @@ struct RawAgentConfig {
     args: Vec<String>,
     timeout_minutes: i64,
     max_retries: i64,
+    context: RawAgentContextConfig,
 }
 
 impl RawAgentConfig {
     fn validate(self) -> Result<AgentConfig, AppError> {
         required(&self.program, "agent.program")?;
+        let context = self.context.validate(&self.program)?;
 
         Ok(AgentConfig {
             program: self.program,
             args: self.args,
             timeout_minutes: positive(self.timeout_minutes, "agent.timeout_minutes")?,
             max_retries: non_negative(self.max_retries, "agent.max_retries")?,
+            context,
         })
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawAgentContextConfig {
+    mode: String,
+    session_id: Option<String>,
+}
+
+impl RawAgentContextConfig {
+    fn validate(self, program: &str) -> Result<AgentContextMode, AppError> {
+        let mode = if self.mode.trim().is_empty() {
+            "fresh"
+        } else {
+            self.mode.trim()
+        };
+
+        let context = match mode {
+            "fresh" => {
+                if self.session_id.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    return Err(AppError::Configuration {
+                        field: "agent.context.session_id",
+                    });
+                }
+                AgentContextMode::Fresh
+            }
+            "resume" => {
+                let session_id = self
+                    .session_id
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .ok_or(AppError::Configuration {
+                        field: "agent.context.session_id",
+                    })?;
+                AgentContextMode::Resume { session_id }
+            }
+            "resume_latest" => {
+                if self.session_id.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                    return Err(AppError::Configuration {
+                        field: "agent.context.session_id",
+                    });
+                }
+                AgentContextMode::ResumeLatest
+            }
+            _ => {
+                return Err(AppError::Configuration {
+                    field: "agent.context.mode",
+                })
+            }
+        };
+
+        if !matches!(context, AgentContextMode::Fresh) && program != "codex" {
+            return Err(AppError::Configuration {
+                field: "agent.context.mode",
+            });
+        }
+
+        Ok(context)
     }
 }
 

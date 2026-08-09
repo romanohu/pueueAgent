@@ -5,6 +5,7 @@ use std::{
 
 use pueue_agent::{
     config::{self, PatternAction},
+    models::AgentContextMode,
     paths, project,
 };
 use tempfile::TempDir;
@@ -64,6 +65,63 @@ fn command_is_an_argument_vector_not_a_shell_string() {
 
     assert_eq!(config.agent.program, "codex");
     assert_eq!(config.agent.args, vec!["exec", "{prompt}"]);
+    assert_eq!(config.agent.context, AgentContextMode::Fresh);
+}
+
+#[test]
+fn codex_context_resume_requires_explicit_non_empty_session() {
+    let config = valid_config().replace(
+        "max_retries = 2\n",
+        "max_retries = 2\n\n[agent.context]\nmode = \"resume\"\nsession_id = \"session-abc\"\n",
+    );
+    let config = load_config(config).unwrap();
+    assert_eq!(
+        config.agent.context,
+        AgentContextMode::Resume {
+            session_id: "session-abc".to_owned()
+        }
+    );
+
+    let missing = valid_config().replace(
+        "max_retries = 2\n",
+        "max_retries = 2\n\n[agent.context]\nmode = \"resume\"\n",
+    );
+    assert!(load_config(missing)
+        .unwrap_err()
+        .to_string()
+        .contains("agent.context.session_id"));
+}
+
+#[test]
+fn resume_latest_rejects_session_id_and_non_codex_programs() {
+    let latest = valid_config().replace(
+        "max_retries = 2\n",
+        "max_retries = 2\n\n[agent.context]\nmode = \"resume_latest\"\n",
+    );
+    assert_eq!(
+        load_config(latest).unwrap().agent.context,
+        AgentContextMode::ResumeLatest
+    );
+
+    let with_session = valid_config().replace(
+        "max_retries = 2\n",
+        "max_retries = 2\n\n[agent.context]\nmode = \"resume_latest\"\nsession_id = \"session-abc\"\n",
+    );
+    assert!(load_config(with_session)
+        .unwrap_err()
+        .to_string()
+        .contains("agent.context.session_id"));
+
+    let non_codex = valid_config()
+        .replace("program = \"codex\"", "program = \"/bin/echo\"")
+        .replace(
+            "max_retries = 2\n",
+            "max_retries = 2\n\n[agent.context]\nmode = \"resume_latest\"\n",
+        );
+    assert!(load_config(non_codex)
+        .unwrap_err()
+        .to_string()
+        .contains("agent.context.mode"));
 }
 
 #[test]

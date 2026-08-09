@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let transaction = connection
@@ -100,6 +100,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 exit_code INTEGER,
                 log_path TEXT NOT NULL,
                 last_error TEXT,
+                context_mode TEXT NOT NULL DEFAULT 'fresh' CHECK (context_mode IN (
+                    'fresh', 'resume', 'resume_latest'
+                )),
+                context_session_id TEXT,
+                context_lineage_json TEXT NOT NULL DEFAULT '[]',
                 UNIQUE(project_id, run_id),
                 FOREIGN KEY(project_id, primary_event_id)
                     REFERENCES events(project_id, event_id) ON DELETE RESTRICT
@@ -185,7 +190,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE INDEX task_observations_group_state_idx
                 ON task_observations(project_id, pueue_group, state, observed_at);
 
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -203,10 +208,32 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE INDEX integration_events_kind_created_idx
                 ON integration_events(kind, created_at);
 
-            PRAGMA user_version = 2;
+            ALTER TABLE agent_runs
+                ADD COLUMN context_mode TEXT NOT NULL DEFAULT 'fresh';
+            ALTER TABLE agent_runs
+                ADD COLUMN context_session_id TEXT;
+            ALTER TABLE agent_runs
+                ADD COLUMN context_lineage_json TEXT NOT NULL DEFAULT '[]';
+
+            PRAGMA user_version = 3;
             "#,
             )
             .map_err(database_error("apply SQLite v2 migration"))?;
+    } else if version == 2 {
+        transaction
+            .execute_batch(
+                r#"
+            ALTER TABLE agent_runs
+                ADD COLUMN context_mode TEXT NOT NULL DEFAULT 'fresh';
+            ALTER TABLE agent_runs
+                ADD COLUMN context_session_id TEXT;
+            ALTER TABLE agent_runs
+                ADD COLUMN context_lineage_json TEXT NOT NULL DEFAULT '[]';
+
+            PRAGMA user_version = 3;
+            "#,
+            )
+            .map_err(database_error("apply SQLite v3 migration"))?;
     }
     transaction
         .commit()

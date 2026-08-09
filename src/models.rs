@@ -134,6 +134,52 @@ database_enum!(AgentRunStatus {
     Cancelled => "cancelled",
 });
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum AgentContextMode {
+    Fresh,
+    Resume { session_id: String },
+    ResumeLatest,
+}
+
+impl AgentContextMode {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Resume { .. } => "resume",
+            Self::ResumeLatest => "resume_latest",
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Resume { session_id } => Some(session_id),
+            Self::Fresh | Self::ResumeLatest => None,
+        }
+    }
+
+    pub fn from_db_parts(
+        mode: &str,
+        session_id: Option<String>,
+    ) -> Result<Self, ModelEnumParseError> {
+        match mode {
+            "fresh" => Ok(Self::Fresh),
+            "resume" => session_id
+                .filter(|value| !value.trim().is_empty())
+                .map(|session_id| Self::Resume { session_id })
+                .ok_or_else(|| ModelEnumParseError {
+                    enum_name: "AgentContextMode",
+                    value: "resume without session_id".to_owned(),
+                }),
+            "resume_latest" => Ok(Self::ResumeLatest),
+            _ => Err(ModelEnumParseError {
+                enum_name: "AgentContextMode",
+                value: mode.to_owned(),
+            }),
+        }
+    }
+}
+
 database_enum!(TerminationRequestStatus {
     Requested => "requested",
     Sent => "sent",
@@ -361,6 +407,9 @@ pub struct AgentRun {
     pub exit_code: Option<i64>,
     pub log_path: PathBuf,
     pub last_error: Option<String>,
+    pub context_mode: AgentContextMode,
+    pub context_session_id: Option<String>,
+    pub context_lineage: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +420,9 @@ pub struct NewAgentRun {
     pub status: AgentRunStatus,
     pub started_at: i64,
     pub log_path: PathBuf,
+    pub context_mode: AgentContextMode,
+    pub context_session_id: Option<String>,
+    pub context_lineage: Vec<String>,
 }
 
 impl NewAgentRun {
@@ -389,6 +441,34 @@ impl NewAgentRun {
             status,
             started_at,
             log_path: log_path.into(),
+            context_mode: AgentContextMode::Fresh,
+            context_session_id: None,
+            context_lineage: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_context(
+        project_id: impl Into<String>,
+        primary_event_id: i64,
+        pid: Option<i64>,
+        status: AgentRunStatus,
+        started_at: i64,
+        log_path: impl Into<PathBuf>,
+        context_mode: AgentContextMode,
+        context_session_id: Option<String>,
+        context_lineage: Vec<String>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            primary_event_id,
+            pid,
+            status,
+            started_at,
+            log_path: log_path.into(),
+            context_mode,
+            context_session_id,
+            context_lineage,
         }
     }
 }
