@@ -11,6 +11,7 @@ pub mod events;
 pub mod guardrails;
 pub mod incidents;
 pub mod init;
+pub mod interventions;
 pub mod logs;
 pub mod models;
 pub mod paths;

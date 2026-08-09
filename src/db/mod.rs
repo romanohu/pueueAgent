@@ -9,8 +9,8 @@ use crate::AppError;
 
 pub use repositories::{
     AgentRunRecovery, AgentRunRepository, EventRepository, IncidentRepository,
-    IntegrationEventRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
-    TerminationRequestRepository,
+    IntegrationEventRepository, InterventionRepository, ProjectRepository, SubmissionRepository,
+    TaskObservationRepository, TerminationRequestRepository,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

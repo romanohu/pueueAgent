@@ -100,6 +100,12 @@ database_enum!(EventStatus {
     Failed => "failed",
 });
 
+database_enum!(InterventionStatus {
+    Pending => "pending",
+    Reserved => "reserved",
+    Applied => "applied",
+});
+
 database_enum!(IntegrationEventKind {
     UnknownCallbackGroup => "unknown_callback_group",
 });

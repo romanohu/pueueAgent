@@ -7,10 +7,15 @@ use std::{
 
 use pueue_agent::{
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
-        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+        AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
+        ProjectRepository, SubmissionRepository, TaskObservationRepository,
+        TerminationRequestRepository,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
+    interventions::{
+        InterventionStatus, MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES,
+        MAX_INTERVENTION_BYTES_PER_RUN,
+    },
     models::{
         AgentRunStatus, EventKind, EventStatus, IncidentStatus, IncidentTransition, NewAgentRun,
         NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
@@ -185,6 +190,7 @@ fn open_configures_sqlite_and_installs_all_tables() {
         "termination_requests",
         "task_observations",
         "operator_logs",
+        "interventions",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -222,7 +228,330 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
+}
+
+#[test]
+fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "v5-event", 100);
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch("DROP TABLE IF EXISTS interventions; PRAGMA user_version = 5;")
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let intervention_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'interventions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let preserved_event_id: i64 = connection
+        .query_row(
+            "SELECT event_id FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let preserved_project_id: String = connection
+        .query_row(
+            "SELECT project_id FROM projects WHERE project_id = 'project-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 6);
+    assert_eq!(intervention_table_count, 1);
+    assert_eq!(preserved_event_id, event_id);
+    assert_eq!(preserved_project_id, "project-a");
+}
+
+#[test]
+fn interventions_validate_messages_and_list_fifo_with_project_scope() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-project-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-project-b");
+    let repository = InterventionRepository::new(&test.db);
+
+    assert!(repository.insert_pending("project-a", "   ", 100).is_err());
+    assert!(repository
+        .insert_pending("project-a", &"a".repeat(MAX_INTERVENTION_BYTES + 1), 100)
+        .is_err());
+
+    let first = repository
+        .insert_pending("project-a", "first instruction", 100)
+        .unwrap();
+    let second = repository
+        .insert_pending("project-a", "second instruction", 100)
+        .unwrap();
+    let other = repository
+        .insert_pending("project-b", "foreign instruction", 100)
+        .unwrap();
+
+    let listed = repository
+        .list("project-a", InterventionStatus::Pending, 8)
+        .unwrap();
+    let mut expected_ids = vec![
+        first.intervention_id.as_str(),
+        second.intervention_id.as_str(),
+    ];
+    expected_ids.sort_unstable();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    assert!(listed.iter().all(|item| item.project_id == "project-a"));
+    assert!(!listed
+        .iter()
+        .any(|item| item.intervention_id == other.intervention_id));
+    let counts = repository.count_by_project("project-a").unwrap();
+    assert_eq!(counts.pending, 2);
+    assert_eq!(counts.reserved, 0);
+    assert_eq!(counts.applied, 0);
+}
+
+#[test]
+fn interventions_reserve_fifo_with_count_and_byte_bounds() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let repository = InterventionRepository::new(&test.db);
+    let first = repository
+        .insert_pending("project-a", "first", 100)
+        .unwrap();
+    let second = repository
+        .insert_pending("project-a", "second", 101)
+        .unwrap();
+    let overflow = repository
+        .insert_pending("project-a", "overflow", 102)
+        .unwrap();
+
+    let reservation = repository
+        .reserve_pending(
+            "project-a",
+            "reservation-a",
+            200,
+            300,
+            2,
+            "firstsecond".len(),
+        )
+        .unwrap();
+    assert_eq!(reservation.token, "reservation-a");
+    assert_eq!(
+        reservation
+            .items
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            first.intervention_id.as_str(),
+            second.intervention_id.as_str()
+        ]
+    );
+    assert!(reservation
+        .items
+        .iter()
+        .all(|item| item.status == InterventionStatus::Reserved
+            && item.reservation_token.as_deref() == Some("reservation-a")));
+    assert_eq!(
+        repository
+            .list("project-a", InterventionStatus::Pending, 8)
+            .unwrap()
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![overflow.intervention_id.as_str()]
+    );
+
+    for index in 0..MAX_INTERVENTIONS_PER_RUN {
+        repository
+            .insert_pending("project-a", &format!("capped-{index}"), 102)
+            .unwrap();
+    }
+    let capped = repository
+        .reserve_pending(
+            "project-a",
+            "reservation-b",
+            201,
+            301,
+            MAX_INTERVENTIONS_PER_RUN + 1,
+            MAX_INTERVENTION_BYTES_PER_RUN + 1,
+        )
+        .unwrap();
+    assert_eq!(capped.items.len(), MAX_INTERVENTIONS_PER_RUN);
+    assert_eq!(
+        repository
+            .list(
+                "project-a",
+                InterventionStatus::Pending,
+                MAX_INTERVENTIONS_PER_RUN
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn interventions_apply_release_and_expiry_respect_project_and_reservation_ownership() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-project-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-project-b");
+    let repository = InterventionRepository::new(&test.db);
+    let applied = repository
+        .insert_pending("project-a", "apply me", 100)
+        .unwrap();
+    let released = repository
+        .insert_pending("project-a", "release me", 101)
+        .unwrap();
+    let foreign = repository
+        .insert_pending("project-b", "foreign", 100)
+        .unwrap();
+    repository
+        .reserve_pending("project-a", "reservation-a", 200, 300, 8, 1024)
+        .unwrap();
+    repository
+        .reserve_pending("project-b", "reservation-b", 200, 300, 8, 1024)
+        .unwrap();
+
+    let event_id = insert_event(&test.db, "project-a", "intervention-apply-run", 100);
+    let applied_run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            200,
+            "/tmp/intervention-run.log",
+        ))
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET agent_run_id = ?1
+             WHERE intervention_id = ?2 AND project_id = ?3 AND reservation_token = ?4",
+            params![
+                applied_run.run_id,
+                applied.intervention_id,
+                "project-a",
+                "reservation-a"
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .mark_applied_for_run("project-b", applied_run.run_id, 250)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        repository
+            .mark_applied_for_run("project-a", applied_run.run_id, 250)
+            .unwrap(),
+        1
+    );
+    AgentRunRepository::new(&test.db)
+        .finish(
+            applied_run.run_id,
+            AgentRunStatus::Completed,
+            251,
+            Some(0),
+            None,
+        )
+        .unwrap();
+    let release_event_id = insert_event(&test.db, "project-a", "intervention-release-run", 101);
+    let release_run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            release_event_id,
+            None,
+            AgentRunStatus::Starting,
+            252,
+            "/tmp/intervention-release.log",
+        ))
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET agent_run_id = ?1
+             WHERE intervention_id = ?2 AND project_id = ?3 AND reservation_token = ?4",
+            params![
+                release_run.run_id,
+                released.intervention_id,
+                "project-a",
+                "reservation-a"
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        repository
+            .release_for_run("project-b", release_run.run_id)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        repository
+            .release_for_run("project-a", release_run.run_id)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        repository
+            .list("project-a", InterventionStatus::Applied, 8)
+            .unwrap()
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![applied.intervention_id.as_str()]
+    );
+    assert_eq!(
+        repository
+            .list("project-a", InterventionStatus::Pending, 8)
+            .unwrap()
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![released.intervention_id.as_str()]
+    );
+    assert_eq!(
+        repository
+            .list("project-b", InterventionStatus::Reserved, 8)
+            .unwrap()
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![foreign.intervention_id.as_str()]
+    );
+    assert_eq!(repository.recover_expired(299).unwrap(), 0);
+    assert_eq!(repository.recover_expired(300).unwrap(), 1);
+    assert_eq!(
+        repository
+            .list("project-b", InterventionStatus::Pending, 8)
+            .unwrap()
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![foreign.intervention_id.as_str()]
+    );
 }
 
 #[test]
@@ -253,7 +582,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     test.db
         .connect()
         .unwrap()
-        .execute("PRAGMA user_version = 4", [])
+        .execute_batch("DROP TABLE interventions; PRAGMA user_version = 4;")
         .unwrap();
 
     let migrated = Db::open(&test.path).unwrap();
@@ -261,7 +590,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     connection
         .execute(
             "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
@@ -298,7 +627,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 5);
+        assert_eq!(migrated_version, 6);
         assert_eq!(index_count, 1);
         drop(connection);
 

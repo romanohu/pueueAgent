@@ -4,15 +4,20 @@ use rusqlite::{
     params, types::Type, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::{
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
+    interventions::{
+        validate_message, Intervention, InterventionCounts, InterventionReservation,
+        MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
+    },
     models::{
         path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, Event, EventKind,
-        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent, NewAgentRun,
-        NewEvent, NewIncident, NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation,
-        NewTerminationRequest, Project, Submission, SubmissionStatus, TaskObservation,
-        TerminationRequest, TerminationRequestStatus,
+        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent,
+        InterventionStatus, NewAgentRun, NewEvent, NewIncident, NewIntegrationEvent, NewProject,
+        NewSubmission, NewTaskObservation, NewTerminationRequest, Project, Submission,
+        SubmissionStatus, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
     AppError,
 };
@@ -2022,6 +2027,286 @@ impl<'db> TerminationRequestRepository<'db> {
     }
 }
 
+pub struct InterventionRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> InterventionRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_pending(
+        &self,
+        project_id: &str,
+        message: &str,
+        created_at: i64,
+    ) -> Result<Intervention, AppError> {
+        validate_message(message)?;
+        let intervention_id = Uuid::new_v4().to_string();
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention insert"))?;
+        transaction
+            .execute(
+                "INSERT INTO interventions (
+                    intervention_id, project_id, message, status, created_at, reserved_at,
+                    applied_at, agent_run_id, attempts, lease_expires_at, reservation_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, 0, NULL, NULL)",
+                params![
+                    intervention_id,
+                    project_id,
+                    message,
+                    InterventionStatus::Pending,
+                    created_at,
+                ],
+            )
+            .map_err(database_error("insert intervention"))?;
+        let intervention = transaction
+            .query_row(
+                &format!(
+                    "{} WHERE intervention_id = ?1 AND project_id = ?2",
+                    INTERVENTION_SELECT
+                ),
+                params![intervention_id, project_id],
+                intervention_from_row,
+            )
+            .map_err(database_error("read inserted intervention"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention insert"))?;
+        Ok(intervention)
+    }
+
+    pub fn list(
+        &self,
+        project_id: &str,
+        status: InterventionStatus,
+        limit: usize,
+    ) -> Result<Vec<Intervention>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND status = ?2
+                 ORDER BY created_at ASC, intervention_id ASC
+                 LIMIT ?3",
+                INTERVENTION_SELECT
+            ))
+            .map_err(database_error("prepare intervention list"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    status,
+                    limit.min(MAX_INTERVENTIONS_PER_RUN) as i64,
+                ],
+                intervention_from_row,
+            )
+            .map_err(database_error("query interventions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read interventions"))
+    }
+
+    pub fn count_by_project(&self, project_id: &str) -> Result<InterventionCounts, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END), 0)
+                 FROM interventions
+                 WHERE project_id = ?1",
+                [project_id],
+                |row| {
+                    Ok(InterventionCounts {
+                        pending: row.get(0)?,
+                        reserved: row.get(1)?,
+                        applied: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(database_error("count project interventions"))
+    }
+
+    pub fn reserve_pending(
+        &self,
+        project_id: &str,
+        token: &str,
+        now: i64,
+        lease_until: i64,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Result<InterventionReservation, AppError> {
+        if lease_until <= now {
+            return Err(AppError::Configuration {
+                field: "intervention_lease",
+            });
+        }
+        let max_count = max_count.min(MAX_INTERVENTIONS_PER_RUN);
+        let max_bytes = max_bytes.min(MAX_INTERVENTION_BYTES_PER_RUN);
+        if max_count == 0 || max_bytes == 0 {
+            return Ok(InterventionReservation {
+                token: token.to_owned(),
+                items: Vec::new(),
+            });
+        }
+
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin immediate intervention reservation"))?;
+        let pending = {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "{} WHERE project_id = ?1 AND status = ?2
+                     ORDER BY created_at ASC, intervention_id ASC
+                     LIMIT ?3",
+                    INTERVENTION_SELECT
+                ))
+                .map_err(database_error("prepare pending intervention reservation"))?;
+            let pending = statement
+                .query_map(
+                    params![project_id, InterventionStatus::Pending, max_count as i64],
+                    intervention_from_row,
+                )
+                .map_err(database_error("query pending interventions"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read pending interventions"))?;
+            pending
+        };
+
+        let mut total_bytes = 0;
+        let mut items = Vec::with_capacity(pending.len());
+        for intervention in pending {
+            let next_total = total_bytes + intervention.message.len();
+            if next_total > max_bytes {
+                break;
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE interventions
+                     SET status = ?1, reserved_at = ?2, attempts = attempts + 1,
+                         lease_expires_at = ?3, reservation_token = ?4
+                     WHERE intervention_id = ?5 AND project_id = ?6 AND status = ?7",
+                    params![
+                        InterventionStatus::Reserved,
+                        now,
+                        lease_until,
+                        token,
+                        intervention.intervention_id,
+                        project_id,
+                        InterventionStatus::Pending,
+                    ],
+                )
+                .map_err(database_error("reserve intervention"))?;
+            if changed == 1 {
+                total_bytes = next_total;
+                items.push(
+                    transaction
+                        .query_row(
+                            &format!(
+                                "{} WHERE intervention_id = ?1 AND project_id = ?2",
+                                INTERVENTION_SELECT
+                            ),
+                            params![intervention.intervention_id, project_id],
+                            intervention_from_row,
+                        )
+                        .map_err(database_error("read reserved intervention"))?,
+                );
+            }
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention reservation"))?;
+        Ok(InterventionReservation {
+            token: token.to_owned(),
+            items,
+        })
+    }
+
+    pub fn mark_applied_for_run(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        applied_at: i64,
+    ) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention application"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
+                     reservation_token = NULL
+                 WHERE project_id = ?3 AND agent_run_id = ?4 AND status = ?5",
+                params![
+                    InterventionStatus::Applied,
+                    applied_at,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error("mark interventions applied for run"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention application"))?;
+        Ok(changed)
+    }
+
+    pub fn release_for_run(&self, project_id: &str, run_id: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention release"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?2 AND agent_run_id = ?3 AND status = ?4",
+                params![
+                    InterventionStatus::Pending,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error("release interventions for run"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention release"))?;
+        Ok(changed)
+    }
+
+    pub fn recover_expired(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin expired intervention recovery"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND lease_expires_at <= ?3",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    now,
+                ],
+            )
+            .map_err(database_error("recover expired interventions"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit expired intervention recovery"))?;
+        Ok(changed)
+    }
+}
+
 pub struct TaskObservationRepository<'db> {
     db: &'db Db,
 }
@@ -2165,6 +2450,11 @@ const TASK_OBSERVATION_SELECT: &str = "SELECT project_id, task_signature, pueue_
             pueue_group, command_json, state, enqueued_at, started_at, ended_at, result, observed_at
      FROM task_observations";
 
+const INTERVENTION_SELECT: &str = "SELECT intervention_id, project_id, message, status,
+            created_at, reserved_at, applied_at, agent_run_id, attempts, lease_expires_at,
+            reservation_token
+     FROM interventions";
+
 fn bounded_diagnostic_limit(limit: usize) -> i64 {
     limit.min(MAX_EVENT_LIST_LIMIT) as i64
 }
@@ -2213,6 +2503,22 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
         created_at: row.get(9)?,
         completed_at: row.get(10)?,
         last_error: row.get(11)?,
+    })
+}
+
+fn intervention_from_row(row: &Row<'_>) -> rusqlite::Result<Intervention> {
+    Ok(Intervention {
+        intervention_id: row.get(0)?,
+        project_id: row.get(1)?,
+        message: row.get(2)?,
+        status: row.get(3)?,
+        created_at: row.get(4)?,
+        reserved_at: row.get(5)?,
+        applied_at: row.get(6)?,
+        agent_run_id: row.get(7)?,
+        attempts: row.get(8)?,
+        lease_expires_at: row.get(9)?,
+        reservation_token: row.get(10)?,
     })
 }
 

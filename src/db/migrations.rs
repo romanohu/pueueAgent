@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -196,6 +196,27 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE interventions (
+                intervention_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
+                created_at INTEGER NOT NULL,
+                reserved_at INTEGER,
+                applied_at INTEGER,
+                agent_run_id INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                lease_expires_at INTEGER,
+                reservation_token TEXT,
+                FOREIGN KEY (project_id, agent_run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE SET NULL,
+                CHECK (
+                    (status = 'pending' AND reserved_at IS NULL AND applied_at IS NULL AND agent_run_id IS NULL AND lease_expires_at IS NULL AND reservation_token IS NULL)
+                    OR (status = 'reserved' AND reserved_at IS NOT NULL AND applied_at IS NULL AND lease_expires_at IS NOT NULL AND reservation_token IS NOT NULL)
+                    OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
+                )
+            );
+
             CREATE INDEX events_claimable_idx
                 ON events(status, not_before, created_at, event_id)
                 WHERE status IN ('pending', 'retry_wait');
@@ -223,8 +244,12 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 ON task_observations(project_id, pueue_group, state, observed_at);
             CREATE INDEX operator_logs_project_created_idx
                 ON operator_logs(project_id, created_at, log_id);
+            CREATE INDEX interventions_project_status_created_idx
+                ON interventions(project_id, status, created_at, intervention_id);
+            CREATE INDEX interventions_reservation_lease_idx
+                ON interventions(status, lease_expires_at, reservation_token);
 
-            PRAGMA user_version = 5;
+            PRAGMA user_version = 6;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -306,10 +331,15 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             .map_err(database_error("apply SQLite v4 migration"))?;
     } else if version == 4 {
         migrate_termination_requests_to_v5(&transaction)?;
+    } else if version == 5 {
+        migrate_interventions_to_v6(&transaction)?;
     }
     if (1..=3).contains(&version) {
         ensure_agent_run_event_project_id(&transaction)?;
         migrate_termination_requests_to_v5(&transaction)?;
+    }
+    if (1..=4).contains(&version) {
+        migrate_interventions_to_v6(&transaction)?;
     }
     ensure_invariant_indexes(&transaction)?;
     transaction
@@ -317,6 +347,40 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         .map_err(database_error("commit SQLite migration"))?;
 
     Ok(())
+}
+
+fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    transaction
+        .execute_batch(
+            r#"
+        CREATE TABLE interventions (
+            intervention_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            message TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
+            created_at INTEGER NOT NULL,
+            reserved_at INTEGER,
+            applied_at INTEGER,
+            agent_run_id INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            lease_expires_at INTEGER,
+            reservation_token TEXT,
+            FOREIGN KEY (project_id, agent_run_id)
+                REFERENCES agent_runs(project_id, run_id) ON DELETE SET NULL,
+            CHECK (
+                (status = 'pending' AND reserved_at IS NULL AND applied_at IS NULL AND agent_run_id IS NULL AND lease_expires_at IS NULL AND reservation_token IS NULL)
+                OR (status = 'reserved' AND reserved_at IS NOT NULL AND applied_at IS NULL AND lease_expires_at IS NOT NULL AND reservation_token IS NOT NULL)
+                OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
+            )
+        );
+        CREATE INDEX interventions_project_status_created_idx
+            ON interventions(project_id, status, created_at, intervention_id);
+        CREATE INDEX interventions_reservation_lease_idx
+            ON interventions(status, lease_expires_at, reservation_token);
+        PRAGMA user_version = 6;
+        "#,
+        )
+        .map_err(database_error("apply SQLite v6 migration"))
 }
 
 fn migrate_termination_requests_to_v5(
