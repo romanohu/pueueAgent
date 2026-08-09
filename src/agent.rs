@@ -288,6 +288,22 @@ impl AgentHandle {
         };
         Ok(status)
     }
+
+    pub async fn timeout_now(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<AgentRunStatus, AppError> {
+        process_tree::terminate_agent_process_tree(&mut self.child, self.pid).await;
+        AgentRunRepository::new(db).finish(
+            self.run_id,
+            AgentRunStatus::TimedOut,
+            now,
+            None,
+            Some("agent timed out"),
+        )?;
+        Ok(AgentRunStatus::TimedOut)
+    }
 }
 
 #[cfg(unix)]

@@ -1,5 +1,6 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, future::Future, time::Duration};
 
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -21,6 +22,7 @@ pub struct DaemonConfig {
     pub lease_seconds: i64,
     pub claim_limit: usize,
     pub now_override: Option<i64>,
+    pub shutdown_grace_period: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -30,6 +32,7 @@ impl Default for DaemonConfig {
             lease_seconds: 600,
             claim_limit: 100,
             now_override: None,
+            shutdown_grace_period: Duration::from_secs(30),
         }
     }
 }
@@ -70,7 +73,7 @@ where
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => {
-                    self.poll_agents().await?;
+                    self.drain_agents_on_shutdown().await?;
                     return Ok(());
                 }
                 () = tokio::time::sleep(self.config.interval) => {
@@ -182,12 +185,76 @@ where
         Ok(finished)
     }
 
+    async fn drain_agents_on_shutdown(&mut self) -> Result<usize, AppError> {
+        let mut finished = self.poll_agents().await?;
+        if self.active_agents.is_empty() {
+            return Ok(finished);
+        }
+
+        let deadline = Instant::now() + self.config.shutdown_grace_period;
+        while !self.active_agents.is_empty() && Instant::now() < deadline {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_else(|| Duration::from_secs(0));
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+            finished += self.poll_agents().await?;
+        }
+
+        while let Some(mut agent) = self.active_agents.pop() {
+            agent.timeout_now(&self.db, self.now()?).await?;
+            finished += 1;
+        }
+        Ok(finished)
+    }
+
     fn now(&self) -> Result<i64, AppError> {
         if let Some(now) = self.config.now_override {
             return Ok(now);
         }
         unix_timestamp()
     }
+}
+
+pub async fn cancel_token_on_shutdown_signal(
+    shutdown: CancellationToken,
+    signal: impl Future<Output = ()>,
+) {
+    signal.await;
+    shutdown.cancel();
+}
+
+pub fn production_shutdown_token() -> CancellationToken {
+    let shutdown = CancellationToken::new();
+    tokio::spawn(cancel_token_on_shutdown_signal(
+        shutdown.clone(),
+        platform_shutdown_signal(),
+    ));
+    shutdown
+}
+
+#[cfg(unix)]
+async fn platform_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    let terminate = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut signal) => {
+                let _ = signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn platform_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn unix_timestamp() -> Result<i64, AppError> {

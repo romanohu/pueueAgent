@@ -11,7 +11,7 @@ use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     daemon::{Daemon, DaemonConfig},
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
-    models::{EventKind, EventStatus, NewEvent, NewProject},
+    models::{AgentRunStatus, EventKind, EventStatus, NewEvent, NewProject},
     pueue::{PueueApi, PueueTask},
     AppError,
 };
@@ -67,6 +67,10 @@ impl PueueApi for FakePueue {
         self.kill_calls.lock().unwrap().push(task_id);
         Ok(())
     }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        panic!("daemon loop must not provision Pueue groups")
+    }
 }
 
 struct DaemonHarness {
@@ -96,6 +100,17 @@ impl DaemonHarness {
     }
 
     fn register_project(&self, project_id: &str, group: &str, program: &str) {
+        self.register_project_with_agent(project_id, group, program, &["{prompt}"], 1);
+    }
+
+    fn register_project_with_agent(
+        &self,
+        project_id: &str,
+        group: &str,
+        program: &str,
+        args: &[&str],
+        timeout_minutes: u32,
+    ) {
         let root = self.root(project_id);
         fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
         fs::write(
@@ -114,8 +129,8 @@ pueue_group = "{group}"
 
 [agent]
 program = "{program}"
-args = ["{{prompt}}"]
-timeout_minutes = 1
+args = [{args}]
+timeout_minutes = {timeout_minutes}
 max_retries = 1
 
 [check]
@@ -140,10 +155,19 @@ kill_after_minutes = 0
 max_consecutive_failures = 3
 max_experiments = 20
 max_agent_runs = 10
-"#
+"#,
+                args = toml_string_array(args),
             ),
         )
         .unwrap();
+
+        if ProjectRepository::new(&self.db)
+            .find_by_id(project_id)
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
 
         ProjectRepository::new(&self.db)
             .register(&NewProject::new(
@@ -168,6 +192,7 @@ max_agent_runs = 10
                 lease_seconds: 60,
                 claim_limit: 100,
                 now_override: Some(self.now),
+                shutdown_grace_period: Duration::from_secs(30),
             },
         )
     }
@@ -208,6 +233,36 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn agent_run_statuses(&self) -> Vec<AgentRunStatus> {
+        let connection = self.db.connect().unwrap();
+        let mut statement = connection
+            .prepare("SELECT status FROM agent_runs ORDER BY run_id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, AgentRunStatus>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    async fn wait_for_active_agent(&self) {
+        let repository = AgentRunRepository::new(&self.db);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if repository
+                    .find_active_by_project("project-a")
+                    .unwrap()
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent should start");
+    }
+
     fn count(&self, table: &str) -> i64 {
         self.db
             .connect()
@@ -234,6 +289,14 @@ max_agent_runs = 10
             )
             .unwrap();
     }
+}
+
+fn toml_string_array(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn running_task() -> PueueTask {
@@ -284,6 +347,107 @@ async fn daemon_shutdown_is_graceful() {
         .expect("daemon task should not panic");
 
     result.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_shutdown_drains_child_agent_that_finishes_promptly() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 0.1"],
+        1,
+    );
+    harness.enqueue(EventKind::DeepCheck, "project-a", "deep-check");
+    let mut daemon = harness.daemon();
+    let shutdown = CancellationToken::new();
+    let join = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { daemon.run(shutdown).await }
+    });
+
+    harness.wait_for_active_agent().await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("daemon should drain promptly")
+        .expect("daemon task should not panic")
+        .unwrap();
+
+    assert_eq!(
+        harness.agent_run_statuses(),
+        vec![AgentRunStatus::Completed]
+    );
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn daemon_shutdown_bounds_long_running_child_agent_and_marks_it_terminal() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 10"],
+        1,
+    );
+    harness.enqueue(EventKind::DeepCheck, "project-a", "deep-check");
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        AgentRunner::new(AgentRunnerConfig::for_tests(
+            harness.temp.path().join("agent.log"),
+        )),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(100),
+        },
+    );
+    let shutdown = CancellationToken::new();
+    let join = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { daemon.run(shutdown).await }
+    });
+
+    harness.wait_for_active_agent().await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("daemon should not hang indefinitely on a long-running child")
+        .expect("daemon task should not panic")
+        .unwrap();
+
+    assert_eq!(harness.agent_run_statuses(), vec![AgentRunStatus::TimedOut]);
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn injected_shutdown_signal_cancels_daemon_token() {
+    let shutdown = CancellationToken::new();
+    let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(pueue_agent::daemon::cancel_token_on_shutdown_signal(
+        shutdown.clone(),
+        async move {
+            let _ = receiver.await;
+        },
+    ));
+
+    assert!(!shutdown.is_cancelled());
+    sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
+        .await
+        .expect("injected signal should cancel token");
+    task.await.unwrap();
 }
 
 #[tokio::test]

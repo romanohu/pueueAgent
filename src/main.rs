@@ -33,7 +33,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Init(args) => commands::init(args),
-        Command::Enable(args) => commands::enable(args),
+        Command::Enable(args) => commands::enable(args).await,
         Command::Disable(args) => commands::disable(args),
         Command::Submit(args) => commands::submit(args).await,
         Command::Event(args) => commands::event(args),
@@ -50,7 +50,7 @@ mod commands {
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
         cli::{DaemonArgs, EventArgs, InitArgs, ProjectArgs, SubmitArgs},
-        daemon::{Daemon, DaemonConfig},
+        daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::Db,
         events::{record_callback, CallbackMetadata},
         paths, project,
@@ -60,13 +60,12 @@ mod commands {
         },
         submit as submit_command, AppError,
     };
-    use tokio_util::sync::CancellationToken;
 
     pub fn init(_args: InitArgs) -> Result<(), AppError> {
         Ok(())
     }
 
-    pub fn enable(args: ProjectArgs) -> Result<(), AppError> {
+    pub async fn enable(args: ProjectArgs) -> Result<(), AppError> {
         let current_dir = env::current_dir().map_err(|source| AppError::Io {
             operation: "read current directory",
             source,
@@ -83,7 +82,14 @@ mod commands {
             now: unix_timestamp()?,
         };
         let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
-        enable_with(&db, &options, &ServiceManager, &callbacks)
+        let pueue = CommandPueue::new(
+            "pueue",
+            vec![
+                OsString::from("--config"),
+                OsString::from(service_paths.pueue_config.as_os_str()),
+            ],
+        );
+        enable_with(&db, &options, &ServiceManager, &callbacks, &pueue).await
     }
 
     pub fn disable(_args: ProjectArgs) -> Result<(), AppError> {
@@ -151,7 +157,7 @@ mod commands {
             AgentRunner::new(AgentRunnerConfig::production()),
             DaemonConfig::default(),
         );
-        daemon.run(CancellationToken::new()).await
+        daemon.run(production_shutdown_token()).await
     }
 
     fn unix_timestamp() -> Result<i64, AppError> {

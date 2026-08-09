@@ -62,6 +62,10 @@ impl PueueApi for FakePueue {
     async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
         panic!("reconciliation must not kill Pueue tasks")
     }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        panic!("reconciliation must not provision Pueue groups")
+    }
 }
 
 struct Harness {

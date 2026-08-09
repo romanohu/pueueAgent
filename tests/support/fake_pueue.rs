@@ -26,6 +26,7 @@ struct FakePueueState {
     add_task_id: Mutex<i64>,
     add_calls: Mutex<Vec<Vec<OsString>>>,
     kill_calls: Mutex<Vec<i64>>,
+    group_calls: Mutex<Vec<String>>,
     fail_add: AtomicBool,
     pause_add: AtomicBool,
     add_entered: Notify,
@@ -40,6 +41,7 @@ impl FakePueue {
                 add_task_id: Mutex::new(41),
                 add_calls: Mutex::new(Vec::new()),
                 kill_calls: Mutex::new(Vec::new()),
+                group_calls: Mutex::new(Vec::new()),
                 fail_add: AtomicBool::new(false),
                 pause_add: AtomicBool::new(false),
                 add_entered: Notify::new(),
@@ -109,6 +111,15 @@ impl PueueApi for FakePueue {
         self.state.kill_calls.lock().unwrap().push(task_id);
         Ok(())
     }
+
+    async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
+        self.state
+            .group_calls
+            .lock()
+            .unwrap()
+            .push(group.to_owned());
+        Ok(())
+    }
 }
 
 pub struct FakePueueCommand {
@@ -139,7 +150,7 @@ operation=""
 for argument in "$@"; do
     printf '%s\0' "$argument" >> "$capture_path"
     case "$argument" in
-        status|add|kill)
+        status|add|group|kill)
             if [ -z "$operation" ]; then
                 operation="$argument"
             fi
@@ -154,6 +165,7 @@ fi
 case "$operation" in
     status) /bin/cat "$status_path" ;;
     add) /bin/cat "$add_path" ;;
+    group) : ;;
     kill) : ;;
     *) printf 'missing operation' >&2; exit 9 ;;
 esac

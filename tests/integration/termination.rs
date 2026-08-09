@@ -119,6 +119,10 @@ impl PueueApi for FakePueue {
         }
         Ok(())
     }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        panic!("termination tests must not provision Pueue groups")
+    }
 }
 
 struct Harness {

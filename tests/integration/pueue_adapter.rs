@@ -135,6 +135,31 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
 }
 
 #[tokio::test]
+async fn command_adapter_provisions_group_without_shell() {
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+
+    adapter
+        .ensure_group("pa-project with spaces")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture.captured_args(),
+        vec![
+            "--config",
+            "profile path.yml",
+            "group",
+            "add",
+            "pa-project with spaces",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn status_json_preserves_task_identity_timestamps_and_result() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());

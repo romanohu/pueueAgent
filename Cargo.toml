@@ -51,7 +51,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 toml = "0.8"
 uuid = { version = "1", features = ["serde", "v4"] }

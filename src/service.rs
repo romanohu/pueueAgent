@@ -8,7 +8,9 @@ use crate::{
     config,
     db::{Db, ProjectRepository},
     models::NewProject,
-    paths, AppError,
+    paths,
+    pueue::PueueApi,
+    AppError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +167,17 @@ impl CallbackRegistry for PueueConfigCallbackRegistry {
             operation: "read Pueue configuration",
             source,
         })?;
-        Ok(find_callback_line(&contents).and_then(parse_callback_value))
+        let scan = scan_callbacks(&contents);
+        if scan.daemon_callback_line.is_none() && scan.outside_callback_line.is_some() {
+            return Err(AppError::Message {
+                message: "Pueue callback exists outside daemon; refusing to edit configuration"
+                    .to_owned(),
+            });
+        }
+        Ok(scan
+            .daemon_callback_line
+            .and_then(|line| contents.lines().nth(line))
+            .and_then(parse_callback_value))
     }
 
     fn set_callback(&self, command: &str) -> Result<(), AppError> {
@@ -173,7 +185,7 @@ impl CallbackRegistry for PueueConfigCallbackRegistry {
             operation: "read Pueue configuration",
             source,
         })?;
-        let replacement = replace_or_append_callback(&contents, command);
+        let replacement = replace_or_insert_daemon_callback(&contents, command)?;
         fs::write(&self.config_path, replacement).map_err(|source| AppError::Io {
             operation: "write Pueue configuration",
             source,
@@ -204,15 +216,18 @@ pub fn install_callback_once(
     }
 }
 
-pub fn enable_with(
+pub async fn enable_with(
     db: &Db,
     options: &EnableOptions,
     service: &impl ServiceControl,
     callbacks: &impl CallbackRegistry,
+    pueue: &impl PueueApi,
 ) -> Result<(), AppError> {
     let config_path = options.project_root.join(".pueue-agent/config.toml");
     let project_config = config::load(&config_path)?;
     register_project_if_needed(db, options, &config_path, &project_config)?;
+
+    pueue.ensure_group(&project_config.pueue_group).await?;
 
     let command = callback_command(&options.service_paths);
     install_callback_once(callbacks, &command)?;
@@ -263,8 +278,8 @@ After=default.target
 [Service]
 Type=simple
 ExecStart={} daemon --foreground --pueue-config {}
-Environment=PATH={}
-Environment=PUEUE_AGENT_STATE_DIR={}
+Environment={}
+Environment={}
 WorkingDirectory={}
 Restart=on-failure
 RestartSec=5
@@ -272,11 +287,14 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 "#,
-        paths.release_binary.display(),
-        paths.pueue_config.display(),
-        paths.path_env,
-        paths.state_dir.display(),
-        paths.working_dir.display(),
+        systemd_quote(&paths.release_binary.display().to_string()),
+        systemd_quote(&paths.pueue_config.display().to_string()),
+        systemd_quote(&format!("PATH={}", paths.path_env)),
+        systemd_quote(&format!(
+            "PUEUE_AGENT_STATE_DIR={}",
+            paths.state_dir.display()
+        )),
+        systemd_quote(&paths.working_dir.display().to_string()),
     )
 }
 
@@ -446,12 +464,6 @@ fn run_service_command(program: &str, args: &[&str]) -> Result<(), AppError> {
     }
 }
 
-fn find_callback_line(contents: &str) -> Option<&str> {
-    contents
-        .lines()
-        .find(|line| line.trim_start().starts_with("callback:"))
-}
-
 fn parse_callback_value(line: &str) -> Option<String> {
     let value = line.split_once(':')?.1.trim();
     if value == "null" || value == "~" || value.is_empty() {
@@ -466,35 +478,142 @@ fn parse_callback_value(line: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-fn replace_or_append_callback(contents: &str, command: &str) -> String {
-    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut replaced = false;
-    let mut output = contents
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("callback:") {
-                replaced = true;
-                let indent_len = line.len() - line.trim_start().len();
-                format!("{}callback: \"{}\"", &line[..indent_len], escaped)
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !replaced {
-        if !output.ends_with('\n') {
-            output.push('\n');
+#[derive(Debug, Default)]
+struct CallbackScan {
+    daemon_line: Option<usize>,
+    daemon_indent: usize,
+    daemon_end_line: usize,
+    daemon_callback_line: Option<usize>,
+    outside_callback_line: Option<usize>,
+}
+
+fn scan_callbacks(contents: &str) -> CallbackScan {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let mut scan = CallbackScan {
+        daemon_end_line: lines.len(),
+        ..CallbackScan::default()
+    };
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
         }
-        output.push_str(&format!("callback: \"{}\"\n", escaped));
-    } else if contents.ends_with('\n') {
+        if key_name(trimmed) == Some("daemon") {
+            scan.daemon_line = Some(index);
+            scan.daemon_indent = line.len() - trimmed.len();
+            break;
+        }
+    }
+
+    if let Some(daemon_line) = scan.daemon_line {
+        for (index, line) in lines.iter().enumerate().skip(daemon_line + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            if indent <= scan.daemon_indent {
+                scan.daemon_end_line = index;
+                break;
+            }
+            if key_name(trimmed) == Some("callback") {
+                scan.daemon_callback_line = Some(index);
+            }
+        }
+    }
+
+    for (index, line) in lines.iter().enumerate() {
+        if Some(index) == scan.daemon_callback_line {
+            continue;
+        }
+        if scan
+            .daemon_line
+            .is_some_and(|daemon_line| index > daemon_line && index < scan.daemon_end_line)
+        {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if key_name(trimmed) == Some("callback") {
+            scan.outside_callback_line = Some(index);
+            break;
+        }
+    }
+
+    scan
+}
+
+fn key_name(trimmed_line: &str) -> Option<&str> {
+    let (key, _) = trimmed_line.split_once(':')?;
+    let key = key.trim();
+    if key.is_empty() || key.starts_with('#') {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+fn replace_or_insert_daemon_callback(contents: &str, command: &str) -> Result<String, AppError> {
+    let scan = scan_callbacks(contents);
+    if scan.daemon_callback_line.is_none() && scan.outside_callback_line.is_some() {
+        return Err(AppError::Message {
+            message: "Pueue callback exists outside daemon; refusing to edit configuration"
+                .to_owned(),
+        });
+    }
+
+    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+    let callback_line = if scan.daemon_line.is_some() {
+        format!(
+            "{}callback: \"{}\"",
+            " ".repeat(scan.daemon_indent + 2),
+            escaped
+        )
+    } else {
+        format!("  callback: \"{}\"", escaped)
+    };
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+
+    if let Some(line) = scan.daemon_callback_line {
+        lines[line] = callback_line;
+    } else if scan.daemon_line.is_some() {
+        lines.insert(scan.daemon_end_line, callback_line);
+    } else {
+        if !lines.is_empty() {
+            lines.push("daemon:".to_owned());
+        } else {
+            lines = vec!["daemon:".to_owned()];
+        }
+        lines.push(callback_line);
+    }
+
+    let mut output = lines.join("\n");
+    if contents.ends_with('\n') || !output.is_empty() {
         output.push('\n');
     }
-    output
+    Ok(output)
 }
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
+}
+
+fn systemd_quote(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn xml_escape(value: &str) -> String {
