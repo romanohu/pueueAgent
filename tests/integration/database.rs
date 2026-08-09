@@ -297,7 +297,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 4);
+        assert_eq!(migrated_version, 5);
         assert_eq!(index_count, 1);
         drop(connection);
 

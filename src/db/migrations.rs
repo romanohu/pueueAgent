@@ -305,51 +305,80 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             ))
             .map_err(database_error("apply SQLite v4 migration"))?;
     } else if version == 4 {
-        transaction
-            .execute_batch(
-                r#"
-            CREATE TABLE termination_requests_v5 (
-                request_id INTEGER PRIMARY KEY,
-                incident_id INTEGER NOT NULL,
-                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
-                task_signature TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN (
-                    'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
-                )),
-                requested_at INTEGER NOT NULL,
-                dispatch_lease_until INTEGER,
-                grace_until INTEGER,
-                confirmed_at INTEGER,
-                last_error TEXT,
-                UNIQUE(project_id, incident_id, task_signature),
-                FOREIGN KEY(project_id, incident_id)
-                    REFERENCES incidents(project_id, incident_id) ON DELETE CASCADE
-            );
-
-            INSERT INTO termination_requests_v5 (
-                request_id, incident_id, project_id, task_signature, reason, status,
-                requested_at, dispatch_lease_until, grace_until, confirmed_at, last_error
-            )
-            SELECT request_id, incident_id, project_id, task_signature, reason, status,
-                   requested_at, NULL, grace_until, confirmed_at, last_error
-            FROM termination_requests;
-
-            DROP TABLE termination_requests;
-            ALTER TABLE termination_requests_v5 RENAME TO termination_requests;
-            CREATE INDEX termination_requests_project_status_idx
-                ON termination_requests(project_id, status, requested_at);
-
-            PRAGMA user_version = 5;
-            "#,
-            )
-            .map_err(database_error("apply SQLite v5 migration"))?;
+        migrate_termination_requests_to_v5(&transaction)?;
+    }
+    if (1..=3).contains(&version) {
+        migrate_termination_requests_to_v5(&transaction)?;
     }
     ensure_invariant_indexes(&transaction)?;
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
 
+    Ok(())
+}
+
+fn migrate_termination_requests_to_v5(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_termination_requests: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'termination_requests'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error(
+            "check termination request table for migration",
+        ))?;
+    if !has_termination_requests {
+        transaction
+            .execute_batch("PRAGMA user_version = 5;")
+            .map_err(database_error("finish legacy SQLite migration"))?;
+        return Ok(());
+    }
+
+    transaction
+        .execute_batch(
+            r#"
+        CREATE TABLE termination_requests_v5 (
+            request_id INTEGER PRIMARY KEY,
+            incident_id INTEGER NOT NULL,
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            task_signature TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN (
+                'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
+            )),
+            requested_at INTEGER NOT NULL,
+            dispatch_lease_until INTEGER,
+            grace_until INTEGER,
+            confirmed_at INTEGER,
+            last_error TEXT,
+            UNIQUE(project_id, incident_id, task_signature),
+            FOREIGN KEY(project_id, incident_id)
+                REFERENCES incidents(project_id, incident_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO termination_requests_v5 (
+            request_id, incident_id, project_id, task_signature, reason, status,
+            requested_at, dispatch_lease_until, grace_until, confirmed_at, last_error
+        )
+        SELECT request_id, incident_id, project_id, task_signature, reason, status,
+               requested_at, NULL, grace_until, confirmed_at, last_error
+        FROM termination_requests;
+
+        DROP TABLE termination_requests;
+        ALTER TABLE termination_requests_v5 RENAME TO termination_requests;
+        CREATE INDEX termination_requests_project_status_idx
+            ON termination_requests(project_id, status, requested_at);
+
+        PRAGMA user_version = 5;
+        "#,
+        )
+        .map_err(database_error("apply SQLite v5 migration"))?;
     Ok(())
 }
 

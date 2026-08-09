@@ -15,6 +15,7 @@ use crate::{
 pub type TerminationRequestId = i64;
 
 pub const DEFAULT_CONFIRMATION_GRACE_SECONDS: i64 = 120;
+pub const MAX_KILL_DURATION_SECONDS: u64 = 30;
 pub const DISPATCH_LEASE_SECONDS: i64 = 120;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -175,7 +176,17 @@ where
                     operation: "read termination dispatch lease",
                 })?;
 
-        let kill_result = self.pueue.kill(task.id).await;
+        let kill_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(MAX_KILL_DURATION_SECONDS),
+            self.pueue.kill(task.id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(AppError::Runtime {
+                operation: "Pueue kill timed out",
+            }),
+        };
         match kill_result {
             Ok(()) => {
                 let grace_until = confirmation_grace_until()?;
