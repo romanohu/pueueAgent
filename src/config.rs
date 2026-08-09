@@ -7,6 +7,9 @@ use serde::Deserialize;
 
 use crate::AppError;
 
+pub const DEFAULT_LOG_TAIL_BYTES: u32 = 64 * 1024;
+pub const DEFAULT_MAX_AGENT_RUNS: u32 = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub project_id: String,
@@ -30,6 +33,7 @@ pub struct CheckConfig {
     pub deep_check_every: u32,
     pub deep_check_interval_minutes: u32,
     pub stall_minutes: u32,
+    pub log_tail_bytes: u32,
     pub extra_log_paths: Vec<PathBuf>,
     pub patterns: Vec<PatternConfig>,
     pub stall: StallConfig,
@@ -60,6 +64,7 @@ pub struct StallConfig {
 pub struct GuardrailsConfig {
     pub max_consecutive_failures: u32,
     pub max_experiments: u32,
+    pub max_agent_runs: u32,
 }
 
 pub fn load(path: &Path) -> Result<ProjectConfig, AppError> {
@@ -86,7 +91,7 @@ impl PatternAction {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawProjectConfig {
     project_id: String,
     pueue_group: String,
@@ -111,7 +116,7 @@ impl RawProjectConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawAgentConfig {
     program: String,
     args: Vec<String>,
@@ -133,12 +138,14 @@ impl RawAgentConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawCheckConfig {
     interval_minutes: i64,
     deep_check_every: i64,
     deep_check_interval_minutes: i64,
     stall_minutes: i64,
+    #[serde(default = "default_log_tail_bytes")]
+    log_tail_bytes: i64,
     extra_log_paths: Vec<PathBuf>,
     patterns: Vec<RawPatternConfig>,
     stall: RawStallConfig,
@@ -154,6 +161,7 @@ impl RawCheckConfig {
                 "check.deep_check_interval_minutes",
             )?,
             stall_minutes: positive(self.stall_minutes, "check.stall_minutes")?,
+            log_tail_bytes: positive(self.log_tail_bytes, "check.log_tail_bytes")?,
             extra_log_paths: self.extra_log_paths,
             patterns: self
                 .patterns
@@ -166,6 +174,7 @@ impl RawCheckConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPatternConfig {
     #[serde(default)]
     name: String,
@@ -195,6 +204,7 @@ impl RawPatternConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawStallConfig {
     #[serde(default = "default_notify")]
     action: String,
@@ -230,10 +240,12 @@ impl RawStallConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct RawGuardrailsConfig {
     max_consecutive_failures: i64,
     max_experiments: i64,
+    #[serde(default = "default_max_agent_runs")]
+    max_agent_runs: i64,
 }
 
 impl RawGuardrailsConfig {
@@ -244,6 +256,7 @@ impl RawGuardrailsConfig {
                 "guardrails.max_consecutive_failures",
             )?,
             max_experiments: positive(self.max_experiments, "guardrails.max_experiments")?,
+            max_agent_runs: positive(self.max_agent_runs, "guardrails.max_agent_runs")?,
         })
     }
 }
@@ -258,6 +271,14 @@ fn default_notify() -> String {
 
 fn default_confirm_matches() -> i64 {
     1
+}
+
+fn default_log_tail_bytes() -> i64 {
+    i64::from(DEFAULT_LOG_TAIL_BYTES)
+}
+
+fn default_max_agent_runs() -> i64 {
+    i64::from(DEFAULT_MAX_AGENT_RUNS)
 }
 
 fn required(value: &str, field: &'static str) -> Result<(), AppError> {

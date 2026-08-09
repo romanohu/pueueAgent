@@ -1,12 +1,25 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use crate::AppError;
 
 pub fn state_db_path() -> Result<PathBuf, AppError> {
-    let state_home = env::var_os("XDG_STATE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(platform_state_home)
+    let xdg_state_home = env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    let home = env::var_os("HOME").map(PathBuf::from);
+
+    state_db_path_with(xdg_state_home.as_deref(), home.as_deref())
+}
+
+pub fn state_db_path_with(
+    xdg_state_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, AppError> {
+    let state_home = xdg_state_home
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| platform_state_home(home))
         .ok_or(AppError::Configuration {
             field: "XDG_STATE_HOME or HOME",
         })?;
@@ -15,17 +28,13 @@ pub fn state_db_path() -> Result<PathBuf, AppError> {
 }
 
 #[cfg(target_os = "macos")]
-fn platform_state_home() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+fn platform_state_home(home: Option<&Path>) -> Option<PathBuf> {
+    home.filter(|path| !path.as_os_str().is_empty())
         .map(|home| home.join("Library/Application Support"))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn platform_state_home() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+fn platform_state_home(home: Option<&Path>) -> Option<PathBuf> {
+    home.filter(|path| !path.as_os_str().is_empty())
         .map(|home| home.join(".local/state"))
 }
