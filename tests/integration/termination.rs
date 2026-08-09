@@ -558,6 +558,35 @@ async fn already_terminal_without_sent_kill_does_not_emit_auto_killed() {
 }
 
 #[tokio::test]
+async fn dispatching_terminal_task_is_not_marked_auto_killed_before_retry() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    let request_id = harness.make_pending_request_dispatching();
+    let terminal_task = PueueTask {
+        state: "Finished".to_owned(),
+        ended_at: Some("201".to_owned()),
+        ..harness.task.clone()
+    };
+    harness.fake_pueue.set_tasks(vec![terminal_task]);
+
+    Reconciler::new(&harness.db, harness.fake_pueue.clone())
+        .run_once()
+        .await
+        .unwrap();
+
+    assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
+    assert_eq!(harness.pending_event_count(EventKind::TaskFinished), 1);
+    assert_eq!(
+        TerminationRequestRepository::new(&harness.db)
+            .find_by_id(request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TerminationRequestStatus::Dispatching
+    );
+}
+
+#[tokio::test]
 async fn termination_revalidates_full_task_signature_before_kill() {
     let harness = Harness::running_task("project-a", 41);
     harness.observe_fatal_pattern("cuda-oom");
@@ -693,6 +722,7 @@ async fn kill_error_does_not_overwrite_concurrent_auto_kill_confirmation() {
             .unwrap()
     });
     harness.fake_pueue.wait_until_kill_started().await;
+    harness.make_pending_request_sent(Some(i64::MAX));
 
     let terminal_task = PueueTask {
         state: "Killed".to_owned(),

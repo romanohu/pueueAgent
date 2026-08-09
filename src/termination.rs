@@ -290,8 +290,14 @@ fn finish_sent_request(
             Some(message),
         )? {
             insert_termination_failed_event_for_request(db, &timed_out, message, now)?;
+            return Ok(TerminationOutcome::TimedOut);
         }
-        return Ok(TerminationOutcome::TimedOut);
+        let current = repository
+            .find_by_id(request.request_id)?
+            .ok_or(AppError::Runtime {
+                operation: "reload concurrently completed termination request",
+            })?;
+        return outcome_for_non_requested(db, repository, &current);
     }
     Ok(TerminationOutcome::PendingConfirmation)
 }
@@ -331,8 +337,7 @@ pub fn auto_kill_request_for_terminal_task(
 ) -> Result<Option<crate::models::TerminationRequest>, AppError> {
     let requests = TerminationRequestRepository::new(db).find_by_project(project_id)?;
     Ok(requests.into_iter().find(|request| {
-        (request.status == TerminationRequestStatus::Dispatching
-            || request.status == TerminationRequestStatus::Sent
+        (request.status == TerminationRequestStatus::Sent
             || (request.status == TerminationRequestStatus::Confirmed
                 && request.last_error.is_none()))
             && request_matches_terminal_task(request, task)
