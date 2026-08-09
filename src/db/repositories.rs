@@ -1,11 +1,14 @@
 use std::{fs, path::PathBuf};
 
-use rusqlite::{params, types::Type, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, types::Type, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 
 use crate::{
     models::{
-        path_text, Event, Incident, IncidentTransition, IncidentUpdate, NewEvent, NewIncident,
-        NewProject, Project,
+        path_text, AgentRun, AgentRunEvent, Event, Incident, IncidentTransition, IncidentUpdate,
+        NewAgentRun, NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
+        NewTerminationRequest, Project, Submission, TaskObservation, TerminationRequest,
     },
     AppError,
 };
@@ -90,6 +93,45 @@ impl<'db> ProjectRepository<'db> {
             .commit()
             .map_err(database_error("commit project registration"))?;
         Ok(registered)
+    }
+
+    pub fn find_by_group(&self, pueue_group: &str) -> Result<Option<Project>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE pueue_group = ?1",
+                [pueue_group],
+                project_from_row,
+            )
+            .optional()
+            .map_err(database_error("find project by Pueue group"))
+    }
+
+    pub fn find_by_root(&self, root: &std::path::Path) -> Result<Option<Project>, AppError> {
+        let canonical_root = match fs::canonicalize(root) {
+            Ok(path) => path,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AppError::Io {
+                    operation: "canonicalize project root for lookup",
+                    source,
+                })
+            }
+        };
+        let root_path = path_text(&canonical_root, "root_path")?;
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE root_path = ?1",
+                [root_path],
+                project_from_row,
+            )
+            .optional()
+            .map_err(database_error("find project by canonical root"))
     }
 }
 
@@ -245,26 +287,47 @@ impl<'db> IncidentRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin active incident upsert"))?;
-        let active = transaction
+        let latest_resolved = transaction
             .query_row(
                 &format!(
                     "{} WHERE project_id = ?1 AND kind = ?2 AND fingerprint = ?3
-                     AND status IN ('open', 'acknowledged')",
+                     AND status = 'resolved' AND resolved_at IS NOT NULL
+                     ORDER BY resolved_at DESC, incident_id DESC LIMIT 1",
                     INCIDENT_SELECT
                 ),
                 params![incident.project_id, incident.kind, incident.fingerprint],
                 incident_from_row,
             )
             .optional()
-            .map_err(database_error("read active incident"))?;
+            .map_err(database_error("read latest resolved incident"))?;
 
-        let update = if let Some(active) = active {
-            let changed = incident.seen_at > active.last_seen_at
-                || incident
+        let update = if let Some(resolved) = latest_resolved.filter(|resolved| {
+            resolved
+                .resolved_at
+                .is_some_and(|at| incident.seen_at <= at)
+        }) {
+            IncidentUpdate {
+                incident: resolved,
+                transition: IncidentTransition::Unchanged,
+            }
+        } else {
+            let active = transaction
+                .query_row(
+                    &format!(
+                        "{} WHERE project_id = ?1 AND kind = ?2 AND fingerprint = ?3
+                         AND status IN ('open', 'acknowledged')",
+                        INCIDENT_SELECT
+                    ),
+                    params![incident.project_id, incident.kind, incident.fingerprint],
+                    incident_from_row,
+                )
+                .optional()
+                .map_err(database_error("read active incident"))?;
+            if let Some(active) = active {
+                let task_changed = incident
                     .task_key
                     .as_ref()
                     .is_some_and(|task_key| Some(task_key) != active.task_key.as_ref());
-            if changed {
                 transaction
                     .execute(
                         "UPDATE incidents
@@ -274,36 +337,36 @@ impl<'db> IncidentRepository<'db> {
                         params![incident.task_key, incident.seen_at, active.incident_id],
                     )
                     .map_err(database_error("update active incident"))?;
-            }
-            let stored = read_incident(&transaction, active.incident_id)?;
-            IncidentUpdate {
-                incident: stored,
-                transition: if changed {
-                    IncidentTransition::Updated
-                } else {
-                    IncidentTransition::Unchanged
-                },
-            }
-        } else {
-            transaction
-                .execute(
-                    "INSERT INTO incidents (
-                        project_id, kind, task_key, fingerprint, status,
-                        first_seen_at, last_seen_at, acknowledged_at, resolved_at
-                     ) VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, NULL, NULL)",
-                    params![
-                        incident.project_id,
-                        incident.kind,
-                        incident.task_key,
-                        incident.fingerprint,
-                        incident.seen_at,
-                    ],
-                )
-                .map_err(database_error("insert active incident"))?;
-            let stored = read_incident(&transaction, transaction.last_insert_rowid())?;
-            IncidentUpdate {
-                incident: stored,
-                transition: IncidentTransition::Opened,
+                let stored = read_incident(&transaction, active.incident_id)?;
+                IncidentUpdate {
+                    incident: stored,
+                    transition: if task_changed {
+                        IncidentTransition::Updated
+                    } else {
+                        IncidentTransition::Unchanged
+                    },
+                }
+            } else {
+                transaction
+                    .execute(
+                        "INSERT INTO incidents (
+                            project_id, kind, task_key, fingerprint, status,
+                            first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                         ) VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?5, NULL, NULL)",
+                        params![
+                            incident.project_id,
+                            incident.kind,
+                            incident.task_key,
+                            incident.fingerprint,
+                            incident.seen_at,
+                        ],
+                    )
+                    .map_err(database_error("insert active incident"))?;
+                let stored = read_incident(&transaction, transaction.last_insert_rowid())?;
+                IncidentUpdate {
+                    incident: stored,
+                    transition: IncidentTransition::Opened,
+                }
             }
         };
 
@@ -343,6 +406,296 @@ impl<'db> IncidentRepository<'db> {
     }
 }
 
+pub struct SubmissionRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> SubmissionRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_idempotent(&self, submission: &NewSubmission) -> Result<Submission, AppError> {
+        let argv_json =
+            serde_json::to_string(&submission.argv).map_err(|source| AppError::Serialization {
+                operation: "serialize submission arguments",
+                source,
+            })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin idempotent submission insert"))?;
+        transaction
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at,
+                    pueue_task_id, task_signature, status
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)
+                 ON CONFLICT(submission_id) DO NOTHING",
+                params![
+                    submission.submission_id,
+                    submission.project_id,
+                    argv_json,
+                    submission.created_at,
+                    submission.status,
+                ],
+            )
+            .map_err(database_error("insert submission"))?;
+        let stored = read_submission(&transaction, &submission.submission_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit idempotent submission insert"))?;
+        Ok(stored)
+    }
+
+    pub fn find_by_id(&self, submission_id: &str) -> Result<Option<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{} WHERE submission_id = ?1", SUBMISSION_SELECT),
+                [submission_id],
+                submission_from_row,
+            )
+            .optional()
+            .map_err(database_error("find submission by ID"))
+    }
+}
+
+pub struct AgentRunRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> AgentRunRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert(&self, run: &NewAgentRun) -> Result<AgentRun, AppError> {
+        let log_path = path_text(&run.log_path, "log_path")?;
+        let connection = self.db.connect()?;
+        connection
+            .execute(
+                "INSERT INTO agent_runs (
+                    project_id, primary_event_id, pid, status, started_at,
+                    finished_at, exit_code, log_path, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL)",
+                params![
+                    run.project_id,
+                    run.primary_event_id,
+                    run.pid,
+                    run.status,
+                    run.started_at,
+                    log_path,
+                ],
+            )
+            .map_err(database_error("insert agent run"))?;
+        read_agent_run(&connection, connection.last_insert_rowid())
+    }
+
+    pub fn find_active_by_project(&self, project_id: &str) -> Result<Option<AgentRun>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND status IN ('starting', 'running')
+                     ORDER BY started_at DESC, run_id DESC LIMIT 1",
+                    AGENT_RUN_SELECT
+                ),
+                [project_id],
+                agent_run_from_row,
+            )
+            .optional()
+            .map_err(database_error("find active agent run"))
+    }
+
+    pub fn attach_event(&self, run_id: i64, event_id: i64) -> Result<AgentRunEvent, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin agent run event attachment"))?;
+        let project_id = transaction
+            .query_row(
+                "SELECT project_id FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(database_error("read agent run project"))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_run_events (project_id, run_id, event_id)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(run_id, event_id) DO NOTHING",
+                params![project_id, run_id, event_id],
+            )
+            .map_err(database_error("attach event to agent run"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit agent run event attachment"))?;
+        Ok(AgentRunEvent {
+            project_id,
+            run_id,
+            event_id,
+        })
+    }
+}
+
+pub struct TerminationRequestRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> TerminationRequestRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_idempotent(
+        &self,
+        request: &NewTerminationRequest,
+    ) -> Result<TerminationRequest, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin idempotent termination request insert",
+            ))?;
+        transaction
+            .execute(
+                "INSERT INTO termination_requests (
+                    incident_id, project_id, task_signature, reason, status,
+                    requested_at, grace_until, confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)
+                 ON CONFLICT(project_id, incident_id, task_signature) DO NOTHING",
+                params![
+                    request.incident_id,
+                    request.project_id,
+                    request.task_signature,
+                    request.reason,
+                    request.status,
+                    request.requested_at,
+                    request.grace_until,
+                ],
+            )
+            .map_err(database_error("insert termination request"))?;
+        let stored = transaction
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND incident_id = ?2 AND task_signature = ?3",
+                    TERMINATION_REQUEST_SELECT
+                ),
+                params![
+                    request.project_id,
+                    request.incident_id,
+                    request.task_signature,
+                ],
+                termination_request_from_row,
+            )
+            .map_err(database_error("read idempotent termination request"))?;
+        transaction.commit().map_err(database_error(
+            "commit idempotent termination request insert",
+        ))?;
+        Ok(stored)
+    }
+
+    pub fn find_by_id(&self, request_id: i64) -> Result<Option<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{} WHERE request_id = ?1", TERMINATION_REQUEST_SELECT),
+                [request_id],
+                termination_request_from_row,
+            )
+            .optional()
+            .map_err(database_error("find termination request by ID"))
+    }
+}
+
+pub struct TaskObservationRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> TaskObservationRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn upsert(&self, observation: &NewTaskObservation) -> Result<TaskObservation, AppError> {
+        let command_json = serde_json::to_string(&observation.command).map_err(|source| {
+            AppError::Serialization {
+                operation: "serialize task observation command",
+                source,
+            }
+        })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin task observation upsert"))?;
+        transaction
+            .execute(
+                "INSERT INTO task_observations (
+                    project_id, task_signature, pueue_task_id, pueue_group, command_json,
+                    state, enqueued_at, started_at, ended_at, result, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(project_id, task_signature) DO UPDATE SET
+                    pueue_task_id = excluded.pueue_task_id,
+                    pueue_group = excluded.pueue_group,
+                    command_json = excluded.command_json,
+                    state = excluded.state,
+                    enqueued_at = excluded.enqueued_at,
+                    started_at = excluded.started_at,
+                    ended_at = excluded.ended_at,
+                    result = excluded.result,
+                    observed_at = excluded.observed_at",
+                params![
+                    observation.project_id,
+                    observation.task_signature,
+                    observation.pueue_task_id,
+                    observation.pueue_group,
+                    command_json,
+                    observation.state,
+                    observation.enqueued_at,
+                    observation.started_at,
+                    observation.ended_at,
+                    observation.result,
+                    observation.observed_at,
+                ],
+            )
+            .map_err(database_error("upsert task observation"))?;
+        let stored = transaction
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND task_signature = ?2",
+                    TASK_OBSERVATION_SELECT
+                ),
+                params![observation.project_id, observation.task_signature],
+                task_observation_from_row,
+            )
+            .map_err(database_error("read upserted task observation"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit task observation upsert"))?;
+        Ok(stored)
+    }
+
+    pub fn find(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+    ) -> Result<Option<TaskObservation>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND task_signature = ?2",
+                    TASK_OBSERVATION_SELECT
+                ),
+                params![project_id, task_signature],
+                task_observation_from_row,
+            )
+            .optional()
+            .map_err(database_error("find task observation"))
+    }
+}
+
 const EVENT_SELECT: &str =
     "SELECT event_id, project_id, kind, dedup_key, payload_json, status, attempts,
             not_before, lease_until, created_at, completed_at, last_error
@@ -351,6 +704,22 @@ const EVENT_SELECT: &str =
 const INCIDENT_SELECT: &str = "SELECT incident_id, project_id, kind, task_key, fingerprint, status,
             first_seen_at, last_seen_at, acknowledged_at, resolved_at
      FROM incidents";
+
+const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, created_at,
+            pueue_task_id, task_signature, status
+     FROM submissions";
+
+const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid, status,
+            started_at, finished_at, exit_code, log_path, last_error
+     FROM agent_runs";
+
+const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, project_id,
+            task_signature, reason, status, requested_at, grace_until, confirmed_at, last_error
+     FROM termination_requests";
+
+const TASK_OBSERVATION_SELECT: &str = "SELECT project_id, task_signature, pueue_task_id,
+            pueue_group, command_json, state, enqueued_at, started_at, ended_at, result, observed_at
+     FROM task_observations";
 
 fn exists(
     transaction: &Transaction<'_>,
@@ -411,6 +780,92 @@ fn incident_from_row(row: &Row<'_>) -> rusqlite::Result<Incident> {
         last_seen_at: row.get(7)?,
         acknowledged_at: row.get(8)?,
         resolved_at: row.get(9)?,
+    })
+}
+
+fn submission_from_row(row: &Row<'_>) -> rusqlite::Result<Submission> {
+    let argv_json: String = row.get(2)?;
+    let argv = serde_json::from_str(&argv_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(source))
+    })?;
+    Ok(Submission {
+        submission_id: row.get(0)?,
+        project_id: row.get(1)?,
+        argv,
+        created_at: row.get(3)?,
+        pueue_task_id: row.get(4)?,
+        task_signature: row.get(5)?,
+        status: row.get(6)?,
+    })
+}
+
+fn read_submission(connection: &Connection, submission_id: &str) -> Result<Submission, AppError> {
+    connection
+        .query_row(
+            &format!("{} WHERE submission_id = ?1", SUBMISSION_SELECT),
+            [submission_id],
+            submission_from_row,
+        )
+        .map_err(database_error("read submission"))
+}
+
+fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
+    Ok(AgentRun {
+        run_id: row.get(0)?,
+        project_id: row.get(1)?,
+        primary_event_id: row.get(2)?,
+        pid: row.get(3)?,
+        status: row.get(4)?,
+        started_at: row.get(5)?,
+        finished_at: row.get(6)?,
+        exit_code: row.get(7)?,
+        log_path: PathBuf::from(row.get::<_, String>(8)?),
+        last_error: row.get(9)?,
+    })
+}
+
+fn read_agent_run(connection: &Connection, run_id: i64) -> Result<AgentRun, AppError> {
+    connection
+        .query_row(
+            &format!("{} WHERE run_id = ?1", AGENT_RUN_SELECT),
+            [run_id],
+            agent_run_from_row,
+        )
+        .map_err(database_error("read agent run"))
+}
+
+fn termination_request_from_row(row: &Row<'_>) -> rusqlite::Result<TerminationRequest> {
+    Ok(TerminationRequest {
+        request_id: row.get(0)?,
+        incident_id: row.get(1)?,
+        project_id: row.get(2)?,
+        task_signature: row.get(3)?,
+        reason: row.get(4)?,
+        status: row.get(5)?,
+        requested_at: row.get(6)?,
+        grace_until: row.get(7)?,
+        confirmed_at: row.get(8)?,
+        last_error: row.get(9)?,
+    })
+}
+
+fn task_observation_from_row(row: &Row<'_>) -> rusqlite::Result<TaskObservation> {
+    let command_json: String = row.get(4)?;
+    let command = serde_json::from_str(&command_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(source))
+    })?;
+    Ok(TaskObservation {
+        project_id: row.get(0)?,
+        task_signature: row.get(1)?,
+        pueue_task_id: row.get(2)?,
+        pueue_group: row.get(3)?,
+        command,
+        state: row.get(5)?,
+        enqueued_at: row.get(6)?,
+        started_at: row.get(7)?,
+        ended_at: row.get(8)?,
+        result: row.get(9)?,
+        observed_at: row.get(10)?,
     })
 }
 

@@ -113,6 +113,31 @@ database_enum!(IncidentStatus {
     Resolved => "resolved",
 });
 
+database_enum!(SubmissionStatus {
+    Pending => "pending",
+    Accepted => "accepted",
+    Adopted => "adopted",
+    Unreconciled => "unreconciled",
+    Failed => "failed",
+});
+
+database_enum!(AgentRunStatus {
+    Starting => "starting",
+    Running => "running",
+    Completed => "completed",
+    Failed => "failed",
+    TimedOut => "timed_out",
+    Cancelled => "cancelled",
+});
+
+database_enum!(TerminationRequestStatus {
+    Requested => "requested",
+    Sent => "sent",
+    Confirmed => "confirmed",
+    TimedOut => "timed_out",
+    Failed => "failed",
+});
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub project_id: String,
@@ -248,6 +273,201 @@ impl NewIncident {
 pub struct IncidentUpdate {
     pub incident: Incident,
     pub transition: IncidentTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    pub submission_id: String,
+    pub project_id: String,
+    pub argv: Vec<String>,
+    pub created_at: i64,
+    pub pueue_task_id: Option<i64>,
+    pub task_signature: Option<String>,
+    pub status: SubmissionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSubmission {
+    pub submission_id: String,
+    pub project_id: String,
+    pub argv: Vec<String>,
+    pub created_at: i64,
+    pub status: SubmissionStatus,
+}
+
+impl NewSubmission {
+    pub fn new(
+        submission_id: impl Into<String>,
+        project_id: impl Into<String>,
+        argv: Vec<String>,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            submission_id: submission_id.into(),
+            project_id: project_id.into(),
+            argv,
+            created_at,
+            status: SubmissionStatus::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRun {
+    pub run_id: i64,
+    pub project_id: String,
+    pub primary_event_id: i64,
+    pub pid: Option<i64>,
+    pub status: AgentRunStatus,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub log_path: PathBuf,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgentRun {
+    pub project_id: String,
+    pub primary_event_id: i64,
+    pub pid: Option<i64>,
+    pub status: AgentRunStatus,
+    pub started_at: i64,
+    pub log_path: PathBuf,
+}
+
+impl NewAgentRun {
+    pub fn new(
+        project_id: impl Into<String>,
+        primary_event_id: i64,
+        pid: Option<i64>,
+        status: AgentRunStatus,
+        started_at: i64,
+        log_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            primary_event_id,
+            pid,
+            status,
+            started_at,
+            log_path: log_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRunEvent {
+    pub project_id: String,
+    pub run_id: i64,
+    pub event_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminationRequest {
+    pub request_id: i64,
+    pub incident_id: i64,
+    pub project_id: String,
+    pub task_signature: String,
+    pub reason: String,
+    pub status: TerminationRequestStatus,
+    pub requested_at: i64,
+    pub grace_until: Option<i64>,
+    pub confirmed_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTerminationRequest {
+    pub incident_id: i64,
+    pub project_id: String,
+    pub task_signature: String,
+    pub reason: String,
+    pub status: TerminationRequestStatus,
+    pub requested_at: i64,
+    pub grace_until: Option<i64>,
+}
+
+impl NewTerminationRequest {
+    pub fn new(
+        incident_id: i64,
+        project_id: impl Into<String>,
+        task_signature: impl Into<String>,
+        reason: impl Into<String>,
+        requested_at: i64,
+        grace_until: Option<i64>,
+    ) -> Self {
+        Self {
+            incident_id,
+            project_id: project_id.into(),
+            task_signature: task_signature.into(),
+            reason: reason.into(),
+            status: TerminationRequestStatus::Requested,
+            requested_at,
+            grace_until,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskObservation {
+    pub project_id: String,
+    pub task_signature: String,
+    pub pueue_task_id: i64,
+    pub pueue_group: String,
+    pub command: Vec<String>,
+    pub state: String,
+    pub enqueued_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub result: Option<String>,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskObservation {
+    pub project_id: String,
+    pub task_signature: String,
+    pub pueue_task_id: i64,
+    pub pueue_group: String,
+    pub command: Vec<String>,
+    pub state: String,
+    pub enqueued_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub result: Option<String>,
+    pub observed_at: i64,
+}
+
+impl NewTaskObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        project_id: impl Into<String>,
+        task_signature: impl Into<String>,
+        pueue_task_id: i64,
+        pueue_group: impl Into<String>,
+        command: Vec<String>,
+        state: impl Into<String>,
+        enqueued_at: Option<i64>,
+        started_at: Option<i64>,
+        ended_at: Option<i64>,
+        result: Option<String>,
+        observed_at: i64,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            task_signature: task_signature.into(),
+            pueue_task_id,
+            pueue_group: pueue_group.into(),
+            command,
+            state: state.into(),
+            enqueued_at,
+            started_at,
+            ended_at,
+            result,
+            observed_at,
+        }
+    }
 }
 
 pub(crate) fn path_text<'path>(

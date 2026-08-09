@@ -6,8 +6,15 @@ use std::{
 };
 
 use pueue_agent::{
-    db::{Db, EventRepository, IncidentRepository, ProjectRepository},
-    models::{EventKind, EventStatus, IncidentTransition, NewEvent, NewIncident, NewProject},
+    db::{
+        AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
+        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+    },
+    models::{
+        AgentRunStatus, EventKind, EventStatus, IncidentStatus, IncidentTransition, NewAgentRun,
+        NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
+        NewTerminationRequest, SubmissionStatus, TerminationRequestStatus,
+    },
 };
 use rusqlite::params;
 use serde_json::json;
@@ -141,6 +148,26 @@ fn project_registration_rejects_duplicate_canonical_root_and_group() {
         .register(&same_group)
         .unwrap_err();
     assert!(group_error.to_string().contains("pueue_group"));
+}
+
+#[test]
+fn project_lookup_returns_registered_projects_by_group_and_canonical_root() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+
+    let repository = ProjectRepository::new(&test.db);
+    let by_group = repository.find_by_group("pa-project").unwrap().unwrap();
+    assert_eq!(by_group.project_id, "project-a");
+    assert_eq!(by_group.root_path, fs::canonicalize(&root).unwrap());
+
+    let by_root = repository.find_by_root(&root.join(".")).unwrap().unwrap();
+    assert_eq!(by_root.project_id, "project-a");
+    assert!(repository.find_by_group("missing-group").unwrap().is_none());
+    assert!(repository
+        .find_by_root(&test._temp.path().join("missing"))
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -296,7 +323,8 @@ fn resolved_incident_can_recur_without_duplicate_active_rows() {
         NewIncident::new("project-a", "pattern", Some("task-41"), "nan-loss:abc", 101);
     let updated = repository.upsert_active(&updated_input).unwrap();
     assert_eq!(updated.incident.incident_id, opened.incident.incident_id);
-    assert_eq!(updated.transition, IncidentTransition::Updated);
+    assert_eq!(updated.transition, IncidentTransition::Unchanged);
+    assert_eq!(updated.incident.last_seen_at, 101);
 
     assert_eq!(
         repository
@@ -304,9 +332,30 @@ fn resolved_incident_can_recur_without_duplicate_active_rows() {
             .unwrap(),
         IncidentTransition::Resolved
     );
-    let recurrence = repository.upsert_active(&updated_input).unwrap();
+    let stale = repository.upsert_active(&updated_input).unwrap();
+    assert_eq!(stale.transition, IncidentTransition::Unchanged);
+    assert_eq!(stale.incident.incident_id, opened.incident.incident_id);
+    assert_eq!(stale.incident.status, IncidentStatus::Resolved);
+
+    let at_resolution =
+        NewIncident::new("project-a", "pattern", Some("task-41"), "nan-loss:abc", 102);
+    let same_time = repository.upsert_active(&at_resolution).unwrap();
+    assert_eq!(same_time.transition, IncidentTransition::Unchanged);
+    assert_eq!(same_time.incident.incident_id, opened.incident.incident_id);
+
+    let later_input =
+        NewIncident::new("project-a", "pattern", Some("task-41"), "nan-loss:abc", 103);
+    let recurrence = repository.upsert_active(&later_input).unwrap();
     assert_eq!(recurrence.transition, IncidentTransition::Opened);
     assert_ne!(recurrence.incident.incident_id, opened.incident.incident_id);
+
+    let delayed_stale = repository.upsert_active(&updated_input).unwrap();
+    assert_eq!(delayed_stale.transition, IncidentTransition::Unchanged);
+    assert_eq!(
+        delayed_stale.incident.incident_id,
+        opened.incident.incident_id
+    );
+    assert_eq!(delayed_stale.incident.status, IncidentStatus::Resolved);
 
     let connection = test.db.connect().unwrap();
     let active_count: i64 = connection
@@ -319,6 +368,277 @@ fn resolved_incident_can_recur_without_duplicate_active_rows() {
         )
         .unwrap();
     assert_eq!(active_count, 1);
+}
+
+#[test]
+fn active_incident_reports_updated_only_when_task_identity_changes() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let repository = IncidentRepository::new(&test.db);
+
+    let opened = repository
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-41"),
+            "nan-loss:abc",
+            100,
+        ))
+        .unwrap();
+    let updated = repository
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-42"),
+            "nan-loss:abc",
+            101,
+        ))
+        .unwrap();
+
+    assert_eq!(updated.incident.incident_id, opened.incident.incident_id);
+    assert_eq!(updated.incident.task_key.as_deref(), Some("task-42"));
+    assert_eq!(updated.incident.last_seen_at, 101);
+    assert_eq!(updated.transition, IncidentTransition::Updated);
+}
+
+#[test]
+fn cross_project_foreign_keys_reject_agent_run_relationships() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-b");
+    let event_a = insert_event(&test.db, "project-a", "event-a", 100);
+    let event_b = insert_event(&test.db, "project-b", "event-b", 100);
+
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_runs (
+                project_id, primary_event_id, pid, status, started_at, finished_at, log_path
+             ) VALUES (?1, ?2, NULL, 'completed', ?3, ?3, ?4)",
+            params!["project-a", event_a, 100, "/tmp/agent-a.log"],
+        )
+        .unwrap();
+    let run_a = connection.last_insert_rowid();
+
+    assert!(connection
+        .execute(
+            "INSERT INTO agent_runs (
+                project_id, primary_event_id, pid, status, started_at, finished_at, log_path
+             ) VALUES (?1, ?2, NULL, 'completed', ?3, ?3, ?4)",
+            params!["project-a", event_b, 100, "/tmp/agent-cross-event.log"],
+        )
+        .is_err());
+
+    assert!(connection
+        .execute(
+            "INSERT INTO agent_run_events (project_id, run_id, event_id)
+             VALUES (?1, ?2, ?3)",
+            params!["project-a", run_a, event_b],
+        )
+        .is_err());
+
+    assert!(connection
+        .execute(
+            "INSERT INTO agent_run_events (project_id, run_id, event_id)
+             VALUES (?1, ?2, ?3)",
+            params!["project-b", run_a, event_b],
+        )
+        .is_err());
+}
+
+#[test]
+fn cross_project_foreign_key_rejects_termination_request_incident() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-b");
+
+    let incident_a = IncidentRepository::new(&test.db)
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-a"),
+            "fingerprint-a",
+            100,
+        ))
+        .unwrap()
+        .incident
+        .incident_id;
+    let connection = test.db.connect().unwrap();
+    assert!(connection
+        .execute(
+            "INSERT INTO termination_requests (
+                incident_id, project_id, task_signature, reason, status, requested_at
+             ) VALUES (?1, ?2, ?3, ?4, 'requested', ?5)",
+            params![incident_a, "project-b", "signature-b", "cross-project", 100],
+        )
+        .is_err());
+}
+
+#[test]
+fn only_one_active_agent_run_is_allowed_per_project() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let first_event = insert_event(&test.db, "project-a", "first-run", 100);
+    let second_event = insert_event(&test.db, "project-a", "second-run", 101);
+    let connection = test.db.connect().unwrap();
+
+    connection
+        .execute(
+            "INSERT INTO agent_runs (
+                project_id, primary_event_id, pid, status, started_at, log_path
+             ) VALUES (?1, ?2, NULL, 'starting', ?3, ?4)",
+            params!["project-a", first_event, 100, "/tmp/agent-1.log"],
+        )
+        .unwrap();
+    assert!(connection
+        .execute(
+            "INSERT INTO agent_runs (
+                project_id, primary_event_id, pid, status, started_at, log_path
+             ) VALUES (?1, ?2, NULL, 'running', ?3, ?4)",
+            params!["project-a", second_event, 101, "/tmp/agent-2.log"],
+        )
+        .is_err());
+
+    connection
+        .execute(
+            "INSERT INTO agent_runs (
+                project_id, primary_event_id, pid, status, started_at, finished_at, log_path
+             ) VALUES (?1, ?2, NULL, 'completed', ?3, ?4, ?5)",
+            params!["project-a", second_event, 101, 102, "/tmp/agent-2.log"],
+        )
+        .unwrap();
+}
+
+#[test]
+fn typed_repositories_round_trip_future_task_records() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "typed-records", 100);
+
+    let submission_repository = SubmissionRepository::new(&test.db);
+    let submission = NewSubmission::new(
+        "submission-1",
+        "project-a",
+        vec!["python".to_owned(), "train.py".to_owned()],
+        100,
+    );
+    let inserted_submission = submission_repository
+        .insert_idempotent(&submission)
+        .unwrap();
+    let duplicate_submission = submission_repository
+        .insert_idempotent(&NewSubmission {
+            status: SubmissionStatus::Accepted,
+            ..submission.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        inserted_submission.submission_id,
+        duplicate_submission.submission_id
+    );
+    assert_eq!(duplicate_submission.status, SubmissionStatus::Pending);
+    assert_eq!(
+        submission_repository
+            .find_by_id("submission-1")
+            .unwrap()
+            .unwrap()
+            .argv,
+        vec!["python".to_owned(), "train.py".to_owned()]
+    );
+
+    let agent_run_repository = AgentRunRepository::new(&test.db);
+    let run = agent_run_repository
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            100,
+            "/tmp/agent.log",
+        ))
+        .unwrap();
+    assert_eq!(
+        agent_run_repository
+            .find_active_by_project("project-a")
+            .unwrap()
+            .unwrap()
+            .run_id,
+        run.run_id
+    );
+    agent_run_repository
+        .attach_event(run.run_id, event_id)
+        .unwrap();
+
+    let incident = IncidentRepository::new(&test.db)
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-a"),
+            "typed-fingerprint",
+            100,
+        ))
+        .unwrap()
+        .incident;
+    let termination_repository = TerminationRequestRepository::new(&test.db);
+    let request = NewTerminationRequest::new(
+        incident.incident_id,
+        "project-a",
+        "signature-a",
+        "fatal pattern",
+        100,
+        Some(110),
+    );
+    let inserted_request = termination_repository.insert_idempotent(&request).unwrap();
+    let duplicate_request = termination_repository.insert_idempotent(&request).unwrap();
+    assert_eq!(inserted_request.request_id, duplicate_request.request_id);
+    assert_eq!(
+        duplicate_request.status,
+        TerminationRequestStatus::Requested
+    );
+    assert_eq!(
+        termination_repository
+            .find_by_id(inserted_request.request_id)
+            .unwrap()
+            .unwrap(),
+        inserted_request
+    );
+
+    let observation_repository = TaskObservationRepository::new(&test.db);
+    let observation = NewTaskObservation::new(
+        "project-a",
+        "signature-a",
+        41,
+        "pa-project",
+        vec!["python".to_owned(), "train.py".to_owned()],
+        "running",
+        None,
+        Some(101),
+        None,
+        None,
+        101,
+    );
+    observation_repository.upsert(&observation).unwrap();
+    let updated_observation = NewTaskObservation {
+        state: "finished".to_owned(),
+        observed_at: 102,
+        ..observation
+    };
+    let stored = observation_repository.upsert(&updated_observation).unwrap();
+    assert_eq!(stored.state, "finished");
+    assert_eq!(
+        observation_repository
+            .find("project-a", "signature-a")
+            .unwrap()
+            .unwrap()
+            .observed_at,
+        102
+    );
 }
 
 #[test]

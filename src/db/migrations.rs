@@ -56,6 +56,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 completed_at INTEGER,
                 last_error TEXT,
                 UNIQUE(project_id, dedup_key),
+                UNIQUE(project_id, event_id),
                 CHECK (
                     (status = 'claimed' AND lease_until IS NOT NULL)
                     OR (status <> 'claimed' AND lease_until IS NULL)
@@ -72,26 +73,35 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 first_seen_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL,
                 acknowledged_at INTEGER,
-                resolved_at INTEGER
+                resolved_at INTEGER,
+                UNIQUE(project_id, incident_id)
             );
 
             CREATE TABLE agent_runs (
                 run_id INTEGER PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
-                primary_event_id INTEGER NOT NULL REFERENCES events(event_id) ON DELETE RESTRICT,
+                primary_event_id INTEGER NOT NULL,
                 pid INTEGER,
                 status TEXT NOT NULL,
                 started_at INTEGER NOT NULL,
                 finished_at INTEGER,
                 exit_code INTEGER,
                 log_path TEXT NOT NULL,
-                last_error TEXT
+                last_error TEXT,
+                UNIQUE(project_id, run_id),
+                FOREIGN KEY(project_id, primary_event_id)
+                    REFERENCES events(project_id, event_id) ON DELETE RESTRICT
             );
 
             CREATE TABLE agent_run_events (
-                run_id INTEGER NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
-                event_id INTEGER NOT NULL REFERENCES events(event_id) ON DELETE RESTRICT,
-                PRIMARY KEY(run_id, event_id)
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                run_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                PRIMARY KEY(run_id, event_id),
+                FOREIGN KEY(project_id, run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE CASCADE,
+                FOREIGN KEY(project_id, event_id)
+                    REFERENCES events(project_id, event_id) ON DELETE RESTRICT
             );
 
             CREATE TABLE submissions (
@@ -106,7 +116,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
 
             CREATE TABLE termination_requests (
                 request_id INTEGER PRIMARY KEY,
-                incident_id INTEGER NOT NULL REFERENCES incidents(incident_id) ON DELETE CASCADE,
+                incident_id INTEGER NOT NULL,
                 project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
                 task_signature TEXT NOT NULL,
                 reason TEXT NOT NULL,
@@ -117,7 +127,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 grace_until INTEGER,
                 confirmed_at INTEGER,
                 last_error TEXT,
-                UNIQUE(project_id, incident_id, task_signature)
+                UNIQUE(project_id, incident_id, task_signature),
+                FOREIGN KEY(project_id, incident_id)
+                    REFERENCES incidents(project_id, incident_id) ON DELETE CASCADE
             );
 
             CREATE TABLE task_observations (
@@ -147,6 +159,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 ON incidents(project_id, status, last_seen_at);
             CREATE INDEX agent_runs_project_status_idx
                 ON agent_runs(project_id, status, started_at);
+            CREATE UNIQUE INDEX agent_runs_one_active_per_project_idx
+                ON agent_runs(project_id)
+                WHERE status IN ('starting', 'running');
             CREATE INDEX agent_run_events_event_idx
                 ON agent_run_events(event_id);
             CREATE INDEX submissions_project_status_idx
