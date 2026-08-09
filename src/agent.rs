@@ -129,7 +129,7 @@ impl AgentRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
+    pub async fn spawn(
         &self,
         db: &crate::db::Db,
         project: &Project,
@@ -152,52 +152,73 @@ impl AgentRunner {
             config.context.session_id().map(str::to_owned),
             event_ids.iter().map(i64::to_string).collect(),
         ))?;
-        for event_id in event_ids {
-            AgentRunRepository::new(db).attach_event(run.run_id, *event_id)?;
-        }
+        let repository = AgentRunRepository::new(db);
+        let mut spawned_child = None;
+        let startup = (|| -> Result<i64, AppError> {
+            for event_id in event_ids {
+                repository.attach_event(run.run_id, *event_id)?;
+            }
 
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|source| AppError::Io {
-                operation: "open agent log",
+            let log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|source| AppError::Io {
+                    operation: "open agent log",
+                    source,
+                })?;
+            let stderr = log_file.try_clone().map_err(|source| AppError::Io {
+                operation: "clone agent log handle",
                 source,
             })?;
-        let stderr = log_file.try_clone().map_err(|source| AppError::Io {
-            operation: "clone agent log handle",
-            source,
-        })?;
 
-        let mut process = Command::new(&command.program);
-        process
-            .args(&command.args)
-            .current_dir(&project.root_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(stderr));
-        process_tree::configure_agent_command(&mut process);
+            let mut process = Command::new(&command.program);
+            process
+                .args(&command.args)
+                .current_dir(&project.root_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(stderr))
+                .kill_on_drop(true);
+            process_tree::configure_agent_command(&mut process);
 
-        let child = match process.spawn() {
-            Ok(child) => child,
-            Err(source) => {
-                AgentRunRepository::new(db).finish(
-                    run.run_id,
-                    AgentRunStatus::Failed,
-                    now,
-                    None,
-                    Some("spawn failed"),
-                )?;
-                return Err(AppError::Io {
-                    operation: "spawn agent process",
-                    source,
-                });
+            spawned_child = Some(process.spawn().map_err(|source| AppError::Io {
+                operation: "spawn agent process",
+                source,
+            })?);
+            let pid = spawned_child
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .map(i64::from)
+                .ok_or(AppError::Runtime {
+                    operation: "read spawned agent PID",
+                })?;
+            repository.mark_running(run.run_id, pid)?;
+            Ok(pid)
+        })();
+        let pid = match startup {
+            Ok(pid) => pid,
+            Err(error) => {
+                if let Some(child) = spawned_child.as_mut() {
+                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
+                        .await;
+                }
+                let reason = error.to_string();
+                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
+                return Err(error);
             }
         };
-        let pid = child.id().map(i64::from).ok_or(AppError::Runtime {
-            operation: "read spawned agent PID",
-        })?;
-        AgentRunRepository::new(db).mark_running(run.run_id, pid)?;
+        let child = match spawned_child.take() {
+            Some(child) => child,
+            None => {
+                let error = AppError::Runtime {
+                    operation: "take spawned agent process",
+                };
+                let reason = error.to_string();
+                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
+                return Err(error);
+            }
+        };
 
         Ok(AgentHandle {
             run_id: run.run_id,
@@ -235,7 +256,7 @@ impl AgentHandle {
         now: i64,
     ) -> Result<Option<AgentRunStatus>, AppError> {
         if Instant::now() >= self.timeout_deadline {
-            process_tree::terminate_agent_process_tree(&mut self.child, self.pid).await;
+            process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
             AgentRunRepository::new(db).finish(
                 self.run_id,
                 AgentRunStatus::TimedOut,
@@ -294,7 +315,7 @@ impl AgentHandle {
                 });
             }
             Err(_) => {
-                process_tree::terminate_agent_process_tree(&mut self.child, self.pid).await;
+                process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
                 AgentRunRepository::new(db).finish(
                     self.run_id,
                     AgentRunStatus::TimedOut,
@@ -313,7 +334,7 @@ impl AgentHandle {
         db: &crate::db::Db,
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
-        process_tree::terminate_agent_process_tree(&mut self.child, self.pid).await;
+        process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
         AgentRunRepository::new(db).finish(
             self.run_id,
             AgentRunStatus::TimedOut,
@@ -349,8 +370,8 @@ mod process_tree {
         }
     }
 
-    pub(super) async fn terminate_agent_process_tree(child: &mut Child, pid: i64) {
-        if let Ok(pid) = c_int::try_from(pid) {
+    pub(super) async fn terminate_agent_process_tree(child: &mut Child, pid: Option<i64>) {
+        if let Some(Ok(pid)) = pid.map(c_int::try_from) {
             let _ = signal_process_group(pid, SIGTERM);
             if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), child.wait()).await
             {
@@ -394,7 +415,7 @@ mod process_tree {
 
     pub(super) fn configure_agent_command(_command: &mut Command) {}
 
-    pub(super) async fn terminate_agent_process_tree(child: &mut Child, _pid: i64) {
+    pub(super) async fn terminate_agent_process_tree(child: &mut Child, _pid: Option<i64>) {
         let _ = child.kill().await;
     }
 }

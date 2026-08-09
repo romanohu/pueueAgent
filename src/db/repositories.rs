@@ -1195,6 +1195,12 @@ pub struct AgentRunRepository<'db> {
     db: &'db Db,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentRunRecovery {
+    pub failed_runs: usize,
+    pub requeued_events: usize,
+}
+
 impl<'db> AgentRunRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
         Self { db }
@@ -1247,6 +1253,50 @@ impl<'db> AgentRunRepository<'db> {
             )
             .optional()
             .map_err(database_error("find active agent run"))
+    }
+
+    pub fn recover_interrupted(
+        &self,
+        finished_at: i64,
+        reason: &str,
+    ) -> Result<AgentRunRecovery, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin interrupted agent run recovery"))?;
+        let requeued_events = transaction
+            .execute(
+                "UPDATE events
+                 SET status = 'pending', lease_until = NULL
+                 WHERE status = 'claimed'
+                   AND event_id IN (
+                       SELECT agent_run_events.event_id
+                       FROM agent_run_events
+                       JOIN agent_runs
+                         ON agent_runs.run_id = agent_run_events.run_id
+                        AND agent_runs.project_id = agent_run_events.project_id
+                       WHERE agent_runs.status IN ('starting', 'running')
+                   )",
+                [],
+            )
+            .map_err(database_error(
+                "requeue events attached to interrupted agent runs",
+            ))?;
+        let failed_runs = transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', finished_at = ?1, last_error = ?2
+                 WHERE status IN ('starting', 'running')",
+                params![finished_at, reason],
+            )
+            .map_err(database_error("fail interrupted agent runs"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit interrupted agent run recovery"))?;
+        Ok(AgentRunRecovery {
+            failed_runs,
+            requeued_events,
+        })
     }
 
     pub fn attach_event(&self, run_id: i64, event_id: i64) -> Result<AgentRunEvent, AppError> {

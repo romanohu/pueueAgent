@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent::{AgentHandle, AgentRunner},
     config,
-    db::{Db, ProjectRepository, TerminationRequestRepository},
+    db::{AgentRunRepository, Db, ProjectRepository, TerminationRequestRepository},
     detect::Detector,
     incidents::IncidentStore,
     pueue::PueueApi,
@@ -15,6 +15,8 @@ use crate::{
     termination::{TerminationManager, TerminationOutcome},
     AppError,
 };
+
+const DAEMON_RESTART_REASON: &str = "agent run interrupted by daemon restart";
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -44,6 +46,8 @@ pub struct DaemonReport {
     pub termination_outcomes: Vec<TerminationOutcome>,
     pub scheduler: SchedulerReport,
     pub finished_agents: usize,
+    pub recovered_agent_runs: usize,
+    pub requeued_agent_events: usize,
 }
 
 pub struct Daemon<P> {
@@ -52,6 +56,7 @@ pub struct Daemon<P> {
     runner: Option<AgentRunner>,
     config: DaemonConfig,
     active_agents: Vec<AgentHandle>,
+    startup_recovery_pending: bool,
 }
 
 impl<P> Daemon<P>
@@ -65,6 +70,7 @@ where
             runner: Some(runner),
             config,
             active_agents: Vec::new(),
+            startup_recovery_pending: true,
         }
     }
 
@@ -85,6 +91,14 @@ where
 
     pub async fn run_once(&mut self) -> Result<DaemonReport, AppError> {
         let mut report = DaemonReport::default();
+
+        if self.startup_recovery_pending {
+            let recovery = AgentRunRepository::new(&self.db)
+                .recover_interrupted(self.now()?, DAEMON_RESTART_REASON)?;
+            self.startup_recovery_pending = false;
+            report.recovered_agent_runs = recovery.failed_runs;
+            report.requeued_agent_events = recovery.requeued_events;
+        }
 
         report.finished_agents += self.poll_agents().await?;
 
@@ -140,7 +154,8 @@ where
                 &project.project_id,
                 &project.root_path,
                 project.root_path.join(".pueue-agent/logs"),
-            );
+            )
+            .with_incident_db(self.db.clone());
             for observation in detector.inspect_task(task, &project_config.check)? {
                 IncidentStore::new(&self.db).observe(observation)?;
                 observations += 1;

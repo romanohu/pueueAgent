@@ -1,5 +1,8 @@
 use std::{fs, path::PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     config,
@@ -158,6 +161,59 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn agent_run_states(&self) -> Vec<(AgentRunStatus, Option<i64>, Option<String>)> {
+        let connection = self.db.connect().unwrap();
+        let mut statement = connection
+            .prepare("SELECT status, finished_at, last_error FROM agent_runs ORDER BY run_id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn configure_agent(&self, program: &str, args: &[&str]) {
+        fs::write(
+            self.root("project-a").join(".pueue-agent/config.toml"),
+            format!(
+                r#"
+project_id = "project-a"
+pueue_group = "pa-project-a"
+
+[agent]
+program = "{program}"
+args = [{args}]
+timeout_minutes = 1
+max_retries = 2
+
+[check]
+interval_minutes = 10
+deep_check_every = 6
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+                args = args
+                    .iter()
+                    .map(|arg| format!("{:?}", arg))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        )
+        .unwrap();
+    }
+
     fn claimed_with_lease_count(&self) -> i64 {
         self.db
             .connect()
@@ -292,6 +348,154 @@ max_agent_runs = 10
         .as_deref()
         .is_some_and(|message| message.contains("agent.context.session_id")));
     assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn event_attachment_failure_finishes_the_inserted_agent_run() {
+    let harness = SchedulerHarness::new();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "attach-failure");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_agent_event_attachment
+             BEFORE INSERT ON agent_run_events
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected attachment failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let runs = harness.agent_run_states();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].0, AgentRunStatus::Failed);
+    assert_eq!(runs[0].1, Some(harness.now));
+    assert!(runs[0]
+        .2
+        .as_deref()
+        .is_some_and(|reason| reason.contains("attach event to agent run")));
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn log_open_failure_finishes_the_inserted_agent_run() {
+    let harness = SchedulerHarness::new();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "log-open-failure");
+    fs::create_dir(
+        harness
+            .temp
+            .path()
+            .join(format!("agent-{}-{event_id}.log", harness.now)),
+    )
+    .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let runs = harness.agent_run_states();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].0, AgentRunStatus::Failed);
+    assert_eq!(runs[0].1, Some(harness.now));
+    assert!(runs[0]
+        .2
+        .as_deref()
+        .is_some_and(|reason| reason.contains("open agent log")));
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn process_spawn_failure_finishes_the_inserted_agent_run() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/path/that/does/not/exist/pueue-agent", &[]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "process-spawn-failure");
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let runs = harness.agent_run_states();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].0, AgentRunStatus::Failed);
+    assert_eq!(runs[0].1, Some(harness.now));
+    assert!(runs[0]
+        .2
+        .as_deref()
+        .is_some_and(|reason| reason.contains("spawn agent process")));
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mark_running_failure_finishes_the_run_and_terminates_the_spawned_process() {
+    let harness = SchedulerHarness::new();
+    let executable = harness.temp.path().join("agent-sleep-recovery-test.sh");
+    let pid_path = harness.temp.path().join("agent-sleep-recovery-test.pid");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\n/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 30' &\necho $! > {}\nwait\n",
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    harness.configure_agent(executable.to_str().unwrap(), &[]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "mark-running-failure");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_agent_mark_running
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status = 'running'
+             BEGIN
+                 SELECT sum(value) FROM (
+                     WITH RECURSIVE counter(value) AS (
+                         VALUES(0)
+                         UNION ALL
+                         SELECT value + 1 FROM counter WHERE value < 100000
+                     )
+                     SELECT value FROM counter
+                 );
+                 SELECT RAISE(ABORT, 'injected mark-running failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let pid = wait_for_optional_pid_file(&pid_path).await;
+    let exited = match pid {
+        Some(pid) => wait_until_process_exits(pid).await,
+        None => true,
+    };
+    if !exited {
+        kill_process(pid.unwrap());
+    }
+
+    let runs = harness.agent_run_states();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].0, AgentRunStatus::Failed);
+    assert_eq!(runs[0].1, Some(harness.now));
+    assert!(runs[0]
+        .2
+        .as_deref()
+        .is_some_and(|reason| reason.contains("mark agent run running")));
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.active_runs("project-a"), 0);
+
+    assert!(
+        exited,
+        "spawn failure cleanup must not orphan the agent child"
+    );
 }
 
 #[tokio::test]
@@ -815,4 +1019,17 @@ fn kill_process(pid: i32) {
     }
     const SIGKILL: std::os::raw::c_int = 9;
     let _ = unsafe { kill(pid, SIGKILL) };
+}
+
+#[cfg(unix)]
+async fn wait_for_optional_pid_file(path: &std::path::Path) -> Option<i32> {
+    for _ in 0..10 {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse::<i32>() {
+                return Some(pid);
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    None
 }

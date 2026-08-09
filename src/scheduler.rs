@@ -135,15 +135,19 @@ impl Scheduler {
 
             let mode = dispatch_mode(primary.kind).to_owned();
             let prompt = build_prompt(&project, &mode, &events)?;
-            match self.runner.spawn(
-                &self.db,
-                &project,
-                &project_config.agent,
-                primary.event_id,
-                &event_ids,
-                &prompt,
-                self.config.now,
-            ) {
+            match self
+                .runner
+                .spawn(
+                    &self.db,
+                    &project,
+                    &project_config.agent,
+                    primary.event_id,
+                    &event_ids,
+                    &prompt,
+                    self.config.now,
+                )
+                .await
+            {
                 Ok(handle) => {
                     EventRepository::new(&self.db).transition_many(
                         &event_ids,

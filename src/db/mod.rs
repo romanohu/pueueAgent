@@ -8,8 +8,8 @@ use rusqlite::Connection;
 use crate::AppError;
 
 pub use repositories::{
-    AgentRunRepository, EventRepository, IncidentRepository, IntegrationEventRepository,
-    ProjectRepository, SubmissionRepository, TaskObservationRepository,
+    AgentRunRecovery, AgentRunRepository, EventRepository, IncidentRepository,
+    IntegrationEventRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
     TerminationRequestRepository,
 };
 

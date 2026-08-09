@@ -11,7 +11,9 @@ use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     daemon::{Daemon, DaemonConfig},
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
-    models::{AgentRunStatus, EventKind, EventStatus, NewEvent, NewProject},
+    models::{
+        AgentContextMode, AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject,
+    },
     pueue::{PueueApi, PueueTask},
     AppError,
 };
@@ -273,21 +275,57 @@ max_agent_runs = 10
             .unwrap()
     }
 
-    fn pause_project(&self) {
+    fn pause_project(&self, project_id: &str) {
         ProjectRepository::new(&self.db)
-            .pause("project-a", self.now)
+            .pause(project_id, self.now)
             .unwrap();
     }
 
-    fn claim_with_expired_lease(&self, event_id: i64) {
+    fn claim_with_lease(&self, event_id: i64, lease_until: i64) {
         self.db
             .connect()
             .unwrap()
             .execute(
                 "UPDATE events SET status = 'claimed', lease_until = ?1 WHERE event_id = ?2",
-                rusqlite::params![self.now - 1, event_id],
+                rusqlite::params![lease_until, event_id],
             )
             .unwrap();
+    }
+
+    fn insert_active_run(
+        &self,
+        project_id: &str,
+        primary_event_id: i64,
+        status: AgentRunStatus,
+    ) -> i64 {
+        AgentRunRepository::new(&self.db)
+            .insert(&NewAgentRun::with_context(
+                project_id,
+                primary_event_id,
+                (status == AgentRunStatus::Running).then_some(42_424),
+                status,
+                self.now - 10,
+                self.temp
+                    .path()
+                    .join(format!("{project_id}-interrupted.log")),
+                AgentContextMode::Fresh,
+                None,
+                vec![primary_event_id.to_string()],
+            ))
+            .unwrap()
+            .run_id
+    }
+
+    fn agent_run_state(&self, run_id: i64) -> (AgentRunStatus, Option<i64>, Option<String>) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, finished_at, last_error FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
     }
 }
 
@@ -453,13 +491,13 @@ async fn injected_shutdown_signal_cancels_daemon_token() {
 #[tokio::test]
 async fn daemon_restart_recovers_expired_claims_without_requiring_a_new_callback() {
     let harness = DaemonHarness::new();
-    harness.pause_project();
+    harness.pause_project("project-a");
     let event_id = harness.enqueue(
         EventKind::TaskFinished,
         "project-a",
         "finished-before-crash",
     );
-    harness.claim_with_expired_lease(event_id);
+    harness.claim_with_lease(event_id, harness.now - 1);
 
     let mut daemon = harness.daemon();
     daemon.run_once().await.unwrap();
@@ -470,4 +508,148 @@ async fn daemon_restart_recovers_expired_claims_without_requiring_a_new_callback
         .unwrap();
     assert_eq!(event.status, EventStatus::Pending);
     assert_eq!(event.lease_until, None);
+}
+
+#[tokio::test]
+async fn first_daemon_cycle_recovers_persisted_runs_and_only_their_claimed_events_once() {
+    let harness = DaemonHarness::new();
+    harness.register_project("project-b", "pa-project-b", "/bin/echo");
+    harness.pause_project("project-a");
+    harness.pause_project("project-b");
+
+    let starting_event = harness.enqueue(EventKind::TaskFailed, "project-a", "starting-event");
+    let running_event = harness.enqueue(EventKind::TaskFailed, "project-b", "running-event");
+    let completed_event = harness.enqueue(EventKind::TaskFinished, "project-a", "completed-event");
+    let unrelated_claim = harness.enqueue(EventKind::DeepCheck, "project-a", "unrelated-claim");
+    for event_id in [starting_event, running_event, unrelated_claim] {
+        harness.claim_with_lease(event_id, harness.now + 600);
+    }
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[completed_event],
+            EventStatus::Completed,
+            harness.now - 5,
+            None,
+            None,
+        )
+        .unwrap();
+
+    let starting_run =
+        harness.insert_active_run("project-a", starting_event, AgentRunStatus::Starting);
+    let running_run =
+        harness.insert_active_run("project-b", running_event, AgentRunStatus::Running);
+    let runs = AgentRunRepository::new(&harness.db);
+    runs.attach_event(starting_run, starting_event).unwrap();
+    runs.attach_event(starting_run, completed_event).unwrap();
+    runs.attach_event(running_run, running_event).unwrap();
+
+    let mut daemon = harness.daemon();
+    let first = daemon.run_once().await.unwrap();
+    let second = daemon.run_once().await.unwrap();
+    let mut restarted_daemon = harness.daemon();
+    let repeated_recovery = restarted_daemon.run_once().await.unwrap();
+
+    assert_eq!(first.recovered_agent_runs, 2);
+    assert_eq!(first.requeued_agent_events, 2);
+    assert_eq!(second.recovered_agent_runs, 0);
+    assert_eq!(second.requeued_agent_events, 0);
+    assert_eq!(repeated_recovery.recovered_agent_runs, 0);
+    assert_eq!(repeated_recovery.requeued_agent_events, 0);
+    for run_id in [starting_run, running_run] {
+        let (status, finished_at, reason) = harness.agent_run_state(run_id);
+        assert_eq!(status, AgentRunStatus::Failed);
+        assert_eq!(finished_at, Some(harness.now));
+        assert!(reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("daemon restart")));
+    }
+    for event_id in [starting_event, running_event] {
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::Pending);
+        assert_eq!(event.lease_until, None);
+    }
+    assert_eq!(
+        harness.event_status(completed_event),
+        EventStatus::Completed
+    );
+    let unrelated = EventRepository::new(&harness.db)
+        .find_by_id(unrelated_claim)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unrelated.status, EventStatus::Claimed);
+    assert_eq!(unrelated.lease_until, Some(harness.now + 600));
+}
+
+#[tokio::test]
+async fn startup_recovery_is_atomic_and_retried_after_a_database_failure() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "atomic-recovery");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let run_id = harness.insert_active_run("project-a", event_id, AgentRunStatus::Starting);
+    AgentRunRepository::new(&harness.db)
+        .attach_event(run_id, event_id)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_restart_recovery
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN OLD.status IN ('starting', 'running') AND NEW.status = 'failed'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected recovery failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    assert!(daemon.run_once().await.is_err());
+    let event = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, EventStatus::Claimed);
+    assert_eq!(event.lease_until, Some(harness.now + 600));
+    assert_eq!(harness.agent_run_state(run_id).0, AgentRunStatus::Starting);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_restart_recovery;")
+        .unwrap();
+    let report = daemon.run_once().await.unwrap();
+
+    assert_eq!(report.recovered_agent_runs, 1);
+    assert_eq!(report.requeued_agent_events, 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    assert_eq!(harness.agent_run_state(run_id).0, AgentRunStatus::Failed);
+}
+
+#[tokio::test]
+async fn startup_recovery_runs_before_the_first_scheduling_pass() {
+    let harness = DaemonHarness::new();
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "restart-dispatch");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let interrupted = harness.insert_active_run("project-a", event_id, AgentRunStatus::Running);
+    AgentRunRepository::new(&harness.db)
+        .attach_event(interrupted, event_id)
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    let report = daemon.run_once().await.unwrap();
+
+    assert_eq!(report.recovered_agent_runs, 1);
+    assert_eq!(report.requeued_agent_events, 1);
+    assert_eq!(harness.agent_run_count(), 2);
+    assert_eq!(
+        harness.agent_run_state(interrupted).0,
+        AgentRunStatus::Failed
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
 }
