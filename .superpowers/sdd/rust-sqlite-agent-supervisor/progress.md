@@ -39,3 +39,15 @@ Base: `6ca1e2b`
 
 - Commits: `f91cbb3 feat: add durable callback and Pueue reconciliation`, `09f46e1 fix: harden callback reconciliation idempotency`
 - Review clean after fix round 1. Unknown groups are stored in the global integration-event table; callback/reconciliation is lifecycle-idempotent; task-ID reuse remains signature-separated; command recovery preserves argument boundaries.
+
+## Task 6 — fix round 1/5
+
+- Reviewer finding: terminal reconciliation used mutable full task signatures and could not resolve incidents opened while tasks were running; task-less recovery matched any same-kind project incident.
+- Fix commits: `3d4560f fix: stabilize detector incident recovery identity`, `f739e02 docs: record task 6 incident identity fix`
+- Re-review: PASS; both findings addressed and no new Critical/Important breakage.
+- Verification: focused detection 7 passed, all Rust targets passed, formatting, Clippy with `-D warnings`, and `git diff --check`.
+
+## Task 6 — complete
+
+- Commits: `5233e4d feat: add fingerprinted anomaly incidents`, `3d4560f fix: stabilize detector incident recovery identity`, `f739e02 docs: record task 6 incident identity fix`
+- Review clean after fix round 1. Bounded logs, safe extra paths, fingerprinted incident transitions, stable task incident identity, and exact task-less recovery are implemented.
