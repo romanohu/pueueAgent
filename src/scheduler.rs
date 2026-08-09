@@ -62,6 +62,7 @@ impl Scheduler {
             recovered_leases,
             ..SchedulerReport::default()
         };
+        let mut first_error = None;
 
         for (project_id, mut events) in group_by_project(claimed) {
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
@@ -93,7 +94,10 @@ impl Scheduler {
                         None,
                         Some(&message),
                     )?;
-                    return Err(error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
                 }
             };
             let guardrails = Guardrails::new(&self.db, self.config.now);
@@ -154,6 +158,7 @@ impl Scheduler {
                     });
                 }
                 Err(error) => {
+                    let message = format!("agent spawn failed: {error}");
                     let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
                     let status = if primary.attempts <= i64::from(project_config.agent.max_retries)
                     {
@@ -166,14 +171,21 @@ impl Scheduler {
                         status,
                         self.config.now,
                         Some(retry_at),
-                        Some("agent spawn failed"),
+                        Some(&message),
                     )?;
-                    return Err(error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
                 }
             }
         }
 
-        Ok(report)
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(report)
+        }
     }
 }
 

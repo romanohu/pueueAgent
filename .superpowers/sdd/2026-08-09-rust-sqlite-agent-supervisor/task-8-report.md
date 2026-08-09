@@ -84,3 +84,42 @@ All commands used:
 - Unix process-group cleanup is best-effort: `setsid()` is attempted in `pre_exec`; if unavailable or cleanup signaling fails, timeout cleanup falls back to killing the direct child.
 - Non-Unix platforms retain the direct-child kill fallback.
 - The process-tree regression is Unix-only because it verifies POSIX process-group behavior.
+
+## Fix round 2
+
+### Summary
+
+- Changed `Scheduler::tick` to keep the first per-project config/spawn error, resolve every project group claimed in the same batch, and return the saved error only after the batch has been processed.
+- Invalid explicit Codex resume config still fails visibly and does not fall back to a fresh run; all claimed events in that invalid group are marked failed with the configuration error and `lease_until` cleared.
+- Valid later project groups in the same batch continue scheduling instead of remaining leased behind an earlier invalid project group.
+- Added a multi-project regression proving a tick that returns an invalid config error leaves no event in any project with `status = 'claimed'` or a non-null `lease_until`.
+
+### Red command
+
+All commands used:
+
+`PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin`
+
+| Command | Result |
+|---|---|
+| `cargo test --test scheduler multi_project_config_error_resolves_all_claimed_events_before_returning -- --nocapture` | RED: failed because the valid project-b event remained `Claimed` after project-a config failure |
+
+### Verification commands
+
+All commands used:
+
+`PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin`
+
+| Command | Result |
+|---|---|
+| `cargo test --test scheduler multi_project_config_error_resolves_all_claimed_events_before_returning -- --nocapture` | Passed: 1 passed |
+| `cargo test --test scheduler` | Passed: 12 passed |
+| `cargo test --offline --all-targets --all-features` | Passed: 99 passed across all integration/unit targets |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --offline --all-targets --all-features -- -D warnings` | Passed |
+| `git diff --check` | Passed |
+
+### Risks / notes
+
+- `Scheduler::tick` still returns the first project error to preserve caller-visible failure semantics; the report for valid groups started before that return is not exposed on the `Err` path.
+- Database errors during failure transitions still abort immediately, because the scheduler cannot safely prove claimed rows were resolved if SQLite writes fail.

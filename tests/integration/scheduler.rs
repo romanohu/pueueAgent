@@ -122,11 +122,14 @@ max_agent_runs = 10
     }
 
     fn event_status(&self, event_id: i64) -> EventStatus {
+        self.event(event_id).status
+    }
+
+    fn event(&self, event_id: i64) -> pueue_agent::models::Event {
         EventRepository::new(&self.db)
             .find_by_id(event_id)
             .unwrap()
             .unwrap()
-            .status
     }
 
     fn event_status_and_error(&self, event_id: i64) -> (EventStatus, Option<String>) {
@@ -145,6 +148,19 @@ max_agent_runs = 10
                 "SELECT COUNT(*) FROM agent_runs
                  WHERE project_id = ?1 AND status IN ('starting', 'running')",
                 [project_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn claimed_with_lease_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE status = 'claimed' OR lease_until IS NOT NULL",
+                [],
                 |row| row.get(0),
             )
             .unwrap()
@@ -271,6 +287,69 @@ max_agent_runs = 10
         .as_deref()
         .is_some_and(|message| message.contains("agent.context.session_id")));
     assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn multi_project_config_error_resolves_all_claimed_events_before_returning() {
+    let harness = SchedulerHarness::new();
+    harness.register_project("project-b", "pa-project-b", "/bin/echo", "");
+    fs::write(
+        harness.root("project-a").join(".pueue-agent/config.toml"),
+        r#"
+project_id = "project-a"
+pueue_group = "pa-project-a"
+
+[agent]
+program = "codex"
+args = ["exec", "{prompt}"]
+timeout_minutes = 1
+max_retries = 2
+
+[agent.context]
+mode = "resume"
+
+[check]
+interval_minutes = 10
+deep_check_every = 6
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+    )
+    .unwrap();
+    let invalid_event = harness.enqueue(EventKind::TaskFailed, "project-a", "bad-resume-batch");
+    let valid_event = harness.enqueue(EventKind::TaskFinished, "project-b", "valid-batch");
+
+    let mut scheduler = harness.scheduler();
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("invalid project config should fail the scheduler tick"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("agent.context.session_id"));
+    let invalid = harness.event(invalid_event);
+    assert_eq!(invalid.status, EventStatus::Failed);
+    assert_eq!(invalid.lease_until, None);
+    assert!(invalid
+        .last_error
+        .as_deref()
+        .is_some_and(|message| message.contains("agent.context.session_id")));
+
+    let valid = harness.event(valid_event);
+    assert_eq!(valid.status, EventStatus::Completed);
+    assert_eq!(valid.lease_until, None);
+    assert_eq!(harness.active_runs("project-b"), 1);
+    assert_eq!(harness.claimed_with_lease_count(), 0);
 }
 
 #[tokio::test]
