@@ -15,6 +15,23 @@ pub enum AppError {
         source: io::Error,
     },
 
+    #[error("database operation `{operation}` failed: {source}")]
+    Database {
+        operation: &'static str,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("database conflict on {field}; the value is already registered")]
+    DatabaseConflict { field: &'static str },
+
+    #[error("failed to {operation}: {source}")]
+    Serialization {
+        operation: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("{operation} failed; inspect pueue-agent logs for details")]
     Runtime { operation: &'static str },
 }

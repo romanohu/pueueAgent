@@ -11,6 +11,10 @@ path = "tests/integration/cli_help.rs"
 name = "config"
 path = "tests/integration/config.rs"
 
+[[test]]
+name = "database"
+path = "tests/integration/database.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
