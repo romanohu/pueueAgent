@@ -1,6 +1,7 @@
 use std::{
     fs,
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ use pueue_agent::{
     reconcile::{task_incident_key, task_signature, Reconciler},
     termination::{
         confirm_auto_kill_terminal_observation, TerminationManager, TerminationOutcome,
-        TerminationPolicy,
+        TerminationPolicy, DEFAULT_CONFIRMATION_GRACE_SECONDS,
     },
     AppError,
 };
@@ -311,6 +312,15 @@ impl Harness {
     }
 }
 
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .try_into()
+        .unwrap()
+}
+
 #[test]
 fn policy_maps_only_explicit_kill_observations_to_termination() {
     assert!(!TerminationPolicy.should_kill(&Observation::pattern(
@@ -341,7 +351,7 @@ async fn explicit_kill_policy_kills_only_the_matching_running_task_once() {
     harness.observe_fatal_pattern("cuda-oom");
     let outcomes = harness.run_termination_cycle().await;
 
-    assert_eq!(outcomes, vec![TerminationOutcome::Confirmed]);
+    assert_eq!(outcomes, vec![TerminationOutcome::PendingConfirmation]);
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 1);
     assert_eq!(
@@ -362,7 +372,6 @@ async fn duplicate_execute_on_sent_request_does_not_kill_again() {
     harness.fake_pueue.keep_running_after_kill();
     harness.observe_fatal_pattern("cuda-oom");
     let request_id = harness.pending_request_ids()[0];
-    harness.set_request_grace_until(request_id, i64::MAX);
 
     let first = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
         .execute(request_id)
@@ -373,8 +382,8 @@ async fn duplicate_execute_on_sent_request_does_not_kill_again() {
         .await
         .unwrap();
 
-    assert_eq!(first, TerminationOutcome::Confirmed);
-    assert_eq!(second, TerminationOutcome::Confirmed);
+    assert_eq!(first, TerminationOutcome::PendingConfirmation);
+    assert_eq!(second, TerminationOutcome::PendingConfirmation);
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(
         harness.request_status(),
@@ -383,22 +392,81 @@ async fn duplicate_execute_on_sent_request_does_not_kill_again() {
 }
 
 #[tokio::test]
-async fn explicit_kill_times_out_after_default_confirmation_grace_without_second_kill() {
+async fn successful_kill_with_running_task_starts_confirmation_grace_at_dispatch() {
     let harness = Harness::running_task("project-a", 41);
     harness.fake_pueue.keep_running_after_kill();
     harness.observe_fatal_pattern("cuda-oom");
     let request_id = harness.pending_request_ids()[0];
+    let requested = TerminationRequestRepository::new(&harness.db)
+        .find_by_id(request_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(requested.requested_at, 200);
+    assert_eq!(requested.grace_until, None);
+
+    let before_dispatch = unix_timestamp();
+    let first = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+    let after_dispatch = unix_timestamp();
     let request = TerminationRequestRepository::new(&harness.db)
         .find_by_id(request_id)
         .unwrap()
         .unwrap();
 
-    assert_eq!(request.requested_at, 200);
-    assert_eq!(request.grace_until, Some(320));
+    assert_eq!(first, TerminationOutcome::PendingConfirmation);
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Sent)
+    );
+    assert!(request.grace_until.is_some_and(|grace_until| {
+        grace_until >= before_dispatch + DEFAULT_CONFIRMATION_GRACE_SECONDS
+            && grace_until <= after_dispatch + DEFAULT_CONFIRMATION_GRACE_SECONDS
+    }));
+}
+
+#[tokio::test]
+async fn sent_request_without_persisted_grace_recovers_to_pending_without_second_kill() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    let request_id = harness.make_pending_request_sent(None);
+    let before_recovery = unix_timestamp();
+
+    let outcome = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+    let after_recovery = unix_timestamp();
+    let request = TerminationRequestRepository::new(&harness.db)
+        .find_by_id(request_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome, TerminationOutcome::PendingConfirmation);
+    assert!(harness.fake_pueue.kill_calls().is_empty());
+    assert_eq!(request.status, TerminationRequestStatus::Sent);
+    assert!(request.grace_until.is_some_and(|grace_until| {
+        grace_until >= before_recovery + DEFAULT_CONFIRMATION_GRACE_SECONDS
+            && grace_until <= after_recovery + DEFAULT_CONFIRMATION_GRACE_SECONDS
+    }));
+}
+
+#[tokio::test]
+async fn explicit_kill_times_out_after_default_confirmation_grace_without_second_kill() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.fake_pueue.keep_running_after_kill();
+    harness.observe_fatal_pattern("cuda-oom");
+    let request_id = harness.pending_request_ids()[0];
 
     let first_outcomes = harness.run_termination_cycle().await;
 
-    assert_eq!(first_outcomes, vec![TerminationOutcome::Confirmed]);
+    assert_eq!(
+        first_outcomes,
+        vec![TerminationOutcome::PendingConfirmation]
+    );
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(
         harness.request_status(),

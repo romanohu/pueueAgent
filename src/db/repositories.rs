@@ -1560,6 +1560,37 @@ impl<'db> TerminationRequestRepository<'db> {
         Ok(stored)
     }
 
+    pub fn set_grace_until_if_current(
+        &self,
+        request_id: i64,
+        current: TerminationRequestStatus,
+        grace_until: i64,
+    ) -> Result<Option<TerminationRequest>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin guarded termination request grace update",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET grace_until = ?1
+                 WHERE request_id = ?2 AND status = ?3 AND grace_until IS NULL",
+                params![grace_until, request_id, current],
+            )
+            .map_err(database_error("guarded update termination request grace"))?;
+        let stored = if changed == 0 {
+            None
+        } else {
+            Some(read_termination_request(&transaction, request_id)?)
+        };
+        transaction.commit().map_err(database_error(
+            "commit guarded termination request grace update",
+        ))?;
+        Ok(stored)
+    }
+
     pub fn find_pending(&self, project_id: &str) -> Result<Vec<TerminationRequest>, AppError> {
         let connection = self.db.connect()?;
         let mut statement = connection

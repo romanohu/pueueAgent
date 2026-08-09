@@ -14,7 +14,7 @@ use crate::{
 
 pub type TerminationRequestId = i64;
 
-pub(crate) const DEFAULT_CONFIRMATION_GRACE_SECONDS: i64 = 120;
+pub const DEFAULT_CONFIRMATION_GRACE_SECONDS: i64 = 120;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TerminationPolicy;
@@ -29,6 +29,7 @@ impl TerminationPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminationOutcome {
+    PendingConfirmation,
     Confirmed,
     TimedOut,
     Failed,
@@ -173,7 +174,7 @@ where
 
         let kill_result = self.pueue.kill(task.id).await;
         match kill_result {
-            Ok(()) => Ok(TerminationOutcome::Confirmed),
+            Ok(()) => persist_confirmation_grace(self.db, &repository, claimed_request.request_id),
             Err(error) => {
                 let message = error.to_string();
                 if let Some(failed_request) = repository.update_result_if_current(
@@ -250,6 +251,9 @@ fn finish_sent_request(
     repository: &TerminationRequestRepository<'_>,
     request: &crate::models::TerminationRequest,
 ) -> Result<TerminationOutcome, AppError> {
+    if request.grace_until.is_none() {
+        return persist_confirmation_grace(db, repository, request.request_id);
+    }
     let now = unix_timestamp()?;
     if request
         .grace_until
@@ -267,7 +271,35 @@ fn finish_sent_request(
         }
         return Ok(TerminationOutcome::TimedOut);
     }
-    Ok(TerminationOutcome::Confirmed)
+    Ok(TerminationOutcome::PendingConfirmation)
+}
+
+fn persist_confirmation_grace(
+    db: &Db,
+    repository: &TerminationRequestRepository<'_>,
+    request_id: TerminationRequestId,
+) -> Result<TerminationOutcome, AppError> {
+    let grace_until = confirmation_grace_until()?;
+    if repository
+        .set_grace_until_if_current(request_id, TerminationRequestStatus::Sent, grace_until)?
+        .is_some()
+    {
+        return Ok(TerminationOutcome::PendingConfirmation);
+    }
+    let current = repository
+        .find_by_id(request_id)?
+        .ok_or(AppError::Runtime {
+            operation: "reload concurrently completed termination request",
+        })?;
+    outcome_for_non_requested(db, repository, &current)
+}
+
+fn confirmation_grace_until() -> Result<i64, AppError> {
+    unix_timestamp()?
+        .checked_add(DEFAULT_CONFIRMATION_GRACE_SECONDS)
+        .ok_or(AppError::Runtime {
+            operation: "calculate termination confirmation grace",
+        })
 }
 
 pub fn auto_kill_request_for_terminal_task(

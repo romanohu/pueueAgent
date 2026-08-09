@@ -5,7 +5,7 @@ use crate::{
     db::{database_error, Db, EventRepository, IncidentRepository},
     detect::{Observation, ObservationState, TASK_TERMINAL_RECOVERY_KIND},
     models::{EventKind, IncidentTransition, NewEvent, NewIncident},
-    termination::{TerminationManager, TerminationPolicy, DEFAULT_CONFIRMATION_GRACE_SECONDS},
+    termination::{TerminationManager, TerminationPolicy},
     AppError,
 };
 
@@ -35,7 +35,7 @@ impl<'db> IncidentStore<'db> {
                             task_signature,
                             termination_reason(&observation),
                             observation.seen_at(),
-                            Some(observation.seen_at() + DEFAULT_CONFIRMATION_GRACE_SECONDS),
+                            None,
                         )?;
                     }
                 }
