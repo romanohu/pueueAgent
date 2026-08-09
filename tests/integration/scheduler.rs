@@ -16,6 +16,11 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use tokio::time::{sleep, Duration, Instant};
 
+const OWNED_CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
+const FOREIGN_CODEX_SESSION_ID: &str = "019f9f30-a553-7e21-b108-16a5c341f728";
+const MISSING_CODEX_SESSION_ID: &str = "019f9f30-c111-7ff1-a54a-43aab2c9e720";
+const MALFORMED_CODEX_SESSION_ID: &str = "019f9f30-d422-7a66-a998-afb8963e4a01";
+
 struct SchedulerHarness {
     temp: TempDir,
     db: Db,
@@ -491,9 +496,15 @@ async fn guardrails_pause_when_experiment_limit_is_reached() {
 }
 
 #[test]
-fn codex_resume_argv_uses_project_scoped_resume_without_shell() {
+fn codex_resume_argv_requires_project_owned_metadata_without_changing_arguments() {
     let harness = SchedulerHarness::new();
     let root = harness.root("project-a").canonicalize().unwrap();
+    let codex_home = harness.temp.path().join("codex-home");
+    write_codex_session_metadata(
+        &codex_home.join("sessions/2026/08/09"),
+        OWNED_CODEX_SESSION_ID,
+        &root.join("nested-worktree"),
+    );
     let project = ProjectRepository::new(&harness.db)
         .find_by_id("project-a")
         .unwrap()
@@ -503,10 +514,17 @@ fn codex_resume_argv_uses_project_scoped_resume_without_shell() {
         .agent;
     agent.program = "codex".to_owned();
     agent.context = AgentContextMode::Resume {
-        session_id: "session-123".to_owned(),
+        session_id: OWNED_CODEX_SESSION_ID.to_owned(),
     };
+    fs::create_dir_all(root.join("nested-worktree")).unwrap();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
+            .with_codex_home(codex_home),
+    );
 
-    let command = AgentRunner::command_for(&project, &agent, "bounded prompt").unwrap();
+    let command = runner
+        .command_for(&project, &agent, "bounded prompt")
+        .unwrap();
 
     assert_eq!(command.program, "codex");
     assert_eq!(
@@ -516,10 +534,128 @@ fn codex_resume_argv_uses_project_scoped_resume_without_shell() {
             "-C",
             root.to_str().unwrap(),
             "resume",
-            "session-123",
+            OWNED_CODEX_SESSION_ID,
             "bounded prompt",
         ]
     );
+}
+
+#[test]
+fn codex_resume_accepts_project_owned_archived_metadata() {
+    let harness = SchedulerHarness::new();
+    let root = harness.root("project-a").canonicalize().unwrap();
+    let codex_home = harness.temp.path().join("codex-home");
+    write_codex_session_metadata(
+        &codex_home.join("archived_sessions"),
+        OWNED_CODEX_SESSION_ID,
+        &root,
+    );
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
+        .unwrap()
+        .agent;
+    agent.program = "codex".to_owned();
+    agent.context = AgentContextMode::Resume {
+        session_id: OWNED_CODEX_SESSION_ID.to_owned(),
+    };
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
+            .with_codex_home(codex_home),
+    );
+
+    let command = runner
+        .command_for(&project, &agent, "bounded prompt")
+        .unwrap();
+
+    assert_eq!(command.args[4], OWNED_CODEX_SESSION_ID);
+}
+
+#[test]
+fn codex_resume_rejects_foreign_project_metadata() {
+    let harness = SchedulerHarness::new();
+    let root = harness.root("project-a").canonicalize().unwrap();
+    let foreign_root = harness.temp.path().join("foreign-project");
+    fs::create_dir_all(&foreign_root).unwrap();
+    let codex_home = harness.temp.path().join("codex-home");
+    write_codex_session_metadata(
+        &codex_home.join("sessions/2026/08/09"),
+        FOREIGN_CODEX_SESSION_ID,
+        &foreign_root,
+    );
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
+        .unwrap()
+        .agent;
+    agent.program = "codex".to_owned();
+    agent.context = AgentContextMode::Resume {
+        session_id: FOREIGN_CODEX_SESSION_ID.to_owned(),
+    };
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
+            .with_codex_home(codex_home),
+    );
+
+    let error = runner
+        .command_for(&project, &agent, "bounded prompt")
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pueue_agent::AppError::CodexSessionMetadata { .. }
+    ));
+    assert!(error.to_string().contains("outside project root"));
+}
+
+#[test]
+fn codex_resume_rejects_missing_and_malformed_metadata() {
+    let harness = SchedulerHarness::new();
+    let root = harness.root("project-a").canonicalize().unwrap();
+    let codex_home = harness.temp.path().join("codex-home");
+    fs::create_dir_all(codex_home.join("sessions/2026/08/09")).unwrap();
+    fs::write(
+        codex_home
+            .join("sessions/2026/08/09")
+            .join(format!("rollout-test-{MALFORMED_CODEX_SESSION_ID}.jsonl")),
+        b"not-json\n",
+    )
+    .unwrap();
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
+        .unwrap()
+        .agent;
+    agent.program = "codex".to_owned();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
+            .with_codex_home(codex_home),
+    );
+
+    for (session_id, expected) in [
+        (MISSING_CODEX_SESSION_ID, "not found"),
+        (MALFORMED_CODEX_SESSION_ID, "malformed"),
+    ] {
+        agent.context = AgentContextMode::Resume {
+            session_id: session_id.to_owned(),
+        };
+
+        let error = runner
+            .command_for(&project, &agent, "bounded prompt")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            pueue_agent::AppError::CodexSessionMetadata { .. }
+        ));
+        assert!(error.to_string().contains(expected));
+    }
 }
 
 #[cfg(unix)]
@@ -601,7 +737,12 @@ fn codex_resume_latest_argv_is_opt_in_and_project_scoped() {
     agent.program = "codex".to_owned();
     agent.context = AgentContextMode::ResumeLatest;
 
-    let command = AgentRunner::command_for(&project, &agent, "bounded prompt").unwrap();
+    let runner = AgentRunner::new(AgentRunnerConfig::for_tests(
+        harness.temp.path().join("agent.log"),
+    ));
+    let command = runner
+        .command_for(&project, &agent, "bounded prompt")
+        .unwrap();
 
     assert_eq!(
         command.args,
@@ -614,6 +755,25 @@ fn codex_resume_latest_argv_is_opt_in_and_project_scoped() {
             "bounded prompt",
         ]
     );
+}
+
+fn write_codex_session_metadata(store: &std::path::Path, session_id: &str, cwd: &std::path::Path) {
+    fs::create_dir_all(store).unwrap();
+    fs::write(
+        store.join(format!("rollout-test-{session_id}.jsonl")),
+        format!(
+            "{}\n{{\"type\":\"response_item\"}}\n",
+            json!({
+                "timestamp": "2026-08-09T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": cwd,
+                }
+            })
+        ),
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]

@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod cli;
+pub mod codex_session;
 pub mod config;
 pub mod daemon;
 pub mod db;

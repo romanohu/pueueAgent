@@ -18,7 +18,7 @@ setup() {
   fake_repo="$BATS_TEST_TMPDIR/repository"
   mkdir -p "$fake_repo/bin" "$fake_repo/target/debug"
   cp "$REPO_ROOT/bin/pueue-agent" "$fake_repo/bin/pueue-agent"
-  printf '%s\n' '#!/usr/bin/env bash' 'printf "<%s>\\n" "$@"' \
+  printf '%s\n' '#!/usr/bin/env bash' "printf '<%s>\\n' \"\$@\"" \
     > "$fake_repo/target/debug/pueue-agent"
   chmod +x "$fake_repo/target/debug/pueue-agent"
 
@@ -38,7 +38,8 @@ setup() {
   prefix="$BATS_TEST_TMPDIR/install"
   cargo_log="$BATS_TEST_TMPDIR/cargo.log"
   mkdir -p "$fake_bin"
-  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$*" > "$TEST_CARGO_LOG"' \
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "printf '%s\\n' \"\$*\" > \"\$TEST_CARGO_LOG\"" \
     > "$fake_bin/cargo"
   chmod +x "$fake_bin/cargo"
 

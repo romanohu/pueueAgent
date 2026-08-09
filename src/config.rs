@@ -5,7 +5,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::{models::AgentContextMode, AppError};
+use crate::{codex_session, models::AgentContextMode, AppError};
 
 pub const DEFAULT_LOG_TAIL_BYTES: u32 = 64 * 1024;
 pub const DEFAULT_MAX_AGENT_RUNS: u32 = 100;
@@ -185,6 +185,7 @@ impl RawAgentContextConfig {
                     .ok_or(AppError::Configuration {
                         field: "agent.context.session_id",
                     })?;
+                let session_id = codex_session::normalize_session_id(&session_id)?;
                 AgentContextMode::Resume { session_id }
             }
             "resume_latest" => {

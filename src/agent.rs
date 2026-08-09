@@ -8,6 +8,7 @@ use std::{
 use tokio::{process::Command, time::Instant};
 
 use crate::{
+    codex_session,
     config::AgentConfig,
     db::AgentRunRepository,
     models::{AgentContextMode, AgentRunStatus, NewAgentRun, Project},
@@ -17,19 +18,27 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct AgentRunnerConfig {
     pub log_dir_override: Option<PathBuf>,
+    pub codex_home_override: Option<PathBuf>,
 }
 
 impl AgentRunnerConfig {
     pub fn production() -> Self {
         Self {
             log_dir_override: None,
+            codex_home_override: None,
         }
     }
 
     pub fn for_tests(log_path: PathBuf) -> Self {
         Self {
             log_dir_override: log_path.parent().map(PathBuf::from),
+            codex_home_override: None,
         }
+    }
+
+    pub fn with_codex_home(mut self, codex_home: PathBuf) -> Self {
+        self.codex_home_override = Some(codex_home);
+        self
     }
 }
 
@@ -57,6 +66,7 @@ impl AgentRunner {
     }
 
     pub fn command_for(
+        &self,
         project: &Project,
         config: &AgentConfig,
         prompt: &str,
@@ -76,6 +86,15 @@ impl AgentRunner {
                         field: "agent.context",
                     });
                 }
+                let codex_home = match &self.config.codex_home_override {
+                    Some(path) => path.clone(),
+                    None => codex_session::home_from_environment()?,
+                };
+                let session_id = codex_session::verify_project_ownership(
+                    &codex_home,
+                    &project.root_path,
+                    session_id,
+                )?;
                 Ok(AgentCommand {
                     program: "codex".to_owned(),
                     args: vec![
@@ -83,7 +102,7 @@ impl AgentRunner {
                         "-C".to_owned(),
                         path_string(&project.root_path, "project.root_path")?,
                         "resume".to_owned(),
-                        session_id.clone(),
+                        session_id,
                         prompt.to_owned(),
                     ],
                 })
@@ -120,7 +139,7 @@ impl AgentRunner {
         prompt: &str,
         now: i64,
     ) -> Result<AgentHandle, AppError> {
-        let command = Self::command_for(project, config, prompt)?;
+        let command = self.command_for(project, config, prompt)?;
         let log_path = self.log_path(project, primary_event_id, now)?;
         let run = AgentRunRepository::new(db).insert(&NewAgentRun::with_context(
             &project.project_id,

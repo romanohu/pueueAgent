@@ -8,6 +8,14 @@ pub enum AppError {
     #[error("configuration error in {field}; update the project configuration and try again")]
     Configuration { field: &'static str },
 
+    #[error(
+        "Codex session `{session_id}` cannot be resumed: {reason}; explicit resume requires local metadata proving project ownership"
+    )]
+    CodexSessionMetadata {
+        session_id: String,
+        reason: &'static str,
+    },
+
     #[error("failed to {operation}: {source}")]
     Io {
         operation: &'static str,

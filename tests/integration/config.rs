@@ -10,6 +10,8 @@ use pueue_agent::{
 };
 use tempfile::TempDir;
 
+const CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
+
 fn write_config(temp: &TempDir, body: &str) -> std::path::PathBuf {
     let path = temp.path().join("config.toml");
     fs::write(&path, body).unwrap();
@@ -72,13 +74,15 @@ fn command_is_an_argument_vector_not_a_shell_string() {
 fn codex_context_resume_requires_explicit_non_empty_session() {
     let config = valid_config().replace(
         "max_retries = 2\n",
-        "max_retries = 2\n\n[agent.context]\nmode = \"resume\"\nsession_id = \"session-abc\"\n",
+        &format!(
+            "max_retries = 2\n\n[agent.context]\nmode = \"resume\"\nsession_id = \"{CODEX_SESSION_ID}\"\n"
+        ),
     );
     let config = load_config(config).unwrap();
     assert_eq!(
         config.agent.context,
         AgentContextMode::Resume {
-            session_id: "session-abc".to_owned()
+            session_id: CODEX_SESSION_ID.to_owned()
         }
     );
 
@@ -90,6 +94,18 @@ fn codex_context_resume_requires_explicit_non_empty_session() {
         .unwrap_err()
         .to_string()
         .contains("agent.context.session_id"));
+}
+
+#[test]
+fn codex_context_resume_rejects_session_ids_that_are_unsafe_for_paths() {
+    let config = valid_config().replace(
+        "max_retries = 2\n",
+        "max_retries = 2\n\n[agent.context]\nmode = \"resume\"\nsession_id = \"../../foreign-session\"\n",
+    );
+
+    let error = load_config(config).unwrap_err();
+
+    assert!(error.to_string().contains("agent.context.session_id"));
 }
 
 #[test]
