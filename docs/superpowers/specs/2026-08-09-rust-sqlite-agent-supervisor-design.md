@@ -281,6 +281,11 @@ events have priority in this order:
 
 The prompt contains all claimed event contexts, not just one task ID.
 
+The prompt is deliberately bounded. It contains a compact experiment summary
+(event and incident IDs, Pueue task state, recent result, artifact paths, and
+the relevant bounded log tails) plus references to `STATE.md` and
+`instructions.md`; it does not paste the complete history of every experiment.
+
 ## 8. Anomaly detection
 
 The cheap detector only reads Pueue status and bounded log tails.
@@ -390,6 +395,37 @@ The supervisor treats a zero exit code as successful agent execution, not as
 proof that a new experiment was submitted. Task submission is separately
 observed and counted.
 
+### Optional Codex conversation continuation
+
+Project files and the structured experiment summary are the durable context.
+Reusing an existing Codex conversation is a separate, explicit option so a
+stale or unrelated conversation is never selected implicitly. The default is:
+
+```toml
+[agent.context]
+mode = "fresh" # fresh | resume | resume_latest
+session_id = ""
+```
+
+For the Codex executable, the two continuation modes map to the local CLI as
+follows:
+
+- `resume`: `codex exec -C <project-root> resume <session-id> <prompt>`
+- `resume_latest`: `codex exec -C <project-root> resume --last <prompt>`
+
+The explicit session ID is preferred for reproducibility. `resume_latest` is
+scoped to the project working directory by `-C`; it is intended for a local
+operator workflow, not unattended cross-project discovery. A requested
+resume that cannot locate its session fails visibly and never falls back to a
+fresh run.
+
+Every agent run records the selected context mode and resolved session ID (when
+available) in SQLite. The prompt still includes the bounded current
+experiment summary and project files, because conversation history alone is
+not the source of truth. Context continuation is supported for Codex; other
+agent programs must use `fresh` unless they provide a separately documented
+resume adapter.
+
 ## 11. Guardrails and token control
 
 Guardrails are stored per project and enforced before an agent is claimed.
@@ -433,6 +469,12 @@ pueue-agent status
 pueue-agent pause
 pueue-agent resume
 ```
+
+Context reuse is configured explicitly per project. An operator may set an
+exact Codex session ID or choose the most recent session for the project; the
+normal `submit` and monitoring workflow does not change. `status` reports the
+configured context mode and the last session lineage so experiment sharing is
+visible without dumping conversation transcripts.
 
 `status` shows supervisor health, project state, active tasks, pending events,
 open incidents, active agent runs, and guardrail counters.

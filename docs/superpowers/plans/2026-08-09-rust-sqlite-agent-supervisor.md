@@ -20,6 +20,7 @@
 - Normal health checks must not start an agent.
 - Every event claim has a lease and is recoverable after supervisor restart.
 - A project may have at most one active agent run unless a future configuration explicitly permits more.
+- Existing Codex conversation context is reusable only through explicit opt-in; fresh context remains the default.
 - The migration must preserve the current Bash implementation until Rust parity is verified.
 - Linux systemd user services and macOS launchd must be supported; interactive shell environment variables are not service configuration.
 
@@ -499,6 +500,8 @@ git commit -m "feat: add policy-controlled Pueue task termination"
 - `AgentRunner::spawn(project, prompt) -> Result<AgentHandle, AppError>` uses `tokio::process::Command` and an argument vector.
 - `Guardrails::check(project, event_batch) -> Result<DispatchDecision, AppError>` returns `Allow`, `Pause`, or `Halt(reason)`.
 - `AgentHandle` exposes run ID, child process, timeout deadline, and log path.
+- `AgentContextMode` is `Fresh`, `Resume { session_id }`, or `ResumeLatest`; only the Codex launcher accepts the latter two modes.
+- `AgentRunner` records the context mode and resolved Codex session ID in the agent-run record and never silently falls back from a requested resume to a fresh run.
 
 - [ ] **Step 1: Write tests for priority coalescing, one active agent, lease expiry, cooldown, retry backoff, and guardrail halts.**
 
@@ -537,6 +540,18 @@ Claim all eligible events in one transaction, group by project, select the highe
 - [ ] **Step 4: Implement direct agent process execution.**
 
 Replace `{prompt}` only inside an argument entry. Write stdout/stderr to a timestamped project log. Track timeout and exit code in SQLite. Use Unix process groups when available so timeout cleanup can terminate the full agent process tree, while keeping a platform-specific fallback for macOS.
+
+For `program = "codex"`, implement the explicit continuation mapping:
+
+- fresh: configured executable and argument vector;
+- resume: `codex exec -C <project-root> resume <session-id> <prompt>`;
+- resume_latest: `codex exec -C <project-root> resume --last <prompt>`.
+
+Always provide the bounded experiment summary, `STATE.md`, and
+`instructions.md` references in the prompt. The database records event/task
+lineage and the selected context mode, rather than copying full conversation
+transcripts into SQLite. A missing requested session is a visible agent-run
+failure.
 
 - [ ] **Step 5: Implement retry and guardrail transitions.**
 
