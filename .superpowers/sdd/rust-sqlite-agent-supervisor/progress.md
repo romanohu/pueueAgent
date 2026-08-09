@@ -94,3 +94,22 @@ Base: `6ca1e2b`
 
 - Commits: `589ad35 feat: add leased agent scheduler and guardrails`, `6954d5d fix: harden task 8 scheduler agent lifecycle`, `f32f1ed fix: resolve claimed scheduler groups after batch errors`
 - Review clean after two fix rounds. Guardrails, leased scheduler, agent lifecycle, explicit Codex fresh/resume/resume_latest launch, bounded context prompts, SQLite context lineage, and migration invariants are implemented.
+
+## Task 9 — fix round 1/5
+
+- Reviewer findings: production signal wiring was missing, shutdown did not drain children, systemd paths were unescaped, group provisioning was absent, and callback YAML updates were not daemon-scoped.
+- Fix commit: `5da23fc fix: harden task 9 daemon service integration`
+- Re-review: four findings addressed; group provisioning idempotency remained open.
+- Verification: daemon/service 16 passed, full offline Rust passed, fmt, Clippy, and diff check passed.
+
+## Task 9 — fix round 2/5
+
+- Finding: existing Pueue groups caused non-idempotent `group add` failure.
+- Fix commit: `7126d69 fix: make pueue group provisioning idempotent`
+- Re-review: PASS; exact JSON group checks, race recheck, and genuine failure propagation verified.
+- Verification: focused service/Pueue/daemon 30 passed, full offline Rust passed, fmt, Clippy, and diff check passed.
+
+## Task 9 — complete
+
+- Commits: `ba10544 feat: add supervisor daemon and user service integration`, `5da23fc fix: harden task 9 daemon service integration`, `7126d69 fix: make pueue group provisioning idempotent`
+- Review clean after two fix rounds. Graceful daemon shutdown, service templates, callback installation, shell-free group provisioning, and recoverable enable flow are implemented.
