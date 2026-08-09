@@ -133,3 +133,17 @@ Base: `6ca1e2b`
 - Rust E2E covers same-basename project isolation, callback and missed-callback reconciliation, normal zero-agent monitoring, repeated fatal detection, one Pueue kill, one agent run, spawn retry, guardrail halt/resume, expired-lease restart recovery, explicit Codex session resume, and installed release execution.
 - Independent Codex CLI review was requested read-only but blocked by the environment's repository-data safety policy. Local requirement and reference audits found no remaining obsolete-code references outside historical design documents.
 - Verification: Rust all-target tests 133 passed, Bats 3 passed, Rust E2E passed, `cargo fmt --check`, all-target/all-feature Clippy with `-D warnings`, ShellCheck for all remaining shell entry points/support scripts, and `git diff --check` passed.
+
+## Task 11 — fix round 1/5
+
+- Reviewer finding: explicit Codex resume accepted an arbitrary session ID and could cross project roots.
+- Fix commit: `ffb03b2 fix: bind Codex resume sessions to project roots`
+- The fix validates canonical UUIDs, reads bounded local Codex session metadata from active/archived stores, requires the metadata cwd to be inside the project root, and fails visibly without fresh fallback.
+
+## Task 11 — fix round 2/5
+
+- Reviewer finding: session discovery had no total entry bound, and the E2E continuation fixture used a non-UUID ID without metadata.
+- Fix commit: `31a4678 fix: bound Codex session discovery and E2E coverage`
+- Discovery now bounds depth and total entries and stops on a second candidate; E2E supplies project-owned metadata and verifies the Codex process boundary and SQLite recording.
+- Re-review: APPROVE; no Blocker, Major, or Minor findings.
+- Verification: full offline Rust 143 tests, Clippy, fmt, ShellCheck, Bats 3, Rust E2E PASS, and diff check passed.
