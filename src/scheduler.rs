@@ -65,7 +65,10 @@ impl Scheduler {
 
         for (project_id, mut events) in group_by_project(claimed) {
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
-            let event_ids = events.iter().map(|event| event.event_id).collect::<Vec<_>>();
+            let event_ids = events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>();
             let Some(primary) = events.first().cloned() else {
                 continue;
             };
@@ -79,7 +82,20 @@ impl Scheduler {
                 )?;
                 continue;
             };
-            let project_config = config::load(&project.config_path)?;
+            let project_config = match config::load(&project.config_path) {
+                Ok(project_config) => project_config,
+                Err(error) => {
+                    let message = error.to_string();
+                    EventRepository::new(&self.db).transition_many(
+                        &event_ids,
+                        EventStatus::Failed,
+                        self.config.now,
+                        None,
+                        Some(&message),
+                    )?;
+                    return Err(error);
+                }
+            };
             let guardrails = Guardrails::new(&self.db, self.config.now);
             match guardrails.check(&project, &project_config.guardrails, &events)? {
                 DispatchDecision::Allow => {}
@@ -139,7 +155,8 @@ impl Scheduler {
                 }
                 Err(error) => {
                     let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
-                    let status = if primary.attempts <= i64::from(project_config.agent.max_retries) {
+                    let status = if primary.attempts <= i64::from(project_config.agent.max_retries)
+                    {
                         EventStatus::RetryWait
                     } else {
                         EventStatus::Failed

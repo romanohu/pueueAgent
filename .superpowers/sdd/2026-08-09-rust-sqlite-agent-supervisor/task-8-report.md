@@ -36,3 +36,51 @@ Baseline / red / verification commands were attempted, but this environment does
 - Not compiler-verified in this environment due to missing `cargo`, `rustc`, `rustfmt`, and `rust-analyzer`.
 - `resume_latest` records mode and event lineage, but cannot know a concrete Codex session id until Codex reports one; no transcript is copied into SQLite.
 - Agent timeout cleanup uses `tokio::process::Child::kill()` for the agent process. No raw OS signal path was added for Pueue task termination.
+
+## Fix round 1
+
+### Summary
+
+- Added Unix agent process session setup with best-effort `setsid()` before spawning the agent process.
+- Changed agent timeout cleanup to terminate the agent process group with TERM, then KILL, then fall back to `Child::kill()` where process groups are unavailable or cleanup fails. Pueue task termination remains through the Pueue adapter only.
+- Changed scheduler config-load failures after claim into visible failed event transitions with the configuration error preserved in `events.last_error`; explicit resume configuration still fails and does not fall back to fresh.
+- Ensured SQLite migrations idempotently create `agent_runs_one_active_per_project_idx` on v1->v3, v2->v3, v0->v3, and already-v3 opens.
+- Added regression coverage for invalid resume config claims, full agent descendant cleanup on timeout, and legacy migration active-agent uniqueness.
+
+### Red commands
+
+All commands used:
+
+`PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin`
+
+| Command | Result |
+|---|---|
+| `cargo test --test scheduler invalid_resume_config_does_not_leave_claimed_event_stranded -- --nocapture` | RED: failed with event left `Claimed` instead of `Failed` |
+| `cargo test --test scheduler agent_timeout_terminates_descendant_agent_processes -- --nocapture` | RED: failed because descendant `sleep` process remained after timeout |
+| `cargo test --test database legacy_migrations_create_active_agent_unique_index -- --nocapture` | RED: failed because legacy migration left index count `0` |
+
+### Verification commands
+
+All commands used:
+
+`PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin`
+
+| Command | Result |
+|---|---|
+| `cargo test --test scheduler invalid_resume_config_does_not_leave_claimed_event_stranded -- --nocapture` | Passed: 1 passed |
+| `cargo test --test scheduler agent_timeout_terminates_descendant_agent_processes -- --nocapture` | Passed: 1 passed |
+| `cargo test --test database legacy_migrations_create_active_agent_unique_index -- --nocapture` | Passed: 1 passed |
+| `cargo test --test scheduler` | Passed: 11 passed |
+| `cargo test --test config` | Passed: 26 passed |
+| `cargo test --test database` | Passed: 18 passed |
+| `cargo fmt --check` | Initially failed; after `cargo fmt`, passed |
+| `cargo test --offline --all-targets --all-features` | Passed: 98 passed across all integration/unit targets |
+| `cargo clippy --offline --all-targets --all-features -- -D warnings` | Passed |
+| `git diff --check` | Passed |
+| `rg -n "kill\\(\|SIGTERM\|SIGKILL\|setsid\|pre_exec\|process_group\|Command::new\\(\\\".*sh\|sh -c\|bash -c" src tests/integration -g '!target/**'` | Only agent process cleanup/test helpers and existing Pueue adapter abstractions matched; no raw Pueue task signal path was added |
+
+### Risks / notes
+
+- Unix process-group cleanup is best-effort: `setsid()` is attempted in `pre_exec`; if unavailable or cleanup signaling fails, timeout cleanup falls back to killing the direct child.
+- Non-Unix platforms retain the direct-child kill fallback.
+- The process-tree regression is Unix-only because it verifies POSIX process-group behavior.

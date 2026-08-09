@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
@@ -16,6 +13,8 @@ use pueue_agent::{
 use rusqlite::params;
 use serde_json::json;
 use tempfile::TempDir;
+#[cfg(unix)]
+use tokio::time::{sleep, Duration, Instant};
 
 struct SchedulerHarness {
     temp: TempDir,
@@ -40,7 +39,11 @@ impl SchedulerHarness {
         let root = self.root(project_id);
         fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
         fs::write(root.join(".pueue-agent/STATE.md"), "state reference").unwrap();
-        fs::write(root.join(".pueue-agent/instructions.md"), "instructions reference").unwrap();
+        fs::write(
+            root.join(".pueue-agent/instructions.md"),
+            "instructions reference",
+        )
+        .unwrap();
         fs::write(
             root.join(".pueue-agent/config.toml"),
             format!(
@@ -107,7 +110,9 @@ max_agent_runs = 10
     fn scheduler(&self) -> Scheduler {
         Scheduler::new(
             self.db.clone(),
-            AgentRunner::new(AgentRunnerConfig::for_tests(self.temp.path().join("agent.log"))),
+            AgentRunner::new(AgentRunnerConfig::for_tests(
+                self.temp.path().join("agent.log"),
+            )),
             SchedulerConfig {
                 now: self.now,
                 lease_seconds: 60,
@@ -122,6 +127,14 @@ max_agent_runs = 10
             .unwrap()
             .unwrap()
             .status
+    }
+
+    fn event_status_and_error(&self, event_id: i64) -> (EventStatus, Option<String>) {
+        let event = EventRepository::new(&self.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        (event.status, event.last_error)
     }
 
     fn active_runs(&self, project_id: &str) -> i64 {
@@ -155,9 +168,7 @@ async fn crash_and_deep_check_for_one_project_start_one_crash_run() {
     assert!(report.started[0]
         .prompt
         .contains(&format!("event_id={crash}")));
-    assert!(report.started[0]
-        .prompt
-        .contains(".pueue-agent/STATE.md"));
+    assert!(report.started[0].prompt.contains(".pueue-agent/STATE.md"));
     assert!(report.started[0]
         .prompt
         .contains(".pueue-agent/instructions.md"));
@@ -205,6 +216,61 @@ async fn active_agent_prevents_new_claim_for_same_project() {
     assert!(report.started.is_empty());
     assert_eq!(harness.active_runs("project-a"), 1);
     assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+}
+
+#[tokio::test]
+async fn invalid_resume_config_does_not_leave_claimed_event_stranded() {
+    let harness = SchedulerHarness::new();
+    let root = harness.root("project-a");
+    fs::write(
+        root.join(".pueue-agent/config.toml"),
+        r#"
+project_id = "project-a"
+pueue_group = "pa-project-a"
+
+[agent]
+program = "codex"
+args = ["exec", "{prompt}"]
+timeout_minutes = 1
+max_retries = 2
+
+[agent.context]
+mode = "resume"
+
+[check]
+interval_minutes = 10
+deep_check_every = 6
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+    )
+    .unwrap();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "bad-resume");
+
+    let mut scheduler = harness.scheduler();
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("invalid resume config should fail the scheduler tick"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("agent.context.session_id"));
+    let (status, last_error) = harness.event_status_and_error(event_id);
+    assert_eq!(status, EventStatus::Failed);
+    assert!(last_error
+        .as_deref()
+        .is_some_and(|message| message.contains("agent.context.session_id")));
+    assert_eq!(harness.active_runs("project-a"), 0);
 }
 
 #[tokio::test]
@@ -278,10 +344,7 @@ async fn guardrails_halt_when_agent_run_limit_is_reached() {
         .find_by_id("project-a")
         .unwrap()
         .unwrap();
-    assert!(project
-        .halted_reason
-        .unwrap()
-        .contains("max_agent_runs"));
+    assert!(project.halted_reason.unwrap().contains("max_agent_runs"));
 }
 
 #[tokio::test]
@@ -356,7 +419,9 @@ fn codex_resume_argv_uses_project_scoped_resume_without_shell() {
         .find_by_id("project-a")
         .unwrap()
         .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml")).unwrap().agent;
+    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
+        .unwrap()
+        .agent;
     agent.program = "codex".to_owned();
     agent.context = AgentContextMode::Resume {
         session_id: "session-123".to_owned(),
@@ -378,6 +443,71 @@ fn codex_resume_argv_uses_project_scoped_resume_without_shell() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_timeout_terminates_descendant_agent_processes() {
+    let harness = SchedulerHarness::new();
+    let root = harness.root("project-a");
+    let pid_path = root.join(".pueue-agent/logs/descendant.pid");
+    fs::write(
+        root.join(".pueue-agent/config.toml"),
+        r#"
+project_id = "project-a"
+pueue_group = "pa-project-a"
+
+[agent]
+program = "/bin/sh"
+args = ["-c", "sleep 30 & echo $! > .pueue-agent/logs/descendant.pid; wait"]
+timeout_minutes = 1
+max_retries = 2
+
+[check]
+interval_minutes = 10
+deep_check_every = 6
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+    )
+    .unwrap();
+    harness.enqueue(EventKind::TaskFailed, "project-a", "process-tree");
+
+    let mut scheduler = harness.scheduler();
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+    let descendant_pid = wait_for_pid_file(&pid_path).await;
+    assert!(
+        process_exists(descendant_pid),
+        "descendant process should be running before timeout cleanup"
+    );
+
+    started.handle.timeout_deadline = Instant::now();
+    let status = started
+        .handle
+        .wait(&harness.db, harness.now + 1)
+        .await
+        .unwrap();
+
+    assert_eq!(status, AgentRunStatus::TimedOut);
+    let descendant_exited = wait_until_process_exits(descendant_pid).await;
+    if !descendant_exited {
+        kill_process(descendant_pid);
+    }
+    assert!(
+        descendant_exited,
+        "timeout cleanup must terminate the full agent process tree"
+    );
+}
+
 #[test]
 fn codex_resume_latest_argv_is_opt_in_and_project_scoped() {
     let harness = SchedulerHarness::new();
@@ -386,7 +516,9 @@ fn codex_resume_latest_argv_is_opt_in_and_project_scoped() {
         .find_by_id("project-a")
         .unwrap()
         .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml")).unwrap().agent;
+    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
+        .unwrap()
+        .agent;
     agent.program = "codex".to_owned();
     agent.context = AgentContextMode::ResumeLatest;
 
@@ -403,4 +535,45 @@ fn codex_resume_latest_argv_is_opt_in_and_project_scoped() {
             "bounded prompt",
         ]
     );
+}
+
+#[cfg(unix)]
+async fn wait_for_pid_file(path: &std::path::Path) -> i32 {
+    for _ in 0..50 {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse::<i32>() {
+                return pid;
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("descendant pid file was not written");
+}
+
+#[cfg(unix)]
+async fn wait_until_process_exits(pid: i32) -> bool {
+    for _ in 0..50 {
+        if !process_exists(pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    unsafe { kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn kill_process(pid: i32) {
+    unsafe extern "C" {
+        fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    const SIGKILL: std::os::raw::c_int = 9;
+    let _ = unsafe { kill(pid, SIGKILL) };
 }

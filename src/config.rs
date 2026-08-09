@@ -166,7 +166,11 @@ impl RawAgentContextConfig {
 
         let context = match mode {
             "fresh" => {
-                if self.session_id.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                if self
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
                     return Err(AppError::Configuration {
                         field: "agent.context.session_id",
                     });
@@ -184,7 +188,11 @@ impl RawAgentContextConfig {
                 AgentContextMode::Resume { session_id }
             }
             "resume_latest" => {
-                if self.session_id.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                if self
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
                     return Err(AppError::Configuration {
                         field: "agent.context.session_id",
                     });

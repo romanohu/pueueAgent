@@ -5,6 +5,11 @@ use crate::AppError;
 use super::database_error;
 
 const LATEST_SCHEMA_VERSION: i64 = 3;
+const ACTIVE_AGENT_INDEX_SQL: &str = r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
+        ON agent_runs(project_id)
+        WHERE status IN ('starting', 'running');
+"#;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let transaction = connection
@@ -19,6 +24,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         });
     }
     if version == LATEST_SCHEMA_VERSION {
+        ensure_invariant_indexes(&transaction)?;
         transaction
             .commit()
             .map_err(database_error("commit SQLite migration check"))?;
@@ -235,9 +241,16 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             )
             .map_err(database_error("apply SQLite v3 migration"))?;
     }
+    ensure_invariant_indexes(&transaction)?;
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
 
     Ok(())
+}
+
+fn ensure_invariant_indexes(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    transaction
+        .execute_batch(ACTIVE_AGENT_INDEX_SQL)
+        .map_err(database_error("ensure SQLite invariant indexes"))
 }

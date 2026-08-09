@@ -42,6 +42,7 @@ pub struct AgentCommand {
 pub struct AgentHandle {
     pub run_id: i64,
     pub child: tokio::process::Child,
+    pub pid: i64,
     pub timeout_deadline: Instant,
     pub log_path: PathBuf,
 }
@@ -156,6 +157,7 @@ impl AgentRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr));
+        process_tree::configure_agent_command(&mut process);
 
         let child = match process.spawn() {
             Ok(child) => child,
@@ -181,6 +183,7 @@ impl AgentRunner {
         Ok(AgentHandle {
             run_id: run.run_id,
             child,
+            pid,
             timeout_deadline: Instant::now()
                 + Duration::from_secs(u64::from(config.timeout_minutes) * 60),
             log_path,
@@ -237,7 +240,7 @@ impl AgentHandle {
                 });
             }
             Err(_) => {
-                let _ = self.child.kill().await;
+                process_tree::terminate_agent_process_tree(&mut self.child, self.pid).await;
                 AgentRunRepository::new(db).finish(
                     self.run_id,
                     AgentRunStatus::TimedOut,
@@ -249,6 +252,80 @@ impl AgentHandle {
             }
         };
         Ok(status)
+    }
+}
+
+#[cfg(unix)]
+mod process_tree {
+    use std::{io, os::raw::c_int, time::Duration};
+
+    use tokio::process::{Child, Command};
+
+    const SIGTERM: c_int = 15;
+    const SIGKILL: c_int = 9;
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        fn setsid() -> c_int;
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    pub(super) fn configure_agent_command(command: &mut Command) {
+        unsafe {
+            command.pre_exec(|| {
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+
+    pub(super) async fn terminate_agent_process_tree(child: &mut Child, pid: i64) {
+        if let Ok(pid) = c_int::try_from(pid) {
+            let _ = signal_process_group(pid, SIGTERM);
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), child.wait()).await
+            {
+                return;
+            }
+
+            let _ = signal_process_group(pid, SIGKILL);
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), child.wait()).await
+            {
+                return;
+            }
+        }
+
+        let _ = child.kill().await;
+    }
+
+    fn signal_process_group(pid: c_int, signal: c_int) -> io::Result<()> {
+        let process_group = pid.checked_neg().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent pid cannot form process group",
+            )
+        })?;
+        let result = unsafe { kill(process_group, signal) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod process_tree {
+    use tokio::process::{Child, Command};
+
+    pub(super) fn configure_agent_command(_command: &mut Command) {}
+
+    pub(super) async fn terminate_agent_process_tree(child: &mut Child, _pid: i64) {
+        let _ = child.kill().await;
     }
 }
 

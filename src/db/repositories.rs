@@ -990,9 +990,11 @@ impl<'db> AgentRunRepository<'db> {
     pub fn insert(&self, run: &NewAgentRun) -> Result<AgentRun, AppError> {
         let log_path = path_text(&run.log_path, "log_path")?;
         let context_lineage_json =
-            serde_json::to_string(&run.context_lineage).map_err(|source| AppError::Serialization {
-                operation: "serialize agent context lineage",
-                source,
+            serde_json::to_string(&run.context_lineage).map_err(|source| {
+                AppError::Serialization {
+                    operation: "serialize agent context lineage",
+                    source,
+                }
             })?;
         let connection = self.db.connect()?;
         connection
@@ -1558,9 +1560,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
     let context_session_id: Option<String> = row.get(11)?;
     let context_mode =
         AgentContextMode::from_db_parts(&context_mode_value, context_session_id.clone()).map_err(
-            |source| {
-                rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(source))
-            },
+            |source| rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(source)),
         )?;
     let context_lineage_json: String = row.get(12)?;
     let context_lineage = serde_json::from_str(&context_lineage_json).map_err(|source| {
