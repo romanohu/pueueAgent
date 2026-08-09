@@ -686,10 +686,21 @@ fn submission_repository_tracks_acceptance_and_unreconciled_rows() {
         .unwrap();
     repository
         .insert_idempotent(&NewSubmission::new(
+            "submission-failed",
+            "project-a",
+            vec!["python".to_owned(), "failed.py".to_owned()],
+            101,
+        ))
+        .unwrap();
+    repository
+        .transition_status("submission-failed", SubmissionStatus::Failed)
+        .unwrap();
+    repository
+        .insert_idempotent(&NewSubmission::new(
             "submission-accepted",
             "project-a",
             vec!["python".to_owned(), "accepted.py".to_owned()],
-            101,
+            102,
         ))
         .unwrap();
     let accepted = repository
@@ -698,6 +709,15 @@ fn submission_repository_tracks_acceptance_and_unreconciled_rows() {
     assert_eq!(accepted.status, SubmissionStatus::Accepted);
     assert_eq!(accepted.pueue_task_id, Some(41));
     assert_eq!(accepted.task_signature.as_deref(), Some("project-a:41"));
+
+    let initially_unreconciled = repository.find_unreconciled("project-a").unwrap();
+    assert_eq!(
+        initially_unreconciled
+            .iter()
+            .map(|submission| submission.submission_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["submission-pending"]
+    );
 
     repository
         .transition_status("submission-accepted", SubmissionStatus::Unreconciled)

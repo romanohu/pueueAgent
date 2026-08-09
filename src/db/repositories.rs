@@ -518,7 +518,13 @@ impl<'db> SubmissionRepository<'db> {
         let mut statement = connection
             .prepare(&format!(
                 "{} WHERE project_id = ?1
-                    AND (pueue_task_id IS NULL OR status NOT IN (?2, ?3, ?4))
+                    AND (
+                        status IN (?2, ?3)
+                        OR (
+                            pueue_task_id IS NULL
+                            AND status IN (?4, ?5)
+                        )
+                    )
                  ORDER BY created_at, submission_id",
                 SUBMISSION_SELECT
             ))
@@ -527,9 +533,10 @@ impl<'db> SubmissionRepository<'db> {
             .query_map(
                 params![
                     project_id,
+                    SubmissionStatus::Pending,
+                    SubmissionStatus::Unreconciled,
                     SubmissionStatus::Accepted,
                     SubmissionStatus::Adopted,
-                    SubmissionStatus::Failed,
                 ],
                 submission_from_row,
             )
