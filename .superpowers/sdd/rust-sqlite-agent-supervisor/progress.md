@@ -147,3 +147,10 @@ Base: `6ca1e2b`
 - Discovery now bounds depth and total entries and stops on a second candidate; E2E supplies project-owned metadata and verifies the Codex process boundary and SQLite recording.
 - Re-review: APPROVE; no Blocker, Major, or Minor findings.
 - Verification: full offline Rust 143 tests, Clippy, fmt, ShellCheck, Bats 3, Rust E2E PASS, and diff check passed.
+
+## Final review — fix rounds 1-6/5
+
+- Findings: persisted active agent runs could strand claimed events after restart; stalled detection policy was not implemented; successful kills without a confirmation grace could remain `sent`; agent-run/event persistence was non-atomic; kill grace started at observation time; `execute` reported confirmed before terminal reconciliation; pre-kill and post-kill dispatch states were ambiguous; concurrent dispatch claims could duplicate kills; stale lease holders could overwrite reclaimed claims; legacy migrations could stop at schema v4; and timed-out Pueue commands could outlive their lease.
+- Fix commits: `20ddb73`, `bc14fe8`, `72cb41e`, `7a92ba4`, `36fc72b`, `9aa38d9`, `cdf9ca8`, `39cd133`, `8cb3dbd`, `caf71af`, `fffb43a`.
+- Final re-review: APPROVE; no remaining actionable findings.
+- Verification: Rust all-target tests 165 passed, Clippy with `-D warnings`, fmt check, Bats 3, ShellCheck, `git diff --check`, and Rust Pueue E2E PASS.
