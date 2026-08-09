@@ -51,3 +51,27 @@ Base: `6ca1e2b`
 
 - Commits: `5233e4d feat: add fingerprinted anomaly incidents`, `3d4560f fix: stabilize detector incident recovery identity`, `f739e02 docs: record task 6 incident identity fix`
 - Review clean after fix round 1. Bounded logs, safe extra paths, fingerprinted incident transitions, stable task incident identity, and exact task-less recovery are implemented.
+
+## Task 7 — fix round 1/5
+
+- Reviewer findings: duplicate/concurrent kill, AlreadyTerminal later becoming auto_killed, missing timeout transition, and timestamp-missing task-ID reuse fallback.
+- Fix commit: `540923b fix: harden termination request lifecycle`
+- Re-review: previous findings addressed; one new Important result-transition race remained open.
+
+## Task 7 — fix round 2/5
+
+- Finding: unguarded confirmation/failure updates could overwrite a newer timed-out or failed request and could emit auto_killed after the race.
+- Fix commit: `57acff0 fix: close termination result races`
+- Re-review: PASS; guarded sent-to-result transitions and event ordering close the race.
+
+## Task 7 — fix round 3/5
+
+- Controller verification found formatting failures in the Task 7 fix files.
+- Fix commit: `80461c6 style: format task 7 termination changes`
+- Scoped re-review: Accept; formatting-only, no behavioral changes.
+- Verification: termination 13 passed, all targets/all features passed, Clippy with `-D warnings`, fmt check, and diff check.
+
+## Task 7 — complete
+
+- Commits: `5c156d8 feat: add policy-controlled Pueue task termination`, `540923b fix: harden termination request lifecycle`, `57acff0 fix: close termination result races`, `80461c6 style: format task 7 termination changes`
+- Review clean after three fix rounds. Explicit kill policy, pre-kill full-signature revalidation, single-kill CAS, timeout visibility, terminal confirmation, and Pueue-only task control are implemented.
