@@ -1,31 +1,42 @@
-# coding agent への指示書
+# Instructions for the experiment agent
 
-あなたは pueue で実行される ML 実験を管理する自律 agent です。
-起動されるたびに、以下を必ず守ってください。
+You manage experiments supervised by `pueue-agent`. The launch prompt contains a
+bounded event summary and references to durable project context.
 
-## 毎回必ずやること
-1. まず `.pueue-agent/STATE.md` を読み、経緯と方針・制約を把握する
-2. 作業の最後に必ず STATE.md を更新する(実験履歴の行追加、現在の状況、次の計画)
-3. このリポジトリが git 管理下なら、変更を「何を・なぜ変えたか」がわかるメッセージでコミットする
-4. タスクの投入は必ず `pueue add -g {{GROUP}} -- <command>` で行う
+## Required workflow
 
-## モード別の役割
-起動時のプロンプトに mode が示されます。
+1. Read `.pueue-agent/instructions.md`, then `.pueue-agent/STATE.md`.
+2. Inspect only the tasks, logs, metrics, and artifacts associated with this project.
+3. Record the diagnosis, experiment result, artifact paths, and next plan in
+   `.pueue-agent/STATE.md` before exiting.
+4. If the repository uses Git, commit intentional source changes with a message that
+   explains what changed and why.
+5. Submit every supervised experiment with:
 
-- **crash / stalled**: タスクが失敗または停滞した。pueue のタスク出力
-  (`pueue log <id>`)とスタックトレースを読んで原因を分析し、コードまたは
-  ハイパーパラメータを修正して再投入する。原因と対処を STATE.md に記録する。
-- **deep_check**: pueue 上はエラーなし。タスク出力・メトリクス・成果物を読み、
-  実験が意味のある進行をしているか判断する(loss の下がり方は妥当か、
-  期待した挙動か)。問題なければ STATE.md のヘルスチェック履歴に 1 行追記して
-  終了する。問題があれば crash 時と同様に介入する。
-- **task_finished**: タスクが完了した。結果を分析・要約して STATE.md の実験履歴に
-  記録し、方針・制約の範囲で次に試すべき実験を設計・実装して投入する。
-  実験を続ける価値がない(目的達成 or 頭打ち)と判断したら、投入せず
-  STATE.md にその結論を書く。
+   ```bash
+   pueue-agent submit -- <command...>
+   ```
 
-## 禁止事項
-- STATE.md の「方針・制約」を逸脱する実験(必要と思うなら STATE.md の
-  「次の計画」に提案として書き、投入はしない)
-- pueue の group 設定・他 group のタスクへの干渉
-- `.pueue-agent/config.yml` の変更
+   Do not call raw `pueue add`; it bypasses SQLite submission accounting.
+
+## Dispatch modes
+
+- `crash`, `failure`, or `stalled`: inspect the bounded evidence and relevant logs,
+  determine the cause, make the smallest justified correction, update `STATE.md`, and
+  submit a replacement experiment only when the configured constraints allow it.
+- `deep_check`: inspect metrics and artifacts for meaningful progress. If healthy,
+  append a concise health record to `STATE.md`. If unhealthy, handle it like a crash.
+- `completion`: summarize the result and decide whether the next experiment is
+  justified. Stop when the goal is reached or evidence indicates no useful next step.
+
+## Context and safety
+
+- The supervisor may start a fresh Codex session or explicitly resume an existing one,
+  according to `.pueue-agent/config.toml`. Do not change the context mode or session ID.
+- `STATE.md` is the durable context shared across fresh and resumed agent runs. Do not
+  assume a conversation transcript exists in SQLite.
+- A detector with explicit `action = "kill"` may already have asked Pueue to stop the
+  failed task. Check current Pueue state before proposing or submitting a replacement.
+- Do not change Pueue groups, interfere with another group, bypass `pueue-agent submit`,
+  or modify `.pueue-agent/config.toml`.
+- Do not exceed the goals, constraints, or guardrails recorded in `STATE.md`.

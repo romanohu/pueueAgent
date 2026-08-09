@@ -7,11 +7,11 @@ use std::{
 
 use pueue_agent::{
     config::{CheckConfig, PatternAction, PatternConfig, StallConfig},
-    db::{Db, ProjectRepository},
+    db::{Db, EventRepository, ProjectRepository},
     detect::{Detector, Observation},
     incidents::IncidentStore,
     logs::LogSnapshot,
-    models::{IncidentStatus, IncidentTransition, NewProject},
+    models::{EventKind, IncidentStatus, IncidentTransition, NewProject},
     pueue::PueueTask,
     reconcile::task_incident_key,
 };
@@ -148,6 +148,27 @@ fn identical_nan_observations_update_one_incident() {
     assert_eq!(first, IncidentTransition::Opened);
     assert_eq!(second, IncidentTransition::Unchanged);
     assert_eq!(harness.active_count(), 1);
+}
+
+#[test]
+fn repeated_wake_observation_creates_one_durable_agent_event() {
+    let harness = Harness::new();
+    let task = task();
+    let store = harness.store();
+
+    store.observe(nan_observation(&task)).unwrap();
+    store.observe(nan_observation(&task)).unwrap();
+
+    let events = EventRepository::new(&harness.db)
+        .recent_events("project-a", 10)
+        .unwrap();
+    let crash_events = events
+        .iter()
+        .filter(|event| event.kind == EventKind::Crash)
+        .collect::<Vec<_>>();
+    assert_eq!(crash_events.len(), 1);
+    assert_eq!(crash_events[0].payload["source"], "incident_detector");
+    assert_eq!(crash_events[0].payload["action"], "wake");
 }
 
 #[test]

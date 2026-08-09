@@ -1,9 +1,10 @@
 use rusqlite::{params, OptionalExtension};
 
 use crate::{
-    db::{database_error, Db, IncidentRepository},
+    config::PatternAction,
+    db::{database_error, Db, EventRepository, IncidentRepository},
     detect::{Observation, ObservationState, TASK_TERMINAL_RECOVERY_KIND},
-    models::{IncidentTransition, NewIncident},
+    models::{EventKind, IncidentTransition, NewEvent, NewIncident},
     termination::{TerminationManager, TerminationPolicy},
     AppError,
 };
@@ -37,6 +38,9 @@ impl<'db> IncidentStore<'db> {
                             None,
                         )?;
                     }
+                }
+                if observation.action() == PatternAction::Wake {
+                    insert_wake_event(self.db, &update.incident, &observation)?;
                 }
                 Ok(update.transition)
             }
@@ -112,6 +116,43 @@ impl<'db> IncidentStore<'db> {
             Ok(IncidentTransition::Unchanged)
         }
     }
+}
+
+fn insert_wake_event(
+    db: &Db,
+    incident: &crate::models::Incident,
+    observation: &Observation,
+) -> Result<(), AppError> {
+    let kind = if observation.kind() == "stalled" {
+        EventKind::Stalled
+    } else {
+        EventKind::Crash
+    };
+    let evidence = observation
+        .evidence()
+        .chars()
+        .take(1024)
+        .collect::<String>();
+    let event = NewEvent::new(
+        observation.project_id(),
+        kind,
+        format!("incident-wake:v1:incident={}", incident.incident_id),
+        serde_json::json!({
+            "source": "incident_detector",
+            "incident_id": incident.incident_id,
+            "kind": observation.kind(),
+            "action": observation.action().as_str(),
+            "task_signature": observation.task_signature(),
+            "pattern_name": observation.pattern_name(),
+            "confirmation_count": observation.confirmation_count(),
+            "evidence": evidence,
+            "source_path": observation.source_path().map(|path| path.display().to_string()),
+        }),
+        observation.seen_at(),
+        observation.seen_at(),
+    );
+    let _ = EventRepository::new(db).insert_idempotent(&event)?;
+    Ok(())
 }
 
 fn termination_reason(observation: &Observation) -> String {

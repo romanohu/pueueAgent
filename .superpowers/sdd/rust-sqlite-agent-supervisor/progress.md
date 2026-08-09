@@ -125,3 +125,11 @@ Base: `6ca1e2b`
 
 - Commits: `5f2f04b feat: add supervisor status and pause controls`, `3697cd6 fix: add operator logs for project transitions`
 - Review clean after one fix round. Status visibility, pause/resume transitions, durable operator logs, and safe disable/remove semantics are implemented.
+
+## Task 11 — complete
+
+- Switched the production and development entry points to the Rust binary, added TOML-backed `init`, release installation, migration documentation, and durable `wake` events for configured detector actions.
+- Removed the obsolete Bash registry, cron/sentinel, YAML parser, direct agent launcher, fixtures, and superseded tests after Rust parity was demonstrated. Retained a small Bats suite for the remaining Bash launcher/install boundary and a compatibility E2E wrapper.
+- Rust E2E covers same-basename project isolation, callback and missed-callback reconciliation, normal zero-agent monitoring, repeated fatal detection, one Pueue kill, one agent run, spawn retry, guardrail halt/resume, expired-lease restart recovery, explicit Codex session resume, and installed release execution.
+- Independent Codex CLI review was requested read-only but blocked by the environment's repository-data safety policy. Local requirement and reference audits found no remaining obsolete-code references outside historical design documents.
+- Verification: Rust all-target tests 133 passed, Bats 3 passed, Rust E2E passed, `cargo fmt --check`, all-target/all-feature Clippy with `-D warnings`, ShellCheck for all remaining shell entry points/support scripts, and `git diff --check` passed.

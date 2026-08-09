@@ -1,48 +1,19 @@
 #!/usr/bin/env bash
-set -u
-# symlink 経由 (install.sh が ~/.local/bin に張る) でも本体位置を解決する
+set -eu
+
 SOURCE="$0"
 while [ -L "$SOURCE" ]; do
   DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
   SOURCE="$(readlink "$SOURCE")"
   case "$SOURCE" in /*) : ;; *) SOURCE="$DIR/$SOURCE" ;; esac
 done
-PA_ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
-# shellcheck source=lib/common.sh
-source "$PA_ROOT/lib/common.sh"
+REPO_ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+BINARY="$REPO_ROOT/target/debug/pueue-agent"
 
-usage() {
-  cat >&2 <<'EOF'
-Usage: pueue-agent <command> [args]
-
-Commands:
-  init            このリポジトリに .pueue-agent/ を生成
-  enable          cron 登録 + pueue callback 設定 + group 作成
-  disable         上記を撤去
-  status          監視状況・通知・カウンタを表示
-  resume          ガードレール停止状態を解除
-  submit <cmd..>  専用 group にタスクを投入
-  notifications   通知ログを表示 (-f で follow)
-  sentinel [dir]  (内部) 定期チェック — cron から呼ばれる
-  wake <mode> ..  (内部) agent 起動口
-  callback <id> <group>  (内部) pueue callback から呼ばれる
-EOF
+if [ ! -x "$BINARY" ]; then
+  echo "error: Rust development binary is missing: $BINARY" >&2
+  echo "build it with: cargo build --manifest-path '$REPO_ROOT/Cargo.toml'" >&2
   exit 1
-}
+fi
 
-[ $# -ge 1 ] || usage
-cmd="$1"; shift
-# shellcheck disable=SC1091
-case "$cmd" in
-  init)          source "$PA_ROOT/lib/init.sh";       pa_cmd_init "$@" ;;
-  enable)        source "$PA_ROOT/lib/manage.sh";     pa_cmd_enable "$@" ;;
-  disable)       source "$PA_ROOT/lib/manage.sh";     pa_cmd_disable "$@" ;;
-  status)        source "$PA_ROOT/lib/manage.sh";     pa_cmd_status "$@" ;;
-  resume)        source "$PA_ROOT/lib/manage.sh";     pa_cmd_resume "$@" ;;
-  submit)        source "$PA_ROOT/lib/manage.sh";     pa_cmd_submit "$@" ;;
-  notifications) source "$PA_ROOT/lib/notify.sh";     pa_cmd_notifications "$@" ;;
-  sentinel)      source "$PA_ROOT/lib/sentinel.sh";   pa_cmd_sentinel "$@" ;;
-  wake)          source "$PA_ROOT/lib/wake_agent.sh"; pa_cmd_wake "$@" ;;
-  callback)      source "$PA_ROOT/lib/callback.sh";   pa_cmd_callback "$@" ;;
-  *)             usage ;;
-esac
+exec "$BINARY" "$@"

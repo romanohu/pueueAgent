@@ -64,7 +64,16 @@ mod commands {
         submit as submit_command, AppError,
     };
 
-    pub fn init(_args: InitArgs) -> Result<(), AppError> {
+    pub fn init(args: InitArgs) -> Result<(), AppError> {
+        let project_root = match args.project_root {
+            Some(path) => path,
+            None => env::current_dir().map_err(|source| AppError::Io {
+                operation: "read current directory",
+                source,
+            })?,
+        };
+        let project_root = pueue_agent::init::run(&project_root)?;
+        println!("initialized: {}", project_root.display());
         Ok(())
     }
 

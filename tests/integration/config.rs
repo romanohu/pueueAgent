@@ -344,6 +344,19 @@ fn absolute_xdg_state_home_is_used_for_the_database() {
 }
 
 #[test]
+fn explicit_service_state_directory_overrides_platform_state_home() {
+    let service_state = Path::new("/var/lib/pueue-agent-profile");
+    let xdg_state = Path::new("/var/state");
+    let home = Path::new("/Users/alice");
+
+    assert_eq!(
+        paths::state_db_path_with_override(Some(service_state), Some(xdg_state), Some(home),)
+            .unwrap(),
+        service_state.join("state.sqlite3")
+    );
+}
+
+#[test]
 fn unset_xdg_state_home_uses_the_platform_fallback() {
     let home = Path::new("/home/tester");
 

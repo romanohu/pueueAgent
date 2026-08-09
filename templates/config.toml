@@ -1,0 +1,50 @@
+# pueue-agent project configuration
+
+project_id = "{{PROJECT_ID}}"
+pueue_group = "{{PUEUE_GROUP}}"
+
+[agent]
+program = "codex"
+args = ["exec", "{prompt}"]
+timeout_minutes = 60
+max_retries = 2
+
+# Conversation continuation is opt-in. The default starts a fresh Codex session.
+[agent.context]
+mode = "fresh" # fresh | resume | resume_latest
+# session_id = "019..." # required only when mode = "resume"
+
+[check]
+interval_minutes = 10
+deep_check_every = 6
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 65536
+extra_log_paths = []
+
+[[check.patterns]]
+name = "numerical-instability"
+regex = "NaN|Inf"
+action = "wake"
+confirm_matches = 1
+
+[[check.patterns]]
+name = "python-traceback"
+regex = "Traceback"
+action = "wake"
+confirm_matches = 1
+
+[[check.patterns]]
+name = "cuda-error"
+regex = "CUDA (error|out of memory)"
+action = "wake"
+confirm_matches = 1
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 100
