@@ -38,6 +38,10 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Submit(args) => commands::submit(args).await,
         Command::Event(args) => commands::event(args),
         Command::Status(args) => commands::status(args).await,
+        Command::Events(args) => commands::events(args),
+        Command::Inspect(args) => commands::inspect(args),
+        Command::Explain(args) => commands::explain(args),
+        Command::Doctor(args) => commands::doctor(args),
         Command::Pause(args) => commands::pause(args),
         Command::Resume(args) => commands::resume(args),
         Command::Daemon(args) => commands::daemon(args).await,
@@ -49,9 +53,13 @@ mod commands {
 
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
-        cli::{DaemonArgs, DisableArgs, EventArgs, InitArgs, ProjectArgs, SubmitArgs},
+        cli::{
+            DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
+            InspectArgs, ProjectArgs, StatusArgs, SubmitArgs,
+        },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, ProjectRepository},
+        diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
         events::{record_callback, CallbackMetadata},
         models::Project,
         paths, project,
@@ -142,8 +150,13 @@ mod commands {
         Ok(())
     }
 
-    pub async fn status(args: ProjectArgs) -> Result<(), AppError> {
-        let (db, project, service_paths) = resolve_project(args.project_root, args.pueue_config)?;
+    pub async fn status(args: StatusArgs) -> Result<(), AppError> {
+        let StatusArgs {
+            project_root,
+            pueue_config,
+            json: _,
+        } = args;
+        let (db, project, service_paths) = resolve_project(project_root, pueue_config)?;
         let pueue = configured_pueue(&service_paths);
         let pueue = match pueue.status_json().await {
             Ok(tasks) => PueueSnapshot::Tasks(tasks),
@@ -157,6 +170,38 @@ mod commands {
             "{}",
             status_command::render_project_status(&db, &project, &input)?
         );
+        Ok(())
+    }
+
+    pub fn events(args: EventsArgs) -> Result<(), AppError> {
+        let limit = validate_event_limit(args.limit)?;
+        let _filter = EventFilter::new(args.kind, args.status, limit);
+        let _ = (args.project_root, args.pueue_config, args.json);
+        Ok(())
+    }
+
+    pub fn inspect(args: InspectArgs) -> Result<(), AppError> {
+        let _ = (
+            args.project_root,
+            args.pueue_config,
+            args.task_id,
+            args.json,
+        );
+        Ok(())
+    }
+
+    pub fn explain(args: ExplainArgs) -> Result<(), AppError> {
+        let _ = (
+            args.project_root,
+            args.pueue_config,
+            args.incident_id,
+            args.json,
+        );
+        Ok(())
+    }
+
+    pub fn doctor(args: DoctorArgs) -> Result<(), AppError> {
+        let _ = (args.project_root, args.pueue_config, args.json);
         Ok(())
     }
 
@@ -269,5 +314,17 @@ mod commands {
                 OsString::from(service_paths.pueue_config.as_os_str()),
             ],
         )
+    }
+
+    fn validate_event_limit(limit: usize) -> Result<usize, AppError> {
+        if (1..=MAX_EVENT_LIST_LIMIT).contains(&limit) {
+            Ok(limit)
+        } else {
+            Err(AppError::Message {
+                message: format!(
+                    "diagnostic event limit must be between 1 and {MAX_EVENT_LIST_LIMIT}"
+                ),
+            })
+        }
     }
 }

@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod detect;
+pub mod diagnostics;
 pub mod error;
 pub mod events;
 pub mod guardrails;

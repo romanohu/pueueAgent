@@ -2,6 +2,8 @@ use std::{ffi::OsString, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::models::{EventKind, EventStatus};
+
 #[derive(Debug, Parser)]
 #[command(name = "pueue-agent", about = "SQLite-backed Pueue agent supervisor")]
 pub struct Cli {
@@ -16,7 +18,11 @@ pub enum Command {
     Disable(DisableArgs),
     Submit(SubmitArgs),
     Event(EventArgs),
-    Status(ProjectArgs),
+    Status(StatusArgs),
+    Events(EventsArgs),
+    Inspect(InspectArgs),
+    Explain(ExplainArgs),
+    Doctor(DoctorArgs),
     Pause(ProjectArgs),
     Resume(ProjectArgs),
     Daemon(DaemonArgs),
@@ -32,6 +38,66 @@ pub struct InitArgs {
 pub struct ProjectArgs {
     #[arg(long, value_name = "PUEUE_CONFIG")]
     pub pueue_config: Option<PathBuf>,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct EventsArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long, value_name = "KIND")]
+    pub kind: Option<EventKind>,
+    #[arg(long, value_name = "STATUS")]
+    pub status: Option<EventStatus>,
+    #[arg(long, default_value_t = crate::diagnostics::DEFAULT_EVENT_LIST_LIMIT, value_name = "N")]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct InspectArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "TASK_ID")]
+    pub task_id: i64,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "INCIDENT_ID")]
+    pub incident_id: i64,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
 }
