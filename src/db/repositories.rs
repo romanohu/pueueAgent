@@ -1239,6 +1239,25 @@ impl<'db> AgentRunRepository<'db> {
         read_agent_run(&connection, connection.last_insert_rowid())
     }
 
+    pub fn insert_with_events(
+        &self,
+        run: &NewAgentRun,
+        event_ids: &[i64],
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin agent run and event insertion"))?;
+        let run_id = insert_agent_run(&transaction, run)?;
+        for event_id in event_ids {
+            attach_event_to_agent_run(&transaction, &run.project_id, run_id, *event_id)?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit agent run and event insertion"))?;
+        read_agent_run(&connection, run_id)
+    }
+
     pub fn find_active_by_project(&self, project_id: &str) -> Result<Option<AgentRun>, AppError> {
         let connection = self.db.connect()?;
         connection
@@ -1311,14 +1330,7 @@ impl<'db> AgentRunRepository<'db> {
                 |row| row.get::<_, String>(0),
             )
             .map_err(database_error("read agent run project"))?;
-        transaction
-            .execute(
-                "INSERT INTO agent_run_events (project_id, run_id, event_id)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(run_id, event_id) DO NOTHING",
-                params![project_id, run_id, event_id],
-            )
-            .map_err(database_error("attach event to agent run"))?;
+        attach_event_to_agent_run(&transaction, &project_id, run_id, event_id)?;
         transaction
             .commit()
             .map_err(database_error("commit agent run event attachment"))?;
@@ -1875,6 +1887,53 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
         context_session_id,
         context_lineage,
     })
+}
+
+fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<i64, AppError> {
+    let log_path = path_text(&run.log_path, "log_path")?;
+    let context_lineage_json =
+        serde_json::to_string(&run.context_lineage).map_err(|source| AppError::Serialization {
+            operation: "serialize agent context lineage",
+            source,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO agent_runs (
+                project_id, primary_event_id, pid, status, started_at,
+                finished_at, exit_code, log_path, last_error, context_mode,
+                context_session_id, context_lineage_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9)",
+            params![
+                run.project_id,
+                run.primary_event_id,
+                run.pid,
+                run.status,
+                run.started_at,
+                log_path,
+                run.context_mode.as_str(),
+                run.context_session_id.as_deref(),
+                context_lineage_json,
+            ],
+        )
+        .map_err(database_error("insert agent run"))?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn attach_event_to_agent_run(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    run_id: i64,
+    event_id: i64,
+) -> Result<(), AppError> {
+    transaction
+        .execute(
+            "INSERT INTO agent_run_events (project_id, run_id, event_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(run_id, event_id) DO NOTHING",
+            params![project_id, run_id, event_id],
+        )
+        .map_err(database_error("attach event to agent run"))?;
+    Ok(())
 }
 
 fn read_agent_run(connection: &Connection, run_id: i64) -> Result<AgentRun, AppError> {

@@ -674,6 +674,81 @@ fn only_one_active_agent_run_is_allowed_per_project() {
 }
 
 #[test]
+fn agent_run_insert_with_events_persists_the_run_and_all_event_links() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let primary_event_id = insert_event(&test.db, "project-a", "primary-event", 100);
+    let related_event_id = insert_event(&test.db, "project-a", "related-event", 101);
+
+    let run = AgentRunRepository::new(&test.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                primary_event_id,
+                None,
+                AgentRunStatus::Starting,
+                102,
+                "/tmp/agent.log",
+            ),
+            &[primary_event_id, related_event_id],
+        )
+        .unwrap();
+
+    let connection = test.db.connect().unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id FROM agent_run_events
+             WHERE run_id = ?1 ORDER BY event_id",
+        )
+        .unwrap();
+    let event_ids = statement
+        .query_map([run.run_id], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(event_ids, vec![primary_event_id, related_event_id]);
+}
+
+#[test]
+fn agent_run_insert_with_events_rolls_back_when_an_event_attachment_is_invalid() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-b");
+    let primary_event_id = insert_event(&test.db, "project-a", "primary-event", 100);
+    let cross_project_event_id = insert_event(&test.db, "project-b", "cross-project-event", 101);
+
+    let error = AgentRunRepository::new(&test.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                primary_event_id,
+                None,
+                AgentRunStatus::Starting,
+                102,
+                "/tmp/agent.log",
+            ),
+            &[primary_event_id, cross_project_event_id],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("attach event to agent run"));
+
+    let connection = test.db.connect().unwrap();
+    let run_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+        .unwrap();
+    let attachment_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM agent_run_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(run_count, 0);
+    assert_eq!(attachment_count, 0);
+}
+
+#[test]
 fn typed_repositories_round_trip_future_task_records() {
     let test = TestDatabase::new();
     let root = test.project_root("project");

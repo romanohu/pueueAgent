@@ -351,7 +351,7 @@ max_agent_runs = 10
 }
 
 #[tokio::test]
-async fn event_attachment_failure_finishes_the_inserted_agent_run() {
+async fn event_attachment_failure_rolls_back_the_agent_run() {
     let harness = SchedulerHarness::new();
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "attach-failure");
     harness
@@ -371,13 +371,7 @@ async fn event_attachment_failure_finishes_the_inserted_agent_run() {
     assert!(scheduler.tick().await.is_err());
 
     let runs = harness.agent_run_states();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].0, AgentRunStatus::Failed);
-    assert_eq!(runs[0].1, Some(harness.now));
-    assert!(runs[0]
-        .2
-        .as_deref()
-        .is_some_and(|reason| reason.contains("attach event to agent run")));
+    assert!(runs.is_empty());
     assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
     assert_eq!(harness.active_runs("project-a"), 0);
 }

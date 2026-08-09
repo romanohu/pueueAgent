@@ -141,24 +141,23 @@ impl AgentRunner {
     ) -> Result<AgentHandle, AppError> {
         let command = self.command_for(project, config, prompt)?;
         let log_path = self.log_path(project, primary_event_id, now)?;
-        let run = AgentRunRepository::new(db).insert(&NewAgentRun::with_context(
-            &project.project_id,
-            primary_event_id,
-            None,
-            AgentRunStatus::Starting,
-            now,
-            &log_path,
-            config.context.clone(),
-            config.context.session_id().map(str::to_owned),
-            event_ids.iter().map(i64::to_string).collect(),
-        ))?;
         let repository = AgentRunRepository::new(db);
+        let run = repository.insert_with_events(
+            &NewAgentRun::with_context(
+                &project.project_id,
+                primary_event_id,
+                None,
+                AgentRunStatus::Starting,
+                now,
+                &log_path,
+                config.context.clone(),
+                config.context.session_id().map(str::to_owned),
+                event_ids.iter().map(i64::to_string).collect(),
+            ),
+            event_ids,
+        )?;
         let mut spawned_child = None;
         let startup = (|| -> Result<i64, AppError> {
-            for event_id in event_ids {
-                repository.attach_event(run.run_id, *event_id)?;
-            }
-
             let log_file = OpenOptions::new()
                 .create(true)
                 .append(true)
