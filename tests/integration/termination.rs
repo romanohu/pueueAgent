@@ -371,7 +371,10 @@ async fn duplicate_execute_on_sent_request_does_not_kill_again() {
     assert_eq!(first, TerminationOutcome::Confirmed);
     assert_eq!(second, TerminationOutcome::Confirmed);
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
-    assert_eq!(harness.request_status(), Some(TerminationRequestStatus::Sent));
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Sent)
+    );
 }
 
 #[tokio::test]
@@ -482,7 +485,10 @@ async fn terminal_fallback_does_not_match_reused_id_without_lifecycle_timestamps
 
     assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
     assert_eq!(harness.pending_event_count(EventKind::TaskFailed), 1);
-    assert_eq!(harness.request_status(), Some(TerminationRequestStatus::Sent));
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Sent)
+    );
 }
 
 #[tokio::test]
@@ -514,7 +520,10 @@ async fn failed_pueue_kill_stays_visible_without_auto_killed_event() {
 
     assert_eq!(outcomes, vec![TerminationOutcome::Failed]);
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
-    assert_eq!(harness.request_status(), Some(TerminationRequestStatus::Failed));
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Failed)
+    );
     assert_eq!(harness.pending_event_count(EventKind::TerminationFailed), 1);
     assert_eq!(harness.pending_event_count(EventKind::AutoKilled), 0);
 }

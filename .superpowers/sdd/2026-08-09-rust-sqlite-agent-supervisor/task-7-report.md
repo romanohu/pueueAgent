@@ -273,3 +273,53 @@ The `tokio::process::Command` match is the existing Pueue adapter boundary. No r
 
 - The new concurrency regressions and formatting need to be run in an environment with the Rust toolchain before merging.
 - The fix relies on `last_error IS NULL` to distinguish prior successful auto-kill confirmation from requested-stage already-terminal confirmation; current requested-stage confirmations write a non-null explanatory `last_error`.
+
+## Fix round 3: formatting and verification
+
+### Summary
+
+Ran `cargo fmt --all` to apply rustfmt-only formatting changes in the Task 7 fix files. No behavior changes were made.
+
+### Changed files
+
+- `src/db/repositories.rs`
+- `src/reconcile.rs`
+- `src/termination.rs`
+- `tests/integration/termination.rs`
+
+### Commands and actual results
+
+```text
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo fmt --all
+exit 0
+
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --test termination
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+exit 0
+
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --all-targets --all-features
+lib.rs: test result: ok. 0 passed; 0 failed
+main.rs: test result: ok. 0 passed; 0 failed
+cli_help.rs: test result: ok. 1 passed; 0 failed
+config.rs: test result: ok. 24 passed; 0 failed
+database.rs: test result: ok. 17 passed; 0 failed
+detection.rs: test result: ok. 7 passed; 0 failed
+pueue_adapter.rs: test result: ok. 9 passed; 0 failed
+reconciliation.rs: test result: ok. 13 passed; 0 failed
+termination.rs: test result: ok. 13 passed; 0 failed
+exit 0
+
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo clippy --offline --all-targets --all-features -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.41s
+exit 0
+
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo fmt --all -- --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Remaining risks
+
+- None identified in this formatting-only round.

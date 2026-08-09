@@ -2,7 +2,9 @@ use serde_json::json;
 
 use crate::{
     config::PatternAction,
-    db::{Db, EventRepository, IncidentRepository, ProjectRepository, TerminationRequestRepository},
+    db::{
+        Db, EventRepository, IncidentRepository, ProjectRepository, TerminationRequestRepository,
+    },
     detect::{Observation, ObservationState},
     models::{EventKind, NewEvent, NewTerminationRequest, TerminationRequestStatus},
     pueue::PueueApi,
@@ -189,12 +191,11 @@ where
                     )?;
                     return Ok(TerminationOutcome::Failed);
                 }
-                let current =
-                    repository
-                        .find_by_id(claimed_request.request_id)?
-                        .ok_or(AppError::Runtime {
-                            operation: "reload concurrently completed termination request",
-                        })?;
+                let current = repository.find_by_id(claimed_request.request_id)?.ok_or(
+                    AppError::Runtime {
+                        operation: "reload concurrently completed termination request",
+                    },
+                )?;
                 outcome_for_non_requested(self.db, &repository, &current)
             }
         }
@@ -357,7 +358,8 @@ pub fn insert_termination_failed_event(
         format!(
             "termination:{}:v1:request={}:signature={}",
             EventKind::TerminationFailed,
-            request.request_id, request.task_signature
+            request.request_id,
+            request.task_signature
         ),
         json!({
             "source": "termination_manager",
@@ -389,7 +391,8 @@ pub fn insert_termination_failed_event_for_request(
         format!(
             "termination:{}:v1:request={}:signature={}",
             EventKind::TerminationFailed,
-            request.request_id, request.task_signature
+            request.request_id,
+            request.task_signature
         ),
         json!({
             "source": "termination_manager",

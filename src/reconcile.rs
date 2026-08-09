@@ -96,11 +96,7 @@ where
                 let auto_kill_confirmation = auto_kill_request
                     .as_ref()
                     .map(|request| {
-                        confirm_auto_kill_terminal_observation(
-                            self.db,
-                            request.request_id,
-                            now,
-                        )
+                        confirm_auto_kill_terminal_observation(self.db, request.request_id, now)
                     })
                     .transpose()?;
                 let event_kind = match auto_kill_confirmation {

@@ -1082,17 +1082,15 @@ impl<'db> TerminationRequestRepository<'db> {
                  WHERE request_id = ?4 AND status = ?5",
                 params![next, confirmed_at, last_error, request_id, current],
             )
-            .map_err(database_error(
-                "guarded update termination request result",
-            ))?;
+            .map_err(database_error("guarded update termination request result"))?;
         let stored = if changed == 0 {
             None
         } else {
             Some(read_termination_request(&transaction, request_id)?)
         };
-        transaction
-            .commit()
-            .map_err(database_error("commit guarded termination request result update"))?;
+        transaction.commit().map_err(database_error(
+            "commit guarded termination request result update",
+        ))?;
         Ok(stored)
     }
 
