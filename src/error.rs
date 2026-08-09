@@ -38,6 +38,9 @@ pub enum AppError {
     #[error(transparent)]
     Pueue(#[from] crate::pueue::PueueError),
 
+    #[error("{message}")]
+    Message { message: String },
+
     #[error("{operation} failed; inspect pueue-agent logs for details")]
     Runtime { operation: &'static str },
 }

@@ -30,6 +30,8 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct ProjectArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
 }
@@ -61,4 +63,6 @@ pub struct EventArgs {
 pub struct DaemonArgs {
     #[arg(long)]
     pub foreground: bool,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
 }

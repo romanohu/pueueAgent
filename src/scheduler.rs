@@ -47,6 +47,10 @@ impl Scheduler {
         Self { db, runner, config }
     }
 
+    pub fn into_runner(self) -> AgentRunner {
+        self.runner
+    }
+
     pub fn recover_expired_leases(&self) -> Result<usize, AppError> {
         EventRepository::new(&self.db).recover_expired_claims(self.config.now)
     }

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod db;
 pub mod detect;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod project;
 pub mod pueue;
 pub mod reconcile;
 pub mod scheduler;
+pub mod service;
 pub mod submit;
 pub mod termination;
 

@@ -210,6 +210,41 @@ impl AgentRunner {
 }
 
 impl AgentHandle {
+    pub async fn poll(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<Option<AgentRunStatus>, AppError> {
+        if Instant::now() >= self.timeout_deadline {
+            process_tree::terminate_agent_process_tree(&mut self.child, self.pid).await;
+            AgentRunRepository::new(db).finish(
+                self.run_id,
+                AgentRunStatus::TimedOut,
+                now,
+                None,
+                Some("agent timed out"),
+            )?;
+            return Ok(Some(AgentRunStatus::TimedOut));
+        }
+
+        let Some(exit) = self.child.try_wait().map_err(|source| AppError::Io {
+            operation: "poll agent process",
+            source,
+        })?
+        else {
+            return Ok(None);
+        };
+
+        let code = exit.code().map(i64::from);
+        let status = if exit.success() {
+            AgentRunStatus::Completed
+        } else {
+            AgentRunStatus::Failed
+        };
+        AgentRunRepository::new(db).finish(self.run_id, status, now, code, None)?;
+        Ok(Some(status))
+    }
+
     pub async fn wait(mut self, db: &crate::db::Db, now: i64) -> Result<AgentRunStatus, AppError> {
         let remaining = self
             .timeout_deadline

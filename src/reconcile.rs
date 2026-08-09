@@ -22,6 +22,7 @@ pub type TaskSignature = String;
 pub struct ReconcileReport {
     pub status_task_count: usize,
     pub observed_task_count: usize,
+    pub observed_tasks: Vec<PueueTask>,
     pub task_finished_events: usize,
     pub task_failed_events: usize,
     pub recovered_submission_ids: Vec<String>,
@@ -89,6 +90,7 @@ where
             );
             TaskObservationRepository::new(self.db).upsert(&observation)?;
             report.observed_task_count += 1;
+            report.observed_tasks.push(task.clone());
 
             if task.is_terminal() {
                 let auto_kill_request =

@@ -35,6 +35,14 @@ path = "tests/integration/termination.rs"
 name = "scheduler"
 path = "tests/integration/scheduler.rs"
 
+[[test]]
+name = "daemon"
+path = "tests/integration/daemon.rs"
+
+[[test]]
+name = "service"
+path = "tests/integration/service.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

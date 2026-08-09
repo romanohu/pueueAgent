@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pueue-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${PUEUE_AGENT_BIN}</string>
+    <string>daemon</string>
+    <string>--foreground</string>
+    <string>--pueue-config</string>
+    <string>${PUEUE_CONFIG}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${PUEUE_AGENT_PATH}</string>
+    <key>PUEUE_AGENT_STATE_DIR</key>
+    <string>${PUEUE_AGENT_STATE_DIR}</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>${PUEUE_AGENT_WORKING_DIR}</string>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
