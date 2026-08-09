@@ -6,8 +6,8 @@ use std::{
 use async_trait::async_trait;
 use pueue_agent::{
     db::{Db, EventRepository, ProjectRepository, SubmissionRepository},
-    events::{record_callback_with, CallbackMetadata},
-    models::{EventKind, NewProject, NewSubmission, SubmissionStatus},
+    events::{record_callback_with, CallbackMetadata, CallbackRecordResult},
+    models::{EventKind, EventStatus, NewProject, NewSubmission, SubmissionStatus},
     pueue::{PueueApi, PueueError, PueueTask},
     reconcile::{task_signature, Reconciler},
     AppError,
@@ -88,13 +88,17 @@ impl Harness {
     }
 
     fn pending_event_count(&self, kind: EventKind) -> i64 {
+        self.event_status_count(kind, EventStatus::Pending)
+    }
+
+    fn event_status_count(&self, kind: EventKind, status: EventStatus) -> i64 {
         self.db
             .connect()
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM events
-                 WHERE project_id = ?1 AND kind = ?2 AND status = 'pending'",
-                rusqlite::params!["project-a", kind],
+                 WHERE project_id = ?1 AND kind = ?2 AND status = ?3",
+                rusqlite::params!["project-a", kind, status],
                 |row| row.get(0),
             )
             .unwrap()
@@ -115,6 +119,58 @@ impl Harness {
             .query_row("SELECT COUNT(*) FROM task_observations", [], |row| {
                 row.get(0)
             })
+            .unwrap()
+    }
+
+    fn integration_event_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM integration_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn set_event_status(&self, event_id: i64, status: EventStatus) {
+        let lease_until = if status == EventStatus::Claimed {
+            Some(10_000)
+        } else {
+            None
+        };
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = ?1,
+                     lease_until = ?2,
+                     completed_at = CASE WHEN ?1 = 'completed' THEN 200 ELSE completed_at END
+                 WHERE event_id = ?3",
+                rusqlite::params![status, lease_until, event_id],
+            )
+            .unwrap();
+    }
+
+    fn observed_command(&self, task_signature: &str) -> Vec<String> {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT command_json FROM task_observations
+                 WHERE project_id = ?1 AND task_signature = ?2",
+                rusqlite::params!["project-a", task_signature],
+                |row| {
+                    let json: String = row.get(0)?;
+                    serde_json::from_str::<Vec<String>>(&json).map_err(|source| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(source),
+                        )
+                    })
+                },
+            )
             .unwrap()
     }
 }
@@ -172,6 +228,65 @@ async fn reconciliation_materializes_a_completion_when_the_callback_was_missed()
 }
 
 #[tokio::test]
+async fn reconciliation_is_idempotent_when_callback_event_is_claimed() {
+    let harness = Harness::new();
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+    let callback = record_callback_with(&harness.db, "pa-project", 41, CallbackMetadata::default())
+        .unwrap()
+        .event_id();
+    harness.set_event_status(callback, EventStatus::Claimed);
+
+    Reconciler::new(&harness.db, fake).run_once().await.unwrap();
+
+    assert_eq!(harness.event_count(), 1);
+    assert_eq!(
+        harness.event_status_count(EventKind::TaskFinished, EventStatus::Claimed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_is_idempotent_when_callback_event_is_completed() {
+    let harness = Harness::new();
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+    let callback = record_callback_with(&harness.db, "pa-project", 41, CallbackMetadata::default())
+        .unwrap()
+        .event_id();
+    harness.set_event_status(callback, EventStatus::Completed);
+
+    Reconciler::new(&harness.db, fake).run_once().await.unwrap();
+
+    assert_eq!(harness.event_count(), 1);
+    assert_eq!(
+        harness.event_status_count(EventKind::TaskFinished, EventStatus::Completed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn task_id_reuse_remains_distinct_after_callback_reconciliation() {
+    let harness = Harness::new();
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+    let mut reconciler = Reconciler::new(&harness.db, fake.clone());
+    let callback = record_callback_with(&harness.db, "pa-project", 41, CallbackMetadata::default())
+        .unwrap()
+        .event_id();
+    harness.set_event_status(callback, EventStatus::Completed);
+
+    reconciler.run_once().await.unwrap();
+    fake.set_tasks(vec![terminal_task(41, "200", json!({"Failed": 17}))]);
+    reconciler.run_once().await.unwrap();
+
+    assert_eq!(harness.event_count(), 2);
+    assert_eq!(harness.observation_count(), 2);
+    assert_eq!(
+        harness.event_status_count(EventKind::TaskFinished, EventStatus::Completed),
+        1
+    );
+    assert_eq!(harness.pending_event_count(EventKind::TaskFailed), 1);
+}
+
+#[tokio::test]
 async fn reused_task_id_creates_distinct_observations_and_events() {
     let harness = Harness::new();
     let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
@@ -225,18 +340,33 @@ async fn empty_status_is_an_authoritative_idle_snapshot() {
 }
 
 #[test]
-fn unknown_callback_group_is_visible_without_registering_a_project() {
+fn unknown_callback_group_records_visible_idempotent_integration_event_without_registering_a_project(
+) {
     let harness = Harness::new();
 
-    let error = record_callback_with(
+    let first = record_callback_with(
         &harness.db,
         "unknown-group",
         41,
         CallbackMetadata::default(),
     )
-    .unwrap_err();
+    .unwrap();
+    let second = record_callback_with(
+        &harness.db,
+        "unknown-group",
+        41,
+        CallbackMetadata::default(),
+    )
+    .unwrap();
 
-    assert!(error.to_string().contains("unknown Pueue group"));
+    assert!(matches!(
+        first,
+        CallbackRecordResult::UnknownGroup {
+            ref group,
+            integration_event_id: _
+        } if group == "unknown-group"
+    ));
+    assert_eq!(first, second);
     let project_count: i64 = harness
         .db
         .connect()
@@ -245,6 +375,7 @@ fn unknown_callback_group_is_visible_without_registering_a_project() {
         .unwrap();
     assert_eq!(project_count, 1);
     assert_eq!(harness.event_count(), 0);
+    assert_eq!(harness.integration_event_count(), 1);
 }
 
 #[tokio::test]
@@ -276,6 +407,47 @@ async fn reconciliation_adopts_one_matching_unlinked_submission() {
     assert!(submission.task_signature.is_some());
 }
 
+#[tokio::test]
+async fn reconciliation_recovers_submission_with_quoted_space_and_shell_special_argument() {
+    let harness = Harness::new();
+    SubmissionRepository::new(&harness.db)
+        .insert_idempotent(&NewSubmission::new(
+            "submission-quoted",
+            "project-a",
+            vec![
+                "python".to_owned(),
+                "train.py".to_owned(),
+                "--name".to_owned(),
+                "a b; echo bad && $(touch nope)".to_owned(),
+            ],
+            100,
+        ))
+        .unwrap();
+    let task = PueueTask {
+        command: "python train.py --name 'a b; echo bad && $(touch nope)'".to_owned(),
+        ..terminal_task(41, "100", json!("Success"))
+    };
+    let signature = task_signature(&task);
+    let fake = FakePueue::with_tasks(vec![task]);
+
+    Reconciler::new(&harness.db, fake).run_once().await.unwrap();
+
+    let submission = SubmissionRepository::new(&harness.db)
+        .find_by_id("submission-quoted")
+        .unwrap()
+        .unwrap();
+    assert_eq!(submission.status, SubmissionStatus::Adopted);
+    assert_eq!(submission.pueue_task_id, Some(41));
+    assert_eq!(
+        submission.task_signature.as_deref(),
+        Some(signature.as_str())
+    );
+    assert_eq!(
+        harness.observed_command(&signature),
+        vec!["python train.py --name 'a b; echo bad && $(touch nope)'"]
+    );
+}
+
 #[test]
 fn callback_metadata_is_retained_as_json() {
     let harness = Harness::new();
@@ -285,7 +457,8 @@ fn callback_metadata_is_retained_as_json() {
         41,
         CallbackMetadata::new(Some("Done"), Some(json!("Success"))),
     )
-    .unwrap();
+    .unwrap()
+    .event_id();
 
     let event = EventRepository::new(&harness.db)
         .find_by_id(event_id)

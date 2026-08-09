@@ -100,6 +100,10 @@ database_enum!(EventStatus {
     Failed => "failed",
 });
 
+database_enum!(IntegrationEventKind {
+    UnknownCallbackGroup => "unknown_callback_group",
+});
+
 database_enum!(IncidentTransition {
     Opened => "opened",
     Updated => "updated",
@@ -223,6 +227,39 @@ impl NewEvent {
             dedup_key: dedup_key.into(),
             payload,
             not_before,
+            created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntegrationEvent {
+    pub integration_event_id: i64,
+    pub kind: IntegrationEventKind,
+    pub dedup_key: String,
+    pub payload: Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewIntegrationEvent {
+    pub kind: IntegrationEventKind,
+    pub dedup_key: String,
+    pub payload: Value,
+    pub created_at: i64,
+}
+
+impl NewIntegrationEvent {
+    pub fn new(
+        kind: IntegrationEventKind,
+        dedup_key: impl Into<String>,
+        payload: Value,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            kind,
+            dedup_key: dedup_key.into(),
+            payload,
             created_at,
         }
     }

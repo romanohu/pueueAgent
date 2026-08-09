@@ -7,9 +7,9 @@ use rusqlite::{
 use crate::{
     models::{
         path_text, AgentRun, AgentRunEvent, Event, Incident, IncidentTransition, IncidentUpdate,
-        NewAgentRun, NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
-        NewTerminationRequest, Project, Submission, SubmissionStatus, TaskObservation,
-        TerminationRequest, TerminationRequestStatus,
+        IntegrationEvent, NewAgentRun, NewEvent, NewIncident, NewIntegrationEvent, NewProject,
+        NewSubmission, NewTaskObservation, NewTerminationRequest, Project, Submission,
+        SubmissionStatus, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
     AppError,
 };
@@ -230,6 +230,31 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("find event by deduplication key"))
     }
 
+    pub fn find_terminal_by_pueue_task(
+        &self,
+        project_id: &str,
+        pueue_group: &str,
+        pueue_task_id: i64,
+    ) -> Result<Option<Event>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1
+                        AND kind IN ('task_finished', 'task_failed')
+                        AND json_extract(payload_json, '$.group') = ?2
+                        AND json_extract(payload_json, '$.task_id') = ?3
+                     ORDER BY event_id DESC
+                     LIMIT 1",
+                    EVENT_SELECT
+                ),
+                params![project_id, pueue_group, pueue_task_id],
+                event_from_row,
+            )
+            .optional()
+            .map_err(database_error("find terminal event by Pueue task"))
+    }
+
     pub fn replace_pending(
         &self,
         event_id: i64,
@@ -276,6 +301,54 @@ impl<'db> EventRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit pending event replacement"))?;
+        Ok(stored)
+    }
+
+    pub fn replace_callback_with_terminal(
+        &self,
+        event_id: i64,
+        event: &NewEvent,
+    ) -> Result<Event, AppError> {
+        let payload_json =
+            serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
+                operation: "serialize terminal callback replacement payload",
+                source,
+            })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin callback terminal replacement"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE events
+                 SET kind = ?1, dedup_key = ?2, payload_json = ?3,
+                     not_before = ?4, created_at = ?5
+                 WHERE event_id = ?6",
+                params![
+                    event.kind,
+                    event.dedup_key,
+                    payload_json,
+                    event.not_before,
+                    event.created_at,
+                    event_id,
+                ],
+            )
+            .map_err(database_error("replace callback with terminal event"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "replace callback with terminal event",
+            });
+        }
+        let stored = transaction
+            .query_row(
+                &format!("{} WHERE event_id = ?1", EVENT_SELECT),
+                [event_id],
+                event_from_row,
+            )
+            .map_err(database_error("read terminal callback replacement"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit callback terminal replacement"))?;
         Ok(stored)
     }
 
@@ -382,6 +455,51 @@ impl<'db> EventRepository<'db> {
             .commit()
             .map_err(database_error("commit expired claim recovery"))?;
         Ok(recovered)
+    }
+}
+
+pub struct IntegrationEventRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> IntegrationEventRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_idempotent(
+        &self,
+        event: &NewIntegrationEvent,
+    ) -> Result<IntegrationEvent, AppError> {
+        let payload_json =
+            serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
+                operation: "serialize integration event payload",
+                source,
+            })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin idempotent integration event insert"))?;
+        transaction
+            .execute(
+                "INSERT INTO integration_events (
+                    kind, dedup_key, payload_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(dedup_key) DO NOTHING",
+                params![event.kind, event.dedup_key, payload_json, event.created_at],
+            )
+            .map_err(database_error("insert integration event"))?;
+        let stored = transaction
+            .query_row(
+                &format!("{} WHERE dedup_key = ?1", INTEGRATION_EVENT_SELECT),
+                [&event.dedup_key],
+                integration_event_from_row,
+            )
+            .map_err(database_error("read idempotent integration event"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit idempotent integration event insert"))?;
+        Ok(stored)
     }
 }
 
@@ -1000,6 +1118,10 @@ const EVENT_SELECT: &str =
             not_before, lease_until, created_at, completed_at, last_error
      FROM events";
 
+const INTEGRATION_EVENT_SELECT: &str =
+    "SELECT integration_event_id, kind, dedup_key, payload_json, created_at
+     FROM integration_events";
+
 const INCIDENT_SELECT: &str = "SELECT incident_id, project_id, kind, task_key, fingerprint, status,
             first_seen_at, last_seen_at, acknowledged_at, resolved_at
      FROM incidents";
@@ -1064,6 +1186,20 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
         created_at: row.get(9)?,
         completed_at: row.get(10)?,
         last_error: row.get(11)?,
+    })
+}
+
+fn integration_event_from_row(row: &Row<'_>) -> rusqlite::Result<IntegrationEvent> {
+    let payload_json: String = row.get(3)?;
+    let payload = serde_json::from_str(&payload_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(source))
+    })?;
+    Ok(IntegrationEvent {
+        integration_event_id: row.get(0)?,
+        kind: row.get(1)?,
+        dedup_key: row.get(2)?,
+        payload,
+        created_at: row.get(4)?,
     })
 }
 

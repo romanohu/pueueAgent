@@ -95,8 +95,8 @@ mod commands {
                     source,
                 }
             })?;
-        let event_id = record_callback(group, task_id, metadata)?;
-        println!("{event_id}");
+        let result = record_callback(group, task_id, metadata)?;
+        println!("{}", result.event_id());
         Ok(())
     }
 

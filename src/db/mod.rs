@@ -8,8 +8,9 @@ use rusqlite::Connection;
 use crate::AppError;
 
 pub use repositories::{
-    AgentRunRepository, EventRepository, IncidentRepository, ProjectRepository,
-    SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+    AgentRunRepository, EventRepository, IncidentRepository, IntegrationEventRepository,
+    ProjectRepository, SubmissionRepository, TaskObservationRepository,
+    TerminationRequestRepository,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

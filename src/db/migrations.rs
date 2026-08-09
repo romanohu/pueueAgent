@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let transaction = connection
@@ -25,9 +25,10 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         return Ok(());
     }
 
-    transaction
-        .execute_batch(
-            r#"
+    if version == 0 {
+        transaction
+            .execute_batch(
+                r#"
             CREATE TABLE projects (
                 project_id TEXT PRIMARY KEY,
                 root_path TEXT NOT NULL UNIQUE,
@@ -64,6 +65,14 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                     (status = 'claimed' AND lease_until IS NOT NULL)
                     OR (status <> 'claimed' AND lease_until IS NULL)
                 )
+            );
+
+            CREATE TABLE integration_events (
+                integration_event_id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('unknown_callback_group')),
+                dedup_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE incidents (
@@ -155,6 +164,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 WHERE status IN ('pending', 'retry_wait');
             CREATE INDEX events_project_status_idx
                 ON events(project_id, status, created_at);
+            CREATE INDEX integration_events_kind_created_idx
+                ON integration_events(kind, created_at);
             CREATE UNIQUE INDEX incidents_active_fingerprint_idx
                 ON incidents(project_id, kind, fingerprint)
                 WHERE status IN ('open', 'acknowledged');
@@ -174,10 +185,29 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE INDEX task_observations_group_state_idx
                 ON task_observations(project_id, pueue_group, state, observed_at);
 
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             "#,
-        )
-        .map_err(database_error("apply SQLite migrations"))?;
+            )
+            .map_err(database_error("apply SQLite migrations"))?;
+    } else if version == 1 {
+        transaction
+            .execute_batch(
+                r#"
+            CREATE TABLE integration_events (
+                integration_event_id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('unknown_callback_group')),
+                dedup_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX integration_events_kind_created_idx
+                ON integration_events(kind, created_at);
+
+            PRAGMA user_version = 2;
+            "#,
+            )
+            .map_err(database_error("apply SQLite v2 migration"))?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;

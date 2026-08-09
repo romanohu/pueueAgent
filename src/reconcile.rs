@@ -66,7 +66,7 @@ where
                 signature.clone(),
                 task.id,
                 task.group.clone(),
-                task.command.split_whitespace().map(str::to_owned).collect(),
+                vec![task.command.clone()],
                 task.state.clone(),
                 task.enqueued_at.as_deref().and_then(parse_timestamp),
                 task.started_at.as_deref().and_then(parse_timestamp),
@@ -193,6 +193,7 @@ fn materialize_terminal_event(
         if let Some(replaced) = repository.replace_pending(callback.event_id, &event)? {
             return Ok(replaced);
         }
+        return repository.replace_callback_with_terminal(callback.event_id, &event);
     }
     repository.insert_idempotent(&event)
 }
@@ -244,7 +245,7 @@ fn submission_matches_task(submission: &Submission, task: &PueueTask) -> bool {
     {
         return false;
     }
-    if submission.argv.join(" ") != task.command {
+    if canonical_command_display(&submission.argv) != task.command {
         return false;
     }
 
@@ -252,6 +253,24 @@ fn submission_matches_task(submission: &Submission, task: &PueueTask) -> bool {
         Some(enqueued_at) => (enqueued_at - submission.created_at).abs() <= 600,
         None => submission.pueue_task_id.is_some(),
     }
+}
+
+fn canonical_command_display(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(argument: &str) -> String {
+    if !argument.is_empty()
+        && argument
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'%' | b'_' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'))
+    {
+        return argument.to_owned();
+    }
+    format!("'{}'", argument.replace('\'', r"'\''"))
 }
 
 fn parse_timestamp(value: &str) -> Option<i64> {
