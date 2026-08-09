@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -158,7 +158,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 task_signature TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN (
-                    'requested', 'sent', 'confirmed', 'timed_out', 'failed'
+                    'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
                 )),
                 requested_at INTEGER NOT NULL,
                 grace_until INTEGER,
@@ -223,7 +223,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE INDEX operator_logs_project_created_idx
                 ON operator_logs(project_id, created_at, log_id);
 
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -303,6 +303,45 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             "#
             ))
             .map_err(database_error("apply SQLite v4 migration"))?;
+    } else if version == 4 {
+        transaction
+            .execute_batch(
+                r#"
+            CREATE TABLE termination_requests_v5 (
+                request_id INTEGER PRIMARY KEY,
+                incident_id INTEGER NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                task_signature TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
+                )),
+                requested_at INTEGER NOT NULL,
+                grace_until INTEGER,
+                confirmed_at INTEGER,
+                last_error TEXT,
+                UNIQUE(project_id, incident_id, task_signature),
+                FOREIGN KEY(project_id, incident_id)
+                    REFERENCES incidents(project_id, incident_id) ON DELETE CASCADE
+            );
+
+            INSERT INTO termination_requests_v5 (
+                request_id, incident_id, project_id, task_signature, reason, status,
+                requested_at, grace_until, confirmed_at, last_error
+            )
+            SELECT request_id, incident_id, project_id, task_signature, reason, status,
+                   requested_at, grace_until, confirmed_at, last_error
+            FROM termination_requests;
+
+            DROP TABLE termination_requests;
+            ALTER TABLE termination_requests_v5 RENAME TO termination_requests;
+            CREATE INDEX termination_requests_project_status_idx
+                ON termination_requests(project_id, status, requested_at);
+
+            PRAGMA user_version = 5;
+            "#,
+            )
+            .map_err(database_error("apply SQLite v5 migration"))?;
     }
     ensure_invariant_indexes(&transaction)?;
     transaction

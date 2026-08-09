@@ -286,6 +286,21 @@ impl Harness {
         request_id
     }
 
+    fn make_pending_request_dispatching(&self) -> i64 {
+        let request_id = self.pending_request_ids()[0];
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE termination_requests
+                 SET status = 'dispatching', grace_until = NULL
+                 WHERE request_id = ?1",
+                [request_id],
+            )
+            .unwrap();
+        request_id
+    }
+
     fn set_request_grace_until(&self, request_id: i64, grace_until: i64) {
         self.db
             .connect()
@@ -452,6 +467,30 @@ async fn sent_request_without_persisted_grace_recovers_to_pending_without_second
         grace_until >= before_recovery + DEFAULT_CONFIRMATION_GRACE_SECONDS
             && grace_until <= after_recovery + DEFAULT_CONFIRMATION_GRACE_SECONDS
     }));
+}
+
+#[tokio::test]
+async fn dispatching_request_retries_kill_after_restart_before_dispatch() {
+    let harness = Harness::running_task("project-a", 41);
+    harness.observe_fatal_pattern("cuda-oom");
+    let request_id = harness.make_pending_request_dispatching();
+
+    let outcome = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, TerminationOutcome::PendingConfirmation);
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
+    assert_eq!(
+        harness.request_status(),
+        Some(TerminationRequestStatus::Sent)
+    );
+    let request = TerminationRequestRepository::new(&harness.db)
+        .find_by_id(request_id)
+        .unwrap()
+        .unwrap();
+    assert!(request.grace_until.is_some());
 }
 
 #[tokio::test]
@@ -696,7 +735,7 @@ async fn kill_error_does_not_overwrite_concurrent_timeout() {
     });
     harness.fake_pueue.wait_until_kill_started().await;
 
-    harness.set_request_grace_until(request_id, 0);
+    harness.make_pending_request_sent(Some(0));
     let timeout_outcome = TerminationManager::new(&harness.db, harness.fake_pueue.clone())
         .execute(request_id)
         .await

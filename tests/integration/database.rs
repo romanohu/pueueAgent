@@ -221,7 +221,60 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
+}
+
+#[test]
+fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_status() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let incident = IncidentRepository::new(&test.db)
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("task-a"),
+            "v4-migration",
+            100,
+        ))
+        .unwrap()
+        .incident;
+    let request = TerminationRequestRepository::new(&test.db)
+        .insert_idempotent(&NewTerminationRequest::new(
+            incident.incident_id,
+            "project-a",
+            "signature-a",
+            "migration test",
+            100,
+            Some(220),
+        ))
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute("PRAGMA user_version = 4", [])
+        .unwrap();
+
+    let migrated = Db::open(&test.path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 5);
+    connection
+        .execute(
+            "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
+            [request.request_id],
+        )
+        .unwrap();
+    let stored_status: TerminationRequestStatus = connection
+        .query_row(
+            "SELECT status FROM termination_requests WHERE request_id = ?1",
+            [request.request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_status, TerminationRequestStatus::Dispatching);
 }
 
 #[test]

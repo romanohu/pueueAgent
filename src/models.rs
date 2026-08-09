@@ -182,6 +182,7 @@ impl AgentContextMode {
 
 database_enum!(TerminationRequestStatus {
     Requested => "requested",
+    Dispatching => "dispatching",
     Sent => "sent",
     Confirmed => "confirmed",
     TimedOut => "timed_out",
