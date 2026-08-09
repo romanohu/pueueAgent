@@ -180,6 +180,18 @@ max_agent_runs = 10
             pueue: snapshot,
         }
     }
+
+    fn operator_log_rows(&self) -> Vec<(String, String)> {
+        let connection = self.db.connect().unwrap();
+        let mut statement = connection
+            .prepare("SELECT action, details_json FROM operator_logs ORDER BY log_id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
 }
 
 #[test]
@@ -383,6 +395,53 @@ async fn pause_prevents_new_agent_claims_and_automatic_termination_until_resume(
 }
 
 #[test]
+fn state_transitions_write_durable_operator_logs_in_the_transition_transaction() {
+    let harness = OperatorHarness::new();
+
+    status::pause_project(&harness.db, "project-a", harness.now + 1).unwrap();
+    ProjectRepository::new(&harness.db)
+        .halt("project-a", "manual halt", harness.now + 2)
+        .unwrap();
+    status::resume_project(&harness.db, "project-a", harness.now + 3).unwrap();
+    status::disable_project(
+        &harness.db,
+        "project-a",
+        DisableMode::KeepReservation,
+        &[],
+        harness.now + 4,
+    )
+    .unwrap();
+    status::disable_project(
+        &harness.db,
+        "project-a",
+        DisableMode::Remove,
+        &[],
+        harness.now + 5,
+    )
+    .unwrap();
+
+    let logs = harness.operator_log_rows();
+    assert_eq!(
+        logs.iter()
+            .map(|(action, _)| action.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pause", "halt", "resume", "disable", "remove"]
+    );
+    assert!(logs[1].1.contains("\"halted_reason\":\"manual halt\""));
+    assert!(logs[2].1.contains("\"cleared_halt\":true"));
+    assert!(logs[3].1.contains("\"unresolved_task_count\":0"));
+    assert!(logs[4].1.contains("\"group_released\":true"));
+
+    let restarted = Db::open(harness.db.path()).unwrap();
+    let persisted_count: i64 = restarted
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM operator_logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted_count, 5);
+}
+
+#[test]
 fn disable_without_remove_keeps_group_reserved_when_unresolved_tasks_remain() {
     let harness = OperatorHarness::new();
     let unresolved = vec![harness.running_task()];
@@ -417,6 +476,38 @@ fn disable_without_remove_keeps_group_reserved_when_unresolved_tasks_remain() {
             field: "pueue_group"
         })
     ));
+    let logs = harness.operator_log_rows();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].0, "disable");
+    assert!(logs[0].1.contains("\"unresolved_task_count\":1"));
+    assert!(logs[0].1.contains("\"unresolved_task_ids\":[41]"));
+    assert!(logs[0].1.contains("\"group_released\":false"));
+}
+
+#[test]
+fn disable_without_remove_keeps_group_reserved_when_pueue_group_is_empty() {
+    let harness = OperatorHarness::new();
+
+    let disabled = status::disable_project(
+        &harness.db,
+        "project-a",
+        DisableMode::KeepReservation,
+        &[],
+        harness.now + 1,
+    )
+    .unwrap();
+
+    assert!(!disabled.enabled);
+    assert!(ProjectRepository::new(&harness.db)
+        .find_by_group("pa-project")
+        .unwrap()
+        .is_some());
+    let logs = harness.operator_log_rows();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].0, "disable");
+    assert!(logs[0].1.contains("\"unresolved_task_count\":0"));
+    assert!(logs[0].1.contains("\"unresolved_task_ids\":[]"));
+    assert!(logs[0].1.contains("\"group_released\":false"));
 }
 
 #[test]
@@ -450,4 +541,10 @@ fn disable_remove_explicitly_releases_group_without_controlling_pueue_tasks() {
             harness.now + 2,
         ))
         .unwrap();
+
+    let logs = harness.operator_log_rows();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].0, "remove");
+    assert!(logs[0].1.contains("\"unresolved_task_count\":1"));
+    assert!(logs[0].1.contains("\"group_released\":true"));
 }

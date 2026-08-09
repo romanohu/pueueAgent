@@ -183,6 +183,7 @@ fn open_configures_sqlite_and_installs_all_tables() {
         "submissions",
         "termination_requests",
         "task_observations",
+        "operator_logs",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -220,7 +221,7 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -243,7 +244,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 3);
+        assert_eq!(migrated_version, 4);
         assert_eq!(index_count, 1);
         drop(connection);
 

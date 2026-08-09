@@ -4,11 +4,25 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
         WHERE status IN ('starting', 'running');
+"#;
+const OPERATOR_LOGS_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS operator_logs (
+        log_id INTEGER PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        pueue_group TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN (
+            'pause', 'resume', 'halt', 'disable', 'remove'
+        )),
+        details_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS operator_logs_project_created_idx
+        ON operator_logs(project_id, created_at, log_id);
 "#;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
@@ -170,6 +184,17 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 PRIMARY KEY(project_id, task_signature)
             );
 
+            CREATE TABLE operator_logs (
+                log_id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                pueue_group TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN (
+                    'pause', 'resume', 'halt', 'disable', 'remove'
+                )),
+                details_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
             CREATE INDEX events_claimable_idx
                 ON events(status, not_before, created_at, event_id)
                 WHERE status IN ('pending', 'retry_wait');
@@ -195,8 +220,10 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 ON termination_requests(project_id, status, requested_at);
             CREATE INDEX task_observations_group_state_idx
                 ON task_observations(project_id, pueue_group, state, observed_at);
+            CREATE INDEX operator_logs_project_created_idx
+                ON operator_logs(project_id, created_at, log_id);
 
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -221,7 +248,20 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             ALTER TABLE agent_runs
                 ADD COLUMN context_lineage_json TEXT NOT NULL DEFAULT '[]';
 
-            PRAGMA user_version = 3;
+            CREATE TABLE operator_logs (
+                log_id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                pueue_group TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN (
+                    'pause', 'resume', 'halt', 'disable', 'remove'
+                )),
+                details_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX operator_logs_project_created_idx
+                ON operator_logs(project_id, created_at, log_id);
+
+            PRAGMA user_version = 4;
             "#,
             )
             .map_err(database_error("apply SQLite v2 migration"))?;
@@ -236,10 +276,33 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             ALTER TABLE agent_runs
                 ADD COLUMN context_lineage_json TEXT NOT NULL DEFAULT '[]';
 
-            PRAGMA user_version = 3;
+            CREATE TABLE operator_logs (
+                log_id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                pueue_group TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN (
+                    'pause', 'resume', 'halt', 'disable', 'remove'
+                )),
+                details_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX operator_logs_project_created_idx
+                ON operator_logs(project_id, created_at, log_id);
+
+            PRAGMA user_version = 4;
             "#,
             )
             .map_err(database_error("apply SQLite v3 migration"))?;
+    } else if version == 3 {
+        transaction
+            .execute_batch(&format!(
+                r#"
+            {OPERATOR_LOGS_SQL}
+
+            PRAGMA user_version = 4;
+            "#
+            ))
+            .map_err(database_error("apply SQLite v4 migration"))?;
     }
     ensure_invariant_indexes(&transaction)?;
     transaction
@@ -253,4 +316,9 @@ fn ensure_invariant_indexes(transaction: &rusqlite::Transaction<'_>) -> Result<(
     transaction
         .execute_batch(ACTIVE_AGENT_INDEX_SQL)
         .map_err(database_error("ensure SQLite invariant indexes"))
+        .and_then(|_| {
+            transaction
+                .execute_batch(OPERATOR_LOGS_SQL)
+                .map_err(database_error("ensure SQLite operator log table"))
+        })
 }

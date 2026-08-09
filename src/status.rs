@@ -141,13 +141,31 @@ pub fn disable_project(
     db: &Db,
     project_id: &str,
     mode: DisableMode,
-    _pueue_tasks: &[PueueTask],
+    pueue_tasks: &[PueueTask],
     now: i64,
 ) -> Result<Project, AppError> {
+    let project = ProjectRepository::new(db)
+        .find_by_id(project_id)?
+        .ok_or(AppError::Runtime {
+            operation: "find project before disable",
+        })?;
+    let unresolved_task_ids = unresolved_task_ids_for_group(&project, pueue_tasks);
     match mode {
-        DisableMode::KeepReservation => ProjectRepository::new(db).disable(project_id, now),
-        DisableMode::Remove => ProjectRepository::new(db).remove(project_id),
+        DisableMode::KeepReservation => {
+            ProjectRepository::new(db).disable(project_id, now, &unresolved_task_ids)
+        }
+        DisableMode::Remove => {
+            ProjectRepository::new(db).remove(project_id, now, &unresolved_task_ids)
+        }
     }
+}
+
+fn unresolved_task_ids_for_group(project: &Project, pueue_tasks: &[PueueTask]) -> Vec<i64> {
+    pueue_tasks
+        .iter()
+        .filter(|task| task.group == project.pueue_group && !task.is_terminal())
+        .map(|task| task.id)
+        .collect()
 }
 
 fn service_status_label(status: ServiceStatus) -> &'static str {

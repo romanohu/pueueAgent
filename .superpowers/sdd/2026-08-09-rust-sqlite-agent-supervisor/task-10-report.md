@@ -102,3 +102,108 @@ Result: passed.
 - `status` output is human-readable text, not a stable machine-readable schema.
 - `disable --remove` releases the supervisor’s SQLite group reservation even if Pueue still has unresolved tasks; this is intentionally explicit and does not kill/remove Pueue tasks.
 - CLI `status` uses the platform service manager health check. If the platform service query itself errors, the command returns that error.
+
+## Fix Round 1 Report
+
+### Summary
+
+Addressed reviewer findings:
+
+- Added durable SQLite `operator_logs` table and schema migration to version 4.
+- Wrote operator log rows inside the same project-transition transaction for `pause`, `halt`, `resume`, `disable`, and `remove`.
+- Kept remove logs durable after project deletion by storing `project_id`/`pueue_group` as log fields without a project foreign key.
+- Made `disable_project` explicitly compute unresolved non-terminal Pueue task IDs for the project group before choosing the state transition.
+- Plain disable always keeps the group reservation, for both unresolved and empty Pueue snapshots.
+- Explicit remove remains the only release path and logs the intentional release even when unresolved tasks exist.
+
+### Red Result
+
+Command:
+
+```bash
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --test operator_commands
+```
+
+Result: failed as expected before implementation.
+
+```text
+running 7 tests
+test result: FAILED. 3 passed; 4 failed
+```
+
+Failure cause:
+
+```text
+no such table: operator_logs
+```
+
+This proved the new tests were checking durable database log rows, not CLI println output.
+
+### Verification
+
+Focused operator tests:
+
+```bash
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --test operator_commands
+```
+
+Result:
+
+```text
+test result: ok. 7 passed; 0 failed; 0 ignored
+```
+
+Focused database/operator migration check:
+
+```bash
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --test database --test operator_commands
+```
+
+Result:
+
+```text
+database: 18 passed; 0 failed
+operator_commands: 7 passed; 0 failed
+```
+
+Full offline all-target/all-features:
+
+```bash
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --offline --all-targets --all-features
+```
+
+Result: all listed suites passed.
+
+```text
+127 passed; 0 failed
+```
+
+Formatting:
+
+```bash
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo fmt --all -- --check
+```
+
+Result: passed.
+
+Clippy:
+
+```bash
+PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo clippy --offline --all-targets --all-features -- -D warnings
+```
+
+Result: passed.
+
+Diff check:
+
+```bash
+git diff --check
+```
+
+Result: passed.
+
+### Risks / Notes
+
+- Existing SQLite databases migrate from schema version 3 to 4 by adding `operator_logs`; versions 1 and 2 also migrate directly to 4.
+- `operator_logs` intentionally does not reference `projects` so remove operations can delete a project row while preserving the operator audit trail.
+- Plain disable still disables the project when Pueue status is unavailable and keeps the group reservation; `disable --remove` still returns the Pueue status error before attempting release.

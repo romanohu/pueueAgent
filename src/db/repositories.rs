@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 use rusqlite::{
     params, types::Type, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
+use serde_json::json;
 
 use crate::{
     models::{
@@ -181,6 +182,15 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read paused project"))?;
+        insert_operator_log(
+            &transaction,
+            &project,
+            "pause",
+            &json!({
+                "paused": true,
+            }),
+            now,
+        )?;
         transaction
             .commit()
             .map_err(database_error("commit project pause"))?;
@@ -192,6 +202,13 @@ impl<'db> ProjectRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin project resume"))?;
+        let was_halted: Option<String> = transaction
+            .query_row(
+                "SELECT halted_reason FROM projects WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read project halt state before resume"))?;
         transaction
             .execute(
                 "UPDATE projects
@@ -209,6 +226,17 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read resumed project"))?;
+        insert_operator_log(
+            &transaction,
+            &project,
+            "resume",
+            &json!({
+                "paused": false,
+                "cleared_halt": was_halted.is_some(),
+                "previous_halted_reason": was_halted,
+            }),
+            now,
+        )?;
         transaction
             .commit()
             .map_err(database_error("commit project resume"))?;
@@ -237,13 +265,28 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read halted project"))?;
+        insert_operator_log(
+            &transaction,
+            &project,
+            "halt",
+            &json!({
+                "paused": true,
+                "halted_reason": reason,
+            }),
+            now,
+        )?;
         transaction
             .commit()
             .map_err(database_error("commit project halt"))?;
         Ok(project)
     }
 
-    pub fn disable(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+    pub fn disable(
+        &self,
+        project_id: &str,
+        now: i64,
+        unresolved_task_ids: &[i64],
+    ) -> Result<Project, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -265,13 +308,30 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read disabled project"))?;
+        insert_operator_log(
+            &transaction,
+            &project,
+            "disable",
+            &json!({
+                "group_released": false,
+                "mode": "keep_reservation",
+                "unresolved_task_count": unresolved_task_ids.len(),
+                "unresolved_task_ids": unresolved_task_ids,
+            }),
+            now,
+        )?;
         transaction
             .commit()
             .map_err(database_error("commit project disable"))?;
         Ok(project)
     }
 
-    pub fn remove(&self, project_id: &str) -> Result<Project, AppError> {
+    pub fn remove(
+        &self,
+        project_id: &str,
+        now: i64,
+        unresolved_task_ids: &[i64],
+    ) -> Result<Project, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -285,6 +345,18 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read project before removal"))?;
+        insert_operator_log(
+            &transaction,
+            &project,
+            "remove",
+            &json!({
+                "group_released": true,
+                "mode": "remove",
+                "unresolved_task_count": unresolved_task_ids.len(),
+                "unresolved_task_ids": unresolved_task_ids,
+            }),
+            now,
+        )?;
         transaction
             .execute("DELETE FROM projects WHERE project_id = ?1", [project_id])
             .map_err(database_error("remove project"))?;
@@ -318,6 +390,35 @@ impl<'db> ProjectRepository<'db> {
             .optional()
             .map_err(database_error("find project by canonical root"))
     }
+}
+
+fn insert_operator_log(
+    transaction: &Transaction<'_>,
+    project: &Project,
+    action: &'static str,
+    details: &serde_json::Value,
+    now: i64,
+) -> Result<(), AppError> {
+    let details_json =
+        serde_json::to_string(details).map_err(|source| AppError::Serialization {
+            operation: "serialize operator log details",
+            source,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO operator_logs (
+                project_id, pueue_group, action, details_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                project.project_id,
+                project.pueue_group,
+                action,
+                details_json,
+                now,
+            ],
+        )
+        .map_err(database_error("insert operator log"))?;
+    Ok(())
 }
 
 pub struct EventRepository<'db> {
