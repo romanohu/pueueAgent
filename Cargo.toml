@@ -48,6 +48,10 @@ name = "operator_commands"
 path = "tests/integration/operator_commands.rs"
 
 [[test]]
+name = "diagnostics"
+path = "tests/integration/diagnostics.rs"
+
+[[test]]
 name = "init"
 path = "tests/integration/init.rs"
 

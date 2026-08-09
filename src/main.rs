@@ -59,7 +59,7 @@ mod commands {
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, ProjectRepository},
-        diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
+        diagnostics::{render_project_status_json, EventFilter, MAX_EVENT_LIST_LIMIT},
         events::{record_callback, CallbackMetadata},
         models::Project,
         paths, project,
@@ -154,7 +154,7 @@ mod commands {
         let StatusArgs {
             project_root,
             pueue_config,
-            json: _,
+            json,
         } = args;
         let (db, project, service_paths) = resolve_project(project_root, pueue_config)?;
         let pueue = configured_pueue(&service_paths);
@@ -166,10 +166,12 @@ mod commands {
             daemon_health: ServiceManager.status()?,
             pueue,
         };
-        println!(
-            "{}",
+        let rendered = if json {
+            render_project_status_json(&db, &project, &input)?
+        } else {
             status_command::render_project_status(&db, &project, &input)?
-        );
+        };
+        println!("{rendered}");
         Ok(())
     }
 
