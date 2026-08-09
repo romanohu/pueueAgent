@@ -1084,11 +1084,25 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
             .collect::<Vec<_>>(),
         vec!["signature-beta", "signature-alpha", "signature-old"]
     );
+    assert_eq!(
+        observations
+            .find_by_pueue_task("project-a", 41, 1)
+            .unwrap()
+            .iter()
+            .map(|observation| observation.task_signature.as_str())
+            .collect::<Vec<_>>(),
+        vec!["signature-beta"]
+    );
+    assert!(observations
+        .find_by_pueue_task("project-a", 41, 0)
+        .unwrap()
+        .is_empty());
 
     let submissions = SubmissionRepository::new(&test.db);
     for (submission_id, project_id, signature) in [
         ("submission-old", "project-a", "signature-old"),
         ("submission-beta", "project-a", "signature-beta"),
+        ("submission-beta-2", "project-a", "signature-beta"),
         ("submission-foreign", "project-b", "signature-beta"),
     ] {
         submissions
@@ -1110,8 +1124,21 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
             .iter()
             .map(|submission| submission.submission_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["submission-beta"]
+        vec!["submission-beta-2", "submission-beta"]
     );
+    assert_eq!(
+        submissions
+            .find_by_task_signature("project-a", "signature-beta", 1)
+            .unwrap()
+            .iter()
+            .map(|submission| submission.submission_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["submission-beta-2"]
+    );
+    assert!(submissions
+        .find_by_task_signature("project-a", "signature-beta", 0)
+        .unwrap()
+        .is_empty());
     assert!(submissions
         .list_by_project("project-a", 10)
         .unwrap()
@@ -1139,6 +1166,16 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
         ))
         .unwrap()
         .incident;
+    let incident_beta_second = incidents
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("signature-beta"),
+            "beta-fingerprint-2",
+            200,
+        ))
+        .unwrap()
+        .incident;
     let foreign_incident = incidents
         .upsert_active(&NewIncident::new(
             "project-b",
@@ -1156,8 +1193,21 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
             .iter()
             .map(|incident| incident.incident_id)
             .collect::<Vec<_>>(),
-        vec![incident_beta.incident_id]
+        vec![incident_beta_second.incident_id, incident_beta.incident_id]
     );
+    assert_eq!(
+        incidents
+            .find_by_task_key("project-a", "signature-beta", 1)
+            .unwrap()
+            .iter()
+            .map(|incident| incident.incident_id)
+            .collect::<Vec<_>>(),
+        vec![incident_beta_second.incident_id]
+    );
+    assert!(incidents
+        .find_by_task_key("project-a", "signature-beta", 0)
+        .unwrap()
+        .is_empty());
     assert!(incidents
         .find_by_project_and_id("project-a", foreign_incident.incident_id)
         .unwrap()
@@ -1169,41 +1219,71 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
         .all(|incident| incident.project_id == "project-a"));
 
     let terminations = TerminationRequestRepository::new(&test.db);
-    for (incident_id, project_id, signature, requested_at) in [
-        (incident_old.incident_id, "project-a", "signature-old", 100),
-        (
+    let request_old = terminations
+        .insert_idempotent(&NewTerminationRequest::new(
+            incident_old.incident_id,
+            "project-a",
+            "signature-old",
+            "diagnostic relation",
+            100,
+            None,
+        ))
+        .unwrap();
+    let request_beta = terminations
+        .insert_idempotent(&NewTerminationRequest::new(
             incident_beta.incident_id,
             "project-a",
             "signature-beta",
+            "diagnostic relation",
             200,
-        ),
-        (
+            None,
+        ))
+        .unwrap();
+    let request_beta_second = terminations
+        .insert_idempotent(&NewTerminationRequest::new(
+            incident_beta_second.incident_id,
+            "project-a",
+            "signature-beta",
+            "diagnostic relation",
+            200,
+            None,
+        ))
+        .unwrap();
+    let request_foreign = terminations
+        .insert_idempotent(&NewTerminationRequest::new(
             foreign_incident.incident_id,
             "project-b",
             "signature-beta",
+            "diagnostic relation",
             300,
-        ),
-    ] {
-        terminations
-            .insert_idempotent(&NewTerminationRequest::new(
-                incident_id,
-                project_id,
-                signature,
-                "diagnostic relation",
-                requested_at,
-                None,
-            ))
-            .unwrap();
-    }
+            None,
+        ))
+        .unwrap();
     assert_eq!(
         terminations
             .find_by_task_signature("project-a", "signature-beta", 10)
             .unwrap()
             .iter()
-            .map(|request| request.incident_id)
+            .map(|request| request.request_id)
             .collect::<Vec<_>>(),
-        vec![incident_beta.incident_id]
+        vec![request_beta_second.request_id, request_beta.request_id,]
     );
+    assert_eq!(
+        terminations
+            .find_by_task_signature("project-a", "signature-beta", 1)
+            .unwrap()
+            .iter()
+            .map(|request| request.request_id)
+            .collect::<Vec<_>>(),
+        vec![request_beta_second.request_id]
+    );
+    assert!(terminations
+        .find_by_task_signature("project-a", "signature-beta", 0)
+        .unwrap()
+        .is_empty());
+    assert!(request_old.request_id < request_beta.request_id);
+    assert!(request_beta.request_id < request_beta_second.request_id);
+    assert!(request_beta_second.request_id < request_foreign.request_id);
     assert!(terminations
         .list_by_project("project-a", 10)
         .unwrap()
@@ -1219,7 +1299,7 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
             event_a,
             None,
             AgentRunStatus::Starting,
-            100,
+            200,
             "/tmp/agent-a-first.log",
         ))
         .unwrap();
@@ -1227,11 +1307,12 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
         .finish(
             first_run.run_id,
             AgentRunStatus::Completed,
-            101,
+            201,
             Some(0),
             None,
         )
         .unwrap();
+    agent_runs.attach_event(first_run.run_id, event_a).unwrap();
     let second_run = agent_runs
         .insert(&NewAgentRun::new(
             "project-a",
@@ -1283,8 +1364,25 @@ fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
             .iter()
             .map(|run| run.run_id)
             .collect::<Vec<_>>(),
+        vec![second_run.run_id, first_run.run_id]
+    );
+    assert_eq!(
+        agent_runs
+            .find_by_event("project-a", event_a, 1)
+            .unwrap()
+            .iter()
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>(),
         vec![second_run.run_id]
     );
+    assert!(agent_runs
+        .find_by_event("project-a", event_a, 0)
+        .unwrap()
+        .is_empty());
+    assert!(agent_runs
+        .find_by_event("project-b", event_a, 10)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
