@@ -10,6 +10,7 @@ use pueue_agent::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
         SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
     },
+    diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     models::{
         AgentRunStatus, EventKind, EventStatus, IncidentStatus, IncidentTransition, NewAgentRun,
         NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
@@ -924,6 +925,365 @@ fn typed_repositories_round_trip_future_task_records() {
             .unwrap()
             .observed_at,
         102
+    );
+}
+
+#[test]
+fn diagnostics_filters_events_by_project_kind_status_and_bounded_deterministic_order() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-b");
+    let repository = EventRepository::new(&test.db);
+
+    let task_failed = repository
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFailed,
+            "task-failed",
+            json!({"task_id": 41}),
+            100,
+            100,
+        ))
+        .unwrap();
+    let first_crash = repository
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "first-crash",
+            json!({"task_id": 41}),
+            200,
+            200,
+        ))
+        .unwrap();
+    let second_crash = repository
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "second-crash",
+            json!({"task_id": 41}),
+            200,
+            200,
+        ))
+        .unwrap();
+    repository
+        .insert_idempotent(&NewEvent::new(
+            "project-b",
+            EventKind::Crash,
+            "foreign-crash",
+            json!({"task_id": 41}),
+            300,
+            300,
+        ))
+        .unwrap();
+    repository
+        .transition_many(
+            &[first_crash.event_id],
+            EventStatus::Completed,
+            400,
+            None,
+            None,
+        )
+        .unwrap();
+
+    let crashes = repository
+        .list_filtered(
+            "project-a",
+            &EventFilter::new(Some(EventKind::Crash), None, 10),
+        )
+        .unwrap();
+    assert_eq!(
+        crashes
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+        vec![second_crash.event_id, first_crash.event_id]
+    );
+    assert!(crashes
+        .iter()
+        .all(|event| event.project_id == "project-a" && event.kind == EventKind::Crash));
+
+    let completed = repository
+        .list_filtered(
+            "project-a",
+            &EventFilter::new(None, Some(EventStatus::Completed), 10),
+        )
+        .unwrap();
+    assert_eq!(
+        completed
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+        vec![first_crash.event_id]
+    );
+    assert_ne!(task_failed.status, EventStatus::Completed);
+
+    for index in 0..=MAX_EVENT_LIST_LIMIT {
+        repository
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::Stalled,
+                format!("bounded-crash-{index}"),
+                json!({"task_id": index}),
+                1,
+                1,
+            ))
+            .unwrap();
+    }
+    let bounded = repository
+        .list_filtered(
+            "project-a",
+            &EventFilter::new(None, None, MAX_EVENT_LIST_LIMIT + 1),
+        )
+        .unwrap();
+    assert_eq!(bounded.len(), MAX_EVENT_LIST_LIMIT);
+    assert!(repository
+        .list_filtered("project-a", &EventFilter::new(None, None, 0))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn diagnostics_scopes_task_relations_by_project_and_stable_signature() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-b");
+    let observations = TaskObservationRepository::new(&test.db);
+
+    for (project_id, signature, group, observed_at) in [
+        ("project-a", "signature-old", "pa-a", 100),
+        ("project-a", "signature-alpha", "pa-a", 200),
+        ("project-a", "signature-beta", "pa-a", 200),
+        ("project-b", "signature-beta", "pa-b", 300),
+    ] {
+        observations
+            .upsert(&NewTaskObservation::new(
+                project_id,
+                signature,
+                41,
+                group,
+                vec!["python".to_owned(), "train.py".to_owned()],
+                "running",
+                None,
+                Some(observed_at),
+                None,
+                None,
+                observed_at,
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        observations
+            .find_by_pueue_task("project-a", 41, 10)
+            .unwrap()
+            .iter()
+            .map(|observation| observation.task_signature.as_str())
+            .collect::<Vec<_>>(),
+        vec!["signature-beta", "signature-alpha", "signature-old"]
+    );
+
+    let submissions = SubmissionRepository::new(&test.db);
+    for (submission_id, project_id, signature) in [
+        ("submission-old", "project-a", "signature-old"),
+        ("submission-beta", "project-a", "signature-beta"),
+        ("submission-foreign", "project-b", "signature-beta"),
+    ] {
+        submissions
+            .insert_idempotent(&NewSubmission::new(
+                submission_id,
+                project_id,
+                vec!["python".to_owned(), "train.py".to_owned()],
+                100,
+            ))
+            .unwrap();
+        submissions
+            .mark_accepted(submission_id, 41, signature)
+            .unwrap();
+    }
+    assert_eq!(
+        submissions
+            .find_by_task_signature("project-a", "signature-beta", 10)
+            .unwrap()
+            .iter()
+            .map(|submission| submission.submission_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["submission-beta"]
+    );
+    assert!(submissions
+        .list_by_project("project-a", 10)
+        .unwrap()
+        .iter()
+        .all(|submission| submission.project_id == "project-a"));
+
+    let incidents = IncidentRepository::new(&test.db);
+    let incident_old = incidents
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("signature-old"),
+            "old-fingerprint",
+            100,
+        ))
+        .unwrap()
+        .incident;
+    let incident_beta = incidents
+        .upsert_active(&NewIncident::new(
+            "project-a",
+            "pattern",
+            Some("signature-beta"),
+            "beta-fingerprint",
+            200,
+        ))
+        .unwrap()
+        .incident;
+    let foreign_incident = incidents
+        .upsert_active(&NewIncident::new(
+            "project-b",
+            "pattern",
+            Some("signature-beta"),
+            "foreign-fingerprint",
+            300,
+        ))
+        .unwrap()
+        .incident;
+    assert_eq!(
+        incidents
+            .find_by_task_key("project-a", "signature-beta", 10)
+            .unwrap()
+            .iter()
+            .map(|incident| incident.incident_id)
+            .collect::<Vec<_>>(),
+        vec![incident_beta.incident_id]
+    );
+    assert!(incidents
+        .find_by_project_and_id("project-a", foreign_incident.incident_id)
+        .unwrap()
+        .is_none());
+    assert!(incidents
+        .list_by_project("project-a", 10)
+        .unwrap()
+        .iter()
+        .all(|incident| incident.project_id == "project-a"));
+
+    let terminations = TerminationRequestRepository::new(&test.db);
+    for (incident_id, project_id, signature, requested_at) in [
+        (incident_old.incident_id, "project-a", "signature-old", 100),
+        (
+            incident_beta.incident_id,
+            "project-a",
+            "signature-beta",
+            200,
+        ),
+        (
+            foreign_incident.incident_id,
+            "project-b",
+            "signature-beta",
+            300,
+        ),
+    ] {
+        terminations
+            .insert_idempotent(&NewTerminationRequest::new(
+                incident_id,
+                project_id,
+                signature,
+                "diagnostic relation",
+                requested_at,
+                None,
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        terminations
+            .find_by_task_signature("project-a", "signature-beta", 10)
+            .unwrap()
+            .iter()
+            .map(|request| request.incident_id)
+            .collect::<Vec<_>>(),
+        vec![incident_beta.incident_id]
+    );
+    assert!(terminations
+        .list_by_project("project-a", 10)
+        .unwrap()
+        .iter()
+        .all(|request| request.project_id == "project-a"));
+
+    let event_a = insert_event(&test.db, "project-a", "agent-run-a", 100);
+    let event_b = insert_event(&test.db, "project-b", "agent-run-b", 100);
+    let agent_runs = AgentRunRepository::new(&test.db);
+    let first_run = agent_runs
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_a,
+            None,
+            AgentRunStatus::Starting,
+            100,
+            "/tmp/agent-a-first.log",
+        ))
+        .unwrap();
+    agent_runs
+        .finish(
+            first_run.run_id,
+            AgentRunStatus::Completed,
+            101,
+            Some(0),
+            None,
+        )
+        .unwrap();
+    let second_run = agent_runs
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_a,
+            None,
+            AgentRunStatus::Starting,
+            200,
+            "/tmp/agent-a-second.log",
+        ))
+        .unwrap();
+    agent_runs
+        .finish(
+            second_run.run_id,
+            AgentRunStatus::Completed,
+            201,
+            Some(0),
+            None,
+        )
+        .unwrap();
+    agent_runs.attach_event(second_run.run_id, event_a).unwrap();
+    let foreign_run = agent_runs
+        .insert(&NewAgentRun::new(
+            "project-b",
+            event_b,
+            None,
+            AgentRunStatus::Starting,
+            300,
+            "/tmp/agent-b.log",
+        ))
+        .unwrap();
+    assert_eq!(
+        agent_runs
+            .list_by_project("project-a", 1)
+            .unwrap()
+            .iter()
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>(),
+        vec![second_run.run_id]
+    );
+    assert!(!agent_runs
+        .list_by_project("project-a", 10)
+        .unwrap()
+        .iter()
+        .any(|run| run.run_id == foreign_run.run_id));
+    assert_eq!(
+        agent_runs
+            .find_by_event("project-a", event_a, 10)
+            .unwrap()
+            .iter()
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>(),
+        vec![second_run.run_id]
     );
 }
 

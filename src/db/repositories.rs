@@ -6,6 +6,7 @@ use rusqlite::{
 use serde_json::json;
 
 use crate::{
+    diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     models::{
         path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, Event, EventKind,
         EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent, NewAgentRun,
@@ -793,6 +794,37 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("read recent events"))
     }
 
+    pub fn list_filtered(
+        &self,
+        project_id: &str,
+        filter: &EventFilter,
+    ) -> Result<Vec<Event>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 AND (?2 IS NULL OR kind = ?2)
+                 AND (?3 IS NULL OR status = ?3)
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT ?4",
+                EVENT_SELECT
+            ))
+            .map_err(database_error("prepare filtered event query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    filter.kind,
+                    filter.status,
+                    bounded_diagnostic_limit(filter.limit),
+                ],
+                event_from_row,
+            )
+            .map_err(database_error("query filtered events"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read filtered events"))
+    }
+
     pub fn count_consecutive_failures(
         &self,
         project_id: &str,
@@ -1001,6 +1033,74 @@ impl<'db> IncidentRepository<'db> {
             .optional()
             .map_err(database_error("find incident by ID"))
     }
+
+    pub fn find_by_project_and_id(
+        &self,
+        project_id: &str,
+        incident_id: i64,
+    ) -> Result<Option<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND incident_id = ?2",
+                    INCIDENT_SELECT
+                ),
+                params![project_id, incident_id],
+                incident_from_row,
+            )
+            .optional()
+            .map_err(database_error("find project incident by ID"))
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY last_seen_at DESC, incident_id DESC
+                 LIMIT ?2",
+                INCIDENT_SELECT
+            ))
+            .map_err(database_error("prepare project incident query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                incident_from_row,
+            )
+            .map_err(database_error("query project incidents"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project incidents"))
+    }
+
+    pub fn find_by_task_key(
+        &self,
+        project_id: &str,
+        task_key: &str,
+        limit: usize,
+    ) -> Result<Vec<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND task_key = ?2
+                 ORDER BY last_seen_at DESC, incident_id DESC
+                 LIMIT ?3",
+                INCIDENT_SELECT
+            ))
+            .map_err(database_error("prepare task incident query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_key, bounded_diagnostic_limit(limit)],
+                incident_from_row,
+            )
+            .map_err(database_error("query task incidents"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task incidents"))
+    }
 }
 
 pub struct SubmissionRepository<'db> {
@@ -1055,6 +1155,55 @@ impl<'db> SubmissionRepository<'db> {
             )
             .optional()
             .map_err(database_error("find submission by ID"))
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY created_at DESC, submission_id DESC
+                 LIMIT ?2",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare project submission query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                submission_from_row,
+            )
+            .map_err(database_error("query project submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project submissions"))
+    }
+
+    pub fn find_by_task_signature(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+        limit: usize,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND task_signature = ?2
+                 ORDER BY created_at DESC, submission_id DESC
+                 LIMIT ?3",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare task submission query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_signature, bounded_diagnostic_limit(limit)],
+                submission_from_row,
+            )
+            .map_err(database_error("query task submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task submissions"))
     }
 
     pub fn mark_accepted(
@@ -1384,6 +1533,63 @@ impl<'db> AgentRunRepository<'db> {
         u32::try_from(count).map_err(|_| AppError::Runtime {
             operation: "count agent runs",
         })
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentRun>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY started_at DESC, run_id DESC
+                 LIMIT ?2",
+                AGENT_RUN_SELECT
+            ))
+            .map_err(database_error("prepare project agent run query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                agent_run_from_row,
+            )
+            .map_err(database_error("query project agent runs"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project agent runs"))
+    }
+
+    pub fn find_by_event(
+        &self,
+        project_id: &str,
+        event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AgentRun>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT agent_runs.run_id, agent_runs.project_id, agent_runs.primary_event_id,
+                        agent_runs.pid, agent_runs.status, agent_runs.started_at,
+                        agent_runs.finished_at, agent_runs.exit_code, agent_runs.log_path,
+                        agent_runs.last_error, agent_runs.context_mode,
+                        agent_runs.context_session_id, agent_runs.context_lineage_json
+                 FROM agent_runs
+                 JOIN agent_run_events
+                   ON agent_run_events.project_id = agent_runs.project_id
+                  AND agent_run_events.run_id = agent_runs.run_id
+                 WHERE agent_runs.project_id = ?1 AND agent_run_events.event_id = ?2
+                 ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(database_error("prepare event agent run query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, event_id, bounded_diagnostic_limit(limit)],
+                agent_run_from_row,
+            )
+            .map_err(database_error("query event agent runs"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read event agent runs"))
     }
 }
 
@@ -1763,6 +1969,57 @@ impl<'db> TerminationRequestRepository<'db> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read project termination requests"))
     }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY requested_at DESC, request_id DESC
+                 LIMIT ?2",
+                TERMINATION_REQUEST_SELECT
+            ))
+            .map_err(database_error(
+                "prepare bounded project termination request query",
+            ))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                termination_request_from_row,
+            )
+            .map_err(database_error("query bounded project termination requests"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read bounded project termination requests"))
+    }
+
+    pub fn find_by_task_signature(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+        limit: usize,
+    ) -> Result<Vec<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND task_signature = ?2
+                 ORDER BY requested_at DESC, request_id DESC
+                 LIMIT ?3",
+                TERMINATION_REQUEST_SELECT
+            ))
+            .map_err(database_error("prepare task termination request query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_signature, bounded_diagnostic_limit(limit)],
+                termination_request_from_row,
+            )
+            .map_err(database_error("query task termination requests"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task termination requests"))
+    }
 }
 
 pub struct TaskObservationRepository<'db> {
@@ -1850,6 +2107,31 @@ impl<'db> TaskObservationRepository<'db> {
             .optional()
             .map_err(database_error("find task observation"))
     }
+
+    pub fn find_by_pueue_task(
+        &self,
+        project_id: &str,
+        pueue_task_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TaskObservation>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND pueue_task_id = ?2
+                 ORDER BY observed_at DESC, task_signature DESC
+                 LIMIT ?3",
+                TASK_OBSERVATION_SELECT
+            ))
+            .map_err(database_error("prepare Pueue task observation query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, pueue_task_id, bounded_diagnostic_limit(limit)],
+                task_observation_from_row,
+            )
+            .map_err(database_error("query Pueue task observations"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read Pueue task observations"))
+    }
 }
 
 const EVENT_SELECT: &str =
@@ -1882,6 +2164,10 @@ const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, projec
 const TASK_OBSERVATION_SELECT: &str = "SELECT project_id, task_signature, pueue_task_id,
             pueue_group, command_json, state, enqueued_at, started_at, ended_at, result, observed_at
      FROM task_observations";
+
+fn bounded_diagnostic_limit(limit: usize) -> i64 {
+    limit.min(MAX_EVENT_LIST_LIMIT) as i64
+}
 
 fn exists(
     transaction: &Transaction<'_>,
