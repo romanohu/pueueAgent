@@ -39,7 +39,8 @@ small CLI around `init`, `enable`, `submit`, `status`, `pause`, and `resume`.
 - Direct API integrations for coding agents.
 - Cross-machine orchestration.
 - A web dashboard.
-- Automatic killing of Pueue tasks as part of anomaly detection.
+- Unconditional or heuristic killing of Pueue tasks. Task termination is
+  allowed only through an explicit, per-detector policy.
 - Inferring experiment quality with an LLM during cheap health checks.
 
 ## 4. Architecture
@@ -76,6 +77,7 @@ The supervisor owns:
 
 - Pueue reconciliation for all enabled projects.
 - Event deduplication and incident state.
+- Policy-controlled Pueue task termination and termination recovery.
 - Agent scheduling, cooldown, retry, timeout, and leases.
 - Guardrail counters and halted state.
 - Recovery of work left by a previous supervisor process.
@@ -210,6 +212,25 @@ reconciliation attempts to adopt the matching task by project group,
 command, and creation window. Ambiguous matches remain visible as an
 unreconciled submission instead of being silently counted.
 
+#### `termination_requests`
+
+Tracks policy-controlled attempts to terminate a still-running task:
+
+- `request_id INTEGER PRIMARY KEY`
+- `incident_id INTEGER NOT NULL`
+- `project_id TEXT NOT NULL`
+- `task_signature TEXT NOT NULL`
+- `reason TEXT NOT NULL`
+- `status TEXT NOT NULL`
+- `requested_at INTEGER NOT NULL`
+- `grace_until INTEGER`
+- `confirmed_at INTEGER`
+- `last_error TEXT`
+- `UNIQUE(project_id, incident_id, task_signature)`
+
+Termination status is one of `requested`, `sent`, `confirmed`, `timed_out`,
+or `failed`.
+
 #### `task_observations`
 
 Stores the latest authoritative Pueue observation for each task signature,
@@ -272,10 +293,80 @@ The cheap detector only reads Pueue status and bounded log tails.
 - `extra_log_paths` use the same fingerprinting and incident lifecycle as task
   logs.
 
-Detection does not kill or modify a Pueue task. The coding agent may decide
-what intervention is appropriate.
+By default, detection does not kill or modify a Pueue task. The coding agent
+may decide what intervention is appropriate unless the detector has an
+explicit termination policy described below.
 
-## 9. Agent execution
+## 9. Policy-controlled task termination
+
+Anomaly detection and task termination are separate decisions. Each detector
+may have one of these actions:
+
+- `notify`: record the incident only.
+- `wake`: schedule an agent without terminating the task.
+- `kill`: terminate the Pueue task first, then schedule an agent after the
+  terminal state is observed.
+
+The default action is `wake` for strong configured error patterns and
+`notify` for soft signals such as stalled output. Automatic termination is
+opt-in per pattern.
+
+Example configuration:
+
+```toml
+[[check.patterns]]
+name = "cuda-oom"
+regex = "CUDA.*out of memory"
+action = "kill"
+confirm_matches = 1
+
+[[check.patterns]]
+name = "nan-loss"
+regex = "loss: NaN"
+action = "wake"
+confirm_matches = 3
+
+[check.stall]
+action = "wake"
+kill_after_minutes = 0
+```
+
+The supervisor performs termination as follows:
+
+1. Open or update the incident and confirm that the policy action is `kill`.
+2. In a short SQLite transaction, create one `termination_request` for the
+   incident and task signature.
+3. Re-read authoritative Pueue status and confirm that the same task
+   signature is still `Running` in the registered project group.
+4. Invoke `pueue kill <task-id>` outside the transaction.
+5. Reconcile Pueue until the task reaches a terminal state, recording whether
+   termination was confirmed, timed out, or failed.
+6. If termination is confirmed, create an `auto_killed` event containing the
+   reason, matched pattern, bounded log evidence, and termination result.
+7. Schedule one agent run for the project. The agent may analyze, repair, and
+   submit a replacement experiment through `pueue-agent submit`.
+
+If termination times out or fails while the task remains `Running`, the
+supervisor records a visible `termination_failed` event and does not start a
+second agent for that incident. A separate explicit retry policy or human
+intervention is required.
+
+The task signature is revalidated immediately before the kill so a stale
+callback or reused numeric task ID cannot terminate a different task. Only
+the registered project group is eligible. The supervisor never sends raw OS
+signals as part of this policy; Pueue remains the task-control boundary.
+
+Termination has its own per-project rate limit and guardrail. `pause` disables
+new automatic termination requests while preserving the incident. A failed or
+timed-out termination remains visible and is retried only according to an
+explicit retry policy.
+
+Stalled tasks may use `kill_after_minutes`, but the default is zero. A stalled
+task must remain unchanged for the configured period and pass the same
+pre-kill revalidation before termination is attempted. This prevents a single
+slow logging interval from killing a healthy experiment.
+
+## 10. Agent execution
 
 The agent command is represented as an executable plus argument vector, not a
 shell command string. `{prompt}` is replaced inside one argument before
@@ -299,7 +390,7 @@ The supervisor treats a zero exit code as successful agent execution, not as
 proof that a new experiment was submitted. Task submission is separately
 observed and counted.
 
-## 10. Guardrails and token control
+## 11. Guardrails and token control
 
 Guardrails are stored per project and enforced before an agent is claimed.
 
@@ -319,7 +410,7 @@ Normal health checks never invoke an agent. Deep checks are time- or count-
 scheduled and are suppressed when an urgent event is pending or an agent is
 already active.
 
-## 11. Configuration and user experience
+## 12. Configuration and user experience
 
 Project configuration moves to a real structured format, preferably TOML for
 the initial Rust implementation. The project still contains:
@@ -349,7 +440,7 @@ open incidents, active agent runs, and guardrail counters.
 The supervisor is normally silent. Human-visible output is reserved for
 agent starts, incidents, guardrail halts, and recovery failures.
 
-## 12. Service and environment integration
+## 13. Service and environment integration
 
 The supervisor must run as a user service, not depend on the interactive shell
 environment. The service configuration must explicitly provide the Pueue
@@ -360,7 +451,7 @@ environment.
 Callback installation and project registration must be recoverable and must
 not report a fully enabled state after a partial failure.
 
-## 13. Failure handling
+## 14. Failure handling
 
 - A missed callback is recovered by reconciliation.
 - A malformed or unavailable Pueue response is logged as an integration error,
@@ -372,7 +463,7 @@ not report a fully enabled state after a partial failure.
 - Agent timeout and non-zero exit use retry backoff; repeated failure halts the
   project and preserves the event context.
 
-## 14. Security and trust boundary
+## 15. Security and trust boundary
 
 The tool is intended for trusted repositories, but the boundary must be
 explicit. Agent processes can read repository files and may edit code or
@@ -382,7 +473,7 @@ The default process launcher must avoid shell interpretation. Any shell wrapper
 must be explicitly configured. Logs and `STATE.md` are agent inputs and should
 be treated as potentially untrusted text; they are not enforcement mechanisms.
 
-## 15. Migration plan
+## 16. Migration plan
 
 1. Add the Rust workspace, CLI skeleton, SQLite migrations, and project
    registration.
@@ -395,7 +486,7 @@ be treated as potentially untrusted text; they are not enforcement mechanisms.
    cron scheduling.
 7. Keep `STATE.md`, `instructions.md`, and the visible CLI workflow stable.
 
-## 16. Verification strategy
+## 17. Verification strategy
 
 ### Unit tests
 
@@ -414,6 +505,11 @@ be treated as potentially untrusted text; they are not enforcement mechanisms.
 - Pueue daemon restart and missed callback.
 - Supervisor restart during an active agent run.
 - Repeated `NaN` and stalled observations.
+- Policy-controlled kill of a still-Running task, including pre-kill task
+  revalidation and post-kill reconciliation.
+- Repeated kill requests for one incident result in one Pueue kill attempt.
+- A failed or timed-out kill remains visible and does not silently wake a
+  second agent.
 - Agent timeout, retry, and halt.
 - Successful `submit` followed by a supervisor crash before task metadata is
   persisted.
@@ -424,6 +520,8 @@ be treated as potentially untrusted text; they are not enforcement mechanisms.
 - The same Pueue completion produces at most one agent run.
 - Repeated identical anomaly observations produce at most one incident and do
   not repeatedly consume tokens.
+- An explicit `kill` policy terminates only the matching project task and
+  produces one `auto_killed` event for agent analysis.
 - Restarting the supervisor does not lose pending events.
 - Normal monitoring produces zero agent invocations.
 - `pueue-agent submit -- <command...>` submits through the project group and
