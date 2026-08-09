@@ -1,42 +1,31 @@
-# Instructions for the experiment agent
+# 実験 agent への指示
 
-You manage experiments supervised by `pueue-agent`. The launch prompt contains a
-bounded event summary and references to durable project context.
+あなたは `pueue-agent` によって監視される実験を管理します。起動 prompt には、範囲を制限した event の要約と、永続的なプロジェクトコンテキストへの参照が含まれます。
 
-## Required workflow
+## 必須の手順
 
-1. Read `.pueue-agent/instructions.md`, then `.pueue-agent/STATE.md`.
-2. Inspect only the tasks, logs, metrics, and artifacts associated with this project.
-3. Record the diagnosis, experiment result, artifact paths, and next plan in
-   `.pueue-agent/STATE.md` before exiting.
-4. If the repository uses Git, commit intentional source changes with a message that
-   explains what changed and why.
-5. Submit every supervised experiment with:
+1. `.pueue-agent/instructions.md`、次に `.pueue-agent/STATE.md` を読む。
+2. このプロジェクトに関係する task、log、metric、artifact だけを調査する。
+3. 終了する前に、診断、実験結果、artifact のパス、次の計画を `.pueue-agent/STATE.md` に記録する。
+4. Git を使っている場合は、意図した source change を「何を、なぜ変更したか」が分かる commit message で commit する。
+5. 監視対象の実験は必ず次の形式で投入する。
 
    ```bash
    pueue-agent submit -- <command...>
    ```
 
-   Do not call raw `pueue add`; it bypasses SQLite submission accounting.
+   raw の `pueue add` は実行しない。SQLite の submission accounting を迂回するためです。
 
-## Dispatch modes
+## Dispatch mode
 
-- `crash`, `failure`, or `stalled`: inspect the bounded evidence and relevant logs,
-  determine the cause, make the smallest justified correction, update `STATE.md`, and
-  submit a replacement experiment only when the configured constraints allow it.
-- `deep_check`: inspect metrics and artifacts for meaningful progress. If healthy,
-  append a concise health record to `STATE.md`. If unhealthy, handle it like a crash.
-- `completion`: summarize the result and decide whether the next experiment is
-  justified. Stop when the goal is reached or evidence indicates no useful next step.
+- `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、設定された制約が許す場合だけ replacement experiment を投入する。
+- `deep_check`: metric と artifact を調べ、実験が意味のある進行をしているか判断する。正常なら短い health record を `STATE.md` に追記する。異常なら crash と同じ手順で対応する。
+- `completion`: 結果を要約し、次の実験に根拠があるか判断する。目的を達成した、または有効な次の手がかりがない場合は停止する。
 
-## Context and safety
+## Context と安全性
 
-- The supervisor may start a fresh Codex session or explicitly resume an existing one,
-  according to `.pueue-agent/config.toml`. Do not change the context mode or session ID.
-- `STATE.md` is the durable context shared across fresh and resumed agent runs. Do not
-  assume a conversation transcript exists in SQLite.
-- A detector with explicit `action = "kill"` may already have asked Pueue to stop the
-  failed task. Check current Pueue state before proposing or submitting a replacement.
-- Do not change Pueue groups, interfere with another group, bypass `pueue-agent submit`,
-  or modify `.pueue-agent/config.toml`.
-- Do not exceed the goals, constraints, or guardrails recorded in `STATE.md`.
+- supervisor は `.pueue-agent/config.toml` に従って fresh Codex session を起動するか、明示的に既存 session を resume します。context mode や session ID を勝手に変更しない。
+- `STATE.md` は fresh run と resumed run の両方で使う永続コンテキストです。会話 transcript が SQLite に保存されているとは仮定しない。
+- detector の `action = "kill"` が設定されている場合、supervisor が失敗した task の終了を Pueue に依頼している可能性があります。replacement を提案・投入する前に、現在の Pueue state を確認する。
+- Pueue group を変更したり、別 group に干渉したり、`pueue-agent submit` を迂回したり、`.pueue-agent/config.toml` を変更したりしない。
+- `STATE.md` に記録された目的、制約、guardrail を超えない。

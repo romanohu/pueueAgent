@@ -1,4 +1,4 @@
-# pueue-agent project configuration
+# pueue-agent プロジェクト設定
 
 project_id = "{{PROJECT_ID}}"
 pueue_group = "{{PUEUE_GROUP}}"
@@ -9,10 +9,11 @@ args = ["exec", "{prompt}"]
 timeout_minutes = 60
 max_retries = 2
 
-# Conversation continuation is opt-in. The default starts a fresh Codex session.
+# 会話コンテキストの継続は opt in。既定値は fresh context。
 [agent.context]
 mode = "fresh" # fresh | resume | resume_latest
-# session_id = "019..." # required only when mode = "resume"
+# mode = "resume" の場合だけ、次の session_id が必要。
+# session_id = "019..."
 
 [check]
 interval_minutes = 10
@@ -40,6 +41,7 @@ regex = "CUDA (error|out of memory)"
 action = "wake"
 confirm_matches = 1
 
+# 出力停止時の既定 action は notify。自動終了する場合は kill と待ち時間を明示する。
 [check.stall]
 action = "notify"
 kill_after_minutes = 0
