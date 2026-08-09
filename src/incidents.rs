@@ -4,6 +4,7 @@ use crate::{
     db::{database_error, Db, IncidentRepository},
     detect::{Observation, ObservationState, TASK_TERMINAL_RECOVERY_KIND},
     models::{IncidentTransition, NewIncident},
+    termination::{TerminationManager, TerminationPolicy},
     AppError,
 };
 
@@ -26,6 +27,17 @@ impl<'db> IncidentStore<'db> {
                     observation.fingerprint(),
                     observation.seen_at(),
                 ))?;
+                if TerminationPolicy.should_kill(&observation) {
+                    if let Some(task_signature) = observation.task_signature() {
+                        TerminationManager::new_without_pueue(self.db).request_with_reason(
+                            update.incident.incident_id,
+                            task_signature,
+                            termination_reason(&observation),
+                            observation.seen_at(),
+                            None,
+                        )?;
+                    }
+                }
                 Ok(update.transition)
             }
             ObservationState::Recovered if observation.kind() == TASK_TERMINAL_RECOVERY_KIND => {
@@ -100,4 +112,18 @@ impl<'db> IncidentStore<'db> {
             Ok(IncidentTransition::Unchanged)
         }
     }
+}
+
+fn termination_reason(observation: &Observation) -> String {
+    let evidence = observation.evidence();
+    let bounded_evidence = evidence.chars().take(1024).collect::<String>();
+    serde_json::json!({
+        "kind": observation.kind(),
+        "pattern_name": observation.pattern_name(),
+        "action": observation.action().as_str(),
+        "confirmation_count": observation.confirmation_count(),
+        "evidence": bounded_evidence,
+        "source_path": observation.source_path().map(|path| path.display().to_string()),
+    })
+    .to_string()
 }

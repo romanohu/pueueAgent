@@ -51,6 +51,10 @@ pub struct PueueTask {
 }
 
 impl PueueTask {
+    pub fn is_running(&self) -> bool {
+        self.state.eq_ignore_ascii_case("running")
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.state.to_ascii_lowercase().as_str(),

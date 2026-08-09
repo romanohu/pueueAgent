@@ -80,6 +80,14 @@ pub fn load(path: &Path) -> Result<ProjectConfig, AppError> {
 }
 
 impl PatternAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Notify => "notify",
+            Self::Wake => "wake",
+            Self::Kill => "kill",
+        }
+    }
+
     fn parse(value: &str, field: &'static str) -> Result<Self, AppError> {
         match value {
             "notify" => Ok(Self::Notify),

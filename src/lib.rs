@@ -12,5 +12,6 @@ pub mod project;
 pub mod pueue;
 pub mod reconcile;
 pub mod submit;
+pub mod termination;
 
 pub use error::AppError;

@@ -9,6 +9,7 @@ use crate::{
     incidents::IncidentStore,
     models::{EventKind, NewEvent, NewTaskObservation, Submission, SubmissionStatus},
     pueue::{PueueApi, PueueTask},
+    termination::{auto_kill_request_for_terminal_task, confirm_auto_kill_terminal_observation},
     AppError,
 };
 
@@ -87,7 +88,13 @@ where
             report.observed_task_count += 1;
 
             if task.is_terminal() {
-                let event_kind = terminal_event_kind(task);
+                let auto_kill_request =
+                    auto_kill_request_for_terminal_task(self.db, &project.project_id, task)?;
+                let event_kind = if auto_kill_request.is_some() {
+                    EventKind::AutoKilled
+                } else {
+                    terminal_event_kind(task)
+                };
                 let event = materialize_terminal_event(
                     self.db,
                     project.project_id.as_str(),
@@ -99,7 +106,13 @@ where
                 match event_kind {
                     EventKind::TaskFinished => report.task_finished_events += 1,
                     EventKind::TaskFailed => report.task_failed_events += 1,
-                    _ => unreachable!("terminal event kind is limited to task completion/failure"),
+                    EventKind::AutoKilled => {}
+                    _ => unreachable!(
+                        "terminal event kind is limited to task completion/failure/auto-kill"
+                    ),
+                }
+                if let Some(request) = auto_kill_request {
+                    confirm_auto_kill_terminal_observation(self.db, request.request_id, now)?;
                 }
                 let _ = event;
                 let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(

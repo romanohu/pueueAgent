@@ -110,6 +110,20 @@ impl<'db> ProjectRepository<'db> {
             .map_err(database_error("find project by Pueue group"))
     }
 
+    pub fn find_by_id(&self, project_id: &str) -> Result<Option<Project>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects WHERE project_id = ?1",
+                [project_id],
+                project_from_row,
+            )
+            .optional()
+            .map_err(database_error("find project by ID"))
+    }
+
     pub fn list_enabled(&self) -> Result<Vec<Project>, AppError> {
         let connection = self.db.connect()?;
         let mut statement = connection
@@ -634,6 +648,18 @@ impl<'db> IncidentRepository<'db> {
             .map_err(database_error("commit incident resolution"))?;
         Ok(IncidentTransition::Resolved)
     }
+
+    pub fn find_by_id(&self, incident_id: i64) -> Result<Option<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{} WHERE incident_id = ?1", INCIDENT_SELECT),
+                [incident_id],
+                incident_from_row,
+            )
+            .optional()
+            .map_err(database_error("find incident by ID"))
+    }
 }
 
 pub struct SubmissionRepository<'db> {
@@ -1023,6 +1049,21 @@ impl<'db> TerminationRequestRepository<'db> {
             .map_err(database_error("find pending termination requests"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read pending termination requests"))
+    }
+
+    pub fn find_by_project(&self, project_id: &str) -> Result<Vec<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 ORDER BY requested_at, request_id",
+                TERMINATION_REQUEST_SELECT
+            ))
+            .map_err(database_error("prepare project termination request query"))?;
+        let rows = statement
+            .query_map([project_id], termination_request_from_row)
+            .map_err(database_error("find project termination requests"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project termination requests"))
     }
 }
 

@@ -30,6 +30,7 @@ pub struct Observation {
     fingerprint: String,
     seen_at: i64,
     state: ObservationState,
+    task_signature: Option<String>,
     pattern_name: Option<String>,
     action: PatternAction,
     confirmation_count: Option<u32>,
@@ -57,6 +58,36 @@ impl Observation {
             fingerprint: format!("pattern:v1:task={task_signature}:name={pattern_name}"),
             seen_at,
             state: ObservationState::Active,
+            task_signature: Some(task_signature),
+            pattern_name: Some(pattern_name),
+            action,
+            confirmation_count: Some(confirmation_count),
+            evidence: evidence.into(),
+            source_path: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_pattern(
+        project_id: impl Into<String>,
+        task_key: impl Into<String>,
+        task_signature: impl Into<String>,
+        pattern_name: impl Into<String>,
+        action: PatternAction,
+        confirmation_count: u32,
+        evidence: impl Into<String>,
+        seen_at: i64,
+    ) -> Self {
+        let task_key = task_key.into();
+        let pattern_name = pattern_name.into();
+        Self {
+            project_id: project_id.into(),
+            kind: "pattern".to_owned(),
+            task_key: Some(task_key.clone()),
+            fingerprint: format!("pattern:v1:task={task_key}:name={pattern_name}"),
+            seen_at,
+            state: ObservationState::Active,
+            task_signature: Some(task_signature.into()),
             pattern_name: Some(pattern_name),
             action,
             confirmation_count: Some(confirmation_count),
@@ -85,6 +116,7 @@ impl Observation {
             fingerprint,
             seen_at,
             state: ObservationState::Active,
+            task_signature: None,
             pattern_name: Some(pattern_name),
             action,
             confirmation_count: Some(confirmation_count),
@@ -111,6 +143,7 @@ impl Observation {
             fingerprint,
             seen_at,
             state: ObservationState::Recovered,
+            task_signature: None,
             pattern_name: Some(pattern_name),
             action: PatternAction::Notify,
             confirmation_count: None,
@@ -137,6 +170,7 @@ impl Observation {
             ),
             seen_at,
             state: ObservationState::Active,
+            task_signature: Some(task_signature),
             pattern_name: None,
             action,
             confirmation_count: None,
@@ -155,10 +189,11 @@ impl Observation {
         Self {
             project_id: project_id.into(),
             kind: "stalled".to_owned(),
-            task_key: Some(task_signature),
+            task_key: Some(task_signature.clone()),
             fingerprint: format!("stalled-recovered:v1:snapshot={}", snapshot.fingerprint),
             seen_at,
             state: ObservationState::Recovered,
+            task_signature: Some(task_signature),
             pattern_name: None,
             action: PatternAction::Notify,
             confirmation_count: None,
@@ -179,6 +214,7 @@ impl Observation {
             fingerprint: "task-terminal:v1".to_owned(),
             seen_at,
             state: ObservationState::Recovered,
+            task_signature: Some(task_signature.as_ref().to_owned()),
             pattern_name: None,
             action: PatternAction::Notify,
             confirmation_count: None,
@@ -197,6 +233,10 @@ impl Observation {
 
     pub fn task_key(&self) -> Option<&str> {
         self.task_key.as_deref()
+    }
+
+    pub fn task_signature(&self) -> Option<&str> {
+        self.task_signature.as_deref()
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -281,12 +321,13 @@ impl Detector {
         let mut observations = Vec::new();
         let project_id = self.project_id.as_deref().unwrap_or(task.group.as_str());
         let task_key = task_incident_key(task);
+        let signature = crate::reconcile::task_signature(task);
         let seen_at = unix_timestamp()?;
         if let Some(snapshot) = self.read_task_snapshot(task.id, config.log_tail_bytes)? {
-            observations.extend(pattern_observations(
+            observations.extend(task_pattern_observations(
                 project_id,
-                Some(task_key.as_str()),
-                None,
+                task_key.as_str(),
+                signature.as_str(),
                 &snapshot,
                 config,
                 seen_at,
@@ -349,6 +390,37 @@ impl Detector {
         }
         Ok(path)
     }
+}
+
+fn task_pattern_observations(
+    project_id: &str,
+    task_key: &str,
+    task_signature: &str,
+    snapshot: &LogSnapshot,
+    config: &CheckConfig,
+    seen_at: i64,
+) -> Result<Vec<Observation>, AppError> {
+    let mut observations = Vec::new();
+    let tail = snapshot.evidence.as_str();
+    for pattern in &config.patterns {
+        let regex = Regex::new(&pattern.regex).map_err(|_| AppError::Configuration {
+            field: "check.patterns.regex",
+        })?;
+        let count = regex.find_iter(tail.as_bytes()).count();
+        if count >= usize::try_from(pattern.confirm_matches).unwrap_or(usize::MAX) {
+            observations.push(Observation::task_pattern(
+                project_id,
+                task_key,
+                task_signature,
+                &pattern.name,
+                pattern.action,
+                pattern.confirm_matches,
+                snapshot.evidence.clone(),
+                seen_at,
+            ));
+        }
+    }
+    Ok(observations)
 }
 
 fn pattern_observations(
