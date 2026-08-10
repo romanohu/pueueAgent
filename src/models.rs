@@ -137,6 +137,22 @@ database_enum!(SubmissionKind {
     Control => "control",
 });
 
+database_enum!(BatchStatus {
+    Pending => "pending",
+    Dispatching => "dispatching",
+    Accepted => "accepted",
+    Partial => "partial",
+    Failed => "failed",
+    Completed => "completed",
+});
+
+database_enum!(BatchJobStatus {
+    Pending => "pending",
+    Dispatching => "dispatching",
+    Accepted => "accepted",
+    Failed => "failed",
+});
+
 database_enum!(AgentRunStatus {
     Starting => "starting",
     Running => "running",
@@ -435,6 +451,87 @@ impl NewSubmission {
             kind,
             metadata,
             origin_agent_run_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchJob {
+    pub request_id: String,
+    pub job_id: String,
+    pub ordinal: i64,
+    pub kind: SubmissionKind,
+    pub argv: Vec<String>,
+    pub metadata: Value,
+    pub status: BatchJobStatus,
+    pub pueue_task_id: Option<i64>,
+    pub submission_id: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBatchJob {
+    pub job_id: String,
+    pub ordinal: i64,
+    pub kind: SubmissionKind,
+    pub argv: Vec<String>,
+    pub metadata: Value,
+}
+
+impl NewBatchJob {
+    pub fn new(
+        job_id: impl Into<String>,
+        ordinal: i64,
+        kind: SubmissionKind,
+        argv: Vec<String>,
+        metadata: Value,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            ordinal,
+            kind,
+            argv,
+            metadata,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchRequest {
+    pub request_id: String,
+    pub project_id: String,
+    pub manifest_hash: String,
+    pub status: BatchStatus,
+    pub lease_until: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_error: Option<String>,
+    pub jobs: Vec<BatchJob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBatchRequest {
+    pub request_id: String,
+    pub project_id: String,
+    pub manifest_hash: String,
+    pub jobs: Vec<NewBatchJob>,
+    pub created_at: i64,
+}
+
+impl NewBatchRequest {
+    pub fn new(
+        request_id: impl Into<String>,
+        project_id: impl Into<String>,
+        manifest_hash: impl Into<String>,
+        jobs: Vec<NewBatchJob>,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            project_id: project_id.into(),
+            manifest_hash: manifest_hash.into(),
+            jobs,
+            created_at,
         }
     }
 }

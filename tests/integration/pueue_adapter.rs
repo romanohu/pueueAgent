@@ -5,10 +5,11 @@ use std::{ffi::OsString, fs, path::PathBuf};
 
 use fake_pueue::{FakePueue, FakePueueCommand};
 use pueue_agent::{
-    db::{Db, EventRepository, ProjectRepository, SubmissionRepository},
+    batches::BatchJobResult,
+    db::{BatchRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
     models::{
-        AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject, Submission, SubmissionKind,
-        SubmissionStatus,
+        AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
+        Submission, SubmissionKind, SubmissionStatus,
     },
     pueue::{CommandPueue, PueueApi, PueueError, PueueTask},
     submit, AppError,
@@ -797,4 +798,53 @@ async fn submit_provisional_signature_uses_submission_intent_to_avoid_task_id_co
         second.task_signature.as_deref(),
         Some(expected_provisional_signature("pa-project", 73, &second.submission_id).as_str())
     );
+}
+
+#[tokio::test]
+async fn batch_external_add_result_is_recorded_after_durable_intent() {
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let repository = BatchRepository::new(&harness.db);
+    repository
+        .create_or_get(&NewBatchRequest::new(
+            "batch-external-result",
+            "project-a",
+            "sha256:external-result",
+            vec![NewBatchJob::new(
+                "job-a",
+                0,
+                SubmissionKind::Experiment,
+                vec!["python".to_owned(), "train.py".to_owned()],
+                serde_json::json!({"name": "external-result"}),
+            )],
+            100,
+        ))
+        .unwrap();
+    repository
+        .claim("project-a", "batch-external-result", 100, 110)
+        .unwrap();
+
+    let pueue_task_id = fake
+        .add(&[OsString::from("--"), OsString::from("python")])
+        .await
+        .unwrap();
+    let completed = repository
+        .record_job_result(
+            "project-a",
+            "batch-external-result",
+            "job-a",
+            BatchJobResult::Accepted {
+                pueue_task_id,
+                submission_id: "submission-external-result".to_owned(),
+            },
+            101,
+        )
+        .unwrap();
+
+    assert_eq!(completed.jobs[0].pueue_task_id, Some(73));
+    assert_eq!(
+        completed.jobs[0].submission_id.as_deref(),
+        Some("submission-external-result")
+    );
+    assert_eq!(completed.jobs[0].status.to_string(), "accepted");
 }

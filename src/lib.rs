@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod batches;
 pub mod cli;
 pub mod codex_session;
 pub mod config;

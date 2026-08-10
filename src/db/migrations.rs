@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 9;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -377,6 +377,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if (1..=6).contains(&version) {
         migrate_events_to_v8(&transaction)?;
     }
+    if version <= 8 {
+        migrate_batches_to_v9(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -397,6 +400,62 @@ fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), A
         PRAGMA writable_schema = OFF;
         PRAGMA user_version = 8;
     "#).map_err(database_error("apply SQLite v8 event migration"))
+}
+
+fn migrate_batches_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    transaction
+        .execute_batch(
+            r#"
+        CREATE TABLE IF NOT EXISTS batch_requests (
+            request_id TEXT PRIMARY KEY
+                CHECK (length(request_id) BETWEEN 1 AND 128),
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            manifest_hash TEXT NOT NULL
+                CHECK (length(manifest_hash) BETWEEN 1 AND 128),
+            status TEXT NOT NULL CHECK (status IN (
+                'pending', 'dispatching', 'accepted', 'partial', 'failed', 'completed'
+            )),
+            lease_until INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 2048),
+            CHECK (
+                (status = 'dispatching' AND lease_until IS NOT NULL)
+                OR status = 'accepted'
+                OR (status <> 'dispatching' AND lease_until IS NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS batch_jobs (
+            request_id TEXT NOT NULL REFERENCES batch_requests(request_id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL CHECK (length(job_id) BETWEEN 1 AND 128),
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            kind TEXT NOT NULL CHECK (kind IN ('experiment', 'control')),
+            argv_json TEXT NOT NULL CHECK (length(argv_json) <= 65536),
+            metadata_json TEXT NOT NULL CHECK (length(metadata_json) <= 16384),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'dispatching', 'accepted', 'failed')),
+            pueue_task_id INTEGER CHECK (pueue_task_id IS NULL OR pueue_task_id >= 0),
+            submission_id TEXT CHECK (submission_id IS NULL OR length(submission_id) BETWEEN 1 AND 128),
+            last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 2048),
+            PRIMARY KEY (request_id, job_id),
+            UNIQUE (request_id, ordinal),
+            CHECK (
+                (status = 'accepted' AND pueue_task_id IS NOT NULL AND submission_id IS NOT NULL)
+                OR (status <> 'accepted' AND pueue_task_id IS NULL AND submission_id IS NULL)
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS batch_requests_project_status_idx
+            ON batch_requests(project_id, status, updated_at, request_id);
+        CREATE INDEX IF NOT EXISTS batch_requests_lease_idx
+            ON batch_requests(status, lease_until, project_id, request_id);
+        CREATE INDEX IF NOT EXISTS batch_jobs_request_status_idx
+            ON batch_jobs(request_id, status, ordinal, job_id);
+
+        PRAGMA user_version = 9;
+        "#,
+        )
+        .map_err(database_error("apply SQLite v9 batch migration"))
 }
 
 fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

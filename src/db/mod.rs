@@ -8,7 +8,7 @@ use rusqlite::{Connection, OpenFlags};
 use crate::AppError;
 
 pub use repositories::{
-    AgentRunRecovery, AgentRunRepository, EventRepository, IncidentRepository,
+    AgentRunRecovery, AgentRunRepository, BatchRepository, EventRepository, IncidentRepository,
     IntegrationEventRepository, InterventionRepository, ProjectRepository, RunLineage,
     RunLineageCursor, RunLineageRepository, SubmissionLineage, SubmissionPageCursor,
     SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,

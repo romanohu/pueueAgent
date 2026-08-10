@@ -7,6 +7,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
+    batches::{
+        derive_request_status, validate_accepted_result, validate_error, validate_new_batch,
+        BatchJobResult, MAX_BATCH_ARGV_JSON_BYTES, MAX_BATCH_METADATA_JSON_BYTES,
+    },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     interventions::{
         validate_message, Intervention, InterventionCounts, InterventionReservation,
@@ -14,8 +18,9 @@ use crate::{
     },
     models::{
         launch_gate_marker_path, path_text, AgentContextMode, AgentRun, AgentRunEvent,
-        AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentTransition,
-        IncidentUpdate, IntegrationEvent, InterventionStatus, NewAgentRun, NewEvent, NewIncident,
+        AgentRunStatus, BatchJob, BatchJobStatus, BatchRequest, BatchStatus, Event, EventKind,
+        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent,
+        InterventionStatus, NewAgentRun, NewBatchRequest, NewEvent, NewIncident,
         NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
         Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
         TerminationRequestStatus,
@@ -1137,6 +1142,424 @@ impl<'db> IncidentRepository<'db> {
 
 pub struct SubmissionRepository<'db> {
     db: &'db Db,
+}
+
+pub struct BatchRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> BatchRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn create_or_get(&self, request: &NewBatchRequest) -> Result<BatchRequest, AppError> {
+        validate_new_batch(request)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin batch create or get"))?;
+        let existing = transaction
+            .query_row(
+                "SELECT project_id, manifest_hash
+                 FROM batch_requests WHERE request_id = ?1",
+                [&request.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(database_error("find existing batch request"))?;
+
+        if let Some((project_id, manifest_hash)) = existing {
+            if project_id != request.project_id {
+                return Err(AppError::Validation {
+                    field: "project_id",
+                    message: "request_id belongs to another project",
+                });
+            }
+            if manifest_hash != request.manifest_hash {
+                return Err(AppError::Validation {
+                    field: "manifest_hash",
+                    message: "request_id already has a different manifest",
+                });
+            }
+            let stored = read_batch(&transaction, &request.project_id, &request.request_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "read existing batch request",
+                })?;
+            transaction
+                .commit()
+                .map_err(database_error("commit existing batch request"))?;
+            return Ok(stored);
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO batch_requests (
+                    request_id, project_id, manifest_hash, status,
+                    lease_until, created_at, updated_at, last_error
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?4, NULL)",
+                params![
+                    request.request_id,
+                    request.project_id,
+                    request.manifest_hash,
+                    request.created_at,
+                ],
+            )
+            .map_err(database_error("insert batch request intent"))?;
+
+        for job in &request.jobs {
+            let argv_json =
+                serde_json::to_string(&job.argv).map_err(|source| AppError::Serialization {
+                    operation: "serialize batch job arguments",
+                    source,
+                })?;
+            let metadata_json =
+                serde_json::to_string(&job.metadata).map_err(|source| AppError::Serialization {
+                    operation: "serialize batch job metadata",
+                    source,
+                })?;
+            debug_assert!(argv_json.len() <= MAX_BATCH_ARGV_JSON_BYTES);
+            debug_assert!(metadata_json.len() <= MAX_BATCH_METADATA_JSON_BYTES);
+            transaction
+                .execute(
+                    "INSERT INTO batch_jobs (
+                        request_id, job_id, ordinal, kind, argv_json, metadata_json,
+                        status, pueue_task_id, submission_id, last_error
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, NULL)",
+                    params![
+                        request.request_id,
+                        job.job_id,
+                        job.ordinal,
+                        job.kind,
+                        argv_json,
+                        metadata_json,
+                    ],
+                )
+                .map_err(database_error("insert batch job intent"))?;
+        }
+
+        let stored = read_batch(&transaction, &request.project_id, &request.request_id)?.ok_or(
+            AppError::Runtime {
+                operation: "read created batch request",
+            },
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit batch request intent"))?;
+        Ok(stored)
+    }
+
+    pub fn find(
+        &self,
+        project_id: &str,
+        request_id: &str,
+    ) -> Result<Option<BatchRequest>, AppError> {
+        let connection = self.db.connect()?;
+        read_batch(&connection, project_id, request_id)
+    }
+
+    pub fn claim(
+        &self,
+        project_id: &str,
+        request_id: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<Option<BatchRequest>, AppError> {
+        if lease_until <= now {
+            return Err(AppError::Validation {
+                field: "lease_until",
+                message: "must be later than now",
+            });
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin batch claim"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE batch_requests
+                 SET status = 'dispatching', lease_until = ?1, updated_at = ?2
+                 WHERE request_id = ?3 AND project_id = ?4
+                   AND lease_until IS NULL
+                   AND status IN ('pending', 'accepted')
+                   AND EXISTS(
+                       SELECT 1 FROM batch_jobs
+                       WHERE batch_jobs.request_id = batch_requests.request_id
+                         AND batch_jobs.status = 'pending'
+                   )",
+                params![lease_until, now, request_id, project_id],
+            )
+            .map_err(database_error("claim batch request"))?;
+        if changed == 0 {
+            transaction
+                .commit()
+                .map_err(database_error("commit empty batch claim"))?;
+            return Ok(None);
+        }
+        transaction
+            .execute(
+                "UPDATE batch_jobs SET status = 'dispatching'
+                 WHERE request_id = ?1 AND status = 'pending'",
+                [request_id],
+            )
+            .map_err(database_error("claim batch jobs"))?;
+        let claimed =
+            read_batch(&transaction, project_id, request_id)?.ok_or(AppError::Runtime {
+                operation: "read claimed batch request",
+            })?;
+        transaction
+            .commit()
+            .map_err(database_error("commit batch claim"))?;
+        Ok(Some(claimed))
+    }
+
+    pub fn record_job_result(
+        &self,
+        project_id: &str,
+        request_id: &str,
+        job_id: &str,
+        result: BatchJobResult,
+        now: i64,
+    ) -> Result<BatchRequest, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin batch job result"))?;
+        let parent = transaction
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND request_id = ?2",
+                    BATCH_REQUEST_SELECT
+                ),
+                params![project_id, request_id],
+                batch_request_from_row,
+            )
+            .optional()
+            .map_err(database_error("find batch for job result"))?
+            .ok_or(AppError::Validation {
+                field: "project_id",
+                message: "batch request is not owned by this project",
+            })?;
+        let active_lease = matches!(
+            parent.status,
+            BatchStatus::Dispatching | BatchStatus::Accepted
+        ) && parent.lease_until.map_or(false, |lease| lease > now);
+
+        let current = transaction
+            .query_row(
+                "SELECT status, pueue_task_id, submission_id
+                 FROM batch_jobs WHERE request_id = ?1 AND job_id = ?2",
+                params![request_id, job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, BatchJobStatus>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("find batch job for result"))?
+            .ok_or(AppError::Validation {
+                field: "job_id",
+                message: "job does not belong to this batch",
+            })?;
+
+        match result {
+            BatchJobResult::Accepted {
+                pueue_task_id,
+                submission_id,
+            } => {
+                validate_accepted_result(pueue_task_id, &submission_id)?;
+                if current.0 == BatchJobStatus::Accepted {
+                    if current.1 == Some(pueue_task_id)
+                        && current.2.as_deref() == Some(submission_id.as_str())
+                    {
+                        let stored = read_batch(&transaction, project_id, request_id)?.ok_or(
+                            AppError::Runtime {
+                                operation: "read idempotent batch job result",
+                            },
+                        )?;
+                        transaction
+                            .commit()
+                            .map_err(database_error("commit idempotent batch job result"))?;
+                        return Ok(stored);
+                    }
+                    return Err(AppError::Validation {
+                        field: "pueue_task_id",
+                        message: "accepted job already has a different external result",
+                    });
+                }
+                if !active_lease {
+                    return Err(AppError::Validation {
+                        field: "request_id",
+                        message: "batch is not actively leased",
+                    });
+                }
+                if current.0 != BatchJobStatus::Dispatching {
+                    return Err(AppError::Validation {
+                        field: "job_id",
+                        message: "job is not dispatching",
+                    });
+                }
+                transaction
+                    .execute(
+                        "UPDATE batch_jobs
+                         SET status = 'accepted', pueue_task_id = ?1,
+                             submission_id = ?2, last_error = NULL
+                         WHERE request_id = ?3 AND job_id = ?4",
+                        params![pueue_task_id, submission_id, request_id, job_id],
+                    )
+                    .map_err(database_error("record accepted batch job"))?;
+                let jobs = read_batch(&transaction, project_id, request_id)?
+                    .ok_or(AppError::Runtime {
+                        operation: "read batch jobs after acceptance",
+                    })?
+                    .jobs;
+                let status = derive_request_status(&jobs);
+                let lease =
+                    (status != BatchStatus::Completed).then_some(parent.lease_until.unwrap());
+                transaction
+                    .execute(
+                        "UPDATE batch_requests SET status = ?1, lease_until = ?2,
+                         updated_at = ?3, last_error = NULL
+                         WHERE request_id = ?4 AND project_id = ?5",
+                        params![status, lease, now, request_id, project_id],
+                    )
+                    .map_err(database_error("update batch status after acceptance"))?;
+            }
+            BatchJobResult::Failed { error } => {
+                validate_error(&error)?;
+                if current.0 == BatchJobStatus::Accepted {
+                    return Err(AppError::Validation {
+                        field: "job_id",
+                        message: "accepted job cannot be marked failed",
+                    });
+                }
+                if current.0 == BatchJobStatus::Failed {
+                    let stored = read_batch(&transaction, project_id, request_id)?.ok_or(
+                        AppError::Runtime {
+                            operation: "read idempotent failed batch job result",
+                        },
+                    )?;
+                    transaction
+                        .commit()
+                        .map_err(database_error("commit idempotent failed batch result"))?;
+                    return Ok(stored);
+                }
+                if !active_lease {
+                    return Err(AppError::Validation {
+                        field: "request_id",
+                        message: "batch is not actively leased",
+                    });
+                }
+                if current.0 != BatchJobStatus::Dispatching {
+                    return Err(AppError::Validation {
+                        field: "job_id",
+                        message: "job is not dispatching",
+                    });
+                }
+                transaction
+                    .execute(
+                        "UPDATE batch_jobs
+                         SET status = 'failed', last_error = ?1
+                         WHERE request_id = ?2 AND job_id = ?3",
+                        params![error, request_id, job_id],
+                    )
+                    .map_err(database_error("record failed batch job"))?;
+                transaction
+                    .execute(
+                        "UPDATE batch_jobs
+                         SET status = 'pending', pueue_task_id = NULL,
+                             submission_id = NULL, last_error = NULL
+                         WHERE request_id = ?1 AND status = 'dispatching'",
+                        [request_id],
+                    )
+                    .map_err(database_error("reset unsubmitted batch jobs"))?;
+                let jobs = read_batch(&transaction, project_id, request_id)?
+                    .ok_or(AppError::Runtime {
+                        operation: "read batch jobs after failure",
+                    })?
+                    .jobs;
+                let status = derive_request_status(&jobs);
+                transaction
+                    .execute(
+                        "UPDATE batch_requests SET status = ?1, lease_until = NULL,
+                         updated_at = ?2, last_error = ?3
+                         WHERE request_id = ?4 AND project_id = ?5",
+                        params![status, now, error, request_id, project_id],
+                    )
+                    .map_err(database_error("update batch status after failure"))?;
+            }
+        }
+
+        let stored =
+            read_batch(&transaction, project_id, request_id)?.ok_or(AppError::Runtime {
+                operation: "read updated batch request",
+            })?;
+        transaction
+            .commit()
+            .map_err(database_error("commit batch job result"))?;
+        Ok(stored)
+    }
+
+    pub fn recover_expired(
+        &self,
+        project_id: &str,
+        now: i64,
+    ) -> Result<Vec<BatchRequest>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin batch lease recovery"))?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT request_id FROM batch_requests
+                 WHERE project_id = ?1 AND lease_until IS NOT NULL AND lease_until <= ?2
+                   AND status IN ('dispatching', 'accepted')
+                 ORDER BY request_id",
+            )
+            .map_err(database_error("prepare expired batch query"))?;
+        let request_ids = statement
+            .query_map(params![project_id, now], |row| row.get::<_, String>(0))
+            .map_err(database_error("query expired batch requests"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read expired batch requests"))?;
+        drop(statement);
+
+        let mut recovered = Vec::with_capacity(request_ids.len());
+        for request_id in request_ids {
+            transaction
+                .execute(
+                    "UPDATE batch_jobs SET status = 'pending'
+                     WHERE request_id = ?1 AND status = 'dispatching'",
+                    [&request_id],
+                )
+                .map_err(database_error("recover unaccepted batch jobs"))?;
+            let jobs = read_batch(&transaction, project_id, &request_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "read recovered batch jobs",
+                })?
+                .jobs;
+            let status = derive_request_status(&jobs);
+            transaction
+                .execute(
+                    "UPDATE batch_requests SET status = ?1, lease_until = NULL,
+                     updated_at = ?2 WHERE request_id = ?3 AND project_id = ?4",
+                    params![status, now, request_id, project_id],
+                )
+                .map_err(database_error("clear expired batch lease"))?;
+            recovered.push(read_batch(&transaction, project_id, &request_id)?.ok_or(
+                AppError::Runtime {
+                    operation: "read recovered batch request",
+                },
+            )?);
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit batch lease recovery"))?;
+        Ok(recovered)
+    }
 }
 
 impl<'db> SubmissionRepository<'db> {
@@ -3545,6 +3968,14 @@ const INTERVENTION_SELECT: &str = "SELECT intervention_id, project_id, insertion
             lease_expires_at, reservation_token
      FROM interventions";
 
+const BATCH_REQUEST_SELECT: &str = "SELECT request_id, project_id, manifest_hash, status,
+            lease_until, created_at, updated_at, last_error
+     FROM batch_requests";
+
+const BATCH_JOB_SELECT: &str = "SELECT request_id, job_id, ordinal, kind, argv_json,
+            metadata_json, status, pueue_task_id, submission_id, last_error
+     FROM batch_jobs";
+
 fn bounded_diagnostic_limit(limit: usize) -> i64 {
     limit.min(MAX_EVENT_LIST_LIMIT) as i64
 }
@@ -3670,6 +4101,83 @@ fn submission_from_row(row: &Row<'_>) -> rusqlite::Result<Submission> {
         metadata,
         origin_agent_run_id: row.get(9)?,
     })
+}
+
+fn batch_request_from_row(row: &Row<'_>) -> rusqlite::Result<BatchRequest> {
+    Ok(BatchRequest {
+        request_id: row.get(0)?,
+        project_id: row.get(1)?,
+        manifest_hash: row.get(2)?,
+        status: row.get(3)?,
+        lease_until: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        last_error: row.get(7)?,
+        jobs: Vec::new(),
+    })
+}
+
+fn batch_job_from_row(row: &Row<'_>) -> rusqlite::Result<BatchJob> {
+    let argv_json: String = row.get(4)?;
+    let argv = serde_json::from_str(&argv_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(source))
+    })?;
+    let metadata_json: String = row.get(5)?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(source))
+    })?;
+    if !metadata.is_object() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            5,
+            Type::Text,
+            "batch metadata must be a JSON object".into(),
+        ));
+    }
+    Ok(BatchJob {
+        request_id: row.get(0)?,
+        job_id: row.get(1)?,
+        ordinal: row.get(2)?,
+        kind: row.get(3)?,
+        argv,
+        metadata,
+        status: row.get(6)?,
+        pueue_task_id: row.get(7)?,
+        submission_id: row.get(8)?,
+        last_error: row.get(9)?,
+    })
+}
+
+fn read_batch(
+    connection: &Connection,
+    project_id: &str,
+    request_id: &str,
+) -> Result<Option<BatchRequest>, AppError> {
+    let Some(mut batch) = connection
+        .query_row(
+            &format!(
+                "{} WHERE project_id = ?1 AND request_id = ?2",
+                BATCH_REQUEST_SELECT
+            ),
+            params![project_id, request_id],
+            batch_request_from_row,
+        )
+        .optional()
+        .map_err(database_error("read batch request"))?
+    else {
+        return Ok(None);
+    };
+    let mut statement = connection
+        .prepare(&format!(
+            "{} WHERE request_id = ?1 ORDER BY ordinal, job_id",
+            BATCH_JOB_SELECT
+        ))
+        .map_err(database_error("prepare batch job query"))?;
+    batch.jobs = statement
+        .query_map([request_id], batch_job_from_row)
+        .map_err(database_error("query batch jobs"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read batch jobs"))?;
+    Ok(Some(batch))
 }
 
 fn read_submission(connection: &Connection, submission_id: &str) -> Result<Submission, AppError> {
