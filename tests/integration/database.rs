@@ -525,6 +525,18 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
     assert!(columns.iter().any(|column| column == "kind"));
     assert!(columns.iter().any(|column| column == "metadata_json"));
     assert!(columns.iter().any(|column| column == "origin_agent_run_id"));
+    let origin_foreign_key_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('submissions')
+             WHERE \"table\" = 'agent_runs'
+               AND \"from\" = 'origin_agent_run_id'
+               AND \"to\" = 'run_id'
+               AND on_delete = 'RESTRICT'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(origin_foreign_key_count, 1);
     drop(connection);
 
     let submission = SubmissionRepository::new(&migrated)
@@ -534,6 +546,78 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
     assert_eq!(submission.kind, SubmissionKind::Experiment);
     assert_eq!(submission.metadata, json!({}));
     assert_eq!(submission.origin_agent_run_id, None);
+
+    let event_id = insert_event(&migrated, "project-a", "v7-origin", 101);
+    let run = AgentRunRepository::new(&migrated)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Running,
+            101,
+            "/tmp/agent.log",
+        ))
+        .unwrap();
+    SubmissionRepository::new(&migrated)
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "v7-origin",
+            "project-a",
+            vec!["python".to_owned()],
+            101,
+            SubmissionKind::Control,
+            json!({"stage": "bootstrap"}),
+            Some(run.run_id),
+        ))
+        .unwrap();
+    let connection = migrated.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            DROP INDEX IF EXISTS submissions_project_origin_agent_run_idx;
+            DROP INDEX IF EXISTS submissions_project_kind_status_idx;
+            DROP INDEX IF EXISTS submissions_project_status_idx;
+            ALTER TABLE submissions RENAME TO submissions_v7_without_origin_fk;
+            CREATE TABLE submissions (
+                submission_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                argv_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                pueue_task_id INTEGER,
+                task_signature TEXT,
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'experiment',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_agent_run_id INTEGER
+            );
+            INSERT INTO submissions SELECT * FROM submissions_v7_without_origin_fk;
+            DROP TABLE submissions_v7_without_origin_fk;
+            PRAGMA user_version = 7;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let rebuilt = Db::open(&test.path).unwrap();
+    let preserved = SubmissionRepository::new(&rebuilt)
+        .find_by_id("v7-origin")
+        .unwrap()
+        .unwrap();
+    assert_eq!(preserved.kind, SubmissionKind::Control);
+    assert_eq!(preserved.metadata, json!({"stage": "bootstrap"}));
+    assert_eq!(preserved.origin_agent_run_id, Some(run.run_id));
+    assert!(rebuilt
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM agent_runs WHERE run_id = ?1", [run.run_id])
+        .is_err());
+    assert_eq!(
+        SubmissionRepository::new(&rebuilt)
+            .find_by_id("v7-origin")
+            .unwrap()
+            .unwrap()
+            .origin_agent_run_id,
+        Some(run.run_id)
+    );
 }
 
 #[test]
@@ -639,7 +723,7 @@ fn submissions_are_scoped_by_project_and_origin_agent_run() {
 }
 
 #[test]
-fn submission_rejects_a_missing_origin_agent_run() {
+fn submission_rejects_a_missing_origin_agent_run_through_repository_and_sql() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
     register_project(&test.db, "project-a", &root, "pa-project");
@@ -667,6 +751,21 @@ fn submission_rejects_a_missing_origin_agent_run() {
         .find_by_id("missing-origin")
         .unwrap()
         .is_none());
+    assert!(test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO submissions (
+                submission_id, project_id, argv_json, created_at,
+                pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
+             ) VALUES (
+                'missing-origin-sql', 'project-a', '[\"python\"]', 100,
+                NULL, NULL, 'pending', 'experiment', '{}', 999
+             )",
+            [],
+        )
+        .is_err());
 }
 
 #[test]

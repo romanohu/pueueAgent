@@ -39,7 +39,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             operation: "open a database created by a newer pueue-agent",
         });
     }
-    if version == LATEST_SCHEMA_VERSION {
+    if version == LATEST_SCHEMA_VERSION && submission_origin_foreign_key_exists(connection)? {
         return Ok(());
     }
     let transaction = connection
@@ -53,13 +53,6 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             operation: "open a database created by a newer pueue-agent",
         });
     }
-    if version == LATEST_SCHEMA_VERSION {
-        transaction
-            .commit()
-            .map_err(database_error("commit SQLite migration race check"))?;
-        return Ok(());
-    }
-
     if version == 0 {
         transaction
             .execute_batch(
@@ -169,7 +162,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 status TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'experiment',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
-                origin_agent_run_id INTEGER
+                origin_agent_run_id INTEGER,
+                FOREIGN KEY (project_id, origin_agent_run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE RESTRICT
             );
 
             CREATE TABLE termination_requests (
@@ -363,6 +358,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_interventions_to_v6(&transaction)?;
     } else if version == 6 {
         migrate_submissions_to_v7(&transaction)?;
+    } else if version == 7 {
+        migrate_submissions_to_v7(&transaction)?;
     }
     if (1..=3).contains(&version) {
         ensure_agent_run_event_project_id(&transaction)?;
@@ -447,7 +444,9 @@ fn migrate_submissions_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<
                 status TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'experiment',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
-                origin_agent_run_id INTEGER
+                origin_agent_run_id INTEGER,
+                FOREIGN KEY (project_id, origin_agent_run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE RESTRICT
             );
             "#,
             )
@@ -455,36 +454,90 @@ fn migrate_submissions_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<
                 "create submission table for SQLite v7 migration",
             ))?;
     } else {
-        if !submission_column_exists(transaction, "kind")? {
-            transaction
-                .execute_batch(
-                    "ALTER TABLE submissions ADD COLUMN kind TEXT NOT NULL DEFAULT 'experiment';",
-                )
-                .map_err(database_error(
-                    "add submission kind for SQLite v7 migration",
-                ))?;
-        }
-        if !submission_column_exists(transaction, "metadata_json")? {
-            transaction
-                .execute_batch(
-                    "ALTER TABLE submissions ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';",
-                )
-                .map_err(database_error(
-                    "add submission metadata for SQLite v7 migration",
-                ))?;
-        }
-        if !submission_column_exists(transaction, "origin_agent_run_id")? {
-            transaction
-                .execute_batch("ALTER TABLE submissions ADD COLUMN origin_agent_run_id INTEGER;")
-                .map_err(database_error(
-                    "add submission origin for SQLite v7 migration",
-                ))?;
-        }
+        let kind = if submission_column_exists(transaction, "kind")? {
+            "kind"
+        } else {
+            "'experiment'"
+        };
+        let metadata = if submission_column_exists(transaction, "metadata_json")? {
+            "metadata_json"
+        } else {
+            "'{}'"
+        };
+        let origin = if submission_column_exists(transaction, "origin_agent_run_id")? {
+            "CASE WHEN EXISTS (
+                 SELECT 1 FROM agent_runs
+                 WHERE agent_runs.project_id = submissions_v7_legacy.project_id
+                   AND agent_runs.run_id = submissions_v7_legacy.origin_agent_run_id
+             ) THEN origin_agent_run_id ELSE NULL END"
+        } else {
+            "NULL"
+        };
+        transaction
+            .execute_batch(
+                r#"
+            DROP INDEX IF EXISTS submissions_project_status_idx;
+            DROP INDEX IF EXISTS submissions_project_kind_status_idx;
+            DROP INDEX IF EXISTS submissions_project_origin_agent_run_idx;
+            ALTER TABLE submissions RENAME TO submissions_v7_legacy;
+            CREATE TABLE submissions (
+                submission_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                argv_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                pueue_task_id INTEGER,
+                task_signature TEXT,
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'experiment',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_agent_run_id INTEGER,
+                FOREIGN KEY (project_id, origin_agent_run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE RESTRICT
+            );
+            "#,
+            )
+            .map_err(database_error(
+                "rebuild submission table for SQLite v7 migration",
+            ))?;
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO submissions (
+                        submission_id, project_id, argv_json, created_at,
+                        pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
+                     ) SELECT submission_id, project_id, argv_json, created_at,
+                        pueue_task_id, task_signature, status, {kind}, {metadata}, {origin}
+                     FROM submissions_v7_legacy"
+                ),
+                [],
+            )
+            .map_err(database_error("copy submissions into SQLite v7 schema"))?;
+        transaction
+            .execute_batch("DROP TABLE submissions_v7_legacy;")
+            .map_err(database_error(
+                "remove legacy submission table after SQLite v7 migration",
+            ))?;
     }
     transaction
         .execute_batch("PRAGMA user_version = 7;")
         .map_err(database_error("finish SQLite v7 migration"))?;
     ensure_submission_indexes(transaction)
+}
+
+fn submission_origin_foreign_key_exists(connection: &Connection) -> Result<bool, AppError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_foreign_key_list('submissions')
+                 WHERE \"table\" = 'agent_runs'
+                   AND \"from\" = 'origin_agent_run_id'
+                   AND \"to\" = 'run_id'
+                   AND on_delete = 'RESTRICT'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check submission origin foreign key"))
 }
 
 fn submission_column_exists(
@@ -507,6 +560,8 @@ fn ensure_submission_indexes(transaction: &rusqlite::Transaction<'_>) -> Result<
     transaction
         .execute_batch(
             r#"
+        CREATE INDEX IF NOT EXISTS submissions_project_status_idx
+            ON submissions(project_id, status, created_at);
         CREATE INDEX IF NOT EXISTS submissions_project_kind_status_idx
             ON submissions(project_id, kind, status, created_at);
         CREATE INDEX IF NOT EXISTS submissions_project_origin_agent_run_idx

@@ -25,7 +25,7 @@
 
 ## Verification
 
-- `cargo test --all-targets --test database` — 45 passed.
+- `cargo test --all-targets --test database` — 49 passed.
 - `cargo test --all-targets scheduler` — 26 scheduler tests passed.
 - `cargo test --all-targets reconciliation` — 13 reconciliation tests passed.
 - `cargo test --all-targets` — passed.
@@ -52,6 +52,17 @@
   error when either is missing.
 - RED: the new origin rejection tests initially failed because `AppError::Validation` did not
   exist. GREEN: the origin, v7 reopen/concurrent open, and doctor index focused tests pass.
-- Final verification after the review follow-up: `cargo test --all-targets` passed; `git diff
-  --check` passed. `cargo fmt --check` remains non-zero only for the unchanged Task 1 readonly
+- Final verification after the review follow-up: `cargo test --all-targets` — 259 passed; `git
+  diff --check` passed. `cargo fmt --check` remains non-zero only for the unchanged Task 1 readonly
   assertion (originally `tests/integration/database.rs:281`, shifted to line 282 by added tests).
+
+## Database foreign-key follow-up
+
+- The v7 submissions schema now enforces `FOREIGN KEY(project_id, origin_agent_run_id)` against
+  `agent_runs(project_id, run_id)`. `ON DELETE RESTRICT` is intentional: SQLite `SET NULL` on a
+  composite key would also null the non-null `project_id` column.
+- v6 and pre-constraint v7 databases rebuild `submissions` in a transaction, preserve existing
+  submission fields, retain valid origins, clear invalid legacy origins, and recreate all three
+  submission indexes. Current compliant v7 databases do not enter that migration transaction.
+- The database integration coverage verifies the composite FK, v7 rebuild preservation, direct
+  SQL rejection of invalid origins, and foreign-key/WAL-compatible reopen behavior.
