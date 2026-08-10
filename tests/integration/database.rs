@@ -1132,9 +1132,7 @@ fn mark_gate_released_rejects_a_run_without_a_release_request() {
         ))
         .unwrap();
 
-    assert!(runs
-        .mark_gate_released("project-a", run.run_id)
-        .is_err());
+    assert!(runs.mark_gate_released("project-a", run.run_id).is_err());
     let gate_state: String = test
         .db
         .connect()
