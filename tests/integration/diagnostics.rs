@@ -157,6 +157,29 @@ fn canonical_state_doctor_rejects_invalid_budget_values_and_oversized_state() {
 }
 
 #[test]
+fn canonical_state_doctor_reports_state_directory_as_error() {
+    let harness = DiagnosticsHarness::new();
+    let state_dir = harness.project().root_path.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir(state_dir.join("state.json")).unwrap();
+
+    let rendered = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let check = state_check(&value, "state.schema");
+
+    assert_eq!(check["status"], "error");
+    assert!(!check["summary"].as_str().unwrap().contains("missing"));
+}
+
+#[test]
 fn canonical_state_doctor_projects_summary_and_state_md_contradiction_as_warning() {
     let harness = DiagnosticsHarness::new();
     let state_dir = harness.project().root_path.join(".pueue-agent");

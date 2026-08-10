@@ -1041,6 +1041,27 @@ async fn canonical_state_budget_zero_prevents_experiment_dispatch() {
     assert!(project.paused);
 }
 
+#[tokio::test]
+async fn canonical_state_directory_fails_closed_without_toml_budget_fallback() {
+    let harness = SchedulerHarness::new();
+    fs::create_dir(harness.root("project-a").join(".pueue-agent/state.json")).unwrap();
+    let event_id = harness.enqueue(
+        EventKind::TaskFinished,
+        "project-a",
+        "canonical-state-directory",
+    );
+
+    let mut scheduler = harness.scheduler();
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("a state.json directory must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("canonical state"));
+    assert_eq!(harness.event_status(event_id), EventStatus::Failed);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
 #[test]
 fn codex_resume_argv_requires_project_owned_metadata_without_changing_arguments() {
     let harness = SchedulerHarness::new();

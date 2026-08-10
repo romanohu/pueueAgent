@@ -76,6 +76,16 @@ pub fn load(path: &Path) -> Result<CanonicalState, AppError> {
     Ok(state.validate()?)
 }
 
+pub fn load_if_present(path: &Path) -> Result<Option<CanonicalState>, AppError> {
+    match load(path) {
+        Ok(state) => Ok(Some(state)),
+        Err(AppError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn load_state_markdown(path: &Path) -> Result<String, AppError> {
     let bytes = read_bounded(
         path,
@@ -92,10 +102,10 @@ pub fn load_effective_guardrails(
     path: &Path,
     configured: &GuardrailsConfig,
 ) -> Result<GuardrailsConfig, AppError> {
-    if !path.is_file() {
-        return Ok(configured.clone());
+    match load_if_present(path)? {
+        Some(state) => state.effective_guardrails(configured),
+        None => Ok(configured.clone()),
     }
-    load(path)?.effective_guardrails(configured)
 }
 
 pub fn check_consistency(state: &CanonicalState, state_markdown: &str) -> Vec<StateWarning> {

@@ -484,32 +484,31 @@ pub fn build_doctor_report(
     });
 
     let canonical_state_path = state::path(&project.root_path);
-    let canonical_state = if canonical_state_path.is_file() {
-        match state::load(&canonical_state_path) {
-            Ok(canonical_state) => {
-                checks.push(doctor_ok(
-                    "state.schema",
-                    &format!("canonical state is valid ({})", canonical_state.summary()),
-                    "none",
-                ));
-                Some(canonical_state)
-            }
-            Err(error) => {
-                checks.push(doctor_error(
-                    "state.schema",
-                    &bounded_redacted_text(&error.to_string()),
-                    "repair state.json using the supported schema without rewriting STATE.md",
-                ));
-                None
-            }
+    let canonical_state = match state::load_if_present(&canonical_state_path) {
+        Ok(Some(canonical_state)) => {
+            checks.push(doctor_ok(
+                "state.schema",
+                &format!("canonical state is valid ({})", canonical_state.summary()),
+                "none",
+            ));
+            Some(canonical_state)
         }
-    } else {
-        checks.push(doctor_warning(
-            "state.schema",
-            "canonical state.json is missing",
-            "create state.json with init for a new project; existing STATE.md is not rewritten",
-        ));
-        None
+        Ok(None) => {
+            checks.push(doctor_warning(
+                "state.schema",
+                "canonical state.json is missing",
+                "create state.json with init for a new project; existing STATE.md is not rewritten",
+            ));
+            None
+        }
+        Err(error) => {
+            checks.push(doctor_error(
+                "state.schema",
+                &bounded_redacted_text(&error.to_string()),
+                "repair state.json using the supported schema without rewriting STATE.md",
+            ));
+            None
+        }
     };
     if let Some(canonical_state) = canonical_state {
         let state_markdown_path = project.root_path.join(".pueue-agent/STATE.md");
