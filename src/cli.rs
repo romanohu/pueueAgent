@@ -2,7 +2,7 @@ use std::{ffi::OsString, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::models::{EventKind, EventStatus};
+use crate::models::{EventKind, EventStatus, SubmissionKind};
 
 #[derive(Debug, Parser)]
 #[command(name = "pueue-agent", about = "SQLite-backed Pueue agent supervisor")]
@@ -117,6 +117,14 @@ pub struct DisableArgs {
 
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
+    #[arg(long, value_enum, default_value_t = SubmissionKind::Experiment)]
+    pub kind: SubmissionKind,
+    #[arg(long, value_name = "PATH", conflicts_with = "metadata_json")]
+    pub metadata: Option<PathBuf>,
+    #[arg(long, value_name = "JSON", conflicts_with = "metadata")]
+    pub metadata_json: Option<String>,
+    #[arg(long)]
+    pub json: bool,
     #[arg(
         required = true,
         trailing_var_arg = true,

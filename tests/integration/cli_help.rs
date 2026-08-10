@@ -25,6 +25,19 @@ fn help_lists_diagnostics_commands_and_status_options() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("--json"));
     assert!(text.contains("--compact"));
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["submit", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("--kind"));
+    assert!(text.contains("--metadata"));
+    assert!(text.contains("--metadata-json"));
+    assert!(text.contains("--json"));
 }
 
 #[test]

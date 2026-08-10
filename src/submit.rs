@@ -1,5 +1,7 @@
 use std::{
+    env,
     ffi::OsString,
+    fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,22 +10,80 @@ use uuid::Uuid;
 
 use crate::{
     config,
-    db::{Db, ProjectRepository, SubmissionRepository},
-    models::{NewSubmission, Submission},
+    db::{AgentRunRepository, Db, ProjectRepository, SubmissionRepository},
+    models::{NewSubmission, Submission, SubmissionKind},
+    output::bounded_redacted_text,
     paths, project,
     pueue::{CommandPueue, PueueApi},
     AppError,
 };
 
+use serde_json::Value;
+
+const MAX_METADATA_BYTES: usize = 16 * 1024;
+const MAX_METADATA_DEPTH: usize = 8;
+const MAX_METADATA_OBJECT_KEYS: usize = 32;
+const MAX_METADATA_KEY_BYTES: usize = 64;
+const MAX_METADATA_STRING_BYTES: usize = 1024;
+const MAX_METADATA_ARRAY_ITEMS: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct SubmitOptions {
+    pub kind: SubmissionKind,
+    pub metadata: Value,
+    pub origin_agent_run_id: Option<i64>,
+}
+
+impl SubmitOptions {
+    pub fn new(kind: SubmissionKind, metadata: Value, origin_agent_run_id: Option<i64>) -> Self {
+        Self {
+            kind,
+            metadata,
+            origin_agent_run_id,
+        }
+    }
+}
+
+impl Default for SubmitOptions {
+    fn default() -> Self {
+        Self::new(
+            SubmissionKind::Experiment,
+            Value::Object(Default::default()),
+            None,
+        )
+    }
+}
+
 pub async fn run(project_root: &Path, args: &[OsString]) -> Result<Submission, AppError> {
     let db = Db::open(&paths::state_db_path()?)?;
-    run_with(&db, project_root, args, &CommandPueue::default()).await
+    let root = project::find_root(project_root)?;
+    let registered = ProjectRepository::new(&db)
+        .find_by_root(&root)?
+        .ok_or(AppError::Runtime {
+            operation: "submit for an unregistered project",
+        })?;
+    let options = SubmitOptions::new(
+        SubmissionKind::Experiment,
+        Value::Object(Default::default()),
+        origin_from_environment(&registered.project_id)?,
+    );
+    run_with_options(&db, project_root, args, &options, &CommandPueue::default()).await
 }
 
 pub async fn run_with<P: PueueApi + ?Sized>(
     db: &Db,
     project_root: &Path,
     args: &[OsString],
+    pueue: &P,
+) -> Result<Submission, AppError> {
+    run_with_options(db, project_root, args, &SubmitOptions::default(), pueue).await
+}
+
+pub async fn run_with_options<P: PueueApi + ?Sized>(
+    db: &Db,
+    project_root: &Path,
+    args: &[OsString],
+    options: &SubmitOptions,
     pueue: &P,
 ) -> Result<Submission, AppError> {
     if args.is_empty() {
@@ -55,6 +115,8 @@ pub async fn run_with<P: PueueApi + ?Sized>(
             field: "pueue_group registration",
         });
     }
+    validate_metadata(&options.metadata)?;
+    validate_active_origin(db, &registered.project_id, options.origin_agent_run_id)?;
 
     let argv = args
         .iter()
@@ -69,11 +131,14 @@ pub async fn run_with<P: PueueApi + ?Sized>(
         .collect::<Result<Vec<_>, _>>()?;
     let created_at = unix_timestamp()?;
     let submission_id = Uuid::new_v4().to_string();
-    let intent = NewSubmission::new(
+    let intent = NewSubmission::with_kind_metadata(
         submission_id.clone(),
         registered.project_id,
         argv,
         created_at,
+        options.kind,
+        options.metadata.clone(),
+        options.origin_agent_run_id,
     );
     let repository = SubmissionRepository::new(db);
     repository.insert_idempotent(&intent)?;
@@ -88,6 +153,179 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     let task_signature =
         provisional_task_signature(&registered.pueue_group, task_id, &submission_id);
     repository.mark_accepted(&submission_id, task_id, &task_signature)
+}
+
+pub fn load_metadata(
+    metadata_path: Option<&Path>,
+    metadata_json: Option<&str>,
+) -> Result<Value, AppError> {
+    let input = match (metadata_path, metadata_json) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::Validation {
+                field: "submit.metadata",
+                message: "--metadata and --metadata-json cannot be used together",
+            });
+        }
+        (Some(path), None) => fs::read(path).map_err(|source| AppError::Io {
+            operation: "read submission metadata",
+            source,
+        })?,
+        (None, Some(json)) => json.as_bytes().to_vec(),
+        (None, None) => return Ok(Value::Object(Default::default())),
+    };
+    if input.len() > MAX_METADATA_BYTES {
+        return Err(metadata_validation("must not exceed 16 KiB"));
+    }
+    let parsed = serde_json::from_slice(&input).map_err(|source| AppError::Serialization {
+        operation: "parse submission metadata",
+        source,
+    })?;
+    validate_metadata(&parsed)?;
+    Ok(parsed)
+}
+
+pub fn origin_from_environment(project_id: &str) -> Result<Option<i64>, AppError> {
+    let run_id = env::var_os("PUEUE_AGENT_RUN_ID");
+    let origin_project_id = env::var_os("PUEUE_AGENT_PROJECT_ID");
+    match (run_id, origin_project_id) {
+        (None, None) => Ok(None),
+        (Some(run_id), Some(origin_project_id)) => origin_from_values(
+            Some(
+                run_id
+                    .to_str()
+                    .ok_or_else(|| metadata_validation("agent run ID must be UTF-8"))?,
+            ),
+            Some(
+                origin_project_id
+                    .to_str()
+                    .ok_or_else(|| metadata_validation("agent project ID must be UTF-8"))?,
+            ),
+            project_id,
+        ),
+        _ => Err(metadata_validation(
+            "agent origin environment is incomplete",
+        )),
+    }
+}
+
+pub fn origin_from_values(
+    run_id: Option<&str>,
+    origin_project_id: Option<&str>,
+    project_id: &str,
+) -> Result<Option<i64>, AppError> {
+    match (run_id, origin_project_id) {
+        (None, None) => Ok(None),
+        (Some(run_id), Some(origin_project_id)) => {
+            let run_id = run_id
+                .parse::<i64>()
+                .ok()
+                .filter(|run_id| *run_id > 0)
+                .ok_or_else(|| metadata_validation("agent run ID must be a positive integer"))?;
+            if origin_project_id != project_id {
+                return Err(metadata_validation(
+                    "agent project ID does not match the submission project",
+                ));
+            }
+            Ok(Some(run_id))
+        }
+        _ => Err(metadata_validation(
+            "agent origin environment is incomplete",
+        )),
+    }
+}
+
+pub fn render_submission(
+    submission: &Submission,
+    group: &str,
+    json: bool,
+) -> Result<String, AppError> {
+    let task_id = submission.pueue_task_id.ok_or(AppError::Runtime {
+        operation: "read accepted Pueue task ID",
+    })?;
+    if json {
+        Ok(serde_json::json!({
+            "submission_id": submission.submission_id,
+            "task_id": task_id,
+            "kind": submission.kind.as_str(),
+            "group": group,
+            "state": submission.status.as_str(),
+        })
+        .to_string())
+    } else {
+        Ok(format!(
+            "submission={} task={} kind={} group={} state={}",
+            bounded_redacted_text(&submission.submission_id),
+            task_id,
+            submission.kind.as_str(),
+            bounded_redacted_text(group),
+            submission.status.as_str(),
+        ))
+    }
+}
+
+fn validate_active_origin(
+    db: &Db,
+    project_id: &str,
+    origin_agent_run_id: Option<i64>,
+) -> Result<(), AppError> {
+    let Some(origin_agent_run_id) = origin_agent_run_id else {
+        return Ok(());
+    };
+    let active = AgentRunRepository::new(db).find_active_by_project(project_id)?;
+    if active.is_some_and(|run| run.run_id == origin_agent_run_id) {
+        Ok(())
+    } else {
+        Err(AppError::Validation {
+            field: "origin_agent_run_id",
+            message: "must identify the active agent run in the submission project",
+        })
+    }
+}
+
+fn validate_metadata(metadata: &Value) -> Result<(), AppError> {
+    if !metadata.is_object() {
+        return Err(metadata_validation("must be a JSON object"));
+    }
+    validate_metadata_value(metadata, 1)
+}
+
+fn validate_metadata_value(value: &Value, depth: usize) -> Result<(), AppError> {
+    if depth > MAX_METADATA_DEPTH {
+        return Err(metadata_validation("must not exceed depth 8"));
+    }
+    match value {
+        Value::Object(object) => {
+            if object.len() > MAX_METADATA_OBJECT_KEYS {
+                return Err(metadata_validation("objects must contain at most 32 keys"));
+            }
+            for (key, child) in object {
+                if key.len() > MAX_METADATA_KEY_BYTES {
+                    return Err(metadata_validation("keys must not exceed 64 bytes"));
+                }
+                validate_metadata_value(child, depth + 1)?;
+            }
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_METADATA_ARRAY_ITEMS {
+                return Err(metadata_validation("arrays must contain at most 64 items"));
+            }
+            for child in items {
+                validate_metadata_value(child, depth + 1)?;
+            }
+        }
+        Value::String(text) if text.len() > MAX_METADATA_STRING_BYTES => {
+            return Err(metadata_validation("strings must not exceed 1024 bytes"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn metadata_validation(message: &'static str) -> AppError {
+    AppError::Validation {
+        field: "submit.metadata",
+        message,
+    }
 }
 
 /// Builds the submit-time task identity placeholder.

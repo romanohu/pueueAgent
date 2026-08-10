@@ -654,6 +654,34 @@ async fn process_spawn_failure_finishes_the_inserted_agent_run() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn agent_runner_passes_run_and_project_identity_to_child_environment() {
+    let harness = SchedulerHarness::new();
+    let executable = harness.temp.path().join("capture-agent-environment.sh");
+    let capture_path = harness.temp.path().join("captured-agent-environment.txt");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s:%s' \"$PUEUE_AGENT_RUN_ID\" \"$PUEUE_AGENT_PROJECT_ID\" > {}\n",
+            capture_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    harness.configure_agent(executable.to_str().unwrap(), &[]);
+    harness.enqueue(EventKind::TaskFinished, "project-a", "child-environment");
+
+    let mut scheduler = harness.scheduler();
+    let report = scheduler.tick().await.unwrap();
+    let started = report.started.into_iter().next().unwrap();
+    let run_id = started.run_id;
+    started.handle.wait(&harness.db, harness.now).await.unwrap();
+
+    let captured = fs::read_to_string(&capture_path).unwrap();
+    assert_eq!(captured, format!("{run_id}:project-a"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn mark_running_failure_finishes_the_run_and_terminates_the_spawned_process() {
     let harness = SchedulerHarness::new();
     let executable = harness.temp.path().join("agent-sleep-recovery-test.sh");

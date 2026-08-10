@@ -242,15 +242,41 @@ mod commands {
     }
 
     pub async fn submit(args: SubmitArgs) -> Result<(), AppError> {
+        let SubmitArgs {
+            kind,
+            metadata,
+            metadata_json,
+            json,
+            command,
+        } = args;
         let current_dir = env::current_dir().map_err(|source| AppError::Io {
             operation: "read current directory",
             source,
         })?;
         let project_root = project::find_root(&current_dir)?;
-        let submission = submit_command::run(&project_root, &args.command).await?;
-        if let Some(task_id) = submission.pueue_task_id {
-            println!("{task_id}");
-        }
+        let db = Db::open(&paths::state_db_path()?)?;
+        let registered = ProjectRepository::new(&db)
+            .find_by_root(&project_root)?
+            .ok_or(AppError::Runtime {
+                operation: "submit for an unregistered project",
+            })?;
+        let options = submit_command::SubmitOptions::new(
+            kind,
+            submit_command::load_metadata(metadata.as_deref(), metadata_json.as_deref())?,
+            submit_command::origin_from_environment(&registered.project_id)?,
+        );
+        let submission = submit_command::run_with_options(
+            &db,
+            &project_root,
+            &command,
+            &options,
+            &CommandPueue::default(),
+        )
+        .await?;
+        println!(
+            "{}",
+            submit_command::render_submission(&submission, &registered.pueue_group, json)?
+        );
         Ok(())
     }
 

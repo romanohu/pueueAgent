@@ -5,8 +5,11 @@ use std::{ffi::OsString, fs, path::PathBuf};
 
 use fake_pueue::{FakePueue, FakePueueCommand};
 use pueue_agent::{
-    db::{Db, ProjectRepository, SubmissionRepository},
-    models::{NewProject, SubmissionStatus},
+    db::{Db, EventRepository, ProjectRepository, SubmissionRepository},
+    models::{
+        AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject, Submission, SubmissionKind,
+        SubmissionStatus,
+    },
     pueue::{CommandPueue, PueueApi, PueueError, PueueTask},
     submit, AppError,
 };
@@ -464,6 +467,198 @@ async fn submit_records_intent_before_add_and_preserves_arguments() {
         accepted.task_signature.as_deref(),
         Some(expected_provisional_signature("pa-project", 73, &accepted.submission_id).as_str())
     );
+}
+
+#[tokio::test]
+async fn submit_options_default_to_experiment_and_persist_metadata_without_changing_pueue_argv() {
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let args = vec![OsString::from("python"), OsString::from("train.py")];
+    let metadata = submit::load_metadata(None, Some(r#"{"trial":"baseline","epochs":3}"#)).unwrap();
+
+    let submission = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Experiment, metadata, None),
+        &fake,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(submission.kind, SubmissionKind::Experiment);
+    assert_eq!(submission.metadata, json!({"trial":"baseline","epochs":3}));
+    assert_eq!(submission.origin_agent_run_id, None);
+    assert_eq!(
+        fake.last_add_args(),
+        vec![
+            OsString::from("-g"),
+            OsString::from("pa-project"),
+            OsString::from("--"),
+            OsString::from("python"),
+            OsString::from("train.py"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn submit_options_accept_explicit_control_kind() {
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let args = vec![OsString::from("python"), OsString::from("control.py")];
+
+    let submission = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Control, json!({}), None),
+        &fake,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(submission.kind, SubmissionKind::Control);
+}
+
+#[test]
+fn metadata_loader_rejects_conflicting_or_out_of_bounds_values() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("metadata.json");
+    fs::write(&path, r#"{"from":"file"}"#).unwrap();
+
+    assert!(submit::load_metadata(Some(&path), Some(r#"{"inline":true}"#)).is_err());
+    assert!(submit::load_metadata(None, Some("[]")).is_err());
+    assert!(submit::load_metadata(
+        None,
+        Some(&format!(r#"{{"value":"{}"}}"#, "x".repeat(1025)))
+    )
+    .is_err());
+    assert!(submit::load_metadata(
+        None,
+        Some(&format!(r#"{{"items":[{}]}}"#, vec!["0"; 65].join(",")))
+    )
+    .is_err());
+    assert!(submit::load_metadata(None, Some(&format!(r#"{{"{}":1}}"#, "k".repeat(65)))).is_err());
+    assert!(submit::load_metadata(
+        None,
+        Some(&format!(
+            r#"{{{}}}"#,
+            (0..33)
+                .map(|index| format!(r#""k{index}":0"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    )
+    .is_err());
+    assert!(submit::load_metadata(
+        None,
+        Some(&format!(
+            r#"{{"nested":{}}}"#,
+            "{".repeat(8) + "0" + &"}".repeat(8)
+        ))
+    )
+    .is_err());
+    assert!(submit::load_metadata(
+        None,
+        Some(&format!(r#"{{"value":"{}"}}"#, "x".repeat(16 * 1024)))
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn invalid_origin_is_rejected_before_pueue_add_and_valid_origin_is_persisted() {
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let args = vec![OsString::from("python"), OsString::from("train.py")];
+
+    let invalid = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Experiment, json!({}), Some(999)),
+        &fake,
+    )
+    .await;
+    assert!(invalid.is_err());
+    assert!(fake.last_add_args().is_empty());
+
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            "origin-test",
+            json!({}),
+            1,
+            1,
+        ))
+        .unwrap();
+    let run = pueue_agent::db::AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event.event_id,
+            None,
+            AgentRunStatus::Running,
+            1,
+            harness.root.join("agent.log"),
+        ))
+        .unwrap();
+    let submission = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Experiment, json!({}), Some(run.run_id)),
+        &fake,
+    )
+    .await
+    .unwrap();
+    assert_eq!(submission.origin_agent_run_id, Some(run.run_id));
+}
+
+#[test]
+fn agent_origin_environment_requires_a_complete_matching_pair() {
+    assert_eq!(
+        submit::origin_from_values(None, None, "project-a").unwrap(),
+        None
+    );
+    assert!(submit::origin_from_values(Some("7"), None, "project-a").is_err());
+    assert!(submit::origin_from_values(Some("nope"), Some("project-a"), "project-a").is_err());
+    assert!(submit::origin_from_values(Some("7"), Some("project-b"), "project-a").is_err());
+    assert_eq!(
+        submit::origin_from_values(Some("7"), Some("project-a"), "project-a").unwrap(),
+        Some(7)
+    );
+}
+
+#[test]
+fn submission_output_is_bounded_and_never_includes_raw_metadata() {
+    let submission = Submission {
+        submission_id: "submission-1".to_owned(),
+        project_id: "project-a".to_owned(),
+        argv: vec!["python".to_owned(), "train.py".to_owned()],
+        created_at: 1,
+        pueue_task_id: Some(73),
+        task_signature: Some("signature".to_owned()),
+        status: SubmissionStatus::Accepted,
+        kind: SubmissionKind::Control,
+        metadata: json!({"credential":"very-secret"}),
+        origin_agent_run_id: Some(7),
+    };
+
+    let human = submit::render_submission(&submission, "pa-project", false).unwrap();
+    assert_eq!(
+        human,
+        "submission=submission-1 task=73 kind=control group=pa-project state=accepted"
+    );
+    assert!(!human.contains("very-secret"));
+
+    let json = submit::render_submission(&submission, "pa-project", true).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["submission_id"], "submission-1");
+    assert_eq!(value["task_id"], 73);
+    assert_eq!(value["kind"], "control");
+    assert_eq!(value["group"], "pa-project");
+    assert_eq!(value["state"], "accepted");
+    assert!(value.get("metadata").is_none());
 }
 
 #[tokio::test]

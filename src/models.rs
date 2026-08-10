@@ -29,7 +29,7 @@ impl Error for ModelEnumParseError {}
 
 macro_rules! database_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
             $($variant),+

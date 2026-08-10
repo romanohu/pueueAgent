@@ -259,6 +259,8 @@ impl AgentRunner {
             };
             process
                 .current_dir(&project.root_path)
+                .env("PUEUE_AGENT_RUN_ID", run.run_id.to_string())
+                .env("PUEUE_AGENT_PROJECT_ID", &project.project_id)
                 .stderr(Stdio::from(stderr))
                 .kill_on_drop(true);
             #[cfg(unix)]
