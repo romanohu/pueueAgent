@@ -1536,7 +1536,7 @@ impl<'db> AgentRunRepository<'db> {
                        WHERE agent_runs.project_id = interventions.project_id
                          AND agent_runs.run_id = interventions.agent_run_id
                          AND (
-                             agent_runs.launch_gate_state IN ('pending', 'failed')
+                             agent_runs.launch_gate_state IN ('pending', 'release_requested', 'failed')
                              OR (agent_runs.pid IS NULL AND agent_runs.status <> 'running')
                          )
                    )",
@@ -1587,7 +1587,7 @@ impl<'db> AgentRunRepository<'db> {
                 "UPDATE agent_runs
                  SET status = 'failed', finished_at = ?1, last_error = ?2,
                      launch_gate_state = CASE
-                         WHEN launch_gate_state = 'pending' THEN 'failed'
+                         WHEN launch_gate_state IN ('pending', 'release_requested') THEN 'failed'
                          ELSE launch_gate_state
                      END
                  WHERE status IN ('starting', 'running')",

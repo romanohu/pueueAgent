@@ -1055,6 +1055,100 @@ fn pre_release_gate_failure_requeues_applied_interventions() {
 }
 
 #[test]
+fn startup_recovery_requeues_applied_interventions_after_release_request_before_ack() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let interventions = InterventionRepository::new(&test.db);
+    let intervention = interventions
+        .insert_pending("project-a", "release request recovery", 100)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "release-request-recovery", 110, 210, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "release-request-recovery", 100);
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/release-request-recovery.log",
+            ),
+            &[event_id],
+            Some("release-request-recovery"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 4245, 130)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+
+    runs.recover_interrupted(140, "daemon restarted before launch gate acknowledgement")
+        .unwrap();
+
+    let intervention_state: (InterventionStatus, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+            [&intervention.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let run_state: (AgentRunStatus, String) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(intervention_state, (InterventionStatus::Pending, None));
+    assert_eq!(run_state, (AgentRunStatus::Failed, "failed".to_owned()));
+}
+
+#[test]
+fn mark_gate_released_rejects_a_run_without_a_release_request() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "gate-release-failure", 100);
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            100,
+            "/tmp/gate-release-failure.log",
+        ))
+        .unwrap();
+
+    assert!(runs
+        .mark_gate_released("project-a", run.run_id)
+        .is_err());
+    let gate_state: String = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(gate_state, "pending");
+}
+
+#[test]
 fn startup_recovery_requeues_an_applied_intervention_before_gate_release() {
     let test = TestDatabase::new();
     let root = test.project_root("project");

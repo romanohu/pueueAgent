@@ -373,7 +373,12 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
+                repository.fail_before_gate_release(
+                    &project.project_id,
+                    run.run_id,
+                    now,
+                    &reason,
+                )?;
                 return Err(error);
             }
         }

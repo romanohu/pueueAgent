@@ -4,7 +4,7 @@
 
 **Goal:** Close the valid whole-branch review findings for the human-intervention and observability implementation at `c7b3ac1` without weakening existing safety behavior.
 
-**Architecture:** Keep project predicates and durable SQLite transitions at repository boundaries. Recovery runs on every scheduler tick, but only unattached expired intervention reservations are requeued there; startup run recovery remains responsible for attached reservations. On supported Unix targets, agent execution is behind a fixed-argv stdin release gate whose byte is written only after the PID/running/intervention transaction commits.
+**Architecture:** Keep project predicates and durable SQLite transitions at repository boundaries. Recovery runs on every scheduler tick, but only unattached expired intervention reservations are requeued there; startup run recovery remains responsible for attached reservations. Unix is the supported agent-launch platform: execution is behind a fixed-argv stdin release gate whose byte is written only after the PID/running/intervention transaction commits. Non-Unix launchers fail explicitly because this guarantee is unavailable.
 
 **Tech Stack:** Rust 2021, Tokio, rusqlite bundled SQLite, Clap, serde/serde_json, POSIX `sh` on Unix, Bats, ShellCheck.
 
@@ -31,7 +31,7 @@
 **Files:** `src/agent.rs`, `tests/integration/scheduler.rs`, unit tests as needed.
 
 - [ ] Add deterministic gate tests proving EOF exits without invoking the configured agent and a release byte permits fixed argv; run RED.
-- [ ] Implement the POSIX gate with piped stdin, keep configured command/args as positional argv, write the release byte only after `mark_running_and_apply_interventions` commits, and retain bounded non-Unix fallback behavior; test spawn failure and process-tree cleanup; run GREEN.
+- [ ] Implement the POSIX gate with piped stdin, keep configured command/args as positional argv, write the release byte only after `mark_running_and_apply_interventions` commits, and reject non-Unix launchers explicitly; test spawn failure and process-tree cleanup; run GREEN.
 
 ### Task 3: Functional diagnostics
 

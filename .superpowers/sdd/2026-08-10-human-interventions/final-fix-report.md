@@ -65,5 +65,29 @@ The initial baseline focused run also exposed one `database::concurrent_first_op
 - `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
 - `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed, exit 0 with no output.
 - `git diff --check`: passed, exit 0 with no output.
+- `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
+- `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed, exit 0 with no output.
 
 The required Rust verification is blocked by the execution environment’s missing Cargo/rustfmt toolchain, not by a reproduced repository failure. No reset or destructive cleanup was performed.
+
+## Independent controller verification after `22d5f4e`
+
+The assigned verification environment supplied the Rust toolchain through its task-specific PATH and reran the complete suite after correcting the doctor lease fixture:
+
+- `cargo fmt --check`: passed.
+- `cargo test --all-targets`: passed; all targets completed with 0 failures.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed with no warnings.
+- `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
+- `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed.
+- `git diff --check`: passed; worktree clean.
+
+## Round 3: recover `release_requested` interventions
+
+- RED: the new focused database tests were added for recovery of an applied intervention attached to a PID-bearing `release_requested` run and for rejecting `mark_gate_released` when no release request exists. Focused Rust execution was blocked before compilation by `zsh:1: command not found: cargo` (exit 127).
+- Fix: startup recovery now treats `release_requested` as pre-execution, requeues attached reserved/applied interventions, and marks the interrupted run failed. An ACK-following `mark_gate_released` database failure now uses `fail_before_gate_release`, so applied interventions are requeued atomically.
+- Documentation: the implementation plan now states Unix is the supported launch platform and non-Unix launchers fail explicitly.
+- `cargo test --test database startup_recovery_requeues_applied_interventions_after_release_request_before_ack mark_gate_released_rejects_a_run_without_a_release_request`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `cargo fmt --check`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `git diff --check`: passed, exit 0 with no output.
+- `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
+- `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed, exit 0 with no output.
