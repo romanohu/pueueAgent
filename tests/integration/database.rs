@@ -933,6 +933,59 @@ fn runs_repository_scopes_lineage_and_keeps_incomplete_submissions() {
 }
 
 #[test]
+fn runs_repository_keeps_old_submission_for_latest_run_when_limit_is_one() {
+    let test = TestDatabase::new();
+    let root = test.project_root("runs-limit");
+    register_project(&test.db, "runs-limit", &root, "pa-runs-limit");
+    let event = insert_event(&test.db, "runs-limit", "runs-limit-event", 200);
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "runs-limit",
+            event,
+            None,
+            AgentRunStatus::Completed,
+            200,
+            "/tmp/runs-limit.log",
+        ))
+        .unwrap();
+    let submissions = SubmissionRepository::new(&test.db);
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "runs-limit-old",
+            "runs-limit",
+            vec!["python".to_owned()],
+            100,
+            SubmissionKind::Experiment,
+            json!({}),
+            Some(run.run_id),
+        ))
+        .unwrap();
+    submissions
+        .insert_idempotent(&NewSubmission::new(
+            "runs-limit-new-orphan",
+            "runs-limit",
+            vec!["python".to_owned()],
+            300,
+        ))
+        .unwrap();
+
+    let lineages = pueue_agent::db::RunLineageRepository::new(&test.db)
+        .list_by_project("runs-limit", 1)
+        .unwrap();
+
+    assert_eq!(lineages.len(), 1);
+    assert_eq!(lineages[0].run_id, Some(run.run_id));
+    assert_eq!(
+        lineages[0]
+            .submissions
+            .iter()
+            .map(|submission| submission.submission_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["runs-limit-old"]
+    );
+}
+
+#[test]
 fn follow_cursor_deduplicates_orders_and_respects_limit() {
     let mut cursor = FollowCursor::default();
     let first = pueue_agent::db::RunLineageCursor::new(100, 1, None, None);

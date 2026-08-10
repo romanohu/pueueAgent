@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::Serialize;
 use tokio::time::{self, Duration};
@@ -139,25 +139,58 @@ pub fn collect_fresh(
     cursor: &mut FollowCursor,
     limit: usize,
 ) -> Vec<RunLineage> {
-    let mut fresh = Vec::new();
-    for lineage in lineages {
-        let mut is_fresh = false;
-        for value in lineage.cursors() {
-            is_fresh |= cursor.observe(&value);
+    let mut cursor_sources = BTreeMap::new();
+    for (lineage_index, lineage) in lineages.iter().enumerate() {
+        if lineage.run_id.is_some() || lineage.event_id.is_some() {
+            cursor_sources.insert(
+                RunLineageCursor::new(
+                    lineage.started_at,
+                    lineage.run_id.unwrap_or_default(),
+                    None,
+                    None,
+                ),
+                (lineage_index, None),
+            );
         }
-        if is_fresh {
-            fresh.push(lineage);
-        }
-        if fresh.len() == limit {
-            break;
+        for (submission_index, submission) in lineage.submissions.iter().enumerate() {
+            cursor_sources.insert(
+                RunLineageCursor::new(
+                    lineage.started_at,
+                    lineage.run_id.unwrap_or_default(),
+                    Some(submission.submission_id.clone()),
+                    submission.pueue_task_id,
+                ),
+                (lineage_index, Some(submission_index)),
+            );
         }
     }
-    fresh.sort_by(|left, right| {
-        left.started_at
-            .cmp(&right.started_at)
-            .then_with(|| left.run_id.cmp(&right.run_id))
-    });
-    fresh
+    for value in cursor_sources.keys() {
+        cursor.observe(value);
+    }
+
+    let selected = cursor.take_ordered(limit);
+    let mut fresh = Vec::<(RunLineageCursor, RunLineage)>::new();
+    for value in selected {
+        let Some(&(lineage_index, submission_index)) = cursor_sources.get(&value) else {
+            continue;
+        };
+        if let Some((_, lineage)) = fresh.iter_mut().find(|(first_cursor, _)| {
+            first_cursor.started_at == value.started_at && first_cursor.run_id == value.run_id
+        }) {
+            if let Some(submission_index) = submission_index {
+                lineage
+                    .submissions
+                    .push(lineages[lineage_index].submissions[submission_index].clone());
+            }
+            continue;
+        }
+        let mut lineage = lineages[lineage_index].clone();
+        lineage.submissions = submission_index
+            .map(|index| vec![lineage.submissions[index].clone()])
+            .unwrap_or_default();
+        fresh.push((value, lineage));
+    }
+    fresh.into_iter().map(|(_, lineage)| lineage).collect()
 }
 
 fn render_human(project_id: &str, lineages: &[RunLineage]) -> String {
@@ -253,5 +286,62 @@ impl From<&SubmissionLineage> for SubmissionSummary {
             status: submission.status.to_string(),
             task_id: submission.pueue_task_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        db::{RunLineage, SubmissionLineage},
+        models::{SubmissionKind, SubmissionStatus},
+    };
+
+    use super::{collect_fresh, FollowCursor};
+
+    fn lineage(run_id: i64, started_at: i64, submission_ids: &[&str]) -> RunLineage {
+        RunLineage {
+            event_id: Some(run_id),
+            event_kind: None,
+            event_status: None,
+            run_id: Some(run_id),
+            mode: None,
+            run_status: None,
+            started_at,
+            submissions: submission_ids
+                .iter()
+                .map(|submission_id| SubmissionLineage {
+                    submission_id: (*submission_id).to_owned(),
+                    kind: SubmissionKind::Experiment,
+                    status: SubmissionStatus::Pending,
+                    pueue_task_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn collect_fresh_consumes_pending_cursors_in_order_and_limit_batches() {
+        let first = lineage(1, 10, &["sub-a", "sub-b"]);
+        let second = lineage(2, 20, &["sub-c"]);
+        let mut cursor = FollowCursor::default();
+
+        let first_batch = collect_fresh(vec![second.clone(), first.clone()], &mut cursor, 2);
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0].run_id, Some(1));
+        assert_eq!(first_batch[0].submissions[0].submission_id, "sub-a");
+
+        let second_batch = collect_fresh(vec![second.clone(), first.clone()], &mut cursor, 2);
+        assert_eq!(second_batch.len(), 2);
+        assert_eq!(second_batch[0].run_id, Some(1));
+        assert_eq!(second_batch[0].submissions[0].submission_id, "sub-b");
+        assert_eq!(second_batch[1].run_id, Some(2));
+        assert!(second_batch[1].submissions.is_empty());
+
+        let third_batch = collect_fresh(vec![second.clone(), first], &mut cursor, 2);
+        assert_eq!(third_batch.len(), 1);
+        assert_eq!(third_batch[0].run_id, Some(2));
+        assert_eq!(third_batch[0].submissions[0].submission_id, "sub-c");
+
+        assert!(collect_fresh(vec![second], &mut cursor, 2).is_empty());
     }
 }

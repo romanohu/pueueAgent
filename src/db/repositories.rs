@@ -1494,20 +1494,19 @@ impl RunLineageCursor {
 impl RunLineage {
     pub fn cursors(&self) -> Vec<RunLineageCursor> {
         let run_id = self.run_id.unwrap_or_default();
-        if self.submissions.is_empty() {
-            return vec![RunLineageCursor::new(self.started_at, run_id, None, None)];
+        let mut cursors = Vec::new();
+        if self.run_id.is_some() || self.event_id.is_some() {
+            cursors.push(RunLineageCursor::new(self.started_at, run_id, None, None));
         }
-        self.submissions
-            .iter()
-            .map(|submission| {
-                RunLineageCursor::new(
-                    self.started_at,
-                    run_id,
-                    Some(submission.submission_id.clone()),
-                    submission.pueue_task_id,
-                )
-            })
-            .collect()
+        cursors.extend(self.submissions.iter().map(|submission| {
+            RunLineageCursor::new(
+                self.started_at,
+                run_id,
+                Some(submission.submission_id.clone()),
+                submission.pueue_task_id,
+            )
+        }));
+        cursors
     }
 }
 
@@ -1526,21 +1525,17 @@ impl<'db> RunLineageRepository<'db> {
         limit: usize,
     ) -> Result<Vec<RunLineage>, AppError> {
         let limit = bounded_diagnostic_limit(limit) as usize;
-        let events = EventRepository::new(self.db).recent_events(project_id, limit)?;
         let runs = AgentRunRepository::new(self.db).list_by_project(project_id, limit)?;
-        let submissions = SubmissionRepository::new(self.db).list_by_project(project_id, limit)?;
-        let mut events_by_id = std::collections::BTreeMap::new();
-        for event in events {
-            events_by_id.insert(event.event_id, event);
-        }
+        let event_repository = EventRepository::new(self.db);
+        let submission_repository = SubmissionRepository::new(self.db);
         let mut lineages = Vec::new();
-        let mut run_ids = std::collections::BTreeSet::new();
         for run in runs {
-            run_ids.insert(run.run_id);
-            let event = events_by_id.remove(&run.primary_event_id);
-            let run_submissions = submissions
+            let event = event_repository
+                .find_by_id(run.primary_event_id)?
+                .filter(|event| event.project_id == project_id);
+            let run_submissions = submission_repository
+                .list_by_origin_agent_run(project_id, run.run_id, limit)?
                 .iter()
-                .filter(|submission| submission.origin_agent_run_id == Some(run.run_id))
                 .map(SubmissionLineage::from)
                 .collect();
             lineages.push(RunLineage {
@@ -1557,8 +1552,22 @@ impl<'db> RunLineageRepository<'db> {
                 submissions: run_submissions,
             });
         }
-        for event in events_by_id.into_values() {
-            lineages.push(RunLineage {
+        let selected_primary_event_ids = lineages
+            .iter()
+            .filter_map(|lineage| lineage.event_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let remaining = limit.saturating_sub(lineages.len());
+        let events = event_repository
+            .recent_events(project_id, limit)?
+            .into_iter()
+            .filter(|event| !selected_primary_event_ids.contains(&event.event_id));
+        let submissions = submission_repository
+            .list_by_project(project_id, limit)?
+            .into_iter()
+            .filter(|submission| submission.origin_agent_run_id.is_none());
+        let mut incomplete = Vec::new();
+        for event in events {
+            incomplete.push(RunLineage {
                 event_id: Some(event.event_id),
                 event_kind: Some(event.kind),
                 event_status: Some(event.status),
@@ -1569,11 +1578,8 @@ impl<'db> RunLineageRepository<'db> {
                 submissions: Vec::new(),
             });
         }
-        for submission in submissions.into_iter().filter(|submission| {
-            submission.origin_agent_run_id.is_none()
-                || !run_ids.contains(&submission.origin_agent_run_id.unwrap_or_default())
-        }) {
-            lineages.push(RunLineage {
+        for submission in submissions {
+            incomplete.push(RunLineage {
                 event_id: None,
                 event_kind: None,
                 event_status: None,
@@ -1584,13 +1590,14 @@ impl<'db> RunLineageRepository<'db> {
                 submissions: vec![SubmissionLineage::from(&submission)],
             });
         }
-        lineages.sort_by(|left, right| {
+        incomplete.sort_by(|left, right| {
             right
                 .started_at
                 .cmp(&left.started_at)
                 .then_with(|| right.run_id.cmp(&left.run_id))
         });
-        lineages.truncate(limit);
+        incomplete.truncate(remaining);
+        lineages.extend(incomplete);
         Ok(lineages)
     }
 }
