@@ -1,7 +1,11 @@
 use std::fs;
 
 use assert_cmd::Command;
-use pueue_agent::{config, models::AgentContextMode};
+use pueue_agent::{
+    config,
+    db::{Db, ProjectRepository},
+    models::{AgentContextMode, NewProject},
+};
 use tempfile::TempDir;
 
 fn init(root: &std::path::Path) -> std::process::Output {
@@ -50,6 +54,96 @@ fn init_bounds_and_redacts_successful_project_root_output() {
     assert!(line.contains("[path]"));
     assert!(!line.contains("AWS_SECRET_ACCESS_KEY"));
     assert!(!line.contains("AKIA_INIT_SECRET"));
+}
+
+#[test]
+fn operator_success_output_bounds_and_redacts_project_and_group_identity() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("operator-project");
+    fs::create_dir(&root).unwrap();
+    assert!(init(&root).status.success());
+
+    let state_dir = temp.path().join("state");
+    let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+    let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+    ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            &project_config.project_id,
+            &root,
+            &project_config.pueue_group,
+            root.join(".pueue-agent/config.toml"),
+            100,
+        ))
+        .unwrap();
+
+    let project_id = format!(
+        "project-{} AWS_SECRET_ACCESS_KEY=AKIA_PROJECT_SECRET",
+        "p".repeat(320)
+    );
+    let group = format!("group-{} password=GROUP_SECRET", "g".repeat(320));
+    let connection = db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE projects SET project_id = ?1, pueue_group = ?2",
+            (&project_id, &group),
+        )
+        .unwrap();
+
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let fake_pueue = bin_dir.join("pueue");
+    fs::write(&fake_pueue, "#!/bin/sh\nprintf '%s' '{\"tasks\":{}}'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let command = |args: &[&str]| {
+        let mut command = Command::cargo_bin("pueue-agent").unwrap();
+        command
+            .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+            .env("PATH", &bin_dir)
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let outputs = [
+        command(&["pause"]),
+        command(&["resume"]),
+        command(&["disable"]),
+        command(&["disable", "--remove"]),
+    ];
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let max_line_len = if stdout.starts_with("paused: ") {
+            "paused: ".len() + 240
+        } else if stdout.starts_with("resumed: ") {
+            "resumed: ".len() + 240
+        } else if stdout.starts_with("disabled: ") {
+            "disabled: ".len() + 240 + " (group reserved: )".len() + 240
+        } else {
+            "removed: ".len() + 240 + " (group released: )".len() + 240
+        };
+        assert!(stdout.lines().all(|line| line.len() <= max_line_len));
+        assert!(!stdout.contains(&project_id));
+        assert!(!stdout.contains(&group));
+        assert!(!stdout.contains("AKIA_PROJECT_SECRET"));
+        assert!(!stdout.contains("GROUP_SECRET"));
+    }
+
+    assert!(String::from_utf8_lossy(&outputs[0].stdout).starts_with("paused: "));
+    assert!(String::from_utf8_lossy(&outputs[1].stdout).starts_with("resumed: "));
+    assert!(String::from_utf8_lossy(&outputs[2].stdout).starts_with("disabled: "));
+    assert!(String::from_utf8_lossy(&outputs[3].stdout).starts_with("removed: "));
 }
 
 #[test]

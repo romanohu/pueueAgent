@@ -312,6 +312,62 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
 }
 
 #[test]
+fn status_bounds_the_joined_termination_error_line() {
+    let harness = OperatorHarness::new();
+    for index in 0..3 {
+        let incident = IncidentRepository::new(&harness.db)
+            .upsert_active(&NewIncident::new(
+                "project-a",
+                "termination",
+                Some(&format!("task-{index}")),
+                &format!("termination-fingerprint-{index}"),
+                harness.now + index,
+            ))
+            .unwrap()
+            .incident;
+        let request = TerminationRequestRepository::new(&harness.db)
+            .insert_idempotent(&NewTerminationRequest::new(
+                incident.incident_id,
+                "project-a",
+                &format!("task-signature-{index}"),
+                "fatal pattern",
+                harness.now + index,
+                Some(harness.now + index + 60),
+            ))
+            .unwrap();
+        TerminationRequestRepository::new(&harness.db)
+            .update_result(
+                request.request_id,
+                TerminationRequestStatus::Failed,
+                None,
+                Some(&format!(
+                    "termination failure {index} AWS_SECRET_ACCESS_KEY=SECRET_{index} {}",
+                    "e".repeat(300)
+                )),
+            )
+            .unwrap();
+    }
+
+    let output = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let termination_line = output
+        .lines()
+        .find(|line| line.starts_with("termination_errors: "))
+        .expect("termination error line");
+
+    assert!(termination_line.len() <= "termination_errors: ".len() + 240);
+    assert!(output
+        .contains("termination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=3"));
+    assert!(!termination_line.contains("SECRET_0"));
+    assert!(!termination_line.contains("SECRET_1"));
+    assert!(!termination_line.contains("SECRET_2"));
+}
+
+#[test]
 fn status_shows_pueue_integration_error_without_claiming_active_tasks_are_empty() {
     let harness = OperatorHarness::new();
 

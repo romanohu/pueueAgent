@@ -145,13 +145,15 @@ mod commands {
             DisableMode::KeepReservation => {
                 println!(
                     "disabled: {} (group reserved: {})",
-                    project.project_id, project.pueue_group
+                    bounded_redacted_text(&project.project_id),
+                    bounded_redacted_text(&project.pueue_group)
                 );
             }
             DisableMode::Remove => {
                 println!(
                     "removed: {} (group released: {})",
-                    project.project_id, project.pueue_group
+                    bounded_redacted_text(&project.project_id),
+                    bounded_redacted_text(&project.pueue_group)
                 );
             }
         }
@@ -271,14 +273,14 @@ mod commands {
     pub fn pause(args: ProjectArgs) -> Result<(), AppError> {
         let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
         let project = status_command::pause_project(&db, &project.project_id, unix_timestamp()?)?;
-        println!("paused: {}", project.project_id);
+        println!("paused: {}", bounded_redacted_text(&project.project_id));
         Ok(())
     }
 
     pub fn resume(args: ProjectArgs) -> Result<(), AppError> {
         let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
         let project = status_command::resume_project(&db, &project.project_id, unix_timestamp()?)?;
-        println!("resumed: {}", project.project_id);
+        println!("resumed: {}", bounded_redacted_text(&project.project_id));
         Ok(())
     }
 

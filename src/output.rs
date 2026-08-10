@@ -57,83 +57,136 @@ pub fn redact_sensitive_text(value: &str) -> String {
     let mut redacted = Vec::with_capacity(tokens.len());
     let mut redact_next = false;
     let mut redact_assignment_value = false;
+    let mut assignment_redaction_emitted = false;
     let mut redact_bearer_value = false;
 
-    for token in tokens {
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+
         if redact_assignment_value {
-            redacted.push("[REDACTED]".to_owned());
-            redact_assignment_value = false;
+            if is_assignment_boundary(&tokens, index) {
+                redact_assignment_value = false;
+                assignment_redaction_emitted = false;
+                continue;
+            }
+            if !assignment_redaction_emitted {
+                redacted.push("[REDACTED]".to_owned());
+                assignment_redaction_emitted = true;
+            }
+            index += 1;
             continue;
         }
 
         if redact_bearer_value {
-            if token.eq_ignore_ascii_case("bearer") {
-                redacted.push(token.to_owned());
+            if token.value.eq_ignore_ascii_case("bearer") {
+                redacted.push(token.value.to_owned());
                 redact_next = true;
-            } else if token == "=" {
-                redacted.push(token.to_owned());
+            } else if token.value == "=" {
+                redacted.push(token.value.to_owned());
                 redact_assignment_value = true;
+                assignment_redaction_emitted = false;
             } else {
                 redacted.push("[REDACTED]".to_owned());
             }
             redact_bearer_value = false;
+            index += 1;
             continue;
         }
 
         if redact_next {
-            if token == "=" {
-                redacted.push(token.to_owned());
+            if token.value == "=" {
+                redacted.push(token.value.to_owned());
                 redact_assignment_value = true;
+                assignment_redaction_emitted = false;
             } else {
                 redacted.push("[REDACTED]".to_owned());
             }
             redact_next = false;
+            index += 1;
             continue;
         }
 
-        if is_path_token(&token) {
+        if is_path_token(&token.value) {
             redacted.push("[path]".to_owned());
+            index += 1;
             continue;
         }
 
-        if let Some((key, _)) = token.split_once('=') {
+        if let Some((key, _)) = token.value.split_once('=') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}=[REDACTED]"));
+                index += 1;
                 continue;
             }
         }
 
-        if let Some((key, _)) = token.split_once(':') {
+        if let Some((key, _)) = token.value.split_once(':') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}:"));
                 redact_bearer_value = true;
+                index += 1;
                 continue;
             }
         }
 
-        if let Some((flag, _)) = token.split_once('=') {
+        if let Some((flag, _)) = token.value.split_once('=') {
             if is_sensitive_flag(flag) {
                 redacted.push(format!("{flag}=[REDACTED]"));
+                index += 1;
                 continue;
             }
         }
 
-        if is_sensitive_flag(&token) || token.eq_ignore_ascii_case("bearer") {
-            redacted.push(token.to_owned());
-            redact_next = true;
+        if is_sensitive_flag(&token.value) || token.value.eq_ignore_ascii_case("bearer") {
+            redacted.push(token.value.to_owned());
+            if tokens
+                .get(index + 1)
+                .is_some_and(|next| !next.quoted && next.value == "=")
+            {
+                redacted.push("=".to_owned());
+                redact_assignment_value = true;
+                assignment_redaction_emitted = false;
+                index += 2;
+            } else {
+                redact_next = true;
+                index += 1;
+            }
             continue;
         }
 
-        if is_sensitive_marker(&token) {
-            redacted.push("[REDACTED]".to_owned());
-            redact_next = true;
+        if is_sensitive_marker(&token.value) {
+            if tokens
+                .get(index + 1)
+                .is_some_and(|next| !next.quoted && next.value == "=")
+            {
+                redacted.push(token.value.to_owned());
+                redacted.push("=".to_owned());
+                redact_assignment_value = true;
+                assignment_redaction_emitted = false;
+                index += 2;
+            } else {
+                redacted.push("[REDACTED]".to_owned());
+                redact_next = true;
+                index += 1;
+            }
             continue;
         }
 
-        redacted.push(token.to_owned());
+        redacted.push(token.value.to_owned());
+        index += 1;
     }
 
     redacted.join(" ")
+}
+
+fn is_assignment_boundary(tokens: &[LexToken], index: usize) -> bool {
+    let token = &tokens[index];
+    (!token.quoted && token.value.starts_with('-') && token.value.len() > 1)
+        || (!token.quoted && token.value.contains('='))
+        || tokens
+            .get(index + 1)
+            .is_some_and(|next| !next.quoted && next.value == "=")
 }
 
 pub fn bounded_redacted_text(value: &str) -> String {
@@ -257,7 +310,13 @@ fn strip_control_and_ansi(value: &str) -> String {
     output
 }
 
-fn lex_tokens(value: &str) -> Vec<String> {
+#[derive(Debug)]
+struct LexToken {
+    value: String,
+    quoted: bool,
+}
+
+fn lex_tokens(value: &str) -> Vec<LexToken> {
     let mut characters = value.chars().peekable();
     let mut tokens = Vec::new();
 
@@ -275,6 +334,7 @@ fn lex_tokens(value: &str) -> Vec<String> {
 
         let mut token = String::new();
         let mut quote = None;
+        let mut quoted = false;
         while let Some(character) = characters.next() {
             if let Some(quote_character) = quote {
                 if character == quote_character {
@@ -291,6 +351,7 @@ fn lex_tokens(value: &str) -> Vec<String> {
 
             if character == '\'' || character == '"' {
                 quote = Some(character);
+                quoted = true;
             } else if character == '\\' {
                 if let Some(escaped) = characters.next() {
                     token.push(escaped);
@@ -301,7 +362,10 @@ fn lex_tokens(value: &str) -> Vec<String> {
                 token.push(character);
             }
         }
-        tokens.push(token);
+        tokens.push(LexToken {
+            value: token,
+            quoted,
+        });
     }
 
     tokens

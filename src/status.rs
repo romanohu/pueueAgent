@@ -119,7 +119,7 @@ pub fn render_project_status(
     if !failed_termination_errors.is_empty() {
         lines.push(format!(
             "termination_errors: {}",
-            failed_termination_errors.join("; ")
+            bounded_redacted_text(&failed_termination_errors.join("; "))
         ));
     }
 

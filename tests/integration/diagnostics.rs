@@ -141,6 +141,31 @@ fn redact_sensitive_text_consumes_spaced_assignment_values_as_whole_credentials(
 }
 
 #[test]
+fn redact_sensitive_text_consumes_independent_assignment_values_until_boundary() {
+    let rendered =
+        redact_sensitive_text("run CREDENTIAL = secret Authorization = Basic secret --lr 0.001");
+
+    for leaked in ["secret", "Basic"] {
+        assert!(
+            !rendered.contains(leaked),
+            "independent assignment leaked: {rendered}"
+        );
+    }
+    assert_eq!(
+        rendered,
+        "run CREDENTIAL = [REDACTED] Authorization = [REDACTED] --lr 0.001"
+    );
+}
+
+#[test]
+fn redact_sensitive_text_keeps_equals_inside_quoted_assignment_values_redacted() {
+    let rendered = redact_sensitive_text(r#"CREDENTIAL = "secret=still-secret" --lr 0.001"#);
+
+    assert!(!rendered.contains("secret=still-secret"));
+    assert_eq!(rendered, "CREDENTIAL = [REDACTED] --lr 0.001");
+}
+
+#[test]
 fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
     let rendered =
         pueue_agent::output::bounded_redacted_text("prefix\x1b[31mhidden\x1b[0m\n\t\u{0007}suffix");
