@@ -4092,17 +4092,31 @@ fn batch_partial_failure_preserves_accepted_jobs_and_leaves_later_jobs_unsubmitt
     assert_eq!(partial.jobs[1].status, BatchJobStatus::Failed);
     assert_eq!(partial.jobs[2].status, BatchJobStatus::Pending);
 
-    let replayed = repository.record_job_result(
+    let replayed = repository
+        .record_job_result(
+            "batch-partial",
+            "request-partial",
+            "job-b",
+            lease_token,
+            BatchJobResult::Failed {
+                error: "ambiguous add response".to_owned(),
+            },
+            103,
+        )
+        .unwrap();
+    assert_eq!(replayed, partial);
+
+    let conflicting_replay = repository.record_job_result(
         "batch-partial",
         "request-partial",
         "job-b",
         lease_token,
         BatchJobResult::Failed {
-            error: "ambiguous add response".to_owned(),
+            error: "different failure".to_owned(),
         },
-        103,
+        104,
     );
-    assert!(replayed.is_err());
+    assert!(conflicting_replay.is_err());
     assert_eq!(
         repository.find("batch-partial", "request-partial").unwrap(),
         Some(partial)
@@ -4190,7 +4204,7 @@ fn batch_find_and_result_updates_cannot_cross_project_boundaries() {
 }
 
 #[test]
-fn batch_completed_result_replay_is_rejected_after_lease_clear() {
+fn batch_completed_result_replay_is_idempotent_after_lease_clear() {
     let test = TestDatabase::new();
     let root = test.project_root("batch-completed");
     register_project(&test.db, "batch-completed", &root, "pa-batch-completed");
@@ -4220,15 +4234,30 @@ fn batch_completed_result_replay_is_rejected_after_lease_clear() {
         .unwrap();
     assert_eq!(completed.status, BatchStatus::Completed);
 
-    let replayed = repository.record_job_result(
+    let replayed = repository
+        .record_job_result(
+            "batch-completed",
+            "request-completed",
+            "job-a",
+            &lease_token,
+            result,
+            102,
+        )
+        .unwrap();
+    assert_eq!(replayed, completed);
+
+    let conflicting_replay = repository.record_job_result(
         "batch-completed",
         "request-completed",
         "job-a",
         &lease_token,
-        result,
-        102,
+        BatchJobResult::Accepted {
+            pueue_task_id: 100,
+            submission_id: "different-submission".to_owned(),
+        },
+        103,
     );
-    assert!(replayed.is_err());
+    assert!(conflicting_replay.is_err());
     let persisted = repository
         .find("batch-completed", "request-completed")
         .unwrap()

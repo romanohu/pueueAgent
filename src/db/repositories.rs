@@ -1343,21 +1343,9 @@ impl<'db> BatchRepository<'db> {
                 field: "project_id",
                 message: "batch request is not owned by this project",
             })?;
-        let active_lease = matches!(
-            parent.status,
-            BatchStatus::Dispatching | BatchStatus::Accepted
-        ) && parent.lease_until.map_or(false, |lease| lease > now)
-            && parent.lease_token.as_deref() == Some(lease_token);
-        if !active_lease {
-            return Err(AppError::Validation {
-                field: "lease_token",
-                message: "batch lease is stale or not owned by this worker",
-            });
-        }
-
         let current = transaction
             .query_row(
-                "SELECT status, pueue_task_id, submission_id
+                "SELECT status, pueue_task_id, submission_id, last_error
                  FROM batch_jobs WHERE request_id = ?1 AND job_id = ?2",
                 params![request_id, job_id],
                 |row| {
@@ -1365,6 +1353,7 @@ impl<'db> BatchRepository<'db> {
                         row.get::<_, BatchJobStatus>(0)?,
                         row.get::<_, Option<i64>>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
@@ -1374,6 +1363,11 @@ impl<'db> BatchRepository<'db> {
                 field: "job_id",
                 message: "job does not belong to this batch",
             })?;
+        let active_lease = matches!(
+            parent.status,
+            BatchStatus::Dispatching | BatchStatus::Accepted
+        ) && parent.lease_until.is_some_and(|lease| lease > now)
+            && parent.lease_token.as_deref() == Some(lease_token);
 
         match result {
             BatchJobResult::Accepted {
@@ -1404,6 +1398,12 @@ impl<'db> BatchRepository<'db> {
                     return Err(AppError::Validation {
                         field: "job_id",
                         message: "job is not dispatching",
+                    });
+                }
+                if !active_lease {
+                    return Err(AppError::Validation {
+                        field: "lease_token",
+                        message: "batch lease is stale or not owned by this worker",
                     });
                 }
                 transaction
@@ -1474,20 +1474,32 @@ impl<'db> BatchRepository<'db> {
                     });
                 }
                 if current.0 == BatchJobStatus::Failed {
-                    let stored = read_batch(&transaction, project_id, request_id)?.ok_or(
-                        AppError::Runtime {
-                            operation: "read idempotent failed batch job result",
-                        },
-                    )?;
-                    transaction
-                        .commit()
-                        .map_err(database_error("commit idempotent failed batch result"))?;
-                    return Ok(stored);
+                    if current.3.as_deref() == Some(error.as_str()) {
+                        let stored = read_batch(&transaction, project_id, request_id)?.ok_or(
+                            AppError::Runtime {
+                                operation: "read idempotent failed batch job result",
+                            },
+                        )?;
+                        transaction
+                            .commit()
+                            .map_err(database_error("commit idempotent failed batch result"))?;
+                        return Ok(stored);
+                    }
+                    return Err(AppError::Validation {
+                        field: "last_error",
+                        message: "failed job already has a different error",
+                    });
                 }
                 if current.0 != BatchJobStatus::Dispatching {
                     return Err(AppError::Validation {
                         field: "job_id",
                         message: "job is not dispatching",
+                    });
+                }
+                if !active_lease {
+                    return Err(AppError::Validation {
+                        field: "lease_token",
+                        message: "batch lease is stale or not owned by this worker",
                     });
                 }
                 transaction
