@@ -141,8 +141,10 @@ pub fn collect_fresh(
 ) -> Vec<RunLineage> {
     let mut cursor_sources = BTreeMap::new();
     for (lineage_index, lineage) in lineages.iter().enumerate() {
-        if let Some(cursor) = lineage.root_cursor() {
-            cursor_sources.insert(cursor, (lineage_index, None));
+        if lineage.submissions.is_empty() {
+            if let Some(cursor) = lineage.root_cursor() {
+                cursor_sources.insert(cursor, (lineage_index, None));
+            }
         }
         for (submission_index, submission) in lineage.submissions.iter().enumerate() {
             cursor_sources.insert(
@@ -332,24 +334,22 @@ mod tests {
         let second = lineage(2, 20, &["sub-c"]);
         let mut cursor = FollowCursor::default();
 
-        let first_batch = collect_fresh(vec![second.clone(), first.clone()], &mut cursor, 2);
+        let first_batch = collect_fresh(vec![second.clone(), first.clone()], &mut cursor, 1);
         assert_eq!(first_batch.len(), 1);
         assert_eq!(first_batch[0].run_id, Some(1));
         assert_eq!(first_batch[0].submissions[0].submission_id, "sub-a");
 
-        let second_batch = collect_fresh(vec![second.clone(), first.clone()], &mut cursor, 2);
-        assert_eq!(second_batch.len(), 2);
+        let second_batch = collect_fresh(vec![second.clone(), first.clone()], &mut cursor, 1);
+        assert_eq!(second_batch.len(), 1);
         assert_eq!(second_batch[0].run_id, Some(1));
         assert_eq!(second_batch[0].submissions[0].submission_id, "sub-b");
-        assert_eq!(second_batch[1].run_id, Some(2));
-        assert!(second_batch[1].submissions.is_empty());
 
-        let third_batch = collect_fresh(vec![second.clone(), first], &mut cursor, 2);
+        let third_batch = collect_fresh(vec![second.clone(), first], &mut cursor, 1);
         assert_eq!(third_batch.len(), 1);
         assert_eq!(third_batch[0].run_id, Some(2));
         assert_eq!(third_batch[0].submissions[0].submission_id, "sub-c");
 
-        assert!(collect_fresh(vec![second], &mut cursor, 2).is_empty());
+        assert!(collect_fresh(vec![second], &mut cursor, 1).is_empty());
     }
 
     #[test]

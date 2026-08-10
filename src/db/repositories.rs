@@ -1259,12 +1259,25 @@ impl<'db> SubmissionRepository<'db> {
         origin_agent_run_id: i64,
         limit: usize,
     ) -> Result<Vec<Submission>, AppError> {
+        self.list_by_origin_agent_run_page(project_id, origin_agent_run_id, limit, 0)
+    }
+
+    fn list_by_origin_agent_run_page(
+        &self,
+        project_id: &str,
+        origin_agent_run_id: i64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Submission>, AppError> {
+        let offset = i64::try_from(offset).map_err(|_| AppError::Configuration {
+            field: "submission_query_offset",
+        })?;
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(&format!(
                 "{} WHERE project_id = ?1 AND origin_agent_run_id = ?2
                  ORDER BY created_at DESC, submission_id DESC
-                 LIMIT ?3",
+                 LIMIT ?3 OFFSET ?4",
                 SUBMISSION_SELECT
             ))
             .map_err(database_error("prepare origin agent run submission query"))?;
@@ -1273,7 +1286,8 @@ impl<'db> SubmissionRepository<'db> {
                 params![
                     project_id,
                     origin_agent_run_id,
-                    bounded_diagnostic_limit(limit)
+                    bounded_diagnostic_limit(limit),
+                    offset,
                 ],
                 submission_from_row,
             )
@@ -1515,8 +1529,10 @@ impl RunLineage {
     pub fn cursors(&self) -> Vec<RunLineageCursor> {
         let run_id = self.run_id.unwrap_or_default();
         let mut cursors = Vec::new();
-        if let Some(cursor) = self.root_cursor() {
-            cursors.push(cursor);
+        if self.submissions.is_empty() {
+            if let Some(cursor) = self.root_cursor() {
+                cursors.push(cursor);
+            }
         }
         cursors.extend(self.submissions.iter().map(|submission| {
             RunLineageCursor::new(
@@ -1533,6 +1549,8 @@ impl RunLineage {
 pub struct RunLineageRepository<'db> {
     db: &'db Db,
 }
+
+const RUN_LINEAGE_SUBMISSION_FETCH_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 
 impl<'db> RunLineageRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
@@ -1553,11 +1571,26 @@ impl<'db> RunLineageRepository<'db> {
             let event = event_repository
                 .find_by_id(run.primary_event_id)?
                 .filter(|event| event.project_id == project_id);
-            let run_submissions = submission_repository
-                .list_by_origin_agent_run(project_id, run.run_id, limit)?
-                .iter()
-                .map(SubmissionLineage::from)
-                .collect();
+            let mut run_submissions = Vec::new();
+            let mut offset = 0;
+            loop {
+                let page = submission_repository.list_by_origin_agent_run_page(
+                    project_id,
+                    run.run_id,
+                    RUN_LINEAGE_SUBMISSION_FETCH_LIMIT,
+                    offset,
+                )?;
+                let page_len = page.len();
+                run_submissions.extend(page.iter().map(SubmissionLineage::from));
+                if page_len < RUN_LINEAGE_SUBMISSION_FETCH_LIMIT {
+                    break;
+                }
+                offset = offset
+                    .checked_add(page_len)
+                    .ok_or(AppError::Configuration {
+                        field: "submission_query_offset",
+                    })?;
+            }
             lineages.push(RunLineage {
                 event_id: event
                     .as_ref()
