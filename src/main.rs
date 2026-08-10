@@ -77,7 +77,7 @@ mod commands {
         events::{record_callback, record_operator_wake_with, CallbackMetadata},
         interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
-        output::bounded_redacted_text,
+        output::{bounded_redacted_text, format_state, human_header, human_summary},
         paths, project,
         pueue::{CommandPueue, PueueApi},
         service::{
@@ -418,7 +418,12 @@ mod commands {
                 serde_json::json!({"schema_version": 1, "event_id": event_id, "project_id": project.project_id, "kind": "operator_wake", "status": "pending"})
             );
         } else {
-            println!("queued operator wake: {event_id}");
+            println!("{}", human_header("wake", &project.project_id));
+            println!(
+                "event={event_id} kind=operator_wake state={}",
+                format_state("pending")
+            );
+            println!("{}", human_summary("operator wake queued"));
         }
         Ok(())
     }

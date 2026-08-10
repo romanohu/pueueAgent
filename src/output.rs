@@ -33,7 +33,18 @@ impl OutputMode {
 }
 
 pub fn render_id(kind: &str, id: impl std::fmt::Display) -> String {
-    format!("{kind} {id}")
+    format!("{kind}={id}")
+}
+
+pub fn human_header(command: &str, project_id: &str) -> String {
+    format!(
+        "pueue-agent {command} project={}",
+        bounded_redacted_text(project_id)
+    )
+}
+
+pub fn human_summary(summary: impl AsRef<str>) -> String {
+    format!("summary: {}", bounded_redacted_text(summary.as_ref()))
 }
 
 pub fn format_state(state: &str) -> String {

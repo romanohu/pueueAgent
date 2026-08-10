@@ -13,7 +13,7 @@ use crate::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
-    output::{bounded_redacted_text, render_id},
+    output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::PueueTask,
     service::{callback_command, ServicePaths, ServiceStatus},
     status::{PueueSnapshot, StatusInput},
@@ -71,31 +71,31 @@ pub fn render_events(
         });
     }
 
-    Ok(events
-        .iter()
-        .map(|event| {
-            format!(
-                "{} kind={} status={} attempts={} lease={} created_at={} completed_at={} error={}",
-                render_id("event", event.event_id),
-                event.kind,
-                event.status,
-                event.attempts,
-                event
-                    .lease_until
-                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                event.created_at,
-                event
-                    .completed_at
-                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                event
-                    .last_error
-                    .as_deref()
-                    .map(bounded_summary)
-                    .unwrap_or_else(|| "none".to_owned())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+    let mut lines = vec![human_header("events", &project.project_id)];
+    lines.push("EVENT STATE KIND ATTEMPTS LEASE CREATED COMPLETED ERROR".to_owned());
+    lines.extend(events.iter().map(|event| {
+        format!(
+            "{} state={} kind={} attempts={} lease={} created_at={} completed_at={} error={}",
+            render_id("event", event.event_id),
+            format_state(event.status.as_str()),
+            event.kind,
+            event.attempts,
+            event
+                .lease_until
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            event.created_at,
+            event
+                .completed_at
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            event
+                .last_error
+                .as_deref()
+                .map(bounded_summary)
+                .unwrap_or_else(|| "none".to_owned())
+        )
+    }));
+    lines.push(human_summary(format!("{} event(s) shown", events.len())));
+    Ok(lines.join("\n"))
 }
 
 #[derive(Serialize)]

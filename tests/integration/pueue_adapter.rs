@@ -690,7 +690,7 @@ fn submission_output_is_bounded_and_never_includes_raw_metadata() {
     let human = submit::render_submission(&submission, "pa-project", false).unwrap();
     assert_eq!(
         human,
-        "submission=submission-1 task=73 kind=control group=pa-project state=accepted"
+        "pueue-agent submit project=project-a\nsub=submission-1 task=73 kind=control group=pa-project state=accepted\nsummary: submission accepted"
     );
     assert!(!human.contains("very-secret"));
 
@@ -702,6 +702,39 @@ fn submission_output_is_bounded_and_never_includes_raw_metadata() {
     assert_eq!(value["group"], "pa-project");
     assert_eq!(value["state"], "accepted");
     assert!(value.get("metadata").is_none());
+}
+
+#[test]
+fn cli_output_contract_submit_has_header_ids_state_summary_and_pure_json() {
+    let submission = Submission {
+        submission_id: "submission-contract".to_owned(),
+        project_id: "project-a".to_owned(),
+        argv: vec!["python".to_owned(), "train.py".to_owned()],
+        created_at: 1,
+        pueue_task_id: Some(73),
+        task_signature: Some("signature".to_owned()),
+        status: SubmissionStatus::Accepted,
+        kind: SubmissionKind::Experiment,
+        metadata: json!({"credential":"very-secret"}),
+        origin_agent_run_id: None,
+    };
+
+    let human = submit::render_submission(&submission, "pa-project", false).unwrap();
+    assert!(human.starts_with("pueue-agent submit"), "{human}");
+    assert!(human.contains("sub=submission-contract"), "{human}");
+    assert!(human.contains("task=73"), "{human}");
+    assert!(human
+        .split_whitespace()
+        .any(|field| field == "state=accepted"));
+    assert!(human.contains("summary:"), "{human}");
+    assert!(!human.contains("very-secret"), "{human}");
+    assert!(!human.contains('\x1b'), "{human}");
+
+    let json = submit::render_submission(&submission, "pa-project", true).unwrap();
+    assert!(json.starts_with('{'), "{json}");
+    assert!(!json.contains("pueue-agent"), "{json}");
+    assert!(!json.contains('\x1b'), "{json}");
+    let _: serde_json::Value = serde_json::from_str(&json).unwrap();
 }
 
 #[tokio::test]

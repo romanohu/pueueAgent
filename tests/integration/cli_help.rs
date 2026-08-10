@@ -86,6 +86,10 @@ fn formatter_never_emits_ansi_for_json_or_piped_output() {
 
     assert!(!OutputMode::Json.uses_ansi(OutputTarget::Terminal));
     assert!(!OutputMode::Human.uses_ansi(OutputTarget::Pipe));
+    assert!(!pueue_agent::output::format_state("running").contains('\x1b'));
+    if std::env::var_os("NO_COLOR").is_none() {
+        assert!(OutputMode::Human.uses_ansi(OutputTarget::Terminal));
+    }
 }
 
 #[test]
@@ -200,6 +204,91 @@ fn events_cli_renders_the_project_scoped_event_projection() {
 }
 
 #[test]
+fn cli_output_contract_events_and_wake_have_human_and_json_boundaries() {
+    let harness = DiagnosticsCliHarness::new();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            &harness.project_id,
+            EventKind::TaskFailed,
+            "cli-output-contract-event",
+            serde_json::json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+
+    let events = harness
+        .command()
+        .args(["events", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        events.status.success(),
+        "{}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let events_text = String::from_utf8_lossy(&events.stdout);
+    assert!(
+        events_text.starts_with("pueue-agent events"),
+        "{events_text}"
+    );
+    assert!(
+        events_text.contains(&format!("event={}", event.event_id)),
+        "{events_text}"
+    );
+    assert!(events_text.contains("state=pending"), "{events_text}");
+    assert!(events_text.contains("summary:"), "{events_text}");
+    assert!(!events_text.contains('\x1b'), "{events_text}");
+
+    let events_json = harness
+        .command()
+        .args(["events", "--json", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(events_json.status.success());
+    let events_json_text = String::from_utf8_lossy(&events_json.stdout);
+    assert!(events_json_text.starts_with('{'), "{events_json_text}");
+    assert!(
+        !events_json_text.contains("pueue-agent"),
+        "{events_json_text}"
+    );
+    assert!(!events_json_text.contains('\x1b'), "{events_json_text}");
+    let _: Value = serde_json::from_str(&events_json_text).unwrap();
+
+    let wake = harness
+        .command()
+        .env("NO_COLOR", "1")
+        .env("PATH", "/definitely-no-pueue")
+        .args(["wake", "--reason", "inspect current loss"])
+        .output()
+        .unwrap();
+    assert!(
+        wake.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+    let wake_text = String::from_utf8_lossy(&wake.stdout);
+    assert!(wake_text.starts_with("pueue-agent wake"), "{wake_text}");
+    assert!(wake_text.contains("event="), "{wake_text}");
+    assert!(wake_text.contains("state=pending"), "{wake_text}");
+    assert!(wake_text.contains("summary:"), "{wake_text}");
+    assert!(!wake_text.contains('\x1b'), "{wake_text}");
+
+    let wake_json = harness
+        .command()
+        .env("NO_COLOR", "1")
+        .args(["wake", "--reason", "inspect current loss", "--json"])
+        .output()
+        .unwrap();
+    assert!(wake_json.status.success());
+    let wake_json_text = String::from_utf8_lossy(&wake_json.stdout);
+    assert!(wake_json_text.starts_with('{'), "{wake_json_text}");
+    assert!(!wake_json_text.contains("pueue-agent"), "{wake_json_text}");
+    assert!(!wake_json_text.contains('\x1b'), "{wake_json_text}");
+    let _: Value = serde_json::from_str(&wake_json_text).unwrap();
+}
+
+#[test]
 fn inspect_cli_process_renders_json_and_text() {
     let harness = DiagnosticsCliHarness::new();
     TaskObservationRepository::new(&harness.db)
@@ -238,7 +327,7 @@ fn inspect_cli_process_renders_json_and_text() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("task 41"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("task=41"));
 }
 
 #[test]
@@ -498,7 +587,7 @@ impl DiagnosticsCliHarness {
 }
 
 #[test]
-fn runs_cli_emits_bounded_json_and_human_lineage_without_sensitive_fields() {
+fn cli_output_contract_runs_emits_bounded_json_and_human_lineage_without_sensitive_fields() {
     let harness = DiagnosticsCliHarness::new();
     let event = EventRepository::new(&harness.db)
         .insert_idempotent(&NewEvent::new(
@@ -553,6 +642,8 @@ fn runs_cli_emits_bounded_json_and_human_lineage_without_sensitive_fields() {
     );
     let json_text = String::from_utf8_lossy(&json.stdout);
     assert!(json_text.starts_with('{'));
+    assert!(!json_text.contains("pueue-agent"), "{json_text}");
+    assert!(!json_text.contains('\x1b'), "{json_text}");
     let body: Value = serde_json::from_str(&json_text).unwrap();
     assert_eq!(body["schema_version"], 1);
     assert_eq!(body["runs"][0]["event"]["kind"], "task_failed");
@@ -576,6 +667,15 @@ fn runs_cli_emits_bounded_json_and_human_lineage_without_sensitive_fields() {
             "missing {expected}: {human_text}"
         );
     }
+    assert!(human_text.contains("summary:"), "{human_text}");
+    assert!(
+        human_text.lines().any(|line| {
+            line.split_whitespace()
+                .any(|field| field == "state=completed")
+        }),
+        "{human_text}"
+    );
+    assert!(!human_text.contains('\x1b'), "{human_text}");
     for leaked in [
         "hidden prompt",
         "hidden transcript",

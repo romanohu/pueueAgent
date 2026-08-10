@@ -6,7 +6,7 @@ use crate::{
     config,
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
     models::{Event, Project},
-    output::{bounded_redacted_text, format_state, render_id},
+    output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::PueueTask,
     service::ServiceStatus,
     AppError,
@@ -35,7 +35,7 @@ pub fn render_project_status(
     project: &Project,
     input: &StatusInput,
 ) -> Result<String, AppError> {
-    let mut lines = Vec::new();
+    let mut lines = vec![human_header("status", &project.project_id)];
     lines.push(format!(
         "daemon: {}",
         service_status_label(input.daemon_health)
@@ -57,7 +57,7 @@ pub fn render_project_status(
         bounded_redacted_text(project.halted_reason.as_deref().unwrap_or("no"))
     ));
 
-    match &input.pueue {
+    let active_task_count = match &input.pueue {
         PueueSnapshot::Tasks(tasks) => {
             let active = tasks
                 .iter()
@@ -67,20 +67,23 @@ pub fn render_project_status(
                         && !task.state.eq_ignore_ascii_case("queued")
                 })
                 .collect::<Vec<_>>();
-            lines.push(format!("active_tasks: {}", active.len()));
+            let active_count = active.len();
+            lines.push(format!("active_tasks: {active_count}"));
             for task in active {
                 lines.push(format!(
-                    "{} {} {}",
+                    "{} state={} {}",
                     render_id("task", task.id),
                     format_state(&bounded_redacted_text(&task.state)),
                     bounded_redacted_text(&task.command)
                 ));
             }
+            active_count
         }
         PueueSnapshot::Error(message) => {
             lines.push(format!("pueue: error: {}", bounded_redacted_text(message)));
+            0
         }
-    }
+    };
 
     let event_counts = event_status_counts(db, &project.project_id)?;
     lines.push(format!(
@@ -133,6 +136,10 @@ pub fn render_project_status(
 
     lines.extend(guardrail_lines(db, project)?);
     lines.extend(context_lines(db, project)?);
+    lines.push(human_summary(format!(
+        "{active_task_count} active task(s), {} pending event(s), {active_agent_runs} active agent run(s)",
+        count(&event_counts, "pending")
+    )));
 
     Ok(lines.join("\n"))
 }
@@ -142,10 +149,7 @@ pub fn render_project_status_compact(
     project: &Project,
     input: &StatusInput,
 ) -> Result<String, AppError> {
-    let mut lines = vec![format!(
-        "pueue-agent: {}",
-        bounded_redacted_text(&project.project_id)
-    )];
+    let mut lines = vec![human_header("status", &project.project_id)];
     lines.push(format!(
         "daemon: {}",
         service_status_label(input.daemon_health)
@@ -195,12 +199,12 @@ pub fn render_project_status_compact(
 
     let guardrails = guardrail_lines(db, project)?;
     lines.extend(guardrails);
-    lines.push(format!(
-        "summary: enabled={} paused={} halted={}",
+    lines.push(human_summary(format!(
+        "enabled={} paused={} halted={}",
         project.enabled,
         project.paused,
         project.halted_reason.is_some()
-    ));
+    )));
 
     Ok(lines.join("\n"))
 }
@@ -304,10 +308,10 @@ fn count(counts: &BTreeMap<String, i64>, key: &str) -> i64 {
 
 fn event_summary(event: &Event) -> String {
     format!(
-        "{}:{}:{}",
+        "{} kind={} state={}",
         render_id("event", event.event_id),
         event.kind,
-        event.status
+        format_state(event.status.as_str())
     )
 }
 

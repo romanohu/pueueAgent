@@ -16,7 +16,7 @@ use pueue_agent::{
     output::redact_sensitive_text,
     pueue::PueueTask,
     service::{ServicePaths, ServiceStatus},
-    status::{render_project_status_compact, PueueSnapshot, StatusInput},
+    status::{render_project_status, render_project_status_compact, PueueSnapshot, StatusInput},
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -32,6 +32,49 @@ fn bounded_redaction_removes_bare_provider_tokens_but_keeps_normal_reason() {
         pueue_agent::output::bounded_redacted_text("inspect current loss")
             .contains("inspect current loss")
     );
+}
+
+#[test]
+fn cli_output_contract_status_has_header_ids_states_summary_and_pure_json() {
+    let harness = DiagnosticsHarness::new();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            "status-output-contract",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    let input = harness.input(PueueSnapshot::Tasks(vec![PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: "python train.py --lr 0.001".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
+    }]));
+
+    let human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    assert!(human.starts_with("pueue-agent status"), "{human}");
+    assert!(human.contains("task=41"), "{human}");
+    assert!(
+        human.contains(&format!("event={}", event.event_id)),
+        "{human}"
+    );
+    assert!(human
+        .split_whitespace()
+        .any(|field| field == "state=running"));
+    assert!(human.contains("summary:"), "{human}");
+
+    let json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+    assert!(json.starts_with('{'), "{json}");
+    assert!(!json.contains("pueue-agent"), "{json}");
+    assert!(!json.contains('\x1b'), "{json}");
+    let _: Value = serde_json::from_str(&json).unwrap();
 }
 
 struct DiagnosticsHarness {
@@ -412,9 +455,9 @@ fn compact_status_bounds_and_redacts_project_id() {
 
     let project_line = rendered
         .lines()
-        .find(|line| line.starts_with("pueue-agent: "))
+        .find(|line| line.starts_with("pueue-agent status project="))
         .unwrap();
-    assert!(project_line.len() <= "pueue-agent: ".len() + 243);
+    assert!(project_line.len() <= "pueue-agent status project=".len() + 243);
     assert!(!project_line.contains("COMPACT_PROJECT_SECRET"));
 }
 

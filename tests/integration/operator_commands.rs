@@ -291,13 +291,13 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
     assert!(output.contains("paused: false"));
     assert!(output.contains("halted: no"));
     assert!(output.contains("active_tasks: 1"));
-    assert!(output.contains("task 41 running"));
+    assert!(output.contains("task=41 state=running"));
     assert!(output.contains("events: pending=1 failed=1"));
-    assert!(output.contains("event "));
+    assert!(output.contains("event="));
     assert!(output
         .contains("termination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=1"));
     assert!(output.contains("termination_failed"));
-    assert!(output.contains("request "));
+    assert!(output.contains("request="));
     assert!(output.contains("open_incidents: 1"));
     assert!(output.contains("agent_runs: active=1 failed=1"));
     assert!(
@@ -469,10 +469,10 @@ fn status_human_bounds_and_redacts_task_state() {
     .unwrap();
     let task_line = output
         .lines()
-        .find(|line| line.starts_with("task 41 "))
+        .find(|line| line.starts_with("task=41 "))
         .expect("task line");
 
-    assert!(task_line.len() <= "task 41 ".len() + 240 + " python train.py".len());
+    assert!(task_line.len() <= "task=41 state=".len() + 240 + " python train.py".len());
     assert!(!task_line.contains("TASK_STATE_SECRET"));
     assert!(!task_line.chars().any(char::is_control));
     assert!(task_line.contains("running"));
@@ -552,7 +552,7 @@ fn status_text_output_is_byte_compatible_for_an_active_project() {
     assert_eq!(
         output,
         format!(
-            "daemon: running\nproject: project-a\nroot: [path]\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\nactive_tasks: 1\ntask 41 running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}",
+            "pueue-agent status project=project-a\ndaemon: running\nproject: project-a\nroot: [path]\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
         )
     );
 }

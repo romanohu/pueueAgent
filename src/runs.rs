@@ -10,7 +10,7 @@ use crate::{
     },
     diagnostics::JSON_SCHEMA_VERSION,
     models::Project,
-    output::{bounded_redacted_text, format_state},
+    output::{bounded_redacted_text, format_state, human_header, human_summary},
     AppError,
 };
 
@@ -392,13 +392,13 @@ fn stream_for_cursor(cursor: &RunLineageCursor) -> FollowStream {
 }
 
 fn render_human(project_id: &str, lineages: &[RunLineage]) -> String {
-    let mut lines = vec![format!(
-        "pueue-agent runs project={} showing={}",
-        bounded_redacted_text(project_id),
-        lineages.len()
-    )];
-    lines.push("RUN EVENT EVENT_KIND EVENT_STATE MODE RUN_STATE SUBMISSION TASK".to_owned());
+    let mut lines = vec![human_header("runs", project_id)];
+    lines.push("RUN EVENT MODE STATE EVENT_STATE SUBMISSION TASK".to_owned());
     lines.extend(lineages.iter().map(render_lineage));
+    lines.push(human_summary(format!(
+        "{} run lineage(s) shown",
+        lineages.len()
+    )));
     lines.join("\n")
 }
 
@@ -433,7 +433,7 @@ fn render_lineage(lineage: &RunLineage) -> String {
             .join(" ")
     };
     format!(
-        "{run} {event} event_kind={event_kind} event_state={event_state} mode={mode} run_state={run_state} {submissions}"
+        "{run} {event} mode={mode} state={run_state} event_kind={event_kind} event_state={event_state} {submissions}"
     )
 }
 

@@ -13,7 +13,7 @@ use crate::{
     config,
     db::{AgentRunRepository, Db, ProjectRepository, SubmissionRepository},
     models::{NewSubmission, Submission, SubmissionKind},
-    output::bounded_redacted_text,
+    output::{bounded_redacted_text, format_state, human_header, human_summary},
     paths, project,
     pueue::{CommandPueue, PueueApi},
     AppError,
@@ -248,14 +248,19 @@ pub fn render_submission(
         })
         .to_string())
     } else {
-        Ok(format!(
-            "submission={} task={} kind={} group={} state={}",
-            bounded_redacted_text(&submission.submission_id),
-            task_id,
-            submission.kind.as_str(),
-            bounded_redacted_text(group),
-            submission.status.as_str(),
-        ))
+        Ok([
+            human_header("submit", &submission.project_id),
+            format!(
+                "sub={} task={} kind={} group={} state={}",
+                bounded_redacted_text(&submission.submission_id),
+                task_id,
+                submission.kind.as_str(),
+                bounded_redacted_text(group),
+                format_state(submission.status.as_str()),
+            ),
+            human_summary(format!("submission {}", submission.status.as_str())),
+        ]
+        .join("\n"))
     }
 }
 
