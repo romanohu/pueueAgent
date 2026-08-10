@@ -79,6 +79,10 @@ pub fn redact_sensitive_text(value: &str) -> String {
         }
 
         if redact_structured_value {
+            if is_assignment_boundary(&tokens, index) {
+                redact_structured_value = false;
+                continue;
+            }
             if token.value.eq_ignore_ascii_case("bearer") {
                 redacted.push(token.value.to_owned());
                 redact_next = true;
@@ -118,6 +122,8 @@ pub fn redact_sensitive_text(value: &str) -> String {
         if let Some((key, _)) = token.value.split_once('=') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}=[REDACTED]"));
+                redact_assignment_value = true;
+                assignment_redaction_emitted = true;
                 index += 1;
                 continue;
             }

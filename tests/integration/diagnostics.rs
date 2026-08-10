@@ -166,6 +166,30 @@ fn redact_sensitive_text_keeps_equals_inside_quoted_assignment_values_redacted()
 }
 
 #[test]
+fn redact_sensitive_text_redacts_inline_assignments_until_argument_boundary() {
+    let rendered =
+        redact_sensitive_text("Authorization=Bearer secret --lr 0.001 AWS_SECRET=foo bar --x");
+
+    for secret in ["Bearer", "secret", "foo", "bar"] {
+        assert!(
+            !rendered.contains(secret),
+            "inline assignment leaked {secret}: {rendered}"
+        );
+    }
+    assert_eq!(
+        rendered,
+        "Authorization=[REDACTED] --lr 0.001 AWS_SECRET=[REDACTED] --x"
+    );
+
+    let json = redact_sensitive_text(r#"curl -H '{"Authorization":"Bearer SECRET"}' --lr 0.001"#);
+    assert!(!json.contains("SECRET"));
+    assert!(json.contains("--lr 0.001"));
+
+    let colon = redact_sensitive_text("Authorization: Bearer secret --lr 0.001");
+    assert_eq!(colon, "Authorization: Bearer [REDACTED] --lr 0.001");
+}
+
+#[test]
 fn redact_sensitive_text_redacts_structured_quoted_authorization_headers() {
     let cases = [
         r#"curl -H '{"Authorization":"Bearer SECRET"}'"#,
