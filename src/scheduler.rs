@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 
+use uuid::Uuid;
+
 use crate::{
     agent::{AgentHandle, AgentRunner},
     config,
-    db::{EventRepository, ProjectRepository},
+    db::{EventRepository, InterventionRepository, ProjectRepository},
     guardrails::{DispatchDecision, Guardrails},
-    interventions::Intervention,
-    models::{Event, EventKind, EventStatus},
+    interventions::{
+        Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
+    },
+    models::{Event, EventKind, EventStatus, Project},
     AppError,
 };
 
@@ -56,6 +60,67 @@ impl Scheduler {
 
     pub fn recover_expired_leases(&self) -> Result<usize, AppError> {
         EventRepository::new(&self.db).recover_expired_claims(self.config.now)
+    }
+
+    fn reserve_interventions_for_prompt(
+        &self,
+        project: &Project,
+        mode: &str,
+        events: &[Event],
+    ) -> Result<(Option<InterventionReservation>, String), AppError> {
+        let base_prompt = build_prompt(project, mode, events, &[])?;
+        let pending = InterventionRepository::new(&self.db).list(
+            &project.project_id,
+            InterventionStatus::Pending,
+            MAX_INTERVENTIONS_PER_RUN,
+        )?;
+        if pending.is_empty() {
+            return Ok((None, base_prompt));
+        }
+
+        let Some(mut available_bytes) = MAX_PROMPT_BYTES
+            .checked_sub(base_prompt.len())
+            .and_then(|remaining| remaining.checked_sub(OPERATOR_INTERVENTIONS_PREFIX.len()))
+        else {
+            return Ok((None, base_prompt));
+        };
+        let mut max_count = 0;
+        let mut message_bytes = 0;
+        for intervention in pending {
+            let item_number = max_count + 1;
+            let item_overhead = format!("{item_number}. \n").len();
+            let required_bytes = item_overhead + intervention.message.len();
+            if required_bytes > available_bytes {
+                break;
+            }
+            available_bytes -= required_bytes;
+            message_bytes += intervention.message.len();
+            max_count += 1;
+        }
+        if max_count == 0 {
+            return Ok((None, base_prompt));
+        }
+
+        let token = Uuid::new_v4().to_string();
+        let reservation = InterventionRepository::new(&self.db).reserve_pending(
+            &project.project_id,
+            &token,
+            self.config.now,
+            self.config.now + self.config.lease_seconds,
+            max_count,
+            message_bytes,
+        )?;
+        if reservation.items.is_empty() {
+            return Ok((None, base_prompt));
+        }
+        match build_prompt(project, mode, events, &reservation.items) {
+            Ok(prompt) => Ok((Some(reservation), prompt)),
+            Err(error) => {
+                InterventionRepository::new(&self.db)
+                    .release_reservation(&project.project_id, &reservation.token)?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn tick(&mut self) -> Result<SchedulerReport, AppError> {
@@ -137,7 +202,31 @@ impl Scheduler {
             }
 
             let mode = dispatch_mode(primary.kind).to_owned();
-            let prompt = build_prompt(&project, &mode, &events, &[])?;
+            let (reservation, prompt) =
+                match self.reserve_interventions_for_prompt(&project, &mode, &events) {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        let message = format!("agent spawn failed: {error}");
+                        let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
+                        let status =
+                            if primary.attempts <= i64::from(project_config.agent.max_retries) {
+                                EventStatus::RetryWait
+                            } else {
+                                EventStatus::Failed
+                            };
+                        EventRepository::new(&self.db).transition_many(
+                            &event_ids,
+                            status,
+                            self.config.now,
+                            Some(retry_at),
+                            Some(&message),
+                        )?;
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        continue;
+                    }
+                };
             match self
                 .runner
                 .spawn(
@@ -146,6 +235,7 @@ impl Scheduler {
                     &project_config.agent,
                     primary.event_id,
                     &event_ids,
+                    reservation.as_ref(),
                     &prompt,
                     self.config.now,
                 )
@@ -169,6 +259,11 @@ impl Scheduler {
                     });
                 }
                 Err(error) => {
+                    let release_error = reservation.as_ref().and_then(|reservation| {
+                        InterventionRepository::new(&self.db)
+                            .release_reservation(&project.project_id, &reservation.token)
+                            .err()
+                    });
                     let message = format!("agent spawn failed: {error}");
                     let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
                     let status = if primary.attempts <= i64::from(project_config.agent.max_retries)
@@ -185,7 +280,7 @@ impl Scheduler {
                         Some(&message),
                     )?;
                     if first_error.is_none() {
-                        first_error = Some(error);
+                        first_error = Some(release_error.unwrap_or(error));
                     }
                     continue;
                 }

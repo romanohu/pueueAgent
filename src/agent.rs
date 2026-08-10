@@ -11,6 +11,7 @@ use crate::{
     codex_session,
     config::AgentConfig,
     db::AgentRunRepository,
+    interventions::InterventionReservation,
     models::{AgentContextMode, AgentRunStatus, NewAgentRun, Project},
     AppError,
 };
@@ -136,13 +137,14 @@ impl AgentRunner {
         config: &AgentConfig,
         primary_event_id: i64,
         event_ids: &[i64],
+        reservation: Option<&InterventionReservation>,
         prompt: &str,
         now: i64,
     ) -> Result<AgentHandle, AppError> {
         let command = self.command_for(project, config, prompt)?;
         let log_path = self.log_path(project, primary_event_id, now)?;
         let repository = AgentRunRepository::new(db);
-        let run = repository.insert_with_events(
+        let run = repository.insert_with_events_and_reservation(
             &NewAgentRun::with_context(
                 &project.project_id,
                 primary_event_id,
@@ -155,6 +157,7 @@ impl AgentRunner {
                 event_ids.iter().map(i64::to_string).collect(),
             ),
             event_ids,
+            reservation.map(|reservation| reservation.token.as_str()),
         )?;
         let mut spawned_child = None;
         let startup = (|| -> Result<i64, AppError> {
@@ -192,7 +195,12 @@ impl AgentRunner {
                 .ok_or(AppError::Runtime {
                     operation: "read spawned agent PID",
                 })?;
-            repository.mark_running(run.run_id, pid)?;
+            repository.mark_running_and_apply_interventions(
+                &project.project_id,
+                run.run_id,
+                pid,
+                now,
+            )?;
             Ok(pid)
         })();
         let pid = match startup {
@@ -203,7 +211,14 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
+                repository.finish_and_release_interventions(
+                    &project.project_id,
+                    run.run_id,
+                    AgentRunStatus::Failed,
+                    now,
+                    None,
+                    Some(&reason),
+                )?;
                 return Err(error);
             }
         };
@@ -214,7 +229,14 @@ impl AgentRunner {
                     operation: "take spawned agent process",
                 };
                 let reason = error.to_string();
-                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
+                repository.finish_and_release_interventions(
+                    &project.project_id,
+                    run.run_id,
+                    AgentRunStatus::Failed,
+                    now,
+                    None,
+                    Some(&reason),
+                )?;
                 return Err(error);
             }
         };

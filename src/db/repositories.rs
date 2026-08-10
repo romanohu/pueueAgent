@@ -1398,17 +1398,50 @@ impl<'db> AgentRunRepository<'db> {
         run: &NewAgentRun,
         event_ids: &[i64],
     ) -> Result<AgentRun, AppError> {
+        self.insert_with_events_and_reservation(run, event_ids, None)
+    }
+
+    pub fn insert_with_events_and_reservation(
+        &self,
+        run: &NewAgentRun,
+        event_ids: &[i64],
+        reservation_token: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error("begin agent run and event insertion"))?;
+            .map_err(database_error(
+                "begin agent run, event, and intervention insertion",
+            ))?;
         let run_id = insert_agent_run(&transaction, run)?;
         for event_id in event_ids {
             attach_event_to_agent_run(&transaction, &run.project_id, run_id, *event_id)?;
         }
-        transaction
-            .commit()
-            .map_err(database_error("commit agent run and event insertion"))?;
+        if let Some(reservation_token) = reservation_token {
+            let changed = transaction
+                .execute(
+                    "UPDATE interventions
+                     SET agent_run_id = ?1
+                     WHERE project_id = ?2 AND reservation_token = ?3 AND status = ?4",
+                    params![
+                        run_id,
+                        run.project_id,
+                        reservation_token,
+                        InterventionStatus::Reserved,
+                    ],
+                )
+                .map_err(database_error(
+                    "attach intervention reservation to agent run",
+                ))?;
+            if changed == 0 {
+                return Err(AppError::Runtime {
+                    operation: "attach intervention reservation to agent run",
+                });
+            }
+        }
+        transaction.commit().map_err(database_error(
+            "commit agent run, event, and intervention insertion",
+        ))?;
         read_agent_run(&connection, run_id)
     }
 
@@ -1437,6 +1470,59 @@ impl<'db> AgentRunRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin interrupted agent run recovery"))?;
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
+                     reservation_token = NULL
+                 WHERE status = ?3 AND agent_run_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM agent_runs
+                       WHERE agent_runs.project_id = interventions.project_id
+                         AND agent_runs.run_id = interventions.agent_run_id
+                         AND (agent_runs.pid IS NOT NULL OR agent_runs.status = 'running')
+                   )",
+                params![
+                    InterventionStatus::Applied,
+                    finished_at,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error(
+                "apply delivered interventions during agent run recovery",
+            ))?;
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND agent_run_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM agent_runs
+                       WHERE agent_runs.project_id = interventions.project_id
+                         AND agent_runs.run_id = interventions.agent_run_id
+                         AND agent_runs.pid IS NULL AND agent_runs.status <> 'running'
+                   )",
+                params![InterventionStatus::Pending, InterventionStatus::Reserved,],
+            )
+            .map_err(database_error(
+                "release undelivered interventions during agent run recovery",
+            ))?;
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND lease_expires_at <= ?3",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    finished_at,
+                ],
+            )
+            .map_err(database_error(
+                "recover expired interventions during agent run recovery",
+            ))?;
         let requeued_events = transaction
             .execute(
                 "UPDATE events
@@ -1506,6 +1592,54 @@ impl<'db> AgentRunRepository<'db> {
         read_agent_run(&connection, run_id)
     }
 
+    pub fn mark_running_and_apply_interventions(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        pid: i64,
+        applied_at: i64,
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin agent run start and intervention application",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs SET pid = ?1, status = 'running'
+                 WHERE project_id = ?2 AND run_id = ?3",
+                params![pid, project_id, run_id],
+            )
+            .map_err(database_error("mark agent run running"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "mark project agent run running",
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
+                     reservation_token = NULL
+                 WHERE project_id = ?3 AND agent_run_id = ?4 AND status = ?5",
+                params![
+                    InterventionStatus::Applied,
+                    applied_at,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error(
+                "mark interventions applied for running agent",
+            ))?;
+        transaction.commit().map_err(database_error(
+            "commit agent run start and intervention application",
+        ))?;
+        read_agent_run(&connection, run_id)
+    }
+
     pub fn finish(
         &self,
         run_id: i64,
@@ -1523,6 +1657,64 @@ impl<'db> AgentRunRepository<'db> {
                 params![status, finished_at, exit_code, last_error, run_id],
             )
             .map_err(database_error("finish agent run"))?;
+        read_agent_run(&connection, run_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_and_release_interventions(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin agent run finish and intervention release",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4
+                 WHERE project_id = ?5 AND run_id = ?6",
+                params![
+                    status,
+                    finished_at,
+                    exit_code,
+                    last_error,
+                    project_id,
+                    run_id,
+                ],
+            )
+            .map_err(database_error("finish project agent run"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "finish project agent run",
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?2 AND agent_run_id = ?3 AND status = ?4",
+                params![
+                    InterventionStatus::Pending,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error(
+                "release interventions for finished agent run",
+            ))?;
+        transaction.commit().map_err(database_error(
+            "commit agent run finish and intervention release",
+        ))?;
         read_agent_run(&connection, run_id)
     }
 
@@ -2288,6 +2480,35 @@ impl<'db> InterventionRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit intervention release"))?;
+        Ok(changed)
+    }
+
+    pub fn release_reservation(
+        &self,
+        project_id: &str,
+        reservation_token: &str,
+    ) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention reservation release"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?2 AND reservation_token = ?3 AND status = ?4",
+                params![
+                    InterventionStatus::Pending,
+                    project_id,
+                    reservation_token,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error("release intervention reservation"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention reservation release"))?;
         Ok(changed)
     }
 

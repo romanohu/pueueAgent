@@ -660,6 +660,202 @@ fn interventions_apply_release_and_expiry_respect_project_and_reservation_owners
 }
 
 #[test]
+fn interventions_bind_to_runs_and_apply_or_release_in_agent_run_transactions() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let interventions = InterventionRepository::new(&test.db);
+    let applied = interventions
+        .insert_pending("project-a", "apply transactionally", 100)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "apply-token", 110, 210, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "apply-transaction", 100);
+    let runs = AgentRunRepository::new(&test.db);
+
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/apply-transaction.log",
+            ),
+            &[event_id],
+            Some("apply-token"),
+        )
+        .unwrap();
+    let reserved_state: (InterventionStatus, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+            [&applied.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        reserved_state,
+        (InterventionStatus::Reserved, Some(run.run_id))
+    );
+
+    let running = runs
+        .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 130)
+        .unwrap();
+    assert_eq!(running.status, AgentRunStatus::Running);
+    assert_eq!(running.pid, Some(4242));
+    let applied_state: (InterventionStatus, Option<i64>, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id, applied_at
+             FROM interventions WHERE intervention_id = ?1",
+            [&applied.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        applied_state,
+        (InterventionStatus::Applied, Some(run.run_id), Some(130))
+    );
+    runs.finish_and_release_interventions(
+        "project-a",
+        run.run_id,
+        AgentRunStatus::Completed,
+        140,
+        Some(0),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        interventions
+            .list("project-a", InterventionStatus::Applied, 8)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let released = interventions
+        .insert_pending("project-a", "release transactionally", 150)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "release-token", 160, 260, 1, 1024)
+        .unwrap();
+    let release_event_id = insert_event(&test.db, "project-a", "release-transaction", 150);
+    let release_run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                release_event_id,
+                None,
+                AgentRunStatus::Starting,
+                170,
+                "/tmp/release-transaction.log",
+            ),
+            &[release_event_id],
+            Some("release-token"),
+        )
+        .unwrap();
+    runs.finish_and_release_interventions(
+        "project-a",
+        release_run.run_id,
+        AgentRunStatus::Failed,
+        180,
+        None,
+        Some("spawn failed"),
+    )
+    .unwrap();
+    let released_state: (InterventionStatus, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+            [&released.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(released_state, (InterventionStatus::Pending, None));
+}
+
+#[test]
+fn interventions_mark_running_and_application_are_atomic() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let interventions = InterventionRepository::new(&test.db);
+    let intervention = interventions
+        .insert_pending("project-a", "fail atomically", 100)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "atomic-token", 110, 210, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "atomic-transaction", 100);
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/atomic-transaction.log",
+            ),
+            &[event_id],
+            Some("atomic-token"),
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_intervention_application
+             BEFORE UPDATE OF status ON interventions
+             WHEN OLD.status = 'reserved' AND NEW.status = 'applied'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected intervention application failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(runs
+        .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 130)
+        .is_err());
+
+    let run_state: (AgentRunStatus, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, pid FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_state, (AgentRunStatus::Starting, None));
+    let intervention_state: (InterventionStatus, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+            [&intervention.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        intervention_state,
+        (InterventionStatus::Reserved, Some(run.run_id))
+    );
+}
+
+#[test]
 fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_status() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
