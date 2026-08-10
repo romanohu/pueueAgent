@@ -71,6 +71,18 @@ pueue-agent disable --remove   # 登録と group の予約を明示的に解放�
 
 `pause` は pending event を保持したまま、新しい agent の起動と自動終了を停止します。`resume` で保持していた event を再び処理対象にできます。通常の `disable` は Pueue group の予約を維持します。`--remove` は明示的な登録解除であり、Pueue の status を取得できない場合は実行しません。
 
+## 人による介入を次回の agent run に渡す
+
+```bash
+pueue-agent steer -- "次は learning rate を半分にして"
+pueue-agent steer list
+pueue-agent status --json
+```
+
+`steer` は現在のプロジェクトに対するメッセージを SQLite へ登録するだけで、agent の起動、Pueue 操作、実行中 process への入力は行いません。登録したメッセージは FIFO 順で一度だけ、次回の agent run の prompt に渡されます。agent の spawn に失敗した場合、メッセージは pending のまま戻されるため、次回の run で再試行されます。
+
+`pause` または `disable` 中でもメッセージはキューへ登録できますが、配信はせず、resume または enable 後の次回 run まで保持されます。`status --json` はキューの件数などの診断情報を返しますが、メッセージ本文は含めません。実行中の agent は中断しません。介入メッセージによって、安全ポリシーや既存の制約を上書きすることはできません。
+
 ## プロジェクトファイルと共有実験コンテキスト
 
 `pueue-agent init` は次のファイルを作成します。

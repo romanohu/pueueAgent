@@ -92,3 +92,14 @@ fn steer_help_describes_enqueue_and_bounded_list_options() {
         String::from_utf8_lossy(&output.stderr).contains("required arguments were not provided")
     );
 }
+
+#[test]
+fn readme_documents_human_intervention_workflow() {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("README.md should be readable");
+
+    assert!(readme.contains("pueue-agent steer --"));
+    assert!(readme.contains("pueue-agent steer list"));
+    assert!(readme.contains("次回の agent run"));
+    assert!(readme.contains("実行中の agent は中断しません"));
+}
