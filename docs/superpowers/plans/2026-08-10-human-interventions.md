@@ -33,7 +33,7 @@
 
 - `src/interventions.rs`: interventionのbounded validation、status/model、prompt section、list projectionの型と定数。
 - `src/models.rs`: SQLite enum macroで読む `InterventionStatus` と永続モデルが既存モデルとの境界を保つ。
-- `src/db/migrations.rs`: schema v5からv6へのinterventions table/index migration。
+- `src/db/migrations.rs`: schema v5からv6へのinterventions table/index migration。FIFOを保証するproject-scoped insertion sequenceを含める。
 - `src/db/repositories.rs`: project-scoped insert/list/count、FIFO reservation、apply/release、lease recoveryのtransaction API。
 - `src/db/mod.rs`: repositoryの公開再export。
 - `src/cli.rs`: `steer` と `steer list` のtyped Clap surface。
@@ -62,7 +62,7 @@
 - Test: `tests/integration/database.rs`
 
 **Interfaces:**
-- Produces `InterventionStatus`, `Intervention`, `InterventionCounts`, `InterventionReservation`, `MAX_INTERVENTION_BYTES`, `MAX_INTERVENTIONS_PER_RUN`, and `MAX_INTERVENTION_BYTES_PER_RUN` for later tasks.
+- Produces `InterventionStatus`, `Intervention`, `InterventionCounts`, `InterventionReservation`, `MAX_INTERVENTION_BYTES`, `MAX_INTERVENTIONS_PER_RUN`, and `MAX_INTERVENTION_BYTES_PER_RUN` for later tasks. `Intervention` carries a monotonic project-scoped insertion sequence used for FIFO.
 - Produces `InterventionRepository::insert_pending`, `list`, `count_by_project`, `reserve_pending`, `mark_applied_for_run`, `release_for_run`, and `recover_expired`.
 
 - [ ] **Step 1: Add failing migration and repository tests**
@@ -127,6 +127,7 @@ Change `LATEST_SCHEMA_VERSION` to `6`. Add a `version == 5` branch that creates:
 CREATE TABLE interventions (
     intervention_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    insertion_sequence INTEGER NOT NULL,
     message TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
     created_at INTEGER NOT NULL,
@@ -144,8 +145,10 @@ CREATE TABLE interventions (
         OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
     )
 );
+CREATE UNIQUE INDEX interventions_project_sequence_idx
+    ON interventions(project_id, insertion_sequence);
 CREATE INDEX interventions_project_status_created_idx
-    ON interventions(project_id, status, created_at, intervention_id);
+    ON interventions(project_id, status, insertion_sequence, intervention_id);
 CREATE INDEX interventions_reservation_lease_idx
     ON interventions(status, lease_expires_at, reservation_token);
 PRAGMA user_version = 6;
@@ -200,7 +203,7 @@ pub fn release_for_run(
 pub fn recover_expired(&self, now: i64) -> Result<usize, AppError>;
 ```
 
-`reserve_pending` must use an Immediate transaction, select pending rows in `created_at ASC, intervention_id ASC` order, stop before either bound would be exceeded, and update only rows still pending. `list`, `count_by_project`, and all transition methods must enforce project scope. Clamp internal limits to the declared maxima and never interpolate user input into SQL.
+`insert_pending` must allocate the next project-scoped `insertion_sequence` inside the same Immediate transaction as the insert. `reserve_pending` and `list` must select pending rows in `insertion_sequence ASC` order, using `created_at, intervention_id` only as deterministic display tie-breakers. Stop before either bound would be exceeded and update only rows still pending. `list`, `count_by_project`, and all transition methods must enforce project scope. Clamp internal limits to the declared maxima and never interpolate user input into SQL.
 
 - [ ] **Step 6: Run focused tests and commit**
 
@@ -233,7 +236,7 @@ git commit -m "feat: add human intervention queue storage"
 
 - [ ] **Step 1: Add failing Clap and handler tests**
 
-Add help assertions for `steer`, `steer list`, `--json`, and the message argument. Add integration cases that invoke the command against a temporary project/database fixture and assert that registration returns an ID, stores the exact bounded message, rejects whitespace-only and over-limit messages, and lists only the selected project's rows.
+Add help assertions for `steer`, `steer list`, `--json`, and the message argument. Add integration cases that invoke the command against a temporary project/database fixture and assert that registration returns an ID, stores the exact bounded message, rejects whitespace-only and over-limit messages, preserves CLI registration order when two messages share one timestamp, and lists only the selected project's rows.
 
 ```rust
 let output = assert_cmd::Command::cargo_bin("pueue-agent")
