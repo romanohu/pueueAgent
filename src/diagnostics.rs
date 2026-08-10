@@ -467,8 +467,8 @@ pub fn build_doctor_report(
             operation: "query doctor SQLite schema version",
             source,
         })?;
-    checks.push(if user_version == 6 {
-        doctor_ok("schema.version", "SQLite schema version is 6", "none")
+    checks.push(if user_version == 7 {
+        doctor_ok("schema.version", "SQLite schema version is 7", "none")
     } else {
         doctor_error(
             "schema.version",

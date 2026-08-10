@@ -131,6 +131,11 @@ database_enum!(SubmissionStatus {
     Failed => "failed",
 });
 
+database_enum!(SubmissionKind {
+    Experiment => "experiment",
+    Control => "control",
+});
+
 database_enum!(AgentRunStatus {
     Starting => "starting",
     Running => "running",
@@ -374,6 +379,9 @@ pub struct Submission {
     pub pueue_task_id: Option<i64>,
     pub task_signature: Option<String>,
     pub status: SubmissionStatus,
+    pub kind: SubmissionKind,
+    pub metadata: Value,
+    pub origin_agent_run_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,6 +391,9 @@ pub struct NewSubmission {
     pub argv: Vec<String>,
     pub created_at: i64,
     pub status: SubmissionStatus,
+    pub kind: SubmissionKind,
+    pub metadata: Value,
+    pub origin_agent_run_id: Option<i64>,
 }
 
 impl NewSubmission {
@@ -398,6 +409,31 @@ impl NewSubmission {
             argv,
             created_at,
             status: SubmissionStatus::Pending,
+            kind: SubmissionKind::Experiment,
+            metadata: Value::Object(Default::default()),
+            origin_agent_run_id: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_kind_metadata(
+        submission_id: impl Into<String>,
+        project_id: impl Into<String>,
+        argv: Vec<String>,
+        created_at: i64,
+        kind: SubmissionKind,
+        metadata: Value,
+        origin_agent_run_id: Option<i64>,
+    ) -> Self {
+        Self {
+            submission_id: submission_id.into(),
+            project_id: project_id.into(),
+            argv,
+            created_at,
+            status: SubmissionStatus::Pending,
+            kind,
+            metadata,
+            origin_agent_run_id,
         }
     }
 }

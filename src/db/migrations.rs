@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -46,6 +46,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         ensure_agent_run_launch_gate(&transaction)?;
         ensure_intervention_insertion_sequence(&transaction)?;
         ensure_invariant_indexes(&transaction)?;
+        ensure_submission_indexes(&transaction)?;
         transaction
             .commit()
             .map_err(database_error("commit SQLite migration check"))?;
@@ -158,7 +159,10 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 created_at INTEGER NOT NULL,
                 pueue_task_id INTEGER,
                 task_signature TEXT,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'experiment',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_agent_run_id INTEGER
             );
 
             CREATE TABLE termination_requests (
@@ -249,6 +253,10 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 ON agent_run_events(event_id);
             CREATE INDEX submissions_project_status_idx
                 ON submissions(project_id, status, created_at);
+            CREATE INDEX submissions_project_kind_status_idx
+                ON submissions(project_id, kind, status, created_at);
+            CREATE INDEX submissions_project_origin_agent_run_idx
+                ON submissions(project_id, origin_agent_run_id, created_at, submission_id);
             CREATE INDEX termination_requests_project_status_idx
                 ON termination_requests(project_id, status, requested_at);
             CREATE INDEX task_observations_group_state_idx
@@ -262,7 +270,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE INDEX interventions_reservation_lease_idx
                 ON interventions(status, lease_expires_at, reservation_token);
 
-            PRAGMA user_version = 6;
+            PRAGMA user_version = 7;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -346,6 +354,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_termination_requests_to_v5(&transaction)?;
     } else if version == 5 {
         migrate_interventions_to_v6(&transaction)?;
+    } else if version == 6 {
+        migrate_submissions_to_v7(&transaction)?;
     }
     if (1..=3).contains(&version) {
         ensure_agent_run_event_project_id(&transaction)?;
@@ -354,8 +364,13 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if (1..=4).contains(&version) {
         migrate_interventions_to_v6(&transaction)?;
     }
+    if (1..=5).contains(&version) {
+        migrate_submissions_to_v7(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
+    ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
+    ensure_submission_indexes(&transaction)?;
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -398,6 +413,100 @@ fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Resul
         "#,
         )
         .map_err(database_error("apply SQLite v6 migration"))
+}
+
+fn migrate_submissions_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let has_submissions: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'submissions'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check submission table for migration"))?;
+    if !has_submissions {
+        transaction
+            .execute_batch(
+                r#"
+            CREATE TABLE submissions (
+                submission_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                argv_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                pueue_task_id INTEGER,
+                task_signature TEXT,
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'experiment',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_agent_run_id INTEGER
+            );
+            "#,
+            )
+            .map_err(database_error(
+                "create submission table for SQLite v7 migration",
+            ))?;
+    } else {
+        if !submission_column_exists(transaction, "kind")? {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE submissions ADD COLUMN kind TEXT NOT NULL DEFAULT 'experiment';",
+                )
+                .map_err(database_error(
+                    "add submission kind for SQLite v7 migration",
+                ))?;
+        }
+        if !submission_column_exists(transaction, "metadata_json")? {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE submissions ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';",
+                )
+                .map_err(database_error(
+                    "add submission metadata for SQLite v7 migration",
+                ))?;
+        }
+        if !submission_column_exists(transaction, "origin_agent_run_id")? {
+            transaction
+                .execute_batch("ALTER TABLE submissions ADD COLUMN origin_agent_run_id INTEGER;")
+                .map_err(database_error(
+                    "add submission origin for SQLite v7 migration",
+                ))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 7;")
+        .map_err(database_error("finish SQLite v7 migration"))?;
+    ensure_submission_indexes(transaction)
+}
+
+fn submission_column_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    column: &str,
+) -> Result<bool, AppError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('submissions')
+                 WHERE name = ?1
+             )",
+            [column],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check submission column for migration"))
+}
+
+fn ensure_submission_indexes(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    transaction
+        .execute_batch(
+            r#"
+        CREATE INDEX IF NOT EXISTS submissions_project_kind_status_idx
+            ON submissions(project_id, kind, status, created_at);
+        CREATE INDEX IF NOT EXISTS submissions_project_origin_agent_run_idx
+            ON submissions(project_id, origin_agent_run_id, created_at, submission_id);
+        "#,
+        )
+        .map_err(database_error("ensure submission indexes"))
 }
 
 fn ensure_intervention_insertion_sequence(

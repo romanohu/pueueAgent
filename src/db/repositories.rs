@@ -1150,6 +1150,17 @@ impl<'db> SubmissionRepository<'db> {
                 operation: "serialize submission arguments",
                 source,
             })?;
+        if !submission.metadata.is_object() {
+            return Err(AppError::Message {
+                message: "submission metadata must be a JSON object".to_owned(),
+            });
+        }
+        let metadata_json = serde_json::to_string(&submission.metadata).map_err(|source| {
+            AppError::Serialization {
+                operation: "serialize submission metadata",
+                source,
+            }
+        })?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1158,8 +1169,8 @@ impl<'db> SubmissionRepository<'db> {
             .execute(
                 "INSERT INTO submissions (
                     submission_id, project_id, argv_json, created_at,
-                    pueue_task_id, task_signature, status
-                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5)
+                    pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8)
                  ON CONFLICT(submission_id) DO NOTHING",
                 params![
                     submission.submission_id,
@@ -1167,6 +1178,9 @@ impl<'db> SubmissionRepository<'db> {
                     argv_json,
                     submission.created_at,
                     submission.status,
+                    submission.kind,
+                    metadata_json,
+                    submission.origin_agent_run_id,
                 ],
             )
             .map_err(database_error("insert submission"))?;
@@ -1236,6 +1250,35 @@ impl<'db> SubmissionRepository<'db> {
             .map_err(database_error("query task submissions"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read task submissions"))
+    }
+
+    pub fn list_by_origin_agent_run(
+        &self,
+        project_id: &str,
+        origin_agent_run_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND origin_agent_run_id = ?2
+                 ORDER BY created_at DESC, submission_id DESC
+                 LIMIT ?3",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare origin agent run submission query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    origin_agent_run_id,
+                    bounded_diagnostic_limit(limit)
+                ],
+                submission_from_row,
+            )
+            .map_err(database_error("query origin agent run submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read origin agent run submissions"))
     }
 
     pub fn mark_accepted(
@@ -1358,6 +1401,7 @@ impl<'db> SubmissionRepository<'db> {
             .query_row(
                 "SELECT COUNT(*) FROM submissions
                  WHERE project_id = ?1
+                   AND kind = 'experiment'
                    AND (
                        pueue_task_id IS NOT NULL
                        OR status IN ('accepted', 'adopted', 'unreconciled')
@@ -2874,7 +2918,7 @@ const INCIDENT_SELECT: &str = "SELECT incident_id, project_id, kind, task_key, f
      FROM incidents";
 
 const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, created_at,
-            pueue_task_id, task_signature, status
+            pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
      FROM submissions";
 
 const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid, status,
@@ -2998,6 +3042,17 @@ fn submission_from_row(row: &Row<'_>) -> rusqlite::Result<Submission> {
     let argv = serde_json::from_str(&argv_json).map_err(|source| {
         rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(source))
     })?;
+    let metadata_json: String = row.get(8)?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(source))
+    })?;
+    if !metadata.is_object() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            8,
+            Type::Text,
+            "submission metadata must be a JSON object".into(),
+        ));
+    }
     Ok(Submission {
         submission_id: row.get(0)?,
         project_id: row.get(1)?,
@@ -3006,6 +3061,9 @@ fn submission_from_row(row: &Row<'_>) -> rusqlite::Result<Submission> {
         pueue_task_id: row.get(4)?,
         task_signature: row.get(5)?,
         status: row.get(6)?,
+        kind: row.get(7)?,
+        metadata,
+        origin_agent_run_id: row.get(9)?,
     })
 }
 

@@ -19,7 +19,7 @@ use pueue_agent::{
     models::{
         AgentRunStatus, EventKind, EventStatus, IncidentStatus, IncidentTransition, NewAgentRun,
         NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
-        NewTerminationRequest, SubmissionStatus, TerminationRequestStatus,
+        NewTerminationRequest, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
     },
 };
 use rusqlite::{params, Connection};
@@ -356,7 +356,7 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -411,6 +411,201 @@ fn existing_v6_interventions_are_backfilled_with_project_sequences() {
             .collect::<Vec<_>>(),
         vec![("old-first", 1), ("old-second", 2)]
     );
+}
+
+#[test]
+fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    SubmissionRepository::new(&test.db)
+        .insert_idempotent(&NewSubmission::new(
+            "legacy-submission",
+            "project-a",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            100,
+        ))
+        .unwrap();
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            DROP INDEX submissions_project_origin_agent_run_idx;
+            DROP INDEX submissions_project_kind_status_idx;
+            ALTER TABLE submissions RENAME TO submissions_v7;
+            CREATE TABLE submissions (
+                submission_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                argv_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                pueue_task_id INTEGER,
+                task_signature TEXT,
+                status TEXT NOT NULL
+            );
+            INSERT INTO submissions (
+                submission_id, project_id, argv_json, created_at,
+                pueue_task_id, task_signature, status
+            ) SELECT submission_id, project_id, argv_json, created_at,
+                pueue_task_id, task_signature, status
+            FROM submissions_v7;
+            DROP TABLE submissions_v7;
+            PRAGMA user_version = 6;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(submissions)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(version, 7);
+    assert!(columns.iter().any(|column| column == "kind"));
+    assert!(columns.iter().any(|column| column == "metadata_json"));
+    assert!(columns.iter().any(|column| column == "origin_agent_run_id"));
+    drop(connection);
+
+    let submission = SubmissionRepository::new(&migrated)
+        .find_by_id("legacy-submission")
+        .unwrap()
+        .unwrap();
+    assert_eq!(submission.kind, SubmissionKind::Experiment);
+    assert_eq!(submission.metadata, json!({}));
+    assert_eq!(submission.origin_agent_run_id, None);
+}
+
+#[test]
+fn control_submissions_do_not_consume_experiment_guardrail() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let connection = test.db.connect().unwrap();
+    let _ = connection.execute(
+        "ALTER TABLE submissions ADD COLUMN kind TEXT NOT NULL DEFAULT 'experiment'",
+        [],
+    );
+    connection
+        .execute(
+            "INSERT INTO submissions (submission_id, project_id, argv_json, created_at, pueue_task_id, task_signature, status, kind)
+             VALUES ('experiment', 'project-a', '[\"python\"]', 100, 1, 'experiment-task', 'accepted', 'experiment')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO submissions (submission_id, project_id, argv_json, created_at, pueue_task_id, task_signature, status, kind)
+             VALUES ('control', 'project-a', '[\"python\"]', 101, 2, 'control-task', 'accepted', 'control')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        SubmissionRepository::new(&test.db)
+            .count_started_or_accepted("project-a")
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn submissions_are_scoped_by_project_and_origin_agent_run() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-project-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-project-b");
+    let event_a = insert_event(&test.db, "project-a", "origin-a", 100);
+    let event_b = insert_event(&test.db, "project-b", "origin-b", 100);
+    let run_a = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_a,
+            None,
+            AgentRunStatus::Running,
+            100,
+            "/tmp/agent-a.log",
+        ))
+        .unwrap();
+    let run_b = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-b",
+            event_b,
+            None,
+            AgentRunStatus::Running,
+            100,
+            "/tmp/agent-b.log",
+        ))
+        .unwrap();
+    let repository = SubmissionRepository::new(&test.db);
+    repository
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "submission-a",
+            "project-a",
+            vec!["python".to_owned()],
+            100,
+            SubmissionKind::Experiment,
+            json!({"variant": "a"}),
+            Some(run_a.run_id),
+        ))
+        .unwrap();
+    repository
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "submission-b",
+            "project-b",
+            vec!["python".to_owned()],
+            100,
+            SubmissionKind::Control,
+            json!({"variant": "b"}),
+            Some(run_b.run_id),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .list_by_origin_agent_run("project-a", run_a.run_id, 10)
+            .unwrap()
+            .iter()
+            .map(|submission| submission.submission_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["submission-a"]
+    );
+    assert!(repository
+        .list_by_origin_agent_run("project-a", run_b.run_id, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn malformed_submission_metadata_fails_closed_when_reading_from_database() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let connection = test.db.connect().unwrap();
+    let _ = connection.execute(
+        "ALTER TABLE submissions ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+        [],
+    );
+    connection
+        .execute(
+            "INSERT INTO submissions (submission_id, project_id, argv_json, created_at, pueue_task_id, task_signature, status, metadata_json)
+             VALUES ('bad-metadata', 'project-a', '[\"python\"]', 100, NULL, NULL, 'pending', 'not-json')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(SubmissionRepository::new(&test.db)
+        .find_by_id("bad-metadata")
+        .is_err());
 }
 
 #[test]
@@ -470,7 +665,7 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(intervention_table_count, 1);
     assert_eq!(preserved_event_id, event_id);
     assert_eq!(preserved_project_id, "project-a");
@@ -1383,7 +1578,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     connection
         .execute(
             "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
@@ -1420,7 +1615,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 6);
+        assert_eq!(migrated_version, 7);
         assert_eq!(index_count, 1);
         drop(connection);
 
