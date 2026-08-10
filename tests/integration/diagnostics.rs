@@ -166,6 +166,26 @@ fn redact_sensitive_text_keeps_equals_inside_quoted_assignment_values_redacted()
 }
 
 #[test]
+fn redact_sensitive_text_redacts_structured_quoted_authorization_headers() {
+    let cases = [
+        r#"curl -H '{"Authorization":"Bearer SECRET"}'"#,
+        r#"curl -H '{"Authorization": "Bearer SECRET"}'"#,
+        r#"curl -H {"Authorization": Basic SECRET}"#,
+        r#"curl -H {"credential": first second}"#,
+    ];
+
+    for input in cases {
+        let rendered = redact_sensitive_text(input);
+        for secret in ["SECRET", "first", "second"] {
+            assert!(
+                !rendered.contains(secret),
+                "structured credential leaked {secret}: {rendered}"
+            );
+        }
+    }
+}
+
+#[test]
 fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
     let rendered =
         pueue_agent::output::bounded_redacted_text("prefix\x1b[31mhidden\x1b[0m\n\t\u{0007}suffix");
@@ -514,6 +534,30 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
     assert!(!rendered.contains("hidden-codex-transcript"));
     assert!(!rendered.contains("very-secret"));
     assert!(!rendered.contains("/Users/secret"));
+}
+
+#[test]
+fn status_json_task_command_projection_redacts_structured_authorization_headers() {
+    let harness = DiagnosticsHarness::new();
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(vec![PueueTask {
+            id: 41,
+            group: "pa-project".to_owned(),
+            command: r#"curl -H '{"Authorization":"Bearer SECRET"}' --lr 0.001"#.to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: None,
+            started_at: None,
+            ended_at: None,
+            result: None,
+        }])),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+
+    assert_eq!(value["pueue"]["active_tasks"][0]["command_summary"], "curl");
+    assert!(!rendered.contains("SECRET"));
 }
 
 #[test]

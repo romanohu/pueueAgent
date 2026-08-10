@@ -58,7 +58,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
     let mut redact_next = false;
     let mut redact_assignment_value = false;
     let mut assignment_redaction_emitted = false;
-    let mut redact_bearer_value = false;
+    let mut redact_structured_value = false;
 
     let mut index = 0;
     while index < tokens.len() {
@@ -78,7 +78,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
             continue;
         }
 
-        if redact_bearer_value {
+        if redact_structured_value {
             if token.value.eq_ignore_ascii_case("bearer") {
                 redacted.push(token.value.to_owned());
                 redact_next = true;
@@ -88,8 +88,10 @@ pub fn redact_sensitive_text(value: &str) -> String {
                 assignment_redaction_emitted = false;
             } else {
                 redacted.push("[REDACTED]".to_owned());
+                redact_assignment_value = true;
+                assignment_redaction_emitted = true;
             }
-            redact_bearer_value = false;
+            redact_structured_value = false;
             index += 1;
             continue;
         }
@@ -124,7 +126,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
         if let Some((key, _)) = token.value.split_once(':') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}:"));
-                redact_bearer_value = true;
+                redact_structured_value = true;
                 index += 1;
                 continue;
             }
@@ -220,7 +222,12 @@ fn is_sensitive_flag(value: &str) -> bool {
 }
 
 fn is_sensitive_key(value: &str) -> bool {
-    let key = value.to_ascii_uppercase().replace('-', "_");
+    let key = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .collect::<String>()
+        .to_ascii_uppercase()
+        .replace('-', "_");
     key.contains("TOKEN")
         || key.contains("SECRET")
         || key.contains("PASSWORD")
