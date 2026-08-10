@@ -17,7 +17,7 @@ use crate::{
         AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentTransition,
         IncidentUpdate, IntegrationEvent, InterventionStatus, NewAgentRun, NewEvent, NewIncident,
         NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
-        Project, Submission, SubmissionStatus, TaskObservation, TerminationRequest,
+        Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
         TerminationRequestStatus,
     },
     AppError,
@@ -1445,6 +1445,165 @@ fn validate_submission_origin_agent_run(
 
 pub struct AgentRunRepository<'db> {
     db: &'db Db,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionLineage {
+    pub submission_id: String,
+    pub kind: SubmissionKind,
+    pub status: SubmissionStatus,
+    pub pueue_task_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLineage {
+    pub event_id: Option<i64>,
+    pub event_kind: Option<EventKind>,
+    pub event_status: Option<EventStatus>,
+    pub run_id: Option<i64>,
+    pub mode: Option<String>,
+    pub run_status: Option<AgentRunStatus>,
+    pub started_at: i64,
+    pub submissions: Vec<SubmissionLineage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunLineageCursor {
+    pub started_at: i64,
+    pub run_id: i64,
+    pub submission_id: Option<String>,
+    pub task_id: Option<i64>,
+}
+
+impl RunLineageCursor {
+    pub fn new(
+        started_at: i64,
+        run_id: i64,
+        submission_id: Option<String>,
+        task_id: Option<i64>,
+    ) -> Self {
+        Self {
+            started_at,
+            run_id,
+            submission_id,
+            task_id,
+        }
+    }
+}
+
+impl RunLineage {
+    pub fn cursors(&self) -> Vec<RunLineageCursor> {
+        let run_id = self.run_id.unwrap_or_default();
+        if self.submissions.is_empty() {
+            return vec![RunLineageCursor::new(self.started_at, run_id, None, None)];
+        }
+        self.submissions
+            .iter()
+            .map(|submission| {
+                RunLineageCursor::new(
+                    self.started_at,
+                    run_id,
+                    Some(submission.submission_id.clone()),
+                    submission.pueue_task_id,
+                )
+            })
+            .collect()
+    }
+}
+
+pub struct RunLineageRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> RunLineageRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunLineage>, AppError> {
+        let limit = bounded_diagnostic_limit(limit) as usize;
+        let events = EventRepository::new(self.db).recent_events(project_id, limit)?;
+        let runs = AgentRunRepository::new(self.db).list_by_project(project_id, limit)?;
+        let submissions = SubmissionRepository::new(self.db).list_by_project(project_id, limit)?;
+        let mut events_by_id = std::collections::BTreeMap::new();
+        for event in events {
+            events_by_id.insert(event.event_id, event);
+        }
+        let mut lineages = Vec::new();
+        let mut run_ids = std::collections::BTreeSet::new();
+        for run in runs {
+            run_ids.insert(run.run_id);
+            let event = events_by_id.remove(&run.primary_event_id);
+            let run_submissions = submissions
+                .iter()
+                .filter(|submission| submission.origin_agent_run_id == Some(run.run_id))
+                .map(SubmissionLineage::from)
+                .collect();
+            lineages.push(RunLineage {
+                event_id: event
+                    .as_ref()
+                    .map(|event| event.event_id)
+                    .or(Some(run.primary_event_id)),
+                event_kind: event.as_ref().map(|event| event.kind),
+                event_status: event.as_ref().map(|event| event.status),
+                run_id: Some(run.run_id),
+                mode: Some(run.context_mode.as_str().to_owned()),
+                run_status: Some(run.status),
+                started_at: run.started_at,
+                submissions: run_submissions,
+            });
+        }
+        for event in events_by_id.into_values() {
+            lineages.push(RunLineage {
+                event_id: Some(event.event_id),
+                event_kind: Some(event.kind),
+                event_status: Some(event.status),
+                run_id: None,
+                mode: None,
+                run_status: None,
+                started_at: event.created_at,
+                submissions: Vec::new(),
+            });
+        }
+        for submission in submissions.into_iter().filter(|submission| {
+            submission.origin_agent_run_id.is_none()
+                || !run_ids.contains(&submission.origin_agent_run_id.unwrap_or_default())
+        }) {
+            lineages.push(RunLineage {
+                event_id: None,
+                event_kind: None,
+                event_status: None,
+                run_id: submission.origin_agent_run_id,
+                mode: None,
+                run_status: None,
+                started_at: submission.created_at,
+                submissions: vec![SubmissionLineage::from(&submission)],
+            });
+        }
+        lineages.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.run_id.cmp(&left.run_id))
+        });
+        lineages.truncate(limit);
+        Ok(lineages)
+    }
+}
+
+impl From<&Submission> for SubmissionLineage {
+    fn from(submission: &Submission) -> Self {
+        Self {
+            submission_id: submission.submission_id.clone(),
+            kind: submission.kind,
+            status: submission.status,
+            pueue_task_id: submission.pueue_task_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

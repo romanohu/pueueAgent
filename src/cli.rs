@@ -20,6 +20,7 @@ pub enum Command {
     Event(EventArgs),
     Status(StatusArgs),
     Events(EventsArgs),
+    Runs(RunsArgs),
     Inspect(InspectArgs),
     Explain(ExplainArgs),
     Doctor(DoctorArgs),
@@ -68,6 +69,20 @@ pub struct EventsArgs {
     pub limit: usize,
     #[arg(long)]
     pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct RunsArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub follow: bool,
+    #[arg(long, default_value_t = crate::runs::DEFAULT_RUN_LIST_LIMIT, value_name = "N")]
+    pub limit: usize,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
 }

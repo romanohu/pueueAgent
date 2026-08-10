@@ -21,6 +21,7 @@ use pueue_agent::{
         NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
         NewTerminationRequest, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
     },
+    runs::{collect_fresh, FollowCursor},
     AppError,
 };
 use rusqlite::{params, Connection};
@@ -809,6 +810,140 @@ fn submissions_are_scoped_by_project_and_origin_agent_run() {
         .list_by_origin_agent_run("project-a", run_b.run_id, 10)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn runs_repository_scopes_lineage_and_keeps_incomplete_submissions() {
+    let test = TestDatabase::new();
+    let root_a = test.project_root("runs-a");
+    let root_b = test.project_root("runs-b");
+    register_project(&test.db, "runs-a", &root_a, "pa-runs-a");
+    register_project(&test.db, "runs-b", &root_b, "pa-runs-b");
+    let event_a = insert_event(&test.db, "runs-a", "runs-a-event", 100);
+    let event_b = insert_event(&test.db, "runs-b", "runs-b-event", 100);
+    let run_a = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "runs-a",
+            event_a,
+            None,
+            AgentRunStatus::Completed,
+            101,
+            "/tmp/a.log",
+        ))
+        .unwrap();
+    let run_b = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "runs-b",
+            event_b,
+            None,
+            AgentRunStatus::Completed,
+            102,
+            "/tmp/b.log",
+        ))
+        .unwrap();
+    let submissions = SubmissionRepository::new(&test.db);
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "runs-a-accepted",
+            "runs-a",
+            vec!["python".to_owned()],
+            103,
+            SubmissionKind::Experiment,
+            json!({"prompt": "never project"}),
+            Some(run_a.run_id),
+        ))
+        .unwrap();
+    submissions
+        .mark_accepted("runs-a-accepted", 41, "runs-a-task")
+        .unwrap();
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "runs-a-pending",
+            "runs-a",
+            vec!["python".to_owned()],
+            104,
+            SubmissionKind::Control,
+            json!({}),
+            Some(run_a.run_id),
+        ))
+        .unwrap();
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "runs-b-accepted",
+            "runs-b",
+            vec!["python".to_owned()],
+            105,
+            SubmissionKind::Experiment,
+            json!({}),
+            Some(run_b.run_id),
+        ))
+        .unwrap();
+    submissions
+        .mark_accepted("runs-b-accepted", 99, "runs-b-task")
+        .unwrap();
+
+    let lineages = pueue_agent::db::RunLineageRepository::new(&test.db)
+        .list_by_project("runs-a", 8)
+        .unwrap();
+    assert_eq!(lineages.len(), 1);
+    assert_eq!(lineages[0].event_id, Some(event_a));
+    assert_eq!(lineages[0].run_id, Some(run_a.run_id));
+    assert_eq!(lineages[0].event_kind, Some(EventKind::TaskFinished));
+    assert_eq!(lineages[0].submissions.len(), 2);
+    assert_eq!(lineages[0].submissions[0].submission_id, "runs-a-pending");
+    assert_eq!(lineages[0].submissions[0].pueue_task_id, None);
+    assert_eq!(lineages[0].submissions[1].pueue_task_id, Some(41));
+
+    let readonly = Db::open_read_only(&test.path).unwrap();
+    let before_schema_version: i64 = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    let mut cursor = FollowCursor::default();
+    let initial = collect_fresh(
+        pueue_agent::db::RunLineageRepository::new(&readonly)
+            .list_by_project("runs-a", 8)
+            .unwrap(),
+        &mut cursor,
+        8,
+    );
+    assert_eq!(initial.len(), 1);
+    let repeated = collect_fresh(
+        pueue_agent::db::RunLineageRepository::new(&readonly)
+            .list_by_project("runs-a", 8)
+            .unwrap(),
+        &mut cursor,
+        8,
+    );
+    assert!(repeated.is_empty());
+    assert!(readonly
+        .connect()
+        .unwrap()
+        .execute("UPDATE projects SET paused = 1", [])
+        .is_err());
+    let after_schema_version: i64 = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after_schema_version, before_schema_version);
+}
+
+#[test]
+fn follow_cursor_deduplicates_orders_and_respects_limit() {
+    let mut cursor = FollowCursor::default();
+    let first = pueue_agent::db::RunLineageCursor::new(100, 1, None, None);
+    let second = pueue_agent::db::RunLineageCursor::new(101, 2, Some("sub-2".to_owned()), Some(42));
+    let duplicate = first.clone();
+
+    assert!(cursor.observe(&second));
+    assert!(cursor.observe(&first));
+    assert!(!cursor.observe(&duplicate));
+    assert_eq!(cursor.take_ordered(1), vec![first]);
+    assert_eq!(cursor.take_ordered(8), vec![second]);
 }
 
 #[test]

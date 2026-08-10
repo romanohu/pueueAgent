@@ -56,6 +56,31 @@ fn wake_help_describes_bounded_operator_wake_options() {
 }
 
 #[test]
+fn runs_help_and_limit_are_bounded() {
+    let help = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["runs", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--json"));
+    assert!(text.contains("--follow"));
+    assert!(text.contains("--limit"));
+
+    for value in ["0", "129"] {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .args(["runs", "--limit", value])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("runs limit must be between 1 and 128"));
+    }
+}
+
+#[test]
 fn formatter_never_emits_ansi_for_json_or_piped_output() {
     use pueue_agent::output::{OutputMode, OutputTarget};
 
@@ -416,8 +441,14 @@ use std::fs;
 
 use pueue_agent::{
     config,
-    db::{Db, EventRepository, IncidentRepository, ProjectRepository, TaskObservationRepository},
-    models::{EventKind, NewEvent, NewIncident, NewProject, NewTaskObservation},
+    db::{
+        AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
+        SubmissionRepository, TaskObservationRepository,
+    },
+    models::{
+        AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewIncident, NewProject, NewSubmission,
+        NewTaskObservation,
+    },
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -463,5 +494,102 @@ impl DiagnosticsCliHarness {
             .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
             .current_dir(&self.root);
         command
+    }
+}
+
+#[test]
+fn runs_cli_emits_bounded_json_and_human_lineage_without_sensitive_fields() {
+    let harness = DiagnosticsCliHarness::new();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            &harness.project_id,
+            EventKind::TaskFailed,
+            "runs-cli-event",
+            serde_json::json!({"prompt": "hidden prompt", "metadata": {"transcript": "hidden transcript"}}),
+            100,
+            100,
+        ))
+        .unwrap();
+    let run = AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::new(
+            &harness.project_id,
+            event.event_id,
+            None,
+            AgentRunStatus::Completed,
+            101,
+            "/tmp/hidden-agent.log",
+        ))
+        .unwrap();
+    let submissions = SubmissionRepository::new(&harness.db);
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "runs-cli-submission",
+            &harness.project_id,
+            vec![
+                "python".to_owned(),
+                "train.py".to_owned(),
+                "--prompt".to_owned(),
+                "hidden command".to_owned(),
+            ],
+            102,
+            pueue_agent::models::SubmissionKind::Experiment,
+            serde_json::json!({"transcript": "hidden submission metadata"}),
+            Some(run.run_id),
+        ))
+        .unwrap();
+    submissions
+        .mark_accepted("runs-cli-submission", 41, "runs-cli-task")
+        .unwrap();
+
+    let json = harness
+        .command()
+        .args(["runs", "--json", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json_text = String::from_utf8_lossy(&json.stdout);
+    assert!(json_text.starts_with('{'));
+    let body: Value = serde_json::from_str(&json_text).unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["runs"][0]["event"]["kind"], "task_failed");
+    assert_eq!(body["runs"][0]["submissions"][0]["kind"], "experiment");
+    assert_eq!(body["runs"][0]["submissions"][0]["task_id"], 41);
+
+    let human = harness
+        .command()
+        .args(["runs", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_text = String::from_utf8_lossy(&human.stdout);
+    for expected in ["pueue-agent runs", "run=", "event=", "sub=", "task="] {
+        assert!(
+            human_text.contains(expected),
+            "missing {expected}: {human_text}"
+        );
+    }
+    for leaked in [
+        "hidden prompt",
+        "hidden transcript",
+        "hidden submission metadata",
+        "hidden command",
+        "/tmp/hidden-agent.log",
+    ] {
+        assert!(
+            !json_text.contains(leaked),
+            "JSON leaked {leaked}: {json_text}"
+        );
+        assert!(
+            !human_text.contains(leaked),
+            "human output leaked {leaked}: {human_text}"
+        );
     }
 }

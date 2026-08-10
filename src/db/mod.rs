@@ -9,7 +9,8 @@ use crate::AppError;
 
 pub use repositories::{
     AgentRunRecovery, AgentRunRepository, EventRepository, IncidentRepository,
-    IntegrationEventRepository, InterventionRepository, ProjectRepository, SubmissionRepository,
+    IntegrationEventRepository, InterventionRepository, ProjectRepository, RunLineage,
+    RunLineageCursor, RunLineageRepository, SubmissionLineage, SubmissionRepository,
     TaskObservationRepository, TerminationRequestRepository,
 };
 

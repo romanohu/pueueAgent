@@ -19,6 +19,7 @@ pub mod paths;
 pub mod project;
 pub mod pueue;
 pub mod reconcile;
+pub mod runs;
 pub mod scheduler;
 pub mod service;
 pub mod status;

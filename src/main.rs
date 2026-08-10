@@ -45,6 +45,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Event(args) => commands::event(args),
         Command::Status(args) => commands::status(args).await,
         Command::Events(args) => commands::events(args),
+        Command::Runs(args) => commands::runs(args).await,
         Command::Inspect(args) => commands::inspect(args),
         Command::Explain(args) => commands::explain(args),
         Command::Doctor(args) => commands::doctor(args).await,
@@ -63,7 +64,8 @@ mod commands {
         agent::{AgentRunner, AgentRunnerConfig},
         cli::{
             DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs, WakeArgs,
+            InspectArgs, ProjectArgs, RunsArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs,
+            WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -200,6 +202,19 @@ mod commands {
         let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
         let filter = EventFilter::new(args.kind, args.status, limit);
         println!("{}", render_events(&db, &project, &filter, args.json)?);
+        Ok(())
+    }
+
+    pub async fn runs(args: RunsArgs) -> Result<(), AppError> {
+        let limit = pueue_agent::runs::validate_limit(args.limit)?;
+        let (db, project, _) = resolve_project_read_only(args.project_root, args.pueue_config)?;
+        if args.follow {
+            return pueue_agent::runs::follow_runs(db.path(), &project, limit, args.json).await;
+        }
+        println!(
+            "{}",
+            pueue_agent::runs::render_runs(&db, &project, limit, args.json)?
+        );
         Ok(())
     }
 
