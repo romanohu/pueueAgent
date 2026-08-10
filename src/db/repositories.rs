@@ -1471,6 +1471,7 @@ pub struct RunLineage {
 pub struct RunLineageCursor {
     pub started_at: i64,
     pub run_id: i64,
+    pub event_id: Option<i64>,
     pub submission_id: Option<String>,
     pub task_id: Option<i64>,
 }
@@ -1485,18 +1486,37 @@ impl RunLineageCursor {
         Self {
             started_at,
             run_id,
+            event_id: None,
             submission_id,
             task_id,
+        }
+    }
+
+    pub fn event_only(started_at: i64, event_id: i64) -> Self {
+        Self {
+            started_at,
+            run_id: 0,
+            event_id: Some(event_id),
+            submission_id: None,
+            task_id: None,
         }
     }
 }
 
 impl RunLineage {
+    pub fn root_cursor(&self) -> Option<RunLineageCursor> {
+        match (self.run_id, self.event_id) {
+            (Some(run_id), _) => Some(RunLineageCursor::new(self.started_at, run_id, None, None)),
+            (None, Some(event_id)) => Some(RunLineageCursor::event_only(self.started_at, event_id)),
+            (None, None) => None,
+        }
+    }
+
     pub fn cursors(&self) -> Vec<RunLineageCursor> {
         let run_id = self.run_id.unwrap_or_default();
         let mut cursors = Vec::new();
-        if self.run_id.is_some() || self.event_id.is_some() {
-            cursors.push(RunLineageCursor::new(self.started_at, run_id, None, None));
+        if let Some(cursor) = self.root_cursor() {
+            cursors.push(cursor);
         }
         cursors.extend(self.submissions.iter().map(|submission| {
             RunLineageCursor::new(

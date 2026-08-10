@@ -141,16 +141,8 @@ pub fn collect_fresh(
 ) -> Vec<RunLineage> {
     let mut cursor_sources = BTreeMap::new();
     for (lineage_index, lineage) in lineages.iter().enumerate() {
-        if lineage.run_id.is_some() || lineage.event_id.is_some() {
-            cursor_sources.insert(
-                RunLineageCursor::new(
-                    lineage.started_at,
-                    lineage.run_id.unwrap_or_default(),
-                    None,
-                    None,
-                ),
-                (lineage_index, None),
-            );
+        if let Some(cursor) = lineage.root_cursor() {
+            cursor_sources.insert(cursor, (lineage_index, None));
         }
         for (submission_index, submission) in lineage.submissions.iter().enumerate() {
             cursor_sources.insert(
@@ -175,7 +167,9 @@ pub fn collect_fresh(
             continue;
         };
         if let Some((_, lineage)) = fresh.iter_mut().find(|(first_cursor, _)| {
-            first_cursor.started_at == value.started_at && first_cursor.run_id == value.run_id
+            first_cursor.started_at == value.started_at
+                && first_cursor.run_id == value.run_id
+                && first_cursor.event_id == value.event_id
         }) {
             if let Some(submission_index) = submission_index {
                 lineage
@@ -319,6 +313,19 @@ mod tests {
         }
     }
 
+    fn event_only_lineage(event_id: i64, started_at: i64) -> RunLineage {
+        RunLineage {
+            event_id: Some(event_id),
+            event_kind: None,
+            event_status: None,
+            run_id: None,
+            mode: None,
+            run_status: None,
+            started_at,
+            submissions: Vec::new(),
+        }
+    }
+
     #[test]
     fn collect_fresh_consumes_pending_cursors_in_order_and_limit_batches() {
         let first = lineage(1, 10, &["sub-a", "sub-b"]);
@@ -343,5 +350,19 @@ mod tests {
         assert_eq!(third_batch[0].submissions[0].submission_id, "sub-c");
 
         assert!(collect_fresh(vec![second], &mut cursor, 2).is_empty());
+    }
+
+    #[test]
+    fn collect_fresh_keeps_same_second_event_only_lineages_distinct() {
+        let first = event_only_lineage(41, 100);
+        let second = event_only_lineage(42, 100);
+        let mut cursor = FollowCursor::default();
+
+        let fresh = collect_fresh(vec![second, first], &mut cursor, 8);
+
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh[0].event_id, Some(41));
+        assert_eq!(fresh[1].event_id, Some(42));
+        assert!(collect_fresh(Vec::new(), &mut cursor, 8).is_empty());
     }
 }
