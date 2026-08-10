@@ -13,6 +13,7 @@ use crate::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
+    output::redact_sensitive_text,
     pueue::PueueTask,
     service::{callback_command, ServicePaths, ServiceStatus},
     status::{PueueSnapshot, StatusInput},
@@ -1356,7 +1357,7 @@ fn safe_error_summary(category: &'static str) -> String {
 }
 
 fn bounded_text(value: &str) -> String {
-    let normalized = value
+    let normalized = redact_sensitive_text(value)
         .chars()
         .map(|character| {
             if character.is_control() {

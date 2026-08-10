@@ -28,6 +28,14 @@ fn help_lists_diagnostics_commands_and_status_options() {
 }
 
 #[test]
+fn formatter_never_emits_ansi_for_json_or_piped_output() {
+    use pueue_agent::output::{OutputMode, OutputTarget};
+
+    assert!(!OutputMode::Json.uses_ansi(OutputTarget::Terminal));
+    assert!(!OutputMode::Human.uses_ansi(OutputTarget::Pipe));
+}
+
+#[test]
 fn events_rejects_limits_outside_the_diagnostic_bound() {
     let zero = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()

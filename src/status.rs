@@ -6,6 +6,7 @@ use crate::{
     config,
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
     models::{Event, Project},
+    output::{bounded_redacted_text, format_state, render_id},
     pueue::PueueTask,
     service::ServiceStatus,
     AppError,
@@ -62,15 +63,15 @@ pub fn render_project_status(
             lines.push(format!("active_tasks: {}", active.len()));
             for task in active {
                 lines.push(format!(
-                    "task {} {} {}",
-                    task.id,
-                    task.state.to_ascii_lowercase(),
-                    task.command
+                    "{} {} {}",
+                    render_id("task", task.id),
+                    format_state(&task.state),
+                    bounded_redacted_text(&task.command)
                 ));
             }
         }
         PueueSnapshot::Error(message) => {
-            lines.push(format!("pueue: error: {message}"));
+            lines.push(format!("pueue: error: {}", bounded_redacted_text(message)));
         }
     }
 
@@ -148,9 +149,7 @@ pub fn render_project_status_compact(
                 .collect::<Vec<_>>();
             let active = project_tasks
                 .iter()
-                .filter(|task| {
-                    !task.is_terminal() && !task.state.eq_ignore_ascii_case("queued")
-                })
+                .filter(|task| !task.is_terminal() && !task.state.eq_ignore_ascii_case("queued"))
                 .count();
             let queued = project_tasks
                 .iter()
@@ -158,7 +157,9 @@ pub fn render_project_status_compact(
                 .count();
             lines.push(format!(
                 "pueue: total={} active={} queued={}",
-                project_tasks.len(), active, queued
+                project_tasks.len(),
+                active,
+                queued
             ));
         }
         PueueSnapshot::Error(_) => lines.push("pueue: error".to_owned()),
@@ -341,7 +342,7 @@ fn failed_termination_errors(db: &Db, project_id: &str) -> Result<Vec<String>, A
             let last_error: Option<String> = row.get(1)?;
             Ok(format!(
                 "#{request_id}:{}",
-                last_error.unwrap_or_else(|| "no detail".to_owned())
+                bounded_redacted_text(&last_error.unwrap_or_else(|| "no detail".to_owned()))
             ))
         })
         .map_err(|source| AppError::Database {

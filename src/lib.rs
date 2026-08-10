@@ -14,6 +14,7 @@ pub mod init;
 pub mod interventions;
 pub mod logs;
 pub mod models;
+pub mod output;
 pub mod paths;
 pub mod project;
 pub mod pueue;

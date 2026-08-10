@@ -13,6 +13,7 @@ use pueue_agent::{
         AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewIncident, NewProject,
         NewTaskObservation, NewTerminationRequest, TerminationRequestStatus,
     },
+    output::redact_sensitive_text,
     pueue::PueueTask,
     service::{ServicePaths, ServiceStatus},
     status::{render_project_status_compact, PueueSnapshot, StatusInput},
@@ -56,6 +57,32 @@ impl DiagnosticsHarness {
             pueue,
         }
     }
+}
+
+#[test]
+fn redact_sensitive_text_removes_flag_bearer_and_credential_values() {
+    let rendered = redact_sensitive_text(
+        "train --token very-secret --api-key abc123 --password hunter2 --secret hidden \
+         Authorization: Bearer bearer-secret AWS_SECRET_ACCESS_KEY=environment-secret --lr 0.001",
+    );
+
+    for secret in [
+        "very-secret",
+        "abc123",
+        "hunter2",
+        "hidden",
+        "bearer-secret",
+        "environment-secret",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "redaction leaked {secret}: {rendered}"
+        );
+    }
+    assert_eq!(
+        rendered,
+        "train --token [REDACTED] --api-key [REDACTED] --password [REDACTED] --secret [REDACTED] Authorization: Bearer [REDACTED] AWS_SECRET_ACCESS_KEY=[REDACTED] --lr 0.001"
+    );
 }
 
 #[test]
@@ -178,10 +205,20 @@ fn compact_status_contains_only_bounded_operational_summaries() {
         "guardrails:",
         "summary:",
     ] {
-        assert!(rendered.contains(section), "missing section {section}: {rendered}");
+        assert!(
+            rendered.contains(section),
+            "missing section {section}: {rendered}"
+        );
     }
-    for secret in ["hidden prompt payload", "python train.py", "/tmp/hidden-prompt.log"] {
-        assert!(!rendered.contains(secret), "compact output leaked {secret}: {rendered}");
+    for secret in [
+        "hidden prompt payload",
+        "python train.py",
+        "/tmp/hidden-prompt.log",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "compact output leaked {secret}: {rendered}"
+        );
     }
 }
 
