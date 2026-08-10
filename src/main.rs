@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{error::ErrorKind, Parser};
 use pueue_agent::{
     cli::{Cli, Command},
     output::bounded_redacted_text,
@@ -13,7 +13,12 @@ async fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => {
             let exit_code = error.exit_code();
-            let _ = error.print();
+            match error.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    let _ = error.print();
+                }
+                _ => eprintln!("{}", bounded_redacted_text(&error.to_string())),
+            }
             return if exit_code == 0 {
                 ExitCode::SUCCESS
             } else {

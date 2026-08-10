@@ -59,6 +59,46 @@ fn events_rejects_limits_outside_the_diagnostic_bound() {
 }
 
 #[test]
+fn invalid_cli_parse_errors_redact_and_bound_values_while_help_stays_complete() {
+    let secret = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args([
+            "events",
+            "--limit",
+            "AWS_SECRET_ACCESS_KEY=CLI_PARSE_SECRET",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(secret.status.code(), Some(2));
+    let secret_stderr = String::from_utf8_lossy(&secret.stderr);
+    assert!(!secret_stderr.contains("CLI_PARSE_SECRET"));
+    assert!(secret_stderr.len() <= 241);
+    assert!(secret_stderr.contains("invalid value"));
+
+    let long_value = format!("AWS_SECRET_ACCESS_KEY={}", "x".repeat(1_000));
+    let long = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["events", "--limit", &long_value])
+        .output()
+        .unwrap();
+
+    assert_eq!(long.status.code(), Some(2));
+    let long_stderr = String::from_utf8_lossy(&long.stderr);
+    assert!(long_stderr.len() <= 241);
+    assert!(!long_stderr.contains(&"x".repeat(1_000)));
+
+    let help = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("events"));
+}
+
+#[test]
 fn events_cli_renders_the_project_scoped_event_projection() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("project");
