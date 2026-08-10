@@ -1,7 +1,8 @@
 use std::{
     env,
     ffi::OsString,
-    fs,
+    fs::File,
+    io::Read,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -166,16 +167,11 @@ pub fn load_metadata(
                 message: "--metadata and --metadata-json cannot be used together",
             });
         }
-        (Some(path), None) => fs::read(path).map_err(|source| AppError::Io {
-            operation: "read submission metadata",
-            source,
-        })?,
+        (Some(path), None) => read_metadata_file(path)?,
         (None, Some(json)) => json.as_bytes().to_vec(),
         (None, None) => return Ok(Value::Object(Default::default())),
     };
-    if input.len() > MAX_METADATA_BYTES {
-        return Err(metadata_validation("must not exceed 16 KiB"));
-    }
+    validate_metadata_bytes(&input)?;
     let parsed = serde_json::from_slice(&input).map_err(|source| AppError::Serialization {
         operation: "parse submission metadata",
         source,
@@ -283,10 +279,38 @@ fn validate_active_origin(
 }
 
 fn validate_metadata(metadata: &Value) -> Result<(), AppError> {
+    let serialized = serde_json::to_vec(metadata).map_err(|source| AppError::Serialization {
+        operation: "serialize submission metadata",
+        source,
+    })?;
+    validate_metadata_bytes(&serialized)?;
     if !metadata.is_object() {
         return Err(metadata_validation("must be a JSON object"));
     }
     validate_metadata_value(metadata, 1)
+}
+
+fn read_metadata_file(path: &Path) -> Result<Vec<u8>, AppError> {
+    let file = File::open(path).map_err(|source| AppError::Io {
+        operation: "open submission metadata",
+        source,
+    })?;
+    let mut input = Vec::with_capacity(MAX_METADATA_BYTES + 1);
+    file.take((MAX_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(|source| AppError::Io {
+            operation: "read submission metadata",
+            source,
+        })?;
+    validate_metadata_bytes(&input)?;
+    Ok(input)
+}
+
+fn validate_metadata_bytes(input: &[u8]) -> Result<(), AppError> {
+    if input.len() > MAX_METADATA_BYTES {
+        return Err(metadata_validation("must not exceed 16 KiB"));
+    }
+    Ok(())
 }
 
 fn validate_metadata_value(value: &Value, depth: usize) -> Result<(), AppError> {

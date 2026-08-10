@@ -525,8 +525,11 @@ fn metadata_loader_rejects_conflicting_or_out_of_bounds_values() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("metadata.json");
     fs::write(&path, r#"{"from":"file"}"#).unwrap();
+    let oversized_path = temp.path().join("oversized-metadata.json");
+    fs::write(&oversized_path, "x".repeat(16 * 1024 + 1)).unwrap();
 
     assert!(submit::load_metadata(Some(&path), Some(r#"{"inline":true}"#)).is_err());
+    assert!(submit::load_metadata(Some(&oversized_path), None).is_err());
     assert!(submit::load_metadata(None, Some("[]")).is_err());
     assert!(submit::load_metadata(
         None,
@@ -563,6 +566,46 @@ fn metadata_loader_rejects_conflicting_or_out_of_bounds_values() {
         Some(&format!(r#"{{"value":"{}"}}"#, "x".repeat(16 * 1024)))
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn run_with_options_rejects_oversized_metadata_before_pueue_add() {
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let args = vec![OsString::from("python"), OsString::from("train.py")];
+    let oversized = serde_json::Value::Object(
+        (0..32)
+            .map(|index| {
+                (
+                    format!("key-{index}"),
+                    serde_json::Value::String("x".repeat(1024)),
+                )
+            })
+            .collect(),
+    );
+
+    let error = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Experiment, oversized, None),
+        &fake,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "submit.metadata",
+            ..
+        }
+    ));
+    assert!(fake.last_add_args().is_empty());
+    assert!(SubmissionRepository::new(&harness.db)
+        .find_unreconciled("project-a")
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

@@ -143,6 +143,15 @@ wait_for_task_terminal() {
   fail "task $task_id did not become terminal"
 }
 
+submission_task_id() {
+  summary="$1"
+  task_id="$(printf '%s\n' "$summary" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^task=[0-9]+$/) { sub(/^task=/, "", $i); print $i } }')"
+  case "$task_id" in
+    ''|*[!0-9]*) fail "submit did not emit exactly one numeric task field: $summary" ;;
+  esac
+  printf '%s\n' "$task_id"
+}
+
 write_config() {
   root="$1"
   project_id="$2"
@@ -296,7 +305,8 @@ stop_daemon
 
 # Callback + reconciliation deduplicate, and a missed callback remains durable while paused.
 "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B"
-task_ok="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+task_ok="$(submission_task_id "$submit_summary")"
 wait_for_task_state "$task_ok" Done
 "$PA_BIN" event callback --group "$GROUP_B" --task-id "$task_ok" \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
@@ -309,7 +319,8 @@ stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND kind = 'task_finished'")" = "1" ] \
   || fail "duplicate callback plus reconciliation created duplicate events"
 
-task_missed="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+task_missed="$(submission_task_id "$submit_summary")"
 wait_for_task_state "$task_missed" Done
 start_daemon
 wait_for_sql "SELECT COUNT(*) FROM task_observations WHERE project_id = '$PROJECT_ID_B'" "2" \
@@ -321,7 +332,8 @@ stop_daemon
   || fail "pause did not preserve pending callback events"
 
 # A persistent fatal task log opens one incident and requests exactly one Pueue kill.
-task_bad="$(cd "$PROJECT_A" && "$PA_BIN" submit -- /bin/sh -c 'sleep 30')"
+submit_summary="$(cd "$PROJECT_A" && "$PA_BIN" submit -- /bin/sh -c 'sleep 30')"
+task_bad="$(submission_task_id "$submit_summary")"
 wait_for_task_state "$task_bad" Running
 printf 'step=10 FATAL_LOSS detected\n' > "$PROJECT_A/.pueue-agent/logs/$task_bad.log"
 start_daemon
