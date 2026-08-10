@@ -40,10 +40,16 @@ pub fn render_project_status(
         "daemon: {}",
         service_status_label(input.daemon_health)
     ));
-    lines.push(format!("project: {}", project.project_id));
+    lines.push(format!(
+        "project: {}",
+        bounded_redacted_text(&project.project_id)
+    ));
     let root_path = project.root_path.to_string_lossy();
     lines.push(format!("root: {}", bounded_redacted_text(&root_path)));
-    lines.push(format!("group: {}", project.pueue_group));
+    lines.push(format!(
+        "group: {}",
+        bounded_redacted_text(&project.pueue_group)
+    ));
     lines.push(format!("enabled: {}", project.enabled));
     lines.push(format!("paused: {}", project.paused));
     lines.push(format!(

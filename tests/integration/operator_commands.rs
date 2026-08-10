@@ -416,6 +416,38 @@ fn status_human_bounds_and_redacts_project_root_path() {
 }
 
 #[test]
+fn status_human_bounds_and_redacts_project_and_group() {
+    let harness = OperatorHarness::new();
+    let mut project = harness.project();
+    project.project_id = format!(
+        "AWS_SECRET_ACCESS_KEY=PROJECT_SECRET {}",
+        "project".repeat(160)
+    );
+    project.pueue_group = format!("ACCESS_KEY=GROUP_SECRET {}", "group".repeat(160));
+
+    let output = status::render_project_status(
+        &harness.db,
+        &project,
+        &harness.status_input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+
+    let project_line = output
+        .lines()
+        .find(|line| line.starts_with("project: "))
+        .unwrap();
+    assert!(project_line.len() <= "project: ".len() + 243);
+    assert!(!project_line.contains("PROJECT_SECRET"));
+
+    let group_line = output
+        .lines()
+        .find(|line| line.starts_with("group: "))
+        .unwrap();
+    assert!(group_line.len() <= "group: ".len() + 243);
+    assert!(!group_line.contains("GROUP_SECRET"));
+}
+
+#[test]
 fn status_text_output_is_byte_compatible_for_an_active_project() {
     let harness = OperatorHarness::new();
     let project = harness.project();

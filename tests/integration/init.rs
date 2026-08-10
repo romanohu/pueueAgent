@@ -32,6 +32,27 @@ fn init_creates_toml_state_and_instructions() {
 }
 
 #[test]
+fn init_bounds_and_redacts_successful_project_root_output() {
+    let temp = TempDir::new().unwrap();
+    let root = temp
+        .path()
+        .join(format!("prefix-{}", "p".repeat(80)))
+        .join(format!("segment-{}", "s".repeat(80)))
+        .join("AWS_SECRET_ACCESS_KEY=AKIA_INIT_SECRET")
+        .join(format!("tail-{}", "t".repeat(80)));
+    fs::create_dir_all(&root).unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert!(line.len() <= "initialized: ".len() + 243);
+    assert!(line.contains("[path]"));
+    assert!(!line.contains("AWS_SECRET_ACCESS_KEY"));
+    assert!(!line.contains("AKIA_INIT_SECRET"));
+}
+
+#[test]
 fn same_basename_projects_receive_distinct_ids_and_groups() {
     let temp = TempDir::new().unwrap();
     let first = temp.path().join("one/shared");

@@ -88,7 +88,8 @@ mod commands {
             })?,
         };
         let project_root = pueue_agent::init::run(&project_root)?;
-        println!("initialized: {}", project_root.display());
+        let project_root = project_root.to_string_lossy();
+        println!("initialized: {}", bounded_redacted_text(&project_root));
         Ok(())
     }
 
