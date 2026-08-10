@@ -92,12 +92,13 @@ fn open_connection(path: &Path) -> Result<Connection, AppError> {
 }
 
 fn open_read_only_connection(path: &Path) -> Result<Connection, AppError> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
-        |source| AppError::Database {
-            operation: "open SQLite database read-only",
-            source,
-        },
-    )?;
+    let connection =
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|source| {
+            AppError::Database {
+                operation: "open SQLite database read-only",
+                source,
+            }
+        })?;
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|source| AppError::Database {

@@ -430,9 +430,7 @@ fn status_json_bounds_and_sanitizes_pueue_state() {
     )
     .unwrap();
     let value: Value = serde_json::from_str(&rendered).unwrap();
-    let state = value["pueue"]["active_tasks"][0]["state"]
-        .as_str()
-        .unwrap();
+    let state = value["pueue"]["active_tasks"][0]["state"].as_str().unwrap();
     assert!(state.len() <= 240);
     assert!(state.chars().all(|character| !character.is_control()));
 }
@@ -789,7 +787,7 @@ fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
         .insert_pending("project-b", "foreign expired intervention", 100)
         .unwrap();
     InterventionRepository::new(&harness.db)
-        .reserve_pending("project-b", "foreign-intervention-token", 100, 99, 1, 1024)
+        .reserve_pending("project-b", "foreign-intervention-token", 100, 199, 1, 1024)
         .unwrap();
     let foreign_incident = IncidentRepository::new(&harness.db)
         .upsert_active(&NewIncident::new(
@@ -837,7 +835,7 @@ fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
             service: Ok(ServiceStatus::Stopped),
             callback: Ok(None),
         },
-        100,
+        200,
         true,
     )
     .unwrap();

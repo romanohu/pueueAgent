@@ -464,9 +464,7 @@ fn ensure_intervention_insertion_sequence(
     )
 }
 
-fn ensure_agent_run_launch_gate(
-    transaction: &rusqlite::Transaction<'_>,
-) -> Result<(), AppError> {
+fn ensure_agent_run_launch_gate(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
     let has_agent_runs: bool = transaction
         .query_row(
             "SELECT EXISTS(

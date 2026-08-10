@@ -1169,7 +1169,10 @@ fn confirmed_gate_release_does_not_requeue_applied_interventions_on_recovery() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(intervention_state, (InterventionStatus::Applied, Some(run.run_id)));
+    assert_eq!(
+        intervention_state,
+        (InterventionStatus::Applied, Some(run.run_id))
+    );
     assert_eq!(run_state, (AgentRunStatus::Failed, "released".to_owned()));
 }
 

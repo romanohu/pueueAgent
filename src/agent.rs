@@ -65,7 +65,11 @@ exec "$@" >>"$log_path" 2>&1
 "#;
 
 #[cfg(unix)]
-fn configure_launch_gate(process: &mut Command, log_path: &std::path::Path, command: &AgentCommand) {
+fn configure_launch_gate(
+    process: &mut Command,
+    log_path: &std::path::Path,
+    command: &AgentCommand,
+) {
     process
         .arg("-c")
         .arg(LAUNCH_GATE_SCRIPT)
@@ -369,13 +373,7 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.finish(
-                    run.run_id,
-                    AgentRunStatus::Failed,
-                    now,
-                    None,
-                    Some(&reason),
-                )?;
+                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
                 return Err(error);
             }
         }
@@ -386,13 +384,7 @@ impl AgentRunner {
                     operation: "take spawned agent process",
                 };
                 let reason = error.to_string();
-                repository.finish(
-                    run.run_id,
-                    AgentRunStatus::Failed,
-                    now,
-                    None,
-                    Some(&reason),
-                )?;
+                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
                 return Err(error);
             }
         };

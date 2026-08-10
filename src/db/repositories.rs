@@ -1763,7 +1763,9 @@ impl<'db> AgentRunRepository<'db> {
                    AND status IN ('reserved', 'applied')",
                 params![project_id, run_id],
             )
-            .map_err(database_error("requeue interventions after launch gate failure"))?;
+            .map_err(database_error(
+                "requeue interventions after launch gate failure",
+            ))?;
         transaction
             .commit()
             .map_err(database_error("commit pre-release agent run failure"))?;
