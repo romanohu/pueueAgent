@@ -181,6 +181,12 @@ pub fn redact_sensitive_text(value: &str) -> String {
             continue;
         }
 
+        if is_bare_secret_token(&token.value) {
+            redacted.push("[REDACTED]".to_owned());
+            index += 1;
+            continue;
+        }
+
         redacted.push(token.value.to_owned());
         index += 1;
     }
@@ -270,6 +276,18 @@ fn is_sensitive_marker(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+fn is_bare_secret_token(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let prefix = ["ghp_", "github_pat_", "sk-", "xoxb-", "xoxp-", "akia"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    prefix
+        && value.len() >= 20
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 fn is_path_token(token: &str) -> bool {

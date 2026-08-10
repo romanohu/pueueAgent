@@ -22,3 +22,4 @@
 ## Remaining concerns
 
 - The event CHECK migration uses SQLite schema-text migration to preserve existing foreign-key relationships; legacy upgrade/reopen tests cover it.
+- `cargo fmt --check` retains the pre-existing Task 1 failure at `tests/integration/database.rs:282`; it was not changed.

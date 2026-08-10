@@ -21,6 +21,19 @@ use pueue_agent::{
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[test]
+fn bounded_redaction_removes_bare_provider_tokens_but_keeps_normal_reason() {
+    let value = pueue_agent::output::bounded_redacted_text(
+        "inspect ghp_abcdefghijklmnopqrstuvwxyz123456 and sk-abcdefghijklmnopqrstuvwxyz123456",
+    );
+    assert!(!value.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(!value.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(
+        pueue_agent::output::bounded_redacted_text("inspect current loss")
+            .contains("inspect current loss")
+    );
+}
+
 struct DiagnosticsHarness {
     _temp: TempDir,
     db: Db,
