@@ -263,6 +263,58 @@ fn compact_status_contains_only_bounded_operational_summaries() {
 }
 
 #[test]
+fn compact_status_bounds_and_redacts_project_id() {
+    let harness = DiagnosticsHarness::new();
+    let mut project = harness.project();
+    project.project_id = format!(
+        "AWS_SECRET_ACCESS_KEY=COMPACT_PROJECT_SECRET {}",
+        "project".repeat(400)
+    );
+
+    let rendered = render_project_status_compact(
+        &harness.db,
+        &project,
+        &harness.input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+
+    let project_line = rendered
+        .lines()
+        .find(|line| line.starts_with("pueue-agent: "))
+        .unwrap();
+    assert!(project_line.len() <= "pueue-agent: ".len() + 243);
+    assert!(!project_line.contains("COMPACT_PROJECT_SECRET"));
+}
+
+#[test]
+fn status_human_bounds_and_redacts_guardrail_config_error() {
+    let harness = DiagnosticsHarness::new();
+    let mut project = harness.project();
+    let config_path = harness._temp.path().join("invalid-config.toml");
+    fs::write(
+        &config_path,
+        "[guardrails]\nmax_agent_runs = \"GUARDRAIL_SECRET --password hidden\"\n",
+    )
+    .unwrap();
+    project.config_path = config_path;
+
+    let rendered = pueue_agent::status::render_project_status(
+        &harness.db,
+        &project,
+        &harness.input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+
+    let guardrail_line = rendered
+        .lines()
+        .find(|line| line.starts_with("guardrails: error: "))
+        .unwrap();
+    assert!(guardrail_line.len() <= "guardrails: error: ".len() + 243);
+    assert!(!guardrail_line.contains("GUARDRAIL_SECRET"));
+    assert!(!guardrail_line.contains("hidden"));
+}
+
+#[test]
 fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
     let harness = DiagnosticsHarness::new();
     let event = EventRepository::new(&harness.db)

@@ -142,7 +142,10 @@ pub fn render_project_status_compact(
     project: &Project,
     input: &StatusInput,
 ) -> Result<String, AppError> {
-    let mut lines = vec![format!("pueue-agent: {}", project.project_id)];
+    let mut lines = vec![format!(
+        "pueue-agent: {}",
+        bounded_redacted_text(&project.project_id)
+    )];
     lines.push(format!(
         "daemon: {}",
         service_status_label(input.daemon_health)
@@ -372,7 +375,7 @@ fn failed_termination_errors(db: &Db, project_id: &str) -> Result<Vec<String>, A
 fn guardrail_lines(db: &Db, project: &Project) -> Result<Vec<String>, AppError> {
     let config = match config::load(&project.config_path) {
         Ok(config) => config,
-        Err(error) => return Ok(vec![format!("guardrails: error: {}", error.render())]),
+        Err(error) => return Ok(vec![guardrail_error_line(&error)]),
     };
     let consecutive_failures = EventRepository::new(db).count_consecutive_failures(
         &project.project_id,
@@ -390,6 +393,13 @@ fn guardrail_lines(db: &Db, project: &Project) -> Result<Vec<String>, AppError> 
         agent_runs,
         config.guardrails.max_agent_runs
     )])
+}
+
+fn guardrail_error_line(error: &AppError) -> String {
+    format!(
+        "guardrails: error: {}",
+        bounded_redacted_text(&error.render())
+    )
 }
 
 fn context_lines(db: &Db, project: &Project) -> Result<Vec<String>, AppError> {
@@ -443,4 +453,25 @@ fn latest_context_lineage(db: &Db, project_id: &str) -> Result<Option<Vec<String
             })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guardrail_error_line_bounds_and_redacts_error_text() {
+        let error = AppError::Message {
+            message: format!(
+                "config failure --password GUARDRAIL_SECRET {}",
+                "x".repeat(400)
+            ),
+        };
+
+        let rendered = guardrail_error_line(&error);
+
+        assert!(rendered.len() <= "guardrails: error: ".len() + 243);
+        assert!(!rendered.contains("GUARDRAIL_SECRET"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
 }
