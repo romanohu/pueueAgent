@@ -820,9 +820,11 @@ async fn batch_external_add_result_is_recorded_after_durable_intent() {
             100,
         ))
         .unwrap();
-    repository
+    let claimed = repository
         .claim("project-a", "batch-external-result", 100, 110)
+        .unwrap()
         .unwrap();
+    let lease_token = claimed.lease_token.as_deref().unwrap();
 
     let pueue_task_id = fake
         .add(&[OsString::from("--"), OsString::from("python")])
@@ -833,6 +835,7 @@ async fn batch_external_add_result_is_recorded_after_durable_intent() {
             "project-a",
             "batch-external-result",
             "job-a",
+            lease_token,
             BatchJobResult::Accepted {
                 pueue_task_id,
                 submission_id: "submission-external-result".to_owned(),

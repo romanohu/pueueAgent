@@ -1196,8 +1196,8 @@ impl<'db> BatchRepository<'db> {
             .execute(
                 "INSERT INTO batch_requests (
                     request_id, project_id, manifest_hash, status,
-                    lease_until, created_at, updated_at, last_error
-                 ) VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?4, NULL)",
+                    lease_until, lease_token, created_at, updated_at, last_error
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, NULL, ?4, ?4, NULL)",
                 params![
                     request.request_id,
                     request.project_id,
@@ -1275,11 +1275,13 @@ impl<'db> BatchRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin batch claim"))?;
+        let lease_token = Uuid::new_v4().to_string();
         let changed = transaction
             .execute(
                 "UPDATE batch_requests
-                 SET status = 'dispatching', lease_until = ?1, updated_at = ?2
-                 WHERE request_id = ?3 AND project_id = ?4
+                 SET status = 'dispatching', lease_until = ?1,
+                     lease_token = ?2, updated_at = ?3
+                 WHERE request_id = ?4 AND project_id = ?5
                    AND lease_until IS NULL
                    AND status IN ('pending', 'accepted')
                    AND EXISTS(
@@ -1287,7 +1289,7 @@ impl<'db> BatchRepository<'db> {
                        WHERE batch_jobs.request_id = batch_requests.request_id
                          AND batch_jobs.status = 'pending'
                    )",
-                params![lease_until, now, request_id, project_id],
+                params![lease_until, lease_token, now, request_id, project_id],
             )
             .map_err(database_error("claim batch request"))?;
         if changed == 0 {
@@ -1318,6 +1320,7 @@ impl<'db> BatchRepository<'db> {
         project_id: &str,
         request_id: &str,
         job_id: &str,
+        lease_token: &str,
         result: BatchJobResult,
         now: i64,
     ) -> Result<BatchRequest, AppError> {
@@ -1343,7 +1346,14 @@ impl<'db> BatchRepository<'db> {
         let active_lease = matches!(
             parent.status,
             BatchStatus::Dispatching | BatchStatus::Accepted
-        ) && parent.lease_until.map_or(false, |lease| lease > now);
+        ) && parent.lease_until.map_or(false, |lease| lease > now)
+            && parent.lease_token.as_deref() == Some(lease_token);
+        if !active_lease {
+            return Err(AppError::Validation {
+                field: "lease_token",
+                message: "batch lease is stale or not owned by this worker",
+            });
+        }
 
         let current = transaction
             .query_row(
@@ -1390,12 +1400,6 @@ impl<'db> BatchRepository<'db> {
                         message: "accepted job already has a different external result",
                     });
                 }
-                if !active_lease {
-                    return Err(AppError::Validation {
-                        field: "request_id",
-                        message: "batch is not actively leased",
-                    });
-                }
                 if current.0 != BatchJobStatus::Dispatching {
                     return Err(AppError::Validation {
                         field: "job_id",
@@ -1407,10 +1411,32 @@ impl<'db> BatchRepository<'db> {
                         "UPDATE batch_jobs
                          SET status = 'accepted', pueue_task_id = ?1,
                              submission_id = ?2, last_error = NULL
-                         WHERE request_id = ?3 AND job_id = ?4",
-                        params![pueue_task_id, submission_id, request_id, job_id],
+                         WHERE request_id = ?3 AND job_id = ?4
+                           AND EXISTS(
+                               SELECT 1 FROM batch_requests
+                               WHERE batch_requests.request_id = batch_jobs.request_id
+                                 AND batch_requests.project_id = ?5
+                                 AND batch_requests.lease_token = ?6
+                                 AND batch_requests.lease_until > ?7
+                                 AND batch_requests.status IN ('dispatching', 'accepted')
+                           )",
+                        params![
+                            pueue_task_id,
+                            submission_id,
+                            request_id,
+                            job_id,
+                            project_id,
+                            lease_token,
+                            now,
+                        ],
                     )
                     .map_err(database_error("record accepted batch job"))?;
+                if transaction.changes() != 1 {
+                    return Err(AppError::Validation {
+                        field: "lease_token",
+                        message: "batch lease is stale or not owned by this worker",
+                    });
+                }
                 let jobs = read_batch(&transaction, project_id, request_id)?
                     .ok_or(AppError::Runtime {
                         operation: "read batch jobs after acceptance",
@@ -1419,12 +1445,23 @@ impl<'db> BatchRepository<'db> {
                 let status = derive_request_status(&jobs);
                 let lease =
                     (status != BatchStatus::Completed).then_some(parent.lease_until.unwrap());
+                let token = (status != BatchStatus::Completed).then_some(lease_token);
                 transaction
                     .execute(
                         "UPDATE batch_requests SET status = ?1, lease_until = ?2,
-                         updated_at = ?3, last_error = NULL
-                         WHERE request_id = ?4 AND project_id = ?5",
-                        params![status, lease, now, request_id, project_id],
+                         lease_token = ?3, updated_at = ?4, last_error = NULL
+                         WHERE request_id = ?5 AND project_id = ?6
+                           AND lease_token = ?7 AND lease_until > ?8",
+                        params![
+                            status,
+                            lease,
+                            token,
+                            now,
+                            request_id,
+                            project_id,
+                            lease_token,
+                            now
+                        ],
                     )
                     .map_err(database_error("update batch status after acceptance"))?;
             }
@@ -1447,12 +1484,6 @@ impl<'db> BatchRepository<'db> {
                         .map_err(database_error("commit idempotent failed batch result"))?;
                     return Ok(stored);
                 }
-                if !active_lease {
-                    return Err(AppError::Validation {
-                        field: "request_id",
-                        message: "batch is not actively leased",
-                    });
-                }
                 if current.0 != BatchJobStatus::Dispatching {
                     return Err(AppError::Validation {
                         field: "job_id",
@@ -1463,10 +1494,24 @@ impl<'db> BatchRepository<'db> {
                     .execute(
                         "UPDATE batch_jobs
                          SET status = 'failed', last_error = ?1
-                         WHERE request_id = ?2 AND job_id = ?3",
-                        params![error, request_id, job_id],
+                         WHERE request_id = ?2 AND job_id = ?3
+                           AND EXISTS(
+                               SELECT 1 FROM batch_requests
+                               WHERE batch_requests.request_id = batch_jobs.request_id
+                                 AND batch_requests.project_id = ?4
+                                 AND batch_requests.lease_token = ?5
+                                 AND batch_requests.lease_until > ?6
+                                 AND batch_requests.status IN ('dispatching', 'accepted')
+                           )",
+                        params![error, request_id, job_id, project_id, lease_token, now],
                     )
                     .map_err(database_error("record failed batch job"))?;
+                if transaction.changes() != 1 {
+                    return Err(AppError::Validation {
+                        field: "lease_token",
+                        message: "batch lease is stale or not owned by this worker",
+                    });
+                }
                 transaction
                     .execute(
                         "UPDATE batch_jobs
@@ -1485,7 +1530,7 @@ impl<'db> BatchRepository<'db> {
                 transaction
                     .execute(
                         "UPDATE batch_requests SET status = ?1, lease_until = NULL,
-                         updated_at = ?2, last_error = ?3
+                         lease_token = NULL, updated_at = ?2, last_error = ?3
                          WHERE request_id = ?4 AND project_id = ?5",
                         params![status, now, error, request_id, project_id],
                     )
@@ -1545,7 +1590,8 @@ impl<'db> BatchRepository<'db> {
             transaction
                 .execute(
                     "UPDATE batch_requests SET status = ?1, lease_until = NULL,
-                     updated_at = ?2 WHERE request_id = ?3 AND project_id = ?4",
+                     lease_token = NULL, updated_at = ?2
+                     WHERE request_id = ?3 AND project_id = ?4",
                     params![status, now, request_id, project_id],
                 )
                 .map_err(database_error("clear expired batch lease"))?;
@@ -3969,7 +4015,7 @@ const INTERVENTION_SELECT: &str = "SELECT intervention_id, project_id, insertion
      FROM interventions";
 
 const BATCH_REQUEST_SELECT: &str = "SELECT request_id, project_id, manifest_hash, status,
-            lease_until, created_at, updated_at, last_error
+            lease_until, lease_token, created_at, updated_at, last_error
      FROM batch_requests";
 
 const BATCH_JOB_SELECT: &str = "SELECT request_id, job_id, ordinal, kind, argv_json,
@@ -4110,9 +4156,10 @@ fn batch_request_from_row(row: &Row<'_>) -> rusqlite::Result<BatchRequest> {
         manifest_hash: row.get(2)?,
         status: row.get(3)?,
         lease_until: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        last_error: row.get(7)?,
+        lease_token: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        last_error: row.get(8)?,
         jobs: Vec::new(),
     })
 }

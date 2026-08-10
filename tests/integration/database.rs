@@ -251,7 +251,7 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     connection.execute(
         "INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at)
          VALUES ('v7-project', 'operator_wake', 'wake-v8', '{}', 'pending', 0, 100, 100)",
@@ -471,7 +471,7 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(columns.iter().any(|column| column == "kind"));
     assert!(columns.iter().any(|column| column == "metadata_json"));
     assert!(columns.iter().any(|column| column == "origin_agent_run_id"));
@@ -1548,7 +1548,7 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(intervention_table_count, 1);
     assert_eq!(preserved_event_id, event_id);
     assert_eq!(preserved_project_id, "project-a");
@@ -2461,7 +2461,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     connection
         .execute(
             "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
@@ -2498,7 +2498,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 9);
+        assert_eq!(migrated_version, 10);
         assert_eq!(index_count, 1);
         drop(connection);
 
@@ -3849,7 +3849,7 @@ fn batch_v9_migration_preserves_projects_and_installs_bounded_tables() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(
         connection
             .query_row(
@@ -3892,6 +3892,59 @@ fn batch_v9_migration_preserves_projects_and_installs_bounded_tables() {
             [],
         )
         .is_err());
+}
+
+#[test]
+fn batch_v10_migration_adds_lease_token_to_a_v9_database() {
+    let test = TestDatabase::new();
+    let root = test.project_root("batch-v10-project");
+    register_project(&test.db, "batch-v10-project", &root, "pa-batch-v10-project");
+
+    let connection = test.db.connect().unwrap();
+    let has_lease_token: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('batch_requests')
+                 WHERE name = 'lease_token'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if has_lease_token {
+        connection
+            .execute("ALTER TABLE batch_requests DROP COLUMN lease_token", [])
+            .unwrap();
+    }
+    connection
+        .execute_batch("PRAGMA user_version = 9;")
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 10);
+    let columns = connection
+        .prepare("PRAGMA table_info(batch_requests)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.iter().any(|column| column == "lease_token"));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT project_id FROM projects WHERE project_id = 'batch-v10-project'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "batch-v10-project"
+    );
 }
 
 #[test]
@@ -3992,15 +4045,18 @@ fn batch_partial_failure_preserves_accepted_jobs_and_leaves_later_jobs_unsubmitt
     repository
         .create_or_get(&sample_batch_request("batch-partial", "request-partial"))
         .unwrap();
-    repository
+    let claimed = repository
         .claim("batch-partial", "request-partial", 100, 110)
+        .unwrap()
         .unwrap();
+    let lease_token = claimed.lease_token.as_deref().unwrap();
 
     repository
         .record_job_result(
             "batch-partial",
             "request-partial",
             "job-a",
+            lease_token,
             BatchJobResult::Accepted {
                 pueue_task_id: 41,
                 submission_id: "submission-a".to_owned(),
@@ -4013,6 +4069,7 @@ fn batch_partial_failure_preserves_accepted_jobs_and_leaves_later_jobs_unsubmitt
             "batch-partial",
             "request-partial",
             "job-b",
+            lease_token,
             BatchJobResult::Failed {
                 error: "ambiguous add response".to_owned(),
             },
@@ -4034,6 +4091,22 @@ fn batch_partial_failure_preserves_accepted_jobs_and_leaves_later_jobs_unsubmitt
     );
     assert_eq!(partial.jobs[1].status, BatchJobStatus::Failed);
     assert_eq!(partial.jobs[2].status, BatchJobStatus::Pending);
+
+    let replayed = repository.record_job_result(
+        "batch-partial",
+        "request-partial",
+        "job-b",
+        lease_token,
+        BatchJobResult::Failed {
+            error: "ambiguous add response".to_owned(),
+        },
+        103,
+    );
+    assert!(replayed.is_err());
+    assert_eq!(
+        repository.find("batch-partial", "request-partial").unwrap(),
+        Some(partial)
+    );
 }
 
 #[test]
@@ -4045,14 +4118,17 @@ fn batch_recovery_never_retries_an_accepted_job() {
     repository
         .create_or_get(&sample_batch_request("batch-recovery", "request-recovery"))
         .unwrap();
-    repository
+    let claimed = repository
         .claim("batch-recovery", "request-recovery", 100, 110)
+        .unwrap()
         .unwrap();
+    let lease_token = claimed.lease_token.as_deref().unwrap();
     repository
         .record_job_result(
             "batch-recovery",
             "request-recovery",
             "job-a",
+            lease_token,
             BatchJobResult::Accepted {
                 pueue_task_id: 73,
                 submission_id: "submission-a".to_owned(),
@@ -4103,6 +4179,7 @@ fn batch_find_and_result_updates_cannot_cross_project_boundaries() {
             "batch-scope-b",
             "request-scope",
             "job-a",
+            "wrong-project-token",
             BatchJobResult::Accepted {
                 pueue_task_id: 1,
                 submission_id: "wrong-project".to_owned(),
@@ -4113,7 +4190,7 @@ fn batch_find_and_result_updates_cannot_cross_project_boundaries() {
 }
 
 #[test]
-fn batch_accepted_result_is_idempotent_after_request_completion() {
+fn batch_completed_result_replay_is_rejected_after_lease_clear() {
     let test = TestDatabase::new();
     let root = test.project_root("batch-completed");
     register_project(&test.db, "batch-completed", &root, "pa-batch-completed");
@@ -4121,9 +4198,11 @@ fn batch_accepted_result_is_idempotent_after_request_completion() {
     let mut request = sample_batch_request("batch-completed", "request-completed");
     request.jobs.truncate(1);
     repository.create_or_get(&request).unwrap();
-    repository
+    let claimed = repository
         .claim("batch-completed", "request-completed", 100, 110)
+        .unwrap()
         .unwrap();
+    let lease_token = claimed.lease_token.clone().unwrap();
 
     let result = BatchJobResult::Accepted {
         pueue_task_id: 99,
@@ -4134,14 +4213,100 @@ fn batch_accepted_result_is_idempotent_after_request_completion() {
             "batch-completed",
             "request-completed",
             "job-a",
+            &lease_token,
             result.clone(),
             101,
         )
         .unwrap();
     assert_eq!(completed.status, BatchStatus::Completed);
 
-    let replayed = repository
-        .record_job_result("batch-completed", "request-completed", "job-a", result, 102)
+    let replayed = repository.record_job_result(
+        "batch-completed",
+        "request-completed",
+        "job-a",
+        &lease_token,
+        result,
+        102,
+    );
+    assert!(replayed.is_err());
+    let persisted = repository
+        .find("batch-completed", "request-completed")
+        .unwrap()
         .unwrap();
-    assert_eq!(replayed, completed);
+    assert_eq!(persisted, completed);
+    assert_eq!(persisted.lease_token, None);
+}
+
+#[test]
+fn batch_stale_worker_token_is_rejected_after_lease_recovery() {
+    let test = TestDatabase::new();
+    let root = test.project_root("batch-stale-worker");
+    register_project(
+        &test.db,
+        "batch-stale-worker",
+        &root,
+        "pa-batch-stale-worker",
+    );
+    let repository = BatchRepository::new(&test.db);
+    let mut request = sample_batch_request("batch-stale-worker", "request-stale-worker");
+    request.jobs.truncate(1);
+    repository.create_or_get(&request).unwrap();
+
+    let claim_a = repository
+        .claim("batch-stale-worker", "request-stale-worker", 100, 110)
+        .unwrap()
+        .unwrap();
+    let token_a = claim_a.lease_token.clone().unwrap();
+    repository
+        .recover_expired("batch-stale-worker", 111)
+        .unwrap();
+    let claim_b = repository
+        .claim("batch-stale-worker", "request-stale-worker", 112, 122)
+        .unwrap()
+        .unwrap();
+    let token_b = claim_b.lease_token.clone().unwrap();
+    assert_ne!(token_a, token_b);
+
+    let stale = repository.record_job_result(
+        "batch-stale-worker",
+        "request-stale-worker",
+        "job-a",
+        &token_a,
+        BatchJobResult::Accepted {
+            pueue_task_id: 41,
+            submission_id: "stale-submission".to_owned(),
+        },
+        113,
+    );
+    assert!(stale.is_err());
+    let still_dispatching = repository
+        .find("batch-stale-worker", "request-stale-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        still_dispatching.jobs[0].status,
+        BatchJobStatus::Dispatching
+    );
+    assert_eq!(still_dispatching.jobs[0].pueue_task_id, None);
+    assert_eq!(still_dispatching.jobs[0].submission_id, None);
+
+    let accepted = repository
+        .record_job_result(
+            "batch-stale-worker",
+            "request-stale-worker",
+            "job-a",
+            &token_b,
+            BatchJobResult::Accepted {
+                pueue_task_id: 42,
+                submission_id: "current-submission".to_owned(),
+            },
+            114,
+        )
+        .unwrap();
+    assert_eq!(accepted.status, BatchStatus::Completed);
+    assert_eq!(accepted.jobs[0].pueue_task_id, Some(42));
+    assert_eq!(
+        accepted.jobs[0].submission_id.as_deref(),
+        Some("current-submission")
+    );
 }

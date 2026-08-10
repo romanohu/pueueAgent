@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 9;
+const LATEST_SCHEMA_VERSION: i64 = 10;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -380,6 +380,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version <= 8 {
         migrate_batches_to_v9(&transaction)?;
     }
+    if version <= 9 {
+        migrate_batches_to_v10(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -456,6 +459,31 @@ fn migrate_batches_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
         "#,
         )
         .map_err(database_error("apply SQLite v9 batch migration"))
+}
+
+fn migrate_batches_to_v10(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let has_lease_token: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('batch_requests')
+                 WHERE name = 'lease_token'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check batch lease token for migration"))?;
+    if !has_lease_token {
+        transaction
+            .execute_batch(
+                "ALTER TABLE batch_requests
+                     ADD COLUMN lease_token TEXT
+                         CHECK (lease_token IS NULL OR length(lease_token) <= 128);",
+            )
+            .map_err(database_error("apply SQLite v10 batch lease migration"))?;
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 10;")
+        .map_err(database_error("set SQLite v10 schema version"))
 }
 
 fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

@@ -503,6 +503,7 @@ pub struct BatchRequest {
     pub manifest_hash: String,
     pub status: BatchStatus,
     pub lease_until: Option<i64>,
+    pub lease_token: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_error: Option<String>,
