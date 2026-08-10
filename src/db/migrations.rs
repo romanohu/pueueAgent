@@ -1,15 +1,20 @@
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
         WHERE status IN ('starting', 'running');
 "#;
+const INTERVENTION_SEQUENCE_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX interventions_project_sequence_idx
+    ON interventions(project_id, insertion_sequence);";
+const INTERVENTION_STATUS_INDEX_SQL: &str = "CREATE INDEX interventions_project_status_created_idx
+    ON interventions(project_id, status, insertion_sequence, intervention_id);";
 const OPERATOR_LOGS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS operator_logs (
         log_id INTEGER PRIMARY KEY,
@@ -38,6 +43,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         });
     }
     if version == LATEST_SCHEMA_VERSION {
+        ensure_agent_run_launch_gate(&transaction)?;
+        ensure_intervention_insertion_sequence(&transaction)?;
         ensure_invariant_indexes(&transaction)?;
         transaction
             .commit()
@@ -120,6 +127,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 exit_code INTEGER,
                 log_path TEXT NOT NULL,
                 last_error TEXT,
+                launch_gate_state TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    launch_gate_state IN ('pending', 'release_requested', 'released', 'failed')
+                ),
                 context_mode TEXT NOT NULL DEFAULT 'fresh' CHECK (context_mode IN (
                     'fresh', 'resume', 'resume_latest'
                 )),
@@ -196,6 +206,28 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE interventions (
+                intervention_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                insertion_sequence INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
+                created_at INTEGER NOT NULL,
+                reserved_at INTEGER,
+                applied_at INTEGER,
+                agent_run_id INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                lease_expires_at INTEGER,
+                reservation_token TEXT,
+                FOREIGN KEY (project_id, agent_run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE SET NULL,
+                CHECK (
+                    (status = 'pending' AND reserved_at IS NULL AND applied_at IS NULL AND agent_run_id IS NULL AND lease_expires_at IS NULL AND reservation_token IS NULL)
+                    OR (status = 'reserved' AND reserved_at IS NOT NULL AND applied_at IS NULL AND lease_expires_at IS NOT NULL AND reservation_token IS NOT NULL)
+                    OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
+                )
+            );
+
             CREATE INDEX events_claimable_idx
                 ON events(status, not_before, created_at, event_id)
                 WHERE status IN ('pending', 'retry_wait');
@@ -223,8 +255,14 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 ON task_observations(project_id, pueue_group, state, observed_at);
             CREATE INDEX operator_logs_project_created_idx
                 ON operator_logs(project_id, created_at, log_id);
+            CREATE UNIQUE INDEX interventions_project_sequence_idx
+                ON interventions(project_id, insertion_sequence);
+            CREATE INDEX interventions_project_status_created_idx
+                ON interventions(project_id, status, insertion_sequence, intervention_id);
+            CREATE INDEX interventions_reservation_lease_idx
+                ON interventions(status, lease_expires_at, reservation_token);
 
-            PRAGMA user_version = 5;
+            PRAGMA user_version = 6;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -306,17 +344,208 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             .map_err(database_error("apply SQLite v4 migration"))?;
     } else if version == 4 {
         migrate_termination_requests_to_v5(&transaction)?;
+    } else if version == 5 {
+        migrate_interventions_to_v6(&transaction)?;
     }
     if (1..=3).contains(&version) {
         ensure_agent_run_event_project_id(&transaction)?;
         migrate_termination_requests_to_v5(&transaction)?;
     }
+    if (1..=4).contains(&version) {
+        migrate_interventions_to_v6(&transaction)?;
+    }
+    ensure_agent_run_launch_gate(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
 
     Ok(())
+}
+
+fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    transaction
+        .execute_batch(
+            r#"
+        CREATE TABLE interventions (
+            intervention_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            insertion_sequence INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
+            created_at INTEGER NOT NULL,
+            reserved_at INTEGER,
+            applied_at INTEGER,
+            agent_run_id INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            lease_expires_at INTEGER,
+            reservation_token TEXT,
+            FOREIGN KEY (project_id, agent_run_id)
+                REFERENCES agent_runs(project_id, run_id) ON DELETE SET NULL,
+            CHECK (
+                (status = 'pending' AND reserved_at IS NULL AND applied_at IS NULL AND agent_run_id IS NULL AND lease_expires_at IS NULL AND reservation_token IS NULL)
+                OR (status = 'reserved' AND reserved_at IS NOT NULL AND applied_at IS NULL AND lease_expires_at IS NOT NULL AND reservation_token IS NOT NULL)
+                OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
+            )
+        );
+        CREATE UNIQUE INDEX interventions_project_sequence_idx
+            ON interventions(project_id, insertion_sequence);
+        CREATE INDEX interventions_project_status_created_idx
+            ON interventions(project_id, status, insertion_sequence, intervention_id);
+        CREATE INDEX interventions_reservation_lease_idx
+            ON interventions(status, lease_expires_at, reservation_token);
+        PRAGMA user_version = 6;
+        "#,
+        )
+        .map_err(database_error("apply SQLite v6 migration"))
+}
+
+fn ensure_intervention_insertion_sequence(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_interventions: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'interventions'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check intervention table for migration"))?;
+    if !has_interventions {
+        return Ok(());
+    }
+
+    let has_sequence: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('interventions')
+                 WHERE name = 'insertion_sequence'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check intervention insertion sequence"))?;
+    if !has_sequence {
+        transaction
+            .execute(
+                "ALTER TABLE interventions
+                 ADD COLUMN insertion_sequence INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(database_error("add intervention insertion sequence"))?;
+        transaction
+            .execute(
+                "UPDATE interventions AS current
+                 SET insertion_sequence = (
+                     SELECT COUNT(*)
+                     FROM interventions AS prior
+                     WHERE prior.project_id = current.project_id
+                       AND (
+                           prior.created_at < current.created_at
+                           OR (prior.created_at = current.created_at AND prior.rowid <= current.rowid)
+                       )
+                 )",
+                [],
+            )
+            .map_err(database_error("backfill intervention insertion sequence"))?;
+    }
+
+    ensure_index_definition(
+        transaction,
+        "interventions_project_sequence_idx",
+        INTERVENTION_SEQUENCE_INDEX_SQL,
+    )?;
+    ensure_index_definition(
+        transaction,
+        "interventions_project_status_created_idx",
+        INTERVENTION_STATUS_INDEX_SQL,
+    )
+}
+
+fn ensure_agent_run_launch_gate(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let has_agent_runs: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_runs'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run table for launch gate"))?;
+    if !has_agent_runs {
+        return Ok(());
+    }
+
+    let has_gate_state: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('agent_runs')
+                 WHERE name = 'launch_gate_state'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run launch gate state"))?;
+    if !has_gate_state {
+        transaction
+            .execute(
+                "ALTER TABLE agent_runs
+                 ADD COLUMN launch_gate_state TEXT NOT NULL DEFAULT 'released'
+                 CHECK (launch_gate_state IN ('pending', 'release_requested', 'released', 'failed'))",
+                [],
+            )
+            .map_err(database_error("add agent run launch gate state"))?;
+    }
+    transaction
+        .execute(
+            "UPDATE agent_runs
+             SET launch_gate_state = 'pending'
+             WHERE status = 'starting' AND launch_gate_state = 'released'",
+            [],
+        )
+        .map_err(database_error("initialize starting agent launch gates"))?;
+    Ok(())
+}
+
+fn ensure_index_definition(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    expected_sql: &str,
+) -> Result<(), AppError> {
+    let existing_sql = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(database_error("read intervention index definition"))?
+        .flatten();
+    if existing_sql
+        .as_deref()
+        .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql))
+    {
+        return Ok(());
+    }
+
+    transaction
+        .execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+        .map_err(database_error("replace stale intervention index"))?;
+    transaction
+        .execute_batch(expected_sql)
+        .map_err(database_error("create intervention FIFO index"))
+}
+
+fn compact_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_owned()
+        .to_ascii_lowercase()
 }
 
 fn migrate_termination_requests_to_v5(

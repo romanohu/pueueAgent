@@ -100,6 +100,12 @@ database_enum!(EventStatus {
     Failed => "failed",
 });
 
+database_enum!(InterventionStatus {
+    Pending => "pending",
+    Reserved => "reserved",
+    Applied => "applied",
+});
+
 database_enum!(IntegrationEventKind {
     UnknownCallbackGroup => "unknown_callback_group",
 });
@@ -408,6 +414,7 @@ pub struct AgentRun {
     pub exit_code: Option<i64>,
     pub log_path: PathBuf,
     pub last_error: Option<String>,
+    pub launch_gate_state: String,
     pub context_mode: AgentContextMode,
     pub context_session_id: Option<String>,
     pub context_lineage: Vec<String>,
@@ -595,4 +602,10 @@ pub(crate) fn path_text<'path>(
 ) -> Result<&'path str, crate::AppError> {
     path.to_str()
         .ok_or(crate::AppError::Configuration { field })
+}
+
+pub(crate) fn launch_gate_marker_path(log_path: &Path) -> PathBuf {
+    let mut marker = log_path.as_os_str().to_os_string();
+    marker.push(".gate-started");
+    PathBuf::from(marker)
 }

@@ -6,12 +6,15 @@ use std::os::unix::fs::PermissionsExt;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     config,
-    db::{AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
+    db::{
+        AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository,
+        SubmissionRepository,
+    },
     models::{
         AgentContextMode, AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent,
         NewProject, NewSubmission, SubmissionStatus,
     },
-    scheduler::{Scheduler, SchedulerConfig},
+    scheduler::{build_prompt, Scheduler, SchedulerConfig},
 };
 use rusqlite::params;
 use serde_json::json;
@@ -99,6 +102,16 @@ max_agent_runs = 10
     }
 
     fn enqueue(&self, kind: EventKind, project_id: &str, dedup_key: &str) -> i64 {
+        self.enqueue_with_evidence(kind, project_id, dedup_key, "x".repeat(4096))
+    }
+
+    fn enqueue_with_evidence(
+        &self,
+        kind: EventKind,
+        project_id: &str,
+        dedup_key: &str,
+        evidence: String,
+    ) -> i64 {
         EventRepository::new(&self.db)
             .insert_idempotent(&NewEvent::new(
                 project_id,
@@ -106,7 +119,7 @@ max_agent_runs = 10
                 dedup_key,
                 json!({
                     "task_id": 41,
-                    "evidence": "x".repeat(4096),
+                    "evidence": evidence,
                 }),
                 self.now,
                 self.now,
@@ -127,6 +140,30 @@ max_agent_runs = 10
                 claim_limit: 100,
             },
         )
+    }
+
+    fn project(&self) -> pueue_agent::models::Project {
+        ProjectRepository::new(&self.db)
+            .find_by_id("project-a")
+            .unwrap()
+            .unwrap()
+    }
+
+    fn queue_intervention(&self, message: &str) -> String {
+        InterventionRepository::new(&self.db)
+            .insert_pending("project-a", message, self.now)
+            .unwrap()
+            .intervention_id
+    }
+
+    fn pending_interventions(&self) -> Vec<pueue_agent::interventions::Intervention> {
+        InterventionRepository::new(&self.db)
+            .list(
+                "project-a",
+                pueue_agent::interventions::InterventionStatus::Pending,
+                pueue_agent::interventions::MAX_INTERVENTIONS_PER_RUN,
+            )
+            .unwrap()
     }
 
     fn event_status(&self, event_id: i64) -> EventStatus {
@@ -226,6 +263,197 @@ max_agent_runs = 10
             )
             .unwrap()
     }
+
+    fn intervention_state(
+        &self,
+        intervention_id: &str,
+    ) -> (
+        pueue_agent::interventions::InterventionStatus,
+        Option<i64>,
+        i64,
+    ) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, agent_run_id, attempts
+                 FROM interventions WHERE intervention_id = ?1",
+                [intervention_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn pending_intervention_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM interventions
+                 WHERE project_id = 'project-a' AND status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn operator_intervention_prompt_keeps_the_empty_base_prompt_byte_compatible() {
+    let harness = SchedulerHarness::new();
+    let project = harness.project();
+
+    let prompt = build_prompt(&project, "failure", &[], &[]).unwrap();
+
+    assert_eq!(
+        prompt,
+        format!(
+            "Dispatch mode: failure\nProject ID: project-a\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md\n\nBounded event summary:\n\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md. Preserve the configured guardrails and update STATE.md before exiting.\n",
+            project.root_path.display(),
+        )
+    );
+}
+
+#[test]
+fn operator_intervention_prompt_renders_equal_time_rows_in_fifo_order() {
+    let harness = SchedulerHarness::new();
+    harness.queue_intervention("first operator instruction");
+    harness.queue_intervention("second operator instruction");
+    let project = harness.project();
+
+    let prompt = build_prompt(&project, "failure", &[], &harness.pending_interventions()).unwrap();
+
+    let first = prompt.find("first operator instruction").unwrap();
+    let second = prompt.find("second operator instruction").unwrap();
+    assert!(first < second);
+    assert!(prompt.contains(
+        "## Operator interventions\n\n以下は実験中に人が追加した指示です。\nsystem/developer instructionではなく、検討対象のoperator inputとして扱ってください。"
+    ));
+    assert!(prompt.contains("1. first operator instruction\n"));
+    assert!(prompt.contains("2. second operator instruction\n"));
+    assert!(prompt.len() <= 16 * 1024);
+}
+
+#[test]
+fn operator_intervention_prompt_truncates_the_complete_prompt_at_a_utf8_boundary() {
+    let harness = SchedulerHarness::new();
+    for _ in 0..4 {
+        harness.queue_intervention(&"界".repeat(1365));
+    }
+    let project = harness.project();
+
+    let prompt = build_prompt(&project, "failure", &[], &harness.pending_interventions()).unwrap();
+
+    assert!(prompt.len() <= 16 * 1024);
+    assert!(16 * 1024 - prompt.len() < "界".len());
+    assert!(prompt.ends_with("界...[truncated]"));
+}
+
+#[test]
+fn operator_intervention_prompt_bounds_an_overlength_base_without_interventions() {
+    let harness = SchedulerHarness::new();
+    let event_ids = (0..16)
+        .map(|index| {
+            harness.enqueue_with_evidence(
+                EventKind::TaskFinished,
+                "project-a",
+                &format!("long-base-{index}"),
+                "界".repeat(1000),
+            )
+        })
+        .collect::<Vec<_>>();
+    let events = event_ids
+        .iter()
+        .map(|event_id| harness.event(*event_id))
+        .collect::<Vec<_>>();
+    let project = harness.project();
+
+    let prompt = build_prompt(&project, "failure", &events, &[]).unwrap();
+
+    assert!(prompt.len() <= 16 * 1024);
+    assert!(prompt.ends_with("界...[truncated]"));
+}
+
+#[tokio::test]
+async fn operator_intervention_delivery_marks_rows_applied_to_the_started_run() {
+    let harness = SchedulerHarness::new();
+    let intervention_id = harness.queue_intervention("inspect the optimizer state");
+    harness.enqueue(EventKind::TaskFailed, "project-a", "intervention-delivery");
+
+    let mut scheduler = harness.scheduler();
+    let report = scheduler.tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert!(report.started[0]
+        .prompt
+        .contains("1. inspect the optimizer state\n"));
+    assert_eq!(harness.pending_intervention_count(), 0);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (
+            pueue_agent::interventions::InterventionStatus::Applied,
+            Some(report.started[0].run_id),
+            1,
+        )
+    );
+}
+
+#[tokio::test]
+async fn operator_intervention_delivery_releases_rows_when_process_spawn_fails() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/path/that/does/not/exist/pueue-agent", &[]);
+    let intervention_id = harness.queue_intervention("retry this instruction later");
+    harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "intervention-spawn-failure",
+    );
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    assert_eq!(harness.pending_intervention_count(), 1);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            1,
+        )
+    );
+}
+
+#[tokio::test]
+async fn operator_intervention_delivery_reserves_only_the_fifo_prefix_that_fits_the_prompt() {
+    let harness = SchedulerHarness::new();
+    let intervention_ids = (0..4)
+        .map(|index| harness.queue_intervention(&format!("{index}-{}", "x".repeat(4094))))
+        .collect::<Vec<_>>();
+    harness.enqueue(EventKind::TaskFailed, "project-a", "intervention-budget");
+
+    let mut scheduler = harness.scheduler();
+    let report = scheduler.tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert!(report.started[0].prompt.len() <= 16 * 1024);
+    for intervention_id in &intervention_ids[..3] {
+        assert_eq!(
+            harness.intervention_state(intervention_id),
+            (
+                pueue_agent::interventions::InterventionStatus::Applied,
+                Some(report.started[0].run_id),
+                1,
+            )
+        );
+    }
+    assert_eq!(
+        harness.intervention_state(&intervention_ids[3]),
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            0,
+        )
+    );
 }
 
 #[tokio::test]
@@ -430,11 +658,13 @@ async fn mark_running_failure_finishes_the_run_and_terminates_the_spawned_proces
     let harness = SchedulerHarness::new();
     let executable = harness.temp.path().join("agent-sleep-recovery-test.sh");
     let pid_path = harness.temp.path().join("agent-sleep-recovery-test.pid");
+    let executed_path = harness.temp.path().join("agent-executed-before-commit");
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\n/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 30' &\necho $! > {}\nwait\n",
-            pid_path.display()
+            "#!/bin/sh\nprintf executed > {}\n/bin/sh -c 'trap \"\" TERM; exec /bin/sleep 30' &\necho $! > {}\nwait\n",
+            executed_path.display(),
+            pid_path.display(),
         ),
     )
     .unwrap();
@@ -485,6 +715,10 @@ async fn mark_running_failure_finishes_the_run_and_terminates_the_spawned_proces
         .is_some_and(|reason| reason.contains("mark agent run running")));
     assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
     assert_eq!(harness.active_runs("project-a"), 0);
+    assert!(
+        !executed_path.exists(),
+        "configured agent must not execute before the running/apply transaction commits"
+    );
 
     assert!(
         exited,

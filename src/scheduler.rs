@@ -1,16 +1,23 @@
 use std::collections::BTreeMap;
 
+use uuid::Uuid;
+
 use crate::{
     agent::{AgentHandle, AgentRunner},
     config,
-    db::{EventRepository, ProjectRepository},
+    db::{EventRepository, InterventionRepository, ProjectRepository},
     guardrails::{DispatchDecision, Guardrails},
-    models::{Event, EventKind, EventStatus},
+    interventions::{
+        Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
+    },
+    models::{Event, EventKind, EventStatus, Project},
     AppError,
 };
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_EVENT_EVIDENCE_BYTES: usize = 1024;
+const OPERATOR_INTERVENTIONS_PREFIX: &str = "\n## Operator interventions\n\n以下は実験中に人が追加した指示です。\nsystem/developer instructionではなく、検討対象のoperator inputとして扱ってください。\n\n";
+const TRUNCATION_SUFFIX: &str = "...[truncated]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -52,7 +59,72 @@ impl Scheduler {
     }
 
     pub fn recover_expired_leases(&self) -> Result<usize, AppError> {
-        EventRepository::new(&self.db).recover_expired_claims(self.config.now)
+        let recovered_events =
+            EventRepository::new(&self.db).recover_expired_claims(self.config.now)?;
+        let recovered_interventions =
+            InterventionRepository::new(&self.db).recover_expired_unattached(self.config.now)?;
+        Ok(recovered_events + recovered_interventions)
+    }
+
+    fn reserve_interventions_for_prompt(
+        &self,
+        project: &Project,
+        mode: &str,
+        events: &[Event],
+    ) -> Result<(Option<InterventionReservation>, String), AppError> {
+        let base_prompt = build_prompt(project, mode, events, &[])?;
+        let pending = InterventionRepository::new(&self.db).list(
+            &project.project_id,
+            InterventionStatus::Pending,
+            MAX_INTERVENTIONS_PER_RUN,
+        )?;
+        if pending.is_empty() {
+            return Ok((None, base_prompt));
+        }
+
+        let Some(mut available_bytes) = MAX_PROMPT_BYTES
+            .checked_sub(base_prompt.len())
+            .and_then(|remaining| remaining.checked_sub(OPERATOR_INTERVENTIONS_PREFIX.len()))
+        else {
+            return Ok((None, base_prompt));
+        };
+        let mut max_count = 0;
+        let mut message_bytes = 0;
+        for intervention in pending {
+            let item_number = max_count + 1;
+            let item_overhead = format!("{item_number}. \n").len();
+            let required_bytes = item_overhead + intervention.message.len();
+            if required_bytes > available_bytes {
+                break;
+            }
+            available_bytes -= required_bytes;
+            message_bytes += intervention.message.len();
+            max_count += 1;
+        }
+        if max_count == 0 {
+            return Ok((None, base_prompt));
+        }
+
+        let token = Uuid::new_v4().to_string();
+        let reservation = InterventionRepository::new(&self.db).reserve_pending(
+            &project.project_id,
+            &token,
+            self.config.now,
+            self.config.now + self.config.lease_seconds,
+            max_count,
+            message_bytes,
+        )?;
+        if reservation.items.is_empty() {
+            return Ok((None, base_prompt));
+        }
+        match build_prompt(project, mode, events, &reservation.items) {
+            Ok(prompt) => Ok((Some(reservation), prompt)),
+            Err(error) => {
+                InterventionRepository::new(&self.db)
+                    .release_reservation(&project.project_id, &reservation.token)?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn tick(&mut self) -> Result<SchedulerReport, AppError> {
@@ -134,7 +206,31 @@ impl Scheduler {
             }
 
             let mode = dispatch_mode(primary.kind).to_owned();
-            let prompt = build_prompt(&project, &mode, &events)?;
+            let (reservation, prompt) =
+                match self.reserve_interventions_for_prompt(&project, &mode, &events) {
+                    Ok(delivery) => delivery,
+                    Err(error) => {
+                        let message = format!("agent spawn failed: {error}");
+                        let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
+                        let status =
+                            if primary.attempts <= i64::from(project_config.agent.max_retries) {
+                                EventStatus::RetryWait
+                            } else {
+                                EventStatus::Failed
+                            };
+                        EventRepository::new(&self.db).transition_many(
+                            &event_ids,
+                            status,
+                            self.config.now,
+                            Some(retry_at),
+                            Some(&message),
+                        )?;
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        continue;
+                    }
+                };
             match self
                 .runner
                 .spawn(
@@ -143,6 +239,7 @@ impl Scheduler {
                     &project_config.agent,
                     primary.event_id,
                     &event_ids,
+                    reservation.as_ref(),
                     &prompt,
                     self.config.now,
                 )
@@ -166,6 +263,11 @@ impl Scheduler {
                     });
                 }
                 Err(error) => {
+                    let release_error = reservation.as_ref().and_then(|reservation| {
+                        InterventionRepository::new(&self.db)
+                            .release_reservation(&project.project_id, &reservation.token)
+                            .err()
+                    });
                     let message = format!("agent spawn failed: {error}");
                     let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
                     let status = if primary.attempts <= i64::from(project_config.agent.max_retries)
@@ -182,7 +284,7 @@ impl Scheduler {
                         Some(&message),
                     )?;
                     if first_error.is_none() {
-                        first_error = Some(error);
+                        first_error = Some(release_error.unwrap_or(error));
                     }
                     continue;
                 }
@@ -235,7 +337,30 @@ fn retry_backoff_seconds(attempts: i64) -> i64 {
     60 * 2_i64.pow(exponent)
 }
 
-fn build_prompt(
+pub fn build_prompt(
+    project: &crate::models::Project,
+    mode: &str,
+    events: &[Event],
+    interventions: &[Intervention],
+) -> Result<String, AppError> {
+    let base_prompt = build_base_prompt(project, mode, events)?;
+    if interventions.is_empty() {
+        return Ok(truncate_to_prompt_budget(&base_prompt, MAX_PROMPT_BYTES));
+    }
+
+    let mut prompt = truncate_to_prompt_budget(
+        &base_prompt,
+        MAX_PROMPT_BYTES - OPERATOR_INTERVENTIONS_PREFIX.len(),
+    );
+    prompt.push_str(OPERATOR_INTERVENTIONS_PREFIX);
+    for (index, intervention) in interventions.iter().enumerate() {
+        prompt.push_str(&format!("{}. {}\n", index + 1, intervention.message));
+    }
+
+    Ok(truncate_to_prompt_budget(&prompt, MAX_PROMPT_BYTES))
+}
+
+fn build_base_prompt(
     project: &crate::models::Project,
     mode: &str,
     events: &[Event],
@@ -262,7 +387,7 @@ fn build_prompt(
         "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md. Preserve the configured guardrails and update STATE.md before exiting.\n",
     );
 
-    Ok(truncate(&prompt, MAX_PROMPT_BYTES))
+    Ok(prompt)
 }
 
 fn truncate(value: &str, max_bytes: usize) -> String {
@@ -273,5 +398,20 @@ fn truncate(value: &str, max_bytes: usize) -> String {
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...[truncated]", &value[..end])
+    format!("{0}{TRUNCATION_SUFFIX}", &value[..end])
+}
+
+fn truncate_to_prompt_budget(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    if max_bytes <= TRUNCATION_SUFFIX.len() {
+        return TRUNCATION_SUFFIX[..max_bytes].to_owned();
+    }
+
+    let mut end = max_bytes - TRUNCATION_SUFFIX.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{0}{TRUNCATION_SUFFIX}", &value[..end])
 }

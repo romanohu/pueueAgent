@@ -4,14 +4,21 @@ use rusqlite::{
     params, types::Type, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::{
+    diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
+    interventions::{
+        validate_message, Intervention, InterventionCounts, InterventionReservation,
+        MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
+    },
     models::{
-        path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, Event, EventKind,
-        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent, NewAgentRun,
-        NewEvent, NewIncident, NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation,
-        NewTerminationRequest, Project, Submission, SubmissionStatus, TaskObservation,
-        TerminationRequest, TerminationRequestStatus,
+        launch_gate_marker_path, path_text, AgentContextMode, AgentRun, AgentRunEvent,
+        AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentTransition,
+        IncidentUpdate, IntegrationEvent, InterventionStatus, NewAgentRun, NewEvent, NewIncident,
+        NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
+        Project, Submission, SubmissionStatus, TaskObservation, TerminationRequest,
+        TerminationRequestStatus,
     },
     AppError,
 };
@@ -793,6 +800,63 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("read recent events"))
     }
 
+    pub fn list_filtered(
+        &self,
+        project_id: &str,
+        filter: &EventFilter,
+    ) -> Result<Vec<Event>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 AND (?2 IS NULL OR kind = ?2)
+                 AND (?3 IS NULL OR status = ?3)
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT ?4",
+                EVENT_SELECT
+            ))
+            .map_err(database_error("prepare filtered event query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    filter.kind,
+                    filter.status,
+                    bounded_diagnostic_limit(filter.limit),
+                ],
+                event_from_row,
+            )
+            .map_err(database_error("query filtered events"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read filtered events"))
+    }
+
+    pub fn find_by_task_signature(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 AND json_extract(payload_json, '$.task_signature') = ?2
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT ?3",
+                EVENT_SELECT
+            ))
+            .map_err(database_error("prepare task event query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_signature, bounded_diagnostic_limit(limit)],
+                event_from_row,
+            )
+            .map_err(database_error("query task events"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task events"))
+    }
+
     pub fn count_consecutive_failures(
         &self,
         project_id: &str,
@@ -1001,6 +1065,74 @@ impl<'db> IncidentRepository<'db> {
             .optional()
             .map_err(database_error("find incident by ID"))
     }
+
+    pub fn find_by_project_and_id(
+        &self,
+        project_id: &str,
+        incident_id: i64,
+    ) -> Result<Option<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!(
+                    "{} WHERE project_id = ?1 AND incident_id = ?2",
+                    INCIDENT_SELECT
+                ),
+                params![project_id, incident_id],
+                incident_from_row,
+            )
+            .optional()
+            .map_err(database_error("find project incident by ID"))
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY last_seen_at DESC, incident_id DESC
+                 LIMIT ?2",
+                INCIDENT_SELECT
+            ))
+            .map_err(database_error("prepare project incident query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                incident_from_row,
+            )
+            .map_err(database_error("query project incidents"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project incidents"))
+    }
+
+    pub fn find_by_task_key(
+        &self,
+        project_id: &str,
+        task_key: &str,
+        limit: usize,
+    ) -> Result<Vec<Incident>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND task_key = ?2
+                 ORDER BY last_seen_at DESC, incident_id DESC
+                 LIMIT ?3",
+                INCIDENT_SELECT
+            ))
+            .map_err(database_error("prepare task incident query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_key, bounded_diagnostic_limit(limit)],
+                incident_from_row,
+            )
+            .map_err(database_error("query task incidents"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task incidents"))
+    }
 }
 
 pub struct SubmissionRepository<'db> {
@@ -1055,6 +1187,55 @@ impl<'db> SubmissionRepository<'db> {
             )
             .optional()
             .map_err(database_error("find submission by ID"))
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY created_at DESC, submission_id DESC
+                 LIMIT ?2",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare project submission query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                submission_from_row,
+            )
+            .map_err(database_error("query project submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project submissions"))
+    }
+
+    pub fn find_by_task_signature(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+        limit: usize,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND task_signature = ?2
+                 ORDER BY created_at DESC, submission_id DESC
+                 LIMIT ?3",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare task submission query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_signature, bounded_diagnostic_limit(limit)],
+                submission_from_row,
+            )
+            .map_err(database_error("query task submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task submissions"))
     }
 
     pub fn mark_accepted(
@@ -1215,14 +1396,20 @@ impl<'db> AgentRunRepository<'db> {
                     source,
                 }
             })?;
+        let launch_gate_state = if run.status == AgentRunStatus::Starting {
+            "pending"
+        } else {
+            "released"
+        };
         let connection = self.db.connect()?;
         connection
             .execute(
                 "INSERT INTO agent_runs (
                     project_id, primary_event_id, pid, status, started_at,
-                    finished_at, exit_code, log_path, last_error, context_mode,
+                    finished_at, exit_code, log_path, last_error, launch_gate_state,
+                    context_mode,
                     context_session_id, context_lineage_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
                 params![
                     run.project_id,
                     run.primary_event_id,
@@ -1230,6 +1417,7 @@ impl<'db> AgentRunRepository<'db> {
                     run.status,
                     run.started_at,
                     log_path,
+                    launch_gate_state,
                     run.context_mode.as_str(),
                     run.context_session_id.as_deref(),
                     context_lineage_json,
@@ -1244,17 +1432,50 @@ impl<'db> AgentRunRepository<'db> {
         run: &NewAgentRun,
         event_ids: &[i64],
     ) -> Result<AgentRun, AppError> {
+        self.insert_with_events_and_reservation(run, event_ids, None)
+    }
+
+    pub fn insert_with_events_and_reservation(
+        &self,
+        run: &NewAgentRun,
+        event_ids: &[i64],
+        reservation_token: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error("begin agent run and event insertion"))?;
+            .map_err(database_error(
+                "begin agent run, event, and intervention insertion",
+            ))?;
         let run_id = insert_agent_run(&transaction, run)?;
         for event_id in event_ids {
             attach_event_to_agent_run(&transaction, &run.project_id, run_id, *event_id)?;
         }
-        transaction
-            .commit()
-            .map_err(database_error("commit agent run and event insertion"))?;
+        if let Some(reservation_token) = reservation_token {
+            let changed = transaction
+                .execute(
+                    "UPDATE interventions
+                     SET agent_run_id = ?1
+                     WHERE project_id = ?2 AND reservation_token = ?3 AND status = ?4",
+                    params![
+                        run_id,
+                        run.project_id,
+                        reservation_token,
+                        InterventionStatus::Reserved,
+                    ],
+                )
+                .map_err(database_error(
+                    "attach intervention reservation to agent run",
+                ))?;
+            if changed == 0 {
+                return Err(AppError::Runtime {
+                    operation: "attach intervention reservation to agent run",
+                });
+            }
+        }
+        transaction.commit().map_err(database_error(
+            "commit agent run, event, and intervention insertion",
+        ))?;
         read_agent_run(&connection, run_id)
     }
 
@@ -1279,10 +1500,115 @@ impl<'db> AgentRunRepository<'db> {
         finished_at: i64,
         reason: &str,
     ) -> Result<AgentRunRecovery, AppError> {
+        let marker_confirmed_run_ids = {
+            let connection = self.db.connect()?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT run_id, log_path
+                     FROM agent_runs
+                     WHERE launch_gate_state = 'release_requested'",
+                )
+                .map_err(database_error("prepare launch gate recovery marker query"))?;
+            let run_logs = statement
+                .query_map([], |row| {
+                    let run_id = row.get::<_, i64>(0)?;
+                    let log_path = PathBuf::from(row.get::<_, String>(1)?);
+                    Ok((run_id, log_path))
+                })
+                .map_err(database_error("inspect launch gate recovery markers"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read launch gate recovery markers"))?;
+            let mut confirmed = Vec::new();
+            for (run_id, log_path) in run_logs {
+                match fs::metadata(launch_gate_marker_path(&log_path)) {
+                    Ok(metadata) if metadata.is_file() => confirmed.push(run_id),
+                    Ok(_) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(AppError::Io {
+                            operation: "inspect agent launch gate marker",
+                            source,
+                        });
+                    }
+                }
+            }
+            confirmed
+        };
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin interrupted agent run recovery"))?;
+        for run_id in marker_confirmed_run_ids {
+            transaction
+                .execute(
+                    "UPDATE agent_runs
+                     SET launch_gate_state = 'released'
+                     WHERE run_id = ?1 AND launch_gate_state = 'release_requested'",
+                    [run_id],
+                )
+                .map_err(database_error("promote marker-confirmed agent launch gate"))?;
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
+                     reservation_token = NULL
+                 WHERE status = ?3 AND agent_run_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM agent_runs
+                       WHERE agent_runs.project_id = interventions.project_id
+                         AND agent_runs.run_id = interventions.agent_run_id
+                         AND agent_runs.launch_gate_state = 'released'
+                         AND (agent_runs.pid IS NOT NULL OR agent_runs.status = 'running')
+                   )",
+                params![
+                    InterventionStatus::Applied,
+                    finished_at,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error(
+                "apply delivered interventions during agent run recovery",
+            ))?;
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status IN (?2, ?3) AND agent_run_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM agent_runs
+                       WHERE agent_runs.project_id = interventions.project_id
+                         AND agent_runs.run_id = interventions.agent_run_id
+                         AND (
+                             agent_runs.launch_gate_state IN ('pending', 'release_requested', 'failed')
+                             OR (agent_runs.pid IS NULL AND agent_runs.status <> 'running')
+                         )
+                   )",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    InterventionStatus::Applied,
+                ],
+            )
+            .map_err(database_error(
+                "release undelivered interventions during agent run recovery",
+            ))?;
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND agent_run_id IS NULL AND lease_expires_at <= ?3",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    finished_at,
+                ],
+            )
+            .map_err(database_error(
+                "recover expired interventions during agent run recovery",
+            ))?;
         let requeued_events = transaction
             .execute(
                 "UPDATE events
@@ -1304,7 +1630,11 @@ impl<'db> AgentRunRepository<'db> {
         let failed_runs = transaction
             .execute(
                 "UPDATE agent_runs
-                 SET status = 'failed', finished_at = ?1, last_error = ?2
+                 SET status = 'failed', finished_at = ?1, last_error = ?2,
+                     launch_gate_state = CASE
+                         WHEN launch_gate_state IN ('pending', 'release_requested') THEN 'failed'
+                         ELSE launch_gate_state
+                     END
                  WHERE status IN ('starting', 'running')",
                 params![finished_at, reason],
             )
@@ -1345,10 +1675,145 @@ impl<'db> AgentRunRepository<'db> {
         let connection = self.db.connect()?;
         connection
             .execute(
-                "UPDATE agent_runs SET pid = ?1, status = 'running' WHERE run_id = ?2",
+                "UPDATE agent_runs
+                 SET pid = ?1, status = 'running', launch_gate_state = 'released'
+                 WHERE run_id = ?2",
                 params![pid, run_id],
             )
             .map_err(database_error("mark agent run running"))?;
+        read_agent_run(&connection, run_id)
+    }
+
+    pub fn mark_running_and_apply_interventions(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        pid: i64,
+        applied_at: i64,
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin agent run start and intervention application",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs SET pid = ?1, status = 'running', launch_gate_state = 'pending'
+                 WHERE project_id = ?2 AND run_id = ?3",
+                params![pid, project_id, run_id],
+            )
+            .map_err(database_error("mark agent run running"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "mark project agent run running",
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
+                     reservation_token = NULL
+                 WHERE project_id = ?3 AND agent_run_id = ?4 AND status = ?5",
+                params![
+                    InterventionStatus::Applied,
+                    applied_at,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error(
+                "mark interventions applied for running agent",
+            ))?;
+        transaction.commit().map_err(database_error(
+            "commit agent run start and intervention application",
+        ))?;
+        read_agent_run(&connection, run_id)
+    }
+
+    pub fn mark_gate_release_requested(
+        &self,
+        project_id: &str,
+        run_id: i64,
+    ) -> Result<(), AppError> {
+        let connection = self.db.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE agent_runs
+                 SET launch_gate_state = 'release_requested'
+                 WHERE project_id = ?1 AND run_id = ?2 AND launch_gate_state = 'pending'",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("record agent launch gate release request"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "record agent launch gate release request",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn mark_gate_released(&self, project_id: &str, run_id: i64) -> Result<(), AppError> {
+        let connection = self.db.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE agent_runs
+                 SET launch_gate_state = 'released'
+                 WHERE project_id = ?1 AND run_id = ?2
+                   AND launch_gate_state = 'release_requested'",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("record agent launch gate release"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "record agent launch gate release",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn fail_before_gate_release(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+        reason: &str,
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin pre-release agent run failure"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', finished_at = ?1, last_error = ?2,
+                     launch_gate_state = 'failed'
+                 WHERE project_id = ?3 AND run_id = ?4
+                   AND launch_gate_state IN ('pending', 'release_requested')",
+                params![finished_at, reason, project_id, run_id],
+            )
+            .map_err(database_error("fail agent run before launch gate release"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "fail agent run before launch gate release",
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = 'pending', reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?1 AND agent_run_id = ?2
+                   AND status IN ('reserved', 'applied')",
+                params![project_id, run_id],
+            )
+            .map_err(database_error(
+                "requeue interventions after launch gate failure",
+            ))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit pre-release agent run failure"))?;
         read_agent_run(&connection, run_id)
     }
 
@@ -1372,6 +1837,71 @@ impl<'db> AgentRunRepository<'db> {
         read_agent_run(&connection, run_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_and_release_interventions(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin agent run finish and intervention release",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4,
+                     launch_gate_state = CASE
+                         WHEN launch_gate_state IN ('pending', 'release_requested')
+                              AND ?1 = 'failed' THEN 'failed'
+                         WHEN launch_gate_state IN ('pending', 'release_requested')
+                              AND ?1 IN ('completed', 'timed_out', 'cancelled') THEN 'released'
+                         ELSE launch_gate_state
+                     END
+                 WHERE project_id = ?5 AND run_id = ?6",
+                params![
+                    status,
+                    finished_at,
+                    exit_code,
+                    last_error,
+                    project_id,
+                    run_id,
+                ],
+            )
+            .map_err(database_error("finish project agent run"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "finish project agent run",
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?2 AND agent_run_id = ?3 AND status = ?4",
+                params![
+                    InterventionStatus::Pending,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error(
+                "release interventions for finished agent run",
+            ))?;
+        transaction.commit().map_err(database_error(
+            "commit agent run finish and intervention release",
+        ))?;
+        read_agent_run(&connection, run_id)
+    }
+
     pub fn count_by_project(&self, project_id: &str) -> Result<u32, AppError> {
         let connection = self.db.connect()?;
         let count: i64 = connection
@@ -1384,6 +1914,64 @@ impl<'db> AgentRunRepository<'db> {
         u32::try_from(count).map_err(|_| AppError::Runtime {
             operation: "count agent runs",
         })
+    }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentRun>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY started_at DESC, run_id DESC
+                 LIMIT ?2",
+                AGENT_RUN_SELECT
+            ))
+            .map_err(database_error("prepare project agent run query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                agent_run_from_row,
+            )
+            .map_err(database_error("query project agent runs"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read project agent runs"))
+    }
+
+    pub fn find_by_event(
+        &self,
+        project_id: &str,
+        event_id: i64,
+        limit: usize,
+    ) -> Result<Vec<AgentRun>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT agent_runs.run_id, agent_runs.project_id, agent_runs.primary_event_id,
+                        agent_runs.pid, agent_runs.status, agent_runs.started_at,
+                        agent_runs.finished_at, agent_runs.exit_code, agent_runs.log_path,
+                        agent_runs.last_error, agent_runs.launch_gate_state,
+                        agent_runs.context_mode, agent_runs.context_session_id,
+                        agent_runs.context_lineage_json
+                 FROM agent_runs
+                 JOIN agent_run_events
+                   ON agent_run_events.project_id = agent_runs.project_id
+                  AND agent_run_events.run_id = agent_runs.run_id
+                 WHERE agent_runs.project_id = ?1 AND agent_run_events.event_id = ?2
+                 ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(database_error("prepare event agent run query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, event_id, bounded_diagnostic_limit(limit)],
+                agent_run_from_row,
+            )
+            .map_err(database_error("query event agent runs"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read event agent runs"))
     }
 }
 
@@ -1763,6 +2351,401 @@ impl<'db> TerminationRequestRepository<'db> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read project termination requests"))
     }
+
+    pub fn list_by_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 ORDER BY requested_at DESC, request_id DESC
+                 LIMIT ?2",
+                TERMINATION_REQUEST_SELECT
+            ))
+            .map_err(database_error(
+                "prepare bounded project termination request query",
+            ))?;
+        let rows = statement
+            .query_map(
+                params![project_id, bounded_diagnostic_limit(limit)],
+                termination_request_from_row,
+            )
+            .map_err(database_error("query bounded project termination requests"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read bounded project termination requests"))
+    }
+
+    pub fn find_by_task_signature(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+        limit: usize,
+    ) -> Result<Vec<TerminationRequest>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND task_signature = ?2
+                 ORDER BY requested_at DESC, request_id DESC
+                 LIMIT ?3",
+                TERMINATION_REQUEST_SELECT
+            ))
+            .map_err(database_error("prepare task termination request query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_signature, bounded_diagnostic_limit(limit)],
+                termination_request_from_row,
+            )
+            .map_err(database_error("query task termination requests"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task termination requests"))
+    }
+}
+
+pub struct InterventionRepository<'db> {
+    db: &'db Db,
+}
+
+impl<'db> InterventionRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_pending(
+        &self,
+        project_id: &str,
+        message: &str,
+        created_at: i64,
+    ) -> Result<Intervention, AppError> {
+        validate_message(message)?;
+        let intervention_id = Uuid::new_v4().to_string();
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention insert"))?;
+        let insertion_sequence: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(insertion_sequence), 0) + 1
+                 FROM interventions WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("allocate intervention insertion sequence"))?;
+        transaction
+            .execute(
+                "INSERT INTO interventions (
+                    intervention_id, project_id, insertion_sequence, message, status, created_at, reserved_at,
+                    applied_at, agent_run_id, attempts, lease_expires_at, reservation_token
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, 0, NULL, NULL)",
+                params![
+                    intervention_id,
+                    project_id,
+                    insertion_sequence,
+                    message,
+                    InterventionStatus::Pending,
+                    created_at,
+                ],
+            )
+            .map_err(database_error("insert intervention"))?;
+        let intervention = transaction
+            .query_row(
+                &format!(
+                    "{} WHERE intervention_id = ?1 AND project_id = ?2",
+                    INTERVENTION_SELECT
+                ),
+                params![intervention_id, project_id],
+                intervention_from_row,
+            )
+            .map_err(database_error("read inserted intervention"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention insert"))?;
+        Ok(intervention)
+    }
+
+    pub fn list(
+        &self,
+        project_id: &str,
+        status: InterventionStatus,
+        limit: usize,
+    ) -> Result<Vec<Intervention>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND status = ?2
+                 ORDER BY insertion_sequence ASC, created_at ASC, intervention_id ASC
+                 LIMIT ?3",
+                INTERVENTION_SELECT
+            ))
+            .map_err(database_error("prepare intervention list"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    status,
+                    limit.min(MAX_INTERVENTIONS_PER_RUN) as i64,
+                ],
+                intervention_from_row,
+            )
+            .map_err(database_error("query interventions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read interventions"))
+    }
+
+    pub fn count_by_project(&self, project_id: &str) -> Result<InterventionCounts, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'reserved' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END), 0)
+                 FROM interventions
+                 WHERE project_id = ?1",
+                [project_id],
+                |row| {
+                    Ok(InterventionCounts {
+                        pending: row.get(0)?,
+                        reserved: row.get(1)?,
+                        applied: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(database_error("count project interventions"))
+    }
+
+    pub fn reserve_pending(
+        &self,
+        project_id: &str,
+        token: &str,
+        now: i64,
+        lease_until: i64,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Result<InterventionReservation, AppError> {
+        if lease_until <= now {
+            return Err(AppError::Configuration {
+                field: "intervention_lease",
+            });
+        }
+        let max_count = max_count.min(MAX_INTERVENTIONS_PER_RUN);
+        let max_bytes = max_bytes.min(MAX_INTERVENTION_BYTES_PER_RUN);
+        if max_count == 0 || max_bytes == 0 {
+            return Ok(InterventionReservation {
+                token: token.to_owned(),
+                items: Vec::new(),
+            });
+        }
+
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin immediate intervention reservation"))?;
+        let pending = {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "{} WHERE project_id = ?1 AND status = ?2
+                     ORDER BY insertion_sequence ASC, created_at ASC, intervention_id ASC
+                     LIMIT ?3",
+                    INTERVENTION_SELECT
+                ))
+                .map_err(database_error("prepare pending intervention reservation"))?;
+            let pending = statement
+                .query_map(
+                    params![project_id, InterventionStatus::Pending, max_count as i64],
+                    intervention_from_row,
+                )
+                .map_err(database_error("query pending interventions"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read pending interventions"))?;
+            pending
+        };
+
+        let mut total_bytes = 0;
+        let mut items = Vec::with_capacity(pending.len());
+        for intervention in pending {
+            let next_total = total_bytes + intervention.message.len();
+            if next_total > max_bytes {
+                break;
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE interventions
+                     SET status = ?1, reserved_at = ?2, attempts = attempts + 1,
+                         lease_expires_at = ?3, reservation_token = ?4
+                     WHERE intervention_id = ?5 AND project_id = ?6 AND status = ?7",
+                    params![
+                        InterventionStatus::Reserved,
+                        now,
+                        lease_until,
+                        token,
+                        intervention.intervention_id,
+                        project_id,
+                        InterventionStatus::Pending,
+                    ],
+                )
+                .map_err(database_error("reserve intervention"))?;
+            if changed == 1 {
+                total_bytes = next_total;
+                items.push(
+                    transaction
+                        .query_row(
+                            &format!(
+                                "{} WHERE intervention_id = ?1 AND project_id = ?2",
+                                INTERVENTION_SELECT
+                            ),
+                            params![intervention.intervention_id, project_id],
+                            intervention_from_row,
+                        )
+                        .map_err(database_error("read reserved intervention"))?,
+                );
+            }
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention reservation"))?;
+        Ok(InterventionReservation {
+            token: token.to_owned(),
+            items,
+        })
+    }
+
+    pub fn mark_applied_for_run(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        applied_at: i64,
+    ) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention application"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
+                     reservation_token = NULL
+                 WHERE project_id = ?3 AND agent_run_id = ?4 AND status = ?5",
+                params![
+                    InterventionStatus::Applied,
+                    applied_at,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error("mark interventions applied for run"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention application"))?;
+        Ok(changed)
+    }
+
+    pub fn release_for_run(&self, project_id: &str, run_id: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention release"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?2 AND agent_run_id = ?3 AND status = ?4",
+                params![
+                    InterventionStatus::Pending,
+                    project_id,
+                    run_id,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error("release interventions for run"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention release"))?;
+        Ok(changed)
+    }
+
+    pub fn release_reservation(
+        &self,
+        project_id: &str,
+        reservation_token: &str,
+    ) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin intervention reservation release"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?2 AND reservation_token = ?3 AND status = ?4",
+                params![
+                    InterventionStatus::Pending,
+                    project_id,
+                    reservation_token,
+                    InterventionStatus::Reserved,
+                ],
+            )
+            .map_err(database_error("release intervention reservation"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit intervention reservation release"))?;
+        Ok(changed)
+    }
+
+    pub fn recover_expired(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin expired intervention recovery"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND lease_expires_at <= ?3",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    now,
+                ],
+            )
+            .map_err(database_error("recover expired interventions"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit expired intervention recovery"))?;
+        Ok(changed)
+    }
+
+    pub fn recover_expired_unattached(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin expired unattached intervention recovery",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND agent_run_id IS NULL AND lease_expires_at <= ?3",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    now,
+                ],
+            )
+            .map_err(database_error("recover expired unattached interventions"))?;
+        transaction.commit().map_err(database_error(
+            "commit expired unattached intervention recovery",
+        ))?;
+        Ok(changed)
+    }
 }
 
 pub struct TaskObservationRepository<'db> {
@@ -1850,6 +2833,31 @@ impl<'db> TaskObservationRepository<'db> {
             .optional()
             .map_err(database_error("find task observation"))
     }
+
+    pub fn find_by_pueue_task(
+        &self,
+        project_id: &str,
+        pueue_task_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TaskObservation>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND pueue_task_id = ?2
+                 ORDER BY observed_at DESC, task_signature DESC
+                 LIMIT ?3",
+                TASK_OBSERVATION_SELECT
+            ))
+            .map_err(database_error("prepare Pueue task observation query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, pueue_task_id, bounded_diagnostic_limit(limit)],
+                task_observation_from_row,
+            )
+            .map_err(database_error("query Pueue task observations"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read Pueue task observations"))
+    }
 }
 
 const EVENT_SELECT: &str =
@@ -1871,7 +2879,7 @@ const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, cr
 
 const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid, status,
             started_at, finished_at, exit_code, log_path, last_error,
-            context_mode, context_session_id, context_lineage_json
+            launch_gate_state, context_mode, context_session_id, context_lineage_json
      FROM agent_runs";
 
 const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, project_id,
@@ -1882,6 +2890,15 @@ const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, projec
 const TASK_OBSERVATION_SELECT: &str = "SELECT project_id, task_signature, pueue_task_id,
             pueue_group, command_json, state, enqueued_at, started_at, ended_at, result, observed_at
      FROM task_observations";
+
+const INTERVENTION_SELECT: &str = "SELECT intervention_id, project_id, insertion_sequence,
+            message, status, created_at, reserved_at, applied_at, agent_run_id, attempts,
+            lease_expires_at, reservation_token
+     FROM interventions";
+
+fn bounded_diagnostic_limit(limit: usize) -> i64 {
+    limit.min(MAX_EVENT_LIST_LIMIT) as i64
+}
 
 fn exists(
     transaction: &Transaction<'_>,
@@ -1927,6 +2944,23 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
         created_at: row.get(9)?,
         completed_at: row.get(10)?,
         last_error: row.get(11)?,
+    })
+}
+
+fn intervention_from_row(row: &Row<'_>) -> rusqlite::Result<Intervention> {
+    Ok(Intervention {
+        intervention_id: row.get(0)?,
+        project_id: row.get(1)?,
+        insertion_sequence: row.get(2)?,
+        message: row.get(3)?,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        reserved_at: row.get(6)?,
+        applied_at: row.get(7)?,
+        agent_run_id: row.get(8)?,
+        attempts: row.get(9)?,
+        lease_expires_at: row.get(10)?,
+        reservation_token: row.get(11)?,
     })
 }
 
@@ -1986,15 +3020,16 @@ fn read_submission(connection: &Connection, submission_id: &str) -> Result<Submi
 }
 
 fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
-    let context_mode_value: String = row.get(10)?;
-    let context_session_id: Option<String> = row.get(11)?;
+    let launch_gate_state: String = row.get(10)?;
+    let context_mode_value: String = row.get(11)?;
+    let context_session_id: Option<String> = row.get(12)?;
     let context_mode =
         AgentContextMode::from_db_parts(&context_mode_value, context_session_id.clone()).map_err(
-            |source| rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(source)),
+            |source| rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(source)),
         )?;
-    let context_lineage_json: String = row.get(12)?;
+    let context_lineage_json: String = row.get(13)?;
     let context_lineage = serde_json::from_str(&context_lineage_json).map_err(|source| {
-        rusqlite::Error::FromSqlConversionFailure(12, Type::Text, Box::new(source))
+        rusqlite::Error::FromSqlConversionFailure(13, Type::Text, Box::new(source))
     })?;
     Ok(AgentRun {
         run_id: row.get(0)?,
@@ -2007,6 +3042,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
         exit_code: row.get(7)?,
         log_path: PathBuf::from(row.get::<_, String>(8)?),
         last_error: row.get(9)?,
+        launch_gate_state,
         context_mode,
         context_session_id,
         context_lineage,
@@ -2020,13 +3056,19 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
             operation: "serialize agent context lineage",
             source,
         })?;
+    let launch_gate_state = if run.status == AgentRunStatus::Starting {
+        "pending"
+    } else {
+        "released"
+    };
     transaction
         .execute(
             "INSERT INTO agent_runs (
                 project_id, primary_event_id, pid, status, started_at,
-                finished_at, exit_code, log_path, last_error, context_mode,
+                finished_at, exit_code, log_path, last_error, launch_gate_state,
+                context_mode,
                 context_session_id, context_lineage_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
             params![
                 run.project_id,
                 run.primary_event_id,
@@ -2034,6 +3076,7 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
                 run.status,
                 run.started_at,
                 log_path,
+                launch_gate_state,
                 run.context_mode.as_str(),
                 run.context_session_id.as_deref(),
                 context_lineage_json,

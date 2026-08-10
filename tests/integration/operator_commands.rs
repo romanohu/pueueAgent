@@ -326,6 +326,27 @@ fn status_shows_pueue_integration_error_without_claiming_active_tasks_are_empty(
     assert!(!output.contains("idle"));
 }
 
+#[test]
+fn status_text_output_is_byte_compatible_for_an_active_project() {
+    let harness = OperatorHarness::new();
+    let project = harness.project();
+
+    let output = status::render_project_status(
+        &harness.db,
+        &project,
+        &harness.status_input(PueueSnapshot::Tasks(vec![harness.running_task()])),
+    )
+    .unwrap();
+
+    assert_eq!(
+        output,
+        format!(
+            "daemon: running\nproject: project-a\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\nactive_tasks: 1\ntask 41 running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}",
+            project.root_path.display()
+        )
+    );
+}
+
 #[tokio::test]
 async fn pause_prevents_new_agent_claims_and_automatic_termination_until_resume() {
     let harness = OperatorHarness::new();

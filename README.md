@@ -71,6 +71,31 @@ pueue-agent disable --remove   # 登録と group の予約を明示的に解放�
 
 `pause` は pending event を保持したまま、新しい agent の起動と自動終了を停止します。`resume` で保持していた event を再び処理対象にできます。通常の `disable` は Pueue group の予約を維持します。`--remove` は明示的な登録解除であり、Pueue の status を取得できない場合は実行しません。
 
+## 診断
+
+```bash
+pueue-agent events --json --limit 100
+pueue-agent inspect <pueue-task-id> --json
+pueue-agent explain <incident-id> --json
+pueue-agent doctor --json
+```
+
+`events` は現在のプロジェクトの event を kind、status、件数で絞り込みます。`inspect` は task ID の最新 observation と、同じ stable signature に結び付く履歴を表示します。`explain` は observation、incident、event、policy、approval、Pueue action の因果順で表示し、Phase A で未設定の policy と approval は `not_configured` として示します。`doctor` は読み取り専用で、error check がある場合だけ非ゼロ終了します。すべての診断出力は上限付きで、prompt、transcript、payload 本文は出力しません。
+
+## 人による介入を次回の agent run に渡す
+
+```bash
+pueue-agent steer -- "次は learning rate を半分にして"
+pueue-agent steer list
+pueue-agent status --json
+```
+
+`steer` は現在のプロジェクトに対するメッセージを SQLite へ登録するだけで、agent の起動、Pueue 操作、実行中 process への入力は行いません。各メッセージは最大 `4,096 bytes` です。1回の run には最大 `16 messages`、合計 `16,384 intervention bytes` までを、残りの prompt budget に収まる範囲で配信します。登録したメッセージは FIFO 順で一度だけ、次回の agent run の prompt に渡されますが、1回ですべての pending メッセージを配信するとは限りません。上限または残りの prompt budget を超える FIFO の後続メッセージ（超過分）は pending のまま、後続の run へ繰り越されます。agent の spawn に失敗した場合、メッセージは pending に戻されるため、次回の run で再試行されます。
+
+`pause` または `disable` 中でもメッセージはキューへ登録できますが、配信はせず、resume または enable 後の次回 run まで保持されます。`status --json` はキューの件数などの診断情報を返しますが、メッセージ本文は含めません。実行中の agent は中断しません。介入メッセージによって、安全ポリシーや既存の制約を上書きすることはできません。
+
+Unix では、agent process は prompt を受け取る前に起動 gate で待機します。run の PID 記録と intervention 適用 transaction が commit された後だけ親 process が release byte を送り、gate が EOF や異なる入力を受けた場合は設定済み agent を実行せず終了します。
+
 ## プロジェクトファイルと共有実験コンテキスト
 
 `pueue-agent init` は次のファイルを作成します。

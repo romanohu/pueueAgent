@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     daemon::{Daemon, DaemonConfig},
-    db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
+    db::{AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository},
+    interventions::InterventionStatus,
     models::{
         AgentContextMode, AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject,
     },
@@ -327,6 +328,49 @@ max_agent_runs = 10
             )
             .unwrap()
     }
+
+    fn reserve_intervention(&self, message: &str, token: &str, lease_expires_at: i64) -> String {
+        let repository = InterventionRepository::new(&self.db);
+        let intervention_id = repository
+            .insert_pending("project-a", message, self.now - 20)
+            .unwrap()
+            .intervention_id;
+        repository
+            .reserve_pending(
+                "project-a",
+                token,
+                self.now - 10,
+                lease_expires_at,
+                1,
+                message.len(),
+            )
+            .unwrap();
+        intervention_id
+    }
+
+    fn attach_intervention(&self, intervention_id: &str, run_id: i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE interventions SET agent_run_id = ?1
+                 WHERE project_id = 'project-a' AND intervention_id = ?2",
+                rusqlite::params![run_id, intervention_id],
+            )
+            .unwrap();
+    }
+
+    fn intervention_state(&self, intervention_id: &str) -> (InterventionStatus, Option<i64>) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+                [intervention_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
 }
 
 fn toml_string_array(values: &[&str]) -> String {
@@ -508,6 +552,104 @@ async fn daemon_restart_recovers_expired_claims_without_requiring_a_new_callback
         .unwrap();
     assert_eq!(event.status, EventStatus::Pending);
     assert_eq!(event.lease_until, None);
+}
+
+#[tokio::test]
+async fn intervention_recovery_returns_an_expired_unattached_reservation_to_pending() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let intervention_id =
+        harness.reserve_intervention("expired instruction", "expired-token", harness.now);
+
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Pending, None)
+    );
+}
+
+#[tokio::test]
+async fn later_daemon_tick_recovers_unattached_intervention_after_startup_recovery() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let intervention_id =
+        harness.reserve_intervention("expires after startup", "later-token", harness.now + 1);
+
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Reserved, None)
+    );
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET lease_expires_at = ?1 WHERE intervention_id = ?2",
+            rusqlite::params![harness.now - 1, intervention_id],
+        )
+        .unwrap();
+
+    daemon.run_once().await.unwrap();
+
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Pending, None)
+    );
+}
+
+#[tokio::test]
+async fn intervention_recovery_applies_a_reserved_row_attached_to_a_run_with_a_pid_once() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "delivered-before-crash");
+    let run_id = harness.insert_active_run("project-a", event_id, AgentRunStatus::Running);
+    let intervention_id =
+        harness.reserve_intervention("already delivered", "live-token", harness.now + 600);
+    harness.attach_intervention(&intervention_id, run_id);
+
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+    daemon.run_once().await.unwrap();
+    let mut restarted_daemon = harness.daemon();
+    restarted_daemon.run_once().await.unwrap();
+
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Applied, Some(run_id))
+    );
+}
+
+#[tokio::test]
+async fn intervention_recovery_releases_a_reserved_row_attached_to_a_failed_pre_spawn_run() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "failed-before-spawn");
+    let run_id = harness.insert_active_run("project-a", event_id, AgentRunStatus::Starting);
+    let intervention_id =
+        harness.reserve_intervention("not delivered", "failed-token", harness.now + 600);
+    harness.attach_intervention(&intervention_id, run_id);
+    AgentRunRepository::new(&harness.db)
+        .finish(
+            run_id,
+            AgentRunStatus::Failed,
+            harness.now - 5,
+            None,
+            Some("spawn failed"),
+        )
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Pending, None)
+    );
 }
 
 #[tokio::test]
