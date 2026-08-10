@@ -13,7 +13,7 @@ use crate::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
-    output::redact_sensitive_text,
+    output::{bounded_redacted_text, render_id},
     pueue::PueueTask,
     service::{callback_command, ServicePaths, ServiceStatus},
     status::{PueueSnapshot, StatusInput},
@@ -26,7 +26,6 @@ pub const DEFAULT_EVENT_LIST_LIMIT: usize = 100;
 pub const MAX_EVENT_LIST_LIMIT: usize = 1_000;
 pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 
-const MAX_SUMMARY_TEXT_BYTES: usize = 240;
 const MAX_TASK_AGENT_RUNS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +75,8 @@ pub fn render_events(
         .iter()
         .map(|event| {
             format!(
-                "event {} kind={} status={} attempts={} lease={} created_at={} completed_at={} error={}",
-                event.event_id,
+                "{} kind={} status={} attempts={} lease={} created_at={} completed_at={} error={}",
+                render_id("event", event.event_id),
                 event.kind,
                 event.status,
                 event.attempts,
@@ -139,7 +138,7 @@ impl From<&TaskObservation> for TaskObservationSummary {
             task_signature: bounded_summary(&observation.task_signature),
             pueue_task_id: observation.pueue_task_id,
             pueue_group: bounded_summary(&observation.pueue_group),
-            state: bounded_text(&observation.state.to_ascii_lowercase()),
+            state: bounded_redacted_text(&observation.state.to_ascii_lowercase()),
             command_summary: executable_summary(&observation.command.join(" ")),
             enqueued_at: observation.enqueued_at,
             started_at: observation.started_at,
@@ -256,8 +255,8 @@ pub fn render_task_inspection(
 
 fn format_task_inspection_text(report: &TaskInspectionReport) -> String {
     format!(
-        "task {} latest_signature={} state={} observed_at={} history={} submissions={} incidents={} events={} terminations={} agent_runs={}",
-        report.task_id,
+        "{} latest_signature={} state={} observed_at={} history={} submissions={} incidents={} events={} terminations={} agent_runs={}",
+        render_id("task", report.task_id),
         report.latest.task_signature,
         report.latest.state,
         report.latest.observed_at,
@@ -597,7 +596,10 @@ pub fn build_doctor_report(
     } else {
         doctor_warning(
             "sqlite.wal",
-            &format!("SQLite journal mode is {}", bounded_text(&journal_mode)),
+            &format!(
+                "SQLite journal mode is {}",
+                bounded_redacted_text(&journal_mode)
+            ),
             "use WAL mode for the daemon database",
         )
     });
@@ -635,7 +637,7 @@ pub fn build_doctor_report(
         ),
         Err(error) => doctor_error(
             "project.config",
-            &bounded_text(&error.to_string()),
+            &bounded_redacted_text(&error.to_string()),
             "repair .pueue-agent/config.toml and validate it before retrying",
         ),
     });
@@ -652,7 +654,7 @@ pub fn build_doctor_report(
         ),
         Err(error) => doctor_error(
             "pueue.status",
-            &bounded_text(error),
+            &bounded_redacted_text(error),
             "start Pueue and verify the configured Pueue profile",
         ),
     });
@@ -674,7 +676,7 @@ pub fn build_doctor_report(
         ),
         Err(error) => doctor_error(
             "pueue.callback",
-            &bounded_text(error),
+            &bounded_redacted_text(error),
             "make the Pueue configuration readable and inspect its callback",
         ),
     });
@@ -694,7 +696,7 @@ pub fn build_doctor_report(
         ),
         Err(error) => doctor_error(
             "service.state",
-            &bounded_text(error),
+            &bounded_redacted_text(error),
             "verify the supported service manager and user session",
         ),
     });
@@ -808,8 +810,8 @@ fn doctor_ok(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
     DoctorCheck {
         name: name.to_owned(),
         status: DoctorCheckStatus::Ok,
-        summary: bounded_text(summary),
-        remediation: bounded_text(remediation),
+        summary: bounded_redacted_text(summary),
+        remediation: bounded_redacted_text(remediation),
     }
 }
 
@@ -817,8 +819,8 @@ fn doctor_warning(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
     DoctorCheck {
         name: name.to_owned(),
         status: DoctorCheckStatus::Warning,
-        summary: bounded_text(summary),
-        remediation: bounded_text(remediation),
+        summary: bounded_redacted_text(summary),
+        remediation: bounded_redacted_text(remediation),
     }
 }
 
@@ -826,8 +828,8 @@ fn doctor_error(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
     DoctorCheck {
         name: name.to_owned(),
         status: DoctorCheckStatus::Error,
-        summary: bounded_text(summary),
-        remediation: bounded_text(remediation),
+        summary: bounded_redacted_text(summary),
+        remediation: bounded_redacted_text(remediation),
     }
 }
 
@@ -1201,10 +1203,10 @@ impl From<&PueueTask> for PueueTaskSummary {
     fn from(task: &PueueTask) -> Self {
         Self {
             task_id: task.id,
-            state: bounded_text(&task.state.to_ascii_lowercase()),
+            state: bounded_redacted_text(&task.state.to_ascii_lowercase()),
             command_summary: executable_summary(&task.command),
-            enqueued_at: task.enqueued_at.as_deref().map(bounded_text),
-            started_at: task.started_at.as_deref().map(bounded_text),
+            enqueued_at: task.enqueued_at.as_deref().map(bounded_redacted_text),
+            started_at: task.started_at.as_deref().map(bounded_redacted_text),
         }
     }
 }
@@ -1337,12 +1339,7 @@ fn count(counts: &BTreeMap<String, i64>, status: &str) -> i64 {
 }
 
 fn bounded_summary(value: &str) -> String {
-    let redacted = value
-        .split_whitespace()
-        .map(redact_sensitive_token)
-        .collect::<Vec<_>>()
-        .join(" ");
-    bounded_text(&redacted)
+    bounded_redacted_text(value)
 }
 
 fn safe_error_summary(category: &'static str) -> String {
@@ -1353,79 +1350,7 @@ fn safe_error_summary(category: &'static str) -> String {
         "agent_run" => "agent run failed",
         _ => "diagnostic operation failed",
     };
-    bounded_text(summary)
-}
-
-fn bounded_text(value: &str) -> String {
-    let normalized = redact_sensitive_text(value)
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.len() <= MAX_SUMMARY_TEXT_BYTES {
-        normalized
-    } else {
-        let mut prefix = String::new();
-        for character in normalized.chars() {
-            if prefix.len() + character.len_utf8() > MAX_SUMMARY_TEXT_BYTES - 3 {
-                break;
-            }
-            prefix.push(character);
-        }
-        format!("{prefix}...")
-    }
-}
-
-fn redact_sensitive_token(token: &str) -> String {
-    let lower = token.to_ascii_lowercase();
-    if is_sensitive_token(&lower) {
-        "[redacted]".to_owned()
-    } else if is_path_token(token) {
-        "[path]".to_owned()
-    } else {
-        token.to_owned()
-    }
-}
-
-fn is_sensitive_token(lower: &str) -> bool {
-    [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "prompt",
-        "transcript",
-        "log_path",
-        "apikey",
-        "api_key",
-        "authorization",
-        "bearer",
-        "credential",
-        "cookie",
-        "private_key",
-        "session_id",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn is_path_token(token: &str) -> bool {
-    token.starts_with('/')
-        || token.starts_with("~/")
-        || token.starts_with("./")
-        || token.starts_with("../")
-        || token.contains('/')
-        || token.contains('\\')
-        || token
-            .as_bytes()
-            .get(1)
-            .is_some_and(|character| *character == b':')
+    bounded_redacted_text(summary)
 }
 
 fn executable_summary(command: &str) -> String {

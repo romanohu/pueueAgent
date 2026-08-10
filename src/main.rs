@@ -68,6 +68,7 @@ mod commands {
         events::{record_callback, CallbackMetadata},
         interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
+        output::bounded_redacted_text,
         paths, project,
         pueue::{CommandPueue, PueueApi},
         service::{
@@ -163,8 +164,7 @@ mod commands {
             json,
             compact,
         } = args;
-        let (db, project, service_paths) =
-            resolve_project_read_only(project_root, pueue_config)?;
+        let (db, project, service_paths) = resolve_project_read_only(project_root, pueue_config)?;
         let pueue = configured_pueue(&service_paths);
         let pueue = match pueue.status_json().await {
             Ok(tasks) => PueueSnapshot::Tasks(tasks),
@@ -306,7 +306,7 @@ mod commands {
                                 "intervention_id": intervention.intervention_id,
                                 "status": intervention.status.as_str(),
                                 "created_at": intervention.created_at,
-                                "message": intervention.message,
+                                "message": bounded_redacted_text(&intervention.message),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -325,7 +325,7 @@ mod commands {
                             intervention.intervention_id,
                             intervention.status,
                             intervention.created_at,
-                            escape_text(&intervention.message)
+                            bounded_redacted_text(&intervention.message)
                         );
                     }
                 }
@@ -451,22 +451,5 @@ mod commands {
                 ),
             })
         }
-    }
-
-    fn escape_text(value: &str) -> String {
-        let mut escaped = String::with_capacity(value.len());
-        for character in value.chars() {
-            match character {
-                '\n' => escaped.push_str(r"\n"),
-                '\r' => escaped.push_str(r"\r"),
-                '\t' => escaped.push_str(r"\t"),
-                '\x1b' => escaped.push_str(r"\x1b"),
-                character if character.is_control() => {
-                    escaped.push_str(&format!(r"\u{{{:04x}}}", character as u32));
-                }
-                character => escaped.push(character),
-            }
-        }
-        escaped
     }
 }

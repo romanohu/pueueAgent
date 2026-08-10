@@ -62,16 +62,22 @@ impl DiagnosticsHarness {
 #[test]
 fn redact_sensitive_text_removes_flag_bearer_and_credential_values() {
     let rendered = redact_sensitive_text(
-        "train --token very-secret --api-key abc123 --password hunter2 --secret hidden \
-         Authorization: Bearer bearer-secret AWS_SECRET_ACCESS_KEY=environment-secret --lr 0.001",
+        "train --token very-secret --access-token separated-token \
+         --access-token=equal-token --api-key abc123 --password hunter2 --secret hidden \
+         Authorization: Bearer bearer-secret AWS_ACCESS_KEY_ID=AKIA123 \
+         ACCESS_KEY=access-secret AWS_SECRET_ACCESS_KEY=environment-secret --lr 0.001",
     );
 
     for secret in [
         "very-secret",
+        "separated-token",
+        "equal-token",
         "abc123",
         "hunter2",
         "hidden",
         "bearer-secret",
+        "AKIA123",
+        "access-secret",
         "environment-secret",
     ] {
         assert!(
@@ -81,8 +87,18 @@ fn redact_sensitive_text_removes_flag_bearer_and_credential_values() {
     }
     assert_eq!(
         rendered,
-        "train --token [REDACTED] --api-key [REDACTED] --password [REDACTED] --secret [REDACTED] Authorization: Bearer [REDACTED] AWS_SECRET_ACCESS_KEY=[REDACTED] --lr 0.001"
+        "train --token [REDACTED] --access-token [REDACTED] --access-token=[REDACTED] --api-key [REDACTED] --password [REDACTED] --secret [REDACTED] Authorization: Bearer [REDACTED] AWS_ACCESS_KEY_ID=[REDACTED] ACCESS_KEY=[REDACTED] AWS_SECRET_ACCESS_KEY=[REDACTED] --lr 0.001"
     );
+}
+
+#[test]
+fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
+    let rendered =
+        pueue_agent::output::bounded_redacted_text("prefix\x1b[31mhidden\x1b[0m\n\t\u{0007}suffix");
+
+    assert_eq!(rendered, "prefixhidden suffix");
+    assert!(!rendered.chars().any(char::is_control));
+    assert!(!rendered.contains("[31m"));
 }
 
 #[test]

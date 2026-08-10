@@ -294,7 +294,7 @@ fn steer_list_text_and_json_are_fifo_bounded_and_project_scoped() {
 }
 
 #[test]
-fn steer_list_text_escapes_controls_without_changing_json_message() {
+fn steer_list_text_and_json_strip_controls() {
     let harness = SteerHarness::new();
     let message = "line\n\t\x1b[31mred";
     let project_id = harness.project_id(&harness.first_root);
@@ -309,7 +309,7 @@ fn steer_list_text_escapes_controls_without_changing_json_message() {
         .unwrap();
     assert!(text_output.status.success());
     let text = String::from_utf8(text_output.stdout).unwrap();
-    assert!(text.contains(r"line\n\t\x1b[31mred"));
+    assert!(text.contains("line red"));
     assert!(!text.contains(message));
     assert!(!text.contains('\x1b'));
 
@@ -320,5 +320,44 @@ fn steer_list_text_escapes_controls_without_changing_json_message() {
         .unwrap();
     assert!(json_output.status.success());
     let body: Value = serde_json::from_slice(&json_output.stdout).unwrap();
-    assert_eq!(body["interventions"][0]["message"], message);
+    assert_eq!(body["interventions"][0]["message"], "line red");
+    assert!(!String::from_utf8_lossy(&json_output.stdout).contains('\x1b'));
+}
+
+#[test]
+fn steer_list_redacts_and_bounds_message_in_human_and_json_output() {
+    let harness = SteerHarness::new();
+    let project_id = harness.project_id(&harness.first_root);
+    let message = format!(
+        "analysis --access-token separate-secret AWS_ACCESS_KEY_ID=AKIASECRET {}",
+        "x".repeat(300)
+    );
+    InterventionRepository::new(&harness.db)
+        .insert_pending(&project_id, &message, 300)
+        .unwrap();
+
+    let text_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "list"])
+        .output()
+        .unwrap();
+    assert!(text_output.status.success());
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(!text.contains("separate-secret"));
+    assert!(!text.contains("AKIASECRET"));
+    assert!(text.contains("[REDACTED]"));
+    assert!(!text.contains('\x1b'));
+
+    let json_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(json_output.status.success());
+    let body: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let rendered_message = body["interventions"][0]["message"].as_str().unwrap();
+    assert!(rendered_message.len() <= 240);
+    assert!(!rendered_message.contains("separate-secret"));
+    assert!(!rendered_message.contains("AKIASECRET"));
+    assert!(!String::from_utf8_lossy(&json_output.stdout).contains('\x1b'));
 }

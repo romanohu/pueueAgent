@@ -52,7 +52,8 @@ pub fn format_state(state: &str) -> String {
 }
 
 pub fn redact_sensitive_text(value: &str) -> String {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let sanitized = strip_control_and_ansi(value);
+    let tokens = sanitized.split_whitespace().collect::<Vec<_>>();
     let mut redacted = Vec::with_capacity(tokens.len());
     let mut redact_next = false;
     let mut redact_bearer_value = false;
@@ -103,6 +104,16 @@ pub fn redact_sensitive_text(value: &str) -> String {
             continue;
         }
 
+        if is_path_token(token) {
+            redacted.push("[path]".to_owned());
+            continue;
+        }
+
+        if is_sensitive_marker(token) {
+            redacted.push("[REDACTED]".to_owned());
+            continue;
+        }
+
         redacted.push(token.to_owned());
     }
 
@@ -126,10 +137,17 @@ pub fn bounded_redacted_text(value: &str) -> String {
 }
 
 fn is_sensitive_flag(value: &str) -> bool {
+    let normalized = value
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace('_', "-");
     matches!(
-        value.to_ascii_lowercase().as_str(),
-        "--token" | "--api-key" | "--password" | "--secret"
-    )
+        normalized.as_str(),
+        "token" | "api-key" | "password" | "secret" | "prompt" | "transcript"
+    ) || normalized.ends_with("-token")
+        || normalized.ends_with("-secret")
+        || normalized.ends_with("-password")
+        || normalized.ends_with("-key")
 }
 
 fn is_sensitive_key(value: &str) -> bool {
@@ -138,8 +156,87 @@ fn is_sensitive_key(value: &str) -> bool {
         || key.contains("SECRET")
         || key.contains("PASSWORD")
         || key.contains("PASSWD")
+        || key.contains("ACCESS_KEY")
         || key.contains("API_KEY")
         || key.contains("AUTHORIZATION")
         || key.contains("CREDENTIAL")
         || key.contains("PRIVATE_KEY")
+}
+
+fn is_sensitive_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "prompt",
+        "transcript",
+        "log_path",
+        "session_id",
+        "cookie",
+        "apikey",
+        "api_key",
+        "authorization",
+        "bearer",
+        "credential",
+        "private_key",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_path_token(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.contains('/')
+        || token.contains('\\')
+        || token
+            .as_bytes()
+            .get(1)
+            .is_some_and(|character| *character == b':')
+}
+
+fn strip_control_and_ansi(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        if character != '\x1b' {
+            if character.is_control() {
+                output.push(' ');
+            } else {
+                output.push(character);
+            }
+            continue;
+        }
+
+        match characters.peek().copied() {
+            Some('[') => {
+                characters.next();
+                for sequence_character in characters.by_ref() {
+                    if ('@'..='~').contains(&sequence_character) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                characters.next();
+                let mut previous = None;
+                for sequence_character in characters.by_ref() {
+                    if sequence_character == '\x07'
+                        || (previous == Some('\x1b') && sequence_character == '\\')
+                    {
+                        break;
+                    }
+                    previous = Some(sequence_character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    output
 }
