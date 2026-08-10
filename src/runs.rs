@@ -1,10 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use tokio::time::{self, Duration};
 
 use crate::{
-    db::{Db, RunLineage, RunLineageCursor, RunLineageRepository, SubmissionLineage},
+    db::{
+        Db, RunLineage, RunLineageCursor, RunLineageRepository, SubmissionLineage,
+        SubmissionPageCursor,
+    },
     diagnostics::JSON_SCHEMA_VERSION,
     models::Project,
     output::{bounded_redacted_text, format_state},
@@ -13,20 +16,175 @@ use crate::{
 
 pub const DEFAULT_RUN_LIST_LIMIT: usize = 32;
 pub const MAX_RUN_LIST_LIMIT: usize = 128;
+pub const MAX_FOLLOW_CURSOR_ENTRIES: usize = MAX_RUN_LIST_LIMIT;
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FollowStream {
+    Run(i64),
+    Event(i64),
+}
+
+#[derive(Debug)]
 pub struct FollowCursor {
-    seen: HashSet<RunLineageCursor>,
+    root_seen: BTreeMap<FollowStream, RunLineageCursor>,
     pending: BTreeSet<RunLineageCursor>,
+    submission_after: BTreeMap<i64, SubmissionPageCursor>,
+    submission_head: BTreeMap<i64, SubmissionPageCursor>,
+    submission_after_task: BTreeMap<i64, Option<i64>>,
+    submission_head_task: BTreeMap<i64, Option<i64>>,
+    pending_limit: usize,
+}
+
+impl Default for FollowCursor {
+    fn default() -> Self {
+        Self {
+            root_seen: BTreeMap::new(),
+            pending: BTreeSet::new(),
+            submission_after: BTreeMap::new(),
+            submission_head: BTreeMap::new(),
+            submission_after_task: BTreeMap::new(),
+            submission_head_task: BTreeMap::new(),
+            pending_limit: MAX_FOLLOW_CURSOR_ENTRIES,
+        }
+    }
 }
 
 impl FollowCursor {
     pub fn observe(&mut self, cursor: &RunLineageCursor) -> bool {
-        if !self.seen.insert(cursor.clone()) {
+        let stream = stream_for_cursor(cursor);
+        if self.root_seen.get(&stream) == Some(cursor) {
+            return false;
+        }
+        if self.pending.len() >= self.pending_limit {
+            return false;
+        }
+        self.root_seen.insert(stream, cursor.clone());
+        self.pending.insert(cursor.clone())
+    }
+
+    fn begin_batch(&mut self, limit: usize) {
+        self.pending_limit = limit.clamp(1, MAX_FOLLOW_CURSOR_ENTRIES);
+    }
+
+    fn observe_submission(&mut self, cursor: &RunLineageCursor) -> bool {
+        let Some(submission_id) = cursor.submission_id.as_ref() else {
+            return false;
+        };
+        let Some(created_at) = cursor.submission_created_at else {
+            return false;
+        };
+        let page_cursor = SubmissionPageCursor {
+            created_at,
+            submission_id: submission_id.clone(),
+        };
+        if let Some(after) = self.submission_after.get(&cursor.run_id) {
+            let is_new_head = self
+                .submission_head
+                .get(&cursor.run_id)
+                .map_or(true, |head| page_cursor > *head);
+            let is_after_task_update = page_cursor == *after
+                && self.submission_after_task.get(&cursor.run_id) != Some(&cursor.task_id);
+            let is_head_task_update = self.submission_head.get(&cursor.run_id)
+                == Some(&page_cursor)
+                && self.submission_head_task.get(&cursor.run_id) != Some(&cursor.task_id);
+            if page_cursor >= *after
+                && !is_new_head
+                && !is_after_task_update
+                && !is_head_task_update
+            {
+                return false;
+            }
+        }
+        if self.pending.contains(cursor) || self.pending.len() >= self.pending_limit {
             return false;
         }
         self.pending.insert(cursor.clone())
+    }
+
+    fn advance_submission(&mut self, cursor: &RunLineageCursor) {
+        let (Some(submission_id), Some(created_at)) =
+            (cursor.submission_id.as_ref(), cursor.submission_created_at)
+        else {
+            return;
+        };
+        let page_cursor = SubmissionPageCursor {
+            created_at,
+            submission_id: submission_id.clone(),
+        };
+        match self.submission_after.get(&cursor.run_id) {
+            Some(after) if page_cursor < *after => {
+                self.submission_after
+                    .insert(cursor.run_id, page_cursor.clone());
+                self.submission_after_task
+                    .insert(cursor.run_id, cursor.task_id);
+            }
+            Some(after) if page_cursor == *after => {
+                self.submission_after_task
+                    .insert(cursor.run_id, cursor.task_id);
+            }
+            None => {
+                self.submission_after
+                    .insert(cursor.run_id, page_cursor.clone());
+                self.submission_after_task
+                    .insert(cursor.run_id, cursor.task_id);
+            }
+            Some(_) => {}
+        }
+        match self.submission_head.get(&cursor.run_id) {
+            Some(head) if page_cursor > *head => {
+                self.submission_head
+                    .insert(cursor.run_id, page_cursor.clone());
+                self.submission_head_task
+                    .insert(cursor.run_id, cursor.task_id);
+            }
+            Some(head) if page_cursor == *head => {
+                self.submission_head_task
+                    .insert(cursor.run_id, cursor.task_id);
+            }
+            None => {
+                self.submission_head.insert(cursor.run_id, page_cursor);
+                self.submission_head_task
+                    .insert(cursor.run_id, cursor.task_id);
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn retain_active(
+        &mut self,
+        active_runs: &BTreeSet<i64>,
+        active_roots: &BTreeSet<FollowStream>,
+    ) {
+        self.submission_after
+            .retain(|run_id, _| active_runs.contains(run_id));
+        self.submission_head
+            .retain(|run_id, _| active_runs.contains(run_id));
+        self.submission_after_task
+            .retain(|run_id, _| active_runs.contains(run_id));
+        self.submission_head_task
+            .retain(|run_id, _| active_runs.contains(run_id));
+        self.root_seen
+            .retain(|stream, _| active_roots.contains(stream));
+        self.pending.retain(|cursor| {
+            if cursor.submission_id.is_some() {
+                active_runs.contains(&cursor.run_id)
+            } else {
+                active_roots.contains(&stream_for_cursor(cursor))
+            }
+        });
+    }
+
+    pub fn submission_after(&self) -> &BTreeMap<i64, SubmissionPageCursor> {
+        &self.submission_after
+    }
+
+    pub fn submission_head(&self) -> &BTreeMap<i64, SubmissionPageCursor> {
+        &self.submission_head
+    }
+
+    fn has_submission_continuation(&self, run_id: i64) -> bool {
+        self.submission_after.contains_key(&run_id)
     }
 
     pub fn take_ordered(&mut self, limit: usize) -> Vec<RunLineageCursor> {
@@ -114,7 +272,14 @@ pub async fn follow_runs(
             _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = interval.tick() => {
                 let db = Db::open_read_only(db_path)?;
-                let lineages = RunLineageRepository::new(&db).list_by_project(&project.project_id, limit)?;
+                let after = cursor.submission_after().clone();
+                let head = cursor.submission_head().clone();
+                let lineages = RunLineageRepository::new(&db).list_by_project_follow(
+                    &project.project_id,
+                    limit,
+                    &after,
+                    &head,
+                )?;
                 let fresh = collect_fresh(lineages, &mut cursor, limit);
                 if fresh.is_empty() {
                     continue;
@@ -139,32 +304,56 @@ pub fn collect_fresh(
     cursor: &mut FollowCursor,
     limit: usize,
 ) -> Vec<RunLineage> {
+    cursor.begin_batch(limit);
+    let active_runs = lineages
+        .iter()
+        .filter_map(|lineage| lineage.run_id)
+        .collect();
+    let active_roots = lineages
+        .iter()
+        .filter(|lineage| {
+            lineage.submissions.is_empty()
+                && lineage
+                    .run_id
+                    .map_or(true, |run_id| !cursor.has_submission_continuation(run_id))
+        })
+        .filter_map(RunLineage::root_cursor)
+        .map(|cursor| stream_for_cursor(&cursor))
+        .collect();
+    cursor.retain_active(&active_runs, &active_roots);
     let mut cursor_sources = BTreeMap::new();
     for (lineage_index, lineage) in lineages.iter().enumerate() {
-        if lineage.submissions.is_empty() {
+        let has_continuation = lineage
+            .run_id
+            .is_some_and(|run_id| cursor.has_submission_continuation(run_id));
+        if lineage.submissions.is_empty() && !has_continuation {
             if let Some(cursor) = lineage.root_cursor() {
                 cursor_sources.insert(cursor, (lineage_index, None));
             }
         }
         for (submission_index, submission) in lineage.submissions.iter().enumerate() {
-            cursor_sources.insert(
-                RunLineageCursor::new(
-                    lineage.started_at,
-                    lineage.run_id.unwrap_or_default(),
-                    Some(submission.submission_id.clone()),
-                    submission.pueue_task_id,
-                ),
-                (lineage_index, Some(submission_index)),
+            let lineage_cursor = RunLineageCursor::submission(
+                lineage.started_at,
+                lineage.run_id.unwrap_or_default(),
+                submission.submission_id.clone(),
+                submission.created_at,
+                submission.pueue_task_id,
             );
+            cursor_sources.insert(lineage_cursor, (lineage_index, Some(submission_index)));
         }
     }
     for value in cursor_sources.keys() {
-        cursor.observe(value);
+        if value.submission_id.is_none() {
+            cursor.observe(value);
+        } else {
+            cursor.observe_submission(value);
+        }
     }
 
     let selected = cursor.take_ordered(limit);
     let mut fresh = Vec::<(RunLineageCursor, RunLineage)>::new();
     for value in selected {
+        cursor.advance_submission(&value);
         let Some(&(lineage_index, submission_index)) = cursor_sources.get(&value) else {
             continue;
         };
@@ -187,6 +376,13 @@ pub fn collect_fresh(
         fresh.push((value, lineage));
     }
     fresh.into_iter().map(|(_, lineage)| lineage).collect()
+}
+
+fn stream_for_cursor(cursor: &RunLineageCursor) -> FollowStream {
+    cursor
+        .event_id
+        .filter(|_| cursor.run_id == 0 && cursor.submission_id.is_none())
+        .map_or(FollowStream::Run(cursor.run_id), FollowStream::Event)
 }
 
 fn render_human(project_id: &str, lineages: &[RunLineage]) -> String {
@@ -309,6 +505,7 @@ mod tests {
                     submission_id: (*submission_id).to_owned(),
                     kind: SubmissionKind::Experiment,
                     status: SubmissionStatus::Pending,
+                    created_at: 10,
                     pueue_task_id: None,
                 })
                 .collect(),
@@ -364,5 +561,68 @@ mod tests {
         assert_eq!(fresh[0].event_id, Some(41));
         assert_eq!(fresh[1].event_id, Some(42));
         assert!(collect_fresh(Vec::new(), &mut cursor, 8).is_empty());
+    }
+
+    #[test]
+    fn collect_fresh_keeps_cursor_state_bounded_to_the_output_limit() {
+        let lineage = RunLineage {
+            event_id: Some(1),
+            event_kind: None,
+            event_status: None,
+            run_id: Some(1),
+            mode: None,
+            run_status: None,
+            started_at: 10,
+            submissions: (0..1000)
+                .map(|index| SubmissionLineage {
+                    submission_id: format!("sub-{index:04}"),
+                    kind: SubmissionKind::Experiment,
+                    status: SubmissionStatus::Pending,
+                    created_at: index,
+                    pueue_task_id: None,
+                })
+                .collect(),
+        };
+        let mut cursor = FollowCursor::default();
+
+        let fresh = collect_fresh(vec![lineage], &mut cursor, 1);
+
+        assert_eq!(fresh.len(), 1);
+        assert!(cursor.pending.len() <= 1);
+        assert!(cursor.root_seen.len() <= 1);
+    }
+
+    #[test]
+    fn collect_fresh_accepts_older_after_and_task_updates_at_boundaries() {
+        let mut cursor = FollowCursor::default();
+        let newest = lineage(1, 10, &["new"]);
+        let first = collect_fresh(vec![newest.clone()], &mut cursor, 1);
+        assert_eq!(first[0].submissions[0].submission_id, "new");
+
+        let older = RunLineage {
+            submissions: vec![SubmissionLineage {
+                submission_id: "old".to_owned(),
+                created_at: 1,
+                kind: SubmissionKind::Experiment,
+                status: SubmissionStatus::Pending,
+                pueue_task_id: None,
+            }],
+            ..newest.clone()
+        };
+        let second = collect_fresh(vec![older], &mut cursor, 1);
+        assert_eq!(second[0].submissions[0].submission_id, "old");
+
+        let updated = RunLineage {
+            submissions: vec![SubmissionLineage {
+                submission_id: "old".to_owned(),
+                created_at: 1,
+                kind: SubmissionKind::Experiment,
+                status: SubmissionStatus::Accepted,
+                pueue_task_id: Some(7),
+            }],
+            ..newest
+        };
+        let third = collect_fresh(vec![updated], &mut cursor, 1);
+        assert_eq!(third[0].submissions[0].pueue_task_id, Some(7));
     }
 }

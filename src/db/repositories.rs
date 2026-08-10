@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use rusqlite::{
     params, types::Type, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
@@ -1259,41 +1259,139 @@ impl<'db> SubmissionRepository<'db> {
         origin_agent_run_id: i64,
         limit: usize,
     ) -> Result<Vec<Submission>, AppError> {
-        self.list_by_origin_agent_run_page(project_id, origin_agent_run_id, limit, 0)
+        self.list_by_origin_agent_run_page_after(project_id, origin_agent_run_id, limit, None)
     }
 
-    fn list_by_origin_agent_run_page(
+    pub fn list_by_origin_agent_run_page_after(
         &self,
         project_id: &str,
         origin_agent_run_id: i64,
         limit: usize,
-        offset: usize,
+        after: Option<&SubmissionPageCursor>,
     ) -> Result<Vec<Submission>, AppError> {
-        let offset = i64::try_from(offset).map_err(|_| AppError::Configuration {
-            field: "submission_query_offset",
-        })?;
+        let connection = self.db.connect()?;
+        if let Some(after) = after {
+            let mut statement = connection
+                .prepare(&format!(
+                    "{} WHERE project_id = ?1 AND origin_agent_run_id = ?2
+                     AND (created_at < ?3
+                          OR (created_at = ?3 AND submission_id < ?4))
+                     ORDER BY created_at DESC, submission_id DESC
+                     LIMIT ?5",
+                    SUBMISSION_SELECT
+                ))
+                .map_err(database_error(
+                    "prepare paged origin agent run submission query",
+                ))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        project_id,
+                        origin_agent_run_id,
+                        after.created_at,
+                        after.submission_id,
+                        bounded_diagnostic_limit(limit),
+                    ],
+                    submission_from_row,
+                )
+                .map_err(database_error("query paged origin agent run submissions"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read paged origin agent run submissions"))
+        } else {
+            let mut statement = connection
+                .prepare(&format!(
+                    "{} WHERE project_id = ?1 AND origin_agent_run_id = ?2
+                     ORDER BY created_at DESC, submission_id DESC
+                     LIMIT ?3",
+                    SUBMISSION_SELECT
+                ))
+                .map_err(database_error("prepare origin agent run submission query"))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        project_id,
+                        origin_agent_run_id,
+                        bounded_diagnostic_limit(limit),
+                    ],
+                    submission_from_row,
+                )
+                .map_err(database_error("query origin agent run submissions"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read origin agent run submissions"))
+        }
+    }
+
+    pub fn list_by_origin_agent_run_page_since(
+        &self,
+        project_id: &str,
+        origin_agent_run_id: i64,
+        limit: usize,
+        since: Option<&SubmissionPageCursor>,
+    ) -> Result<Vec<Submission>, AppError> {
+        let Some(since) = since else {
+            return Ok(Vec::new());
+        };
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(&format!(
                 "{} WHERE project_id = ?1 AND origin_agent_run_id = ?2
-                 ORDER BY created_at DESC, submission_id DESC
-                 LIMIT ?3 OFFSET ?4",
+                 AND (created_at > ?3
+                      OR (created_at = ?3 AND submission_id > ?4))
+                 ORDER BY created_at ASC, submission_id ASC
+                 LIMIT ?5",
                 SUBMISSION_SELECT
             ))
-            .map_err(database_error("prepare origin agent run submission query"))?;
+            .map_err(database_error(
+                "prepare new origin agent run submission query",
+            ))?;
         let rows = statement
             .query_map(
                 params![
                     project_id,
                     origin_agent_run_id,
+                    since.created_at,
+                    since.submission_id,
                     bounded_diagnostic_limit(limit),
-                    offset,
                 ],
                 submission_from_row,
             )
-            .map_err(database_error("query origin agent run submissions"))?;
+            .map_err(database_error("query new origin agent run submissions"))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(database_error("read origin agent run submissions"))
+            .map_err(database_error("read new origin agent run submissions"))
+    }
+
+    pub fn list_by_origin_agent_run_page_at(
+        &self,
+        project_id: &str,
+        origin_agent_run_id: i64,
+        at: &SubmissionPageCursor,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND origin_agent_run_id = ?2
+                 AND created_at = ?3 AND submission_id = ?4
+                 LIMIT 1",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error(
+                "prepare boundary origin agent run submission query",
+            ))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    origin_agent_run_id,
+                    at.created_at,
+                    at.submission_id,
+                ],
+                submission_from_row,
+            )
+            .map_err(database_error(
+                "query boundary origin agent run submissions",
+            ))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read boundary origin agent run submissions"))
     }
 
     pub fn mark_accepted(
@@ -1464,9 +1562,16 @@ pub struct AgentRunRepository<'db> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionLineage {
     pub submission_id: String,
+    pub created_at: i64,
     pub kind: SubmissionKind,
     pub status: SubmissionStatus,
     pub pueue_task_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubmissionPageCursor {
+    pub created_at: i64,
+    pub submission_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1486,6 +1591,7 @@ pub struct RunLineageCursor {
     pub started_at: i64,
     pub run_id: i64,
     pub event_id: Option<i64>,
+    pub submission_created_at: Option<i64>,
     pub submission_id: Option<String>,
     pub task_id: Option<i64>,
 }
@@ -1502,6 +1608,24 @@ impl RunLineageCursor {
             run_id,
             event_id: None,
             submission_id,
+            submission_created_at: None,
+            task_id,
+        }
+    }
+
+    pub fn submission(
+        started_at: i64,
+        run_id: i64,
+        submission_id: String,
+        submission_created_at: i64,
+        task_id: Option<i64>,
+    ) -> Self {
+        Self {
+            started_at,
+            run_id,
+            event_id: None,
+            submission_id: Some(submission_id),
+            submission_created_at: Some(submission_created_at),
             task_id,
         }
     }
@@ -1512,6 +1636,7 @@ impl RunLineageCursor {
             run_id: 0,
             event_id: Some(event_id),
             submission_id: None,
+            submission_created_at: None,
             task_id: None,
         }
     }
@@ -1535,10 +1660,11 @@ impl RunLineage {
             }
         }
         cursors.extend(self.submissions.iter().map(|submission| {
-            RunLineageCursor::new(
+            RunLineageCursor::submission(
                 self.started_at,
                 run_id,
-                Some(submission.submission_id.clone()),
+                submission.submission_id.clone(),
+                submission.created_at,
                 submission.pueue_task_id,
             )
         }));
@@ -1550,7 +1676,8 @@ pub struct RunLineageRepository<'db> {
     db: &'db Db,
 }
 
-const RUN_LINEAGE_SUBMISSION_FETCH_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
+const FOLLOW_SUBMISSION_PAGE_LIMIT: usize = 1;
+pub const MAX_FOLLOW_LINEAGE_SUBMISSIONS: usize = FOLLOW_SUBMISSION_PAGE_LIMIT * 4;
 
 impl<'db> RunLineageRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
@@ -1563,6 +1690,41 @@ impl<'db> RunLineageRepository<'db> {
         limit: usize,
     ) -> Result<Vec<RunLineage>, AppError> {
         let limit = bounded_diagnostic_limit(limit) as usize;
+        self.list_by_project_with_submission_page(
+            project_id,
+            limit,
+            limit,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    pub fn list_by_project_follow(
+        &self,
+        project_id: &str,
+        limit: usize,
+        after: &BTreeMap<i64, SubmissionPageCursor>,
+        head: &BTreeMap<i64, SubmissionPageCursor>,
+    ) -> Result<Vec<RunLineage>, AppError> {
+        let limit = bounded_diagnostic_limit(limit) as usize;
+        self.list_by_project_with_submission_page(
+            project_id,
+            limit,
+            FOLLOW_SUBMISSION_PAGE_LIMIT,
+            after,
+            head,
+        )
+    }
+
+    fn list_by_project_with_submission_page(
+        &self,
+        project_id: &str,
+        limit: usize,
+        submission_page_limit: usize,
+        after: &BTreeMap<i64, SubmissionPageCursor>,
+        head: &BTreeMap<i64, SubmissionPageCursor>,
+    ) -> Result<Vec<RunLineage>, AppError> {
+        let limit = bounded_diagnostic_limit(limit) as usize;
         let runs = AgentRunRepository::new(self.db).list_by_project(project_id, limit)?;
         let event_repository = EventRepository::new(self.db);
         let submission_repository = SubmissionRepository::new(self.db);
@@ -1571,26 +1733,51 @@ impl<'db> RunLineageRepository<'db> {
             let event = event_repository
                 .find_by_id(run.primary_event_id)?
                 .filter(|event| event.project_id == project_id);
-            let mut run_submissions = Vec::new();
-            let mut offset = 0;
-            loop {
-                let page = submission_repository.list_by_origin_agent_run_page(
+            let mut run_submissions = if let Some(after) = after.get(&run.run_id) {
+                let mut page = submission_repository.list_by_origin_agent_run_page_after(
                     project_id,
                     run.run_id,
-                    RUN_LINEAGE_SUBMISSION_FETCH_LIMIT,
-                    offset,
+                    submission_page_limit,
+                    Some(after),
                 )?;
-                let page_len = page.len();
-                run_submissions.extend(page.iter().map(SubmissionLineage::from));
-                if page_len < RUN_LINEAGE_SUBMISSION_FETCH_LIMIT {
-                    break;
-                }
-                offset = offset
-                    .checked_add(page_len)
-                    .ok_or(AppError::Configuration {
-                        field: "submission_query_offset",
-                    })?;
+                page.extend(
+                    submission_repository
+                        .list_by_origin_agent_run_page_at(project_id, run.run_id, after)?,
+                );
+                page
+            } else if head.contains_key(&run.run_id) {
+                Vec::new()
+            } else {
+                submission_repository.list_by_origin_agent_run_page_after(
+                    project_id,
+                    run.run_id,
+                    submission_page_limit,
+                    None,
+                )?
+            };
+            if let Some(head) = head.get(&run.run_id) {
+                run_submissions.extend(submission_repository.list_by_origin_agent_run_page_since(
+                    project_id,
+                    run.run_id,
+                    submission_page_limit,
+                    Some(head),
+                )?);
+                run_submissions.extend(
+                    submission_repository
+                        .list_by_origin_agent_run_page_at(project_id, run.run_id, head)?,
+                );
             }
+            run_submissions.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.submission_id.cmp(&left.submission_id))
+            });
+            run_submissions.dedup_by(|left, right| left.submission_id == right.submission_id);
+            let run_submissions = run_submissions
+                .iter()
+                .map(SubmissionLineage::from)
+                .collect();
             lineages.push(RunLineage {
                 event_id: event
                     .as_ref()
@@ -1659,6 +1846,7 @@ impl From<&Submission> for SubmissionLineage {
     fn from(submission: &Submission) -> Self {
         Self {
             submission_id: submission.submission_id.clone(),
+            created_at: submission.created_at,
             kind: submission.kind,
             status: submission.status,
             pueue_task_id: submission.pueue_task_id,

@@ -10,8 +10,9 @@ use crate::AppError;
 pub use repositories::{
     AgentRunRecovery, AgentRunRepository, EventRepository, IncidentRepository,
     IntegrationEventRepository, InterventionRepository, ProjectRepository, RunLineage,
-    RunLineageCursor, RunLineageRepository, SubmissionLineage, SubmissionRepository,
-    TaskObservationRepository, TerminationRequestRepository,
+    RunLineageCursor, RunLineageRepository, SubmissionLineage, SubmissionPageCursor,
+    SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+    MAX_FOLLOW_LINEAGE_SUBMISSIONS,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

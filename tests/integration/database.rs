@@ -1017,18 +1017,43 @@ fn follow_limit_one_reaches_every_submission_on_one_run_through_repository() {
     }
 
     let repository = pueue_agent::db::RunLineageRepository::new(&test.db);
-    let first_lineages = repository.list_by_project("follow-page", 1).unwrap();
-    assert_eq!(first_lineages[0].submissions.len(), 2);
-
     let mut cursor = FollowCursor::default();
+    let first_lineages = repository
+        .list_by_project_follow(
+            "follow-page",
+            1,
+            cursor.submission_after(),
+            cursor.submission_head(),
+        )
+        .unwrap();
+    assert_eq!(first_lineages[0].submissions.len(), 1);
     let first = collect_fresh(first_lineages, &mut cursor, 1);
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].submissions.len(), 1);
     let first_submission = first[0].submissions[0].submission_id.clone();
-    assert!(matches!(first_submission.as_str(), "new" | "old"));
+    assert_eq!(first_submission, "new");
+
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "head-new",
+            "follow-page",
+            vec!["python".to_owned()],
+            300,
+            SubmissionKind::Experiment,
+            json!({}),
+            Some(run.run_id),
+        ))
+        .unwrap();
 
     let second = collect_fresh(
-        repository.list_by_project("follow-page", 1).unwrap(),
+        repository
+            .list_by_project_follow(
+                "follow-page",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
         &mut cursor,
         1,
     );
@@ -1036,7 +1061,22 @@ fn follow_limit_one_reaches_every_submission_on_one_run_through_repository() {
     assert_eq!(second[0].submissions.len(), 1);
     let second_submission = second[0].submissions[0].submission_id.as_str();
     assert_ne!(first_submission, second_submission);
-    assert!(matches!(second_submission, "new" | "old"));
+    assert_eq!(second_submission, "old");
+
+    let third = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "follow-page",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].submissions[0].submission_id, "head-new");
 }
 
 #[test]
@@ -1070,12 +1110,30 @@ fn follow_lineage_pages_all_submissions_beyond_one_internal_page() {
             .unwrap();
     }
 
-    let lineages = pueue_agent::db::RunLineageRepository::new(&test.db)
-        .list_by_project("follow-pages", 1)
-        .unwrap();
+    let repository = pueue_agent::db::RunLineageRepository::new(&test.db);
+    let normal = repository.list_by_project("follow-pages", 1).unwrap();
+    assert_eq!(normal.len(), 1);
+    assert_eq!(normal[0].submissions.len(), 1);
 
-    assert_eq!(lineages.len(), 1);
-    assert_eq!(lineages[0].submissions.len(), 1001);
+    let mut cursor = FollowCursor::default();
+    let mut observed = std::collections::BTreeSet::new();
+    for _ in 0..1001 {
+        let lineages = repository
+            .list_by_project_follow(
+                "follow-pages",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap();
+        assert!(lineages[0].submissions.len() <= pueue_agent::db::MAX_FOLLOW_LINEAGE_SUBMISSIONS);
+        let fresh = collect_fresh(lineages, &mut cursor, 1);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].submissions.len(), 1);
+        observed.insert(fresh[0].submissions[0].submission_id.clone());
+    }
+
+    assert_eq!(observed.len(), 1001);
 }
 
 #[test]
