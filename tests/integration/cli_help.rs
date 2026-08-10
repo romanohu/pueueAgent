@@ -24,6 +24,7 @@ fn help_lists_diagnostics_commands_and_status_json_option() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("--json"));
+    assert!(text.contains("--compact"));
 }
 
 #[test]

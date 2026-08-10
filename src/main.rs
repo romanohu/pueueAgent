@@ -161,8 +161,10 @@ mod commands {
             project_root,
             pueue_config,
             json,
+            compact,
         } = args;
-        let (db, project, service_paths) = resolve_project(project_root, pueue_config)?;
+        let (db, project, service_paths) =
+            resolve_project_read_only(project_root, pueue_config)?;
         let pueue = configured_pueue(&service_paths);
         let pueue = match pueue.status_json().await {
             Ok(tasks) => PueueSnapshot::Tasks(tasks),
@@ -174,6 +176,8 @@ mod commands {
         };
         let rendered = if json {
             render_project_status_json(&db, &project, &input)?
+        } else if compact {
+            status_command::render_project_status_compact(&db, &project, &input)?
         } else {
             status_command::render_project_status(&db, &project, &input)?
         };

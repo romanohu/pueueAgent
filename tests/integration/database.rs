@@ -276,6 +276,19 @@ fn readonly_open_does_not_migrate_or_create_database_state() {
 }
 
 #[test]
+fn readonly_open_rejects_write_pragmas_and_statements() {
+    let test = TestDatabase::new();
+    let readonly = Db::open_read_only(&test.path).unwrap();
+    let connection = readonly.connect().unwrap();
+
+    assert!(connection.execute("UPDATE projects SET paused = 1", []).is_err());
+    assert!(connection
+        .execute("CREATE TABLE should_not_exist (id INTEGER)", [])
+        .is_err());
+    assert!(connection.execute("PRAGMA user_version = 99", []).is_err());
+}
+
+#[test]
 fn repeated_current_schema_open_does_not_rebuild_intervention_indexes() {
     let test = TestDatabase::new();
     let before = test

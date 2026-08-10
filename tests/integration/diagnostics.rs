@@ -15,7 +15,7 @@ use pueue_agent::{
     },
     pueue::PueueTask,
     service::{ServicePaths, ServiceStatus},
-    status::{PueueSnapshot, StatusInput},
+    status::{render_project_status_compact, PueueSnapshot, StatusInput},
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -122,6 +122,67 @@ fn status_json_counts_project_interventions_without_exposing_message_bodies() {
     assert!(!rendered.contains(&pending.message));
     assert!(!rendered.contains(&reserved.message));
     assert!(!rendered.contains(&applied.message));
+}
+
+#[test]
+fn compact_status_contains_only_bounded_operational_summaries() {
+    let harness = DiagnosticsHarness::new();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFailed,
+            "compact-status",
+            json!({"prompt": "hidden prompt payload"}),
+            100,
+            100,
+        ))
+        .unwrap();
+    AgentRunRepository::new(&harness.db)
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                None,
+                AgentRunStatus::Running,
+                101,
+                "/tmp/hidden-prompt.log",
+            ),
+            &[],
+            None,
+        )
+        .unwrap();
+
+    let rendered = render_project_status_compact(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(vec![PueueTask {
+            id: 41,
+            group: "pa-project".to_owned(),
+            command: "python train.py --prompt hidden prompt payload".to_owned(),
+            state: "running".to_owned(),
+            enqueued_at: None,
+            started_at: None,
+            ended_at: None,
+            result: None,
+        }])),
+    )
+    .unwrap();
+
+    for section in [
+        "pueue-agent",
+        "daemon:",
+        "pueue:",
+        "experiments:",
+        "agent_runs:",
+        "events:",
+        "guardrails:",
+        "summary:",
+    ] {
+        assert!(rendered.contains(section), "missing section {section}: {rendered}");
+    }
+    for secret in ["hidden prompt payload", "python train.py", "/tmp/hidden-prompt.log"] {
+        assert!(!rendered.contains(secret), "compact output leaked {secret}: {rendered}");
+    }
 }
 
 #[test]

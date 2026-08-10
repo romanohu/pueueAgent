@@ -129,6 +129,71 @@ pub fn render_project_status(
     Ok(lines.join("\n"))
 }
 
+pub fn render_project_status_compact(
+    db: &Db,
+    project: &Project,
+    input: &StatusInput,
+) -> Result<String, AppError> {
+    let mut lines = vec![format!("pueue-agent: {}", project.project_id)];
+    lines.push(format!(
+        "daemon: {}",
+        service_status_label(input.daemon_health)
+    ));
+
+    match &input.pueue {
+        PueueSnapshot::Tasks(tasks) => {
+            let project_tasks = tasks
+                .iter()
+                .filter(|task| task.group == project.pueue_group)
+                .collect::<Vec<_>>();
+            let active = project_tasks
+                .iter()
+                .filter(|task| {
+                    !task.is_terminal() && !task.state.eq_ignore_ascii_case("queued")
+                })
+                .count();
+            let queued = project_tasks
+                .iter()
+                .filter(|task| task.state.eq_ignore_ascii_case("queued"))
+                .count();
+            lines.push(format!(
+                "pueue: total={} active={} queued={}",
+                project_tasks.len(), active, queued
+            ));
+        }
+        PueueSnapshot::Error(_) => lines.push("pueue: error".to_owned()),
+    }
+
+    let experiments =
+        SubmissionRepository::new(db).count_started_or_accepted(&project.project_id)?;
+    lines.push(format!("experiments: {experiments}"));
+
+    let agent_counts = agent_run_status_counts(db, &project.project_id)?;
+    lines.push(format!(
+        "agent_runs: active={} failed={}",
+        count(&agent_counts, "starting") + count(&agent_counts, "running"),
+        count(&agent_counts, "failed")
+    ));
+
+    let event_counts = event_status_counts(db, &project.project_id)?;
+    lines.push(format!(
+        "events: pending={} failed={}",
+        count(&event_counts, "pending"),
+        count(&event_counts, "failed")
+    ));
+
+    let guardrails = guardrail_lines(db, project)?;
+    lines.extend(guardrails);
+    lines.push(format!(
+        "summary: enabled={} paused={} halted={}",
+        project.enabled,
+        project.paused,
+        project.halted_reason.is_some()
+    ));
+
+    Ok(lines.join("\n"))
+}
+
 pub fn pause_project(db: &Db, project_id: &str, now: i64) -> Result<Project, AppError> {
     ProjectRepository::new(db).pause(project_id, now)
 }

@@ -49,6 +49,8 @@ pub struct StatusArgs {
     pub pueue_config: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    #[arg(long)]
+    pub compact: bool,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
 }
