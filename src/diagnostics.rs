@@ -5,7 +5,8 @@ use serde::Serialize;
 
 use crate::{
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, TerminationRequestRepository,
+        AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
+        TerminationRequestRepository,
     },
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
@@ -81,6 +82,9 @@ pub fn render_project_status_json(
             counts: agent_run_counts(db, &project.project_id)?,
             recent: agent_runs.iter().map(AgentRunSummary::from).collect(),
         },
+        interventions: InterventionStatusProjection {
+            counts: intervention_counts(db, &project.project_id)?,
+        },
         policy: FutureSection::default(),
         resource: FutureSection::default(),
     };
@@ -101,6 +105,7 @@ struct ProjectStatusReport {
     incidents: IncidentSection,
     termination: TerminationSection,
     agent_runs: AgentRunSection,
+    interventions: InterventionStatusProjection,
     policy: FutureSection,
     resource: FutureSection,
 }
@@ -324,6 +329,18 @@ struct AgentRunSummary {
     error_summary: Option<String>,
 }
 
+#[derive(Serialize)]
+struct InterventionStatusProjection {
+    counts: InterventionCountsProjection,
+}
+
+#[derive(Serialize)]
+struct InterventionCountsProjection {
+    pending: i64,
+    reserved: i64,
+    applied: i64,
+}
+
 impl From<&AgentRun> for AgentRunSummary {
     fn from(run: &AgentRun) -> Self {
         Self {
@@ -472,6 +489,18 @@ fn agent_run_counts(db: &Db, project_id: &str) -> Result<AgentRunCounts, AppErro
         timed_out: count(&counts, "timed_out"),
         cancelled: count(&counts, "cancelled"),
         active: starting + running,
+    })
+}
+
+fn intervention_counts(
+    db: &Db,
+    project_id: &str,
+) -> Result<InterventionCountsProjection, AppError> {
+    let counts = InterventionRepository::new(db).count_by_project(project_id)?;
+    Ok(InterventionCountsProjection {
+        pending: counts.pending,
+        reserved: counts.reserved,
+        applied: counts.applied,
     })
 }
 

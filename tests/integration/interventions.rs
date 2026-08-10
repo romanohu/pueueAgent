@@ -220,7 +220,7 @@ fn steer_accepts_the_byte_limit_and_joins_message_arguments_with_spaces() {
 }
 
 #[test]
-fn steer_list_json_is_project_scoped_and_bounded() {
+fn steer_list_text_and_json_are_fifo_bounded_and_project_scoped() {
     let harness = SteerHarness::new();
     let first_id = harness.project_id(&harness.first_root);
     let second_id = harness.project_id(&harness.second_root);
@@ -252,6 +252,15 @@ fn steer_list_json_is_project_scoped_and_bounded() {
         .as_array()
         .expect("JSON list should contain interventions");
     assert_eq!(interventions.len(), MAX_INTERVENTIONS_PER_RUN);
+    assert_eq!(
+        interventions
+            .iter()
+            .map(|item| item["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        (0..MAX_INTERVENTIONS_PER_RUN)
+            .map(|index| format!("first project intervention {index}"))
+            .collect::<Vec<_>>()
+    );
     assert!(interventions.iter().all(|item| {
         item["intervention_id"].is_string()
             && item["status"] == "pending"
@@ -263,4 +272,23 @@ fn steer_list_json_is_project_scoped_and_bounded() {
     assert!(interventions
         .iter()
         .all(|item| item["message"] != "second project secret"));
+
+    let text_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "list"])
+        .output()
+        .unwrap();
+
+    assert!(text_output.status.success());
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), MAX_INTERVENTIONS_PER_RUN);
+    assert!(lines[0].ends_with("first project intervention 0"));
+    assert!(lines[MAX_INTERVENTIONS_PER_RUN - 1].ends_with(&format!(
+        "first project intervention {}",
+        MAX_INTERVENTIONS_PER_RUN - 1
+    )));
+    assert!(lines
+        .iter()
+        .all(|line| !line.contains("second project secret")));
 }

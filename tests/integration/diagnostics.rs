@@ -2,8 +2,8 @@ use std::fs;
 
 use pueue_agent::{
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
-        TerminationRequestRepository,
+        AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
+        ProjectRepository, TerminationRequestRepository,
     },
     diagnostics::render_project_status_json,
     models::{
@@ -53,6 +53,72 @@ impl DiagnosticsHarness {
             pueue,
         }
     }
+}
+
+#[test]
+fn status_json_counts_project_interventions_without_exposing_message_bodies() {
+    let harness = DiagnosticsHarness::new();
+    let interventions = InterventionRepository::new(&harness.db);
+    let reserved = interventions
+        .insert_pending("project-a", "hidden prompt-like value reserved", 100)
+        .unwrap();
+    let applied = interventions
+        .insert_pending("project-a", "hidden prompt-like value applied", 101)
+        .unwrap();
+    let pending = interventions
+        .insert_pending("project-a", "hidden prompt-like value pending", 102)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "reserved-token", 103, 203, 1, 4 * 1024)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "applied-token", 104, 204, 1, 4 * 1024)
+        .unwrap();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFailed,
+            "intervention-status-counts",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                None,
+                AgentRunStatus::Starting,
+                105,
+                "/tmp/intervention-status-counts.log",
+            ),
+            &[],
+            Some("applied-token"),
+        )
+        .unwrap();
+    assert_eq!(
+        interventions
+            .mark_applied_for_run("project-a", run.run_id, 106)
+            .unwrap(),
+        1
+    );
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+
+    assert_eq!(value["interventions"]["counts"]["pending"], 1);
+    assert_eq!(value["interventions"]["counts"]["reserved"], 1);
+    assert_eq!(value["interventions"]["counts"]["applied"], 1);
+    assert!(!rendered.contains(&pending.message));
+    assert!(!rendered.contains(&reserved.message));
+    assert!(!rendered.contains(&applied.message));
 }
 
 #[test]
