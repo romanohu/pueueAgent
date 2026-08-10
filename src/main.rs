@@ -51,6 +51,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Pause(args) => commands::pause(args),
         Command::Resume(args) => commands::resume(args),
         Command::Steer(args) => commands::steer(args),
+        Command::Wake(args) => commands::wake(args),
         Command::Daemon(args) => commands::daemon(args).await,
     }
 }
@@ -62,7 +63,7 @@ mod commands {
         agent::{AgentRunner, AgentRunnerConfig},
         cli::{
             DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs,
+            InspectArgs, ProjectArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -71,7 +72,7 @@ mod commands {
             render_incident_explanation, render_project_status_json, render_task_inspection,
             DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
         },
-        events::{record_callback, CallbackMetadata},
+        events::{record_callback, record_operator_wake_with, CallbackMetadata},
         interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
         output::bounded_redacted_text,
@@ -389,6 +390,21 @@ mod commands {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn wake(args: WakeArgs) -> Result<(), AppError> {
+        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let event_id =
+            record_operator_wake_with(&db, &project.project_id, &args.reason, unix_timestamp()?)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version": 1, "event_id": event_id, "project_id": project.project_id, "kind": "operator_wake", "status": "pending"})
+            );
+        } else {
+            println!("queued operator wake: {event_id}");
+        }
         Ok(())
     }
 

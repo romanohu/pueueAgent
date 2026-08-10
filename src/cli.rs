@@ -26,6 +26,7 @@ pub enum Command {
     Pause(ProjectArgs),
     Resume(ProjectArgs),
     Steer(SteerArgs),
+    Wake(WakeArgs),
     Daemon(DaemonArgs),
 }
 
@@ -151,6 +152,18 @@ pub struct SteerArgs {
     #[arg(long, value_name = "PUEUE_CONFIG")]
     pub pueue_config: Option<PathBuf>,
     #[arg(long, value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct WakeArgs {
+    #[arg(long, value_name = "TEXT")]
+    pub reason: String,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
 }
 

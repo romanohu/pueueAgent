@@ -870,7 +870,7 @@ impl<'db> EventRepository<'db> {
                 | EventKind::Stalled
                 | EventKind::AutoKilled
                 | EventKind::TerminationFailed => count += 1,
-                EventKind::TaskFinished | EventKind::DeepCheck => break,
+                EventKind::TaskFinished | EventKind::DeepCheck | EventKind::OperatorWake => break,
             }
         }
         Ok(count)

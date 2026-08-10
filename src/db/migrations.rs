@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -76,7 +76,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
                 kind TEXT NOT NULL CHECK (kind IN (
                     'task_finished', 'task_failed', 'crash', 'stalled',
-                    'deep_check', 'auto_killed', 'termination_failed'
+                    'deep_check', 'auto_killed', 'termination_failed', 'operator_wake'
                 )),
                 dedup_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
@@ -274,7 +274,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE INDEX interventions_reservation_lease_idx
                 ON interventions(status, lease_expires_at, reservation_token);
 
-            PRAGMA user_version = 7;
+            PRAGMA user_version = 8;
             "#,
             )
             .map_err(database_error("apply SQLite migrations"))?;
@@ -362,6 +362,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_submissions_to_v7(&transaction)?;
     } else if version == 7 {
         migrate_submissions_to_v7(&transaction)?;
+        migrate_events_to_v8(&transaction)?;
     }
     if (1..=3).contains(&version) {
         ensure_agent_run_event_project_id(&transaction)?;
@@ -373,6 +374,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if (1..=5).contains(&version) {
         migrate_submissions_to_v7(&transaction)?;
     }
+    if (1..=6).contains(&version) {
+        migrate_events_to_v8(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -382,6 +386,17 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         .map_err(database_error("commit SQLite migration"))?;
 
     Ok(())
+}
+
+fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    transaction.execute_batch(r#"
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master
+           SET sql = replace(sql, '''termination_failed''', '''termination_failed'', ''operator_wake''')
+         WHERE type = 'table' AND name = 'events';
+        PRAGMA writable_schema = OFF;
+        PRAGMA user_version = 8;
+    "#).map_err(database_error("apply SQLite v8 event migration"))
 }
 
 fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

@@ -318,6 +318,7 @@ fn event_priority(kind: EventKind) -> u8 {
         | EventKind::TerminationFailed => 0,
         EventKind::Stalled => 1,
         EventKind::TaskFinished => 2,
+        EventKind::OperatorWake => 2,
         EventKind::DeepCheck => 3,
     }
 }
@@ -328,6 +329,7 @@ fn dispatch_mode(kind: EventKind) -> &'static str {
         EventKind::TaskFailed => "failure",
         EventKind::Stalled => "stalled",
         EventKind::TaskFinished => "completion",
+        EventKind::OperatorWake => "operator_wake",
         EventKind::DeepCheck => "deep_check",
     }
 }

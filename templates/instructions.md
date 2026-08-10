@@ -21,6 +21,7 @@
 - `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、設定された制約が許す場合だけ replacement experiment を投入する。
 - `deep_check`: metric と artifact を調べ、実験が意味のある進行をしているか判断する。正常なら短い health record を `STATE.md` に追記する。異常なら crash と同じ手順で対応する。
 - `completion`: 結果を要約し、次の実験に根拠があるか判断する。目的を達成した、または有効な次の手がかりがない場合は停止する。
+- `operator_wake`: reason は人間からの追加指示として扱う。既存の STATE、guardrail、experiment budget を尊重し、迂回しない。
 
 ## Context と安全性
 

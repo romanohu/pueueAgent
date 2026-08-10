@@ -90,6 +90,7 @@ database_enum!(EventKind {
     DeepCheck => "deep_check",
     AutoKilled => "auto_killed",
     TerminationFailed => "termination_failed",
+    OperatorWake => "operator_wake",
 });
 
 database_enum!(EventStatus {

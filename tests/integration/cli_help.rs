@@ -14,6 +14,7 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("inspect"));
     assert!(text.contains("explain"));
     assert!(text.contains("doctor"));
+    assert!(text.contains("wake"));
 
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -37,6 +38,20 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("--kind"));
     assert!(text.contains("--metadata"));
     assert!(text.contains("--metadata-json"));
+    assert!(text.contains("--json"));
+}
+
+#[test]
+fn wake_help_describes_bounded_operator_wake_options() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["wake", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("--reason"));
     assert!(text.contains("--json"));
 }
 

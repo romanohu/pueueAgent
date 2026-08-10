@@ -410,7 +410,7 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
@@ -521,7 +521,7 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert!(columns.iter().any(|column| column == "kind"));
     assert!(columns.iter().any(|column| column == "metadata_json"));
     assert!(columns.iter().any(|column| column == "origin_agent_run_id"));
@@ -941,7 +941,7 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(intervention_table_count, 1);
     assert_eq!(preserved_event_id, event_id);
     assert_eq!(preserved_project_id, "project-a");
@@ -1854,7 +1854,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     connection
         .execute(
             "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
@@ -1891,7 +1891,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 7);
+        assert_eq!(migrated_version, 8);
         assert_eq!(index_count, 1);
         drop(connection);
 

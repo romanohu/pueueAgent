@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::{
     db::{Db, EventRepository, IntegrationEventRepository, ProjectRepository},
@@ -8,6 +9,31 @@ use crate::{
 };
 
 pub type EventId = i64;
+
+const MAX_OPERATOR_WAKE_REASON_BYTES: usize = 1024;
+
+pub fn record_operator_wake_with(
+    db: &Db,
+    project_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<EventId, AppError> {
+    if reason.trim().is_empty() || reason.len() > MAX_OPERATOR_WAKE_REASON_BYTES {
+        return Err(AppError::Configuration {
+            field: "wake.reason",
+        });
+    }
+    let reason = crate::output::bounded_redacted_text(reason);
+    let event = EventRepository::new(db).insert_idempotent(&NewEvent::new(
+        project_id,
+        EventKind::OperatorWake,
+        format!("operator-wake:v1:{}", Uuid::new_v4()),
+        json!({"source": "operator", "reason": reason}),
+        now,
+        now,
+    ))?;
+    Ok(event.event_id)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallbackRecordResult {

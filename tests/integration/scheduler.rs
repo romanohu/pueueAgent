@@ -498,6 +498,24 @@ async fn crash_and_deep_check_for_one_project_start_one_crash_run() {
 }
 
 #[tokio::test]
+async fn operator_wake_uses_the_existing_scheduler_dispatch_path() {
+    let harness = SchedulerHarness::new();
+    let wake = harness.enqueue(
+        EventKind::OperatorWake,
+        "project-a",
+        "operator-wake:v1:test",
+    );
+
+    let mut scheduler = harness.scheduler();
+    let report = scheduler.tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].primary_event_id, wake);
+    assert_eq!(report.started[0].mode, "operator_wake");
+    assert_eq!(harness.event_status(wake), EventStatus::Completed);
+}
+
+#[tokio::test]
 async fn active_agent_prevents_new_claim_for_same_project() {
     let harness = SchedulerHarness::new();
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "failure");
