@@ -1,7 +1,7 @@
 mod migrations;
 mod repositories;
 
-use std::{fs, path::Path, path::PathBuf, time::Duration};
+use std::{fs, path::Path, path::PathBuf, sync::Mutex, time::Duration};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -14,6 +14,7 @@ pub use repositories::{
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+static OPEN_INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -23,6 +24,9 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self, AppError> {
+        let _initialization = OPEN_INITIALIZATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
