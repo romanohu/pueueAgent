@@ -13,7 +13,8 @@ use crate::{
         MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
     },
     models::{
-        path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, Event, EventKind,
+        launch_gate_marker_path, path_text, AgentContextMode, AgentRun, AgentRunEvent,
+        AgentRunStatus, Event, EventKind,
         EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent,
         InterventionStatus, NewAgentRun, NewEvent, NewIncident, NewIntegrationEvent, NewProject,
         NewSubmission, NewTaskObservation, NewTerminationRequest, Project, Submission,
@@ -1499,10 +1500,56 @@ impl<'db> AgentRunRepository<'db> {
         finished_at: i64,
         reason: &str,
     ) -> Result<AgentRunRecovery, AppError> {
+        let marker_confirmed_run_ids = {
+            let connection = self.db.connect()?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT run_id, log_path
+                     FROM agent_runs
+                     WHERE launch_gate_state = 'release_requested'",
+                )
+                .map_err(database_error("prepare launch gate recovery marker query"))?;
+            let run_logs = statement
+                .query_map([], |row| {
+                    let run_id = row.get::<_, i64>(0)?;
+                    let log_path = PathBuf::from(row.get::<_, String>(1)?);
+                    Ok((run_id, log_path))
+                })
+                .map_err(database_error("inspect launch gate recovery markers"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read launch gate recovery markers"))?;
+            let mut confirmed = Vec::new();
+            for (run_id, log_path) in run_logs {
+                match fs::metadata(launch_gate_marker_path(&log_path)) {
+                    Ok(metadata) if metadata.is_file() => confirmed.push(run_id),
+                    Ok(_) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(AppError::Io {
+                            operation: "inspect agent launch gate marker",
+                            source,
+                        });
+                    }
+                }
+            }
+            confirmed
+        };
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin interrupted agent run recovery"))?;
+        for run_id in marker_confirmed_run_ids {
+            transaction
+                .execute(
+                    "UPDATE agent_runs
+                     SET launch_gate_state = 'released'
+                     WHERE run_id = ?1 AND launch_gate_state = 'release_requested'",
+                    [run_id],
+                )
+                .map_err(database_error(
+                    "promote marker-confirmed agent launch gate",
+                ))?;
+        }
         transaction
             .execute(
                 "UPDATE interventions

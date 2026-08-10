@@ -1076,7 +1076,7 @@ fn startup_recovery_requeues_applied_interventions_after_release_request_before_
                 None,
                 AgentRunStatus::Starting,
                 120,
-                "/tmp/release-request-recovery.log",
+                test._temp.path().join("release-request-recovery.log"),
             ),
             &[event_id],
             Some("release-request-recovery"),
@@ -1112,6 +1112,72 @@ fn startup_recovery_requeues_applied_interventions_after_release_request_before_
         .unwrap();
     assert_eq!(intervention_state, (InterventionStatus::Pending, None));
     assert_eq!(run_state, (AgentRunStatus::Failed, "failed".to_owned()));
+}
+
+#[test]
+fn startup_recovery_promotes_marker_confirmed_release_request_and_retains_applied_interventions() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let interventions = InterventionRepository::new(&test.db);
+    let intervention = interventions
+        .insert_pending("project-a", "marker-confirmed release", 100)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "marker-confirmed-release", 110, 210, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "marker-confirmed-release", 100);
+    let log_path = test._temp.path().join("marker-confirmed-release.log");
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                log_path.clone(),
+            ),
+            &[event_id],
+            Some("marker-confirmed-release"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 4246, 130)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    fs::write(&marker_path, b"started\n").unwrap();
+
+    runs.recover_interrupted(140, "daemon restarted after child spawn")
+        .unwrap();
+
+    let intervention_state: (InterventionStatus, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+            [&intervention.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let run_state: (AgentRunStatus, String) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        intervention_state,
+        (InterventionStatus::Applied, Some(run.run_id))
+    );
+    assert_eq!(run_state, (AgentRunStatus::Failed, "released".to_owned()));
 }
 
 #[test]

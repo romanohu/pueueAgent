@@ -603,3 +603,9 @@ pub(crate) fn path_text<'path>(
     path.to_str()
         .ok_or(crate::AppError::Configuration { field })
 }
+
+pub(crate) fn launch_gate_marker_path(log_path: &Path) -> PathBuf {
+    let mut marker = log_path.as_os_str().to_os_string();
+    marker.push(".gate-started");
+    PathBuf::from(marker)
+}

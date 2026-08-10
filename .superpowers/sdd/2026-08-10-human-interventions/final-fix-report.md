@@ -65,6 +65,22 @@ The initial baseline focused run also exposed one `database::concurrent_first_op
 - `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
 - `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed, exit 0 with no output.
 - `git diff --check`: passed, exit 0 with no output.
+
+## Round 4: durable launch-gate acknowledgement
+
+- RED: added database coverage for an absent marker requeue and a marker-confirmed `release_requested` run retaining applied interventions. Added Unix gate coverage for ACK ordering, EOF, and unavailable configured-program failure. Focused Rust commands were blocked before compilation by `zsh:1: command not found: cargo` (exit 127).
+- Fix: the fixed-argv Unix gate now starts the configured child with redirected output, atomically commits `<log_path>.gate-started`, emits `released\n` only afterward, and waits/propagates the child status. It validates the configured executable before spawning and removes stale markers before a new run.
+- Fix: startup recovery inspects `release_requested` marker paths before opening its transaction. Marker-confirmed runs are promoted to `released` and retain applied interventions; unconfirmed runs remain pre-execution and requeue reserved/applied interventions. ACK-following DB failure preserves marker-confirmed applied state and leaves recovery evidence instead of requeueing it.
+- Documentation: the Unix-only plan now documents the log-derived marker and ACK ordering; non-Unix launchers remain explicit failures.
+- `cargo test --test database startup_recovery_requeues_applied_interventions_after_release_request_before_ack startup_recovery_promotes_marker_confirmed_release_request_and_retains_applied_interventions`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `cargo test --lib launch_gate_exits_on_eof_without_executing_configured_agent launch_gate_acknowledges_only_after_child_spawn_and_marker_commit`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `cargo test --lib launch_gate_exits_without_ack_for_unavailable_configured_program`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `cargo fmt --check`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `cargo test --all-targets`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `cargo clippy --all-targets --all-features -- -D warnings`: blocked; exact result `zsh:1: command not found: cargo` (exit 127).
+- `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
+- `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed, exit 0 with no output.
+- `git diff --check`: passed, exit 0 with no output.
 - `bats tests/test_shell_entrypoints.bats`: passed, 3 tests.
 - `shellcheck --shell=bash bin/pueue-agent tests/test_shell_entrypoints.bats`: passed, exit 0 with no output.
 

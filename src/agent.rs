@@ -17,7 +17,7 @@ use crate::{
     config::AgentConfig,
     db::AgentRunRepository,
     interventions::InterventionReservation,
-    models::{AgentContextMode, AgentRunStatus, NewAgentRun, Project},
+    models::{launch_gate_marker_path, AgentContextMode, AgentRunStatus, NewAgentRun, Project},
     AppError,
 };
 
@@ -57,17 +57,35 @@ pub struct AgentCommand {
 #[cfg(unix)]
 const LAUNCH_GATE_SCRIPT: &str = r#"
 log_path=$1
-shift
+marker_path=$2
+shift 2
 IFS= read -r release || exit 0
 [ "$release" = x ] || exit 0
+[ "$#" -gt 0 ] || exit 127
+case "$1" in
+    */*) [ -x "$1" ] || exit 127 ;;
+    *) command -v "$1" >/dev/null 2>&1 || exit 127 ;;
+esac
+
+"$@" >>"$log_path" 2>&1 &
+child_pid=$!
+marker_tmp="${marker_path}.$$"
+if ! (umask 077 && : >"$marker_tmp" && mv -f "$marker_tmp" "$marker_path"); then
+    rm -f "$marker_tmp"
+    kill "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    exit 1
+fi
 printf 'released\n'
-exec "$@" >>"$log_path" 2>&1
+wait "$child_pid"
+exit $?
 "#;
 
 #[cfg(unix)]
 fn configure_launch_gate(
     process: &mut Command,
     log_path: &std::path::Path,
+    marker_path: &std::path::Path,
     command: &AgentCommand,
 ) {
     process
@@ -75,6 +93,7 @@ fn configure_launch_gate(
         .arg(LAUNCH_GATE_SCRIPT)
         .arg("pueue-agent-launch-gate")
         .arg(log_path)
+        .arg(marker_path)
         .arg(&command.program)
         .args(&command.args);
 }
@@ -173,6 +192,7 @@ impl AgentRunner {
     ) -> Result<AgentHandle, AppError> {
         let command = self.command_for(project, config, prompt)?;
         let log_path = self.log_path(project, primary_event_id, now)?;
+        let gate_marker_path = launch_gate_marker_path(&log_path);
         let repository = AgentRunRepository::new(db);
         let run = repository.insert_with_events_and_reservation(
             &NewAgentRun::with_context(
@@ -197,6 +217,16 @@ impl AgentRunner {
         let startup = (|| -> Result<i64, AppError> {
             ensure_launch_gate_platform_supported()?;
             ensure_agent_program_available(&command.program)?;
+            match fs::remove_file(&gate_marker_path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(AppError::Io {
+                        operation: "remove stale agent launch gate marker",
+                        source,
+                    });
+                }
+            }
             let log_file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -214,7 +244,7 @@ impl AgentRunner {
                 #[cfg(unix)]
                 {
                     let mut process = Command::new("/bin/sh");
-                    configure_launch_gate(&mut process, &log_path, &command);
+                    configure_launch_gate(&mut process, &log_path, &gate_marker_path, &command);
                     process.stdin(Stdio::piped());
                     process.stdout(Stdio::piped());
                     process
@@ -373,12 +403,27 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.fail_before_gate_release(
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    &reason,
-                )?;
+                let marker_confirmed = match fs::metadata(&gate_marker_path) {
+                    Ok(metadata) => metadata.is_file(),
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                };
+                if marker_confirmed {
+                    repository.finish(
+                        run.run_id,
+                        AgentRunStatus::Failed,
+                        now,
+                        None,
+                        Some(&reason),
+                    )?;
+                } else {
+                    repository.fail_before_gate_release(
+                        &project.project_id,
+                        run.run_id,
+                        now,
+                        &reason,
+                    )?;
+                }
                 return Err(error);
             }
         }
@@ -662,19 +707,24 @@ mod tests {
 
     #[tokio::test]
     async fn launch_gate_exits_on_eof_without_executing_configured_agent() {
-        let marker =
+        let directory =
             std::env::temp_dir().join(format!("pueue-agent-gate-{}/marker", Uuid::new_v4()));
+        let parent = directory.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        let log_path = parent.join("agent.log");
+        let gate_marker = parent.join("agent.log.gate-started");
+        let child_marker = parent.join("configured-agent-started");
         let command = AgentCommand {
             program: "/bin/sh".to_owned(),
             args: vec![
                 "-c".to_owned(),
                 "printf executed > \"$1\"".to_owned(),
                 "configured-agent".to_owned(),
-                marker.display().to_string(),
+                child_marker.display().to_string(),
             ],
         };
         let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &marker, &command);
+        configure_launch_gate(&mut process, &log_path, &gate_marker, &command);
         process.stdin(Stdio::piped());
         let mut child = process.spawn().unwrap();
         drop(child.stdin.take());
@@ -682,15 +732,19 @@ mod tests {
         let status = child.wait().await.unwrap();
 
         assert!(status.success());
-        assert!(!marker.exists());
+        assert!(!gate_marker.exists());
+        assert!(!child_marker.exists());
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[tokio::test]
-    async fn launch_gate_releases_fixed_argv_only_after_release_line() {
+    async fn launch_gate_acknowledges_only_after_child_spawn_and_marker_commit() {
         let marker =
             std::env::temp_dir().join(format!("pueue-agent-gate-{}/marker", Uuid::new_v4()));
         let parent = marker.parent().unwrap();
         fs::create_dir_all(parent).unwrap();
+        let log_path = parent.join("agent.log");
+        let gate_marker = parent.join("agent.log.gate-started");
         let command = AgentCommand {
             program: "/bin/sh".to_owned(),
             args: vec![
@@ -702,7 +756,7 @@ mod tests {
             ],
         };
         let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &marker, &command);
+        configure_launch_gate(&mut process, &log_path, &gate_marker, &command);
         process.stdin(Stdio::piped());
         process.stdout(Stdio::piped());
         let mut child = process.spawn().unwrap();
@@ -714,6 +768,7 @@ mod tests {
         let mut line = String::new();
         acknowledgement.read_line(&mut line).await.unwrap();
         assert_eq!(line, "released\n");
+        assert!(gate_marker.exists());
 
         let status = child.wait().await.unwrap();
 
@@ -723,6 +778,37 @@ mod tests {
             "$(not-shell-expanded)"
         );
         fs::remove_file(&marker).unwrap();
+        fs::remove_file(&gate_marker).unwrap();
+        fs::remove_file(&log_path).unwrap();
         fs::remove_dir(parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_gate_exits_without_ack_for_unavailable_configured_program() {
+        let marker =
+            std::env::temp_dir().join(format!("pueue-agent-gate-{}/marker", Uuid::new_v4()));
+        let parent = marker.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        let log_path = parent.join("agent.log");
+        let gate_marker = parent.join("agent.log.gate-started");
+        let command = AgentCommand {
+            program: parent.join("does-not-exist").display().to_string(),
+            args: Vec::new(),
+        };
+        let mut process = Command::new("/bin/sh");
+        configure_launch_gate(&mut process, &log_path, &gate_marker, &command);
+        process.stdin(Stdio::piped());
+        process.stdout(Stdio::piped());
+        let mut child = process.spawn().unwrap();
+        let mut release = child.stdin.take().unwrap();
+        release.write_all(b"x\n").await.unwrap();
+        drop(release);
+
+        let output = child.wait_with_output().await.unwrap();
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!gate_marker.exists());
+        fs::remove_dir_all(parent).unwrap();
     }
 }
