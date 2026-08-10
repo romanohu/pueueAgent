@@ -30,3 +30,11 @@ Implementation commit: `2e625700c3f19523bafb25173f2bc059622c1272` (`feat: expose
 
 - The requested global formatting check remains non-zero solely because of the inherited Task 1 formatting difference above. No Task 6 formatting differences remain.
 - Follow polling is deliberately read-only and does not contact Pueue or control agent processes; it reports only persisted SQLite lineage.
+
+## Review follow-up
+
+- Selected runs are now limited before lineage expansion. Each selected run reads its primary event and bounded origin submissions independently, so an older submission cannot be hidden by unrelated newer submissions.
+- Follow now consumes `FollowCursor::take_ordered` in bounded cursor batches and emits a lineage containing only the newly selected submissions; an unaccompanied run/event cursor emits the same lineage with no submissions.
+- New RED/GREEN regressions cover `--limit 1` with an old selected-run submission and pending-cursor ordering, batching, partial lineage projection, and deduplication.
+- Follow-up verification: `cargo test --all-targets` completed with 279 passed, 0 failed; `git diff --check` passed.
+- Follow-up commit: `ddfdf4fcdf4f7b5f0694fe8d2cc39e2f43d66998` (`fix: preserve run lineage follow cursors`).
