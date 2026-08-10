@@ -116,6 +116,31 @@ fn redact_sensitive_text_consumes_quoted_values_as_whole_credentials() {
 }
 
 #[test]
+fn redact_sensitive_text_consumes_spaced_assignment_values_as_whole_credentials() {
+    let rendered = redact_sensitive_text(
+        r#"run AWS_SECRET_ACCESS_KEY = "first second" password = 'third fourth' --password = fifth --api-key = "six seven" --lr 0.001"#,
+    );
+
+    for leaked in [
+        "first second",
+        "third fourth",
+        "fifth",
+        "six seven",
+        "second\"",
+        "fourth'",
+    ] {
+        assert!(
+            !rendered.contains(leaked),
+            "spaced assignment leaked: {rendered}"
+        );
+    }
+    assert_eq!(
+        rendered,
+        "run AWS_SECRET_ACCESS_KEY = [REDACTED] password = [REDACTED] --password = [REDACTED] --api-key = [REDACTED] --lr 0.001"
+    );
+}
+
+#[test]
 fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
     let rendered =
         pueue_agent::output::bounded_redacted_text("prefix\x1b[31mhidden\x1b[0m\n\t\u{0007}suffix");
@@ -380,9 +405,11 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
         ))
         .unwrap();
 
+    let project = harness.project();
+    let expected_root_path = project.root_path.to_string_lossy().into_owned();
     let rendered = render_project_status_json(
         &harness.db,
-        &harness.project(),
+        &project,
         &harness.input(PueueSnapshot::Tasks(vec![PueueTask {
             id: 41,
             group: "pa-project".to_owned(),
@@ -399,6 +426,8 @@ fn status_json_projects_bounded_diagnostics_without_payloads_or_transcripts() {
 
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["project"]["project_id"], "project-a");
+    assert_eq!(value["project"]["root_path"], expected_root_path);
+    assert_eq!(value["project"]["pueue_group"], "pa-project");
     assert_eq!(value["daemon"]["status"], "running");
     assert_eq!(value["pueue"]["status"], "ok");
     assert_eq!(value["pueue"]["active_task_count"], 1);

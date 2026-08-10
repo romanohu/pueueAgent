@@ -56,13 +56,23 @@ pub fn redact_sensitive_text(value: &str) -> String {
     let tokens = lex_tokens(&sanitized);
     let mut redacted = Vec::with_capacity(tokens.len());
     let mut redact_next = false;
+    let mut redact_assignment_value = false;
     let mut redact_bearer_value = false;
 
     for token in tokens {
+        if redact_assignment_value {
+            redacted.push("[REDACTED]".to_owned());
+            redact_assignment_value = false;
+            continue;
+        }
+
         if redact_bearer_value {
             if token.eq_ignore_ascii_case("bearer") {
                 redacted.push(token.to_owned());
                 redact_next = true;
+            } else if token == "=" {
+                redacted.push(token.to_owned());
+                redact_assignment_value = true;
             } else {
                 redacted.push("[REDACTED]".to_owned());
             }
@@ -71,7 +81,12 @@ pub fn redact_sensitive_text(value: &str) -> String {
         }
 
         if redact_next {
-            redacted.push("[REDACTED]".to_owned());
+            if token == "=" {
+                redacted.push(token.to_owned());
+                redact_assignment_value = true;
+            } else {
+                redacted.push("[REDACTED]".to_owned());
+            }
             redact_next = false;
             continue;
         }
@@ -111,6 +126,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
 
         if is_sensitive_marker(&token) {
             redacted.push("[REDACTED]".to_owned());
+            redact_next = true;
             continue;
         }
 
