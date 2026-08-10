@@ -1080,6 +1080,101 @@ fn follow_limit_one_reaches_every_submission_on_one_run_through_repository() {
 }
 
 #[test]
+fn follow_limit_one_pages_originless_submissions_and_keeps_the_stream_active() {
+    let test = TestDatabase::new();
+    let root = test.project_root("originless-follow");
+    register_project(&test.db, "originless-follow", &root, "pa-originless-follow");
+    let submissions = SubmissionRepository::new(&test.db);
+    for (submission_id, created_at) in [("originless-new", 200), ("originless-old", 100)] {
+        submissions
+            .insert_idempotent(&NewSubmission::with_kind_metadata(
+                submission_id,
+                "originless-follow",
+                vec!["python".to_owned()],
+                created_at,
+                SubmissionKind::Experiment,
+                json!({}),
+                None,
+            ))
+            .unwrap();
+    }
+
+    let repository = pueue_agent::db::RunLineageRepository::new(&test.db);
+    let mut cursor = FollowCursor::default();
+    let first = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "originless-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(first[0].submissions[0].submission_id, "originless-new");
+
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "originless-head",
+            "originless-follow",
+            vec!["python".to_owned()],
+            300,
+            SubmissionKind::Experiment,
+            json!({}),
+            None,
+        ))
+        .unwrap();
+
+    let second = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "originless-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(second[0].submissions[0].submission_id, "originless-old");
+
+    submissions
+        .mark_accepted("originless-old", 88, "sig-originless-old")
+        .unwrap();
+    let third = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "originless-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(third[0].submissions[0].submission_id, "originless-old");
+    assert_eq!(third[0].submissions[0].pueue_task_id, Some(88));
+
+    let fourth = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "originless-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(fourth[0].submissions[0].submission_id, "originless-head");
+}
+
+#[test]
 fn follow_lineage_pages_all_submissions_beyond_one_internal_page() {
     let test = TestDatabase::new();
     let root = test.project_root("follow-pages");

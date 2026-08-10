@@ -1228,6 +1228,115 @@ impl<'db> SubmissionRepository<'db> {
             .map_err(database_error("read project submissions"))
     }
 
+    pub fn list_originless_by_project_page_after(
+        &self,
+        project_id: &str,
+        limit: usize,
+        after: Option<&SubmissionPageCursor>,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        if let Some(after) = after {
+            let mut statement = connection
+                .prepare(&format!(
+                    "{} WHERE project_id = ?1 AND origin_agent_run_id IS NULL
+                     AND (created_at < ?2
+                          OR (created_at = ?2 AND submission_id < ?3))
+                     ORDER BY created_at DESC, submission_id DESC
+                     LIMIT ?4",
+                    SUBMISSION_SELECT
+                ))
+                .map_err(database_error("prepare paged originless submission query"))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        project_id,
+                        after.created_at,
+                        after.submission_id,
+                        bounded_diagnostic_limit(limit),
+                    ],
+                    submission_from_row,
+                )
+                .map_err(database_error("query paged originless submissions"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read paged originless submissions"))
+        } else {
+            let mut statement = connection
+                .prepare(&format!(
+                    "{} WHERE project_id = ?1 AND origin_agent_run_id IS NULL
+                     ORDER BY created_at DESC, submission_id DESC
+                     LIMIT ?2",
+                    SUBMISSION_SELECT
+                ))
+                .map_err(database_error("prepare originless submission query"))?;
+            let rows = statement
+                .query_map(
+                    params![project_id, bounded_diagnostic_limit(limit)],
+                    submission_from_row,
+                )
+                .map_err(database_error("query originless submissions"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read originless submissions"))
+        }
+    }
+
+    pub fn list_originless_by_project_page_since(
+        &self,
+        project_id: &str,
+        limit: usize,
+        since: &SubmissionPageCursor,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND origin_agent_run_id IS NULL
+                 AND (created_at > ?2
+                      OR (created_at = ?2 AND submission_id > ?3))
+                 ORDER BY created_at ASC, submission_id ASC
+                 LIMIT ?4",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error("prepare new originless submission query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    project_id,
+                    since.created_at,
+                    since.submission_id,
+                    bounded_diagnostic_limit(limit),
+                ],
+                submission_from_row,
+            )
+            .map_err(database_error("query new originless submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read new originless submissions"))
+    }
+
+    pub fn list_originless_by_project_page_at(
+        &self,
+        project_id: &str,
+        at: &SubmissionPageCursor,
+    ) -> Result<Vec<Submission>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1 AND origin_agent_run_id IS NULL
+                 AND created_at = ?2 AND submission_id = ?3
+                 LIMIT 1",
+                SUBMISSION_SELECT
+            ))
+            .map_err(database_error(
+                "prepare boundary originless submission query",
+            ))?;
+        let rows = statement
+            .query_map(
+                params![project_id, at.created_at, at.submission_id],
+                submission_from_row,
+            )
+            .map_err(database_error("query boundary originless submissions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read boundary originless submissions"))
+    }
+
     pub fn find_by_task_signature(
         &self,
         project_id: &str,
@@ -1696,6 +1805,7 @@ impl<'db> RunLineageRepository<'db> {
             limit,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            false,
         )
     }
 
@@ -1713,6 +1823,7 @@ impl<'db> RunLineageRepository<'db> {
             FOLLOW_SUBMISSION_PAGE_LIMIT,
             after,
             head,
+            true,
         )
     }
 
@@ -1723,6 +1834,7 @@ impl<'db> RunLineageRepository<'db> {
         submission_page_limit: usize,
         after: &BTreeMap<i64, SubmissionPageCursor>,
         head: &BTreeMap<i64, SubmissionPageCursor>,
+        follow: bool,
     ) -> Result<Vec<RunLineage>, AppError> {
         let limit = bounded_diagnostic_limit(limit) as usize;
         let runs = AgentRunRepository::new(self.db).list_by_project(project_id, limit)?;
@@ -1801,10 +1913,51 @@ impl<'db> RunLineageRepository<'db> {
             .recent_events(project_id, limit)?
             .into_iter()
             .filter(|event| !selected_primary_event_ids.contains(&event.event_id));
-        let submissions = submission_repository
-            .list_by_project(project_id, limit)?
-            .into_iter()
-            .filter(|submission| submission.origin_agent_run_id.is_none());
+        let mut submissions = if follow {
+            let mut page = if let Some(after) = after.get(&0) {
+                let mut page = submission_repository.list_originless_by_project_page_after(
+                    project_id,
+                    submission_page_limit,
+                    Some(after),
+                )?;
+                page.extend(
+                    submission_repository.list_originless_by_project_page_at(project_id, after)?,
+                );
+                page
+            } else if head.contains_key(&0) {
+                Vec::new()
+            } else {
+                submission_repository.list_originless_by_project_page_after(
+                    project_id,
+                    submission_page_limit,
+                    None,
+                )?
+            };
+            if let Some(head) = head.get(&0) {
+                page.extend(submission_repository.list_originless_by_project_page_since(
+                    project_id,
+                    submission_page_limit,
+                    head,
+                )?);
+                page.extend(
+                    submission_repository.list_originless_by_project_page_at(project_id, head)?,
+                );
+            }
+            page.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.submission_id.cmp(&left.submission_id))
+            });
+            page.dedup_by(|left, right| left.submission_id == right.submission_id);
+            page
+        } else {
+            submission_repository
+                .list_by_project(project_id, limit)?
+                .into_iter()
+                .filter(|submission| submission.origin_agent_run_id.is_none())
+                .collect()
+        };
         let mut incomplete = Vec::new();
         for event in events {
             incomplete.push(RunLineage {
@@ -1818,17 +1971,33 @@ impl<'db> RunLineageRepository<'db> {
                 submissions: Vec::new(),
             });
         }
-        for submission in submissions {
-            incomplete.push(RunLineage {
-                event_id: None,
-                event_kind: None,
-                event_status: None,
-                run_id: submission.origin_agent_run_id,
-                mode: None,
-                run_status: None,
-                started_at: submission.created_at,
-                submissions: vec![SubmissionLineage::from(&submission)],
-            });
+        if follow {
+            if !submissions.is_empty() {
+                let started_at = submissions[0].created_at;
+                incomplete.push(RunLineage {
+                    event_id: None,
+                    event_kind: None,
+                    event_status: None,
+                    run_id: None,
+                    mode: None,
+                    run_status: None,
+                    started_at,
+                    submissions: submissions.iter().map(SubmissionLineage::from).collect(),
+                });
+            }
+        } else {
+            for submission in submissions.drain(..) {
+                incomplete.push(RunLineage {
+                    event_id: None,
+                    event_kind: None,
+                    event_status: None,
+                    run_id: submission.origin_agent_run_id,
+                    mode: None,
+                    run_status: None,
+                    started_at: submission.created_at,
+                    submissions: vec![SubmissionLineage::from(&submission)],
+                });
+            }
         }
         incomplete.sort_by(|left, right| {
             right

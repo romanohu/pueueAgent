@@ -307,7 +307,13 @@ pub fn collect_fresh(
     cursor.begin_batch(limit);
     let active_runs = lineages
         .iter()
-        .filter_map(|lineage| lineage.run_id)
+        .filter_map(|lineage| {
+            if !lineage.submissions.is_empty() {
+                Some(lineage.run_id.unwrap_or_default())
+            } else {
+                lineage.run_id
+            }
+        })
         .collect();
     let active_roots = lineages
         .iter()
