@@ -76,6 +76,11 @@ pub fn redact_sensitive_text(value: &str) -> String {
             continue;
         }
 
+        if is_path_token(&token) {
+            redacted.push("[path]".to_owned());
+            continue;
+        }
+
         if let Some((key, _)) = token.split_once('=') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}=[REDACTED]"));
@@ -101,11 +106,6 @@ pub fn redact_sensitive_text(value: &str) -> String {
         if is_sensitive_flag(&token) || token.eq_ignore_ascii_case("bearer") {
             redacted.push(token.to_owned());
             redact_next = true;
-            continue;
-        }
-
-        if is_path_token(&token) {
-            redacted.push("[path]".to_owned());
             continue;
         }
 

@@ -389,6 +389,33 @@ fn status_human_bounds_halted_reason_and_context_lineage() {
 }
 
 #[test]
+fn status_human_bounds_and_redacts_project_root_path() {
+    let harness = OperatorHarness::new();
+    let mut project = harness.project();
+    project.root_path = std::path::PathBuf::from(format!(
+        "/tmp/{}/AWS_SECRET_ACCESS_KEY=AKIA_ROOT_SECRET/{}/tail",
+        "root".repeat(160),
+        "segment".repeat(160)
+    ));
+
+    let output = status::render_project_status(
+        &harness.db,
+        &project,
+        &harness.status_input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+
+    let root_line = output
+        .lines()
+        .find(|line| line.starts_with("root: "))
+        .unwrap();
+    assert!(root_line.len() <= "root: ".len() + 243);
+    assert!(root_line.contains("[path]"));
+    assert!(!root_line.contains("AWS_SECRET_ACCESS_KEY"));
+    assert!(!root_line.contains("AKIA_ROOT_SECRET"));
+}
+
+#[test]
 fn status_text_output_is_byte_compatible_for_an_active_project() {
     let harness = OperatorHarness::new();
     let project = harness.project();
@@ -403,8 +430,7 @@ fn status_text_output_is_byte_compatible_for_an_active_project() {
     assert_eq!(
         output,
         format!(
-            "daemon: running\nproject: project-a\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\nactive_tasks: 1\ntask 41 running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}",
-            project.root_path.display()
+            "daemon: running\nproject: project-a\nroot: [path]\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\nactive_tasks: 1\ntask 41 running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}",
         )
     );
 }
