@@ -16,12 +16,13 @@
 
 ## Verification
 
-- `cargo test --test database`: 49 passed.
-- `cargo test --all-targets`: 273 passed (final formatting follow-up rerun pending).
+- `cargo test --test database`: 50 passed.
+- `cargo test --all-targets`: 273 passed; final rerun completed successfully twice on fresh invocations.
 - `git diff --check`: passed.
 - `cargo fmt --check` still fails only on the pre-existing Task 1 formatting at `tests/integration/database.rs:338` (line shifted by Task 5 tests); it was not changed.
 - E2E with a real external Pueue daemon was not run; the CLI contract uses an unavailable `PATH` marker to prove wake does not require or invoke Pueue.
 - `concurrent_first_opens_apply_migration_once` was reproduced as a WAL `database is locked` failure, then passed five consecutive focused runs after serializing only `Db::open` initialization.
+- Fresh full-suite evidence: two consecutive `cargo test --all-targets` runs completed successfully with 273 passed each.
 
 ## Review follow-up coverage
 
@@ -32,4 +33,4 @@
 ## Remaining concerns
 
 - The event CHECK migration uses SQLite schema-text migration to preserve existing foreign-key relationships; legacy upgrade/reopen tests cover it.
-- `cargo fmt --check` retains the pre-existing Task 1 failure at `tests/integration/database.rs:282`; it was not changed.
+- `cargo fmt --check` retains the pre-existing Task 1 failure at `tests/integration/database.rs:338`; it was not changed.
