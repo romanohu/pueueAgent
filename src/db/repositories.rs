@@ -2048,15 +2048,24 @@ impl<'db> InterventionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin intervention insert"))?;
+        let insertion_sequence: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(insertion_sequence), 0) + 1
+                 FROM interventions WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("allocate intervention insertion sequence"))?;
         transaction
             .execute(
                 "INSERT INTO interventions (
-                    intervention_id, project_id, message, status, created_at, reserved_at,
+                    intervention_id, project_id, insertion_sequence, message, status, created_at, reserved_at,
                     applied_at, agent_run_id, attempts, lease_expires_at, reservation_token
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, 0, NULL, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, 0, NULL, NULL)",
                 params![
                     intervention_id,
                     project_id,
+                    insertion_sequence,
                     message,
                     InterventionStatus::Pending,
                     created_at,
@@ -2089,7 +2098,7 @@ impl<'db> InterventionRepository<'db> {
         let mut statement = connection
             .prepare(&format!(
                 "{} WHERE project_id = ?1 AND status = ?2
-                 ORDER BY created_at ASC, intervention_id ASC
+                 ORDER BY insertion_sequence ASC, created_at ASC, intervention_id ASC
                  LIMIT ?3",
                 INTERVENTION_SELECT
             ))
@@ -2161,7 +2170,7 @@ impl<'db> InterventionRepository<'db> {
             let mut statement = transaction
                 .prepare(&format!(
                     "{} WHERE project_id = ?1 AND status = ?2
-                     ORDER BY created_at ASC, intervention_id ASC
+                     ORDER BY insertion_sequence ASC, created_at ASC, intervention_id ASC
                      LIMIT ?3",
                     INTERVENTION_SELECT
                 ))
@@ -2450,9 +2459,9 @@ const TASK_OBSERVATION_SELECT: &str = "SELECT project_id, task_signature, pueue_
             pueue_group, command_json, state, enqueued_at, started_at, ended_at, result, observed_at
      FROM task_observations";
 
-const INTERVENTION_SELECT: &str = "SELECT intervention_id, project_id, message, status,
-            created_at, reserved_at, applied_at, agent_run_id, attempts, lease_expires_at,
-            reservation_token
+const INTERVENTION_SELECT: &str = "SELECT intervention_id, project_id, insertion_sequence,
+            message, status, created_at, reserved_at, applied_at, agent_run_id, attempts,
+            lease_expires_at, reservation_token
      FROM interventions";
 
 fn bounded_diagnostic_limit(limit: usize) -> i64 {
@@ -2510,15 +2519,16 @@ fn intervention_from_row(row: &Row<'_>) -> rusqlite::Result<Intervention> {
     Ok(Intervention {
         intervention_id: row.get(0)?,
         project_id: row.get(1)?,
-        message: row.get(2)?,
-        status: row.get(3)?,
-        created_at: row.get(4)?,
-        reserved_at: row.get(5)?,
-        applied_at: row.get(6)?,
-        agent_run_id: row.get(7)?,
-        attempts: row.get(8)?,
-        lease_expires_at: row.get(9)?,
-        reservation_token: row.get(10)?,
+        insertion_sequence: row.get(2)?,
+        message: row.get(3)?,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        reserved_at: row.get(6)?,
+        applied_at: row.get(7)?,
+        agent_run_id: row.get(8)?,
+        attempts: row.get(9)?,
+        lease_expires_at: row.get(10)?,
+        reservation_token: row.get(11)?,
     })
 }
 

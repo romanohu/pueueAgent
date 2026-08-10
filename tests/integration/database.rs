@@ -198,6 +198,26 @@ fn open_configures_sqlite_and_installs_all_tables() {
         );
     }
 
+    let intervention_columns = connection
+        .prepare("PRAGMA table_info(interventions)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(intervention_columns
+        .iter()
+        .any(|name| name == "insertion_sequence"));
+    let sequence_index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'interventions_project_sequence_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_index_count, 1);
+
     drop(statement);
     drop(connection);
     Db::open(&test.path).unwrap();
@@ -232,6 +252,60 @@ fn concurrent_first_opens_apply_migration_once() {
 }
 
 #[test]
+fn existing_v6_interventions_are_backfilled_with_project_sequences() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+        DROP TABLE interventions;
+        CREATE TABLE interventions (
+            intervention_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            message TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
+            created_at INTEGER NOT NULL,
+            reserved_at INTEGER,
+            applied_at INTEGER,
+            agent_run_id INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            lease_expires_at INTEGER,
+            reservation_token TEXT,
+            FOREIGN KEY (project_id, agent_run_id)
+                REFERENCES agent_runs(project_id, run_id) ON DELETE SET NULL
+        );
+        CREATE INDEX interventions_project_status_created_idx
+            ON interventions(project_id, status, created_at, intervention_id);
+        CREATE INDEX interventions_reservation_lease_idx
+            ON interventions(status, lease_expires_at, reservation_token);
+        INSERT INTO interventions (
+            intervention_id, project_id, message, status, created_at
+        ) VALUES ('old-first', 'project-a', 'first', 'pending', 100);
+        INSERT INTO interventions (
+            intervention_id, project_id, message, status, created_at
+        ) VALUES ('old-second', 'project-a', 'second', 'pending', 100);
+        PRAGMA user_version = 6;
+        "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let listed = InterventionRepository::new(&migrated)
+        .list("project-a", InterventionStatus::Pending, 8)
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|item| (item.intervention_id.as_str(), item.insertion_sequence))
+            .collect::<Vec<_>>(),
+        vec![("old-first", 1), ("old-second", 2)]
+    );
+}
+
+#[test]
 fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
@@ -255,6 +329,25 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
             |row| row.get(0),
         )
         .unwrap();
+    let migrated_intervention_columns = connection
+        .prepare("PRAGMA table_info(interventions)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(migrated_intervention_columns
+        .iter()
+        .any(|name| name == "insertion_sequence"));
+    let sequence_index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'interventions_project_sequence_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_index_count, 1);
     let preserved_event_id: i64 = connection
         .query_row(
             "SELECT event_id FROM events WHERE event_id = ?1",
@@ -289,37 +382,49 @@ fn interventions_validate_messages_and_list_fifo_with_project_scope() {
         .insert_pending("project-a", &"a".repeat(MAX_INTERVENTION_BYTES + 1), 100)
         .is_err());
 
-    let first = repository
-        .insert_pending("project-a", "first instruction", 100)
-        .unwrap();
-    let second = repository
-        .insert_pending("project-a", "second instruction", 100)
-        .unwrap();
+    let inserted = (0..8)
+        .map(|index| {
+            repository
+                .insert_pending("project-a", &format!("instruction-{index}"), 100)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let other = repository
         .insert_pending("project-b", "foreign instruction", 100)
         .unwrap();
 
+    let connection = test.db.connect().unwrap();
+    let stored_sequences = connection
+        .prepare(
+            "SELECT insertion_sequence FROM interventions
+             WHERE project_id = 'project-a' ORDER BY insertion_sequence ASC",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stored_sequences, (1..=8).collect::<Vec<_>>());
+
     let listed = repository
         .list("project-a", InterventionStatus::Pending, 8)
         .unwrap();
-    let mut expected_ids = vec![
-        first.intervention_id.as_str(),
-        second.intervention_id.as_str(),
-    ];
-    expected_ids.sort_unstable();
     assert_eq!(
         listed
             .iter()
             .map(|item| item.intervention_id.as_str())
             .collect::<Vec<_>>(),
-        expected_ids
+        inserted
+            .iter()
+            .map(|item| item.intervention_id.as_str())
+            .collect::<Vec<_>>()
     );
     assert!(listed.iter().all(|item| item.project_id == "project-a"));
     assert!(!listed
         .iter()
         .any(|item| item.intervention_id == other.intervention_id));
     let counts = repository.count_by_project("project-a").unwrap();
-    assert_eq!(counts.pending, 2);
+    assert_eq!(counts.pending, 8);
     assert_eq!(counts.reserved, 0);
     assert_eq!(counts.applied, 0);
 }
@@ -334,10 +439,10 @@ fn interventions_reserve_fifo_with_count_and_byte_bounds() {
         .insert_pending("project-a", "first", 100)
         .unwrap();
     let second = repository
-        .insert_pending("project-a", "second", 101)
+        .insert_pending("project-a", "second", 100)
         .unwrap();
     let overflow = repository
-        .insert_pending("project-a", "overflow", 102)
+        .insert_pending("project-a", "overflow", 100)
         .unwrap();
 
     let reservation = repository

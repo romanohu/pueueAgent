@@ -7,7 +7,7 @@ use assert_cmd::Command;
 use pueue_agent::{
     config,
     db::{Db, InterventionRepository, ProjectRepository},
-    interventions::MAX_INTERVENTIONS_PER_RUN,
+    interventions::{MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES},
     models::NewProject,
 };
 use serde_json::Value;
@@ -186,6 +186,37 @@ fn steer_json_reports_the_pending_intervention_and_accepts_hyphenated_text() {
         .unwrap();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].message, message);
+}
+
+#[test]
+fn steer_accepts_the_byte_limit_and_joins_message_arguments_with_spaces() {
+    let harness = SteerHarness::new();
+    let exact_limit_message = "x".repeat(MAX_INTERVENTION_BYTES);
+    let exact_limit_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "--", &exact_limit_message])
+        .output()
+        .unwrap();
+    assert!(exact_limit_output.status.success());
+
+    let joined_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "--", "first", "second", "third"])
+        .output()
+        .unwrap();
+    assert!(joined_output.status.success());
+
+    let project_id = harness.project_id(&harness.first_root);
+    let queued = InterventionRepository::new(&harness.db)
+        .list(
+            &project_id,
+            pueue_agent::interventions::InterventionStatus::Pending,
+            MAX_INTERVENTIONS_PER_RUN,
+        )
+        .unwrap();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0].message, exact_limit_message);
+    assert_eq!(queued[1].message, "first second third");
 }
 
 #[test]

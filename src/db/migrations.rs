@@ -38,6 +38,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         });
     }
     if version == LATEST_SCHEMA_VERSION {
+        ensure_intervention_insertion_sequence(&transaction)?;
         ensure_invariant_indexes(&transaction)?;
         transaction
             .commit()
@@ -199,6 +200,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             CREATE TABLE interventions (
                 intervention_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                insertion_sequence INTEGER NOT NULL,
                 message TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
                 created_at INTEGER NOT NULL,
@@ -244,8 +246,10 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 ON task_observations(project_id, pueue_group, state, observed_at);
             CREATE INDEX operator_logs_project_created_idx
                 ON operator_logs(project_id, created_at, log_id);
+            CREATE UNIQUE INDEX interventions_project_sequence_idx
+                ON interventions(project_id, insertion_sequence);
             CREATE INDEX interventions_project_status_created_idx
-                ON interventions(project_id, status, created_at, intervention_id);
+                ON interventions(project_id, status, insertion_sequence, intervention_id);
             CREATE INDEX interventions_reservation_lease_idx
                 ON interventions(status, lease_expires_at, reservation_token);
 
@@ -356,6 +360,7 @@ fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Resul
         CREATE TABLE interventions (
             intervention_id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            insertion_sequence INTEGER NOT NULL,
             message TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
             created_at INTEGER NOT NULL,
@@ -373,14 +378,79 @@ fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Resul
                 OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
             )
         );
+        CREATE UNIQUE INDEX interventions_project_sequence_idx
+            ON interventions(project_id, insertion_sequence);
         CREATE INDEX interventions_project_status_created_idx
-            ON interventions(project_id, status, created_at, intervention_id);
+            ON interventions(project_id, status, insertion_sequence, intervention_id);
         CREATE INDEX interventions_reservation_lease_idx
             ON interventions(status, lease_expires_at, reservation_token);
         PRAGMA user_version = 6;
         "#,
         )
         .map_err(database_error("apply SQLite v6 migration"))
+}
+
+fn ensure_intervention_insertion_sequence(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_interventions: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'interventions'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check intervention table for migration"))?;
+    if !has_interventions {
+        return Ok(());
+    }
+
+    let has_sequence: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('interventions')
+                 WHERE name = 'insertion_sequence'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check intervention insertion sequence"))?;
+    if !has_sequence {
+        transaction
+            .execute(
+                "ALTER TABLE interventions
+                 ADD COLUMN insertion_sequence INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(database_error("add intervention insertion sequence"))?;
+        transaction
+            .execute(
+                "UPDATE interventions AS current
+                 SET insertion_sequence = (
+                     SELECT COUNT(*)
+                     FROM interventions AS prior
+                     WHERE prior.project_id = current.project_id
+                       AND (
+                           prior.created_at < current.created_at
+                           OR (prior.created_at = current.created_at AND prior.rowid <= current.rowid)
+                       )
+                 )",
+                [],
+            )
+            .map_err(database_error("backfill intervention insertion sequence"))?;
+    }
+
+    transaction
+        .execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS interventions_project_sequence_idx
+                 ON interventions(project_id, insertion_sequence);
+             DROP INDEX IF EXISTS interventions_project_status_created_idx;
+             CREATE INDEX interventions_project_status_created_idx
+                 ON interventions(project_id, status, insertion_sequence, intervention_id);",
+        )
+        .map_err(database_error("ensure intervention FIFO indexes"))
 }
 
 fn migrate_termination_requests_to_v5(

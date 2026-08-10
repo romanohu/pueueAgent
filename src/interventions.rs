@@ -10,6 +10,7 @@ pub const MAX_INTERVENTION_BYTES_PER_RUN: usize = 16 * 1024;
 pub struct Intervention {
     pub intervention_id: String,
     pub project_id: String,
+    pub insertion_sequence: i64,
     pub message: String,
     pub status: InterventionStatus,
     pub created_at: i64,
