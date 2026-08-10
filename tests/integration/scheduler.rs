@@ -308,7 +308,7 @@ fn operator_intervention_prompt_keeps_the_empty_base_prompt_byte_compatible() {
     assert_eq!(
         prompt,
         format!(
-            "Dispatch mode: failure\nProject ID: project-a\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md\n\nBounded event summary:\n\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md. Preserve the configured guardrails and update STATE.md before exiting.\n",
+            "Dispatch mode: failure\nProject ID: project-a\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/state.json (canonical)\n- .pueue-agent/STATE.md (supplementary)\n\nBounded event summary:\n\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/state.json as canonical machine state, and finally .pueue-agent/STATE.md as supplementary context. Preserve the configured guardrails and update canonical state before exiting.\n",
             project.root_path.display(),
         )
     );

@@ -36,6 +36,50 @@ fn init_creates_toml_state_and_instructions() {
 }
 
 #[test]
+fn canonical_state_init_creates_bounded_machine_state() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    fs::create_dir(&root).unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    let state = root.join(".pueue-agent/state.json");
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert!(value["current_facts"].is_array());
+    assert!(value["historical_facts"].is_array());
+    assert!(value["next_action"].is_string());
+    assert!(value["budgets"].is_object());
+    assert!(value["active_lineage"].is_object());
+}
+
+#[test]
+fn canonical_state_init_preserves_existing_state_json_and_state_md() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    let state = root.join(".pueue-agent");
+    fs::create_dir_all(&state).unwrap();
+    let state_json = br#"{"schema_version":1,"current_facts":["keep me"],"historical_facts":[],"next_action":"keep next","budgets":{"max_experiments":3},"active_lineage":{"event_id":null,"run_id":null,"submission_ids":[],"task_ids":[]}}"#;
+    fs::write(state.join("state.json"), state_json).unwrap();
+    fs::write(state.join("STATE.md"), "campaign stopped\nuser history\n").unwrap();
+    fs::write(state.join("instructions.md"), "user instructions\n").unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    assert_eq!(fs::read(state.join("state.json")).unwrap(), state_json);
+    assert_eq!(
+        fs::read_to_string(state.join("STATE.md")).unwrap(),
+        "campaign stopped\nuser history\n"
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("instructions.md")).unwrap(),
+        "user instructions\n"
+    );
+}
+
+#[test]
 fn init_bounds_and_redacts_successful_project_root_output() {
     let temp = TempDir::new().unwrap();
     let root = temp

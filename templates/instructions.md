@@ -4,9 +4,9 @@
 
 ## 必須の手順
 
-1. `.pueue-agent/instructions.md`、次に `.pueue-agent/STATE.md` を読む。
+1. `.pueue-agent/instructions.md`、次に canonical machine state の `.pueue-agent/state.json`、最後に補足情報として `.pueue-agent/STATE.md` を読む。
 2. このプロジェクトに関係する task、log、metric、artifact だけを調査する。
-3. 終了する前に、診断、実験結果、artifact のパス、次の計画を `.pueue-agent/STATE.md` に記録する。
+3. 終了する前に、現在の事実、lineage、budget、次の計画を `.pueue-agent/state.json` に記録する。人間向けの経緯や補足は `.pueue-agent/STATE.md` に記録してよいが、canonical state と矛盾させない。
 4. Git を使っている場合は、意図した source change を「何を、なぜ変更したか」が分かる commit message で commit する。
 5. 監視対象の実験は必ず次の形式で投入する。
 
@@ -26,7 +26,7 @@
 ## Context と安全性
 
 - supervisor は `.pueue-agent/config.toml` に従って fresh Codex session を起動するか、明示的に既存 session を resume します。context mode や session ID を勝手に変更しない。
-- `STATE.md` は fresh run と resumed run の両方で使う永続コンテキストです。会話 transcript が SQLite に保存されているとは仮定しない。
+- `state.json` は fresh run と resumed run の両方で使う canonical machine state です。`STATE.md` は人間向けの supplementary context であり、会話 transcript の代替とはみなしません。
 - detector の `action = "kill"` が設定されている場合、supervisor が失敗した task の終了を Pueue に依頼している可能性があります。replacement を提案・投入する前に、現在の Pueue state を確認する。
 - Pueue group を変更したり、別 group に干渉したり、`pueue-agent submit` を迂回したり、`.pueue-agent/config.toml` を変更したりしない。
 - `STATE.md` に記録された目的、制約、guardrail を超えない。

@@ -8,6 +8,7 @@ use crate::{
     db::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
         SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+        LATEST_SCHEMA_VERSION,
     },
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
@@ -16,6 +17,7 @@ use crate::{
     output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::PueueTask,
     service::{callback_command, ServicePaths, ServiceStatus},
+    state,
     status::{PueueSnapshot, StatusInput},
     AppError,
 };
@@ -467,8 +469,12 @@ pub fn build_doctor_report(
             operation: "query doctor SQLite schema version",
             source,
         })?;
-    checks.push(if user_version == 7 {
-        doctor_ok("schema.version", "SQLite schema version is 7", "none")
+    checks.push(if user_version == LATEST_SCHEMA_VERSION {
+        doctor_ok(
+            "schema.version",
+            &format!("SQLite schema version is {LATEST_SCHEMA_VERSION}"),
+            "none",
+        )
     } else {
         doctor_error(
             "schema.version",
@@ -476,6 +482,80 @@ pub fn build_doctor_report(
             "run the supported database migration before starting the daemon",
         )
     });
+
+    let canonical_state_path = state::path(&project.root_path);
+    let canonical_state = if canonical_state_path.is_file() {
+        match state::load(&canonical_state_path) {
+            Ok(canonical_state) => {
+                checks.push(doctor_ok(
+                    "state.schema",
+                    &format!("canonical state is valid ({})", canonical_state.summary()),
+                    "none",
+                ));
+                Some(canonical_state)
+            }
+            Err(error) => {
+                checks.push(doctor_error(
+                    "state.schema",
+                    &bounded_redacted_text(&error.to_string()),
+                    "repair state.json using the supported schema without rewriting STATE.md",
+                ));
+                None
+            }
+        }
+    } else {
+        checks.push(doctor_warning(
+            "state.schema",
+            "canonical state.json is missing",
+            "create state.json with init for a new project; existing STATE.md is not rewritten",
+        ));
+        None
+    };
+    if let Some(canonical_state) = canonical_state {
+        let state_markdown_path = project.root_path.join(".pueue-agent/STATE.md");
+        if state_markdown_path.is_file() {
+            match state::load_state_markdown(&state_markdown_path) {
+                Ok(state_markdown) => {
+                    let warnings = state::check_consistency(&canonical_state, &state_markdown);
+                    if warnings.is_empty() {
+                        checks.push(doctor_ok(
+                            "state.consistency",
+                            &format!(
+                                "STATE.md has no canonical contradiction ({})",
+                                canonical_state.summary()
+                            ),
+                            "none",
+                        ));
+                    } else {
+                        let summary = warnings
+                            .iter()
+                            .map(|warning| warning.summary.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        checks.push(doctor_warning(
+                            "state.consistency",
+                            &summary,
+                            "treat state.json as canonical and review STATE.md without automatic repair",
+                        ));
+                    }
+                }
+                Err(error) => checks.push(doctor_warning(
+                    "state.consistency",
+                    &bounded_redacted_text(&error.to_string()),
+                    "keep state.json canonical and inspect supplementary STATE.md manually",
+                )),
+            }
+        } else {
+            checks.push(doctor_warning(
+                "state.consistency",
+                &format!(
+                    "supplementary STATE.md is missing ({})",
+                    canonical_state.summary()
+                ),
+                "review the human-readable project context; state.json remains canonical",
+            ));
+        }
+    }
 
     let required_tables = [
         "projects",

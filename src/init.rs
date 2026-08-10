@@ -8,6 +8,7 @@ use crate::{project, AppError};
 
 const CONFIG_TEMPLATE: &str = include_str!("../templates/config.toml");
 const STATE_TEMPLATE: &str = include_str!("../templates/STATE.md");
+const CANONICAL_STATE_TEMPLATE: &str = include_str!("../templates/state.json");
 const INSTRUCTIONS_TEMPLATE: &str = include_str!("../templates/instructions.md");
 
 pub fn run(project_root: &Path) -> Result<PathBuf, AppError> {
@@ -35,6 +36,7 @@ pub fn run(project_root: &Path) -> Result<PathBuf, AppError> {
     })?;
 
     write_if_missing(&state_dir.join("STATE.md"), STATE_TEMPLATE)?;
+    write_if_missing(&state_dir.join("state.json"), CANONICAL_STATE_TEMPLATE)?;
     write_if_missing(&state_dir.join("instructions.md"), INSTRUCTIONS_TEMPLATE)?;
 
     let project_id = project::new_project_id();

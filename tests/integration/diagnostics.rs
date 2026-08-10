@@ -6,8 +6,9 @@ use pueue_agent::{
         ProjectRepository, TaskObservationRepository, TerminationRequestRepository,
     },
     diagnostics::{
-        render_doctor_report, render_events, render_incident_explanation,
-        render_project_status_json, render_task_inspection, DoctorExternal, EventFilter,
+        build_doctor_report, render_doctor_report, render_doctor_report_value, render_events,
+        render_incident_explanation, render_project_status_json, render_task_inspection,
+        DoctorExternal, EventFilter,
     },
     models::{
         AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewIncident, NewProject,
@@ -32,6 +33,189 @@ fn bounded_redaction_removes_bare_provider_tokens_but_keeps_normal_reason() {
         pueue_agent::output::bounded_redacted_text("inspect current loss")
             .contains("inspect current loss")
     );
+}
+
+fn canonical_state_json() -> Value {
+    json!({
+        "schema_version": 1,
+        "current_facts": ["campaign active"],
+        "historical_facts": ["campaign started"],
+        "next_action": "inspect current loss",
+        "budgets": {
+            "max_experiments": 3,
+            "max_agent_runs": 4,
+            "max_consecutive_failures": 2
+        },
+        "active_lineage": {
+            "event_id": 17,
+            "run_id": 23,
+            "submission_ids": ["submission-1"],
+            "task_ids": [41]
+        }
+    })
+}
+
+fn doctor_paths(harness: &DiagnosticsHarness) -> ServicePaths {
+    ServicePaths {
+        release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
+        pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
+        state_dir: std::path::PathBuf::from("/state"),
+        working_dir: harness.project().root_path,
+        path_env: "/usr/bin:/bin".to_owned(),
+    }
+}
+
+fn doctor_external() -> DoctorExternal {
+    DoctorExternal {
+        pueue: Ok(Vec::new()),
+        service: Ok(ServiceStatus::Stopped),
+        callback: Ok(None),
+    }
+}
+
+fn state_check<'a>(value: &'a Value, name: &str) -> &'a Value {
+    value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("missing doctor check {name}: {value}"))
+}
+
+#[test]
+fn canonical_state_doctor_rejects_duplicate_current_facts() {
+    let harness = DiagnosticsHarness::new();
+    let mut state = canonical_state_json();
+    state["current_facts"] = json!(["campaign active", "campaign active"]);
+    fs::create_dir_all(harness.project().root_path.join(".pueue-agent")).unwrap();
+    fs::write(
+        harness.project().root_path.join(".pueue-agent/state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+
+    let rendered = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let check = state_check(&value, "state.schema");
+    assert_eq!(check["status"], "error");
+    assert!(check["summary"].as_str().unwrap().contains("duplicate"));
+}
+
+#[test]
+fn canonical_state_doctor_rejects_invalid_budget_values_and_oversized_state() {
+    let harness = DiagnosticsHarness::new();
+    fs::create_dir_all(harness.project().root_path.join(".pueue-agent")).unwrap();
+    let mut state = canonical_state_json();
+    state["budgets"]["max_experiments"] = json!(-1);
+    fs::write(
+        harness.project().root_path.join(".pueue-agent/state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+
+    let invalid_budget = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let invalid_budget: Value = serde_json::from_str(&invalid_budget).unwrap();
+    assert_eq!(
+        state_check(&invalid_budget, "state.schema")["status"],
+        "error"
+    );
+
+    state = canonical_state_json();
+    state["current_facts"] = json!(["x".repeat(70_000)]);
+    fs::write(
+        harness.project().root_path.join(".pueue-agent/state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    let oversized = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let oversized: Value = serde_json::from_str(&oversized).unwrap();
+    assert_eq!(state_check(&oversized, "state.schema")["status"], "error");
+}
+
+#[test]
+fn canonical_state_doctor_projects_summary_and_state_md_contradiction_as_warning() {
+    let harness = DiagnosticsHarness::new();
+    let state_dir = harness.project().root_path.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_vec(&canonical_state_json()).unwrap(),
+    )
+    .unwrap();
+    fs::write(state_dir.join("STATE.md"), "campaign stopped\n").unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let json = render_doctor_report_value(&report, true).unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let consistency = state_check(&value, "state.consistency");
+    assert_eq!(consistency["status"], "warning");
+    assert!(consistency["summary"]
+        .as_str()
+        .unwrap()
+        .contains("campaign stopped"));
+    assert!(consistency["summary"]
+        .as_str()
+        .unwrap()
+        .contains("active lineage"));
+
+    let text = render_doctor_report_value(&report, false).unwrap();
+    assert!(text.contains("state.consistency: warning"));
+    assert!(text.contains("current_facts=1"));
+    assert!(text.contains("active_lineage=1"));
+    assert!(!text.contains("prompt"));
+    assert!(!text.contains("transcript"));
+}
+
+#[test]
+fn canonical_state_doctor_reports_actual_sqlite_schema_version_in_json_and_text() {
+    let harness = DiagnosticsHarness::new();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let json = render_doctor_report_value(&report, true).unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let schema = state_check(&value, "schema.version");
+    assert_eq!(schema["status"], "ok");
+    assert!(schema["summary"].as_str().unwrap().contains("10"));
+    assert!(render_doctor_report_value(&report, false)
+        .unwrap()
+        .contains("schema.version: ok"));
 }
 
 #[test]

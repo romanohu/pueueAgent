@@ -368,7 +368,7 @@ fn build_base_prompt(
     events: &[Event],
 ) -> Result<String, AppError> {
     let mut prompt = format!(
-        "Dispatch mode: {mode}\nProject ID: {}\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md\n\nBounded event summary:\n",
+        "Dispatch mode: {mode}\nProject ID: {}\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/state.json (canonical)\n- .pueue-agent/STATE.md (supplementary)\n\nBounded event summary:\n",
         project.project_id,
         project
             .root_path
@@ -386,7 +386,7 @@ fn build_base_prompt(
         ));
     }
     prompt.push_str(
-        "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md. Preserve the configured guardrails and update STATE.md before exiting.\n",
+        "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/state.json as canonical machine state, and finally .pueue-agent/STATE.md as supplementary context. Preserve the configured guardrails and update canonical state before exiting.\n",
     );
 
     Ok(prompt)

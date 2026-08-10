@@ -1,6 +1,8 @@
 mod migrations;
 mod repositories;
 
+pub use migrations::LATEST_SCHEMA_VERSION;
+
 use std::{fs, path::Path, path::PathBuf, sync::Mutex, time::Duration};
 
 use rusqlite::{Connection, OpenFlags};
