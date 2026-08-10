@@ -21,7 +21,7 @@
 
 ## Commit
 
-`c75682f` (`feat: make status read-only and compact`)
+`5bdba04` (`feat: make status read-only and compact`)
 
 ## 実行したテスト
 
