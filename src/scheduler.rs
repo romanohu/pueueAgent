@@ -11,7 +11,7 @@ use crate::{
         Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
     },
     models::{Event, EventKind, EventStatus, Project},
-    AppError,
+    state, AppError,
 };
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
@@ -176,8 +176,28 @@ impl Scheduler {
                     continue;
                 }
             };
+            let effective_guardrails = match state::load_effective_guardrails(
+                &state::path(&project.root_path),
+                &project_config.guardrails,
+            ) {
+                Ok(effective_guardrails) => effective_guardrails,
+                Err(error) => {
+                    let message = error.to_string();
+                    EventRepository::new(&self.db).transition_many(
+                        &event_ids,
+                        EventStatus::Failed,
+                        self.config.now,
+                        None,
+                        Some(&message),
+                    )?;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
             let guardrails = Guardrails::new(&self.db, self.config.now);
-            match guardrails.check(&project, &project_config.guardrails, &events)? {
+            match guardrails.check(&project, &effective_guardrails, &events)? {
                 DispatchDecision::Allow => {}
                 DispatchDecision::Pause(reason) => {
                     guardrails.apply_pause(&project.project_id)?;

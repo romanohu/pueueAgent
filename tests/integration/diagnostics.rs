@@ -198,6 +198,71 @@ fn canonical_state_doctor_projects_summary_and_state_md_contradiction_as_warning
 }
 
 #[test]
+fn canonical_state_doctor_uses_normalized_current_fact_for_consistency() {
+    let harness = DiagnosticsHarness::new();
+    let state_dir = harness.project().root_path.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+    let mut state = canonical_state_json();
+    state["current_facts"] = json!(["  Campaign ACTIVE  "]);
+    state["active_lineage"] = json!({
+        "event_id": null,
+        "run_id": null,
+        "submission_ids": [],
+        "task_ids": []
+    });
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    fs::write(state_dir.join("STATE.md"), "## Campaign Stopped\n").unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+
+    let consistency = state_check(&value, "state.consistency");
+    assert_eq!(consistency["status"], "warning");
+}
+
+#[test]
+fn canonical_state_doctor_ignores_historical_markdown_prose() {
+    let harness = DiagnosticsHarness::new();
+    let state_dir = harness.project().root_path.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_vec(&canonical_state_json()).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state_dir.join("STATE.md"),
+        "The previous campaign stopped after an old run; the current work is active.\n",
+    )
+    .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+
+    assert_eq!(state_check(&value, "state.consistency")["status"], "ok");
+}
+
+#[test]
 fn canonical_state_doctor_reports_actual_sqlite_schema_version_in_json_and_text() {
     let harness = DiagnosticsHarness::new();
     let report = build_doctor_report(

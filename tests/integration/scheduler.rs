@@ -997,6 +997,50 @@ async fn guardrails_pause_when_experiment_limit_is_reached() {
     assert!(project.paused);
 }
 
+#[tokio::test]
+async fn canonical_state_budget_zero_prevents_experiment_dispatch() {
+    let harness = SchedulerHarness::new();
+    fs::write(
+        harness.root("project-a").join(".pueue-agent/state.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "current_facts": ["campaign active"],
+            "historical_facts": [],
+            "next_action": "inspect current loss",
+            "budgets": {
+                "max_experiments": 0,
+                "max_agent_runs": 10,
+                "max_consecutive_failures": 3
+            },
+            "active_lineage": {
+                "event_id": null,
+                "run_id": null,
+                "submission_ids": [],
+                "task_ids": []
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let event_id = harness.enqueue(
+        EventKind::TaskFinished,
+        "project-a",
+        "canonical-budget-zero",
+    );
+
+    let mut scheduler = harness.scheduler();
+    let report = scheduler.tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    assert_eq!(report.paused.len(), 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::Failed);
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+    assert!(project.paused);
+}
+
 #[test]
 fn codex_resume_argv_requires_project_owned_metadata_without_changing_arguments() {
     let harness = SchedulerHarness::new();

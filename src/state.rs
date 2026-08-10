@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::AppError;
+use crate::{config::GuardrailsConfig, AppError};
 
 pub const CANONICAL_STATE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_STATE_BYTES: usize = 64 * 1024;
@@ -88,10 +88,24 @@ pub fn load_state_markdown(path: &Path) -> Result<String, AppError> {
     })
 }
 
+pub fn load_effective_guardrails(
+    path: &Path,
+    configured: &GuardrailsConfig,
+) -> Result<GuardrailsConfig, AppError> {
+    if !path.is_file() {
+        return Ok(configured.clone());
+    }
+    load(path)?.effective_guardrails(configured)
+}
+
 pub fn check_consistency(state: &CanonicalState, state_markdown: &str) -> Vec<StateWarning> {
-    let markdown = state_markdown.to_ascii_lowercase();
+    let current_fact_active = state.has_current_fact("campaign active");
+    let current_fact_stopped = state.has_current_fact("campaign stopped");
+    let canonical_active = state.active_lineage.is_active() || current_fact_active;
+    let canonical_stopped =
+        current_fact_stopped || (!state.active_lineage.is_active() && !current_fact_active);
     let mut warnings = Vec::new();
-    if state.active_lineage.is_active() && markdown.contains("campaign stopped") {
+    if canonical_active && has_markdown_sentinel(state_markdown, "campaign stopped") {
         warnings.push(StateWarning {
             code: "state_md.sentinel_contradiction",
             summary: format!(
@@ -100,7 +114,7 @@ pub fn check_consistency(state: &CanonicalState, state_markdown: &str) -> Vec<St
             ),
         });
     }
-    if !state.active_lineage.is_active() && markdown.contains("campaign active") {
+    if canonical_stopped && has_markdown_sentinel(state_markdown, "campaign active") {
         warnings.push(StateWarning {
             code: "state_md.sentinel_contradiction",
             summary: format!(
@@ -122,6 +136,29 @@ impl CanonicalState {
             self.budgets.len(),
             usize::from(self.active_lineage.is_active()),
         )
+    }
+
+    pub fn effective_guardrails(
+        &self,
+        configured: &GuardrailsConfig,
+    ) -> Result<GuardrailsConfig, AppError> {
+        let mut effective = configured.clone();
+        if let Some(value) = budget_u32(&self.budgets, "max_experiments")? {
+            effective.max_experiments = value;
+        }
+        if let Some(value) = budget_u32(&self.budgets, "max_agent_runs")? {
+            effective.max_agent_runs = value;
+        }
+        if let Some(value) = budget_u32(&self.budgets, "max_consecutive_failures")? {
+            effective.max_consecutive_failures = value;
+        }
+        Ok(effective)
+    }
+
+    fn has_current_fact(&self, sentinel: &str) -> bool {
+        self.current_facts
+            .iter()
+            .any(|fact| normalize_sentinel_text(fact) == sentinel)
     }
 
     fn validate(self) -> Result<Self, AppError> {
@@ -194,6 +231,47 @@ impl ActiveLineage {
         }
         Ok(())
     }
+}
+
+fn budget_u32(budgets: &BTreeMap<String, u64>, key: &str) -> Result<Option<u32>, AppError> {
+    match budgets.get(key) {
+        Some(value) => u32::try_from(*value)
+            .map(Some)
+            .map_err(|_| invalid_state("budget value exceeds the supported integer range")),
+        None => Ok(None),
+    }
+}
+
+fn has_markdown_sentinel(markdown: &str, sentinel: &str) -> bool {
+    markdown
+        .lines()
+        .any(|line| normalized_markdown_line(line).is_some_and(|line| line == sentinel))
+}
+
+fn normalized_markdown_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let content = if trimmed.starts_with('#') {
+        let hash_count = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if hash_count == trimmed.len() || !trimmed.as_bytes()[hash_count].is_ascii_whitespace() {
+            return None;
+        }
+        trimmed[hash_count..].trim()
+    } else {
+        trimmed
+    };
+    let normalized = normalize_sentinel_text(content);
+    match normalized.as_str() {
+        "campaign active" | "campaign stopped" => Some(normalized),
+        _ => None,
+    }
+}
+
+fn normalize_sentinel_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn read_bounded(path: &Path, maximum: usize, operation: &'static str) -> Result<Vec<u8>, AppError> {
