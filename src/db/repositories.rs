@@ -1283,7 +1283,7 @@ impl<'db> BatchRepository<'db> {
                      lease_token = ?2, updated_at = ?3
                  WHERE request_id = ?4 AND project_id = ?5
                    AND lease_until IS NULL
-                   AND status IN ('pending', 'accepted')
+                   AND status IN ('pending', 'accepted', 'partial')
                    AND EXISTS(
                        SELECT 1 FROM batch_jobs
                        WHERE batch_jobs.request_id = batch_requests.request_id
@@ -1442,10 +1442,20 @@ impl<'db> BatchRepository<'db> {
                         operation: "read batch jobs after acceptance",
                     })?
                     .jobs;
-                let status = derive_request_status(&jobs);
-                let lease =
-                    (status != BatchStatus::Completed).then_some(parent.lease_until.unwrap());
-                let token = (status != BatchStatus::Completed).then_some(lease_token);
+                let mut status = derive_request_status(&jobs);
+                if status == BatchStatus::Partial
+                    && jobs.iter().any(|job| {
+                        matches!(
+                            job.status,
+                            BatchJobStatus::Pending | BatchJobStatus::Dispatching
+                        )
+                    })
+                {
+                    status = BatchStatus::Accepted;
+                }
+                let lease = (matches!(status, BatchStatus::Accepted | BatchStatus::Dispatching))
+                    .then_some(parent.lease_until.unwrap());
+                let token = lease.is_some().then_some(lease_token);
                 transaction
                     .execute(
                         "UPDATE batch_requests SET status = ?1, lease_until = ?2,

@@ -526,7 +526,7 @@ fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
         .status
         .success());
 }
-use std::fs;
+use std::{fs, path::PathBuf};
 
 use pueue_agent::{
     config,
@@ -692,4 +692,237 @@ fn cli_output_contract_runs_emits_bounded_json_and_human_lineage_without_sensiti
             "human output leaked {leaked}: {human_text}"
         );
     }
+}
+
+struct SubmitBatchCliHarness {
+    _temp: TempDir,
+    root: PathBuf,
+    state_dir: PathBuf,
+    manifest: PathBuf,
+    pueue_bin: PathBuf,
+    add_count: PathBuf,
+    fail_on_add: PathBuf,
+}
+
+impl SubmitBatchCliHarness {
+    fn new(manifest: &str) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        pueue_agent::init::run(&root).unwrap();
+
+        let state_dir = temp.path().join("state");
+        let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+        let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project_config.project_id,
+                &root,
+                &project_config.pueue_group,
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+
+        let manifest_path = temp.path().join("jobs.json");
+        fs::write(&manifest_path, manifest).unwrap();
+        let pueue_dir = temp.path().join("bin");
+        fs::create_dir_all(&pueue_dir).unwrap();
+        let pueue_bin = pueue_dir.join("pueue");
+        let add_count = temp.path().join("add-count");
+        let fail_on_add = temp.path().join("fail-on-add");
+        fs::write(&add_count, "0").unwrap();
+        fs::write(&fail_on_add, "0").unwrap();
+        fs::write(
+            &pueue_bin,
+            format!(
+                "#!/bin/sh\nset -eu\noperation=\"\"\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    add) operation=add; break ;;\n  esac\ndone\nif [ \"$operation\" = add ]; then\n  count=$(/bin/cat '{add_count}')\n  count=$((count + 1))\n  printf '%s' \"$count\" > '{add_count}'\n  fail=$(/bin/cat '{fail_on_add}')\n  if [ \"$fail\" -gt 0 ] && [ \"$count\" -eq \"$fail\" ]; then\n    printf 'fake pueue failure secret' >&2\n    exit 7\n  fi\n  printf '%s\\n' $((700 + count))\n  exit 0\nfi\nexit 0\n",
+                add_count = add_count.display(),
+                fail_on_add = fail_on_add.display(),
+            ),
+        )
+        .unwrap();
+        make_executable(&pueue_bin);
+
+        Self {
+            _temp: temp,
+            root,
+            state_dir,
+            manifest: manifest_path,
+            pueue_bin,
+            add_count,
+            fail_on_add,
+        }
+    }
+
+    fn command(&self) -> assert_cmd::Command {
+        let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
+        command
+            .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
+            .env("PATH", self.pueue_bin.parent().unwrap())
+            .current_dir(&self.root);
+        command
+    }
+
+    fn run_json(&self, request_id: &str) -> std::process::Output {
+        self.command()
+            .args([
+                "submit-batch",
+                "--request-id",
+                request_id,
+                "--manifest",
+                self.manifest.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    }
+
+    fn set_fail_on_add(&self, ordinal: usize) {
+        fs::write(&self.fail_on_add, ordinal.to_string()).unwrap();
+    }
+
+    fn add_count(&self) -> usize {
+        fs::read_to_string(&self.add_count)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+const BATCH_REQUEST_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test]
+fn submit_batch_cli_help_lists_request_manifest_group_and_json_options() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["submit-batch", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for option in ["--request-id", "--manifest", "--group", "--json"] {
+        assert!(text.contains(option), "missing {option}: {text}");
+    }
+}
+
+#[test]
+fn submit_batch_cli_rejects_malformed_manifest_before_pueue_add() {
+    let harness = SubmitBatchCliHarness::new("{not-json");
+    let output = harness.run_json(BATCH_REQUEST_ID);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("manifest"));
+    assert_eq!(harness.add_count(), 0);
+}
+
+#[test]
+fn submit_batch_cli_validates_job_shape_before_pueue_add() {
+    let harness = SubmitBatchCliHarness::new(
+        r#"{"jobs":[{"id":"duplicate","argv":["python"]},{"id":"duplicate","argv":[] }]}"#,
+    );
+    let output = harness.run_json(BATCH_REQUEST_ID);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("job_id"));
+    assert_eq!(harness.add_count(), 0);
+}
+
+#[test]
+fn submit_batch_cli_same_request_does_not_add_pueue_task_twice() {
+    let harness = SubmitBatchCliHarness::new(
+        r#"{"jobs":[{"id":"job-a","argv":["python","train.py"],"metadata":{"secret":"hidden"}}]}"#,
+    );
+    let first = harness.run_json(BATCH_REQUEST_ID);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = harness.run_json(BATCH_REQUEST_ID);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let result: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["jobs"][0]["task_id"], 701);
+    assert!(!String::from_utf8_lossy(&second.stdout).contains("hidden"));
+    assert_eq!(harness.add_count(), 1);
+}
+
+#[test]
+fn submit_batch_cli_reports_partial_json_and_stops_after_failed_add() {
+    let harness = SubmitBatchCliHarness::new(
+        r#"{"jobs":[{"id":"job-a","argv":["python","a.py"]},{"id":"job-b","argv":["python","b.py"]},{"id":"job-c","argv":["python","c.py"]}]}"#,
+    );
+    harness.set_fail_on_add(2);
+    let output = harness.run_json(BATCH_REQUEST_ID);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["counts"]["accepted"], 1);
+    assert_eq!(result["counts"]["failed"], 1);
+    assert_eq!(result["counts"]["pending"], 1);
+    assert_eq!(result["jobs"][0]["task_id"], 701);
+    assert_eq!(result["jobs"][1]["status"], "failed");
+    assert_eq!(result["jobs"][2]["status"], "pending");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fake pueue failure secret"));
+    assert_eq!(harness.add_count(), 2);
+
+    let replay = harness.run_json(BATCH_REQUEST_ID);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay_result: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay_result["status"], "partial");
+    assert_eq!(replay_result["counts"]["accepted"], 2);
+    assert_eq!(replay_result["counts"]["failed"], 1);
+    assert_eq!(replay_result["counts"]["pending"], 0);
+    assert_eq!(replay_result["jobs"][2]["task_id"], 703);
+    assert_eq!(harness.add_count(), 3);
+}
+
+#[test]
+fn submit_batch_cli_rejects_group_mismatch_before_pueue_add() {
+    let harness =
+        SubmitBatchCliHarness::new(r#"{"jobs":[{"id":"job-a","argv":["python","train.py"]}]}"#);
+    let output = harness
+        .command()
+        .args([
+            "submit-batch",
+            "--request-id",
+            BATCH_REQUEST_ID,
+            "--manifest",
+            harness.manifest.to_str().unwrap(),
+            "--group",
+            "wrong-group",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("group"));
+    assert_eq!(harness.add_count(), 0);
 }

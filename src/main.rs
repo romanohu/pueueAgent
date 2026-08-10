@@ -42,6 +42,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Enable(args) => commands::enable(args).await,
         Command::Disable(args) => commands::disable(args).await,
         Command::Submit(args) => commands::submit(args).await,
+        Command::SubmitBatch(args) => commands::submit_batch(args).await,
         Command::Event(args) => commands::event(args),
         Command::Status(args) => commands::status(args).await,
         Command::Events(args) => commands::events(args),
@@ -65,7 +66,7 @@ mod commands {
         cli::{
             DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
             InspectArgs, ProjectArgs, RunsArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs,
-            WakeArgs,
+            SubmitBatchArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -292,6 +293,25 @@ mod commands {
         println!(
             "{}",
             submit_command::render_submission(&submission, &registered.pueue_group, json)?
+        );
+        Ok(())
+    }
+
+    pub async fn submit_batch(args: SubmitBatchArgs) -> Result<(), AppError> {
+        let (db, project, service_paths) = resolve_project(args.project_root, None)?;
+        let pueue = configured_pueue(&service_paths);
+        let batch = pueue_agent::batches::run_with(
+            &db,
+            &project.root_path,
+            &args.request_id.to_string(),
+            &args.manifest,
+            args.group.as_deref(),
+            &pueue,
+        )
+        .await?;
+        println!(
+            "{}",
+            pueue_agent::batches::render_batch(&batch, &project.pueue_group, args.json)?
         );
         Ok(())
     }

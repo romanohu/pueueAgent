@@ -851,3 +851,55 @@ async fn batch_external_add_result_is_recorded_after_durable_intent() {
     );
     assert_eq!(completed.jobs[0].status.to_string(), "accepted");
 }
+
+#[tokio::test]
+async fn submit_batch_cli_core_flow_uses_pueue_adapter_double_and_shared_renderers() {
+    let harness = SubmitHarness::new();
+    let manifest_path = harness.root.join("jobs.json");
+    fs::write(
+        &manifest_path,
+        r#"{"jobs":[{"id":"job-a","argv":["python","train.py"],"metadata":{"credential":"hidden"}}]}"#,
+    )
+    .unwrap();
+    let fake = FakePueue::new().with_add_task_id(73);
+
+    let batch = pueue_agent::batches::run_with(
+        &harness.db,
+        &harness.root,
+        "22222222-2222-4222-8222-222222222222",
+        &manifest_path,
+        None,
+        &fake,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(batch.status.to_string(), "completed");
+    assert_eq!(batch.jobs[0].pueue_task_id, Some(73));
+    assert!(batch.jobs[0].submission_id.is_some());
+    assert_eq!(
+        fake.last_add_args(),
+        vec![
+            OsString::from("-g"),
+            OsString::from("pa-project"),
+            OsString::from("--"),
+            OsString::from("python"),
+            OsString::from("train.py"),
+        ]
+    );
+
+    let human = pueue_agent::batches::render_batch(&batch, "pa-project", false).unwrap();
+    assert!(human.starts_with("pueue-agent submit-batch"));
+    assert!(human.contains("request=22222222-2222-4222-8222-222222222222"));
+    assert!(human.contains("state=completed"));
+    assert!(human.contains("accepted=1 failed=0 pending=0"));
+    assert!(!human.contains("hidden"));
+
+    let json = pueue_agent::batches::render_batch(&batch, "pa-project", true).unwrap();
+    assert!(json.starts_with('{'));
+    assert!(!json.contains("pueue-agent"));
+    assert!(!json.contains("hidden"));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["jobs"][0]["task_id"], 73);
+}

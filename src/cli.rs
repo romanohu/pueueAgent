@@ -1,6 +1,7 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use uuid::Uuid;
 
 use crate::models::{EventKind, EventStatus, SubmissionKind};
 
@@ -17,6 +18,7 @@ pub enum Command {
     Enable(ProjectArgs),
     Disable(DisableArgs),
     Submit(SubmitArgs),
+    SubmitBatch(SubmitBatchArgs),
     Event(EventArgs),
     Status(StatusArgs),
     Events(EventsArgs),
@@ -148,6 +150,20 @@ pub struct SubmitArgs {
         value_name = "COMMAND"
     )]
     pub command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+pub struct SubmitBatchArgs {
+    #[arg(long, value_name = "UUID")]
+    pub request_id: Uuid,
+    #[arg(long, value_name = "PATH")]
+    pub manifest: PathBuf,
+    #[arg(long, value_name = "GROUP")]
+    pub group: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

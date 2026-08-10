@@ -283,7 +283,7 @@ fn validate_active_origin(
     }
 }
 
-fn validate_metadata(metadata: &Value) -> Result<(), AppError> {
+pub(crate) fn validate_metadata(metadata: &Value) -> Result<(), AppError> {
     let serialized = serde_json::to_vec(metadata).map_err(|source| AppError::Serialization {
         operation: "serialize submission metadata",
         source,
