@@ -100,6 +100,8 @@ fn readme_documents_human_intervention_workflow() {
 
     for clause in [
         r#"pueue-agent steer -- "次は learning rate を半分にして""#,
+        "pueue-agent steer list",
+        "pueue-agent status --json",
         "SQLite へ登録するだけで、agent の起動、Pueue 操作、実行中 process への入力は行いません",
         "FIFO 順で一度だけ、次回の agent run の prompt に渡されますが、1回ですべての pending メッセージを配信するとは限りません",
         "各メッセージは最大 `4,096 bytes` です。1回の run には最大 `16 messages`、合計 `16,384 intervention bytes` までを、残りの prompt budget に収まる範囲で配信します",
