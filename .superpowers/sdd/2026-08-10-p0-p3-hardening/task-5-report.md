@@ -25,7 +25,7 @@
 
 - CLI: unavailable `PATH` proves wake does not need Pueue; two project-scoped wake rows have unique dedup keys; human/JSON omit a bare GitHub token; blank and 1025-byte reasons fail.
 - Scheduler: a `record_operator_wake_with` event stays pending while paused and dispatches through the standard scheduler after resume.
-- Migration: existing v4-v7 upgrade/reopen and foreign-key regression tests remain the coverage for schema-text migration. A dedicated v7 fixture INSERT assertion remains outstanding.
+- Migration: dedicated `v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes` creates a v7 CHECK fixture through `sqlite_master`, reopens it, verifies user_version 8, both event kinds, FK rejection, required indexes, and a second reopen.
 
 ## Remaining concerns
 

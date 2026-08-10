@@ -225,6 +225,48 @@ fn open_configures_sqlite_and_installs_all_tables() {
 }
 
 #[test]
+fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
+    let test = TestDatabase::new();
+    let root = test.project_root("v7-project");
+    register_project(&test.db, "v7-project", &root, "pa-v7-project");
+    insert_event(&test.db, "v7-project", "before-v8", 100);
+    let connection = test.db.connect().unwrap();
+    connection.execute_batch(
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_master
+            SET sql = replace(sql, '''termination_failed'', ''operator_wake''', '''termination_failed''')
+          WHERE type = 'table' AND name = 'events';
+         PRAGMA writable_schema = OFF;
+         PRAGMA user_version = 7;",
+    ).unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, 8);
+    connection.execute(
+        "INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at)
+         VALUES ('v7-project', 'operator_wake', 'wake-v8', '{}', 'pending', 0, 100, 100)",
+        [],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at)
+         VALUES ('v7-project', 'task_finished', 'finished-v8', '{}', 'pending', 0, 100, 100)",
+        [],
+    ).unwrap();
+    let event_count: i64 = connection.query_row("SELECT COUNT(*) FROM events WHERE project_id = 'v7-project'", [], |row| row.get(0)).unwrap();
+    assert_eq!(event_count, 3);
+    assert!(connection.execute("INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at) VALUES ('missing', 'operator_wake', 'foreign', '{}', 'pending', 0, 100, 100)", []).is_err());
+    for index in ["events_claimable_idx", "events_project_status_idx"] {
+        let found: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1", [index], |row| row.get(0)).unwrap();
+        assert_eq!(found, 1, "missing {index}");
+    }
+    drop(connection);
+    Db::open(&test.path).unwrap();
+}
+
+#[test]
 fn readonly_open_does_not_migrate_or_create_database_state() {
     let test = TestDatabase::new();
     let connection = test.db.connect().unwrap();
