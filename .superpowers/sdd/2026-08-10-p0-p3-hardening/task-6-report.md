@@ -61,3 +61,14 @@ Implementation commit: `2e625700c3f19523bafb25173f2bc059622c1272` (`feat: expose
 
 - The follow page performs bounded boundary/head probes in addition to the one-row continuation page; the resulting internal lineage is capped by `MAX_FOLLOW_LINEAGE_SUBMISSIONS` and output remains capped by `--limit`.
 - As above, the repository-wide format check cannot be zero without changing the explicitly excluded Task 1 formatting lines.
+
+## Fresh review fix loop 3
+
+- Implementation commit: `7fe16301489e987bcf865131085e7325b4ed4184` (`fix: page originless follow submissions`).
+- Originless submissions (`origin_agent_run_id IS NULL`) now use the same bounded project-scoped keyset continuation as run submissions. Follow reserves stream key `0`; actual agent run IDs are positive.
+- Added originless project page-after, page-since, and page-at repository queries. Normal `list_by_project` behavior remains unchanged, while follow groups the bounded originless page into one project-scoped lineage before applying the output `--limit`.
+- `collect_fresh` retains stream key `0` whenever an originless lineage has submissions, preventing the continuation from being discarded between polls. Event-only cursor behavior remains unchanged.
+- RED: the SQLite regression initially returned the newly inserted originless head on the second limit-one poll instead of the older submission because the incomplete projection still used the latest project query and truncated individual submissions by `remaining`.
+- GREEN: the regression now observes `originless-new -> originless-old -> originless-old(task_id=88) -> originless-head` through the repository follow path.
+- Full verification: `cargo test --all-targets` — 285 passed, 0 failed; `git diff --check` — passed.
+- `cargo fmt --check` reports only the inherited Task 1 formatting difference at `tests/integration/database.rs:339-344`; Task 1 lines were not modified.
