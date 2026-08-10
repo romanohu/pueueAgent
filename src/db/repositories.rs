@@ -14,11 +14,11 @@ use crate::{
     },
     models::{
         launch_gate_marker_path, path_text, AgentContextMode, AgentRun, AgentRunEvent,
-        AgentRunStatus, Event, EventKind,
-        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent,
-        InterventionStatus, NewAgentRun, NewEvent, NewIncident, NewIntegrationEvent, NewProject,
-        NewSubmission, NewTaskObservation, NewTerminationRequest, Project, Submission,
-        SubmissionStatus, TaskObservation, TerminationRequest, TerminationRequestStatus,
+        AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentTransition,
+        IncidentUpdate, IntegrationEvent, InterventionStatus, NewAgentRun, NewEvent, NewIncident,
+        NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
+        Project, Submission, SubmissionStatus, TaskObservation, TerminationRequest,
+        TerminationRequestStatus,
     },
     AppError,
 };
@@ -1546,9 +1546,7 @@ impl<'db> AgentRunRepository<'db> {
                      WHERE run_id = ?1 AND launch_gate_state = 'release_requested'",
                     [run_id],
                 )
-                .map_err(database_error(
-                    "promote marker-confirmed agent launch gate",
-                ))?;
+                .map_err(database_error("promote marker-confirmed agent launch gate"))?;
         }
         transaction
             .execute(
