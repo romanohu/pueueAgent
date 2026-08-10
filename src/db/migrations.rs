@@ -43,6 +43,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         });
     }
     if version == LATEST_SCHEMA_VERSION {
+        ensure_agent_run_launch_gate(&transaction)?;
         ensure_intervention_insertion_sequence(&transaction)?;
         ensure_invariant_indexes(&transaction)?;
         transaction
@@ -126,6 +127,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 exit_code INTEGER,
                 log_path TEXT NOT NULL,
                 last_error TEXT,
+                launch_gate_state TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    launch_gate_state IN ('pending', 'release_requested', 'released', 'failed')
+                ),
                 context_mode TEXT NOT NULL DEFAULT 'fresh' CHECK (context_mode IN (
                     'fresh', 'resume', 'resume_latest'
                 )),
@@ -350,6 +354,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if (1..=4).contains(&version) {
         migrate_interventions_to_v6(&transaction)?;
     }
+    ensure_agent_run_launch_gate(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
     transaction
         .commit()
@@ -457,6 +462,54 @@ fn ensure_intervention_insertion_sequence(
         "interventions_project_status_created_idx",
         INTERVENTION_STATUS_INDEX_SQL,
     )
+}
+
+fn ensure_agent_run_launch_gate(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_agent_runs: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_runs'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run table for launch gate"))?;
+    if !has_agent_runs {
+        return Ok(());
+    }
+
+    let has_gate_state: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('agent_runs')
+                 WHERE name = 'launch_gate_state'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run launch gate state"))?;
+    if !has_gate_state {
+        transaction
+            .execute(
+                "ALTER TABLE agent_runs
+                 ADD COLUMN launch_gate_state TEXT NOT NULL DEFAULT 'released'
+                 CHECK (launch_gate_state IN ('pending', 'release_requested', 'released', 'failed'))",
+                [],
+            )
+            .map_err(database_error("add agent run launch gate state"))?;
+    }
+    transaction
+        .execute(
+            "UPDATE agent_runs
+             SET launch_gate_state = 'pending'
+             WHERE status = 'starting' AND launch_gate_state = 'released'",
+            [],
+        )
+        .map_err(database_error("initialize starting agent launch gates"))?;
+    Ok(())
 }
 
 fn ensure_index_definition(

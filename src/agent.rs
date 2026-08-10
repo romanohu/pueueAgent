@@ -6,7 +6,11 @@ use std::{
     time::Duration,
 };
 
-use tokio::{io::AsyncWriteExt, process::Command, time::Instant};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    time::{timeout, Instant},
+};
 
 use crate::{
     codex_session,
@@ -52,17 +56,21 @@ pub struct AgentCommand {
 
 #[cfg(unix)]
 const LAUNCH_GATE_SCRIPT: &str = r#"
+log_path=$1
+shift
 IFS= read -r release || exit 0
 [ "$release" = x ] || exit 0
-exec "$@"
+printf 'released\n'
+exec "$@" >>"$log_path" 2>&1
 "#;
 
 #[cfg(unix)]
-fn configure_launch_gate(process: &mut Command, command: &AgentCommand) {
+fn configure_launch_gate(process: &mut Command, log_path: &std::path::Path, command: &AgentCommand) {
     process
         .arg("-c")
         .arg(LAUNCH_GATE_SCRIPT)
         .arg("pueue-agent-launch-gate")
+        .arg(log_path)
         .arg(&command.program)
         .args(&command.args);
 }
@@ -180,7 +188,10 @@ impl AgentRunner {
         let mut spawned_child = None;
         #[cfg(unix)]
         let mut release_stdin: Option<tokio::process::ChildStdin> = None;
+        #[cfg(unix)]
+        let mut gate_stdout: Option<tokio::process::ChildStdout> = None;
         let startup = (|| -> Result<i64, AppError> {
+            ensure_launch_gate_platform_supported()?;
             ensure_agent_program_available(&command.program)?;
             let log_file = OpenOptions::new()
                 .create(true)
@@ -199,8 +210,9 @@ impl AgentRunner {
                 #[cfg(unix)]
                 {
                     let mut process = Command::new("/bin/sh");
-                    configure_launch_gate(&mut process, &command);
+                    configure_launch_gate(&mut process, &log_path, &command);
                     process.stdin(Stdio::piped());
+                    process.stdout(Stdio::piped());
                     process
                 }
                 #[cfg(not(unix))]
@@ -213,9 +225,12 @@ impl AgentRunner {
             };
             process
                 .current_dir(&project.root_path)
-                .stdout(Stdio::from(log_file))
                 .stderr(Stdio::from(stderr))
                 .kill_on_drop(true);
+            #[cfg(unix)]
+            drop(log_file);
+            #[cfg(not(unix))]
+            process.stdout(Stdio::from(log_file));
             process_tree::configure_agent_command(&mut process);
 
             spawned_child = Some(process.spawn().map_err(|source| AppError::Io {
@@ -232,6 +247,7 @@ impl AgentRunner {
             #[cfg(unix)]
             {
                 release_stdin = spawned_child.as_mut().and_then(|child| child.stdin.take());
+                gate_stdout = spawned_child.as_mut().and_then(|child| child.stdout.take());
             }
             repository.mark_running_and_apply_interventions(
                 &project.project_id,
@@ -239,6 +255,7 @@ impl AgentRunner {
                 pid,
                 now,
             )?;
+            repository.mark_gate_release_requested(&project.project_id, run.run_id)?;
             Ok(pid)
         })();
         let pid = match startup {
@@ -251,19 +268,34 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.finish_and_release_interventions(
+                repository.fail_before_gate_release(
                     &project.project_id,
                     run.run_id,
-                    AgentRunStatus::Failed,
                     now,
-                    None,
-                    Some(&reason),
+                    &reason,
                 )?;
                 return Err(error);
             }
         };
         #[cfg(unix)]
-        if let Some(mut release) = release_stdin.take() {
+        {
+            let Some(mut release) = release_stdin.take() else {
+                let error = AppError::Runtime {
+                    operation: "open agent launch gate stdin",
+                };
+                if let Some(child) = spawned_child.as_mut() {
+                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
+                        .await;
+                }
+                let reason = error.to_string();
+                repository.fail_before_gate_release(
+                    &project.project_id,
+                    run.run_id,
+                    now,
+                    &reason,
+                )?;
+                return Err(error);
+            };
             if let Err(source) = release.write_all(b"x\n").await {
                 drop(release);
                 if let Some(child) = spawned_child.as_mut() {
@@ -271,18 +303,80 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = format!("release agent launch gate: {source}");
-                repository.finish_and_release_interventions(
+                repository.fail_before_gate_release(
                     &project.project_id,
+                    run.run_id,
+                    now,
+                    &reason,
+                )?;
+                return Err(AppError::Io {
+                    operation: "release agent launch gate",
+                    source,
+                });
+            }
+
+            let Some(gate_stdout) = gate_stdout.take() else {
+                let error = AppError::Runtime {
+                    operation: "open agent launch gate acknowledgement",
+                };
+                if let Some(child) = spawned_child.as_mut() {
+                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
+                        .await;
+                }
+                let reason = error.to_string();
+                repository.fail_before_gate_release(
+                    &project.project_id,
+                    run.run_id,
+                    now,
+                    &reason,
+                )?;
+                return Err(error);
+            };
+            let mut acknowledgement = String::new();
+            let read_result = timeout(
+                Duration::from_secs(5),
+                BufReader::new(gate_stdout).read_line(&mut acknowledgement),
+            )
+            .await;
+            let acknowledged = matches!(
+                &read_result,
+                Ok(Ok(count)) if *count > 0 && acknowledgement == "released\n"
+            );
+            if !acknowledged {
+                if let Some(child) = spawned_child.as_mut() {
+                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
+                        .await;
+                }
+                let reason = match read_result {
+                    Ok(Ok(0)) => "agent launch gate closed before acknowledgement".to_owned(),
+                    Ok(Ok(_)) => "agent launch gate returned an invalid acknowledgement".to_owned(),
+                    Ok(Err(source)) => format!("read agent launch gate acknowledgement: {source}"),
+                    Err(_) => "timed out waiting for agent launch gate acknowledgement".to_owned(),
+                };
+                repository.fail_before_gate_release(
+                    &project.project_id,
+                    run.run_id,
+                    now,
+                    &reason,
+                )?;
+                return Err(AppError::Runtime {
+                    operation: "confirm agent launch gate release",
+                });
+            }
+            if let Err(error) = repository.mark_gate_released(&project.project_id, run.run_id) {
+                if let Some(child) = spawned_child.as_mut() {
+                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
+                        .await;
+                }
+                let reason = error.to_string();
+                repository.finish(
                     run.run_id,
                     AgentRunStatus::Failed,
                     now,
                     None,
                     Some(&reason),
                 )?;
-                return Err(AppError::Io {
-                    operation: "release agent launch gate",
-                    source,
-                });
+                return Err(error);
             }
         }
         let child = match spawned_child.take() {
@@ -292,8 +386,7 @@ impl AgentRunner {
                     operation: "take spawned agent process",
                 };
                 let reason = error.to_string();
-                repository.finish_and_release_interventions(
-                    &project.project_id,
+                repository.finish(
                     run.run_id,
                     AgentRunStatus::Failed,
                     now,
@@ -546,11 +639,26 @@ fn ensure_agent_program_available(program: &str) -> Result<(), AppError> {
     })
 }
 
+#[cfg(unix)]
+fn ensure_launch_gate_platform_supported() -> Result<(), AppError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_launch_gate_platform_supported() -> Result<(), AppError> {
+    Err(AppError::Runtime {
+        operation: "agent launch gate requires a Unix process launcher",
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::{fs, process::Stdio};
 
-    use tokio::{io::AsyncWriteExt, process::Command};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt},
+        process::Command,
+    };
     use uuid::Uuid;
 
     use super::{configure_launch_gate, AgentCommand};
@@ -569,7 +677,7 @@ mod tests {
             ],
         };
         let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &command);
+        configure_launch_gate(&mut process, &marker, &command);
         process.stdin(Stdio::piped());
         let mut child = process.spawn().unwrap();
         drop(child.stdin.take());
@@ -597,13 +705,18 @@ mod tests {
             ],
         };
         let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &command);
+        configure_launch_gate(&mut process, &marker, &command);
         process.stdin(Stdio::piped());
+        process.stdout(Stdio::piped());
         let mut child = process.spawn().unwrap();
         let mut release = child.stdin.take().unwrap();
+        let mut acknowledgement = tokio::io::BufReader::new(child.stdout.take().unwrap());
         assert!(!marker.exists());
         release.write_all(b"x\n").await.unwrap();
         drop(release);
+        let mut line = String::new();
+        acknowledgement.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "released\n");
 
         let status = child.wait().await.unwrap();
 

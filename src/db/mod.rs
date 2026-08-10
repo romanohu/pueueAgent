@@ -3,7 +3,7 @@ mod repositories;
 
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::AppError;
 
@@ -18,6 +18,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct Db {
     path: PathBuf,
+    read_only: bool,
 }
 
 impl Db {
@@ -37,11 +38,25 @@ impl Db {
 
         Ok(Self {
             path: path.to_path_buf(),
+            read_only: false,
+        })
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self, AppError> {
+        let connection = open_read_only_connection(path)?;
+        drop(connection);
+        Ok(Self {
+            path: path.to_path_buf(),
+            read_only: true,
         })
     }
 
     pub fn connect(&self) -> Result<Connection, AppError> {
-        open_connection(&self.path)
+        if self.read_only {
+            open_read_only_connection(&self.path)
+        } else {
+            open_connection(&self.path)
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -73,6 +88,28 @@ fn open_connection(path: &Path) -> Result<Connection, AppError> {
             source,
         })?;
 
+    Ok(connection)
+}
+
+fn open_read_only_connection(path: &Path) -> Result<Connection, AppError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+        |source| AppError::Database {
+            operation: "open SQLite database read-only",
+            source,
+        },
+    )?;
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|source| AppError::Database {
+            operation: "configure SQLite busy timeout",
+            source,
+        })?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|source| AppError::Database {
+            operation: "enable SQLite foreign keys for read-only connection",
+            source,
+        })?;
     Ok(connection)
 }
 

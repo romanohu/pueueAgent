@@ -98,6 +98,129 @@ fn events_cli_renders_the_project_scoped_event_projection() {
 }
 
 #[test]
+fn inspect_cli_process_renders_json_and_text() {
+    let harness = DiagnosticsCliHarness::new();
+    TaskObservationRepository::new(&harness.db)
+        .upsert(&NewTaskObservation::new(
+            &harness.project_id,
+            "cli-inspect-signature",
+            41,
+            "pa-project",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "done",
+            Some(10),
+            Some(11),
+            Some(12),
+            Some("0".to_owned()),
+            100,
+        ))
+        .unwrap();
+
+    let output = harness
+        .command()
+        .args(["inspect", "41", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["task_id"], 41);
+    assert_eq!(body["latest"]["task_signature"], "cli-inspect-signature");
+
+    let output = harness.command().args(["inspect", "41"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("task 41"));
+}
+
+#[test]
+fn explain_cli_process_renders_json_and_text() {
+    let harness = DiagnosticsCliHarness::new();
+    let incident = IncidentRepository::new(&harness.db)
+        .upsert_active(&NewIncident::new(
+            &harness.project_id,
+            "cli-incident",
+            Some("cli-task-signature"),
+            "cli-explain",
+            100,
+        ))
+        .unwrap()
+        .incident;
+
+    let output = harness
+        .command()
+        .args(["explain", &incident.incident_id.to_string(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["incident"]["incident_id"], incident.incident_id);
+    assert_eq!(body["policy"]["status"], "not_configured");
+
+    let output = harness
+        .command()
+        .args(["explain", &incident.incident_id.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("observation ->"));
+}
+
+#[test]
+fn doctor_cli_process_reports_errors_without_repairing_schema() {
+    let harness = DiagnosticsCliHarness::new();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute("DROP INDEX events_project_status_idx", [])
+        .unwrap();
+    let before_cookie: i64 = connection
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    drop(connection);
+
+    let output = harness
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["status"] == "error"));
+
+    let connection = harness.db.connect().unwrap();
+    let after_cookie: i64 = connection
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    let index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_project_status_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_cookie, before_cookie);
+    assert_eq!(index_count, 0);
+}
+
+#[test]
 fn steer_help_describes_enqueue_and_bounded_list_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -170,8 +293,52 @@ use std::fs;
 
 use pueue_agent::{
     config,
-    db::{Db, EventRepository, ProjectRepository},
-    models::{EventKind, NewEvent, NewProject},
+    db::{Db, EventRepository, IncidentRepository, ProjectRepository, TaskObservationRepository},
+    models::{EventKind, NewEvent, NewIncident, NewProject, NewTaskObservation},
 };
 use serde_json::Value;
 use tempfile::TempDir;
+
+struct DiagnosticsCliHarness {
+    _temp: TempDir,
+    root: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
+    db: Db,
+    project_id: String,
+}
+
+impl DiagnosticsCliHarness {
+    fn new() -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        pueue_agent::init::run(&root).unwrap();
+        let state_dir = temp.path().join("state");
+        let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+        let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project_config.project_id,
+                &root,
+                &project_config.pueue_group,
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        Self {
+            _temp: temp,
+            root,
+            state_dir,
+            db,
+            project_id: project_config.project_id,
+        }
+    }
+
+    fn command(&self) -> assert_cmd::Command {
+        let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
+        command
+            .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
+            .current_dir(&self.root);
+        command
+    }
+}

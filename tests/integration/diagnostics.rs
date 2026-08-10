@@ -411,6 +411,33 @@ fn status_json_bounds_and_sanitizes_pueue_timestamps() {
 }
 
 #[test]
+fn status_json_bounds_and_sanitizes_pueue_state() {
+    let harness = DiagnosticsHarness::new();
+    let state = format!("{}\n\t\x1b[31m", "running-".repeat(80));
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(vec![PueueTask {
+            id: 78,
+            group: "pa-project".to_owned(),
+            command: "python job.py".to_owned(),
+            state,
+            enqueued_at: Some("1".to_owned()),
+            started_at: Some("2".to_owned()),
+            ended_at: None,
+            result: None,
+        }])),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let state = value["pueue"]["active_tasks"][0]["state"]
+        .as_str()
+        .unwrap();
+    assert!(state.len() <= 240);
+    assert!(state.chars().all(|character| !character.is_control()));
+}
+
+#[test]
 fn events_projection_filters_project_events_and_emits_bounded_fields() {
     let harness = DiagnosticsHarness::new();
     let crash = EventRepository::new(&harness.db)
@@ -529,6 +556,55 @@ fn task_inspection_stays_project_scoped_and_keeps_stable_signature_history_toget
     assert!(!rendered.contains("reused-signature-a"));
     assert!(!rendered.contains("foreign-signature"));
     assert!(!rendered.contains("old.py"));
+}
+
+#[test]
+fn task_inspection_bounds_agent_runs_before_accumulating_per_event_history() {
+    let harness = DiagnosticsHarness::new();
+    TaskObservationRepository::new(&harness.db)
+        .upsert(&NewTaskObservation::new(
+            "project-a",
+            "bounded-agent-history",
+            41,
+            "pa-project",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "done",
+            Some(10),
+            Some(11),
+            Some(12),
+            Some("0".to_owned()),
+            100,
+        ))
+        .unwrap();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            "bounded-agent-history-event",
+            json!({"task_signature": "bounded-agent-history"}),
+            100,
+            100,
+        ))
+        .unwrap();
+    for run_number in 0..65 {
+        AgentRunRepository::new(&harness.db)
+            .insert_with_events(
+                &NewAgentRun::new(
+                    "project-a",
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Completed,
+                    200 + run_number,
+                    format!("/tmp/bounded-agent-history-{run_number}.log"),
+                ),
+                &[event.event_id],
+            )
+            .unwrap();
+    }
+
+    let rendered = render_task_inspection(&harness.db, &harness.project(), 41, true).unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    assert!(value["agent_runs"].as_array().unwrap().len() <= 64);
 }
 
 #[test]
@@ -674,4 +750,103 @@ fn doctor_projection_reports_unavailable_integrations_as_errors_without_repairin
         .unwrap();
     assert_eq!(event_after.status, EventStatus::Claimed);
     assert_eq!(event_after.lease_until, Some(99));
+}
+
+#[test]
+fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
+    let harness = DiagnosticsHarness::new();
+    let foreign_root = harness._temp.path().join("project-b");
+    fs::create_dir_all(&foreign_root).unwrap();
+    ProjectRepository::new(&harness.db)
+        .register(&NewProject::new(
+            "project-b",
+            &foreign_root,
+            "pb-project",
+            foreign_root.join(".pueue-agent/config.toml"),
+            100,
+        ))
+        .unwrap();
+    let foreign_event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-b",
+            EventKind::TaskFailed,
+            "foreign-expired-event",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'claimed', lease_until = 99 WHERE event_id = ?1",
+            [foreign_event.event_id],
+        )
+        .unwrap();
+    InterventionRepository::new(&harness.db)
+        .insert_pending("project-b", "foreign expired intervention", 100)
+        .unwrap();
+    InterventionRepository::new(&harness.db)
+        .reserve_pending("project-b", "foreign-intervention-token", 100, 99, 1, 1024)
+        .unwrap();
+    let foreign_incident = IncidentRepository::new(&harness.db)
+        .upsert_active(&NewIncident::new(
+            "project-b",
+            "foreign",
+            Some("foreign-task"),
+            "foreign-doctor",
+            100,
+        ))
+        .unwrap()
+        .incident;
+    let foreign_request = TerminationRequestRepository::new(&harness.db)
+        .insert_idempotent(&NewTerminationRequest::new(
+            foreign_incident.incident_id,
+            "project-b",
+            "foreign-task",
+            "foreign request",
+            100,
+            None,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE termination_requests SET dispatch_lease_until = 99 WHERE request_id = ?1",
+            [foreign_request.request_id],
+        )
+        .unwrap();
+
+    let paths = ServicePaths {
+        release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
+        pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
+        state_dir: std::path::PathBuf::from("/state"),
+        working_dir: harness.project().root_path,
+        path_env: "/usr/bin:/bin".to_owned(),
+    };
+    let rendered = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &paths,
+        DoctorExternal {
+            pueue: Ok(Vec::new()),
+            service: Ok(ServiceStatus::Stopped),
+            callback: Ok(None),
+        },
+        100,
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let lease_check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "leases.expired")
+        .unwrap();
+    assert_eq!(lease_check["status"], "ok");
 }

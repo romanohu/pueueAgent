@@ -26,6 +26,7 @@ pub const MAX_EVENT_LIST_LIMIT: usize = 1_000;
 pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 
 const MAX_SUMMARY_TEXT_BYTES: usize = 240;
+const MAX_TASK_AGENT_RUNS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
@@ -189,10 +190,14 @@ pub fn render_task_inspection(
     let agent_runs_repository = AgentRunRepository::new(db);
     let mut agent_runs = Vec::new();
     for event in &events {
+        let remaining = MAX_TASK_AGENT_RUNS.saturating_sub(agent_runs.len());
+        if remaining == 0 {
+            break;
+        }
         agent_runs.extend(agent_runs_repository.find_by_event(
             &project.project_id,
             event.event_id,
-            MAX_TASK_SUMMARY_LIMIT,
+            remaining,
         )?);
     }
     agent_runs.sort_unstable_by(|left, right| {
@@ -707,8 +712,9 @@ pub fn build_doctor_report(
     });
     let expired_events: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE status = 'claimed' AND lease_until <= ?1",
-            [now],
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND status = 'claimed' AND lease_until <= ?2",
+            params![&project.project_id, now],
             |row| row.get(0),
         )
         .map_err(|source| AppError::Database {
@@ -718,8 +724,8 @@ pub fn build_doctor_report(
     let expired_interventions: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM interventions
-             WHERE status = 'reserved' AND lease_expires_at <= ?1",
-            [now],
+             WHERE project_id = ?1 AND status = 'reserved' AND lease_expires_at <= ?2",
+            params![&project.project_id, now],
             |row| row.get(0),
         )
         .map_err(|source| AppError::Database {
@@ -729,8 +735,9 @@ pub fn build_doctor_report(
     let expired_terminations: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM termination_requests
-             WHERE dispatch_lease_until IS NOT NULL AND dispatch_lease_until <= ?1",
-            [now],
+             WHERE project_id = ?1
+               AND dispatch_lease_until IS NOT NULL AND dispatch_lease_until <= ?2",
+            params![&project.project_id, now],
             |row| row.get(0),
         )
         .map_err(|source| AppError::Database {
@@ -1193,7 +1200,7 @@ impl From<&PueueTask> for PueueTaskSummary {
     fn from(task: &PueueTask) -> Self {
         Self {
             task_id: task.id,
-            state: task.state.to_ascii_lowercase(),
+            state: bounded_text(&task.state.to_ascii_lowercase()),
             command_summary: executable_summary(&task.command),
             enqueued_at: task.enqueued_at.as_deref().map(bounded_text),
             started_at: task.started_at.as_deref().map(bounded_text),

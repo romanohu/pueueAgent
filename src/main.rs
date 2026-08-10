@@ -208,7 +208,8 @@ mod commands {
     }
 
     pub async fn doctor(args: DoctorArgs) -> Result<(), AppError> {
-        let (db, project, service_paths) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, service_paths) =
+            resolve_project_read_only(args.project_root, args.pueue_config)?;
         let pueue = configured_pueue(&service_paths);
         let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
         let external = DoctorExternal {
@@ -396,6 +397,28 @@ mod commands {
         };
         let service_paths = ServicePaths::from_environment(&project_root, pueue_config)?;
         let db = Db::open(&paths::state_db_path()?)?;
+        let project = ProjectRepository::new(&db)
+            .find_by_root(&project_root)?
+            .ok_or(AppError::Runtime {
+                operation: "find registered project",
+            })?;
+        Ok((db, project, service_paths))
+    }
+
+    fn resolve_project_read_only(
+        project_root: Option<std::path::PathBuf>,
+        pueue_config: Option<std::path::PathBuf>,
+    ) -> Result<(Db, Project, ServicePaths), AppError> {
+        let current_dir = env::current_dir().map_err(|source| AppError::Io {
+            operation: "read current directory",
+            source,
+        })?;
+        let project_root = match project_root {
+            Some(path) => project::find_root(&path)?,
+            None => project::find_root(&current_dir)?,
+        };
+        let service_paths = ServicePaths::from_environment(&project_root, pueue_config)?;
+        let db = Db::open_read_only(&paths::state_db_path()?)?;
         let project = ProjectRepository::new(&db)
             .find_by_root(&project_root)?
             .ok_or(AppError::Runtime {

@@ -414,6 +414,7 @@ pub struct AgentRun {
     pub exit_code: Option<i64>,
     pub log_path: PathBuf,
     pub last_error: Option<String>,
+    pub launch_gate_state: String,
     pub context_mode: AgentContextMode,
     pub context_session_id: Option<String>,
     pub context_lineage: Vec<String>,

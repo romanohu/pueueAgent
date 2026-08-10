@@ -1395,14 +1395,20 @@ impl<'db> AgentRunRepository<'db> {
                     source,
                 }
             })?;
+        let launch_gate_state = if run.status == AgentRunStatus::Starting {
+            "pending"
+        } else {
+            "released"
+        };
         let connection = self.db.connect()?;
         connection
             .execute(
                 "INSERT INTO agent_runs (
                     project_id, primary_event_id, pid, status, started_at,
-                    finished_at, exit_code, log_path, last_error, context_mode,
+                    finished_at, exit_code, log_path, last_error, launch_gate_state,
+                    context_mode,
                     context_session_id, context_lineage_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
                 params![
                     run.project_id,
                     run.primary_event_id,
@@ -1410,6 +1416,7 @@ impl<'db> AgentRunRepository<'db> {
                     run.status,
                     run.started_at,
                     log_path,
+                    launch_gate_state,
                     run.context_mode.as_str(),
                     run.context_session_id.as_deref(),
                     context_lineage_json,
@@ -1506,6 +1513,7 @@ impl<'db> AgentRunRepository<'db> {
                        SELECT 1 FROM agent_runs
                        WHERE agent_runs.project_id = interventions.project_id
                          AND agent_runs.run_id = interventions.agent_run_id
+                         AND agent_runs.launch_gate_state = 'released'
                          AND (agent_runs.pid IS NOT NULL OR agent_runs.status = 'running')
                    )",
                 params![
@@ -1522,14 +1530,21 @@ impl<'db> AgentRunRepository<'db> {
                 "UPDATE interventions
                  SET status = ?1, reserved_at = NULL, applied_at = NULL,
                      agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
-                 WHERE status = ?2 AND agent_run_id IS NOT NULL
+                 WHERE status IN (?2, ?3) AND agent_run_id IS NOT NULL
                    AND EXISTS (
                        SELECT 1 FROM agent_runs
                        WHERE agent_runs.project_id = interventions.project_id
                          AND agent_runs.run_id = interventions.agent_run_id
-                         AND agent_runs.pid IS NULL AND agent_runs.status <> 'running'
+                         AND (
+                             agent_runs.launch_gate_state IN ('pending', 'failed')
+                             OR (agent_runs.pid IS NULL AND agent_runs.status <> 'running')
+                         )
                    )",
-                params![InterventionStatus::Pending, InterventionStatus::Reserved,],
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    InterventionStatus::Applied,
+                ],
             )
             .map_err(database_error(
                 "release undelivered interventions during agent run recovery",
@@ -1539,7 +1554,7 @@ impl<'db> AgentRunRepository<'db> {
                 "UPDATE interventions
                  SET status = ?1, reserved_at = NULL, applied_at = NULL,
                      agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
-                 WHERE status = ?2 AND lease_expires_at <= ?3",
+                 WHERE status = ?2 AND agent_run_id IS NULL AND lease_expires_at <= ?3",
                 params![
                     InterventionStatus::Pending,
                     InterventionStatus::Reserved,
@@ -1570,7 +1585,11 @@ impl<'db> AgentRunRepository<'db> {
         let failed_runs = transaction
             .execute(
                 "UPDATE agent_runs
-                 SET status = 'failed', finished_at = ?1, last_error = ?2
+                 SET status = 'failed', finished_at = ?1, last_error = ?2,
+                     launch_gate_state = CASE
+                         WHEN launch_gate_state = 'pending' THEN 'failed'
+                         ELSE launch_gate_state
+                     END
                  WHERE status IN ('starting', 'running')",
                 params![finished_at, reason],
             )
@@ -1611,7 +1630,9 @@ impl<'db> AgentRunRepository<'db> {
         let connection = self.db.connect()?;
         connection
             .execute(
-                "UPDATE agent_runs SET pid = ?1, status = 'running' WHERE run_id = ?2",
+                "UPDATE agent_runs
+                 SET pid = ?1, status = 'running', launch_gate_state = 'released'
+                 WHERE run_id = ?2",
                 params![pid, run_id],
             )
             .map_err(database_error("mark agent run running"))?;
@@ -1633,7 +1654,7 @@ impl<'db> AgentRunRepository<'db> {
             ))?;
         let changed = transaction
             .execute(
-                "UPDATE agent_runs SET pid = ?1, status = 'running'
+                "UPDATE agent_runs SET pid = ?1, status = 'running', launch_gate_state = 'pending'
                  WHERE project_id = ?2 AND run_id = ?3",
                 params![pid, project_id, run_id],
             )
@@ -1663,6 +1684,89 @@ impl<'db> AgentRunRepository<'db> {
         transaction.commit().map_err(database_error(
             "commit agent run start and intervention application",
         ))?;
+        read_agent_run(&connection, run_id)
+    }
+
+    pub fn mark_gate_release_requested(
+        &self,
+        project_id: &str,
+        run_id: i64,
+    ) -> Result<(), AppError> {
+        let connection = self.db.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE agent_runs
+                 SET launch_gate_state = 'release_requested'
+                 WHERE project_id = ?1 AND run_id = ?2 AND launch_gate_state = 'pending'",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("record agent launch gate release request"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "record agent launch gate release request",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn mark_gate_released(&self, project_id: &str, run_id: i64) -> Result<(), AppError> {
+        let connection = self.db.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE agent_runs
+                 SET launch_gate_state = 'released'
+                 WHERE project_id = ?1 AND run_id = ?2
+                   AND launch_gate_state = 'release_requested'",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("record agent launch gate release"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "record agent launch gate release",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn fail_before_gate_release(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+        reason: &str,
+    ) -> Result<AgentRun, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin pre-release agent run failure"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', finished_at = ?1, last_error = ?2,
+                     launch_gate_state = 'failed'
+                 WHERE project_id = ?3 AND run_id = ?4
+                   AND launch_gate_state IN ('pending', 'release_requested')",
+                params![finished_at, reason, project_id, run_id],
+            )
+            .map_err(database_error("fail agent run before launch gate release"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "fail agent run before launch gate release",
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = 'pending', reserved_at = NULL, applied_at = NULL,
+                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                 WHERE project_id = ?1 AND agent_run_id = ?2
+                   AND status IN ('reserved', 'applied')",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("requeue interventions after launch gate failure"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit pre-release agent run failure"))?;
         read_agent_run(&connection, run_id)
     }
 
@@ -1705,7 +1809,14 @@ impl<'db> AgentRunRepository<'db> {
         let changed = transaction
             .execute(
                 "UPDATE agent_runs
-                 SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4
+                 SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4,
+                     launch_gate_state = CASE
+                         WHEN launch_gate_state IN ('pending', 'release_requested')
+                              AND ?1 = 'failed' THEN 'failed'
+                         WHEN launch_gate_state IN ('pending', 'release_requested')
+                              AND ?1 IN ('completed', 'timed_out', 'cancelled') THEN 'released'
+                         ELSE launch_gate_state
+                     END
                  WHERE project_id = ?5 AND run_id = ?6",
                 params![
                     status,
@@ -1794,8 +1905,9 @@ impl<'db> AgentRunRepository<'db> {
                 "SELECT agent_runs.run_id, agent_runs.project_id, agent_runs.primary_event_id,
                         agent_runs.pid, agent_runs.status, agent_runs.started_at,
                         agent_runs.finished_at, agent_runs.exit_code, agent_runs.log_path,
-                        agent_runs.last_error, agent_runs.context_mode,
-                        agent_runs.context_session_id, agent_runs.context_lineage_json
+                        agent_runs.last_error, agent_runs.launch_gate_state,
+                        agent_runs.context_mode, agent_runs.context_session_id,
+                        agent_runs.context_lineage_json
                  FROM agent_runs
                  JOIN agent_run_events
                    ON agent_run_events.project_id = agent_runs.project_id
@@ -2720,7 +2832,7 @@ const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, cr
 
 const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid, status,
             started_at, finished_at, exit_code, log_path, last_error,
-            context_mode, context_session_id, context_lineage_json
+            launch_gate_state, context_mode, context_session_id, context_lineage_json
      FROM agent_runs";
 
 const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, project_id,
@@ -2861,15 +2973,16 @@ fn read_submission(connection: &Connection, submission_id: &str) -> Result<Submi
 }
 
 fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
-    let context_mode_value: String = row.get(10)?;
-    let context_session_id: Option<String> = row.get(11)?;
+    let launch_gate_state: String = row.get(10)?;
+    let context_mode_value: String = row.get(11)?;
+    let context_session_id: Option<String> = row.get(12)?;
     let context_mode =
         AgentContextMode::from_db_parts(&context_mode_value, context_session_id.clone()).map_err(
-            |source| rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(source)),
+            |source| rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(source)),
         )?;
-    let context_lineage_json: String = row.get(12)?;
+    let context_lineage_json: String = row.get(13)?;
     let context_lineage = serde_json::from_str(&context_lineage_json).map_err(|source| {
-        rusqlite::Error::FromSqlConversionFailure(12, Type::Text, Box::new(source))
+        rusqlite::Error::FromSqlConversionFailure(13, Type::Text, Box::new(source))
     })?;
     Ok(AgentRun {
         run_id: row.get(0)?,
@@ -2882,6 +2995,7 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
         exit_code: row.get(7)?,
         log_path: PathBuf::from(row.get::<_, String>(8)?),
         last_error: row.get(9)?,
+        launch_gate_state,
         context_mode,
         context_session_id,
         context_lineage,
@@ -2895,13 +3009,19 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
             operation: "serialize agent context lineage",
             source,
         })?;
+    let launch_gate_state = if run.status == AgentRunStatus::Starting {
+        "pending"
+    } else {
+        "released"
+    };
     transaction
         .execute(
             "INSERT INTO agent_runs (
                 project_id, primary_event_id, pid, status, started_at,
-                finished_at, exit_code, log_path, last_error, context_mode,
+                finished_at, exit_code, log_path, last_error, launch_gate_state,
+                context_mode,
                 context_session_id, context_lineage_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
             params![
                 run.project_id,
                 run.primary_event_id,
@@ -2909,6 +3029,7 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
                 run.status,
                 run.started_at,
                 log_path,
+                launch_gate_state,
                 run.context_mode.as_str(),
                 run.context_session_id.as_deref(),
                 context_lineage_json,
