@@ -45,3 +45,19 @@ Implementation commit: `2e625700c3f19523bafb25173f2bc059622c1272` (`feat: expose
 - Fresh review GREEN: selected runs now page all origin submissions internally, while `collect_fresh` treats `--limit` as an output batch size and emits submission cursors before a root cursor for populated lineages. A 1000-row page boundary regression verifies no submission is stranded.
 - Fresh review verification: `cargo test --all-targets` completed with 282 passed, 0 failed; `git diff --check` passed. `cargo fmt --check` still reports only the inherited Task 1 difference at `tests/integration/database.rs:339-344`.
 - Fresh review implementation commit: `54ae1d99c595fa9e82bb842de7ec99545f8672f1` (`fix: page follow run submissions`).
+
+## Fresh review fix loop 2
+
+- Implementation commit: `9af8268ceb03de0a072766f7e418fe98bde14866` (`fix: bound follow lineage pagination`).
+- Normal `RunLineageRepository::list_by_project` now fetches only a bounded per-run page; it no longer materializes all submissions for a selected run.
+- Follow uses `list_by_project_follow` with per-run keyset continuation. `created_at < after_created_at` (with `submission_id` tie-break) advances toward older submissions, while a separate head cursor accepts newer submissions. Boundary rows are re-read with bounded single-row queries so `task_id` changes such as `None -> Some` remain observable.
+- `follow_runs` passes cloned `after` and `head` maps on every read-only SQLite poll. `FollowCursor` uses bounded per-run maps and bounded pending/root state; submission history is not retained in an unbounded `seen` set. `--limit` remains the output batch limit, distinct from the internal page/cursor caps.
+- RED: the 1001-submission repository regression returned 1001 rows from normal `list_by_project`, and the cursor-state regression left more than one pending cursor after a limit-one collection. GREEN: normal reads return one bounded page; the repository follow path emits `new -> old` with `--limit 1`, later emits a newer head submission, and eventually observes all 1001 submissions.
+- Focused GREEN: `collect_fresh` tests (4 passed), the repository `new -> old`/head regression (1 passed), and the 1001-submission continuation regression (1 passed).
+- Full verification: `cargo test --all-targets` — 284 passed, 0 failed; `git diff --check` — passed.
+- `cargo fmt --check` remains non-zero only for the inherited Task 1 formatting difference in `tests/integration/database.rs:339-344`; Task 1 lines were not modified. Changed source files have no remaining formatting differences.
+
+## Remaining concerns
+
+- The follow page performs bounded boundary/head probes in addition to the one-row continuation page; the resulting internal lineage is capped by `MAX_FOLLOW_LINEAGE_SUBMISSIONS` and output remains capped by `--limit`.
+- As above, the repository-wide format check cannot be zero without changing the explicitly excluded Task 1 formatting lines.
