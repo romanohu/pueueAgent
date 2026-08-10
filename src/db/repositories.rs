@@ -2005,7 +2005,9 @@ impl<'db> RunLineageRepository<'db> {
                 .cmp(&left.started_at)
                 .then_with(|| right.run_id.cmp(&left.run_id))
         });
-        incomplete.truncate(remaining);
+        if !follow {
+            incomplete.truncate(remaining);
+        }
         lineages.extend(incomplete);
         Ok(lineages)
     }

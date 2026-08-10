@@ -1175,6 +1175,119 @@ fn follow_limit_one_pages_originless_submissions_and_keeps_the_stream_active() {
 }
 
 #[test]
+fn follow_limit_one_does_not_starve_originless_stream_when_a_run_is_selected() {
+    let test = TestDatabase::new();
+    let root = test.project_root("mixed-follow");
+    register_project(&test.db, "mixed-follow", &root, "pa-mixed-follow");
+    let event = insert_event(&test.db, "mixed-follow", "mixed-follow-event", 100);
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "mixed-follow",
+            event,
+            None,
+            AgentRunStatus::Running,
+            100,
+            "/tmp/mixed-follow.log",
+        ))
+        .unwrap();
+    let submissions = SubmissionRepository::new(&test.db);
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "run-new",
+            "mixed-follow",
+            vec!["python".to_owned()],
+            100,
+            SubmissionKind::Experiment,
+            json!({}),
+            Some(run.run_id),
+        ))
+        .unwrap();
+    for (submission_id, created_at) in [("originless-new", 200), ("originless-old", 100)] {
+        submissions
+            .insert_idempotent(&NewSubmission::with_kind_metadata(
+                submission_id,
+                "mixed-follow",
+                vec!["python".to_owned()],
+                created_at,
+                SubmissionKind::Experiment,
+                json!({}),
+                None,
+            ))
+            .unwrap();
+    }
+
+    let repository = pueue_agent::db::RunLineageRepository::new(&test.db);
+    let mut cursor = FollowCursor::default();
+    let first = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "mixed-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(first[0].submissions[0].submission_id, "run-new");
+
+    let second = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "mixed-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(second[0].submissions[0].submission_id, "originless-new");
+
+    submissions
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "originless-head",
+            "mixed-follow",
+            vec!["python".to_owned()],
+            300,
+            SubmissionKind::Experiment,
+            json!({}),
+            None,
+        ))
+        .unwrap();
+
+    let third = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "mixed-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(third[0].submissions[0].submission_id, "originless-old");
+
+    let fourth = collect_fresh(
+        repository
+            .list_by_project_follow(
+                "mixed-follow",
+                1,
+                cursor.submission_after(),
+                cursor.submission_head(),
+            )
+            .unwrap(),
+        &mut cursor,
+        1,
+    );
+    assert_eq!(fourth[0].submissions[0].submission_id, "originless-head");
+}
+
+#[test]
 fn follow_lineage_pages_all_submissions_beyond_one_internal_page() {
     let test = TestDatabase::new();
     let root = test.project_root("follow-pages");
