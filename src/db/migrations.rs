@@ -1,4 +1,4 @@
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::AppError;
 
@@ -10,6 +10,11 @@ const ACTIVE_AGENT_INDEX_SQL: &str = r#"
         ON agent_runs(project_id)
         WHERE status IN ('starting', 'running');
 "#;
+const INTERVENTION_SEQUENCE_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX interventions_project_sequence_idx
+    ON interventions(project_id, insertion_sequence);";
+const INTERVENTION_STATUS_INDEX_SQL: &str = "CREATE INDEX interventions_project_status_created_idx
+    ON interventions(project_id, status, insertion_sequence, intervention_id);";
 const OPERATOR_LOGS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS operator_logs (
         log_id INTEGER PRIMARY KEY,
@@ -442,15 +447,54 @@ fn ensure_intervention_insertion_sequence(
             .map_err(database_error("backfill intervention insertion sequence"))?;
     }
 
-    transaction
-        .execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS interventions_project_sequence_idx
-                 ON interventions(project_id, insertion_sequence);
-             DROP INDEX IF EXISTS interventions_project_status_created_idx;
-             CREATE INDEX interventions_project_status_created_idx
-                 ON interventions(project_id, status, insertion_sequence, intervention_id);",
+    ensure_index_definition(
+        transaction,
+        "interventions_project_sequence_idx",
+        INTERVENTION_SEQUENCE_INDEX_SQL,
+    )?;
+    ensure_index_definition(
+        transaction,
+        "interventions_project_status_created_idx",
+        INTERVENTION_STATUS_INDEX_SQL,
+    )
+}
+
+fn ensure_index_definition(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    expected_sql: &str,
+) -> Result<(), AppError> {
+    let existing_sql = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |row| row.get::<_, Option<String>>(0),
         )
-        .map_err(database_error("ensure intervention FIFO indexes"))
+        .optional()
+        .map_err(database_error("read intervention index definition"))?
+        .flatten();
+    if existing_sql
+        .as_deref()
+        .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql))
+    {
+        return Ok(());
+    }
+
+    transaction
+        .execute(&format!("DROP INDEX IF EXISTS {name}"), [])
+        .map_err(database_error("replace stale intervention index"))?;
+    transaction
+        .execute_batch(expected_sql)
+        .map_err(database_error("create intervention FIFO index"))
+}
+
+fn compact_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_owned()
+        .to_ascii_lowercase()
 }
 
 fn migrate_termination_requests_to_v5(

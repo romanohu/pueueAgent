@@ -224,6 +224,49 @@ fn open_configures_sqlite_and_installs_all_tables() {
 }
 
 #[test]
+fn repeated_current_schema_open_does_not_rebuild_intervention_indexes() {
+    let test = TestDatabase::new();
+    let before = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+
+    Db::open(&test.path).unwrap();
+
+    let connection = test.db.connect().unwrap();
+    let after: i64 = connection
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    let sequence_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'interventions_project_sequence_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let status_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'interventions_project_status_created_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(after, before);
+    let compact_sql = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        compact_sql(&sequence_sql).to_ascii_lowercase(),
+        "create unique index interventions_project_sequence_idx on interventions(project_id, insertion_sequence)"
+    );
+    assert_eq!(
+        compact_sql(&status_sql).to_ascii_lowercase(),
+        "create index interventions_project_status_created_idx on interventions(project_id, status, insertion_sequence, intervention_id)"
+    );
+}
+
+#[test]
 fn concurrent_first_opens_apply_migration_once() {
     let temp = TempDir::new().unwrap();
     let path = Arc::new(temp.path().join("fresh.sqlite3"));
@@ -657,6 +700,50 @@ fn interventions_apply_release_and_expiry_respect_project_and_reservation_owners
             .collect::<Vec<_>>(),
         vec![foreign.intervention_id.as_str()]
     );
+}
+
+#[test]
+fn periodic_intervention_recovery_leaves_expired_attached_reservations_untouched() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project-a");
+    register_project(&test.db, "project-a", &root, "pa-project-a");
+    let intervention = InterventionRepository::new(&test.db)
+        .insert_pending("project-a", "attached instruction", 100)
+        .unwrap();
+    InterventionRepository::new(&test.db)
+        .reserve_pending("project-a", "attached-token", 100, 101, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "attached-recovery", 100);
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            Some(4242),
+            AgentRunStatus::Running,
+            100,
+            "/tmp/attached-recovery.log",
+        ))
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET agent_run_id = ?1 WHERE intervention_id = ?2",
+            params![run.run_id, intervention.intervention_id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        InterventionRepository::new(&test.db)
+            .recover_expired_unattached(101)
+            .unwrap(),
+        0
+    );
+    let state = InterventionRepository::new(&test.db)
+        .list("project-a", InterventionStatus::Reserved, 8)
+        .unwrap();
+    assert_eq!(state.len(), 1);
+    assert_eq!(state[0].agent_run_id, Some(run.run_id));
 }
 
 #[test]

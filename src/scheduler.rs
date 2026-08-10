@@ -59,7 +59,11 @@ impl Scheduler {
     }
 
     pub fn recover_expired_leases(&self) -> Result<usize, AppError> {
-        EventRepository::new(&self.db).recover_expired_claims(self.config.now)
+        let recovered_events =
+            EventRepository::new(&self.db).recover_expired_claims(self.config.now)?;
+        let recovered_interventions =
+            InterventionRepository::new(&self.db).recover_expired_unattached(self.config.now)?;
+        Ok(recovered_events + recovered_interventions)
     }
 
     fn reserve_interventions_for_prompt(

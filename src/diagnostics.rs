@@ -4,16 +4,17 @@ use rusqlite::params;
 use serde::Serialize;
 
 use crate::{
+    config,
     db::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
-        TerminationRequestRepository,
+        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
     },
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
-        TerminationRequest, TerminationRequestStatus,
+        Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
     pueue::PueueTask,
-    service::ServiceStatus,
+    service::{callback_command, ServicePaths, ServiceStatus},
     status::{PueueSnapshot, StatusInput},
     AppError,
 };
@@ -40,6 +41,793 @@ impl EventFilter {
             status,
             limit,
         }
+    }
+}
+
+#[derive(Serialize)]
+struct EventListReport {
+    schema_version: u32,
+    project_id: String,
+    events: Vec<EventSummary>,
+}
+
+pub fn render_events(
+    db: &Db,
+    project: &Project,
+    filter: &EventFilter,
+    json: bool,
+) -> Result<String, AppError> {
+    let events = EventRepository::new(db).list_filtered(&project.project_id, filter)?;
+    if json {
+        return serde_json::to_string(&EventListReport {
+            schema_version: JSON_SCHEMA_VERSION,
+            project_id: project.project_id.clone(),
+            events: events.iter().map(EventSummary::from).collect(),
+        })
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize event diagnostics",
+            source,
+        });
+    }
+
+    Ok(events
+        .iter()
+        .map(|event| {
+            format!(
+                "event {} kind={} status={} attempts={} lease={} created_at={} completed_at={} error={}",
+                event.event_id,
+                event.kind,
+                event.status,
+                event.attempts,
+                event
+                    .lease_until
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                event.created_at,
+                event
+                    .completed_at
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                event
+                    .last_error
+                    .as_deref()
+                    .map(bounded_summary)
+                    .unwrap_or_else(|| "none".to_owned())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+#[derive(Serialize)]
+struct SubmissionSummary {
+    submission_id: String,
+    status: crate::models::SubmissionStatus,
+    created_at: i64,
+    pueue_task_id: Option<i64>,
+    task_signature: Option<String>,
+}
+
+impl From<&Submission> for SubmissionSummary {
+    fn from(submission: &Submission) -> Self {
+        Self {
+            submission_id: bounded_summary(&submission.submission_id),
+            status: submission.status,
+            created_at: submission.created_at,
+            pueue_task_id: submission.pueue_task_id,
+            task_signature: submission.task_signature.as_deref().map(bounded_summary),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TaskObservationSummary {
+    task_signature: String,
+    pueue_task_id: i64,
+    pueue_group: String,
+    state: String,
+    command_summary: String,
+    enqueued_at: Option<i64>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    observed_at: i64,
+}
+
+impl From<&TaskObservation> for TaskObservationSummary {
+    fn from(observation: &TaskObservation) -> Self {
+        Self {
+            task_signature: bounded_summary(&observation.task_signature),
+            pueue_task_id: observation.pueue_task_id,
+            pueue_group: bounded_summary(&observation.pueue_group),
+            state: bounded_text(&observation.state.to_ascii_lowercase()),
+            command_summary: executable_summary(&observation.command.join(" ")),
+            enqueued_at: observation.enqueued_at,
+            started_at: observation.started_at,
+            ended_at: observation.ended_at,
+            observed_at: observation.observed_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TaskInspectionReport {
+    schema_version: u32,
+    project_id: String,
+    task_id: i64,
+    latest: TaskObservationSummary,
+    history: Vec<TaskObservationSummary>,
+    submissions: Vec<SubmissionSummary>,
+    incidents: Vec<IncidentSummary>,
+    events: Vec<EventSummary>,
+    terminations: Vec<TerminationSummary>,
+    agent_runs: Vec<AgentRunSummary>,
+}
+
+pub fn render_task_inspection(
+    db: &Db,
+    project: &Project,
+    task_id: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let observations = TaskObservationRepository::new(db).find_by_pueue_task(
+        &project.project_id,
+        task_id,
+        MAX_TASK_SUMMARY_LIMIT,
+    )?;
+    let latest = observations.first().ok_or(AppError::Runtime {
+        operation: "find project task observation",
+    })?;
+    let stable_signature = latest.task_signature.clone();
+    let history = observations
+        .iter()
+        .filter(|observation| observation.task_signature == stable_signature)
+        .map(TaskObservationSummary::from)
+        .collect::<Vec<_>>();
+    let events = EventRepository::new(db).find_by_task_signature(
+        &project.project_id,
+        &stable_signature,
+        MAX_TASK_SUMMARY_LIMIT,
+    )?;
+    let agent_runs_repository = AgentRunRepository::new(db);
+    let mut agent_runs = Vec::new();
+    for event in &events {
+        agent_runs.extend(agent_runs_repository.find_by_event(
+            &project.project_id,
+            event.event_id,
+            MAX_TASK_SUMMARY_LIMIT,
+        )?);
+    }
+    agent_runs.sort_unstable_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    agent_runs.dedup_by_key(|run| run.run_id);
+    agent_runs.truncate(MAX_TASK_SUMMARY_LIMIT);
+    let report = TaskInspectionReport {
+        schema_version: JSON_SCHEMA_VERSION,
+        project_id: project.project_id.clone(),
+        task_id,
+        latest: TaskObservationSummary::from(latest),
+        history,
+        submissions: SubmissionRepository::new(db)
+            .find_by_task_signature(
+                &project.project_id,
+                &stable_signature,
+                MAX_TASK_SUMMARY_LIMIT,
+            )?
+            .iter()
+            .map(SubmissionSummary::from)
+            .collect(),
+        incidents: IncidentRepository::new(db)
+            .find_by_task_key(
+                &project.project_id,
+                &stable_signature,
+                MAX_TASK_SUMMARY_LIMIT,
+            )?
+            .iter()
+            .map(IncidentSummary::from)
+            .collect(),
+        events: events.iter().map(EventSummary::from).collect(),
+        terminations: TerminationRequestRepository::new(db)
+            .find_by_task_signature(
+                &project.project_id,
+                &stable_signature,
+                MAX_TASK_SUMMARY_LIMIT,
+            )?
+            .iter()
+            .map(TerminationSummary::from)
+            .collect(),
+        agent_runs: agent_runs.iter().map(AgentRunSummary::from).collect(),
+    };
+    if json {
+        return serde_json::to_string(&report).map_err(|source| AppError::Serialization {
+            operation: "serialize task diagnostics",
+            source,
+        });
+    }
+    Ok(format_task_inspection_text(&report))
+}
+
+fn format_task_inspection_text(report: &TaskInspectionReport) -> String {
+    format!(
+        "task {} latest_signature={} state={} observed_at={} history={} submissions={} incidents={} events={} terminations={} agent_runs={}",
+        report.task_id,
+        report.latest.task_signature,
+        report.latest.state,
+        report.latest.observed_at,
+        report.history.len(),
+        report.submissions.len(),
+        report.incidents.len(),
+        report.events.len(),
+        report.terminations.len(),
+        report.agent_runs.len(),
+    )
+}
+
+#[derive(Serialize)]
+struct ExplanationReport {
+    schema_version: u32,
+    project_id: String,
+    incident: IncidentSummary,
+    event: Option<EventSummary>,
+    policy: NotConfigured,
+    approval: NotConfigured,
+    pueue_action: Vec<TerminationSummary>,
+    agent_runs: Vec<AgentRunSummary>,
+    chain: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct NotConfigured {
+    status: &'static str,
+}
+
+pub fn render_incident_explanation(
+    db: &Db,
+    project: &Project,
+    incident_id: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let incident = IncidentRepository::new(db)
+        .find_by_project_and_id(&project.project_id, incident_id)?
+        .ok_or(AppError::Runtime {
+            operation: "find project incident",
+        })?;
+    let event = EventRepository::new(db).find_by_dedup_key(
+        &project.project_id,
+        &format!("incident-wake:v1:incident={incident_id}"),
+    )?;
+    let task_signature = event
+        .as_ref()
+        .and_then(|event| event.payload.get("task_signature"))
+        .and_then(serde_json::Value::as_str)
+        .or(incident.task_key.as_deref());
+    let terminations = task_signature
+        .map(|signature| {
+            TerminationRequestRepository::new(db).find_by_task_signature(
+                &project.project_id,
+                signature,
+                MAX_TASK_SUMMARY_LIMIT,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let agent_runs = event
+        .as_ref()
+        .map(|event| {
+            AgentRunRepository::new(db).find_by_event(
+                &project.project_id,
+                event.event_id,
+                MAX_TASK_SUMMARY_LIMIT,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let policy = NotConfigured {
+        status: "not_configured",
+    };
+    let approval = NotConfigured {
+        status: "not_configured",
+    };
+    let pueue_action = terminations
+        .iter()
+        .map(TerminationSummary::from)
+        .collect::<Vec<_>>();
+    let mut chain = vec![serde_json::json!({
+        "stage": "observation",
+        "task_signature": task_signature.map(bounded_summary),
+    })];
+    chain.push(serde_json::json!({
+        "stage": "incident_transition",
+        "incident_id": incident.incident_id,
+        "status": incident.status,
+        "first_seen_at": incident.first_seen_at,
+        "last_seen_at": incident.last_seen_at,
+    }));
+    chain.push(serde_json::json!({
+        "stage": "event",
+        "event": event.as_ref().map(EventSummary::from),
+    }));
+    chain.push(serde_json::json!({"stage": "policy", "status": policy.status}));
+    chain.push(serde_json::json!({"stage": "approval", "status": approval.status}));
+    chain.push(serde_json::json!({
+        "stage": "pueue_action",
+        "request_ids": terminations.iter().map(|request| request.request_id).collect::<Vec<_>>(),
+    }));
+    let report = ExplanationReport {
+        schema_version: JSON_SCHEMA_VERSION,
+        project_id: project.project_id.clone(),
+        incident: IncidentSummary::from(&incident),
+        event: event.as_ref().map(EventSummary::from),
+        policy,
+        approval,
+        pueue_action,
+        agent_runs: agent_runs.iter().map(AgentRunSummary::from).collect(),
+        chain,
+    };
+    if json {
+        return serde_json::to_string(&report).map_err(|source| AppError::Serialization {
+            operation: "serialize incident explanation",
+            source,
+        });
+    }
+    Ok(report
+        .chain
+        .iter()
+        .filter_map(|step| step.get("stage").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" -> "))
+}
+
+#[derive(Debug, Clone)]
+pub struct DoctorExternal {
+    pub pueue: Result<Vec<PueueTask>, String>,
+    pub service: Result<ServiceStatus, String>,
+    pub callback: Result<Option<String>, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorCheckStatus {
+    Ok,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: DoctorCheckStatus,
+    pub summary: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorReport {
+    pub schema_version: u32,
+    pub status: DoctorCheckStatus,
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl DoctorReport {
+    pub fn has_errors(&self) -> bool {
+        self.status == DoctorCheckStatus::Error
+    }
+}
+
+pub fn render_doctor_report(
+    db: &Db,
+    project: &Project,
+    paths: &ServicePaths,
+    external: DoctorExternal,
+    now: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let report = build_doctor_report(db, project, paths, external, now)?;
+    render_doctor_report_value(&report, json)
+}
+
+pub fn render_doctor_report_value(report: &DoctorReport, json: bool) -> Result<String, AppError> {
+    if json {
+        return serde_json::to_string(report).map_err(|source| AppError::Serialization {
+            operation: "serialize doctor diagnostics",
+            source,
+        });
+    }
+    let mut lines = vec![format!("doctor: {}", doctor_status_label(report.status))];
+    lines.extend(report.checks.iter().map(|check| {
+        format!(
+            "{}: {} — {} [{}]",
+            check.name,
+            doctor_status_label(check.status),
+            check.summary,
+            check.remediation
+        )
+    }));
+    Ok(lines.join("\n"))
+}
+
+pub fn build_doctor_report(
+    db: &Db,
+    project: &Project,
+    paths: &ServicePaths,
+    external: DoctorExternal,
+    now: i64,
+) -> Result<DoctorReport, AppError> {
+    let connection = db.connect()?;
+    let mut checks = Vec::new();
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|source| AppError::Database {
+            operation: "query doctor SQLite schema version",
+            source,
+        })?;
+    checks.push(if user_version == 6 {
+        doctor_ok("schema.version", "SQLite schema version is 6", "none")
+    } else {
+        doctor_error(
+            "schema.version",
+            &format!("SQLite schema version is {user_version}"),
+            "run the supported database migration before starting the daemon",
+        )
+    });
+
+    let required_tables = [
+        "projects",
+        "events",
+        "integration_events",
+        "incidents",
+        "agent_runs",
+        "agent_run_events",
+        "submissions",
+        "termination_requests",
+        "task_observations",
+        "operator_logs",
+        "interventions",
+    ];
+    let table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                 'projects','events','integration_events','incidents','agent_runs',
+                 'agent_run_events','submissions','termination_requests','task_observations',
+                 'operator_logs','interventions'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor SQLite tables",
+            source,
+        })?;
+    checks.push(if table_count == required_tables.len() as i64 {
+        doctor_ok(
+            "schema.tables",
+            "required SQLite tables are present",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "schema.tables",
+            "one or more required SQLite tables are missing",
+            "reopen the database with the matching pueue-agent release",
+        )
+    });
+    let required_indexes = [
+        "events_claimable_idx",
+        "events_project_status_idx",
+        "integration_events_kind_created_idx",
+        "incidents_active_fingerprint_idx",
+        "incidents_project_status_idx",
+        "agent_runs_project_status_idx",
+        "agent_runs_one_active_per_project_idx",
+        "agent_run_events_event_idx",
+        "submissions_project_status_idx",
+        "termination_requests_project_status_idx",
+        "task_observations_group_state_idx",
+        "operator_logs_project_created_idx",
+        "interventions_project_sequence_idx",
+        "interventions_project_status_created_idx",
+        "interventions_reservation_lease_idx",
+    ];
+    let index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (
+                 'events_claimable_idx','events_project_status_idx',
+                 'integration_events_kind_created_idx','incidents_active_fingerprint_idx',
+                 'incidents_project_status_idx','agent_runs_project_status_idx',
+                 'agent_runs_one_active_per_project_idx','agent_run_events_event_idx',
+                 'submissions_project_status_idx','termination_requests_project_status_idx',
+                 'task_observations_group_state_idx','operator_logs_project_created_idx',
+                 'interventions_project_sequence_idx','interventions_project_status_created_idx',
+                 'interventions_reservation_lease_idx'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor SQLite indexes",
+            source,
+        })?;
+    checks.push(if index_count == required_indexes.len() as i64 {
+        doctor_ok(
+            "schema.indexes",
+            "required SQLite indexes are present",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "schema.indexes",
+            "one or more required SQLite indexes are missing",
+            "reopen the database with the matching pueue-agent release",
+        )
+    });
+    let foreign_keys: i64 = connection
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|source| AppError::Database {
+            operation: "query doctor SQLite foreign keys",
+            source,
+        })?;
+    checks.push(if foreign_keys == 1 {
+        doctor_ok(
+            "sqlite.foreign_keys",
+            "SQLite foreign keys are enabled",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "sqlite.foreign_keys",
+            "SQLite foreign keys are disabled",
+            "enable foreign keys on every database connection",
+        )
+    });
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|source| AppError::Database {
+            operation: "query doctor SQLite journal mode",
+            source,
+        })?;
+    checks.push(if journal_mode.eq_ignore_ascii_case("wal") {
+        doctor_ok("sqlite.wal", "SQLite WAL mode is enabled", "none")
+    } else {
+        doctor_warning(
+            "sqlite.wal",
+            &format!("SQLite journal mode is {}", bounded_text(&journal_mode)),
+            "use WAL mode for the daemon database",
+        )
+    });
+    let busy_timeout: i64 = connection
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .map_err(|source| AppError::Database {
+            operation: "query doctor SQLite busy timeout",
+            source,
+        })?;
+    checks.push(if busy_timeout >= 5_000 {
+        doctor_ok(
+            "sqlite.busy_timeout",
+            "SQLite busy timeout is at least 5 seconds",
+            "none",
+        )
+    } else {
+        doctor_warning(
+            "sqlite.busy_timeout",
+            &format!("SQLite busy timeout is {busy_timeout} ms"),
+            "configure a busy timeout of at least 5000 ms",
+        )
+    });
+
+    checks.push(match config::load(&project.config_path) {
+        Ok(project_config)
+            if project_config.project_id == project.project_id
+                && project_config.pueue_group == project.pueue_group =>
+        {
+            doctor_ok("project.config", "project configuration is valid", "none")
+        }
+        Ok(_) => doctor_error(
+            "project.config",
+            "project configuration identity does not match SQLite",
+            "align project_id and pueue_group in config.toml and the registered project",
+        ),
+        Err(error) => doctor_error(
+            "project.config",
+            &bounded_text(&error.to_string()),
+            "repair .pueue-agent/config.toml and validate it before retrying",
+        ),
+    });
+    checks.push(match &external.pueue {
+        Ok(tasks) if tasks.iter().any(|task| task.group == project.pueue_group) => doctor_ok(
+            "pueue.status",
+            "Pueue status is available and the project group is observed",
+            "none",
+        ),
+        Ok(_) => doctor_warning(
+            "pueue.status",
+            "Pueue status is available but the project group is not observed",
+            "verify that Pueue is running and the dedicated project group exists",
+        ),
+        Err(error) => doctor_error(
+            "pueue.status",
+            &bounded_text(error),
+            "start Pueue and verify the configured Pueue profile",
+        ),
+    });
+    checks.push(match &external.callback {
+        Ok(Some(callback)) if callback == &callback_command(paths) => doctor_ok(
+            "pueue.callback",
+            "the daemon callback is registered",
+            "none",
+        ),
+        Ok(Some(_)) => doctor_warning(
+            "pueue.callback",
+            "a different callback is registered",
+            "review the Pueue callback before enabling automatic processing",
+        ),
+        Ok(None) => doctor_warning(
+            "pueue.callback",
+            "the daemon callback is not registered",
+            "run enable for this project after reviewing the Pueue configuration",
+        ),
+        Err(error) => doctor_error(
+            "pueue.callback",
+            &bounded_text(error),
+            "make the Pueue configuration readable and inspect its callback",
+        ),
+    });
+    checks.push(match &external.service {
+        Ok(ServiceStatus::Running) => {
+            doctor_ok("service.state", "the daemon service is running", "none")
+        }
+        Ok(ServiceStatus::Stopped) => doctor_warning(
+            "service.state",
+            "the daemon service is stopped",
+            "start the configured user service",
+        ),
+        Ok(ServiceStatus::NotInstalled) => doctor_warning(
+            "service.state",
+            "the daemon service is not installed",
+            "run enable to install the supported user service",
+        ),
+        Err(error) => doctor_error(
+            "service.state",
+            &bounded_text(error),
+            "verify the supported service manager and user session",
+        ),
+    });
+    checks.push(if paths.release_binary.is_file() {
+        doctor_ok(
+            "service.path",
+            "the configured release binary exists",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "service.path",
+            "the configured release binary is missing",
+            "build or install the release binary referenced by the service",
+        )
+    });
+    let expired_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE status = 'claimed' AND lease_until <= ?1",
+            [now],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor expired event leases",
+            source,
+        })?;
+    let expired_interventions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM interventions
+             WHERE status = 'reserved' AND lease_expires_at <= ?1",
+            [now],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor expired intervention leases",
+            source,
+        })?;
+    let expired_terminations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM termination_requests
+             WHERE dispatch_lease_until IS NOT NULL AND dispatch_lease_until <= ?1",
+            [now],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor expired termination leases",
+            source,
+        })?;
+    let expired_total = expired_events + expired_interventions + expired_terminations;
+    checks.push(if expired_total == 0 {
+        doctor_ok(
+            "leases.expired",
+            "no expired event, intervention, or termination leases",
+            "none",
+        )
+    } else {
+        doctor_warning(
+            "leases.expired",
+            &format!("{expired_total} expired lease(s) require scheduler recovery"),
+            "keep the daemon running and inspect the affected project records",
+        )
+    });
+    let starting_without_pid: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE project_id = ?1 AND status = 'starting' AND pid IS NULL",
+            [&project.project_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor starting agent runs",
+            source,
+        })?;
+    checks.push(if starting_without_pid == 0 {
+        doctor_ok(
+            "agent_runs.starting",
+            "no agent run is stuck before PID assignment",
+            "none",
+        )
+    } else {
+        doctor_warning(
+            "agent_runs.starting",
+            &format!("{starting_without_pid} starting agent run(s) have no PID"),
+            "inspect the scheduler log and allow startup recovery to release reservations",
+        )
+    });
+
+    checks.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    let status = if checks
+        .iter()
+        .any(|check| check.status == DoctorCheckStatus::Error)
+    {
+        DoctorCheckStatus::Error
+    } else if checks
+        .iter()
+        .any(|check| check.status == DoctorCheckStatus::Warning)
+    {
+        DoctorCheckStatus::Warning
+    } else {
+        DoctorCheckStatus::Ok
+    };
+    Ok(DoctorReport {
+        schema_version: JSON_SCHEMA_VERSION,
+        status,
+        checks,
+    })
+}
+
+fn doctor_ok(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_owned(),
+        status: DoctorCheckStatus::Ok,
+        summary: bounded_text(summary),
+        remediation: bounded_text(remediation),
+    }
+}
+
+fn doctor_warning(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_owned(),
+        status: DoctorCheckStatus::Warning,
+        summary: bounded_text(summary),
+        remediation: bounded_text(remediation),
+    }
+}
+
+fn doctor_error(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_owned(),
+        status: DoctorCheckStatus::Error,
+        summary: bounded_text(summary),
+        remediation: bounded_text(remediation),
+    }
+}
+
+fn doctor_status_label(status: DoctorCheckStatus) -> &'static str {
+    match status {
+        DoctorCheckStatus::Ok => "ok",
+        DoctorCheckStatus::Warning => "warning",
+        DoctorCheckStatus::Error => "error",
     }
 }
 
@@ -374,7 +1162,7 @@ fn pueue_summary(project: &Project, snapshot: &PueueSnapshot) -> PueueSummary {
                         && !task.state.eq_ignore_ascii_case("queued")
                 })
                 .collect::<Vec<_>>();
-            active.sort_unstable_by(|left, right| compare_pueue_tasks(left, right));
+            active.sort_unstable_by(compare_pueue_tasks);
             let active_task_count = active.len();
             let task_limit = DEFAULT_SUMMARY_LIMIT.min(MAX_TASK_SUMMARY_LIMIT);
             active.truncate(task_limit);
@@ -407,8 +1195,8 @@ impl From<&PueueTask> for PueueTaskSummary {
             task_id: task.id,
             state: task.state.to_ascii_lowercase(),
             command_summary: executable_summary(&task.command),
-            enqueued_at: task.enqueued_at.clone(),
-            started_at: task.started_at.clone(),
+            enqueued_at: task.enqueued_at.as_deref().map(bounded_text),
+            started_at: task.started_at.as_deref().map(bounded_text),
         }
     }
 }

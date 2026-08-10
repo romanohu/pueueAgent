@@ -41,7 +41,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Events(args) => commands::events(args),
         Command::Inspect(args) => commands::inspect(args),
         Command::Explain(args) => commands::explain(args),
-        Command::Doctor(args) => commands::doctor(args),
+        Command::Doctor(args) => commands::doctor(args).await,
         Command::Pause(args) => commands::pause(args),
         Command::Resume(args) => commands::resume(args),
         Command::Steer(args) => commands::steer(args),
@@ -60,15 +60,19 @@ mod commands {
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
-        diagnostics::{render_project_status_json, EventFilter, MAX_EVENT_LIST_LIMIT},
+        diagnostics::{
+            build_doctor_report, render_doctor_report_value, render_events,
+            render_incident_explanation, render_project_status_json, render_task_inspection,
+            DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
+        },
         events::{record_callback, CallbackMetadata},
         interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
         paths, project,
         pueue::{CommandPueue, PueueApi},
         service::{
-            enable_with, EnableOptions, PueueConfigCallbackRegistry, ServiceControl,
-            ServiceManager, ServicePaths,
+            enable_with, CallbackRegistry, EnableOptions, PueueConfigCallbackRegistry,
+            ServiceControl, ServiceManager, ServicePaths,
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
         submit as submit_command, AppError,
@@ -179,33 +183,47 @@ mod commands {
 
     pub fn events(args: EventsArgs) -> Result<(), AppError> {
         let limit = validate_event_limit(args.limit)?;
-        let _filter = EventFilter::new(args.kind, args.status, limit);
-        let _ = (args.project_root, args.pueue_config, args.json);
+        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let filter = EventFilter::new(args.kind, args.status, limit);
+        println!("{}", render_events(&db, &project, &filter, args.json)?);
         Ok(())
     }
 
     pub fn inspect(args: InspectArgs) -> Result<(), AppError> {
-        let _ = (
-            args.project_root,
-            args.pueue_config,
-            args.task_id,
-            args.json,
+        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        println!(
+            "{}",
+            render_task_inspection(&db, &project, args.task_id, args.json)?
         );
         Ok(())
     }
 
     pub fn explain(args: ExplainArgs) -> Result<(), AppError> {
-        let _ = (
-            args.project_root,
-            args.pueue_config,
-            args.incident_id,
-            args.json,
+        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        println!(
+            "{}",
+            render_incident_explanation(&db, &project, args.incident_id, args.json)?
         );
         Ok(())
     }
 
-    pub fn doctor(args: DoctorArgs) -> Result<(), AppError> {
-        let _ = (args.project_root, args.pueue_config, args.json);
+    pub async fn doctor(args: DoctorArgs) -> Result<(), AppError> {
+        let (db, project, service_paths) = resolve_project(args.project_root, args.pueue_config)?;
+        let pueue = configured_pueue(&service_paths);
+        let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
+        let external = DoctorExternal {
+            pueue: pueue.status_json().await.map_err(|error| error.render()),
+            service: ServiceManager.status().map_err(|error| error.render()),
+            callback: callbacks.current_callback().map_err(|error| error.render()),
+        };
+        let report =
+            build_doctor_report(&db, &project, &service_paths, external, unix_timestamp()?)?;
+        println!("{}", render_doctor_report_value(&report, args.json)?);
+        if report.has_errors() {
+            return Err(AppError::Message {
+                message: "doctor found error checks; inspect the report".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -302,7 +320,7 @@ mod commands {
                             intervention.intervention_id,
                             intervention.status,
                             intervention.created_at,
-                            intervention.message
+                            escape_text(&intervention.message)
                         );
                     }
                 }
@@ -406,5 +424,22 @@ mod commands {
                 ),
             })
         }
+    }
+
+    fn escape_text(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for character in value.chars() {
+            match character {
+                '\n' => escaped.push_str(r"\n"),
+                '\r' => escaped.push_str(r"\r"),
+                '\t' => escaped.push_str(r"\t"),
+                '\x1b' => escaped.push_str(r"\x1b"),
+                character if character.is_control() => {
+                    escaped.push_str(&format!(r"\u{{{:04x}}}", character as u32));
+                }
+                character => escaped.push(character),
+            }
+        }
+        escaped
     }
 }

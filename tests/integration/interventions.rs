@@ -292,3 +292,33 @@ fn steer_list_text_and_json_are_fifo_bounded_and_project_scoped() {
         .iter()
         .all(|line| !line.contains("second project secret")));
 }
+
+#[test]
+fn steer_list_text_escapes_controls_without_changing_json_message() {
+    let harness = SteerHarness::new();
+    let message = "line\n\t\x1b[31mred";
+    let project_id = harness.project_id(&harness.first_root);
+    InterventionRepository::new(&harness.db)
+        .insert_pending(&project_id, message, 300)
+        .unwrap();
+
+    let text_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "list"])
+        .output()
+        .unwrap();
+    assert!(text_output.status.success());
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text.contains(r"line\n\t\x1b[31mred"));
+    assert!(!text.contains(message));
+    assert!(!text.contains('\x1b'));
+
+    let json_output = harness
+        .command(&harness.first_root)
+        .args(["steer", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(json_output.status.success());
+    let body: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(body["interventions"][0]["message"], message);
+}

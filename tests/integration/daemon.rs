@@ -571,6 +571,38 @@ async fn intervention_recovery_returns_an_expired_unattached_reservation_to_pend
 }
 
 #[tokio::test]
+async fn later_daemon_tick_recovers_unattached_intervention_after_startup_recovery() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let intervention_id =
+        harness.reserve_intervention("expires after startup", "later-token", harness.now + 1);
+
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Reserved, None)
+    );
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET lease_expires_at = ?1 WHERE intervention_id = ?2",
+            rusqlite::params![harness.now - 1, intervention_id],
+        )
+        .unwrap();
+
+    daemon.run_once().await.unwrap();
+
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Pending, None)
+    );
+}
+
+#[tokio::test]
 async fn intervention_recovery_applies_a_reserved_row_attached_to_a_run_with_a_pid_once() {
     let harness = DaemonHarness::new();
     harness.pause_project("project-a");

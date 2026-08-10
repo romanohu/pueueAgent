@@ -50,6 +50,54 @@ fn events_rejects_limits_outside_the_diagnostic_bound() {
 }
 
 #[test]
+fn events_cli_renders_the_project_scoped_event_projection() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    pueue_agent::init::run(&root).unwrap();
+    let state_dir = temp.path().join("state");
+    let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+    let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+    ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            &project_config.project_id,
+            &root,
+            &project_config.pueue_group,
+            root.join(".pueue-agent/config.toml"),
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&db)
+        .insert_idempotent(&NewEvent::new(
+            &project_config.project_id,
+            EventKind::TaskFailed,
+            "cli-events-test",
+            serde_json::json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+        .current_dir(&root)
+        .args(["events", "--json", "--limit", "1"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["project_id"], project_config.project_id);
+    assert_eq!(body["events"].as_array().unwrap().len(), 1);
+    assert_eq!(body["events"][0]["kind"], "task_failed");
+}
+
+#[test]
 fn steer_help_describes_enqueue_and_bounded_list_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -118,3 +166,12 @@ fn readme_documents_human_intervention_workflow() {
         );
     }
 }
+use std::fs;
+
+use pueue_agent::{
+    config,
+    db::{Db, EventRepository, ProjectRepository},
+    models::{EventKind, NewEvent, NewProject},
+};
+use serde_json::Value;
+use tempfile::TempDir;

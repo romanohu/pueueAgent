@@ -830,6 +830,32 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("read filtered events"))
     }
 
+    pub fn find_by_task_signature(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 AND json_extract(payload_json, '$.task_signature') = ?2
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT ?3",
+                EVENT_SELECT
+            ))
+            .map_err(database_error("prepare task event query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, task_signature, bounded_diagnostic_limit(limit)],
+                event_from_row,
+            )
+            .map_err(database_error("query task events"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read task events"))
+    }
+
     pub fn count_consecutive_failures(
         &self,
         project_id: &str,
@@ -2533,6 +2559,32 @@ impl<'db> InterventionRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit expired intervention recovery"))?;
+        Ok(changed)
+    }
+
+    pub fn recover_expired_unattached(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin expired unattached intervention recovery",
+            ))?;
+        let changed = transaction
+            .execute(
+                "UPDATE interventions
+                 SET status = ?1, reserved_at = NULL, applied_at = NULL, agent_run_id = NULL,
+                     lease_expires_at = NULL, reservation_token = NULL
+                 WHERE status = ?2 AND agent_run_id IS NULL AND lease_expires_at <= ?3",
+                params![
+                    InterventionStatus::Pending,
+                    InterventionStatus::Reserved,
+                    now,
+                ],
+            )
+            .map_err(database_error("recover expired unattached interventions"))?;
+        transaction.commit().map_err(database_error(
+            "commit expired unattached intervention recovery",
+        ))?;
         Ok(changed)
     }
 }
