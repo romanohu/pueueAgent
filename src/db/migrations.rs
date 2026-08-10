@@ -31,6 +31,17 @@ const OPERATOR_LOGS_SQL: &str = r#"
 "#;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(database_error("read SQLite schema version"))?;
+    if version > LATEST_SCHEMA_VERSION {
+        return Err(AppError::Runtime {
+            operation: "open a database created by a newer pueue-agent",
+        });
+    }
+    if version == LATEST_SCHEMA_VERSION {
+        return Ok(());
+    }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error("begin SQLite migration"))?;
@@ -43,13 +54,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         });
     }
     if version == LATEST_SCHEMA_VERSION {
-        ensure_agent_run_launch_gate(&transaction)?;
-        ensure_intervention_insertion_sequence(&transaction)?;
-        ensure_invariant_indexes(&transaction)?;
-        ensure_submission_indexes(&transaction)?;
         transaction
             .commit()
-            .map_err(database_error("commit SQLite migration check"))?;
+            .map_err(database_error("commit SQLite migration race check"))?;
         return Ok(());
     }
 

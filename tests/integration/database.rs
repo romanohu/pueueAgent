@@ -21,6 +21,7 @@ use pueue_agent::{
         NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
         NewTerminationRequest, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
     },
+    AppError,
 };
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -332,6 +333,59 @@ fn repeated_current_schema_open_does_not_rebuild_intervention_indexes() {
 }
 
 #[test]
+fn current_schema_reopen_does_not_recreate_submission_indexes() {
+    let test = TestDatabase::new();
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX submissions_project_kind_status_idx;
+             DROP INDEX submissions_project_origin_agent_run_idx;",
+        )
+        .unwrap();
+    drop(connection);
+
+    Db::open(&test.path).unwrap();
+
+    let connection = test.db.connect().unwrap();
+    for index in [
+        "submissions_project_kind_status_idx",
+        "submissions_project_origin_agent_run_idx",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+                 )",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists, "current-schema reopen recreated {index}");
+    }
+}
+
+#[test]
+fn concurrent_current_schema_opens_complete_without_migration_work() {
+    let test = TestDatabase::new();
+    let path = Arc::new(test.path.clone());
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let path = Arc::clone(&path);
+            thread::spawn(move || {
+                barrier.wait();
+                Db::open(path.as_ref()).map(|_| ())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+}
+
+#[test]
 fn concurrent_first_opens_apply_migration_once() {
     let temp = TempDir::new().unwrap();
     let path = Arc::new(temp.path().join("fresh.sqlite3"));
@@ -582,6 +636,81 @@ fn submissions_are_scoped_by_project_and_origin_agent_run() {
         .list_by_origin_agent_run("project-a", run_b.run_id, 10)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn submission_rejects_a_missing_origin_agent_run() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+
+    let error = SubmissionRepository::new(&test.db)
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "missing-origin",
+            "project-a",
+            vec!["python".to_owned()],
+            100,
+            SubmissionKind::Experiment,
+            json!({}),
+            Some(999),
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "origin_agent_run_id",
+            ..
+        }
+    ));
+    assert!(SubmissionRepository::new(&test.db)
+        .find_by_id("missing-origin")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn submission_rejects_an_origin_agent_run_from_another_project() {
+    let test = TestDatabase::new();
+    let project_a_root = test.project_root("project-a");
+    let project_b_root = test.project_root("project-b");
+    register_project(&test.db, "project-a", &project_a_root, "pa-project-a");
+    register_project(&test.db, "project-b", &project_b_root, "pa-project-b");
+    let event_b = insert_event(&test.db, "project-b", "origin-b", 100);
+    let run_b = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-b",
+            event_b,
+            None,
+            AgentRunStatus::Running,
+            100,
+            "/tmp/agent-b.log",
+        ))
+        .unwrap();
+
+    let error = SubmissionRepository::new(&test.db)
+        .insert_idempotent(&NewSubmission::with_kind_metadata(
+            "cross-project-origin",
+            "project-a",
+            vec!["python".to_owned()],
+            100,
+            SubmissionKind::Experiment,
+            json!({}),
+            Some(run_b.run_id),
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "origin_agent_run_id",
+            ..
+        }
+    ));
+    assert!(SubmissionRepository::new(&test.db)
+        .find_by_id("cross-project-origin")
+        .unwrap()
+        .is_none());
 }
 
 #[test]

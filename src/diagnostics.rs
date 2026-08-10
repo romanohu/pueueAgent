@@ -527,6 +527,8 @@ pub fn build_doctor_report(
         "agent_runs_one_active_per_project_idx",
         "agent_run_events_event_idx",
         "submissions_project_status_idx",
+        "submissions_project_kind_status_idx",
+        "submissions_project_origin_agent_run_idx",
         "termination_requests_project_status_idx",
         "task_observations_group_state_idx",
         "operator_logs_project_created_idx",
@@ -541,7 +543,8 @@ pub fn build_doctor_report(
                  'integration_events_kind_created_idx','incidents_active_fingerprint_idx',
                  'incidents_project_status_idx','agent_runs_project_status_idx',
                  'agent_runs_one_active_per_project_idx','agent_run_events_event_idx',
-                 'submissions_project_status_idx','termination_requests_project_status_idx',
+                 'submissions_project_status_idx','submissions_project_kind_status_idx',
+                 'submissions_project_origin_agent_run_idx','termination_requests_project_status_idx',
                  'task_observations_group_state_idx','operator_logs_project_created_idx',
                  'interventions_project_sequence_idx','interventions_project_status_created_idx',
                  'interventions_reservation_lease_idx'

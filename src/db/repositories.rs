@@ -1165,6 +1165,7 @@ impl<'db> SubmissionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin idempotent submission insert"))?;
+        validate_submission_origin_agent_run(&transaction, submission)?;
         transaction
             .execute(
                 "INSERT INTO submissions (
@@ -1412,6 +1413,32 @@ impl<'db> SubmissionRepository<'db> {
             .map_err(database_error("count accepted submissions"))?;
         u32::try_from(count).map_err(|_| AppError::Runtime {
             operation: "count accepted submissions",
+        })
+    }
+}
+
+fn validate_submission_origin_agent_run(
+    transaction: &Transaction<'_>,
+    submission: &NewSubmission,
+) -> Result<(), AppError> {
+    let Some(origin_agent_run_id) = submission.origin_agent_run_id else {
+        return Ok(());
+    };
+    let belongs_to_project: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_runs WHERE run_id = ?1 AND project_id = ?2
+             )",
+            params![origin_agent_run_id, submission.project_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("validate submission origin agent run"))?;
+    if belongs_to_project {
+        Ok(())
+    } else {
+        Err(AppError::Validation {
+            field: "origin_agent_run_id",
+            message: "must identify an agent run in the submission project",
         })
     }
 }

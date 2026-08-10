@@ -33,6 +33,12 @@ pub enum AppError {
     #[error("database conflict on {field}; the value is already registered")]
     DatabaseConflict { field: &'static str },
 
+    #[error("invalid {field}: {message}")]
+    Validation {
+        field: &'static str,
+        message: &'static str,
+    },
+
     #[error("unknown Pueue group `{group}`; callback was not associated with a project")]
     UnknownPueueGroup { group: String },
 

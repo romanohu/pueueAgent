@@ -38,6 +38,20 @@
 - Task 4 owns strict external metadata size/depth/input validation and CLI origin propagation.
 - Metadata read failures are fail-closed; malformed persisted values return an error rather than
   being silently interpreted.
-- One final full-suite attempt hit a transient `database is locked` error while the existing
-  concurrent-open test enabled WAL. Five subsequent focused runs passed; no Task 3 code touches
-  that connection setup.
+
+## Review follow-up
+
+- `SubmissionRepository::insert_idempotent` now verifies every supplied
+  `origin_agent_run_id` inside its insert transaction. Missing runs and runs owned by another
+  project return `AppError::Validation { field: "origin_agent_run_id", .. }` and do not create a
+  submission. A matching project/run remains valid.
+- Current-schema v7 opens now read `user_version` before beginning a migration transaction and
+  return without rebuilding indexes. SQLite WAL is only enabled when the current journal mode is
+  not already WAL. A barrier-based eight-open test covers concurrent v7 reopen without sleep.
+- Doctor now requires both submission kind/origin indexes and reports `schema.indexes` as an
+  error when either is missing.
+- RED: the new origin rejection tests initially failed because `AppError::Validation` did not
+  exist. GREEN: the origin, v7 reopen/concurrent open, and doctor index focused tests pass.
+- Final verification after the review follow-up: `cargo test --all-targets` passed; `git diff
+  --check` passed. `cargo fmt --check` remains non-zero only for the unchanged Task 1 readonly
+  assertion (originally `tests/integration/database.rs:281`, shifted to line 282 by added tests).

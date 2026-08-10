@@ -1088,6 +1088,46 @@ fn doctor_projection_reports_unavailable_integrations_as_errors_without_repairin
 }
 
 #[test]
+fn doctor_reports_missing_submission_kind_or_origin_indexes() {
+    let harness = DiagnosticsHarness::new();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX submissions_project_origin_agent_run_idx", [])
+        .unwrap();
+    let paths = ServicePaths {
+        release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
+        pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
+        state_dir: std::path::PathBuf::from("/state"),
+        working_dir: harness.project().root_path,
+        path_env: "/usr/bin:/bin".to_owned(),
+    };
+
+    let rendered = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &paths,
+        DoctorExternal {
+            pueue: Ok(Vec::new()),
+            service: Ok(ServiceStatus::Stopped),
+            callback: Ok(None),
+        },
+        100,
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let index_check = value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "schema.indexes")
+        .unwrap();
+    assert_eq!(index_check["status"], "error");
+}
+
+#[test]
 fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
     let harness = DiagnosticsHarness::new();
     let foreign_root = harness._temp.path().join("project-b");

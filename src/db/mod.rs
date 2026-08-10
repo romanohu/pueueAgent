@@ -81,12 +81,20 @@ fn open_connection(path: &Path) -> Result<Connection, AppError> {
             operation: "enable SQLite foreign keys",
             source,
         })?;
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .map_err(|source| AppError::Database {
-            operation: "enable SQLite WAL mode",
+            operation: "read SQLite journal mode",
             source,
         })?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|source| AppError::Database {
+                operation: "enable SQLite WAL mode",
+                source,
+            })?;
+    }
 
     Ok(connection)
 }
