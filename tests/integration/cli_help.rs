@@ -366,6 +366,29 @@ fn readme_documents_human_intervention_workflow() {
         );
     }
 }
+
+#[test]
+fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
+    let harness = DiagnosticsCliHarness::new();
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+    let first = harness.command().env("PATH", "/definitely-no-pueue").args(["wake", "--reason", &format!("inspect {secret}")]).output().unwrap();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(!String::from_utf8_lossy(&first.stdout).contains(secret));
+    let second = harness.command().args(["wake", "--reason", "inspect current loss", "--json"]).output().unwrap();
+    assert!(second.status.success());
+    let json: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(json["project_id"], harness.project_id);
+    let connection = harness.db.connect().unwrap();
+    let rows: Vec<(String, String, String)> = connection.prepare("SELECT project_id, dedup_key, payload_json FROM events WHERE kind = 'operator_wake' ORDER BY event_id").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, harness.project_id);
+    assert_ne!(rows[0].1, rows[1].1);
+    assert!(!rows[0].2.contains(secret));
+    let blank = harness.command().args(["wake", "--reason", "   "]).output().unwrap();
+    assert!(!blank.status.success());
+    let oversize = "x".repeat(1025);
+    assert!(!harness.command().args(["wake", "--reason", &oversize]).output().unwrap().status.success());
+}
 use std::fs;
 
 use pueue_agent::{

@@ -516,6 +516,20 @@ async fn operator_wake_uses_the_existing_scheduler_dispatch_path() {
 }
 
 #[tokio::test]
+async fn recorded_operator_wake_stays_pending_while_paused_then_dispatches_after_resume() {
+    let harness = SchedulerHarness::new();
+    let wake = pueue_agent::events::record_operator_wake_with(&harness.db, "project-a", "inspect current loss", harness.now).unwrap();
+    ProjectRepository::new(&harness.db).pause("project-a", harness.now).unwrap();
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.unwrap().started.is_empty());
+    assert_eq!(harness.event_status(wake), EventStatus::Pending);
+    ProjectRepository::new(&harness.db).resume("project-a", harness.now + 1).unwrap();
+    let report = scheduler.tick().await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].mode, "operator_wake");
+}
+
+#[tokio::test]
 async fn active_agent_prevents_new_claim_for_same_project() {
     let harness = SchedulerHarness::new();
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "failure");

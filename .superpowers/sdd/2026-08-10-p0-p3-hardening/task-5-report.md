@@ -11,13 +11,21 @@
 
 - RED: `cargo test --all-targets operator_wake` failed because `EventKind::OperatorWake` was absent.
 - GREEN: the same focused command passed after implementation.
+- Review follow-up: bare-token redaction test was RED, then GREEN after extending the common projection.
+- Review follow-up: CLI wake contract and pause/resume scheduler focused tests passed (1 each).
 
 ## Verification
 
 - `cargo test --test database`: 49 passed.
-- `cargo test --all-targets`: passed.
+- `cargo test --all-targets`: passed before this follow-up; final rerun follows the added CLI/scheduler tests.
 - `git diff --check`: passed.
 - `cargo fmt --check` still fails only on the pre-existing Task 1 formatting at `tests/integration/database.rs:282`; it was not changed.
+
+## Review follow-up coverage
+
+- CLI: unavailable `PATH` proves wake does not need Pueue; two project-scoped wake rows have unique dedup keys; human/JSON omit a bare GitHub token; blank and 1025-byte reasons fail.
+- Scheduler: a `record_operator_wake_with` event stays pending while paused and dispatches through the standard scheduler after resume.
+- Migration: existing v4-v7 upgrade/reopen and foreign-key regression tests remain the coverage for schema-text migration. A dedicated v7 fixture INSERT assertion remains outstanding.
 
 ## Remaining concerns
 
