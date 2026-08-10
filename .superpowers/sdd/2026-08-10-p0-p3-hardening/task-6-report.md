@@ -72,3 +72,13 @@ Implementation commit: `2e625700c3f19523bafb25173f2bc059622c1272` (`feat: expose
 - GREEN: the regression now observes `originless-new -> originless-old -> originless-old(task_id=88) -> originless-head` through the repository follow path.
 - Full verification: `cargo test --all-targets` — 285 passed, 0 failed; `git diff --check` — passed.
 - `cargo fmt --check` reports only the inherited Task 1 formatting difference at `tests/integration/database.rs:339-344`; Task 1 lines were not modified.
+
+## Fresh review fix loop 4
+
+- Implementation commit: `c23ffeeee06a50203f577fad840bbc4a3eac4e85` (`fix: keep originless follow candidates`).
+- Follow candidate collection no longer applies normal-list `remaining` truncation. Runs, recent events, and the bounded originless page are all retained as bounded candidates; `collect_fresh(limit)` remains the output and pending-state control point. Normal `list_by_project` truncation is unchanged.
+- Added the SQLite mixed-project regression: with one run and two originless submissions under `--limit 1`, the run is emitted first, the originless stream advances on the next poll, then its old continuation and newly inserted head are emitted.
+- RED: the second poll was empty because `remaining = limit - lineages.len()` was zero after selecting the run.
+- GREEN: the mixed run/originless regression passes, together with the existing originless task-update and event-only regressions.
+- Full verification: `cargo test --all-targets` — 286 passed, 0 failed; `git diff --check` — passed.
+- `cargo fmt --check` still reports only the inherited Task 1 formatting difference at `tests/integration/database.rs:339-344`; Task 1 lines were not modified.
