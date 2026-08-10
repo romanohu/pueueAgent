@@ -41,3 +41,7 @@ Implementation commit: `2e625700c3f19523bafb25173f2bc059622c1272` (`feat: expose
 - Event-only cursor follow-up: `RunLineageCursor::event_only(started_at, event_id)` preserves the existing four-argument `new()` API while making same-second event-only lineages distinct.
 - Event-only regression: `cargo test --all-targets` completed with 280 passed, 0 failed; `git diff --check` passed.
 - Event-only commit: `35ab8d74857076107a29f8f0a46d1feb6fef1207` (`fix: distinguish event-only follow cursors`).
+- Fresh review RED: repository polling with `--limit 1` returned only one of two submissions and the root cursor produced an empty submission projection.
+- Fresh review GREEN: selected runs now page all origin submissions internally, while `collect_fresh` treats `--limit` as an output batch size and emits submission cursors before a root cursor for populated lineages. A 1000-row page boundary regression verifies no submission is stranded.
+- Fresh review verification: `cargo test --all-targets` completed with 282 passed, 0 failed; `git diff --check` passed. `cargo fmt --check` still reports only the inherited Task 1 difference at `tests/integration/database.rs:339-344`.
+- Fresh review implementation commit: `54ae1d99c595fa9e82bb842de7ec99545f8672f1` (`fix: page follow run submissions`).
