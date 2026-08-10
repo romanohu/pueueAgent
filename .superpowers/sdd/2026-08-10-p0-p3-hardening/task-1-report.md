@@ -25,24 +25,20 @@
 
 ## 実行したテスト
 
-### TDD RED
+### Review fix round 1
 
-- `cargo test --all-targets compact_status`
-  - 実行結果: `cargo` が環境に存在せず、シェルが exit 127。
-- `cargo test --all-targets readonly_open`
-  - 実行結果: `cargo` が環境に存在せず、シェルが exit 127。
+以下のコマンドを、指定された Rust toolchain PATH で実行した。
 
-### 実行できた検証
+- `PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --all-targets compact_status`
+  - 成功。対象テスト 1 件成功。
+- `PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --all-targets readonly_open`
+  - 成功。対象テスト 2 件成功。
+- `PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo test --all-targets --quiet`
+  - 成功。全テスト成功。失敗 0 件。
 
-- `git diff --check`
-  - 成功。
-- `command -v cargo`、`command -v rustc`、Rust toolchain の探索
-  - `cargo` と `rustc` は見つからなかった。
-
-したがって、この環境では focused test および `cargo test --all-targets` の GREEN 確認を実行できていない。
+あわせて、CLI help test の名前を `help_lists_diagnostics_commands_and_status_options` に変更し、`--json` と `--compact` の両方を表す名前に更新した。
 
 ## 懸念点
 
-1. Rust toolchain 不在のため、コンパイル、focused test、全 Rust test の実行結果は未確認である。Rust toolchain が利用可能な環境で、まず `cargo test --all-targets compact_status` と `cargo test --all-targets readonly_open`、続いて `cargo test --all-targets` を実行する必要がある。
-2. compact の Pueue 表示は command 本文を意図的に捨て、project group に限定した total/active/queued counts のみを表示する。これは payload/prompt-like text を含めない brief の契約に合わせたもの。
-3. `--json --compact` の同時指定時は既存契約を優先し、`--json` の full JSON を出力する。
+1. compact の Pueue 表示は command 本文を意図的に捨て、project group に限定した total/active/queued counts のみを表示する。これは payload/prompt-like text を含めない brief の契約に合わせたもの。
+2. `--json --compact` の同時指定時は既存契約を優先し、`--json` の full JSON を出力する。

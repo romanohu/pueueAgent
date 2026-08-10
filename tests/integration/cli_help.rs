@@ -1,5 +1,5 @@
 #[test]
-fn help_lists_diagnostics_commands_and_status_json_option() {
+fn help_lists_diagnostics_commands_and_status_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
         .arg("--help")
