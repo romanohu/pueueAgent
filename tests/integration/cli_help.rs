@@ -371,10 +371,23 @@ fn readme_documents_human_intervention_workflow() {
 fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
     let harness = DiagnosticsCliHarness::new();
     let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
-    let first = harness.command().env("PATH", "/definitely-no-pueue").args(["wake", "--reason", &format!("inspect {secret}")]).output().unwrap();
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let first = harness
+        .command()
+        .env("PATH", "/definitely-no-pueue")
+        .args(["wake", "--reason", &format!("inspect {secret}")])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     assert!(!String::from_utf8_lossy(&first.stdout).contains(secret));
-    let second = harness.command().args(["wake", "--reason", "inspect current loss", "--json"]).output().unwrap();
+    let second = harness
+        .command()
+        .args(["wake", "--reason", "inspect current loss", "--json"])
+        .output()
+        .unwrap();
     assert!(second.status.success());
     let json: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(json["project_id"], harness.project_id);
@@ -384,10 +397,20 @@ fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
     assert_eq!(rows[0].0, harness.project_id);
     assert_ne!(rows[0].1, rows[1].1);
     assert!(!rows[0].2.contains(secret));
-    let blank = harness.command().args(["wake", "--reason", "   "]).output().unwrap();
+    let blank = harness
+        .command()
+        .args(["wake", "--reason", "   "])
+        .output()
+        .unwrap();
     assert!(!blank.status.success());
     let oversize = "x".repeat(1025);
-    assert!(!harness.command().args(["wake", "--reason", &oversize]).output().unwrap().status.success());
+    assert!(!harness
+        .command()
+        .args(["wake", "--reason", &oversize])
+        .output()
+        .unwrap()
+        .status
+        .success());
 }
 use std::fs;
 

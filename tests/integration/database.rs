@@ -243,7 +243,9 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
 
     let migrated = Db::open(&test.path).unwrap();
     let connection = migrated.connect().unwrap();
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     assert_eq!(version, 8);
     connection.execute(
         "INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at)
@@ -255,11 +257,23 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
          VALUES ('v7-project', 'task_finished', 'finished-v8', '{}', 'pending', 0, 100, 100)",
         [],
     ).unwrap();
-    let event_count: i64 = connection.query_row("SELECT COUNT(*) FROM events WHERE project_id = 'v7-project'", [], |row| row.get(0)).unwrap();
+    let event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE project_id = 'v7-project'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(event_count, 3);
     assert!(connection.execute("INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at) VALUES ('missing', 'operator_wake', 'foreign', '{}', 'pending', 0, 100, 100)", []).is_err());
     for index in ["events_claimable_idx", "events_project_status_idx"] {
-        let found: i64 = connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1", [index], |row| row.get(0)).unwrap();
+        let found: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(found, 1, "missing {index}");
     }
     drop(connection);
