@@ -246,7 +246,7 @@ pub fn build_prompt(
 ) -> Result<String, AppError> {
     let base_prompt = build_base_prompt(project, mode, events)?;
     if interventions.is_empty() {
-        return Ok(truncate(&base_prompt, MAX_PROMPT_BYTES));
+        return Ok(truncate_to_prompt_budget(&base_prompt, MAX_PROMPT_BYTES));
     }
 
     let mut prompt = truncate_to_prompt_budget(

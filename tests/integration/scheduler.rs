@@ -102,6 +102,16 @@ max_agent_runs = 10
     }
 
     fn enqueue(&self, kind: EventKind, project_id: &str, dedup_key: &str) -> i64 {
+        self.enqueue_with_evidence(kind, project_id, dedup_key, "x".repeat(4096))
+    }
+
+    fn enqueue_with_evidence(
+        &self,
+        kind: EventKind,
+        project_id: &str,
+        dedup_key: &str,
+        evidence: String,
+    ) -> i64 {
         EventRepository::new(&self.db)
             .insert_idempotent(&NewEvent::new(
                 project_id,
@@ -109,7 +119,7 @@ max_agent_runs = 10
                 dedup_key,
                 json!({
                     "task_id": 41,
-                    "evidence": "x".repeat(4096),
+                    "evidence": evidence,
                 }),
                 self.now,
                 self.now,
@@ -302,6 +312,31 @@ fn operator_intervention_prompt_truncates_the_complete_prompt_at_a_utf8_boundary
 
     assert!(prompt.len() <= 16 * 1024);
     assert!(16 * 1024 - prompt.len() < "界".len());
+    assert!(prompt.ends_with("界...[truncated]"));
+}
+
+#[test]
+fn operator_intervention_prompt_bounds_an_overlength_base_without_interventions() {
+    let harness = SchedulerHarness::new();
+    let event_ids = (0..16)
+        .map(|index| {
+            harness.enqueue_with_evidence(
+                EventKind::TaskFinished,
+                "project-a",
+                &format!("long-base-{index}"),
+                "界".repeat(1000),
+            )
+        })
+        .collect::<Vec<_>>();
+    let events = event_ids
+        .iter()
+        .map(|event_id| harness.event(*event_id))
+        .collect::<Vec<_>>();
+    let project = harness.project();
+
+    let prompt = build_prompt(&project, "failure", &events, &[]).unwrap();
+
+    assert!(prompt.len() <= 16 * 1024);
     assert!(prompt.ends_with("界...[truncated]"));
 }
 
