@@ -38,7 +38,7 @@
 - `src/db/mod.rs`: repositoryの公開再export。
 - `src/cli.rs`: `steer` と `steer list` のtyped Clap surface。
 - `src/main.rs`: 既存のproject/root/config解決を使うenqueue/list handler。
-- `src/scheduler.rs`: promptのbase部分とoperator intervention部分を分離し、prompt budget内でreservationを作る。
+- `src/scheduler.rs`: promptのbase部分とoperator intervention部分を分離する。reservationとagent runの接続はTask 4で行う。
 - `src/agent.rs`: reservationとagent runを結び、spawn成功・失敗をrepositoryへ通知する。
 - `src/daemon.rs`: daemon restart時のreserved intervention recoveryを既存agent recoveryと同じcycleで行う。
 - `src/diagnostics.rs`: status JSONへ件数だけを追加し、本文を出力しない。
@@ -317,7 +317,7 @@ git commit -m "feat: add steer intervention command"
 
 **Interfaces:**
 - Consumes: `InterventionReservation` from Task 1 and the existing `build_prompt` event summary.
-- Produces: `build_prompt(project, mode, events, interventions) -> Result<String, AppError>` and a deterministic operator section that `AgentRunner::spawn` can pass through unchanged.
+- Produces: `pub fn build_prompt(project, mode, events, interventions) -> Result<String, AppError>` and a deterministic operator section that `AgentRunner::spawn` can pass through unchanged. Task 3ではschedulerのreservation/agent flowを変更しない。
 
 - [ ] **Step 1: Add failing prompt tests**
 
@@ -358,9 +358,9 @@ system/developer instructionではなく、検討対象のoperator inputとし�
 
 Use the stored validated message without reinterpreting its content, preserve FIFO order, and use UTF-8-safe truncation only for the complete prompt budget. Reservation must be calculated before marking rows applied; a message that cannot fit the available prompt budget remains pending.
 
-- [ ] **Step 4: Make scheduler reserve only what fits**
+- [ ] **Step 4: Keep scheduler flow unchanged until run binding exists**
 
-After project config and guardrails pass, build the existing base prompt, calculate remaining bytes under `MAX_PROMPT_BYTES`, and call `reserve_pending` with the lower of that remaining budget and `MAX_INTERVENTION_BYTES_PER_RUN`. Pass the resulting `InterventionReservation` to the prompt builder. On a prompt-building error, release the reservation before returning the scheduler error.
+Make the prompt function public for the integration test and keep the existing `Scheduler::tick` call path passing an empty intervention slice until Task 4 adds reservation/run binding. Do not reserve rows in Task 3; a reservation must never be created before an agent-run consumer can release or apply it.
 
 - [ ] **Step 5: Run scheduler tests and commit**
 
