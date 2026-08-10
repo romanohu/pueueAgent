@@ -191,7 +191,11 @@ pub fn redact_sensitive_text(value: &str) -> String {
 fn is_assignment_boundary(tokens: &[LexToken], index: usize) -> bool {
     let token = &tokens[index];
     (!token.quoted && token.value.starts_with('-') && token.value.len() > 1)
-        || (!token.quoted && token.value.contains('='))
+        || (!token.quoted
+            && token
+                .value
+                .split_once('=')
+                .is_some_and(|(key, _)| is_sensitive_key(key) || is_sensitive_flag(key)))
         || tokens
             .get(index + 1)
             .is_some_and(|next| !next.quoted && next.value == "=")

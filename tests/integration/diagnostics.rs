@@ -166,6 +166,31 @@ fn redact_sensitive_text_keeps_equals_inside_quoted_assignment_values_redacted()
 }
 
 #[test]
+fn redact_sensitive_text_keeps_equals_inside_unquoted_assignment_values_redacted() {
+    let rendered = redact_sensitive_text("AWS_SECRET_ACCESS_KEY = abc=def --lr 0.001");
+    assert!(!rendered.contains("abc=def"));
+    assert_eq!(rendered, "AWS_SECRET_ACCESS_KEY = [REDACTED] --lr 0.001");
+
+    let chained =
+        redact_sensitive_text("AWS_SECRET_ACCESS_KEY = abc=def password = second --lr 0.001");
+    assert!(!chained.contains("abc=def"));
+    assert!(!chained.contains("second"));
+    assert_eq!(
+        chained,
+        "AWS_SECRET_ACCESS_KEY = [REDACTED] password = [REDACTED] --lr 0.001"
+    );
+
+    let quoted = redact_sensitive_text(r#"AWS_SECRET_ACCESS_KEY = "abc=def" --lr 0.001"#);
+    assert!(!quoted.contains("abc=def"));
+    assert_eq!(quoted, "AWS_SECRET_ACCESS_KEY = [REDACTED] --lr 0.001");
+
+    assert_eq!(
+        redact_sensitive_text("run --lr 0.001 scale=abc"),
+        "run --lr 0.001 scale=abc"
+    );
+}
+
+#[test]
 fn redact_sensitive_text_redacts_inline_assignments_until_argument_boundary() {
     let rendered =
         redact_sensitive_text("Authorization=Bearer secret --lr 0.001 AWS_SECRET=foo bar --x");
