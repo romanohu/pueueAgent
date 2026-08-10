@@ -98,8 +98,31 @@ fn readme_documents_human_intervention_workflow() {
     let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
         .expect("README.md should be readable");
 
-    assert!(readme.contains("pueue-agent steer --"));
-    assert!(readme.contains("pueue-agent steer list"));
-    assert!(readme.contains("次回の agent run"));
-    assert!(readme.contains("実行中の agent は中断しません"));
+    for marker in [
+        "pueue-agent steer --",
+        "pueue-agent steer list",
+        "SQLite へ登録するだけ",
+        "FIFO",
+        "一度だけ",
+        "次回の agent run",
+        "4,096 bytes",
+        "16 messages",
+        "16,384 intervention bytes",
+        "FIFO の後続メッセージ（超過分）は pending のまま",
+        "pending に戻される",
+        "`pause`",
+        "`disable`",
+        "キューへ登録できます",
+        "保持されます",
+        "status --json",
+        "メッセージ本文は含めません",
+        "実行中の agent は中断しません",
+        "安全ポリシー",
+        "上書きすることはできません",
+    ] {
+        assert!(
+            readme.contains(marker),
+            "README is missing marker: {marker}"
+        );
+    }
 }

@@ -79,7 +79,7 @@ pueue-agent steer list
 pueue-agent status --json
 ```
 
-`steer` は現在のプロジェクトに対するメッセージを SQLite へ登録するだけで、agent の起動、Pueue 操作、実行中 process への入力は行いません。登録したメッセージは FIFO 順で一度だけ、次回の agent run の prompt に渡されます。agent の spawn に失敗した場合、メッセージは pending のまま戻されるため、次回の run で再試行されます。
+`steer` は現在のプロジェクトに対するメッセージを SQLite へ登録するだけで、agent の起動、Pueue 操作、実行中 process への入力は行いません。各メッセージは最大 `4,096 bytes` です。1回の run には最大 `16 messages`、合計 `16,384 intervention bytes` までを、残りの prompt budget に収まる範囲で配信します。登録したメッセージは FIFO 順で一度だけ、次回の agent run の prompt に渡されますが、1回ですべての pending メッセージを配信するとは限りません。上限または残りの prompt budget を超える FIFO の後続メッセージ（超過分）は pending のまま、後続の run へ繰り越されます。agent の spawn に失敗した場合、メッセージは pending に戻されるため、次回の run で再試行されます。
 
 `pause` または `disable` 中でもメッセージはキューへ登録できますが、配信はせず、resume または enable 後の次回 run まで保持されます。`status --json` はキューの件数などの診断情報を返しますが、メッセージ本文は含めません。実行中の agent は中断しません。介入メッセージによって、安全ポリシーや既存の制約を上書きすることはできません。
 
