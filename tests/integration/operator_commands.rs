@@ -445,6 +445,40 @@ fn status_human_bounds_halted_reason_and_context_lineage() {
 }
 
 #[test]
+fn status_human_bounds_and_redacts_task_state() {
+    let harness = OperatorHarness::new();
+    let task = PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: "python train.py".to_owned(),
+        state: format!(
+            "running AWS_SECRET_ACCESS_KEY=TASK_STATE_SECRET {}\x1b[31m",
+            "s".repeat(400)
+        ),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
+    };
+
+    let output = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(vec![task])),
+    )
+    .unwrap();
+    let task_line = output
+        .lines()
+        .find(|line| line.starts_with("task 41 "))
+        .expect("task line");
+
+    assert!(task_line.len() <= "task 41 ".len() + 240 + " python train.py".len());
+    assert!(!task_line.contains("TASK_STATE_SECRET"));
+    assert!(!task_line.chars().any(char::is_control));
+    assert!(task_line.contains("running"));
+}
+
+#[test]
 fn status_human_bounds_and_redacts_project_root_path() {
     let harness = OperatorHarness::new();
     let mut project = harness.project();

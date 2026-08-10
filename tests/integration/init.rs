@@ -181,6 +181,29 @@ fn init_refuses_to_overwrite_an_existing_configuration() {
 }
 
 #[test]
+fn init_error_output_bounds_and_redacts_long_credential_like_paths() {
+    let temp = TempDir::new().unwrap();
+    let root = temp
+        .path()
+        .join(format!("prefix-{}", "p".repeat(160)))
+        .join("AWS_SECRET_ACCESS_KEY=INIT_SECRET")
+        .join(format!("tail-{}", "t".repeat(160)));
+    fs::create_dir_all(&root).unwrap();
+    assert!(init(&root).status.success());
+
+    let output = init(&root);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.len() <= 241);
+    assert!(stderr.contains("project is already initialized"));
+    assert!(!stderr.contains("AWS_SECRET_ACCESS_KEY"));
+    assert!(!stderr.contains("INIT_SECRET"));
+    assert!(!stderr.contains(&"p".repeat(160)));
+    assert!(!stderr.trim_end_matches('\n').chars().any(char::is_control));
+}
+
+#[test]
 fn init_preserves_existing_durable_context_files() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("experiment");

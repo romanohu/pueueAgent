@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use pueue_agent::{
     cli::{Cli, Command},
+    output::bounded_redacted_text,
     AppError,
 };
 
@@ -24,7 +25,7 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}", error.render());
+            eprintln!("{}", bounded_redacted_text(&error.render()));
             ExitCode::FAILURE
         }
     }

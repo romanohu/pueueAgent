@@ -72,7 +72,7 @@ pub fn render_project_status(
                 lines.push(format!(
                     "{} {} {}",
                     render_id("task", task.id),
-                    format_state(&task.state),
+                    format_state(&bounded_redacted_text(&task.state)),
                     bounded_redacted_text(&task.command)
                 ));
             }
