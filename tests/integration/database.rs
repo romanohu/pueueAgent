@@ -573,10 +573,11 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
     connection
         .execute_batch(
             r#"
+            PRAGMA foreign_keys = OFF;
             DROP INDEX IF EXISTS submissions_project_origin_agent_run_idx;
             DROP INDEX IF EXISTS submissions_project_kind_status_idx;
             DROP INDEX IF EXISTS submissions_project_status_idx;
-            ALTER TABLE submissions RENAME TO submissions_v7_without_origin_fk;
+            ALTER TABLE submissions RENAME TO submissions_v7_with_compliant_origin_fk;
             CREATE TABLE submissions (
                 submission_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -587,11 +588,16 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
                 status TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'experiment',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
-                origin_agent_run_id INTEGER
+                origin_agent_run_id INTEGER,
+                FOREIGN KEY (origin_agent_run_id)
+                    REFERENCES agent_runs(run_id) ON DELETE RESTRICT,
+                FOREIGN KEY (origin_agent_run_id, project_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE RESTRICT
             );
-            INSERT INTO submissions SELECT * FROM submissions_v7_without_origin_fk;
-            DROP TABLE submissions_v7_without_origin_fk;
+            INSERT INTO submissions SELECT * FROM submissions_v7_with_compliant_origin_fk;
+            DROP TABLE submissions_v7_with_compliant_origin_fk;
             PRAGMA user_version = 7;
+            PRAGMA foreign_keys = ON;
             "#,
         )
         .unwrap();
@@ -605,6 +611,33 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
     assert_eq!(preserved.kind, SubmissionKind::Control);
     assert_eq!(preserved.metadata, json!({"stage": "bootstrap"}));
     assert_eq!(preserved.origin_agent_run_id, Some(run.run_id));
+    let connection = rebuilt.connect().unwrap();
+    let composite_origin_foreign_key_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM pragma_foreign_key_list('submissions') AS project_fk
+             JOIN pragma_foreign_key_list('submissions') AS origin_fk
+               ON project_fk.id = origin_fk.id
+             WHERE project_fk.seq = 0
+               AND project_fk.\"table\" = 'agent_runs'
+               AND project_fk.\"from\" = 'project_id'
+               AND project_fk.\"to\" = 'project_id'
+               AND project_fk.on_delete = 'RESTRICT'
+               AND origin_fk.seq = 1
+               AND origin_fk.\"from\" = 'origin_agent_run_id'
+               AND origin_fk.\"to\" = 'run_id'
+               AND origin_fk.on_delete = 'RESTRICT'
+               AND 2 = (
+                   SELECT COUNT(*)
+                   FROM pragma_foreign_key_list('submissions') AS fk_part
+                   WHERE fk_part.id = project_fk.id
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(composite_origin_foreign_key_count, 1);
+    drop(connection);
     assert!(rebuilt
         .connect()
         .unwrap()
@@ -810,6 +843,21 @@ fn submission_rejects_an_origin_agent_run_from_another_project() {
         .find_by_id("cross-project-origin")
         .unwrap()
         .is_none());
+    assert!(test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO submissions (
+                submission_id, project_id, argv_json, created_at,
+                pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
+             ) VALUES (
+                'cross-project-origin-sql', 'project-a', '[\"python\"]', 100,
+                NULL, NULL, 'pending', 'experiment', '{}', ?1
+             )",
+            [run_b.run_id],
+        )
+        .is_err());
 }
 
 #[test]

@@ -54,7 +54,7 @@
   exist. GREEN: the origin, v7 reopen/concurrent open, and doctor index focused tests pass.
 - Final verification after the review follow-up: `cargo test --all-targets` — 259 passed; `git
   diff --check` passed. `cargo fmt --check` remains non-zero only for the unchanged Task 1 readonly
-  assertion (originally `tests/integration/database.rs:281`, shifted to line 282 by added tests).
+  assertion (Task 3 base `tests/integration/database.rs:284`).
 
 ## Database foreign-key follow-up
 
@@ -66,3 +66,8 @@
   submission indexes. Current compliant v7 databases do not enter that migration transaction.
 - The database integration coverage verifies the composite FK, v7 rebuild preservation, direct
   SQL rejection of invalid origins, and foreign-key/WAL-compatible reopen behavior.
+- Legacy-v7 compliance now requires both members of the same two-column FK, in order:
+  `project_id -> agent_runs.project_id` followed by `origin_agent_run_id -> agent_runs.run_id`.
+  A standalone origin FK, a reversed composite FK, or any other shape is rebuilt. RED first
+  demonstrated that the former single-column check incorrectly accepted that fixture; GREEN
+  verifies rebuild and direct-SQL rejection for an origin from another project.

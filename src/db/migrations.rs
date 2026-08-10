@@ -39,7 +39,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             operation: "open a database created by a newer pueue-agent",
         });
     }
-    if version == LATEST_SCHEMA_VERSION && submission_origin_foreign_key_exists(connection)? {
+    if version == LATEST_SCHEMA_VERSION
+        && submissions_have_composite_origin_foreign_key(connection)?
+    {
         return Ok(());
     }
     let transaction = connection
@@ -524,20 +526,38 @@ fn migrate_submissions_to_v7(transaction: &rusqlite::Transaction<'_>) -> Result<
     ensure_submission_indexes(transaction)
 }
 
-fn submission_origin_foreign_key_exists(connection: &Connection) -> Result<bool, AppError> {
+fn submissions_have_composite_origin_foreign_key(
+    connection: &Connection,
+) -> Result<bool, AppError> {
     connection
         .query_row(
             "SELECT EXISTS(
-                 SELECT 1 FROM pragma_foreign_key_list('submissions')
-                 WHERE \"table\" = 'agent_runs'
-                   AND \"from\" = 'origin_agent_run_id'
-                   AND \"to\" = 'run_id'
-                   AND on_delete = 'RESTRICT'
+                 SELECT 1
+                 FROM pragma_foreign_key_list('submissions') AS project_fk
+                 JOIN pragma_foreign_key_list('submissions') AS origin_fk
+                   ON project_fk.id = origin_fk.id
+                 WHERE project_fk.seq = 0
+                   AND project_fk.\"table\" = 'agent_runs'
+                   AND project_fk.\"from\" = 'project_id'
+                   AND project_fk.\"to\" = 'project_id'
+                   AND project_fk.on_delete = 'RESTRICT'
+                   AND origin_fk.seq = 1
+                   AND origin_fk.\"table\" = 'agent_runs'
+                   AND origin_fk.\"from\" = 'origin_agent_run_id'
+                   AND origin_fk.\"to\" = 'run_id'
+                   AND origin_fk.on_delete = 'RESTRICT'
+                   AND 2 = (
+                       SELECT COUNT(*)
+                       FROM pragma_foreign_key_list('submissions') AS fk_part
+                       WHERE fk_part.id = project_fk.id
+                   )
              )",
             [],
             |row| row.get(0),
         )
-        .map_err(database_error("check submission origin foreign key"))
+        .map_err(database_error(
+            "check composite submission origin foreign key",
+        ))
 }
 
 fn submission_column_exists(
