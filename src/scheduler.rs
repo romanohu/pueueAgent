@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
@@ -11,6 +12,7 @@ use crate::{
         Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
     },
     models::{Event, EventKind, EventStatus, Project},
+    output::bounded_redacted_text,
     state, AppError,
 };
 
@@ -399,10 +401,10 @@ fn build_base_prompt(
     );
 
     for event in events {
-        let payload = truncate(&event.payload.to_string(), MAX_EVENT_EVIDENCE_BYTES);
+        let evidence = prompt_event_evidence(event);
         prompt.push_str(&format!(
             "- event_id={} kind={} attempts={} created_at={} evidence={}\n",
-            event.event_id, event.kind, event.attempts, event.created_at, payload
+            event.event_id, event.kind, event.attempts, event.created_at, evidence
         ));
     }
     prompt.push_str(
@@ -412,15 +414,41 @@ fn build_base_prompt(
     Ok(prompt)
 }
 
-fn truncate(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
+fn prompt_event_evidence(event: &Event) -> String {
+    let mut fields = Vec::with_capacity(5);
+    if let Some(task_id) = event.payload.get("task_id").and_then(Value::as_i64) {
+        fields.push(format!("task_id={task_id}"));
     }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
+    if let Some(source) = prompt_payload_text(&event.payload, "source") {
+        fields.push(format!("source={source}"));
     }
-    format!("{0}{TRUNCATION_SUFFIX}", &value[..end])
+    fields.push(format!("action={}", event.kind.as_str()));
+    if let Some(state) = prompt_payload_text(&event.payload, "state").or_else(|| {
+        event
+            .payload
+            .get("metadata")
+            .and_then(|metadata| metadata.get("state"))
+            .and_then(Value::as_str)
+            .map(bounded_redacted_text)
+    }) {
+        fields.push(format!("state={state}"));
+    }
+    if let Some(reason) = prompt_payload_text(&event.payload, "reason") {
+        fields.push(format!("reason={reason}"));
+    }
+    truncate_to_prompt_budget(
+        &bounded_redacted_text(&fields.join(" ")),
+        MAX_EVENT_EVIDENCE_BYTES,
+    )
+}
+
+fn prompt_payload_text(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(bounded_redacted_text)
 }
 
 fn truncate_to_prompt_budget(value: &str, max_bytes: usize) -> String {

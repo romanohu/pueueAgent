@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -12,7 +12,7 @@ use crate::{config::GuardrailsConfig, AppError};
 
 pub const CANONICAL_STATE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_STATE_BYTES: usize = 64 * 1024;
-pub const MAX_STATE_DEPTH: usize = 8;
+pub const MAX_STATE_DEPTH: usize = 32;
 pub const MAX_CURRENT_FACTS: usize = 64;
 pub const MAX_HISTORICAL_FACTS: usize = 256;
 pub const MAX_FACT_BYTES: usize = 1_024;
@@ -77,12 +77,13 @@ pub fn load(path: &Path) -> Result<CanonicalState, AppError> {
 }
 
 pub fn load_if_present(path: &Path) -> Result<Option<CanonicalState>, AppError> {
-    match load(path) {
-        Ok(state) => Ok(Some(state)),
-        Err(AppError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(None)
-        }
-        Err(error) => Err(error),
+    match fs::symlink_metadata(path) {
+        Ok(_) => load(path).map(Some),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(AppError::Io {
+            operation: "inspect canonical state",
+            source,
+        }),
     }
 }
 
@@ -199,6 +200,12 @@ impl CanonicalState {
             ));
         }
         for (key, value) in &self.budgets {
+            if !matches!(
+                key.as_str(),
+                "max_experiments" | "max_agent_runs" | "max_consecutive_failures"
+            ) {
+                return Err(invalid_state("unknown budget key"));
+            }
             validate_text("budget key", key, MAX_BUDGET_KEY_BYTES, true)?;
             if *value > MAX_BUDGET_VALUE {
                 return Err(invalid_state("budget value exceeds the supported bound"));
@@ -226,6 +233,7 @@ impl ActiveLineage {
                 "active lineage exceeds the maximum number of IDs",
             ));
         }
+        let mut submission_ids = BTreeSet::new();
         for submission_id in &self.submission_ids {
             validate_text(
                 "active lineage submission ID",
@@ -233,11 +241,20 @@ impl ActiveLineage {
                 MAX_LINEAGE_ID_BYTES,
                 true,
             )?;
+            if !submission_ids.insert(submission_id) {
+                return Err(invalid_state("duplicate active lineage submission ID"));
+            }
         }
+        let mut task_ids = BTreeSet::new();
         if self.task_ids.iter().any(|id| *id < 0) {
             return Err(invalid_state(
                 "active lineage task IDs must be non-negative",
             ));
+        }
+        for task_id in &self.task_ids {
+            if !task_ids.insert(task_id) {
+                return Err(invalid_state("duplicate active lineage task ID"));
+            }
         }
         Ok(())
     }
@@ -331,7 +348,7 @@ fn validate_facts(
     let mut seen = BTreeSet::new();
     for fact in facts {
         validate_text(field, fact, MAX_FACT_BYTES, true)?;
-        if reject_duplicates && !seen.insert(fact.trim().to_owned()) {
+        if reject_duplicates && !seen.insert(normalize_sentinel_text(fact)) {
             return Err(invalid_state("duplicate current fact"));
         }
     }
@@ -362,5 +379,27 @@ fn invalid_state(message: &'static str) -> AppError {
     AppError::Validation {
         field: "state.json",
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::{validate_depth, MAX_STATE_DEPTH};
+
+    fn value_at_depth(depth: usize) -> Value {
+        let mut value = Value::Null;
+        for _ in 1..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    #[test]
+    fn canonical_state_depth_boundary_accepts_32_and_rejects_33() {
+        assert!(validate_depth(&value_at_depth(32), 1).is_ok());
+        assert!(validate_depth(&value_at_depth(33), 1).is_err());
+        assert_eq!(MAX_STATE_DEPTH, 32);
     }
 }

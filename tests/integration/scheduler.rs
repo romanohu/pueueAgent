@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
@@ -11,7 +11,7 @@ use pueue_agent::{
         SubmissionRepository,
     },
     models::{
-        AgentContextMode, AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent,
+        AgentContextMode, AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent,
         NewProject, NewSubmission, SubmissionStatus,
     },
     scheduler::{build_prompt, Scheduler, SchedulerConfig},
@@ -120,6 +120,30 @@ max_agent_runs = 10
                 json!({
                     "task_id": 41,
                     "evidence": evidence,
+                }),
+                self.now,
+                self.now,
+            ))
+            .unwrap()
+            .event_id
+    }
+
+    fn enqueue_with_reason(
+        &self,
+        kind: EventKind,
+        project_id: &str,
+        dedup_key: &str,
+        reason: String,
+    ) -> i64 {
+        EventRepository::new(&self.db)
+            .insert_idempotent(&NewEvent::new(
+                project_id,
+                kind,
+                dedup_key,
+                json!({
+                    "task_id": 41,
+                    "source": "test",
+                    "reason": reason,
                 }),
                 self.now,
                 self.now,
@@ -352,9 +376,9 @@ fn operator_intervention_prompt_truncates_the_complete_prompt_at_a_utf8_boundary
 #[test]
 fn operator_intervention_prompt_bounds_an_overlength_base_without_interventions() {
     let harness = SchedulerHarness::new();
-    let event_ids = (0..16)
+    let event_ids = (0..80)
         .map(|index| {
-            harness.enqueue_with_evidence(
+            harness.enqueue_with_reason(
                 EventKind::TaskFinished,
                 "project-a",
                 &format!("long-base-{index}"),
@@ -371,7 +395,49 @@ fn operator_intervention_prompt_bounds_an_overlength_base_without_interventions(
     let prompt = build_prompt(&project, "failure", &events, &[]).unwrap();
 
     assert!(prompt.len() <= 16 * 1024);
-    assert!(prompt.ends_with("界...[truncated]"));
+    assert!(prompt.ends_with("[truncated]"));
+}
+
+#[test]
+fn scheduler_prompt_projects_only_allowlisted_event_payload_fields() {
+    let harness = SchedulerHarness::new();
+    let event = Event {
+        event_id: 901,
+        project_id: "project-a".to_owned(),
+        kind: EventKind::TaskFailed,
+        dedup_key: "safe-payload-projection".to_owned(),
+        payload: json!({
+            "task_id": 41,
+            "source": "pueue_callback",
+            "state": "failed",
+            "reason": "inspect current loss",
+            "prompt": "prompt-secret",
+            "transcript": "transcript-secret",
+            "credential": "credential-secret",
+            "result": {"nested": "nested-result-secret"},
+            "evidence": "arbitrary-evidence"
+        }),
+        status: EventStatus::Pending,
+        attempts: 0,
+        not_before: harness.now,
+        lease_until: None,
+        created_at: harness.now,
+        completed_at: None,
+        last_error: None,
+    };
+
+    let prompt = build_prompt(&harness.project(), "failure", &[event], &[]).unwrap();
+
+    assert!(prompt.contains("task_id=41"));
+    assert!(prompt.contains("source=pueue_callback"));
+    assert!(prompt.contains("action=task_failed"));
+    assert!(prompt.contains("state=failed"));
+    assert!(prompt.contains("reason=inspect current loss"));
+    assert!(!prompt.contains("prompt-secret"));
+    assert!(!prompt.contains("transcript-secret"));
+    assert!(!prompt.contains("credential-secret"));
+    assert!(!prompt.contains("nested-result-secret"));
+    assert!(!prompt.contains("arbitrary-evidence"));
 }
 
 #[tokio::test]
@@ -1054,6 +1120,34 @@ async fn canonical_state_directory_fails_closed_without_toml_budget_fallback() {
     let mut scheduler = harness.scheduler();
     let error = match scheduler.tick().await {
         Ok(_) => panic!("a state.json directory must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("canonical state"));
+    assert_eq!(harness.event_status(event_id), EventStatus::Failed);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn canonical_state_dangling_symlink_fails_closed_without_toml_budget_fallback() {
+    let harness = SchedulerHarness::new();
+    symlink(
+        harness
+            .root("project-a")
+            .join(".pueue-agent/missing-state-target"),
+        harness.root("project-a").join(".pueue-agent/state.json"),
+    )
+    .unwrap();
+    let event_id = harness.enqueue(
+        EventKind::TaskFinished,
+        "project-a",
+        "canonical-state-dangling-symlink",
+    );
+
+    let mut scheduler = harness.scheduler();
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("a dangling state.json symlink must fail closed"),
         Err(error) => error,
     };
 
