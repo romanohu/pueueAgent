@@ -53,7 +53,7 @@ pub fn format_state(state: &str) -> String {
 
 pub fn redact_sensitive_text(value: &str) -> String {
     let sanitized = strip_control_and_ansi(value);
-    let tokens = sanitized.split_whitespace().collect::<Vec<_>>();
+    let tokens = lex_tokens(&sanitized);
     let mut redacted = Vec::with_capacity(tokens.len());
     let mut redact_next = false;
     let mut redact_bearer_value = false;
@@ -98,18 +98,18 @@ pub fn redact_sensitive_text(value: &str) -> String {
             }
         }
 
-        if is_sensitive_flag(token) || token.eq_ignore_ascii_case("bearer") {
+        if is_sensitive_flag(&token) || token.eq_ignore_ascii_case("bearer") {
             redacted.push(token.to_owned());
             redact_next = true;
             continue;
         }
 
-        if is_path_token(token) {
+        if is_path_token(&token) {
             redacted.push("[path]".to_owned());
             continue;
         }
 
-        if is_sensitive_marker(token) {
+        if is_sensitive_marker(&token) {
             redacted.push("[REDACTED]".to_owned());
             continue;
         }
@@ -239,4 +239,54 @@ fn strip_control_and_ansi(value: &str) -> String {
     }
 
     output
+}
+
+fn lex_tokens(value: &str) -> Vec<String> {
+    let mut characters = value.chars().peekable();
+    let mut tokens = Vec::new();
+
+    loop {
+        while characters
+            .peek()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            characters.next();
+        }
+
+        if characters.peek().is_none() {
+            break;
+        }
+
+        let mut token = String::new();
+        let mut quote = None;
+        while let Some(character) = characters.next() {
+            if let Some(quote_character) = quote {
+                if character == quote_character {
+                    quote = None;
+                } else if character == '\\' {
+                    if let Some(escaped) = characters.next() {
+                        token.push(escaped);
+                    }
+                } else {
+                    token.push(character);
+                }
+                continue;
+            }
+
+            if character == '\'' || character == '"' {
+                quote = Some(character);
+            } else if character == '\\' {
+                if let Some(escaped) = characters.next() {
+                    token.push(escaped);
+                }
+            } else if character.is_whitespace() {
+                break;
+            } else {
+                token.push(character);
+            }
+        }
+        tokens.push(token);
+    }
+
+    tokens
 }

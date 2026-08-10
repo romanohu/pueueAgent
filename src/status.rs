@@ -47,7 +47,7 @@ pub fn render_project_status(
     lines.push(format!("paused: {}", project.paused));
     lines.push(format!(
         "halted: {}",
-        project.halted_reason.as_deref().unwrap_or("no")
+        bounded_redacted_text(project.halted_reason.as_deref().unwrap_or("no"))
     ));
 
     match &input.pueue {
@@ -293,7 +293,12 @@ fn count(counts: &BTreeMap<String, i64>, key: &str) -> i64 {
 }
 
 fn event_summary(event: &Event) -> String {
-    format!("#{}:{}:{}", event.event_id, event.kind, event.status)
+    format!(
+        "{}:{}:{}",
+        render_id("event", event.event_id),
+        event.kind,
+        event.status
+    )
 }
 
 fn integration_error_count(db: &Db) -> Result<i64, AppError> {
@@ -341,7 +346,8 @@ fn failed_termination_errors(db: &Db, project_id: &str) -> Result<Vec<String>, A
             let request_id: i64 = row.get(0)?;
             let last_error: Option<String> = row.get(1)?;
             Ok(format!(
-                "#{request_id}:{}",
+                "{}:{}",
+                render_id("request", request_id),
                 bounded_redacted_text(&last_error.unwrap_or_else(|| "no detail".to_owned()))
             ))
         })
@@ -390,14 +396,17 @@ fn context_lines(db: &Db, project: &Project) -> Result<Vec<String>, AppError> {
                     .agent
                     .context
                     .session_id()
-                    .map(|session| format!(" session={session}"))
+                    .map(|session| format!(" session={}", bounded_redacted_text(session)))
                     .unwrap_or_default()
             ));
         }
     }
 
     if let Some(lineage) = latest_context_lineage(db, &project.project_id)? {
-        lines.push(format!("last_lineage: {}", lineage.join(" -> ")));
+        lines.push(format!(
+            "last_lineage: {}",
+            bounded_redacted_text(&lineage.join(" -> "))
+        ));
     }
 
     Ok(lines)

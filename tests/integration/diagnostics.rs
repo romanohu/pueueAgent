@@ -92,6 +92,30 @@ fn redact_sensitive_text_removes_flag_bearer_and_credential_values() {
 }
 
 #[test]
+fn redact_sensitive_text_consumes_quoted_values_as_whole_credentials() {
+    let rendered = redact_sensitive_text(
+        r#"run --password "first second" --prompt 'prompt first second' AWS_SECRET_ACCESS_KEY="secret first second" --lr 0.001"#,
+    );
+
+    for leaked in [
+        "first second",
+        "prompt first second",
+        "secret first second",
+        "second\"",
+        "second'",
+    ] {
+        assert!(
+            !rendered.contains(leaked),
+            "quoted value leaked: {rendered}"
+        );
+    }
+    assert_eq!(
+        rendered,
+        "run --password [REDACTED] --prompt [REDACTED] AWS_SECRET_ACCESS_KEY=[REDACTED] --lr 0.001"
+    );
+}
+
+#[test]
 fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
     let rendered =
         pueue_agent::output::bounded_redacted_text("prefix\x1b[31mhidden\x1b[0m\n\t\u{0007}suffix");

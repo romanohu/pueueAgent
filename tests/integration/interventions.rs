@@ -329,7 +329,7 @@ fn steer_list_redacts_and_bounds_message_in_human_and_json_output() {
     let harness = SteerHarness::new();
     let project_id = harness.project_id(&harness.first_root);
     let message = format!(
-        "analysis --access-token separate-secret AWS_ACCESS_KEY_ID=AKIASECRET {}",
+        r#"analysis --password "first second" --prompt 'prompt first second' AWS_SECRET_ACCESS_KEY="secret first second" --access-token separate-secret AWS_ACCESS_KEY_ID=AKIASECRET {}"#,
         "x".repeat(300)
     );
     InterventionRepository::new(&harness.db)
@@ -345,6 +345,9 @@ fn steer_list_redacts_and_bounds_message_in_human_and_json_output() {
     let text = String::from_utf8(text_output.stdout).unwrap();
     assert!(!text.contains("separate-secret"));
     assert!(!text.contains("AKIASECRET"));
+    assert!(!text.contains("first second"));
+    assert!(!text.contains("prompt first second"));
+    assert!(!text.contains("secret first second"));
     assert!(text.contains("[REDACTED]"));
     assert!(!text.contains('\x1b'));
 
@@ -359,5 +362,8 @@ fn steer_list_redacts_and_bounds_message_in_human_and_json_output() {
     assert!(rendered_message.len() <= 240);
     assert!(!rendered_message.contains("separate-secret"));
     assert!(!rendered_message.contains("AKIASECRET"));
+    assert!(!rendered_message.contains("first second"));
+    assert!(!rendered_message.contains("prompt first second"));
+    assert!(!rendered_message.contains("secret first second"));
     assert!(!String::from_utf8_lossy(&json_output.stdout).contains('\x1b'));
 }

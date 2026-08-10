@@ -293,9 +293,11 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
     assert!(output.contains("active_tasks: 1"));
     assert!(output.contains("task 41 running"));
     assert!(output.contains("events: pending=1 failed=1"));
+    assert!(output.contains("event "));
     assert!(output
         .contains("termination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=1"));
     assert!(output.contains("termination_failed"));
+    assert!(output.contains("request "));
     assert!(output.contains("open_incidents: 1"));
     assert!(output.contains("agent_runs: active=1 failed=1"));
     assert!(
@@ -324,6 +326,66 @@ fn status_shows_pueue_integration_error_without_claiming_active_tasks_are_empty(
     assert!(!output.contains("active_tasks: 0"));
     assert!(!output.contains("active_tasks: none"));
     assert!(!output.contains("idle"));
+}
+
+#[test]
+fn status_human_bounds_halted_reason_and_context_lineage() {
+    let harness = OperatorHarness::new();
+    let halted_reason = format!(
+        "manual halt --password HALT_SECRET_VALUE {}",
+        "h".repeat(400)
+    );
+    ProjectRepository::new(&harness.db)
+        .halt("project-a", &halted_reason, harness.now + 1)
+        .unwrap();
+
+    let event_id = harness.event(EventKind::Crash, "bounded-context");
+    let lineage = format!("LINEAGE_VALUE {}", "l".repeat(400));
+    AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::with_context(
+            "project-a",
+            event_id,
+            Some(1234),
+            AgentRunStatus::Running,
+            harness.now + 2,
+            harness.temp.path().join("active-agent.log"),
+            AgentContextMode::Resume {
+                session_id: CODEX_SESSION_ID.to_owned(),
+            },
+            Some(CODEX_SESSION_ID.to_owned()),
+            vec![lineage],
+        ))
+        .unwrap();
+
+    let output = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+
+    let halted_line = output
+        .lines()
+        .find(|line| line.starts_with("halted: "))
+        .unwrap();
+    assert!(halted_line.len() <= "halted: ".len() + 243);
+    assert!(halted_line.ends_with("..."));
+    assert!(!halted_line.contains("HALT_SECRET_VALUE"));
+
+    let lineage_line = output
+        .lines()
+        .find(|line| line.starts_with("last_lineage: "))
+        .unwrap();
+    assert!(lineage_line.len() <= "last_lineage: ".len() + 243);
+    assert!(lineage_line.ends_with("..."));
+    assert!(!lineage_line.contains(&"l".repeat(400)));
+
+    let context_line = output
+        .lines()
+        .find(|line| line.starts_with("codex_context: "))
+        .unwrap();
+    assert!(context_line.len() <= "codex_context: mode=resume session=".len() + 243);
+    assert!(context_line.contains(CODEX_SESSION_ID));
 }
 
 #[test]
