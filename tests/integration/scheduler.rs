@@ -1063,6 +1063,9 @@ max_agent_runs = 10
 #[tokio::test]
 async fn event_attachment_failure_rolls_back_the_agent_run() {
     let harness = SchedulerHarness::new();
+    let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, config.replace("max_retries = 2", "max_retries = 0")).unwrap();
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "attach-failure");
     harness
         .db
@@ -1082,7 +1085,7 @@ async fn event_attachment_failure_rolls_back_the_agent_run() {
 
     let runs = harness.agent_run_states();
     assert!(runs.is_empty());
-    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
     assert_eq!(harness.active_runs("project-a"), 0);
 }
 
@@ -1132,6 +1135,183 @@ async fn process_spawn_failure_finishes_the_inserted_agent_run() {
         .is_some_and(|reason| reason.contains("spawn agent process")));
     assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
     assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn grouped_event_failure_applies_per_event_retry_limit() {
+    let mut harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 7"]);
+    let retry_event = harness.enqueue(EventKind::TaskFailed, "project-a", "grouped-retry");
+    let dead_letter_event =
+        harness.enqueue(EventKind::TaskFailed, "project-a", "grouped-dead-letter");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events
+             SET attempts = CASE event_id WHEN ?1 THEN 0 ELSE 2 END
+             WHERE event_id IN (?1, ?2)",
+            params![retry_event, dead_letter_event],
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+    assert_eq!(started.event_ids, vec![retry_event, dead_letter_event]);
+    assert_eq!(
+        started
+            .handle
+            .wait(&harness.db, harness.now + 1)
+            .await
+            .unwrap(),
+        AgentRunStatus::Failed
+    );
+
+    let retry = harness.event(retry_event);
+    assert_eq!(retry.status, EventStatus::RetryWait);
+    assert_eq!(retry.attempts, 1);
+    assert_eq!(retry.not_before, harness.now + 61);
+    let dead_letter = harness.event(dead_letter_event);
+    assert_eq!(dead_letter.status, EventStatus::DeadLetter);
+    assert_eq!(dead_letter.attempts, 3);
+
+    harness.now += 61;
+    let mut next_scheduler = harness.scheduler();
+    let next = next_scheduler.tick().await.unwrap();
+    assert_eq!(next.started.len(), 1);
+    assert_eq!(next.started[0].event_ids, vec![retry_event]);
+    assert_eq!(harness.event_status(retry_event), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(dead_letter_event), EventStatus::DeadLetter);
+    let mut next_handle = next.started.into_iter().next().unwrap().handle;
+    assert_eq!(
+        next_handle
+            .wait(&harness.db, harness.now + 1)
+            .await
+            .unwrap(),
+        AgentRunStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn grouped_prebinding_failure_applies_per_event_retry_limit() {
+    let mut harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
+    let retry_event = harness.enqueue(EventKind::TaskFailed, "project-a", "grouped-prebinding-retry");
+    let dead_letter_event =
+        harness.enqueue(EventKind::TaskFailed, "project-a", "grouped-prebinding-dead-letter");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events
+             SET attempts = CASE event_id WHEN ?1 THEN 0 ELSE 2 END
+             WHERE event_id IN (?1, ?2)",
+            params![retry_event, dead_letter_event],
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_grouped_event_attachment
+             BEFORE INSERT ON agent_run_events
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected grouped attachment failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+    let retry = harness.event(retry_event);
+    assert_eq!(retry.status, EventStatus::RetryWait);
+    assert_eq!(retry.attempts, 1);
+    let dead_letter = harness.event(dead_letter_event);
+    assert_eq!(dead_letter.status, EventStatus::DeadLetter);
+    assert_eq!(dead_letter.attempts, 3);
+    assert_eq!(retry.not_before, harness.now + 60);
+    assert_eq!(harness.agent_run_states().len(), 0);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_grouped_event_attachment;")
+        .unwrap();
+    harness.now += 60;
+    let mut next_scheduler = harness.scheduler();
+    let next = next_scheduler.tick().await.unwrap();
+    assert_eq!(next.started.len(), 1);
+    assert_eq!(next.started[0].event_ids, vec![retry_event]);
+    let mut next_handle = next.started.into_iter().next().unwrap().handle;
+    assert_eq!(
+        next_handle
+            .wait(&harness.db, harness.now + 1)
+            .await
+            .unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(harness.event_status(dead_letter_event), EventStatus::DeadLetter);
+}
+
+#[tokio::test]
+async fn scheduler_does_not_double_resolve_run_bound_spawn_failure() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/path/that/does/not/exist/pueue-agent", &[]);
+    let event_id = harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "run-bound-failure-counter",
+    );
+    let intervention_id = harness.queue_intervention("release exactly once");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE mutation_counts (
+                 kind TEXT PRIMARY KEY,
+                 count INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO mutation_counts(kind) VALUES ('event'), ('intervention');
+             CREATE TRIGGER count_event_resolution
+             AFTER UPDATE OF status ON events
+             WHEN NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 UPDATE mutation_counts SET count = count + 1 WHERE kind = 'event';
+             END;
+             CREATE TRIGGER count_intervention_release
+             AFTER UPDATE OF status ON interventions
+             WHEN OLD.status IN ('reserved', 'applied') AND NEW.status = 'pending'
+             BEGIN
+                 UPDATE mutation_counts SET count = count + 1 WHERE kind = 'intervention';
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending
+    );
+    let counts: (i64, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                 (SELECT count FROM mutation_counts WHERE kind = 'event'),
+                 (SELECT count FROM mutation_counts WHERE kind = 'intervention')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 1));
 }
 
 #[cfg(unix)]

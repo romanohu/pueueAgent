@@ -13,6 +13,7 @@ use crate::{
     },
     models::{Event, EventKind, EventStatus, Project},
     output::bounded_redacted_text,
+    retry::RetryPolicy,
     state, AppError,
 };
 
@@ -178,6 +179,9 @@ impl Scheduler {
                     continue;
                 }
             };
+            let retry_policy = RetryPolicy {
+                max_retries: project_config.agent.max_retries,
+            };
             let effective_guardrails = match state::load_effective_guardrails(
                 &state::path(&project.root_path),
                 &project_config.guardrails,
@@ -233,19 +237,12 @@ impl Scheduler {
                     Ok(delivery) => delivery,
                     Err(error) => {
                         let message = format!("agent spawn failed: {error}");
-                        let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
-                        let status =
-                            if primary.attempts <= i64::from(project_config.agent.max_retries) {
-                                EventStatus::RetryWait
-                            } else {
-                                EventStatus::Failed
-                            };
-                        EventRepository::new(&self.db).transition_many(
+                        EventRepository::new(&self.db).resolve_claimed_without_run(
+                            &project.project_id,
                             &event_ids,
-                            status,
                             self.config.now,
-                            Some(retry_at),
-                            Some(&message),
+                            &message,
+                            retry_policy,
                         )?;
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -259,6 +256,7 @@ impl Scheduler {
                     &self.db,
                     &project,
                     &project_config.agent,
+                    retry_policy,
                     primary.event_id,
                     &event_ids,
                     reservation.as_ref(),
@@ -302,19 +300,12 @@ impl Scheduler {
                             .err()
                     });
                     let message = format!("agent spawn failed: {source}");
-                    let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
-                    let status = if primary.attempts <= i64::from(project_config.agent.max_retries)
-                    {
-                        EventStatus::RetryWait
-                    } else {
-                        EventStatus::Failed
-                    };
-                    EventRepository::new(&self.db).transition_many(
+                    EventRepository::new(&self.db).resolve_claimed_without_run(
+                        &project.project_id,
                         &event_ids,
-                        status,
                         self.config.now,
-                        Some(retry_at),
-                        Some(&message),
+                        &message,
+                        retry_policy,
                     )?;
                     if first_error.is_none() {
                         first_error = Some(release_error.unwrap_or(source));
@@ -394,11 +385,6 @@ fn dispatch_mode(kind: EventKind) -> &'static str {
         EventKind::OperatorWake => "operator_wake",
         EventKind::DeepCheck => "deep_check",
     }
-}
-
-fn retry_backoff_seconds(attempts: i64) -> i64 {
-    let exponent = attempts.clamp(0, 6) as u32;
-    60 * 2_i64.pow(exponent)
 }
 
 pub fn build_prompt(

@@ -228,6 +228,7 @@ impl AgentRunner {
         db: &crate::db::Db,
         project: &Project,
         config: &AgentConfig,
+        retry_policy: RetryPolicy,
         primary_event_id: i64,
         event_ids: &[i64],
         reservation: Option<&InterventionReservation>,
@@ -362,9 +363,7 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     &reason,
-                    RetryPolicy {
-                        max_retries: config.max_retries,
-                    },
+                    retry_policy,
                     error,
                 ));
             }
@@ -386,9 +385,7 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     &reason,
-                    RetryPolicy {
-                        max_retries: config.max_retries,
-                    },
+                    retry_policy,
                     error,
                 ));
             };
@@ -405,9 +402,7 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     &reason,
-                    RetryPolicy {
-                        max_retries: config.max_retries,
-                    },
+                    retry_policy,
                     AppError::Io {
                         operation: "release agent launch gate",
                         source,
@@ -430,9 +425,7 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     &reason,
-                    RetryPolicy {
-                        max_retries: config.max_retries,
-                    },
+                    retry_policy,
                     error,
                 ));
             };
@@ -464,9 +457,7 @@ impl AgentRunner {
                     now,
                     inspect_launch_marker(&gate_marker_path),
                     &reason,
-                    RetryPolicy {
-                        max_retries: config.max_retries,
-                    },
+                    retry_policy,
                     AppError::Runtime {
                         operation: "confirm agent launch gate release",
                     },
@@ -513,9 +504,7 @@ impl AgentRunner {
             timeout_deadline: Instant::now()
                 + Duration::from_secs(u64::from(config.timeout_minutes) * 60),
             log_path,
-            retry_policy: RetryPolicy {
-                max_retries: config.max_retries,
-            },
+            retry_policy,
             terminal_outcome: None,
         })
     }
