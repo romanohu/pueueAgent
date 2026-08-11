@@ -17,6 +17,7 @@ pub enum Command {
     Init(InitArgs),
     Enable(ProjectArgs),
     Disable(DisableArgs),
+    Cancel(CancelArgs),
     Submit(SubmitArgs),
     SubmitBatch(SubmitBatchArgs),
     Event(EventArgs),
@@ -129,6 +130,18 @@ pub struct DoctorArgs {
 pub struct DisableArgs {
     #[arg(long)]
     pub remove: bool,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct CancelArgs {
+    #[arg(long, value_name = "TASK_ID")]
+    pub task_id: i64,
+    #[arg(long)]
+    pub json: bool,
     #[arg(long, value_name = "PUEUE_CONFIG")]
     pub pueue_config: Option<PathBuf>,
     #[arg(value_name = "PROJECT_ROOT")]

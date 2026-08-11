@@ -9,14 +9,15 @@ use async_trait::async_trait;
 use clap::Parser;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
+    cancel::{cancel_task_with, render_cancel_result},
     daemon::{Daemon, DaemonConfig},
     db::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
-        TerminationRequestRepository,
+        TaskObservationRepository, TerminationRequestRepository,
     },
     models::{
         AgentContextMode, AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewIncident,
-        NewProject, NewTerminationRequest, TerminationRequestStatus,
+        NewProject, NewTaskObservation, NewTerminationRequest, TerminationRequestStatus,
     },
     pueue::{PueueApi, PueueTask},
     service::ServiceStatus,
@@ -50,6 +51,34 @@ fn service_lifecycle_commands_parse_without_project_state() {
             _ => panic!("expected {command} service lifecycle command"),
         }
     }
+}
+
+#[test]
+fn cancel_command_requires_one_explicit_task_id() {
+    let cli = pueue_agent::cli::Cli::try_parse_from([
+        "pueue-agent",
+        "cancel",
+        "--task-id",
+        "41",
+        "--json",
+        "project",
+    ])
+    .unwrap();
+    match cli.command {
+        pueue_agent::cli::Command::Cancel(args) => {
+            assert_eq!(args.task_id, 41);
+            assert!(args.json);
+            assert_eq!(
+                args.project_root.as_deref(),
+                Some(std::path::Path::new("project"))
+            );
+        }
+        _ => panic!("expected cancel command"),
+    }
+
+    assert!(pueue_agent::cli::Cli::try_parse_from(["pueue-agent", "cancel"]).is_err());
+    assert!(pueue_agent::cli::Cli::try_parse_from(["pueue-agent", "cancel", "--all"])
+        .is_err());
 }
 
 #[cfg(unix)]
@@ -161,6 +190,7 @@ fn write_service_shim(path: &std::path::Path, contents: &str) {
 struct OperatorPueue {
     tasks: Arc<Mutex<Result<Vec<PueueTask>, String>>>,
     kill_calls: Arc<Mutex<Vec<i64>>>,
+    status_calls: Arc<Mutex<usize>>,
 }
 
 impl OperatorPueue {
@@ -168,17 +198,31 @@ impl OperatorPueue {
         Self {
             tasks: Arc::new(Mutex::new(Ok(tasks))),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
+            status_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn with_status_failure() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(Err("unavailable".to_owned()))),
+            kill_calls: Arc::new(Mutex::new(Vec::new())),
+            status_calls: Arc::new(Mutex::new(0)),
         }
     }
 
     fn kill_calls(&self) -> Vec<i64> {
         self.kill_calls.lock().unwrap().clone()
     }
+
+    fn status_calls(&self) -> usize {
+        *self.status_calls.lock().unwrap()
+    }
 }
 
 #[async_trait]
 impl PueueApi for OperatorPueue {
     async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        *self.status_calls.lock().unwrap() += 1;
         self.tasks
             .lock()
             .unwrap()
@@ -199,6 +243,194 @@ impl PueueApi for OperatorPueue {
 
     async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
         panic!("operator tests must not provision Pueue groups")
+    }
+}
+
+struct CancelHarness {
+    operator: OperatorHarness,
+    pueue: OperatorPueue,
+}
+
+impl CancelHarness {
+    fn with_tasks(tasks: Vec<PueueTask>) -> Self {
+        Self {
+            operator: OperatorHarness::new(),
+            pueue: OperatorPueue::with_tasks(tasks),
+        }
+    }
+
+    fn with_status_failure() -> Self {
+        Self {
+            operator: OperatorHarness::new(),
+            pueue: OperatorPueue::with_status_failure(),
+        }
+    }
+
+    async fn cancel(
+        &self,
+        task_id: i64,
+    ) -> Result<pueue_agent::cancel::CancelResult, AppError> {
+        cancel_task_with(
+            &self.operator.db,
+            &self.operator.project(),
+            &self.pueue,
+            task_id,
+            self.operator.now,
+        )
+        .await
+    }
+
+    fn task(&self, group: &str, state: &str, enqueued_at: &str) -> PueueTask {
+        PueueTask {
+            id: 41,
+            group: group.to_owned(),
+            command: "python train.py".to_owned(),
+            state: state.to_owned(),
+            enqueued_at: Some(enqueued_at.to_owned()),
+            started_at: Some("101".to_owned()),
+            ended_at: None,
+            result: None,
+        }
+    }
+
+    fn record_observation(&self, task: &PueueTask) {
+        TaskObservationRepository::new(&self.operator.db)
+            .upsert(&NewTaskObservation::new(
+                "project-a",
+                pueue_agent::reconcile::task_signature(task),
+                task.id,
+                &task.group,
+                vec![task.command.clone()],
+                &task.state,
+                task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+                task.started_at.as_deref().and_then(|value| value.parse().ok()),
+                task.ended_at.as_deref().and_then(|value| value.parse().ok()),
+                task.result.as_ref().map(ToString::to_string),
+                self.operator.now,
+            ))
+            .unwrap();
+    }
+
+    fn operator_log_contains(&self, action: &str) -> bool {
+        self.operator
+            .operator_log_rows()
+            .iter()
+            .any(|(stored_action, _)| stored_action == action)
+    }
+}
+
+#[tokio::test]
+async fn cancel_kills_only_a_running_task_in_the_project_group() {
+    let harness = CancelHarness::with_tasks(vec![PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: "python train.py".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
+    }]);
+
+    let result = harness.cancel(41).await.unwrap();
+
+    assert!(result.kill_sent);
+    assert_eq!(result.task_id, 41);
+    assert_eq!(result.requested_state, "Running");
+    assert_eq!(result.final_observed_state.as_deref(), Some("Running"));
+    assert_eq!(harness.pueue.kill_calls(), vec![41]);
+    assert_eq!(harness.pueue.status_calls(), 2);
+    assert!(harness.operator_log_contains("cancel"));
+}
+
+#[tokio::test]
+async fn cancel_refuses_status_failure_without_killing() {
+    let harness = CancelHarness::with_status_failure();
+
+    assert!(harness.cancel(41).await.is_err());
+    assert!(harness.pueue.kill_calls().is_empty());
+    assert_eq!(harness.pueue.status_calls(), 1);
+    assert!(!harness.operator_log_contains("cancel"));
+}
+
+#[tokio::test]
+async fn cancel_refuses_other_group_terminal_and_ambiguous_task_ids_without_killing() {
+    for tasks in [
+        vec![cancel_task(41, "other-group", "Running", "100")],
+        vec![cancel_task(41, "pa-project", "Done", "100")],
+        vec![
+            cancel_task(41, "pa-project", "Running", "100"),
+            cancel_task(41, "pa-project", "Running", "200"),
+        ],
+    ] {
+        let harness = CancelHarness::with_tasks(tasks);
+
+        assert!(harness.cancel(41).await.is_err());
+        assert!(harness.pueue.kill_calls().is_empty());
+        assert_eq!(harness.pueue.status_calls(), 1);
+        assert!(!harness.operator_log_contains("cancel"));
+    }
+}
+
+#[tokio::test]
+async fn cancel_refuses_a_reused_task_id_with_a_stale_signature() {
+    let harness = CancelHarness::with_tasks(vec![PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: "python train.py".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("200".to_owned()),
+        started_at: Some("201".to_owned()),
+        ended_at: None,
+        result: None,
+    }]);
+    let stale_task = harness.task("pa-project", "Running", "100");
+    harness.record_observation(&stale_task);
+
+    assert!(harness.cancel(41).await.is_err());
+    assert!(harness.pueue.kill_calls().is_empty());
+    assert_eq!(harness.pueue.status_calls(), 1);
+    assert!(!harness.operator_log_contains("cancel"));
+}
+
+#[tokio::test]
+async fn cancel_renders_human_and_json_final_state() {
+    let harness = CancelHarness::with_tasks(vec![PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: "python train.py".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
+    }]);
+    let result = harness.cancel(41).await.unwrap();
+
+    let human = render_cancel_result(&harness.operator.project(), &result, false);
+    assert!(human.contains("task=41"));
+    assert!(human.contains("state=running"));
+    assert!(human.contains("summary:"));
+
+    let json = render_cancel_result(&harness.operator.project(), &result, true);
+    let body: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["project_id"], "project-a");
+    assert_eq!(body["task_id"], 41);
+    assert_eq!(body["kill_sent"], true);
+    assert_eq!(body["state"], "Running");
+}
+
+fn cancel_task(id: i64, group: &str, state: &str, enqueued_at: &str) -> PueueTask {
+    PueueTask {
+        id,
+        group: group.to_owned(),
+        command: "python train.py".to_owned(),
+        state: state.to_owned(),
+        enqueued_at: Some(enqueued_at.to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
     }
 }
 

@@ -139,6 +139,22 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
 }
 
 #[tokio::test]
+async fn command_adapter_kills_only_the_requested_task_id() {
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+
+    adapter.kill(41).await.unwrap();
+
+    assert_eq!(
+        fixture.captured_args(),
+        vec!["--config", "profile path.yml", "kill", "41"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn command_adapter_provisions_group_without_shell() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);

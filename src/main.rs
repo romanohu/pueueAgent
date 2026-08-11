@@ -41,6 +41,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Init(args) => commands::init(args),
         Command::Enable(args) => commands::enable(args).await,
         Command::Disable(args) => commands::disable(args).await,
+        Command::Cancel(args) => commands::cancel(args).await,
         Command::Submit(args) => commands::submit(args).await,
         Command::SubmitBatch(args) => commands::submit_batch(args).await,
         Command::Event(args) => commands::event(args),
@@ -65,10 +66,11 @@ mod commands {
 
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
+        cancel::{cancel_task_with, render_cancel_result},
         cli::{
-            DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs, SteerAction,
-            SteerArgs, SubmitArgs, SubmitBatchArgs, WakeArgs,
+            CancelArgs, DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs,
+            InitArgs, InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs,
+            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -169,6 +171,20 @@ mod commands {
                 );
             }
         }
+        Ok(())
+    }
+
+    pub async fn cancel(args: CancelArgs) -> Result<(), AppError> {
+        let CancelArgs {
+            task_id,
+            json,
+            pueue_config,
+            project_root,
+        } = args;
+        let (db, project, service_paths) = resolve_project(project_root, pueue_config)?;
+        let pueue = configured_pueue(&service_paths);
+        let result = cancel_task_with(&db, &project, &pueue, task_id, unix_timestamp()?).await?;
+        println!("{}", render_cancel_result(&project, &result, json));
         Ok(())
     }
 
