@@ -12,7 +12,8 @@ use pueue_agent::{
     pueue::{PueueApi, PueueTask},
     service::{
         callback_command, enable_with, install_callback_once, launchd_status_from_output,
-        systemd_status_from_output, CallbackRegistry, EnableOptions, LaunchdAgent,
+        systemd_status_from_load_state_output, systemd_status_from_output, CallbackRegistry,
+        EnableOptions, LaunchdAgent,
         PueueConfigCallbackRegistry, ServiceCommandOutput, ServiceCommandRunner, ServiceControl,
         ServiceDefinition, ServiceManager, ServicePaths, ServicePlatform, ServiceStatus,
     },
@@ -445,6 +446,38 @@ fn systemd_status_classifies_active_stopped_and_unknown_units() {
     assert_eq!(
         systemd_status_from_output(false, b"unknown\n", "Unit pueue-agent.service could not be found.\n"),
         ServiceStatus::NotInstalled
+    );
+}
+
+#[test]
+fn systemd_load_state_classifier_distinguishes_absent_inactive_and_active_units() {
+    assert_eq!(
+        systemd_status_from_load_state_output(true, b"not-found\n", false, b""),
+        ServiceStatus::NotInstalled
+    );
+    assert_eq!(
+        systemd_status_from_load_state_output(true, b"loaded\n", true, b"inactive\n"),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        systemd_status_from_load_state_output(true, b"loaded\n", true, b"failed\n"),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        systemd_status_from_load_state_output(true, b"loaded\n", true, b"active\n"),
+        ServiceStatus::Running
+    );
+}
+
+#[test]
+fn systemd_load_state_classifier_falls_back_safely_on_query_failure() {
+    assert_eq!(
+        systemd_status_from_load_state_output(false, b"", true, b"active\n"),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        systemd_status_from_load_state_output(true, b"loaded\n", false, b""),
+        ServiceStatus::Stopped
     );
 }
 

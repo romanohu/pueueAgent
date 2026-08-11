@@ -602,19 +602,86 @@ fn install_launchd(rendered: &str) -> Result<(), AppError> {
 }
 
 fn systemd_status() -> Result<ServiceStatus, AppError> {
-    let output = Command::new("systemctl")
+    let load_state_output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "pueue-agent.service",
+            "--property=LoadState",
+            "--value",
+        ])
+        .output()
+        .map_err(|source| AppError::Io {
+            operation: "query systemd user service",
+            source,
+        })?;
+    let load_state_details = bounded_redacted_text(&String::from_utf8_lossy(
+        &load_state_output.stderr,
+    ));
+
+    if load_state_output.status.success()
+        && systemd_state_from_output(&load_state_output.stdout) == "not-found"
+    {
+        return Ok(ServiceStatus::NotInstalled);
+    }
+
+    let active_state_output = Command::new("systemctl")
         .args(["--user", "is-active", "pueue-agent.service"])
         .output()
         .map_err(|source| AppError::Io {
             operation: "query systemd user service",
             source,
         })?;
-    let details = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr));
-    Ok(systemd_status_from_output(
-        output.status.success(),
-        &output.stdout,
-        &details,
-    ))
+    let active_state_details = bounded_redacted_text(&String::from_utf8_lossy(
+        &active_state_output.stderr,
+    ));
+
+    if load_state_output.status.success() {
+        Ok(systemd_status_from_load_state_output(
+            true,
+            &load_state_output.stdout,
+            active_state_output.status.success(),
+            &active_state_output.stdout,
+        ))
+    } else {
+        let details = format!("{load_state_details}{active_state_details}");
+        Ok(systemd_status_from_output(
+            active_state_output.status.success(),
+            &active_state_output.stdout,
+            &details,
+        ))
+    }
+}
+
+pub fn systemd_status_from_load_state_output(
+    load_state_command_succeeded: bool,
+    load_state_stdout: &[u8],
+    active_state_command_succeeded: bool,
+    active_state_stdout: &[u8],
+) -> ServiceStatus {
+    if !load_state_command_succeeded {
+        return ServiceStatus::Stopped;
+    }
+
+    match systemd_state_from_output(load_state_stdout).as_str() {
+        "not-found" => ServiceStatus::NotInstalled,
+        "loaded"
+            if active_state_command_succeeded
+                && systemd_state_from_output(active_state_stdout) == "active" =>
+        {
+            ServiceStatus::Running
+        }
+        _ => ServiceStatus::Stopped,
+    }
+}
+
+fn systemd_state_from_output(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 pub fn systemd_status_from_output(
@@ -622,12 +689,7 @@ pub fn systemd_status_from_output(
     stdout: &[u8],
     details: &str,
 ) -> ServiceStatus {
-    let state = String::from_utf8_lossy(stdout)
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let state = systemd_state_from_output(stdout);
 
     match state.as_str() {
         "active" if command_succeeded => ServiceStatus::Running,
