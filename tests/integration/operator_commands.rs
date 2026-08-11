@@ -94,7 +94,7 @@ fn service_lifecycle_commands_report_only_verified_service_state() {
     write_service_shim(&launchctl, "#!/bin/sh\necho 'state = running'\nexit 0\n");
     write_service_shim(
         &systemctl,
-        "#!/bin/sh\nif [ \"$2\" = is-active ]; then echo active; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$2\" = show ]; then echo loaded; fi\nif [ \"$2\" = is-active ]; then echo active; fi\nexit 0\n",
     );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
@@ -134,7 +134,7 @@ fn service_lifecycle_commands_report_only_verified_service_state() {
     );
     write_service_shim(
         &systemctl,
-        "#!/bin/sh\nif [ \"$2\" = is-active ]; then echo inactive; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$2\" = show ]; then echo not-found; fi\nif [ \"$2\" = is-active ]; then echo inactive; fi\nexit 0\n",
     );
     let unverified_start = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -530,6 +530,33 @@ async fn cancel_refuses_a_reused_task_id_with_a_different_stable_identity() {
 
     assert!(harness.cancel(41).await.is_err());
     assert!(harness.pueue.kill_calls().is_empty());
+    assert_eq!(harness.pueue.status_calls(), 1);
+    assert!(!harness.operator_log_contains("cancel"));
+}
+
+#[tokio::test]
+async fn cancel_refuses_task_id_reuse_when_current_and_historical_enqueued_at_are_missing() {
+    let old_task = PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: "old command".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: None,
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
+    };
+    let current_task = PueueTask {
+        command: "new command".to_owned(),
+        started_at: Some("201".to_owned()),
+        ..old_task.clone()
+    };
+    let harness = CancelHarness::with_tasks(vec![current_task]);
+    harness.record_observation(&old_task);
+
+    assert!(harness.cancel(41).await.is_err());
+    assert!(harness.pueue.kill_calls().is_empty());
+    assert!(harness.pueue.remove_calls().is_empty());
     assert_eq!(harness.pueue.status_calls(), 1);
     assert!(!harness.operator_log_contains("cancel"));
 }

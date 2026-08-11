@@ -1000,7 +1000,7 @@ impl UpgradeLock {
             operation: "create upgrade state directory",
             source,
         })?;
-        let coordination_guard = UpgradeCoordinationGuard::acquire_blocking(state_dir)?;
+        let coordination_guard = UpgradeCoordinationGuard::try_acquire(state_dir)?;
         let path = state_dir.join("upgrade.lock");
         let owner_path = path.join("owner");
         for _ in 0..32 {
@@ -1140,10 +1140,6 @@ struct UpgradeCoordinationGuard {
 }
 
 impl UpgradeCoordinationGuard {
-    fn acquire_blocking(state_dir: &Path) -> Result<Self, AppError> {
-        Self::acquire(state_dir, false)
-    }
-
     fn try_acquire(state_dir: &Path) -> Result<Self, AppError> {
         Self::acquire(state_dir, true)
     }
@@ -1691,13 +1687,15 @@ mod tests {
         fs,
         io::Cursor,
         path::Path,
+        sync::mpsc,
+        time::Duration,
     };
 
     use tempfile::TempDir;
 
     use super::{
-        cleanup_failure_suffix, read_capped, run_git, AgentStartUpgradeGuard, GitCommandOutput,
-        GitCommandRunner, UpgradeLock, MAX_RAW_PROCESS_OUTPUT_BYTES,
+        cleanup_failure_suffix, lock_file, read_capped, run_git, AgentStartUpgradeGuard,
+        GitCommandOutput, GitCommandRunner, UpgradeLock, MAX_RAW_PROCESS_OUTPUT_BYTES,
     };
     use crate::{
         db::Db,
@@ -1750,6 +1748,35 @@ mod tests {
             .expect("upgrade coordination guard must exclude agent start");
 
         assert!(matches!(error, AppError::UpgradeInProgress));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn competing_upgrade_rejects_flock_contention_without_waiting() {
+        let temporary = TempDir::new().unwrap();
+        let guard_path = temporary.path().join("upgrade.lock.guard");
+        let guard_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(guard_path)
+            .unwrap();
+        lock_file(&guard_file, false).unwrap();
+
+        let state_dir = temporary.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            sender.send(UpgradeLock::acquire(&state_dir)).unwrap();
+        });
+
+        let immediate_result = receiver.recv_timeout(Duration::from_millis(100));
+        drop(guard_file);
+        let eventual_result = handle.join().unwrap();
+
+        assert!(
+            matches!(immediate_result, Ok(Err(AppError::UpgradeInProgress))),
+            "competing upgrade must reject immediately; eventual result: {eventual_result:?}"
+        );
     }
 
     #[test]
