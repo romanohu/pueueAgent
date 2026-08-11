@@ -1035,7 +1035,7 @@ async fn intervention_recovery_applies_a_reserved_row_attached_to_a_run_with_a_p
 
     assert_eq!(
         harness.intervention_state(&intervention_id),
-        (InterventionStatus::Applied, Some(run_id))
+        (InterventionStatus::Pending, None)
     );
 }
 
@@ -1091,14 +1091,35 @@ async fn first_daemon_cycle_recovers_persisted_runs_and_only_their_claimed_event
         )
         .unwrap();
 
-    let starting_run =
-        harness.insert_active_run("project-a", starting_event, AgentRunStatus::Starting);
-    let running_run =
-        harness.insert_active_run("project-b", running_event, AgentRunStatus::Running);
     let runs = AgentRunRepository::new(&harness.db);
-    runs.attach_event(starting_run, starting_event).unwrap();
-    runs.attach_event(starting_run, completed_event).unwrap();
-    runs.attach_event(running_run, running_event).unwrap();
+    let starting_run = runs
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                starting_event,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                harness.temp.path().join("project-a-starting.log"),
+            ),
+            &[starting_event],
+        )
+        .unwrap()
+        .run_id;
+    let running_run = runs
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-b",
+                running_event,
+                None,
+                AgentRunStatus::Running,
+                harness.now - 10,
+                harness.temp.path().join("project-b-running.log"),
+            ),
+            &[running_event],
+        )
+        .unwrap()
+        .run_id;
 
     let mut daemon = harness.daemon();
     let first = daemon.run_once().await.unwrap();
@@ -1107,7 +1128,8 @@ async fn first_daemon_cycle_recovers_persisted_runs_and_only_their_claimed_event
     let repeated_recovery = restarted_daemon.run_once().await.unwrap();
 
     assert_eq!(first.recovered_agent_runs, 2);
-    assert_eq!(first.requeued_agent_events, 2);
+    assert_eq!(first.requeued_agent_events, 1);
+    assert_eq!(first.dead_lettered_agent_events, 1);
     assert_eq!(second.recovered_agent_runs, 0);
     assert_eq!(second.requeued_agent_events, 0);
     assert_eq!(repeated_recovery.recovered_agent_runs, 0);
@@ -1120,13 +1142,17 @@ async fn first_daemon_cycle_recovers_persisted_runs_and_only_their_claimed_event
             .as_deref()
             .is_some_and(|reason| reason.contains("daemon restart")));
     }
+    assert_eq!(harness.event_status(starting_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(running_event), EventStatus::DeadLetter);
     for event_id in [starting_event, running_event] {
-        let event = EventRepository::new(&harness.db)
-            .find_by_id(event_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.status, EventStatus::Pending);
-        assert_eq!(event.lease_until, None);
+        assert_eq!(
+            EventRepository::new(&harness.db)
+                .find_by_id(event_id)
+                .unwrap()
+                .unwrap()
+                .lease_until,
+            None
+        );
     }
     assert_eq!(
         harness.event_status(completed_event),
@@ -1146,10 +1172,20 @@ async fn startup_recovery_is_atomic_and_retried_after_a_database_failure() {
     harness.pause_project("project-a");
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "atomic-recovery");
     harness.claim_with_lease(event_id, harness.now + 600);
-    let run_id = harness.insert_active_run("project-a", event_id, AgentRunStatus::Starting);
-    AgentRunRepository::new(&harness.db)
-        .attach_event(run_id, event_id)
-        .unwrap();
+    let run_id = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                harness.temp.path().join("atomic-recovery.log"),
+            ),
+            &[event_id],
+        )
+        .unwrap()
+        .run_id;
     harness
         .db
         .connect()
@@ -1170,8 +1206,8 @@ async fn startup_recovery_is_atomic_and_retried_after_a_database_failure() {
         .find_by_id(event_id)
         .unwrap()
         .unwrap();
-    assert_eq!(event.status, EventStatus::Claimed);
-    assert_eq!(event.lease_until, Some(harness.now + 600));
+    assert_eq!(event.status, EventStatus::InFlight);
+    assert_eq!(event.lease_until, None);
     assert_eq!(harness.agent_run_state(run_id).0, AgentRunStatus::Starting);
 
     harness
@@ -1184,8 +1220,154 @@ async fn startup_recovery_is_atomic_and_retried_after_a_database_failure() {
 
     assert_eq!(report.recovered_agent_runs, 1);
     assert_eq!(report.requeued_agent_events, 1);
-    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
     assert_eq!(harness.agent_run_state(run_id).0, AgentRunStatus::Failed);
+}
+
+#[tokio::test]
+async fn startup_recovery_loads_disabled_project_config() {
+    let harness = DaemonHarness::new();
+    harness.register_project("project-b", "pb-project", "/bin/echo");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE projects SET enabled = 0, paused = 1 WHERE project_id = 'project-b'",
+            [],
+        )
+        .unwrap();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-b", "disabled-recovery");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-b",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                harness.temp.path().join("project-b-disabled.log"),
+            ),
+            &[event_id],
+        )
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    let report = daemon.run_once().await.unwrap();
+
+    assert_eq!(report.recovered_agent_runs, 1);
+    assert_eq!(harness.agent_run_state(run.run_id).0, AgentRunStatus::Failed);
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+}
+
+#[tokio::test]
+async fn startup_recovery_rejects_project_identity_mismatch_before_mutation() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "identity-mismatch");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                harness.temp.path().join("identity-mismatch.log"),
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace("pueue_group = \"pa-project\"", "pueue_group = \"wrong-group\""),
+    )
+    .unwrap();
+
+    let mut daemon = harness.daemon();
+    assert!(daemon.run_once().await.is_err());
+    let unchanged_event = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged_event.status, EventStatus::InFlight);
+    assert_eq!(unchanged_event.lease_until, None);
+    assert_eq!(harness.agent_run_state(run.run_id).0, AgentRunStatus::Starting);
+
+    fs::write(&config_path, config).unwrap();
+    let report = daemon.run_once().await.unwrap();
+    assert_eq!(report.recovered_agent_runs, 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.agent_run_state(run.run_id).0, AgentRunStatus::Failed);
+}
+
+#[tokio::test]
+async fn startup_recovery_commits_projects_independently_and_retries_failed_project() {
+    let harness = DaemonHarness::new();
+    harness.register_project("project-b", "pb-project", "/bin/echo");
+    harness.pause_project("project-a");
+    harness.pause_project("project-b");
+    let first_event = harness.enqueue(EventKind::TaskFailed, "project-a", "project-a-recovery");
+    let second_event = harness.enqueue(EventKind::TaskFailed, "project-b", "project-b-recovery");
+    harness.claim_with_lease(first_event, harness.now + 600);
+    harness.claim_with_lease(second_event, harness.now + 600);
+    let runs = AgentRunRepository::new(&harness.db);
+    runs.insert_with_events(
+        &NewAgentRun::new(
+            "project-a",
+            first_event,
+            None,
+            AgentRunStatus::Starting,
+            harness.now - 10,
+            harness.temp.path().join("project-a-recovery.log"),
+        ),
+        &[first_event],
+    )
+    .unwrap();
+    runs.insert_with_events(
+        &NewAgentRun::new(
+            "project-b",
+            second_event,
+            None,
+            AgentRunStatus::Starting,
+            harness.now - 10,
+            harness.temp.path().join("project-b-recovery.log"),
+        ),
+        &[second_event],
+    )
+    .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_project_b_recovery
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN OLD.project_id = 'project-b' AND NEW.status = 'failed'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected project-b recovery failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(first_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(second_event), EventStatus::InFlight);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_project_b_recovery;")
+        .unwrap();
+    let report = daemon.run_once().await.unwrap();
+    assert_eq!(report.recovered_agent_runs, 1);
+    assert_eq!(harness.event_status(second_event), EventStatus::RetryWait);
 }
 
 #[tokio::test]
@@ -1193,20 +1375,30 @@ async fn startup_recovery_runs_before_the_first_scheduling_pass() {
     let harness = DaemonHarness::new();
     let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "restart-dispatch");
     harness.claim_with_lease(event_id, harness.now + 600);
-    let interrupted = harness.insert_active_run("project-a", event_id, AgentRunStatus::Running);
-    AgentRunRepository::new(&harness.db)
-        .attach_event(interrupted, event_id)
-        .unwrap();
+    let interrupted = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Running,
+                harness.now - 10,
+                harness.temp.path().join("restart-dispatch.log"),
+            ),
+            &[event_id],
+        )
+        .unwrap()
+        .run_id;
 
     let mut daemon = harness.daemon();
     let report = daemon.run_once().await.unwrap();
 
     assert_eq!(report.recovered_agent_runs, 1);
-    assert_eq!(report.requeued_agent_events, 1);
-    assert_eq!(harness.agent_run_count(), 2);
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(harness.agent_run_count(), 1);
     assert_eq!(
         harness.agent_run_state(interrupted).0,
         AgentRunStatus::Failed
     );
-    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
 }

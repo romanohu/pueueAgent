@@ -161,6 +161,23 @@ impl<'db> ProjectRepository<'db> {
         Ok(projects)
     }
 
+    pub fn list_all(&self) -> Result<Vec<Project>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                        halted_reason, created_at, updated_at
+                 FROM projects ORDER BY project_id",
+            )
+            .map_err(database_error("prepare all project query"))?;
+        let projects = statement
+            .query_map([], project_from_row)
+            .map_err(database_error("list all projects"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read all projects"))?;
+        Ok(projects)
+    }
+
     pub fn list_active(&self) -> Result<Vec<Project>, AppError> {
         let connection = self.db.connect()?;
         let mut statement = connection
@@ -2880,6 +2897,7 @@ impl From<&Submission> for SubmissionLineage {
 pub struct AgentRunRecovery {
     pub failed_runs: usize,
     pub requeued_events: usize,
+    pub dead_lettered_events: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3035,14 +3053,26 @@ impl<'db> AgentRunRepository<'db> {
         &self,
         finished_at: i64,
         reason: &str,
+        policies: &BTreeMap<String, RetryPolicy>,
     ) -> Result<AgentRunRecovery, AppError> {
+        let projects = ProjectRepository::new(self.db).list_all()?;
+        for project in &projects {
+            if !policies.contains_key(&project.project_id) {
+                return Err(AppError::Validation {
+                    field: "retry_policy",
+                    message: "startup recovery policy is missing for a project",
+                });
+            }
+        }
+
         let marker_confirmed_run_ids = {
             let connection = self.db.connect()?;
             let mut statement = connection
                 .prepare(
                     "SELECT run_id, log_path
                      FROM agent_runs
-                     WHERE launch_gate_state = 'release_requested'",
+                     WHERE status IN ('starting', 'running')
+                       AND launch_gate_state = 'release_requested'",
                 )
                 .map_err(database_error("prepare launch gate recovery marker query"))?;
             let run_logs = statement
@@ -3054,11 +3084,12 @@ impl<'db> AgentRunRepository<'db> {
                 .map_err(database_error("inspect launch gate recovery markers"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(database_error("read launch gate recovery markers"))?;
-            let mut confirmed = Vec::new();
+            let mut confirmed = BTreeSet::new();
             for (run_id, log_path) in run_logs {
                 match fs::metadata(launch_gate_marker_path(&log_path)) {
-                    Ok(metadata) if metadata.is_file() => confirmed.push(run_id),
-                    Ok(_) => {}
+                    Ok(_metadata) => {
+                        confirmed.insert(run_id);
+                    }
                     Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                     Err(source) => {
                         return Err(AppError::Io {
@@ -3070,118 +3101,231 @@ impl<'db> AgentRunRepository<'db> {
             }
             confirmed
         };
-        let mut connection = self.db.connect()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error("begin interrupted agent run recovery"))?;
-        for run_id in marker_confirmed_run_ids {
+        let pre_marker_reason = bounded_redacted_text(&format!(
+            "restart_interruption: pre-marker execution not confirmed ({reason})"
+        ));
+        let execution_unknown_reason = bounded_redacted_text(&format!(
+            "restart_interruption: execution outcome unknown ({reason})"
+        ));
+        let mut recovery = AgentRunRecovery::default();
+
+        for project in projects {
+            let policy = *policies
+                .get(&project.project_id)
+                .ok_or(AppError::Validation {
+                    field: "retry_policy",
+                    message: "startup recovery policy is missing for a project",
+                })?;
+            let mut connection = self.db.connect()?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error("begin project interrupted agent run recovery"))?;
+
+            let active_runs = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT run_id, launch_gate_state
+                         FROM agent_runs
+                         WHERE project_id = ?1 AND status IN ('starting', 'running')
+                         ORDER BY run_id",
+                    )
+                    .map_err(database_error("prepare project interrupted agent runs"))?;
+                let rows = statement
+                    .query_map([&project.project_id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(database_error("query project interrupted agent runs"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(database_error("read project interrupted agent runs"))?;
+                rows
+            };
+
+            for (run_id, gate_state) in active_runs {
+                let linked_events = {
+                    let mut statement = transaction
+                        .prepare(
+                            "SELECT events.event_id, events.status, events.attempts
+                             FROM agent_run_events
+                             JOIN events
+                               ON events.project_id = agent_run_events.project_id
+                              AND events.event_id = agent_run_events.event_id
+                             WHERE agent_run_events.project_id = ?1
+                               AND agent_run_events.run_id = ?2
+                             ORDER BY events.event_id",
+                        )
+                        .map_err(database_error("prepare project recovery event query"))?;
+                    let rows = statement
+                        .query_map(params![&project.project_id, run_id], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, EventStatus>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })
+                        .map_err(database_error("query project recovery events"))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error("read project recovery events"))?;
+                    rows
+                };
+                let execution_unknown = marker_confirmed_run_ids.contains(&run_id)
+                    || gate_state == "released"
+                    || linked_events
+                        .iter()
+                        .any(|(_, status, _)| *status == EventStatus::Dispatched);
+                if linked_events.iter().any(|(_, status, _)| {
+                    if execution_unknown {
+                        !matches!(status, EventStatus::InFlight | EventStatus::Dispatched)
+                    } else {
+                        *status != EventStatus::InFlight
+                    }
+                }) {
+                    return Err(AppError::Validation {
+                        field: "event_status",
+                        message: "linked event is not in the expected startup recovery state",
+                    });
+                }
+                let recovery_reason = if execution_unknown {
+                    &execution_unknown_reason
+                } else {
+                    &pre_marker_reason
+                };
+
+                for (event_id, event_status, attempts) in linked_events {
+                    let (status, not_before, completed_at) = if execution_unknown
+                        && matches!(event_status, EventStatus::InFlight | EventStatus::Dispatched)
+                    {
+                        (
+                            EventStatus::DeadLetter,
+                            None,
+                            Some(finished_at),
+                        )
+                    } else if !execution_unknown && event_status == EventStatus::InFlight {
+                        match retry_decision(attempts, finished_at, policy) {
+                            RetryDecision::Retry { not_before } => {
+                                (EventStatus::RetryWait, Some(not_before), None)
+                            }
+                            RetryDecision::DeadLetter => {
+                                (EventStatus::DeadLetter, None, Some(finished_at))
+                            }
+                        }
+                    } else {
+                        return Err(AppError::Validation {
+                            field: "event_status",
+                            message: "linked event is not recoverable during startup",
+                        });
+                    };
+                    let changed = transaction
+                        .execute(
+                            "UPDATE events
+                             SET status = ?1, lease_until = NULL,
+                                 not_before = CASE
+                                     WHEN ?1 = 'dead_letter' THEN not_before
+                                     ELSE ?2
+                                 END,
+                                 completed_at = ?3, last_error = ?4
+                             WHERE project_id = ?5 AND event_id = ?6 AND status = ?7",
+                            params![
+                                status,
+                                not_before,
+                                completed_at,
+                                recovery_reason,
+                                &project.project_id,
+                                event_id,
+                                event_status,
+                            ],
+                        )
+                        .map_err(database_error("resolve project interrupted event"))?;
+                    if changed != 1 {
+                        return Err(AppError::Runtime {
+                            operation: "resolve project interrupted event",
+                        });
+                    }
+                    match status {
+                        EventStatus::RetryWait => recovery.requeued_events += 1,
+                        EventStatus::DeadLetter => recovery.dead_lettered_events += 1,
+                        _ => {}
+                    }
+                }
+
+                let intervention_statuses = if execution_unknown {
+                    "status = 'reserved'"
+                } else {
+                    "status IN ('reserved', 'applied')"
+                };
+                transaction
+                    .execute(
+                        &format!(
+                            "UPDATE interventions
+                             SET status = 'pending', reserved_at = NULL, applied_at = NULL,
+                                 agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                             WHERE project_id = ?1 AND agent_run_id = ?2 AND {intervention_statuses}"
+                        ),
+                        params![&project.project_id, run_id],
+                    )
+                    .map_err(database_error("release project interrupted interventions"))?;
+
+                let final_gate = if execution_unknown { "released" } else { "failed" };
+                let changed = transaction
+                    .execute(
+                        "UPDATE agent_runs
+                         SET status = 'failed', finished_at = ?1, last_error = ?2,
+                             launch_gate_state = ?3
+                         WHERE project_id = ?4 AND run_id = ?5
+                           AND status IN ('starting', 'running')",
+                        params![
+                            finished_at,
+                            recovery_reason,
+                            final_gate,
+                            &project.project_id,
+                            run_id,
+                        ],
+                    )
+                    .map_err(database_error("fail project interrupted agent run"))?;
+                if changed != 1 {
+                    return Err(AppError::Runtime {
+                        operation: "fail project interrupted agent run",
+                    });
+                }
+                recovery.failed_runs += 1;
+            }
+
             transaction
                 .execute(
-                    "UPDATE agent_runs
-                     SET launch_gate_state = 'released'
-                     WHERE run_id = ?1 AND launch_gate_state = 'release_requested'",
-                    [run_id],
+                    "UPDATE interventions
+                     SET status = 'pending', reserved_at = NULL, applied_at = NULL,
+                         agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                     WHERE project_id = ?1 AND status = 'reserved'
+                       AND agent_run_id IS NULL AND lease_expires_at <= ?2",
+                    params![&project.project_id, finished_at],
                 )
-                .map_err(database_error("promote marker-confirmed agent launch gate"))?;
+                .map_err(database_error(
+                    "recover expired project interventions",
+                ))?;
+            transaction
+                .execute(
+                    "UPDATE interventions
+                     SET status = 'pending', reserved_at = NULL, applied_at = NULL,
+                         agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                     WHERE project_id = ?1 AND agent_run_id IS NOT NULL
+                       AND status IN ('reserved', 'applied')
+                       AND EXISTS (
+                           SELECT 1 FROM agent_runs
+                           WHERE agent_runs.project_id = interventions.project_id
+                             AND agent_runs.run_id = interventions.agent_run_id
+                             AND agent_runs.status = 'failed'
+                             AND agent_runs.launch_gate_state IN ('pending', 'release_requested', 'failed')
+                       )",
+                    [&project.project_id],
+                )
+                .map_err(database_error(
+                    "release stale pre-marker project interventions",
+                ))?;
+            transaction
+                .commit()
+                .map_err(database_error("commit project interrupted agent run recovery"))?;
         }
-        transaction
-            .execute(
-                "UPDATE interventions
-                 SET status = ?1, applied_at = ?2, lease_expires_at = NULL,
-                     reservation_token = NULL
-                 WHERE status = ?3 AND agent_run_id IS NOT NULL
-                   AND EXISTS (
-                       SELECT 1 FROM agent_runs
-                       WHERE agent_runs.project_id = interventions.project_id
-                         AND agent_runs.run_id = interventions.agent_run_id
-                         AND agent_runs.launch_gate_state = 'released'
-                         AND (agent_runs.pid IS NOT NULL OR agent_runs.status = 'running')
-                   )",
-                params![
-                    InterventionStatus::Applied,
-                    finished_at,
-                    InterventionStatus::Reserved,
-                ],
-            )
-            .map_err(database_error(
-                "apply delivered interventions during agent run recovery",
-            ))?;
-        transaction
-            .execute(
-                "UPDATE interventions
-                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
-                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
-                 WHERE status IN (?2, ?3) AND agent_run_id IS NOT NULL
-                   AND EXISTS (
-                       SELECT 1 FROM agent_runs
-                       WHERE agent_runs.project_id = interventions.project_id
-                         AND agent_runs.run_id = interventions.agent_run_id
-                         AND (
-                             agent_runs.launch_gate_state IN ('pending', 'release_requested', 'failed')
-                             OR (agent_runs.pid IS NULL AND agent_runs.status <> 'running')
-                         )
-                   )",
-                params![
-                    InterventionStatus::Pending,
-                    InterventionStatus::Reserved,
-                    InterventionStatus::Applied,
-                ],
-            )
-            .map_err(database_error(
-                "release undelivered interventions during agent run recovery",
-            ))?;
-        transaction
-            .execute(
-                "UPDATE interventions
-                 SET status = ?1, reserved_at = NULL, applied_at = NULL,
-                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
-                 WHERE status = ?2 AND agent_run_id IS NULL AND lease_expires_at <= ?3",
-                params![
-                    InterventionStatus::Pending,
-                    InterventionStatus::Reserved,
-                    finished_at,
-                ],
-            )
-            .map_err(database_error(
-                "recover expired interventions during agent run recovery",
-            ))?;
-        let requeued_events = transaction
-            .execute(
-                "UPDATE events
-                 SET status = 'pending', lease_until = NULL
-                 WHERE status = 'claimed'
-                   AND event_id IN (
-                       SELECT agent_run_events.event_id
-                       FROM agent_run_events
-                       JOIN agent_runs
-                         ON agent_runs.run_id = agent_run_events.run_id
-                        AND agent_runs.project_id = agent_run_events.project_id
-                       WHERE agent_runs.status IN ('starting', 'running')
-                   )",
-                [],
-            )
-            .map_err(database_error(
-                "requeue events attached to interrupted agent runs",
-            ))?;
-        let failed_runs = transaction
-            .execute(
-                "UPDATE agent_runs
-                 SET status = 'failed', finished_at = ?1, last_error = ?2,
-                     launch_gate_state = CASE
-                         WHEN launch_gate_state IN ('pending', 'release_requested') THEN 'failed'
-                         ELSE launch_gate_state
-                     END
-                 WHERE status IN ('starting', 'running')",
-                params![finished_at, reason],
-            )
-            .map_err(database_error("fail interrupted agent runs"))?;
-        transaction
-            .commit()
-            .map_err(database_error("commit interrupted agent run recovery"))?;
-        Ok(AgentRunRecovery {
-            failed_runs,
-            requeued_events,
-        })
+
+        Ok(recovery)
     }
 
     pub fn attach_event(&self, run_id: i64, event_id: i64) -> Result<AgentRunEvent, AppError> {

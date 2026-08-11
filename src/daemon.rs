@@ -12,6 +12,7 @@ use crate::{
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
     reconcile::{ReconcileReport, Reconciler},
+    retry::RetryPolicy,
     scheduler::{Scheduler, SchedulerConfig, SchedulerReport},
     termination::{TerminationManager, TerminationOutcome},
     AppError,
@@ -50,6 +51,7 @@ pub struct DaemonReport {
     pub finished_agents: usize,
     pub recovered_agent_runs: usize,
     pub requeued_agent_events: usize,
+    pub dead_lettered_agent_events: usize,
 }
 
 pub struct Daemon<P> {
@@ -106,11 +108,13 @@ where
         let mut report = DaemonReport::default();
 
         if self.startup_recovery_pending {
+            let policies = self.load_startup_retry_policies()?;
             let recovery = AgentRunRepository::new(&self.db)
-                .recover_interrupted(now, DAEMON_RESTART_REASON)?;
+                .recover_interrupted(now, DAEMON_RESTART_REASON, &policies)?;
             self.startup_recovery_pending = false;
             report.recovered_agent_runs = recovery.failed_runs;
             report.requeued_agent_events = recovery.requeued_events;
+            report.dead_lettered_agent_events = recovery.dead_lettered_events;
         }
 
         report.finished_agents += self.poll_agents_at(now).await?;
@@ -159,6 +163,33 @@ where
         report.finished_agents += self.poll_agents_at(now).await?;
         report.reconciliation = reconciliation;
         Ok(report)
+    }
+
+    pub fn load_startup_retry_policies(&self) -> Result<BTreeMap<String, RetryPolicy>, AppError> {
+        let projects = ProjectRepository::new(&self.db).list_all()?;
+        let mut policies = BTreeMap::new();
+        for project in projects {
+            let project_config = config::load(&project.config_path)?;
+            if project_config.project_id != project.project_id {
+                return Err(AppError::Validation {
+                    field: "project_id",
+                    message: "project config identity does not match the database project",
+                });
+            }
+            if project_config.pueue_group != project.pueue_group {
+                return Err(AppError::Validation {
+                    field: "pueue_group",
+                    message: "project config group does not match the database project",
+                });
+            }
+            policies.insert(
+                project.project_id,
+                RetryPolicy {
+                    max_retries: project_config.agent.max_retries,
+                },
+            );
+        }
+        Ok(policies)
     }
 
     async fn run_detection(&self, reconciliation: &ReconcileReport) -> Result<usize, AppError> {

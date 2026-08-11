@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
@@ -2571,7 +2572,14 @@ fn startup_recovery_requeues_applied_interventions_after_release_request_before_
     runs.mark_gate_release_requested("project-a", run.run_id)
         .unwrap();
 
-    runs.recover_interrupted(140, "daemon restarted before launch gate acknowledgement")
+    runs.recover_interrupted(
+        140,
+        "daemon restarted before launch gate acknowledgement",
+        &BTreeMap::from([(
+            "project-a".to_owned(),
+            RetryPolicy { max_retries: 1 },
+        )]),
+    )
         .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
@@ -2596,6 +2604,207 @@ fn startup_recovery_requeues_applied_interventions_after_release_request_before_
         .unwrap();
     assert_eq!(intervention_state, (InterventionStatus::Pending, None));
     assert_eq!(run_state, (AgentRunStatus::Failed, "failed".to_owned()));
+}
+
+#[test]
+fn startup_recovery_retries_pre_marker_inflight_events() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "startup-pre-marker-retry");
+    let runs = AgentRunRepository::new(&test.db);
+
+    let recovery = runs
+        .recover_interrupted(
+            140,
+            "daemon restarted",
+            &BTreeMap::from([(
+                "project-a".to_owned(),
+                RetryPolicy { max_retries: 2 },
+            )]),
+        )
+        .unwrap();
+
+    assert_eq!(recovery.failed_runs, 1);
+    assert_eq!(recovery.requeued_events, 1);
+    assert_eq!(recovery.dead_lettered_events, 0);
+    let event = EventRepository::new(&test.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, EventStatus::RetryWait);
+    let reason = event.last_error.unwrap();
+    assert!(reason.contains("pre-marker"));
+    assert!(!reason.contains("execution outcome unknown"));
+    assert_eq!(
+        test.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, finished_at FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get::<_, AgentRunStatus>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap(),
+        (AgentRunStatus::Failed, Some(140))
+    );
+}
+
+#[test]
+fn startup_recovery_dead_letters_marker_released_and_dispatched_events() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "startup-dispatched-unknown");
+    let runs = AgentRunRepository::new(&test.db);
+    runs.mark_gate_release_requested("project-a", run_id).unwrap();
+    runs.acknowledge_dispatch("project-a", run_id).unwrap();
+
+    let recovery = runs
+        .recover_interrupted(
+            140,
+            "restart_interruption: execution outcome unknown",
+            &BTreeMap::from([(
+                "project-a".to_owned(),
+                RetryPolicy { max_retries: 99 },
+            )]),
+        )
+        .unwrap();
+
+    assert_eq!(recovery.dead_lettered_events, 1);
+    assert_eq!(recovery.requeued_events, 0);
+    assert_eq!(EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap().status, EventStatus::DeadLetter);
+    assert_eq!(
+        test.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get::<_, AgentRunStatus>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        (AgentRunStatus::Failed, "released".to_owned())
+    );
+}
+
+#[test]
+fn startup_recovery_leaves_unexpired_unbound_claim_until_lease_expiry() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "startup-unbound-claim", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let before = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+
+    AgentRunRepository::new(&test.db)
+        .recover_interrupted(
+            140,
+            "restart_interruption: execution outcome unknown",
+            &BTreeMap::from([(
+                "project-a".to_owned(),
+                RetryPolicy { max_retries: 0 },
+            )]),
+        )
+        .unwrap();
+    let during = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    assert_eq!(during.status, EventStatus::Claimed);
+    assert_eq!(during.attempts, before.attempts);
+    assert_eq!(during.lease_until, Some(200));
+
+    EventRepository::new(&test.db)
+        .recover_expired_claims(201)
+        .unwrap();
+    let after = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    assert_eq!(after.status, EventStatus::Pending);
+    assert_eq!(after.attempts, 0);
+    assert_eq!(after.lease_until, None);
+}
+
+#[test]
+fn startup_recovery_treats_non_file_marker_as_execution_unknown() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "startup-directory-marker", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let log_path = test._temp.path().join("startup-directory-marker.log");
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    fs::create_dir_all(&marker_path).unwrap();
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+
+    runs.recover_interrupted(
+        140,
+        "daemon restarted",
+        &BTreeMap::from([(
+            "project-a".to_owned(),
+            RetryPolicy { max_retries: 99 },
+        )]),
+    )
+    .unwrap();
+
+    let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.not_before, 100);
+    let reason = event.last_error.unwrap();
+    assert!(reason.contains("execution outcome unknown"));
+    assert!(!reason.contains("pre-marker"));
+}
+
+#[test]
+fn startup_recovery_rejects_unexpected_linked_claimed_state_atomically() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "startup-linked-claim", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            120,
+            test._temp.path().join("startup-linked-claim.log"),
+        ))
+        .unwrap();
+    runs.attach_event(run.run_id, event_id).unwrap();
+
+    assert!(runs
+        .recover_interrupted(
+            140,
+            "daemon restarted",
+            &BTreeMap::from([(
+                "project-a".to_owned(),
+                RetryPolicy { max_retries: 1 },
+            )]),
+        )
+        .is_err());
+    let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    assert_eq!(event.status, EventStatus::Claimed);
+    assert_eq!(event.lease_until, Some(200));
+    assert_eq!(
+        runs.find_active_by_project("project-a").unwrap().unwrap().status,
+        AgentRunStatus::Starting
+    );
 }
 
 #[test]
@@ -2637,7 +2846,14 @@ fn startup_recovery_promotes_marker_confirmed_release_request_and_retains_applie
         .unwrap();
     fs::write(&marker_path, b"started\n").unwrap();
 
-    runs.recover_interrupted(140, "daemon restarted after child spawn")
+    runs.recover_interrupted(
+        140,
+        "daemon restarted after child spawn",
+        &BTreeMap::from([(
+            "project-a".to_owned(),
+            RetryPolicy { max_retries: 1 },
+        )]),
+    )
         .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
@@ -2733,7 +2949,14 @@ fn startup_recovery_requeues_an_applied_intervention_before_gate_release() {
     runs.mark_running_and_apply_interventions("project-a", run.run_id, 4243, 130)
         .unwrap();
 
-    runs.recover_interrupted(140, "daemon restarted before gate release")
+    runs.recover_interrupted(
+        140,
+        "daemon restarted before gate release",
+        &BTreeMap::from([(
+            "project-a".to_owned(),
+            RetryPolicy { max_retries: 1 },
+        )]),
+    )
         .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
@@ -2797,7 +3020,14 @@ fn confirmed_gate_release_does_not_requeue_applied_interventions_on_recovery() {
         .unwrap();
     runs.mark_gate_released("project-a", run.run_id).unwrap();
 
-    runs.recover_interrupted(140, "daemon restarted after gate release")
+    runs.recover_interrupted(
+        140,
+        "daemon restarted after gate release",
+        &BTreeMap::from([(
+            "project-a".to_owned(),
+            RetryPolicy { max_retries: 1 },
+        )]),
+    )
         .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
