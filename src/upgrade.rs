@@ -149,8 +149,6 @@ pub fn validate_checkout_with<R: GitCommandRunner>(
         });
     }
 
-    run_git(runner, &source, &["fetch", remote, branch])?;
-
     let head = git_stdout(runner, &source, &["rev-parse", "HEAD"])?;
     let upstream_head = git_stdout(runner, &source, &["rev-parse", &expected_upstream])?;
     let ancestry = runner.run(

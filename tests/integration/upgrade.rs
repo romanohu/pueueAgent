@@ -5,7 +5,13 @@ use std::{
     process::Command,
 };
 
-use pueue_agent::upgrade::{resolve_source_root, validate_checkout};
+use pueue_agent::{
+    upgrade::{
+        resolve_source_root, validate_checkout, validate_checkout_with, GitCommandOutput,
+        GitCommandRunner,
+    },
+    AppError,
+};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -78,10 +84,36 @@ impl UpgradeFixture {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Default)]
 struct FakeCommandRunner {
     invocations: RefCell<Vec<Vec<String>>>,
+}
+
+impl GitCommandRunner for FakeCommandRunner {
+    fn run(&self, _source: &Path, args: &[&str]) -> Result<GitCommandOutput, AppError> {
+        self.invocations
+            .borrow_mut()
+            .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+
+        let (success, stdout) = match args {
+            ["status", "--porcelain"] => (true, ""),
+            ["branch", "--show-current"] => (true, "main"),
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"] => {
+                (true, "origin/main")
+            }
+            ["fetch", "origin", "main"] => (true, ""),
+            ["rev-parse", "HEAD"] => (true, "local-head"),
+            ["rev-parse", "origin/main"] => (true, "remote-head"),
+            ["merge-base", "--is-ancestor", "HEAD", "origin/main"] => (true, ""),
+            _ => panic!("unexpected git arguments: {args:?}"),
+        };
+
+        Ok(GitCommandOutput {
+            success,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -170,6 +202,26 @@ fn clean_main_checkout_tracking_origin_main_is_accepted() {
 
     assert_eq!(state.branch, "main");
     assert_eq!(state.upstream, "origin/main");
+}
+
+#[test]
+fn checkout_validation_does_not_issue_fetch_commands() {
+    let fixture = UpgradeFixture::new();
+
+    validate_checkout_with(
+        fixture.source_root(),
+        "main",
+        "origin",
+        &fixture.commands,
+    )
+    .unwrap();
+
+    assert!(fixture
+        .commands
+        .invocations
+        .borrow()
+        .iter()
+        .all(|args| args.first().is_none_or(|command| command != "fetch")));
 }
 
 #[test]
