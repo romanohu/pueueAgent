@@ -624,6 +624,8 @@ where
             .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
         let backup = temporary_path(&state_dir, "upgrade-backup")
             .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        let database_backup = temporary_path(&state_dir, "upgrade-database-backup")
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
 
         report.install = UpgradeStep::attempted();
         if let Err(error) = copy_file(
@@ -633,7 +635,10 @@ where
         ) {
             return Err(UpgradeFailure::with_report(
                 report,
-                with_cleanup_failure(error, &[&install_candidate, &backup]),
+                with_cleanup_failure(
+                    error,
+                    &[&install_candidate, &backup, &database_backup],
+                ),
             ));
         }
         if let Err(error) = copy_file(
@@ -643,13 +648,28 @@ where
         ) {
             return Err(UpgradeFailure::with_report(
                 report,
-                with_cleanup_failure(error, &[&install_candidate, &backup]),
+                with_cleanup_failure(
+                    error,
+                    &[&install_candidate, &backup, &database_backup],
+                ),
             ));
         }
         if let Err(error) = self.reject_active_agent_runs() {
             return Err(UpgradeFailure::with_report(
                 report,
-                with_cleanup_failure(error, &[&install_candidate, &backup]),
+                with_cleanup_failure(
+                    error,
+                    &[&install_candidate, &backup, &database_backup],
+                ),
+            ));
+        }
+        if let Err(error) = self.snapshot_database(&database_backup) {
+            return Err(UpgradeFailure::with_report(
+                report,
+                with_cleanup_failure(
+                    error,
+                    &[&install_candidate, &backup, &database_backup],
+                ),
             ));
         }
         if let Err(error) = fs::rename(&install_candidate, &install_target) {
@@ -660,7 +680,7 @@ where
                         operation: "atomically install upgrade candidate",
                         source: error,
                     },
-                    &[&install_candidate, &backup],
+                    &[&install_candidate, &backup, &database_backup],
                 ),
             ));
         }
@@ -670,6 +690,7 @@ where
         if let Err(error) = self.service.restart() {
             return Err(self.rollback_after_post_install_failure(
                 &backup,
+                &database_backup,
                 &install_target,
                 report,
                 error,
@@ -681,6 +702,7 @@ where
         if let Err(error) = self.check_health(&source) {
             return Err(self.rollback_after_post_install_failure(
                 &backup,
+                &database_backup,
                 &install_target,
                 report,
                 error,
@@ -688,6 +710,8 @@ where
         }
         report.health = UpgradeStep::succeeded();
         remove_file_if_present(&backup)
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        remove_file_if_present(&database_backup)
             .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
         remove_retry_marker(&retry_marker_path)
             .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
@@ -783,22 +807,56 @@ where
         validate_pueue_status_shape(&status)
     }
 
+    fn snapshot_database(&self, destination: &Path) -> Result<(), AppError> {
+        let connection = self.db.connect()?;
+        let destination = destination.to_string_lossy().into_owned();
+        connection
+            .execute("VACUUM INTO ?1", [&destination])
+            .map(|_| ())
+            .map_err(|source| AppError::Database {
+                operation: "create upgrade SQLite snapshot",
+                source,
+            })
+    }
+
     fn rollback_after_post_install_failure(
         &self,
         backup: &Path,
+        database_backup: &Path,
         install_target: &Path,
         mut report: UpgradeReport,
         failure: AppError,
     ) -> UpgradeFailure {
-        let restore = self.restore_backup(backup, install_target);
-        let restart = self.service.restart();
+        let stop = self.service.stop();
+        let service_stopped = stop.is_ok();
+        let database_restore = if service_stopped {
+            self.restore_database_snapshot(database_backup)
+        } else {
+            Err(AppError::Message {
+                message: "database restore skipped because service stop failed".to_owned(),
+            })
+        };
+        let restore = if service_stopped {
+            self.restore_backup(backup, install_target)
+        } else {
+            Err(AppError::Message {
+                message: "binary restore skipped because service stop failed".to_owned(),
+            })
+        };
+        let restart = if service_stopped && database_restore.is_ok() && restore.is_ok() {
+            self.service.restart()
+        } else {
+            Err(AppError::Message {
+                message: "service restart skipped because rollback restore failed".to_owned(),
+            })
+        };
         let rollback_health = if restart.is_ok() {
             self.check_service_health()
         } else {
             Ok(())
         };
-        match (restore, restart, rollback_health) {
-            (Ok(()), Ok(()), Ok(())) => {
+        match (stop, database_restore, restore, restart, rollback_health) {
+            (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => {
                 report.rollback = UpgradeRollback::Succeeded;
                 UpgradeFailure::with_report(
                     report,
@@ -806,15 +864,19 @@ where
                         message: format!(
                             "upgrade failed after installation: {}; rollback succeeded{}",
                             bounded_redacted_text(&failure.to_string()),
-                            cleanup_failure_suffix(&[backup])
+                            cleanup_failure_suffix(&[backup, database_backup])
                         ),
                     },
                 )
             }
-            (restore, restart, rollback_health) => {
+            (stop, database_restore, restore, restart, rollback_health) => {
                 report.rollback = UpgradeRollback::Failed;
                 let details = [
-                    restore.err().map(|error| format!("restore: {error}")),
+                    stop.err().map(|error| format!("service stop: {error}")),
+                    database_restore
+                        .err()
+                        .map(|error| format!("database restore: {error}")),
+                    restore.err().map(|error| format!("binary restore: {error}")),
                     restart.err().map(|error| format!("service restart: {error}")),
                     rollback_health
                         .err()
@@ -836,6 +898,41 @@ where
                 )
             }
         }
+    }
+
+    fn restore_database_snapshot(&self, backup: &Path) -> Result<(), AppError> {
+        let database_path = self.db.path();
+        let state_dir = database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| AppError::Message {
+                message: "upgrade database path has no state directory".to_owned(),
+            })?;
+        let restore_candidate = temporary_path(state_dir, "upgrade-database-rollback")?;
+        if let Err(error) = copy_file(
+            backup,
+            &restore_candidate,
+            "copy upgrade SQLite snapshot for rollback",
+        ) {
+            return Err(with_cleanup_failure(error, &[&restore_candidate]));
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = database_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            if let Err(error) = remove_file_if_present(Path::new(&sidecar)) {
+                return Err(with_cleanup_failure(error, &[&restore_candidate]));
+            }
+        }
+        if let Err(error) = fs::rename(&restore_candidate, database_path) {
+            return Err(with_cleanup_failure(
+                AppError::Io {
+                    operation: "atomically restore upgrade SQLite snapshot",
+                    source: error,
+                },
+                &[&restore_candidate],
+            ));
+        }
+        Ok(())
     }
 
     fn restore_backup(&self, backup: &Path, install_target: &Path) -> Result<(), AppError> {

@@ -145,9 +145,9 @@ impl UpgradeFixture {
             temp,
             source: source.canonicalize().unwrap(),
             installed_binary,
-            db,
+            db: db.clone(),
             commands: FakeCommandRunner::default(),
-            service: FakeServiceRecorder::default(),
+            service: FakeServiceRecorder::with_db(db.clone()),
         }
     }
 
@@ -341,6 +341,49 @@ impl UpgradeFixture {
     fn state_dir(&self) -> &Path {
         self.db.path().parent().unwrap()
     }
+
+    fn set_database_marker(&self, value: &str) {
+        let connection = self.db.connect().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS upgrade_fixture_marker (value TEXT NOT NULL);
+                 DELETE FROM upgrade_fixture_marker;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upgrade_fixture_marker (value) VALUES (?1)",
+                [value],
+            )
+            .unwrap();
+    }
+
+    fn database_marker(&self) -> String {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM upgrade_fixture_marker ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn database_backups(&self) -> Vec<PathBuf> {
+        fs::read_dir(self.state_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| {
+                        name.to_string_lossy()
+                            .starts_with(".upgrade-database-backup-")
+                    })
+            })
+            .collect()
+    }
 }
 
 struct ActiveRunPlan {
@@ -528,9 +571,12 @@ impl UpgradeCommandRunner for FakeCommandRunner {
 
 struct FakeServiceRecorder {
     actions: RefCell<Vec<String>>,
+    database: RefCell<Option<Db>>,
     status: Cell<ServiceStatus>,
     status_sequence: RefCell<Vec<ServiceStatus>>,
     failed_restarts_remaining: Cell<u8>,
+    failed_stops_remaining: Cell<u8>,
+    mutate_database_on_first_restart: Cell<bool>,
 }
 
 impl Default for FakeServiceRecorder {
@@ -543,10 +589,23 @@ impl FakeServiceRecorder {
     fn running() -> Self {
         Self {
             actions: RefCell::new(Vec::new()),
+            database: RefCell::new(None),
             status: Cell::new(ServiceStatus::Running),
             status_sequence: RefCell::new(Vec::new()),
             failed_restarts_remaining: Cell::new(0),
+            failed_stops_remaining: Cell::new(0),
+            mutate_database_on_first_restart: Cell::new(false),
         }
+    }
+
+    fn with_db(db: Db) -> Self {
+        let service = Self::running();
+        *service.database.borrow_mut() = Some(db);
+        service
+    }
+
+    fn mutate_database_on_first_restart(&self) {
+        self.mutate_database_on_first_restart.set(true);
     }
 
     fn set_statuses(&self, statuses: impl IntoIterator<Item = ServiceStatus>) {
@@ -555,6 +614,10 @@ impl FakeServiceRecorder {
 
     fn fail_restarts(&self, count: u8) {
         self.failed_restarts_remaining.set(count);
+    }
+
+    fn fail_stops(&self, count: u8) {
+        self.failed_stops_remaining.set(count);
     }
 }
 
@@ -568,7 +631,15 @@ impl ServiceControl for FakeServiceRecorder {
     }
 
     fn stop(&self) -> Result<(), AppError> {
-        panic!("upgrade must not stop the service separately")
+        self.actions.borrow_mut().push("stop".to_owned());
+        let remaining = self.failed_stops_remaining.get();
+        if remaining > 0 {
+            self.failed_stops_remaining.set(remaining - 1);
+            return Err(AppError::Message {
+                message: "fake stop failure".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn restart(&self) -> Result<(), AppError> {
@@ -579,6 +650,15 @@ impl ServiceControl for FakeServiceRecorder {
             return Err(AppError::Message {
                 message: "fake restart failure".to_owned(),
             });
+        }
+        if self.mutate_database_on_first_restart.replace(false) {
+            let connection = self.database.borrow().as_ref().unwrap().connect().unwrap();
+            connection
+                .execute(
+                    "UPDATE upgrade_fixture_marker SET value = 'candidate'",
+                    [],
+                )
+                .unwrap();
         }
         Ok(())
     }
@@ -780,6 +860,7 @@ async fn successful_upgrade_fast_forwards_builds_installs_and_checks_health() {
     assert_eq!(report.rollback, UpgradeRollback::NotRequired);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::new_binary_bytes());
     assert_eq!(fixture.service_calls(), ["restart"]);
+    assert!(fixture.database_backups().is_empty());
     assert!(fixture.commands.invocations.borrow().iter().any(|arguments| {
         arguments == &vec!["merge".to_owned(), "--ff-only".to_owned(), "origin/main".to_owned()]
     }));
@@ -914,13 +995,17 @@ async fn build_failure_leaves_installed_binary_and_service_unchanged() {
 #[tokio::test]
 async fn service_health_failure_restores_previous_binary() {
     let fixture = UpgradeFixture::service_failure();
+    fixture.set_database_marker("old");
+    fixture.service.mutate_database_on_first_restart();
 
     let failure = fixture.run_upgrade().await.unwrap_err();
 
     assert!(failure.to_string().contains("rollback"));
     assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["restart", "restart"]);
+    assert_eq!(fixture.database_marker(), "old");
+    assert_eq!(fixture.service_calls(), ["restart", "stop", "restart"]);
+    assert!(fixture.database_backups().is_empty());
 }
 
 #[tokio::test]
@@ -932,7 +1017,7 @@ async fn pueue_health_failure_restores_previous_binary_without_touching_experime
     assert!(failure.to_string().contains("rollback"));
     assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["restart", "restart"]);
+    assert_eq!(fixture.service_calls(), ["restart", "stop", "restart"]);
     assert!(fixture
         .commands
         .command_invocations
@@ -1098,7 +1183,7 @@ async fn invalid_pueue_status_json_triggers_rollback() {
     assert!(failure.to_string().contains("Pueue"));
     assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["restart", "restart"]);
+    assert_eq!(fixture.service_calls(), ["restart", "stop", "restart"]);
 }
 
 #[tokio::test]
@@ -1155,7 +1240,21 @@ async fn rollback_failure_is_exposed_in_the_failure_report() {
     assert!(failure.to_string().contains("rollback failed"));
     assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Failed);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["restart", "restart"]);
+    assert_eq!(fixture.service_calls(), ["restart", "stop", "restart"]);
+}
+
+#[tokio::test]
+async fn rollback_stop_failure_includes_database_restore_detail() {
+    let fixture = UpgradeFixture::service_failure();
+    fixture.service.fail_stops(1);
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Failed);
+    assert!(failure.to_string().contains("service stop"));
+    assert!(failure.to_string().contains("database restore"));
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::new_binary_bytes());
+    assert_eq!(fixture.service_calls(), ["restart", "stop"]);
 }
 
 #[tokio::test]
@@ -1169,7 +1268,7 @@ async fn rollback_requires_the_restarted_service_to_be_running() {
 
     assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Failed);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["restart", "restart"]);
+    assert_eq!(fixture.service_calls(), ["restart", "stop", "restart"]);
 }
 
 #[cfg(unix)]
