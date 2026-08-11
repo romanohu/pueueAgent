@@ -18,6 +18,7 @@ pub mod logs;
 pub mod models;
 pub mod output;
 pub mod paths;
+pub mod periodic;
 pub mod project;
 pub mod pueue;
 pub mod reconcile;
