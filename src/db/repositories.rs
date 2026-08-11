@@ -26,6 +26,7 @@ use crate::{
         TerminationRequestStatus,
     },
     output::bounded_redacted_text,
+    retry::{retry_decision, EventResolution, RetryDecision, RetryPolicy},
     AppError,
 };
 
@@ -946,7 +947,8 @@ impl<'db> EventRepository<'db> {
         let recovered = transaction
             .execute(
                 "UPDATE events
-                 SET status = 'pending', lease_until = NULL
+                 SET status = 'pending', lease_until = NULL,
+                     attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
                  WHERE status = 'claimed' AND lease_until <= ?1",
                 [now],
             )
@@ -955,6 +957,91 @@ impl<'db> EventRepository<'db> {
             .commit()
             .map_err(database_error("commit expired claim recovery"))?;
         Ok(recovered)
+    }
+
+    pub fn resolve_claimed_without_run(
+        &self,
+        project_id: &str,
+        event_ids: &[i64],
+        now: i64,
+        reason: &str,
+        policy: RetryPolicy,
+    ) -> Result<usize, AppError> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin unbound claimed event resolution"))?;
+        let bounded_reason = bounded_redacted_text(reason);
+        let mut claimed_events = Vec::with_capacity(event_ids.len());
+        for event_id in event_ids {
+            let Some((event_project_id, status, attempts)) = transaction
+                .query_row(
+                    "SELECT project_id, status, attempts FROM events WHERE event_id = ?1",
+                    [event_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, EventStatus>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(database_error("validate unbound claimed event"))?
+            else {
+                return Err(AppError::Validation {
+                    field: "event_id",
+                    message: "event does not exist",
+                });
+            };
+            if event_project_id != project_id {
+                return Err(AppError::Validation {
+                    field: "project_id",
+                    message: "event belongs to another project",
+                });
+            }
+            if status != EventStatus::Claimed {
+                return Err(AppError::Validation {
+                    field: "event_status",
+                    message: "event must be claimed without a run",
+                });
+            }
+            claimed_events.push((*event_id, attempts));
+        }
+
+        let mut changed = 0;
+        for (event_id, attempts) in claimed_events {
+            let (status, not_before, completed_at) = match retry_decision(attempts, now, policy) {
+                RetryDecision::Retry { not_before } => {
+                    (EventStatus::RetryWait, Some(not_before), None)
+                }
+                RetryDecision::DeadLetter => (EventStatus::DeadLetter, None, Some(now)),
+            };
+            changed += transaction
+                .execute(
+                    "UPDATE events
+                     SET status = ?1, lease_until = NULL,
+                         not_before = COALESCE(?2, not_before),
+                         completed_at = ?3, last_error = ?4
+                     WHERE project_id = ?5 AND event_id = ?6 AND status = 'claimed'",
+                    params![
+                        status,
+                        not_before,
+                        completed_at,
+                        bounded_reason,
+                        project_id,
+                        event_id,
+                    ],
+                )
+                .map_err(database_error("resolve unbound claimed event"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit unbound claimed event resolution"))?;
+        Ok(changed)
     }
 
     pub fn defer_claimed(&self, event_ids: &[i64]) -> Result<usize, AppError> {
@@ -2824,7 +2911,36 @@ impl<'db> AgentRunRepository<'db> {
             ))?;
         let run_id = insert_agent_run(&transaction, run)?;
         for event_id in event_ids {
+            let status = transaction
+                .query_row(
+                    "SELECT status FROM events WHERE project_id = ?1 AND event_id = ?2",
+                    params![run.project_id, event_id],
+                    |row| row.get::<_, EventStatus>(0),
+                )
+                .optional()
+                .map_err(database_error("validate event for agent run binding"))?;
+            if status != Some(EventStatus::Claimed) {
+                return Err(AppError::Validation {
+                    field: "event_id",
+                    message: "event must be a claimed project-owned event",
+                });
+            }
             attach_event_to_agent_run(&transaction, &run.project_id, run_id, *event_id)?;
+        }
+        for event_id in event_ids {
+            let changed = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'in_flight', lease_until = NULL
+                     WHERE project_id = ?1 AND event_id = ?2 AND status = 'claimed'",
+                    params![run.project_id, event_id],
+                )
+                .map_err(database_error("bind claimed event to agent run"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "bind claimed event to agent run",
+                });
+            }
         }
         if let Some(reservation_token) = reservation_token {
             let changed = transaction
@@ -3148,47 +3264,382 @@ impl<'db> AgentRunRepository<'db> {
         Ok(())
     }
 
+    pub fn acknowledge_dispatch(&self, project_id: &str, run_id: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin agent dispatch acknowledgement"))?;
+
+        let Some((stored_project_id, gate_state)) = transaction
+            .query_row(
+                "SELECT project_id, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(database_error("validate agent dispatch acknowledgement run"))?
+        else {
+            return Err(AppError::Validation {
+                field: "run_id",
+                message: "agent run does not exist",
+            });
+        };
+        if stored_project_id != project_id {
+            return Err(AppError::Validation {
+                field: "project_id",
+                message: "agent run belongs to another project",
+            });
+        }
+        if gate_state != "release_requested" {
+            return Err(AppError::Validation {
+                field: "launch_gate_state",
+                message: "agent launch gate is not awaiting dispatch acknowledgement",
+            });
+        }
+
+        let event_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run_events
+                 WHERE project_id = ?1 AND run_id = ?2",
+                params![project_id, run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(database_error("count agent dispatch events"))?;
+        let in_flight_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_run_events
+                 JOIN events
+                   ON events.project_id = agent_run_events.project_id
+                  AND events.event_id = agent_run_events.event_id
+                 WHERE agent_run_events.project_id = ?1
+                   AND agent_run_events.run_id = ?2
+                   AND events.status = 'in_flight'",
+                params![project_id, run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(database_error("validate agent dispatch event states"))?;
+        if event_count != in_flight_count {
+            return Err(AppError::Validation {
+                field: "event_status",
+                message: "all linked events must be in flight",
+            });
+        }
+
+        let changed = transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET launch_gate_state = 'released'
+                 WHERE project_id = ?1 AND run_id = ?2
+                   AND launch_gate_state = 'release_requested'",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("acknowledge agent dispatch gate"))?;
+        if changed != 1 {
+            return Err(AppError::Validation {
+                field: "launch_gate_state",
+                message: "agent launch gate changed before dispatch acknowledgement",
+            });
+        }
+        let dispatched = transaction
+            .execute(
+                "UPDATE events
+                 SET status = 'dispatched', lease_until = NULL
+                 WHERE project_id = ?1 AND status = 'in_flight'
+                   AND event_id IN (
+                       SELECT event_id FROM agent_run_events
+                       WHERE project_id = ?1 AND run_id = ?2
+                   )",
+                params![project_id, run_id],
+            )
+            .map_err(database_error("acknowledge linked agent dispatch events"))?;
+        if i64::try_from(dispatched).ok() != Some(event_count) {
+            return Err(AppError::Runtime {
+                operation: "acknowledge linked agent dispatch events",
+            });
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit agent dispatch acknowledgement"))?;
+        Ok(dispatched)
+    }
+
     pub fn fail_before_gate_release(
         &self,
         project_id: &str,
         run_id: i64,
         finished_at: i64,
         reason: &str,
+        policy: RetryPolicy,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_and_resolve_events_inner(
+            project_id,
+            run_id,
+            AgentRunStatus::Failed,
+            finished_at,
+            None,
+            Some(reason),
+            EventResolution::RetryPolicy(policy),
+            true,
+            true,
+        )
+    }
+
+    pub fn finish_and_resolve_events(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+        resolution: EventResolution,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_and_resolve_events_inner(
+            project_id,
+            run_id,
+            status,
+            finished_at,
+            exit_code,
+            last_error,
+            resolution,
+            false,
+            false,
+        )
+    }
+
+    pub fn finish_after_marker_failure(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+        reason: &str,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_and_resolve_events_inner(
+            project_id,
+            run_id,
+            AgentRunStatus::Failed,
+            finished_at,
+            None,
+            Some(reason),
+            EventResolution::ExecutionUnknown {
+                reason: reason.to_owned(),
+            },
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_and_resolve_events_inner(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+        resolution: EventResolution,
+        reset_applied_interventions: bool,
+        require_pre_release_gate: bool,
     ) -> Result<AgentRun, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error("begin pre-release agent run failure"))?;
+            .map_err(database_error("begin agent run event finalization"))?;
+
+        let Some((stored_project_id, current_status, gate_state)) = transaction
+            .query_row(
+                "SELECT project_id, status, launch_gate_state
+                 FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, AgentRunStatus>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("validate agent run event finalization run"))?
+        else {
+            return Err(AppError::Validation {
+                field: "run_id",
+                message: "agent run does not exist",
+            });
+        };
+        if stored_project_id != project_id {
+            return Err(AppError::Validation {
+                field: "project_id",
+                message: "agent run belongs to another project",
+            });
+        }
+        if !matches!(
+            current_status,
+            AgentRunStatus::Starting | AgentRunStatus::Running
+        ) {
+            return Err(AppError::Validation {
+                field: "status",
+                message: "agent run is not active",
+            });
+        }
+        if require_pre_release_gate
+            && !matches!(gate_state.as_str(), "pending" | "release_requested")
+        {
+            return Err(AppError::Validation {
+                field: "launch_gate_state",
+                message: "agent launch gate is already released",
+            });
+        }
+
+        let linked_events = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT events.event_id, events.status, events.attempts
+                     FROM agent_run_events
+                     JOIN events
+                       ON events.project_id = agent_run_events.project_id
+                      AND events.event_id = agent_run_events.event_id
+                     WHERE agent_run_events.project_id = ?1
+                       AND agent_run_events.run_id = ?2
+                     ORDER BY events.event_id",
+                )
+                .map_err(database_error("prepare agent run event finalization"))?;
+            let events = statement
+                .query_map(params![project_id, run_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, EventStatus>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(database_error("query agent run event finalization"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read agent run event finalization"))?;
+            events
+        };
+        if linked_events
+            .iter()
+            .any(|(_, event_status, _)| !matches!(event_status, EventStatus::InFlight | EventStatus::Dispatched))
+        {
+            return Err(AppError::Validation {
+                field: "event_status",
+                message: "linked events must be in flight or dispatched",
+            });
+        }
+        if require_pre_release_gate
+            && linked_events
+                .iter()
+                .any(|(_, event_status, _)| *event_status != EventStatus::InFlight)
+        {
+            return Err(AppError::Validation {
+                field: "event_status",
+                message: "pre-release linked events must be in flight",
+            });
+        }
+
+        let bounded_run_error = match &resolution {
+            EventResolution::ExecutionUnknown { reason } => Some(bounded_redacted_text(reason)),
+            EventResolution::RetryPolicy(_) => last_error.map(bounded_redacted_text),
+        };
+        let bounded_event_error = bounded_run_error.clone();
+        for (event_id, _, attempts) in linked_events {
+            let (event_status, not_before, completed_at) = if matches!(
+                &resolution,
+                EventResolution::ExecutionUnknown { .. }
+            ) {
+                (EventStatus::DeadLetter, None, Some(finished_at))
+            } else if status == AgentRunStatus::Completed {
+                (EventStatus::Completed, None, Some(finished_at))
+            } else {
+                match retry_decision(
+                    attempts,
+                    finished_at,
+                    match &resolution {
+                        EventResolution::RetryPolicy(policy) => *policy,
+                        EventResolution::ExecutionUnknown { .. } => unreachable!(),
+                    },
+                ) {
+                    RetryDecision::Retry { not_before } => {
+                        (EventStatus::RetryWait, Some(not_before), None)
+                    }
+                    RetryDecision::DeadLetter => {
+                        (EventStatus::DeadLetter, None, Some(finished_at))
+                    }
+                }
+            };
+            let changed = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = ?1, lease_until = NULL,
+                         not_before = COALESCE(?2, not_before),
+                         completed_at = ?3, last_error = ?4
+                     WHERE project_id = ?5 AND event_id = ?6
+                       AND status IN ('in_flight', 'dispatched')",
+                    params![
+                        event_status,
+                        not_before,
+                        completed_at,
+                        bounded_event_error.as_deref(),
+                        project_id,
+                        event_id,
+                    ],
+                )
+                .map_err(database_error("resolve linked agent event"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "resolve linked agent event",
+                });
+            }
+        }
+
         let changed = transaction
             .execute(
                 "UPDATE agent_runs
-                 SET status = 'failed', finished_at = ?1, last_error = ?2,
-                     launch_gate_state = 'failed'
-                 WHERE project_id = ?3 AND run_id = ?4
-                   AND launch_gate_state IN ('pending', 'release_requested')",
-                params![finished_at, reason, project_id, run_id],
+                 SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4,
+                     launch_gate_state = CASE
+                         WHEN launch_gate_state IN ('pending', 'release_requested')
+                              AND ?1 = 'failed' THEN 'failed'
+                         WHEN launch_gate_state IN ('pending', 'release_requested')
+                              AND ?1 IN ('completed', 'timed_out', 'cancelled') THEN 'released'
+                         ELSE launch_gate_state
+                     END
+                 WHERE project_id = ?5 AND run_id = ?6
+                   AND status IN ('starting', 'running')",
+                params![
+                    status,
+                    finished_at,
+                    exit_code,
+                    bounded_run_error.as_deref(),
+                    project_id,
+                    run_id,
+                ],
             )
-            .map_err(database_error("fail agent run before launch gate release"))?;
+            .map_err(database_error("finish agent run with event resolution"))?;
         if changed != 1 {
             return Err(AppError::Runtime {
-                operation: "fail agent run before launch gate release",
+                operation: "finish agent run with event resolution",
             });
         }
+        let intervention_statuses = if reset_applied_interventions {
+            "status IN ('reserved', 'applied')"
+        } else {
+            "status = 'reserved'"
+        };
         transaction
             .execute(
-                "UPDATE interventions
-                 SET status = 'pending', reserved_at = NULL, applied_at = NULL,
-                     agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
-                 WHERE project_id = ?1 AND agent_run_id = ?2
-                   AND status IN ('reserved', 'applied')",
+                &format!(
+                    "UPDATE interventions
+                     SET status = 'pending', reserved_at = NULL, applied_at = NULL,
+                         agent_run_id = NULL, lease_expires_at = NULL, reservation_token = NULL
+                     WHERE project_id = ?1 AND agent_run_id = ?2 AND {intervention_statuses}"
+                ),
                 params![project_id, run_id],
             )
-            .map_err(database_error(
-                "requeue interventions after launch gate failure",
-            ))?;
+            .map_err(database_error("release interventions after agent run finalization"))?;
         transaction
             .commit()
-            .map_err(database_error("commit pre-release agent run failure"))?;
+            .map_err(database_error("commit agent run event finalization"))?;
         read_agent_run(&connection, run_id)
     }
 
