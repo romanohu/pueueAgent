@@ -3,6 +3,10 @@
 project_id = "{{PROJECT_ID}}"
 pueue_group = "{{PUEUE_GROUP}}"
 
+# supervisor の機械的な状態は .pueue-agent/state.json が canonical です。
+# submission は experiment（既定）または control を選びます。
+# control は履歴には残りますが、guardrails.max_experiments を消費しません。
+
 [agent]
 program = "codex"
 args = ["exec", "{prompt}"]

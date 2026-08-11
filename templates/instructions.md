@@ -16,6 +16,35 @@
 
    raw の `pueue add` は実行しない。SQLite の submission accounting を迂回するためです。
 
+## Submission kind と experiment budget
+
+- 学習、評価、比較対象の本体は `experiment` として投入する。
+- bootstrap、診断、準備、後片付けなど実験数に含めない制御 task は `control` として投入する。
+- `control` は履歴と Pueue task には残るが、`max_experiments` を消費しない。その他の guardrail や group 制約を無視してよいという意味ではない。
+
+```bash
+pueue-agent submit --kind experiment -- python train.py --lr 0.001
+pueue-agent submit --kind control -- python prepare.py
+```
+
+複数 job を投入する場合は `pueue-agent submit-batch --request-id <UUID> --manifest jobs.json` を使う。同じ request ID を再送した場合、accepted 済み job は二重投入せず、未確定 job の durable な状態を再利用する。
+
+## 人間からの介入
+
+人間の自然言語による追加指示は、次の agent run に渡すキューへ登録する。
+
+```bash
+pueue-agent steer -- "次は validation loss を確認する"
+pueue-agent steer list
+pueue-agent wake --reason "結果を確認して次の実験を判断する"
+```
+
+`steer` は実行中の process を中断せず、`operator_wake` は既存の state、budget、guardrail を尊重した scheduler event です。介入で制約を上書きしたり、`state.json` の canonical な budget と矛盾する指示を採用したりしない。
+
+## Canonical state
+
+`.pueue-agent/state.json` の `current_facts`、`next_action`、`budgets`、`active_lineage` を機械状態の正として扱う。`STATE.md` は人間向けの補足ノートであり、古い文章を根拠に canonical state を上書きしない。run の終了前に、変更した事実と次の計画を両方のファイルへ必要な範囲で反映する。
+
 ## Dispatch mode
 
 - `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、設定された制約が許す場合だけ replacement experiment を投入する。

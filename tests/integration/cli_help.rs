@@ -156,6 +156,55 @@ fn invalid_cli_parse_errors_redact_and_bound_values_while_help_stays_complete() 
 }
 
 #[test]
+fn documentation_contract_covers_current_operator_surface() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    for required in [
+        "pueue-agent status --compact",
+        "pueue-agent status --json",
+        "pueue-agent wake --reason",
+        "pueue-agent runs --follow",
+        "pueue-agent submit-batch",
+        "pueue-agent submit --kind control",
+        ".pueue-agent/state.json",
+        "人間向け出力",
+        "JSON 出力",
+        "max_experiments",
+        "request-id",
+        "冪等",
+        "raw Pueue",
+        "supervisor",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README.md is missing documentation contract text: {required}"
+        );
+    }
+
+    let instructions = std::fs::read_to_string(root.join("templates/instructions.md")).unwrap();
+    for required in [
+        ".pueue-agent/state.json",
+        "control",
+        "experiment",
+        "operator_wake",
+        "pueue-agent steer",
+    ] {
+        assert!(
+            instructions.contains(required),
+            "templates/instructions.md is missing documentation contract text: {required}"
+        );
+    }
+
+    let config = std::fs::read_to_string(root.join("templates/config.toml")).unwrap();
+    for required in ["state.json", "control", "experiment", "max_experiments"] {
+        assert!(
+            config.contains(required),
+            "templates/config.toml is missing documentation contract text: {required}"
+        );
+    }
+}
+
+#[test]
 fn events_cli_renders_the_project_scoped_event_projection() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("project");

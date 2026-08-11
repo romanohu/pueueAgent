@@ -59,17 +59,69 @@ pueue-agent submit -- python train.py --lr 0.001
 
 `submit` は `pueue add` を実行する前に SQLite へ submission intent を記録します。引数の境界も保持するため、人と agent の両方で使う正式な投入経路です。監視対象の実験では raw の `pueue add` を使わないでください。submission の記録を迂回してしまいます。
 
+submission には `experiment` と `control` の2種類があります。通常の学習・評価ジョブは `experiment`（既定値）として投入し、bootstrap、診断、後片付けなど実験数に含めたくないジョブは明示的に `control` にします。
+
+```bash
+pueue-agent submit --kind experiment -- python train.py --lr 0.001
+pueue-agent submit --kind control -- /usr/bin/true
+```
+
+`control` は SQLite の履歴と Pueue task として記録されますが、`guardrails.max_experiments` を消費しません。`max_agent_runs` や Pueue group の制約まで無効にする機能ではないため、control を無制限の実験枠として使うことはできません。
+
 主な operator command は次のとおりです。
 
 ```bash
 pueue-agent status
+pueue-agent status --compact
+pueue-agent status --json
 pueue-agent pause
 pueue-agent resume
 pueue-agent disable
 pueue-agent disable --remove   # 登録と group の予約を明示的に解放する
+pueue-agent wake --reason "variant-2 の分析を始める"
+pueue-agent runs --follow
 ```
 
 `pause` は pending event を保持したまま、新しい agent の起動と自動終了を停止します。`resume` で保持していた event を再び処理対象にできます。通常の `disable` は Pueue group の予約を維持します。`--remove` は明示的な登録解除であり、Pueue の status を取得できない場合は実行しません。
+
+`wake` は Pueue にダミー task を投入せず、operator wake event を SQLite に記録して supervisor の次の scheduler loop の処理対象にします。`runs --follow` は新しい agent run と submission の lineage を監視し、Ctrl-C まで追加分を表示します。`--follow` は端末での追跡用で、`--json` を併用すると追加された run ごとに bounded JSON record を出力します。
+
+### 人間向け出力と JSON 出力
+
+既定の人間向け出力は、`pueue-agent status` のような見出し、`key=value` の状態行、最後の `summary:` で構成されます。`status --compact` は daemon、Pueue task 数、experiment 数、agent run、event、guardrail を短く確認するための表示です。`status --json` は同じプロジェクト範囲の機械可読な report で、パイプや自動処理に使えます。JSON 出力には ANSI escape を入れず、上限を超える本文や secret らしい値を展開しません。
+
+`pueue-agent` の human/JSON output は supervisor の投影です。`pueue status --json` の raw Pueue output とは形式も責務も異なり、前者は SQLite の event、incident、submission、agent run と Pueue の最新 snapshot を project scope でまとめ、後者は Pueue daemon が持つ task の生データです。raw Pueue output が必要な低レベル調査では `pueue` を直接使えますが、pueue-agent の accounting や guardrail の確認には supervisor output と `events` / `runs` を使用してください。
+
+### batch submission
+
+複数の job を一つの request として投入する場合は、JSON manifest を作り、UUID の `request-id` を指定します。
+
+```json
+{
+  "jobs": [
+    {
+      "id": "variant-1",
+      "argv": ["python", "train.py", "--lr", "0.001"],
+      "kind": "experiment",
+      "metadata": {"variant": 1, "seed": 11}
+    },
+    {
+      "id": "prepare-variant-1",
+      "argv": ["python", "prepare.py"],
+      "kind": "control"
+    }
+  ]
+}
+```
+
+```bash
+pueue-agent submit-batch \
+  --request-id 00000000-0000-4000-8000-000000000001 \
+  --manifest jobs.json \
+  --json
+```
+
+同じ `request-id` を再度使うと、SQLite に保存された batch の状態を再利用します。この request-id 冪等性により、すでに accepted の job は二重投入せず、部分失敗で未確定の job だけを再開できます。ネットワーク障害や supervisor 再起動後の再送に使えます。request ID と manifest の組み合わせは一つの durable request として扱い、別の内容を同じ request ID に載せてはいけません。human output は job ごとの状態を行で表示し、`--json` は request、counts、accepted task ID、失敗 job を含む機械可読な結果を返します。
 
 ## 診断
 
@@ -103,14 +155,17 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 ```text
 .pueue-agent/
   config.toml
+  state.json
   STATE.md
   instructions.md
   logs/
 ```
 
-`STATE.md` は agent run をまたいで共有する永続的な実験ノートです。目的、制約、実験履歴、発見、成果物のパス、次の計画を記録してください。
+`.pueue-agent/state.json` は supervisor と agent が読む canonical machine state です。`current_facts`、`historical_facts`、`next_action`、`budgets`、`active_lineage` を構造化して保存し、特に budget と lineage の判断ではこのファイルを正とします。`pueue-agent init` は新規 project に template を作りますが、既存の `state.json` は上書きしません。壊れた、読めない、またはファイルではない canonical state は安全側に倒して dispatch を止めます。
 
-`instructions.md` は agent の作業手順を定義します。supervisor は、トリガーになった event の範囲を制限した要約と、これら2つのファイルへの参照を prompt に追加します。会話 transcript 全体を SQLite にコピーすることはありません。
+`STATE.md` は agent run をまたいで共有する人間向けの実験ノートです。目的、制約、実験履歴、発見、成果物のパス、次の計画を記録してください。文章の履歴は補足情報であり、canonical state の budget や active lineage を上書きしません。
+
+`instructions.md` は agent の作業手順を定義します。supervisor は、トリガーになった event の範囲を制限した要約と、これら3つのファイルへの参照を prompt に追加します。会話 transcript 全体を SQLite にコピーすることはありません。人間から次の run へ自然言語を渡す場合は `pueue-agent steer -- "指示"` を使い、実行中 process の stdin や prompt を直接書き換えないでください。
 
 ## 設定
 
@@ -132,6 +187,8 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 | `guardrails.*` | 連続失敗数、実験数、agent run 数の上限。 |
 
 未知のキーや不正な範囲の値は無視せず、エラーとして拒否します。
+
+`guardrails.max_experiments` は `kind = experiment` の submission だけを数えます。control submission は制御・準備用の履歴として残りますが、この実験 budget からは除外されます。機械的な判断を `STATE.md` の自由文へ移さず、canonical `.pueue-agent/state.json` の `budgets` と現在の設定を確認してください。
 
 ### Codex の会話コンテキストを明示的に継続する
 
