@@ -420,7 +420,7 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
     const OLD_STATUS_LIST: &str =
         "'pending', 'claimed', 'completed', 'retry_wait', 'failed'";
     const NEW_STATUS_LIST: &str =
-        "'pending', 'claimed', 'in_flight', 'dispatched', 'completed', 'retry_wait', 'failed', 'dead_letter'";
+        "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'";
 
     let current_event_sql: String = transaction
         .query_row(
@@ -429,10 +429,8 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
             |row| row.get(0),
         )
         .map_err(database_error("read SQLite events schema for v13 migration"))?;
-    if ["'in_flight'", "'dispatched'", "'dead_letter'"]
-        .iter()
-        .all(|status| current_event_sql.contains(status))
-    {
+    if current_event_sql.contains(NEW_STATUS_LIST) {
+        verify_events_v13(transaction, NEW_STATUS_LIST)?;
         return transaction
             .execute_batch("PRAGMA user_version = 13;")
             .map_err(database_error("set SQLite v13 schema version"));
@@ -461,6 +459,16 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
         });
     }
 
+    verify_events_v13(transaction, NEW_STATUS_LIST)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 13;")
+        .map_err(database_error("set SQLite v13 schema version"))
+}
+
+fn verify_events_v13(
+    transaction: &rusqlite::Transaction<'_>,
+    canonical_status_list: &str,
+) -> Result<(), AppError> {
     let event_sql: String = transaction
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
@@ -468,7 +476,14 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
             |row| row.get(0),
         )
         .map_err(database_error("read SQLite v13 events schema"))?;
-    if !event_sql.contains(NEW_STATUS_LIST) {
+    let canonical_status_list = canonical_status_list
+        .split_whitespace()
+        .collect::<String>();
+    let actual_status_list = event_sql
+        .split_once("status TEXT NOT NULL CHECK (status IN (")
+        .and_then(|(_, remainder)| remainder.split_once(")").map(|(list, _)| list))
+        .map(|list| list.split_whitespace().collect::<String>());
+    if actual_status_list.as_deref() != Some(canonical_status_list.as_str()) {
         return Err(AppError::Runtime {
             operation: "verify SQLite v13 events status list",
         });
@@ -481,9 +496,7 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
             operation: "verify SQLite integrity after v13 event migration",
         });
     }
-    transaction
-        .execute_batch("PRAGMA user_version = 13;")
-        .map_err(database_error("set SQLite v13 schema version"))
+    Ok(())
 }
 
 fn migrate_batches_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

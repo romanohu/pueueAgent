@@ -584,6 +584,44 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
 }
 
 #[test]
+fn schema_v12_migration_rejects_extra_event_status_even_when_ack_literals_are_present() {
+    let test = TestDatabase::new();
+    let root = test.project_root("v12-malformed-project");
+    register_project(
+        &test.db,
+        "v12-malformed-project",
+        &root,
+        "pa-v12-malformed-project",
+    );
+    insert_event(&test.db, "v12-malformed-project", "malformed-v13", 100);
+
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'",
+            params![
+                "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'",
+                "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter', 'unexpected'",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = OFF; PRAGMA user_version = 12;")
+        .unwrap();
+    drop(connection);
+
+    assert!(
+        Db::open(&test.path).is_err(),
+        "migration must reject a non-canonical event status CHECK"
+    );
+}
+
+#[test]
 fn readonly_open_does_not_migrate_or_create_database_state() {
     let test = TestDatabase::new();
     let connection = test.db.connect().unwrap();
