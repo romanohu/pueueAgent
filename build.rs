@@ -29,13 +29,14 @@ fn git_metadata_paths(manifest_dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let head = git_dir.join("HEAD");
+    let common_git_dir = resolve_common_git_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
     let mut paths = vec![head.clone()];
 
     if let Ok(contents) = fs::read_to_string(&head) {
         if let Some(reference) = contents.trim().strip_prefix("ref: ") {
             let reference = Path::new(reference);
             if reference.components().all(|component| matches!(component, Component::Normal(_))) {
-                paths.push(git_dir.join(reference));
+                paths.push(common_git_dir.join(reference));
             }
         }
     }
@@ -66,6 +67,22 @@ fn resolve_git_dir(manifest_dir: &Path) -> Option<PathBuf> {
     })
 }
 
+fn resolve_common_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let target = contents.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    let target = PathBuf::from(target);
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        git_dir.join(target)
+    };
+    Some(fs::canonicalize(&resolved).unwrap_or(resolved))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, time::SystemTime};
@@ -73,20 +90,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linked_worktree_tracks_head_and_symbolic_branch_ref() {
+    fn linked_worktree_tracks_head_and_symbolic_branch_ref_in_common_git_dir() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = env::temp_dir().join(format!("pueue-agent-build-{unique}"));
-        let git_dir = root.join("metadata");
-        fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+        let git_dir = root.join("metadata/worktree");
+        let common_git_dir = root.join("metadata/common");
+        fs::create_dir_all(common_git_dir.join("refs/heads")).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
         fs::write(root.join(".git"), format!("gitdir: {}", git_dir.display())).unwrap();
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("commondir"), "../common\n").unwrap();
 
         assert_eq!(
             git_metadata_paths(&root),
-            vec![git_dir.join("HEAD"), git_dir.join("refs/heads/main")]
+            vec![
+                git_dir.join("HEAD"),
+                fs::canonicalize(common_git_dir).unwrap().join("refs/heads/main"),
+            ]
         );
 
         fs::remove_dir_all(root).unwrap();
