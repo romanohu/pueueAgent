@@ -97,9 +97,83 @@ pub struct ServiceDefinition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServicePlatform {
+pub enum ServicePlatform {
     Systemd,
     Launchd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchdAgent {
+    domain: String,
+    plist: PathBuf,
+}
+
+impl LaunchdAgent {
+    pub fn new(domain: impl Into<String>, plist: impl Into<PathBuf>) -> Self {
+        Self {
+            domain: domain.into(),
+            plist: plist.into(),
+        }
+    }
+
+    fn service_target(&self) -> String {
+        format!("{}/com.pueue-agent", self.domain)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCommandOutput {
+    success: bool,
+    status: i32,
+    details: String,
+}
+
+impl ServiceCommandOutput {
+    pub fn success() -> Self {
+        Self {
+            success: true,
+            status: 0,
+            details: String::new(),
+        }
+    }
+
+    pub fn failure(status: i32, details: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            status,
+            details: details.into(),
+        }
+    }
+}
+
+pub trait ServiceCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, AppError>;
+}
+
+struct ProcessServiceCommandRunner;
+
+impl ServiceCommandRunner for ProcessServiceCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, AppError> {
+        let output = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|source| AppError::Io {
+                operation: "run platform service manager",
+                source,
+            })?;
+        if output.status.success() {
+            Ok(ServiceCommandOutput::success())
+        } else {
+            Ok(ServiceCommandOutput::failure(
+                output.status.code().unwrap_or(-1),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ))
+        }
+    }
 }
 
 impl ServiceDefinition {
@@ -154,28 +228,111 @@ impl ServiceControl for ServiceManager {
     }
 
     fn start(&self) -> Result<(), AppError> {
+        let runner = ProcessServiceCommandRunner;
         if cfg!(target_os = "macos") {
-            start_launchd()
+            let agent = launchd_agent()?;
+            self.start_with(ServicePlatform::Launchd, &runner, Some(&agent))
         } else {
-            run_service_command("systemctl", &["--user", "start", "pueue-agent.service"])
+            self.start_with(ServicePlatform::Systemd, &runner, None)
         }
     }
 
     fn stop(&self) -> Result<(), AppError> {
+        let runner = ProcessServiceCommandRunner;
         if cfg!(target_os = "macos") {
-            let service = launchd_service_target()?;
-            run_service_command("launchctl", &["bootout", service.as_str()])
+            let agent = launchd_agent()?;
+            self.stop_with(ServicePlatform::Launchd, &runner, Some(&agent))
         } else {
-            run_service_command("systemctl", &["--user", "stop", "pueue-agent.service"])
+            self.stop_with(ServicePlatform::Systemd, &runner, None)
         }
     }
 
     fn restart(&self) -> Result<(), AppError> {
+        let runner = ProcessServiceCommandRunner;
         if cfg!(target_os = "macos") {
-            let service = launchd_service_target()?;
-            run_service_command("launchctl", &["kickstart", "-k", service.as_str()])
+            let agent = launchd_agent()?;
+            self.restart_with(ServicePlatform::Launchd, &runner, Some(&agent))
         } else {
-            run_service_command("systemctl", &["--user", "restart", "pueue-agent.service"])
+            self.restart_with(ServicePlatform::Systemd, &runner, None)
+        }
+    }
+}
+
+impl ServiceManager {
+    pub fn start_with(
+        &self,
+        platform: ServicePlatform,
+        runner: &impl ServiceCommandRunner,
+        launchd: Option<&LaunchdAgent>,
+    ) -> Result<(), AppError> {
+        match platform {
+            ServicePlatform::Systemd => run_lifecycle_command(
+                runner,
+                "systemctl",
+                &["--user", "start", "pueue-agent.service"],
+            ),
+            ServicePlatform::Launchd => {
+                let agent = required_launchd_agent(launchd)?;
+                let service = agent.service_target();
+                let output = runner.run("launchctl", &["kickstart", service.as_str()])?;
+                if output.success {
+                    Ok(())
+                } else if launchd_service_is_not_loaded(&output.details) {
+                    run_lifecycle_command(
+                        runner,
+                        "launchctl",
+                        &[
+                            "bootstrap",
+                            agent.domain.as_str(),
+                            agent.plist.to_str().ok_or(AppError::Configuration {
+                                field: "launchd.plist",
+                            })?,
+                        ],
+                    )
+                } else {
+                    lifecycle_command_error("launchctl", output.status)
+                }
+            }
+        }
+    }
+
+    pub fn stop_with(
+        &self,
+        platform: ServicePlatform,
+        runner: &impl ServiceCommandRunner,
+        launchd: Option<&LaunchdAgent>,
+    ) -> Result<(), AppError> {
+        match platform {
+            ServicePlatform::Systemd => run_lifecycle_command(
+                runner,
+                "systemctl",
+                &["--user", "stop", "pueue-agent.service"],
+            ),
+            ServicePlatform::Launchd => {
+                let agent = required_launchd_agent(launchd)?;
+                let service = agent.service_target();
+                run_lifecycle_command(runner, "launchctl", &["bootout", service.as_str()])
+            }
+        }
+    }
+
+    pub fn restart_with(
+        &self,
+        platform: ServicePlatform,
+        runner: &impl ServiceCommandRunner,
+        launchd: Option<&LaunchdAgent>,
+    ) -> Result<(), AppError> {
+        match platform {
+            ServicePlatform::Systemd => run_lifecycle_command(
+                runner,
+                "systemctl",
+                &["--user", "restart", "pueue-agent.service"],
+            ),
+            ServicePlatform::Launchd => {
+                let agent = required_launchd_agent(launchd)?;
+                let service = agent.service_target();
+                run_lifecycle_command(runner, "launchctl", &["kickstart", "-k", service.as_str()])
+            }
         }
     }
 }
@@ -454,47 +611,45 @@ fn launchd_status() -> Result<ServiceStatus, AppError> {
     }
 }
 
-fn start_launchd() -> Result<(), AppError> {
-    let service = launchd_service_target()?;
-    let output = Command::new("launchctl")
-        .args(["kickstart", service.as_str()])
-        .output()
-        .map_err(|source| AppError::Io {
-            operation: "run platform service manager",
-            source,
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let details = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-    .to_lowercase();
-    if !details.contains("could not find service") {
-        return service_command_error("launchctl", output.status);
-    }
-
+fn launchd_agent() -> Result<LaunchdAgent, AppError> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or(AppError::Configuration { field: "HOME" })?;
     let plist = home.join("Library/LaunchAgents/com.pueue-agent.plist");
-    run_service_command(
-        "launchctl",
-        &[
-            "bootstrap",
-            launchd_gui_domain()?.as_str(),
-            plist.to_str().ok_or(AppError::Configuration {
-                field: "launchd.plist",
-            })?,
-        ],
-    )
+    Ok(LaunchdAgent::new(launchd_gui_domain()?, plist))
 }
 
 fn launchd_service_target() -> Result<String, AppError> {
     Ok(format!("{}/com.pueue-agent", launchd_gui_domain()?))
+}
+
+fn required_launchd_agent(agent: Option<&LaunchdAgent>) -> Result<&LaunchdAgent, AppError> {
+    agent.ok_or(AppError::Configuration {
+        field: "launchd agent",
+    })
+}
+
+fn launchd_service_is_not_loaded(details: &str) -> bool {
+    details.to_lowercase().contains("could not find service")
+}
+
+fn run_lifecycle_command(
+    runner: &impl ServiceCommandRunner,
+    program: &str,
+    args: &[&str],
+) -> Result<(), AppError> {
+    let output = runner.run(program, args)?;
+    if output.success {
+        Ok(())
+    } else {
+        lifecycle_command_error(program, output.status)
+    }
+}
+
+fn lifecycle_command_error(program: &str, status: i32) -> Result<(), AppError> {
+    Err(AppError::Message {
+        message: format!("{program} service command failed with status {status}"),
+    })
 }
 
 fn launchd_gui_domain() -> Result<String, AppError> {

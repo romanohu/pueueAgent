@@ -12,7 +12,8 @@ use pueue_agent::{
     pueue::{PueueApi, PueueTask},
     service::{
         callback_command, enable_with, install_callback_once, CallbackRegistry, EnableOptions,
-        PueueConfigCallbackRegistry, ServiceControl, ServiceDefinition, ServicePaths,
+        LaunchdAgent, PueueConfigCallbackRegistry, ServiceCommandOutput, ServiceCommandRunner,
+        ServiceControl, ServiceDefinition, ServiceManager, ServicePaths, ServicePlatform,
         ServiceStatus,
     },
     AppError,
@@ -180,6 +181,105 @@ impl ServiceControl for RecordingService {
     fn status(&self) -> Result<ServiceStatus, AppError> {
         Ok(*self.status.borrow())
     }
+}
+
+#[derive(Default)]
+struct RecordingCommandRunner {
+    calls: RefCell<Vec<(String, Vec<String>)>>,
+    outputs: RefCell<Vec<ServiceCommandOutput>>,
+}
+
+impl RecordingCommandRunner {
+    fn with_outputs(outputs: impl IntoIterator<Item = ServiceCommandOutput>) -> Self {
+        Self {
+            calls: RefCell::new(Vec::new()),
+            outputs: RefCell::new(outputs.into_iter().collect()),
+        }
+    }
+}
+
+impl ServiceCommandRunner for RecordingCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<ServiceCommandOutput, AppError> {
+        self.calls.borrow_mut().push((
+            program.to_owned(),
+            args.iter().map(|argument| (*argument).to_owned()).collect(),
+        ));
+        Ok(self.outputs.borrow_mut().remove(0))
+    }
+}
+
+#[test]
+fn service_manager_uses_exact_systemd_lifecycle_arguments() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([
+        ServiceCommandOutput::success(),
+        ServiceCommandOutput::success(),
+        ServiceCommandOutput::success(),
+    ]);
+
+    manager
+        .start_with(ServicePlatform::Systemd, &runner, None)
+        .unwrap();
+    manager
+        .stop_with(ServicePlatform::Systemd, &runner, None)
+        .unwrap();
+    manager
+        .restart_with(ServicePlatform::Systemd, &runner, None)
+        .unwrap();
+
+    assert_eq!(
+        runner.calls.into_inner(),
+        vec![
+            ("systemctl".to_owned(), vec!["--user", "start", "pueue-agent.service"].into_iter().map(str::to_owned).collect()),
+            ("systemctl".to_owned(), vec!["--user", "stop", "pueue-agent.service"].into_iter().map(str::to_owned).collect()),
+            ("systemctl".to_owned(), vec!["--user", "restart", "pueue-agent.service"].into_iter().map(str::to_owned).collect()),
+        ]
+    );
+}
+
+#[test]
+fn service_manager_uses_launchd_commands_and_bootstraps_unloaded_agents() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([
+        ServiceCommandOutput::failure(3, "Could not find service"),
+        ServiceCommandOutput::success(),
+        ServiceCommandOutput::success(),
+        ServiceCommandOutput::success(),
+    ]);
+    let agent = LaunchdAgent::new("gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist");
+
+    manager
+        .start_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .unwrap();
+    manager
+        .stop_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .unwrap();
+    manager
+        .restart_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .unwrap();
+
+    assert_eq!(
+        runner.calls.into_inner(),
+        vec![
+            ("launchctl".to_owned(), vec!["kickstart", "gui/501/com.pueue-agent"].into_iter().map(str::to_owned).collect()),
+            ("launchctl".to_owned(), vec!["bootstrap", "gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist"].into_iter().map(str::to_owned).collect()),
+            ("launchctl".to_owned(), vec!["bootout", "gui/501/com.pueue-agent"].into_iter().map(str::to_owned).collect()),
+            ("launchctl".to_owned(), vec!["kickstart", "-k", "gui/501/com.pueue-agent"].into_iter().map(str::to_owned).collect()),
+        ]
+    );
+}
+
+#[test]
+fn service_manager_propagates_non_zero_lifecycle_status() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([ServiceCommandOutput::failure(1, "permission denied")]);
+
+    let error = manager
+        .stop_with(ServicePlatform::Systemd, &runner, None)
+        .expect_err("a non-zero service-manager status must be returned as AppError");
+
+    assert!(error.to_string().contains("status 1"));
+    assert_eq!(runner.calls.into_inner().len(), 1);
 }
 
 #[test]
