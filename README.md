@@ -87,7 +87,7 @@ pueue-agent runs --follow
 
 `pause` は pending event を保持したまま、新しい agent の起動と自動終了を停止します。`resume` で保持していた event を再び処理対象にできます。通常の `disable` は Pueue group の予約を維持します。`--remove` は明示的な登録解除であり、Pueue の status を取得できない場合は実行しません。
 
-`stop` は supervisor service だけを止め、`pause` は automation だけを止め、`cancel --task-id` は確認済みの Pueue task 1件を止めます。`disable` と `disable --remove` は project の automation / 登録を変更します。`stop` と `disable` は Pueue task を kill しません。操作対象と再開方法を含む日本語の手順は [運用ガイド](docs/operations-ja.md) を参照してください。
+`stop` は supervisor service を止め、`pause` は automation だけを止め、`cancel --task-id` は確認済みの Pueue task 1件を止めます。`disable` と `disable --remove` は project の automation / 登録を変更します。`stop` と `disable` は Pueue task を kill しません。Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る。操作対象と再開方法を含む日本語の手順は [運用ガイド](docs/operations-ja.md) を参照してください。
 
 `wake` は Pueue にダミー task を投入せず、operator wake event を SQLite に記録して supervisor の次の scheduler loop の処理対象にします。`runs --follow` は新しい agent run と submission の lineage を監視し、Ctrl-C まで追加分を表示します。`--follow` は端末での追跡用で、`--json` を併用すると新しいデータを検出した polling 単位で、複数 run を含み得る bounded JSON report を出力します。
 

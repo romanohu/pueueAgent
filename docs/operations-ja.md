@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 自律動作だけ止める | `pueue-agent pause` | 新しい agent 起動と自動 termination | 実行中 Pueue task、実行中 agent run、pending event |
 | 自律動作を再開する | `pueue-agent resume` | pause/halt された automation の dispatch | 実行中 Pueue task の状態 |
-| supervisor だけ止める | `pueue-agent stop` | user service | Pueue task、agent process、project 登録 |
+| supervisor だけ止める | `pueue-agent stop` | user service と active agent の graceful shutdown | Pueue task、project 登録 |
 | supervisor を起動する | `pueue-agent start` | user service | Pueue task、project の pause/halt 状態 |
 | 実験 task を止める | `pueue-agent cancel --task-id <ID>` | 指定 project group の登録済み Pueue task 1件 | 別 task、supervisor service、project 登録 |
 | project を無効化する | `pueue-agent disable` | project の automation | Pueue task、group の予約 |
@@ -30,7 +30,7 @@ pueue-agent stop
 pueue-agent status
 ```
 
-`service: stopped` を確認します。これは scheduler service の停止だけです。Pueue と既に起動した agent process は止まりません。起動し直すときは `pueue-agent start` を使います。
+`service: stopped` を確認します。これは scheduler service の停止であり、Pueue task は kill しません。Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る。起動し直すときは `pueue-agent start` を使います。
 
 ### 実験を止める
 

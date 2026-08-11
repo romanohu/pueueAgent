@@ -56,6 +56,7 @@ pueue-agent wake --reason "結果を確認して次の実験を判断する"
 
 - lifecycle 操作は対象が異なる。`pause` は新規 automation を止め、`stop` は supervisor service を止め、`cancel --task-id` は確認済みの Pueue task 1件を止め、`disable` は project automation/登録を変更する。これらを相互の代用にしない。
 - `stop`、`pause`、`disable` は Pueue task を kill しない。実験 task を止める必要がある場合だけ、対象 ID を確認して `pueue-agent cancel --task-id <ID>` を使う。`resume` は automation を再開する操作であり、終了済み task を再実行しない。
+- `stop` は active agent の graceful shutdown を開始する。Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る。
 - supervisor は `.pueue-agent/config.toml` に従って fresh Codex session を起動するか、明示的に既存 session を resume します。context mode や session ID を勝手に変更しない。
 - `state.json` は fresh run と resumed run の両方で使う canonical machine state です。`STATE.md` は人間向けの supplementary context であり、会話 transcript の代替とはみなしません。
 - detector の `action = "kill"` が設定されている場合、supervisor が失敗した task の終了を Pueue に依頼している可能性があります。replacement を提案・投入する前に、現在の Pueue state を確認する。

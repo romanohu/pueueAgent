@@ -196,6 +196,7 @@ fn documentation_contract_covers_current_operator_surface() {
         "`status --json` には submission の一覧を含めず",
         "runs --json",
         "polling 単位",
+        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
     ] {
         assert!(
             readme.contains(required),
@@ -210,6 +211,7 @@ fn documentation_contract_covers_current_operator_surface() {
         "experiment",
         "operator_wake",
         "pueue-agent steer",
+        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
     ] {
         assert!(
             instructions.contains(required),
@@ -224,6 +226,14 @@ fn documentation_contract_covers_current_operator_surface() {
             "templates/config.toml is missing documentation contract text: {required}"
         );
     }
+
+    let operations = std::fs::read_to_string(root.join("docs/operations-ja.md")).unwrap();
+    assert!(
+        operations.contains(
+            "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る"
+        ),
+        "docs/operations-ja.md is missing stop shutdown behavior"
+    );
 }
 
 #[test]
