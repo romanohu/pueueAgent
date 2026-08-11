@@ -320,7 +320,7 @@ fn status_bounds_the_joined_termination_error_line() {
                 "project-a",
                 "termination",
                 Some(&format!("task-{index}")),
-                &format!("termination-fingerprint-{index}"),
+                format!("termination-fingerprint-{index}"),
                 harness.now + index,
             ))
             .unwrap()
@@ -329,7 +329,7 @@ fn status_bounds_the_joined_termination_error_line() {
             .insert_idempotent(&NewTerminationRequest::new(
                 incident.incident_id,
                 "project-a",
-                &format!("task-signature-{index}"),
+                format!("task-signature-{index}"),
                 "fatal pattern",
                 harness.now + index,
                 Some(harness.now + index + 60),

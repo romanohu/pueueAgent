@@ -82,7 +82,7 @@ impl FollowCursor {
             let is_new_head = self
                 .submission_head
                 .get(&cursor.run_id)
-                .map_or(true, |head| page_cursor > *head);
+                .is_none_or(|head| page_cursor > *head);
             let is_after_task_update = page_cursor == *after
                 && self.submission_after_task.get(&cursor.run_id) != Some(&cursor.task_id);
             let is_head_task_update = self.submission_head.get(&cursor.run_id)
@@ -321,7 +321,7 @@ pub fn collect_fresh(
             lineage.submissions.is_empty()
                 && lineage
                     .run_id
-                    .map_or(true, |run_id| !cursor.has_submission_continuation(run_id))
+                    .is_none_or(|run_id| !cursor.has_submission_continuation(run_id))
         })
         .filter_map(RunLineage::root_cursor)
         .map(|cursor| stream_for_cursor(&cursor))

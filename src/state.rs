@@ -73,7 +73,7 @@ pub fn load(path: &Path) -> Result<CanonicalState, AppError> {
             operation: "decode canonical state schema",
             source,
         })?;
-    Ok(state.validate()?)
+    state.validate()
 }
 
 pub fn load_if_present(path: &Path) -> Result<Option<CanonicalState>, AppError> {
