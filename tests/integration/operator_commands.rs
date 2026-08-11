@@ -55,14 +55,16 @@ fn service_lifecycle_commands_parse_without_project_state() {
 #[cfg(unix)]
 #[test]
 fn service_lifecycle_commands_report_only_verified_service_state() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = TempDir::new().unwrap();
     let bin = temp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     let launchctl = bin.join("launchctl");
-    fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let systemctl = bin.join("systemctl");
+    write_service_shim(&launchctl, "#!/bin/sh\nexit 0\n");
+    write_service_shim(
+        &systemctl,
+        "#!/bin/sh\nif [ \"$2\" = is-active ]; then echo active; fi\nexit 0\n",
+    );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
     let start = assert_cmd::Command::cargo_bin("pueue-agent")
@@ -95,12 +97,14 @@ fn service_lifecycle_commands_report_only_verified_service_state() {
     assert!(body.get("project_id").is_none());
     assert!(body.get("pueue").is_none());
 
-    fs::write(
+    write_service_shim(
         &launchctl,
         "#!/bin/sh\nif [ \"$1\" = print ]; then exit 1; fi\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    );
+    write_service_shim(
+        &systemctl,
+        "#!/bin/sh\nif [ \"$2\" = is-active ]; then echo inactive; fi\nexit 0\n",
+    );
     let unverified_start = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
         .current_dir(temp.path())
@@ -111,6 +115,46 @@ fn service_lifecycle_commands_report_only_verified_service_state() {
         .unwrap();
     assert!(!unverified_start.status.success());
     assert!(String::from_utf8_lossy(&unverified_start.stderr).contains("verify service started"));
+}
+
+#[cfg(unix)]
+#[test]
+fn stop_service_manager_failure_emits_no_success_output() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let launchctl = bin.join("launchctl");
+    let systemctl = bin.join("systemctl");
+    write_service_shim(
+        &launchctl,
+        "#!/bin/sh\nif [ \"$1\" = bootout ]; then exit 1; fi\nexit 0\n",
+    );
+    write_service_shim(
+        &systemctl,
+        "#!/bin/sh\nif [ \"$2\" = stop ]; then exit 1; fi\nexit 0\n",
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("PATH", path)
+        .args(["stop", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("service command failed"));
+}
+
+#[cfg(unix)]
+fn write_service_shim(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[derive(Clone)]
