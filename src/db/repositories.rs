@@ -1213,6 +1213,35 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("read filtered events"))
     }
 
+    pub fn latest_run_id(
+        &self,
+        project_id: &str,
+        event_id: i64,
+    ) -> Result<Option<i64>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT agent_runs.run_id
+                 FROM agent_runs
+                 JOIN agent_run_events
+                   ON agent_run_events.project_id = agent_runs.project_id
+                  AND agent_run_events.run_id = agent_runs.run_id
+                 JOIN events
+                   ON events.project_id = agent_run_events.project_id
+                  AND events.event_id = agent_run_events.event_id
+                 WHERE agent_runs.project_id = ?1
+                   AND agent_run_events.project_id = ?1
+                   AND events.project_id = ?1
+                   AND agent_run_events.event_id = ?2
+                 ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
+                 LIMIT 1",
+                params![project_id, event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("find latest event agent run"))
+    }
+
     pub fn find_by_task_signature(
         &self,
         project_id: &str,

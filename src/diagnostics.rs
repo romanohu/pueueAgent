@@ -29,6 +29,7 @@ pub const MAX_EVENT_LIST_LIMIT: usize = 1_000;
 pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 
 const MAX_TASK_AGENT_RUNS: usize = 64;
+const MAX_RESTART_UNCERTAIN_SAMPLES: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
@@ -60,12 +61,21 @@ pub fn render_events(
     filter: &EventFilter,
     json: bool,
 ) -> Result<String, AppError> {
-    let events = EventRepository::new(db).list_filtered(&project.project_id, filter)?;
+    let event_repository = EventRepository::new(db);
+    let events = event_repository.list_filtered(&project.project_id, filter)?;
     if json {
+        let summaries = events
+            .iter()
+            .map(|event| {
+                event_repository
+                    .latest_run_id(&project.project_id, event.event_id)
+                    .map(|run_id| EventSummary::from_event(event, run_id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         return serde_json::to_string(&EventListReport {
             schema_version: JSON_SCHEMA_VERSION,
             project_id: project.project_id.clone(),
-            events: events.iter().map(EventSummary::from).collect(),
+            events: summaries,
         })
         .map_err(|source| AppError::Serialization {
             operation: "serialize event diagnostics",
@@ -74,20 +84,27 @@ pub fn render_events(
     }
 
     let mut lines = vec![human_header("events", &project.project_id)];
-    lines.push("EVENT STATE KIND ATTEMPTS LEASE CREATED COMPLETED ERROR".to_owned());
-    lines.extend(events.iter().map(|event| {
+    lines.push("EVENT STATE KIND ATTEMPTS NOT_BEFORE LEASE CREATED COMPLETED RUN ERROR".to_owned());
+    let run_ids = events
+        .iter()
+        .map(|event| event_repository.latest_run_id(&project.project_id, event.event_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    lines.extend(events.iter().zip(run_ids).map(|(event, run_id)| {
         format!(
-            "{} state={} kind={} attempts={} lease={} created_at={} completed_at={} error={}",
+            "{} state={} kind={} attempts={} not_before={} lease={} created_at={} completed_at={} run_id={} error={}",
             render_id("event", event.event_id),
             format_state(event.status.as_str()),
             event.kind,
             event.attempts,
+            event.not_before,
             event
                 .lease_until
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
             event.created_at,
             event
                 .completed_at
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            run_id
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
             event
                 .last_error
@@ -867,6 +884,132 @@ pub fn build_doctor_report(
         )
     });
 
+    let unlinked_ack_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1
+               AND status IN ('in_flight', 'dispatched')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM agent_run_events
+                   JOIN agent_runs
+                     ON agent_runs.project_id = agent_run_events.project_id
+                    AND agent_runs.run_id = agent_run_events.run_id
+                   WHERE agent_run_events.project_id = events.project_id
+                     AND agent_run_events.event_id = events.event_id
+               )",
+            [&project.project_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor event ack consistency",
+            source,
+        })?;
+    checks.push(if unlinked_ack_events == 0 {
+        doctor_ok(
+            "events.ack_consistency",
+            "all in-flight and dispatched events have a same-project agent run link",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "events.ack_consistency",
+            &format!(
+                "{unlinked_ack_events} in-flight or dispatched event(s) have no same-project agent run link"
+            ),
+            "inspect the affected event and agent-run records without repairing them from doctor",
+        )
+    });
+
+    let dead_letter_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND status = 'dead_letter'",
+            [&project.project_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor dead-letter events",
+            source,
+        })?;
+    checks.push(if dead_letter_events == 0 {
+        doctor_ok(
+            "events.dead_letter",
+            "no dead-letter events are present",
+            "none",
+        )
+    } else {
+        doctor_warning(
+            "events.dead_letter",
+            &format!("{dead_letter_events} dead-letter event(s) are present"),
+            "inspect bounded dead-letter details with events --status dead-letter",
+        )
+    });
+
+    let restart_uncertain_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1
+               AND status = 'dead_letter'
+               AND last_error LIKE 'restart_interruption: execution outcome unknown%'",
+            [&project.project_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query doctor restart-uncertain events",
+            source,
+        })?;
+    let restart_samples = if restart_uncertain_count == 0 {
+        Vec::new()
+    } else {
+        let mut statement = connection
+            .prepare(
+                "SELECT last_error FROM events
+                 WHERE project_id = ?1
+                   AND status = 'dead_letter'
+                   AND last_error LIKE 'restart_interruption: execution outcome unknown%'
+                 ORDER BY event_id DESC LIMIT ?2",
+            )
+            .map_err(|source| AppError::Database {
+                operation: "prepare doctor restart-uncertain samples",
+                source,
+            })?;
+        let rows = statement
+            .query_map(
+                params![&project.project_id, MAX_RESTART_UNCERTAIN_SAMPLES],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|source| AppError::Database {
+                operation: "query doctor restart-uncertain samples",
+                source,
+            })?;
+        rows.collect::<Result<Vec<Option<String>>, _>>()
+            .map_err(|source| AppError::Database {
+                operation: "read doctor restart-uncertain samples",
+                source,
+            })?
+            .into_iter()
+            .flatten()
+            .map(|sample| bounded_redacted_text(&sample))
+            .collect::<Vec<_>>()
+    };
+    checks.push(if restart_uncertain_count == 0 {
+        doctor_ok(
+            "events.restart_uncertain",
+            "no restart-uncertain event reasons are recorded",
+            "none",
+        )
+    } else {
+        let sample_summary = restart_samples.join("; ");
+        doctor_warning(
+            "events.restart_uncertain",
+            &format!(
+                "{restart_uncertain_count} restart-uncertain event(s): {sample_summary}"
+            ),
+            "review bounded restart-interruption details and decide whether to re-submit manually",
+        )
+    });
+
     checks.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     let status = if checks
         .iter()
@@ -950,7 +1093,7 @@ pub fn render_project_status_json(
         pueue: pueue_summary(project, &input.pueue),
         events: EventSection {
             counts: event_counts(db, &project.project_id)?,
-            recent: events.iter().map(EventSummary::from).collect(),
+            recent: event_summaries(db, &project.project_id, &events)?,
         },
         incidents: IncidentSection {
             counts: incident_counts(db, &project.project_id)?,
@@ -1058,9 +1201,12 @@ struct EventSection {
 struct EventCounts {
     pending: i64,
     claimed: i64,
+    in_flight: i64,
+    dispatched: i64,
     completed: i64,
     retry_wait: i64,
     failed: i64,
+    dead_letter: i64,
 }
 
 #[derive(Serialize)]
@@ -1069,20 +1215,33 @@ struct EventSummary {
     kind: EventKind,
     status: EventStatus,
     attempts: i64,
+    not_before: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<i64>,
     lease_until: Option<i64>,
     created_at: i64,
     completed_at: Option<i64>,
     error_category: Option<&'static str>,
     error_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 impl From<&Event> for EventSummary {
     fn from(event: &Event) -> Self {
+        Self::from_event(event, None)
+    }
+}
+
+impl EventSummary {
+    fn from_event(event: &Event, run_id: Option<i64>) -> Self {
         Self {
             event_id: event.event_id,
             kind: event.kind,
             status: event.status,
             attempts: event.attempts,
+            not_before: event.not_before,
+            run_id,
             lease_until: event.lease_until,
             created_at: event.created_at,
             completed_at: event.completed_at,
@@ -1091,6 +1250,7 @@ impl From<&Event> for EventSummary {
                 .last_error
                 .as_ref()
                 .map(|_| safe_error_summary("event_processing")),
+            last_error: event.last_error.as_deref().map(bounded_summary),
         }
     }
 }
@@ -1339,10 +1499,29 @@ fn event_counts(db: &Db, project_id: &str) -> Result<EventCounts, AppError> {
     Ok(EventCounts {
         pending: count(&counts, "pending"),
         claimed: count(&counts, "claimed"),
+        in_flight: count(&counts, "in_flight"),
+        dispatched: count(&counts, "dispatched"),
         completed: count(&counts, "completed"),
         retry_wait: count(&counts, "retry_wait"),
         failed: count(&counts, "failed"),
+        dead_letter: count(&counts, "dead_letter"),
     })
+}
+
+fn event_summaries(
+    db: &Db,
+    project_id: &str,
+    events: &[Event],
+) -> Result<Vec<EventSummary>, AppError> {
+    let repository = EventRepository::new(db);
+    events
+        .iter()
+        .map(|event| {
+            repository
+                .latest_run_id(project_id, event.event_id)
+                .map(|run_id| EventSummary::from_event(event, run_id))
+        })
+        .collect()
 }
 
 fn incident_counts(db: &Db, project_id: &str) -> Result<IncidentCounts, AppError> {

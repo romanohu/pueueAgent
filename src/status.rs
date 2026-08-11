@@ -101,11 +101,7 @@ pub fn render_project_status(
     };
 
     let event_counts = event_status_counts(db, &project.project_id)?;
-    lines.push(format!(
-        "events: pending={} failed={}",
-        count(&event_counts, "pending"),
-        count(&event_counts, "failed")
-    ));
+    lines.push(event_counts_line(&event_counts));
     let recent_events = EventRepository::new(db).recent_events(&project.project_id, 8)?;
     if !recent_events.is_empty() {
         lines.push(format!(
@@ -212,11 +208,7 @@ pub fn render_project_status_compact(
     ));
 
     let event_counts = event_status_counts(db, &project.project_id)?;
-    lines.push(format!(
-        "events: pending={} failed={}",
-        count(&event_counts, "pending"),
-        count(&event_counts, "failed")
-    ));
+    lines.push(event_counts_line(&event_counts));
 
     let guardrails = guardrail_lines(db, project)?;
     lines.extend(guardrails);
@@ -346,6 +338,30 @@ fn grouped_counts(
 
 fn count(counts: &BTreeMap<String, i64>, key: &str) -> i64 {
     counts.get(key).copied().unwrap_or(0)
+}
+
+fn event_counts_line(counts: &BTreeMap<String, i64>) -> String {
+    let retry_wait = count(counts, "retry_wait");
+    let in_flight = count(counts, "in_flight");
+    let dispatched = count(counts, "dispatched");
+    let dead_letter = count(counts, "dead_letter");
+    if retry_wait == 0 && in_flight == 0 && dispatched == 0 && dead_letter == 0 {
+        return format!(
+            "events: pending={} failed={}",
+            count(counts, "pending"),
+            count(counts, "failed")
+        );
+    }
+    format!(
+        "events: pending={} claimed={} retry_wait={} in_flight={} dispatched={} failed={} dead_letter={}",
+        count(counts, "pending"),
+        count(counts, "claimed"),
+        retry_wait,
+        in_flight,
+        dispatched,
+        count(counts, "failed"),
+        dead_letter
+    )
 }
 
 fn event_summary(event: &Event) -> String {

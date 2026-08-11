@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 use pueue_agent::{
+    cli::Cli,
     db::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
         ProjectRepository, TaskObservationRepository, TerminationRequestRepository,
@@ -23,6 +24,8 @@ use pueue_agent::{
     service::{ServicePaths, ServiceStatus},
     status::{render_project_status, render_project_status_compact, PueueSnapshot, StatusInput},
 };
+use clap::Parser;
+use rusqlite::params;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -758,6 +761,73 @@ fn status_json_counts_project_interventions_without_exposing_message_bodies() {
             .unwrap(),
         1
     );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'in_flight' WHERE event_id = ?1",
+            [event.event_id],
+        )
+        .unwrap();
+
+    let retry_wait = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "intervention-status-retry-wait",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[retry_wait.event_id],
+            EventStatus::RetryWait,
+            106,
+            Some(200),
+            Some("retry wait detail"),
+        )
+        .unwrap();
+    let dispatched = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "intervention-status-dispatched",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dispatched' WHERE event_id = ?1",
+            [dispatched.event_id],
+        )
+        .unwrap();
+    let dead_letter = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "intervention-status-dead-letter",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[dead_letter.event_id],
+            EventStatus::DeadLetter,
+            106,
+            None,
+            Some("dead letter detail"),
+        )
+        .unwrap();
 
     let rendered = render_project_status_json(
         &harness.db,
@@ -770,9 +840,101 @@ fn status_json_counts_project_interventions_without_exposing_message_bodies() {
     assert_eq!(value["interventions"]["counts"]["pending"], 1);
     assert_eq!(value["interventions"]["counts"]["reserved"], 1);
     assert_eq!(value["interventions"]["counts"]["applied"], 1);
+    assert_eq!(value["events"]["counts"]["in_flight"], 1);
+    assert_eq!(value["events"]["counts"]["dispatched"], 1);
+    assert_eq!(value["events"]["counts"]["retry_wait"], 1);
+    assert_eq!(value["events"]["counts"]["dead_letter"], 1);
     assert!(!rendered.contains(&pending.message));
     assert!(!rendered.contains(&reserved.message));
     assert!(!rendered.contains(&applied.message));
+}
+
+#[test]
+fn status_human_and_compact_counts_include_ack_states() {
+    let harness = DiagnosticsHarness::new();
+    let retry_wait = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "status-human-retry-wait",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[retry_wait.event_id],
+            EventStatus::RetryWait,
+            100,
+            Some(200),
+            None,
+        )
+        .unwrap();
+    let in_flight = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "status-human-in-flight",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    let dispatched = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "status-human-dispatched",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    let dead_letter = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "status-human-dead-letter",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = CASE event_id
+                WHEN ?1 THEN 'in_flight'
+                WHEN ?2 THEN 'dispatched'
+                WHEN ?3 THEN 'dead_letter'
+             END
+             WHERE event_id IN (?1, ?2, ?3)",
+            params![in_flight.event_id, dispatched.event_id, dead_letter.event_id],
+        )
+        .unwrap();
+
+    let input = harness.input(PueueSnapshot::Tasks(vec![]));
+    for rendered in [
+        render_project_status(&harness.db, &harness.project(), &input).unwrap(),
+        render_project_status_compact(&harness.db, &harness.project(), &input).unwrap(),
+    ] {
+        let event_line = rendered
+            .lines()
+            .find(|line| line.starts_with("events: "))
+            .unwrap();
+        for field in [
+            "retry_wait=1",
+            "in_flight=1",
+            "dispatched=1",
+            "failed=0",
+            "dead_letter=1",
+        ] {
+            assert!(event_line.contains(field), "missing {field}: {event_line}");
+        }
+    }
 }
 
 #[test]
@@ -1256,18 +1418,69 @@ fn events_projection_filters_project_events_and_emits_bounded_fields() {
             EventStatus::Failed,
             101,
             None,
-            Some("unbounded internal failure detail"),
+            Some(&"unbounded internal failure detail ".repeat(100)),
         )
         .unwrap();
-    EventRepository::new(&harness.db)
+    let dispatched = EventRepository::new(&harness.db)
         .insert_idempotent(&NewEvent::new(
             "project-a",
             EventKind::TaskFinished,
-            "diagnostic-finished",
-            json!({}),
+            "diagnostic-dispatched",
+            json!({"prompt": "hidden dispatched prompt"}),
             102,
             102,
         ))
+        .unwrap();
+    let claimed = EventRepository::new(&harness.db)
+        .claim_batch(102, 202, 1)
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                dispatched.event_id,
+                None,
+                AgentRunStatus::Running,
+                103,
+                "/tmp/diagnostic-run.log",
+            ),
+            &[dispatched.event_id],
+        )
+        .unwrap();
+    let dispatch_error = format!(
+        "dispatch failed --token hidden-token \x1b[31m{}\x1b[0m",
+        "detail ".repeat(100)
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dispatched', attempts = 2,
+                last_error = ?2, not_before = 123
+             WHERE event_id = ?1",
+            params![dispatched.event_id, dispatch_error],
+        )
+        .unwrap();
+    let dead_letter = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "diagnostic-dead-letter",
+            json!({"prompt": "hidden dead-letter prompt"}),
+            103,
+            103,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[dead_letter.event_id],
+            EventStatus::DeadLetter,
+            104,
+            None,
+            Some(&"dead-letter error ".repeat(100)),
+        )
         .unwrap();
 
     let rendered = render_events(
@@ -1284,8 +1497,142 @@ fn events_projection_filters_project_events_and_emits_bounded_fields() {
     assert_eq!(events[0]["kind"], "crash");
     assert_eq!(events[0]["status"], "failed");
     assert!(events[0]["error_summary"].as_str().unwrap().len() <= 240);
+    assert!(events[0]["last_error"].as_str().unwrap().len() <= 240);
     assert!(!rendered.contains("hidden"));
-    assert!(!rendered.contains("unbounded internal failure detail"));
+    assert!(!rendered.contains(&"unbounded internal failure detail ".repeat(100)));
+
+    let rendered = render_events(
+        &harness.db,
+        &harness.project(),
+        &EventFilter::new(None, Some(EventStatus::DeadLetter), 10),
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let dead_letter_projection = &value["events"][0];
+    assert_eq!(dead_letter_projection["status"], "dead_letter");
+    assert_eq!(dead_letter_projection["attempts"], 0);
+    assert_eq!(dead_letter_projection["not_before"], 103);
+    assert!(dead_letter_projection["last_error"].as_str().unwrap().len() <= 240);
+    assert_eq!(dead_letter_projection["run_id"], Value::Null);
+    assert!(!rendered.contains("hidden dead-letter prompt"));
+    assert!(!rendered.contains("dead-letter error ".repeat(100).as_str()));
+
+    let rendered = render_events(
+        &harness.db,
+        &harness.project(),
+        &EventFilter::new(None, Some(EventStatus::Dispatched), 10),
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let dispatched_projection = &value["events"][0];
+    assert_eq!(dispatched_projection["run_id"], run.run_id);
+    assert_eq!(dispatched_projection["attempts"], 2);
+    assert_eq!(dispatched_projection["not_before"], 123);
+    assert!(dispatched_projection["last_error"].as_str().unwrap().len() <= 240);
+    assert!(!rendered.contains("hidden dispatched prompt"));
+    assert!(!rendered.contains("hidden-token"));
+    assert!(!rendered.contains('\x1b'));
+    assert!(
+        dispatched_projection["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED]")
+    );
+
+    assert!(Cli::try_parse_from(["pueue-agent", "events", "--status", "dead-letter"]).is_ok());
+    assert!(Cli::try_parse_from(["pueue-agent", "events", "--status", "dead_letter"]).is_err());
+}
+
+#[test]
+fn latest_run_id_is_project_scoped_and_deterministic() {
+    let harness = DiagnosticsHarness::new();
+    let foreign_root = harness._temp.path().join("project-b");
+    fs::create_dir_all(&foreign_root).unwrap();
+    ProjectRepository::new(&harness.db)
+        .register(&NewProject::new(
+            "project-b",
+            &foreign_root,
+            "pb-project",
+            foreign_root.join(".pueue-agent/config.toml"),
+            100,
+        ))
+        .unwrap();
+
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "latest-run-project-a",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'claimed', lease_until = 300 WHERE event_id = ?1",
+            [event.event_id],
+        )
+        .unwrap();
+    let first = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                None,
+                AgentRunStatus::Completed,
+                200,
+                "/tmp/latest-first.log",
+            ),
+            &[event.event_id],
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'claimed', lease_until = 300 WHERE event_id = ?1",
+            [event.event_id],
+        )
+        .unwrap();
+    let second = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                None,
+                AgentRunStatus::Completed,
+                200,
+                "/tmp/latest-second.log",
+            ),
+            &[event.event_id],
+        )
+        .unwrap();
+    assert!(second.run_id > first.run_id);
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .latest_run_id("project-a", event.event_id)
+            .unwrap(),
+        Some(second.run_id)
+    );
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .latest_run_id("project-b", event.event_id)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .latest_run_id("project-a", 999_999)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -1550,6 +1897,129 @@ fn doctor_projection_reports_unavailable_integrations_as_errors_without_repairin
         .unwrap();
     assert_eq!(event_after.status, EventStatus::Claimed);
     assert_eq!(event_after.lease_until, Some(99));
+}
+
+#[test]
+fn doctor_reports_dead_letter_ack_consistency_and_restart_uncertainty_without_repair() {
+    let harness = DiagnosticsHarness::new();
+    let dead_letter = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "doctor-dead-letter",
+            json!({"prompt": "hidden doctor prompt"}),
+            100,
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[dead_letter.event_id],
+            EventStatus::DeadLetter,
+            101,
+            None,
+            Some(&format!(
+                "restart_interruption: execution outcome unknown --password hidden \x1b[31m{}\x1b[0m",
+                "reason ".repeat(100)
+            )),
+        )
+        .unwrap();
+    let pre_marker_dead_letter = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "doctor-pre-marker-dead-letter",
+            json!({}),
+            101,
+            101,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .transition_many(
+            &[pre_marker_dead_letter.event_id],
+            EventStatus::DeadLetter,
+            102,
+            None,
+            Some("restart_interruption: pre-marker execution not confirmed (retry limit)"),
+        )
+        .unwrap();
+    let unlinked = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "doctor-unlinked-in-flight",
+            json!({"prompt": "hidden in-flight prompt"}),
+            102,
+            102,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'in_flight', lease_until = NULL WHERE event_id = ?1",
+            [unlinked.event_id],
+        )
+        .unwrap();
+
+    let before_dead_letter = EventRepository::new(&harness.db)
+        .find_by_id(dead_letter.event_id)
+        .unwrap()
+        .unwrap();
+    let before_unlinked = EventRepository::new(&harness.db)
+        .find_by_id(unlinked.event_id)
+        .unwrap()
+        .unwrap();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        200,
+    )
+    .unwrap();
+
+    let ack_consistency = report
+        .checks
+        .iter()
+        .find(|check| check.name == "events.ack_consistency")
+        .unwrap();
+    assert_eq!(ack_consistency.status, pueue_agent::diagnostics::DoctorCheckStatus::Error);
+    let dead_letter_check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "events.dead_letter")
+        .unwrap();
+    assert_eq!(dead_letter_check.status, pueue_agent::diagnostics::DoctorCheckStatus::Warning);
+    assert!(dead_letter_check.remediation.contains("dead-letter"));
+    let restart_uncertain = report
+        .checks
+        .iter()
+        .find(|check| check.name == "events.restart_uncertain")
+        .unwrap();
+    assert_eq!(restart_uncertain.status, pueue_agent::diagnostics::DoctorCheckStatus::Warning);
+    assert!(restart_uncertain.summary.contains("1 restart-uncertain"));
+    assert!(restart_uncertain.summary.contains("restart_interruption"));
+    assert!(restart_uncertain.summary.contains("execution outcome unknown"));
+    assert!(!restart_uncertain.summary.contains("hidden"));
+    assert!(!restart_uncertain.summary.contains("doctor prompt"));
+    assert!(!restart_uncertain.summary.contains("pre-marker"));
+    assert!(restart_uncertain.summary.len() <= 240);
+    assert!(!restart_uncertain.summary.chars().any(char::is_control));
+
+    let after_dead_letter = EventRepository::new(&harness.db)
+        .find_by_id(dead_letter.event_id)
+        .unwrap()
+        .unwrap();
+    let after_unlinked = EventRepository::new(&harness.db)
+        .find_by_id(unlinked.event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_dead_letter.status, after_dead_letter.status);
+    assert_eq!(before_dead_letter.lease_until, after_dead_letter.lease_until);
+    assert_eq!(before_unlinked.status, after_unlinked.status);
+    assert_eq!(before_unlinked.lease_until, after_unlinked.lease_until);
 }
 
 #[test]
