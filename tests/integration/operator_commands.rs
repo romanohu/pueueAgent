@@ -398,6 +398,40 @@ async fn cancel_refuses_other_group_terminal_and_ambiguous_task_ids_without_kill
 }
 
 #[tokio::test]
+async fn cancel_allows_case_insensitive_queued_and_running_states() {
+    for state in ["qUeUeD", "rUnNiNg"] {
+        let harness = CancelHarness::with_tasks(vec![cancel_task(
+            41,
+            "pa-project",
+            state,
+            "100",
+        )]);
+
+        let result = harness.cancel(41).await.unwrap();
+
+        assert!(result.kill_sent);
+        assert_eq!(harness.pueue.kill_calls(), vec![41]);
+    }
+}
+
+#[tokio::test]
+async fn cancel_refuses_paused_stashed_and_unknown_states_before_side_effects() {
+    for state in ["paused", "stashed", "mysterious"] {
+        let harness = CancelHarness::with_tasks(vec![cancel_task(
+            41,
+            "pa-project",
+            state,
+            "100",
+        )]);
+
+        assert!(harness.cancel(41).await.is_err());
+        assert!(harness.pueue.kill_calls().is_empty());
+        assert_eq!(harness.pueue.status_calls(), 1);
+        assert!(harness.operator.operator_log_rows().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn cancel_refuses_a_reused_task_id_with_a_different_stable_identity() {
     let harness = CancelHarness::with_tasks(vec![PueueTask {
         id: 41,

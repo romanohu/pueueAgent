@@ -36,7 +36,9 @@ pub async fn cancel_task_with(
     }
 
     let task = matching_tasks[0];
-    if task.group != project.pueue_group || task.is_terminal() {
+    if task.group != project.pueue_group
+        || !matches!(task.state.to_ascii_lowercase().as_str(), "queued" | "running")
+    {
         return Err(AppError::Runtime {
             operation: "validate task cancellation target",
         });
