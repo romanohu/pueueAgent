@@ -12,7 +12,10 @@ fn version_reports_package_revision_and_json_mode() {
     assert!(value["package_version"].is_string());
     assert!(value["revision"].is_string());
     assert!(value["source"].is_string());
-    assert!(value["service"].is_string() || value["service"].is_null());
+    assert!(matches!(
+        value["service"].as_str(),
+        Some("running" | "stopped" | "not_installed" | "unknown")
+    ));
 }
 
 #[test]

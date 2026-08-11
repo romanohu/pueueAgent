@@ -2,7 +2,11 @@ use std::{env, path::PathBuf};
 
 use serde::Serialize;
 
-use crate::{output::bounded_redacted_text, AppError};
+use crate::{
+    output::bounded_redacted_text,
+    service::{ServiceControl, ServiceManager, ServiceStatus},
+    AppError,
+};
 
 const JSON_SCHEMA_VERSION: u32 = 1;
 
@@ -16,14 +20,10 @@ pub struct BuildInfo {
 
 impl BuildInfo {
     pub fn current() -> Result<Self, AppError> {
-        let executable = env::current_exe().map_err(|source| AppError::Io {
+        let _executable = env::current_exe().map_err(|source| AppError::Io {
             operation: "resolve current executable",
             source,
         })?;
-        let service = executable
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned);
 
         Ok(Self {
             package_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -31,8 +31,17 @@ impl BuildInfo {
                 .unwrap_or("unknown")
                 .to_owned(),
             source_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            service,
+            service: Some(service_label(ServiceManager.status())),
         })
+    }
+}
+
+fn service_label(status: Result<ServiceStatus, AppError>) -> String {
+    match status {
+        Ok(ServiceStatus::Running) => "running".to_owned(),
+        Ok(ServiceStatus::Stopped) => "stopped".to_owned(),
+        Ok(ServiceStatus::NotInstalled) => "not_installed".to_owned(),
+        Err(_) => "unknown".to_owned(),
     }
 }
 
@@ -69,4 +78,61 @@ pub fn render(info: BuildInfo, json: bool) -> Result<String, AppError> {
         "pueue-agent {package_version}\nrevision: {revision}\nsource: {source}\nservice: {}",
         service.as_deref().unwrap_or("none")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_reports_bounded_human_service_state() {
+        let info = BuildInfo {
+            package_version: "v".repeat(500),
+            revision: "r".repeat(500),
+            source_root: PathBuf::from("/tmp/SECRET_TOKEN=hidden"),
+            service: Some("running".to_owned()),
+        };
+
+        let rendered = render(info, false).unwrap();
+
+        assert!(rendered.contains("service: running"));
+        assert!(rendered.lines().all(|line| line.len() <= 260));
+        assert!(!rendered.contains("hidden"));
+    }
+
+    #[test]
+    fn render_reports_bounded_json_service_state() {
+        let info = BuildInfo {
+            package_version: "v".repeat(500),
+            revision: "r".repeat(500),
+            source_root: PathBuf::from("/tmp/SECRET_TOKEN=hidden"),
+            service: Some("stopped".to_owned()),
+        };
+
+        let rendered = render(info, true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["service"], "stopped");
+        assert!(value["package_version"].as_str().unwrap().len() <= 240);
+        assert!(value["revision"].as_str().unwrap().len() <= 240);
+        assert!(value["source"].as_str().unwrap().len() <= 240);
+        assert!(value["service"].as_str().unwrap().len() <= 240);
+        assert!(!rendered.contains("hidden"));
+    }
+
+    #[test]
+    fn service_label_uses_status_or_safe_unknown_fallback() {
+        assert_eq!(service_label(Ok(ServiceStatus::Running)), "running");
+        assert_eq!(service_label(Ok(ServiceStatus::Stopped)), "stopped");
+        assert_eq!(
+            service_label(Ok(ServiceStatus::NotInstalled)),
+            "not_installed"
+        );
+        assert_eq!(
+            service_label(Err(AppError::Runtime {
+                operation: "query service",
+            })),
+            "unknown"
+        );
+    }
 }
