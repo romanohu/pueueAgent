@@ -290,6 +290,11 @@ impl UpgradeFixture {
         self.commands.no_update.set(true);
     }
 
+    fn make_noop_at_revision(&self, revision: &str) {
+        self.make_noop();
+        *self.commands.revision_override.borrow_mut() = Some(revision.to_owned());
+    }
+
     fn retry_marker(&self) -> PathBuf {
         self.state_dir().join("upgrade.pending")
     }
@@ -395,6 +400,7 @@ struct FakeCommandRunner {
     activate_during_checkout: RefCell<Option<ActiveRunPlan>>,
     activate_before_install: RefCell<Option<ActiveRunPlan>>,
     no_update: Cell<bool>,
+    revision_override: RefCell<Option<String>>,
     merged: Cell<bool>,
 }
 
@@ -404,6 +410,7 @@ impl GitCommandRunner for FakeCommandRunner {
             .borrow_mut()
             .push(args.iter().map(|arg| (*arg).to_owned()).collect());
 
+        let revision_override = self.revision_override.borrow().clone();
         let (success, stdout, stderr) = match args {
             ["status", "--porcelain"] => {
                 if let Some(plan) = self.activate_during_checkout.borrow_mut().take() {
@@ -419,10 +426,25 @@ impl GitCommandRunner for FakeCommandRunner {
                 (false, "", self.fetch_stderr.borrow().clone())
             }
             ["fetch", "origin", "main"] => (true, "", String::new()),
-            ["rev-parse", "HEAD"] if self.merged.get() => (true, "new-revision", String::new()),
-            ["rev-parse", "HEAD"] => (true, "old-revision", String::new()),
+            ["rev-parse", "HEAD"] => (
+                true,
+                revision_override
+                    .as_deref()
+                    .unwrap_or(if self.merged.get() {
+                        "new-revision"
+                    } else {
+                        "old-revision"
+                    }),
+                String::new(),
+            ),
             ["rev-parse", "origin/main"] if self.no_update.get() => {
-                (true, "old-revision", String::new())
+                (
+                    true,
+                    revision_override
+                        .as_deref()
+                        .unwrap_or("old-revision"),
+                    String::new(),
+                )
             }
             ["rev-parse", "origin/main"] => (true, "new-revision", String::new()),
             ["merge-base", "--is-ancestor", "HEAD", "origin/main"] => (true, "", String::new()),
@@ -820,8 +842,32 @@ async fn no_op_upgrade_skips_test_build_install_and_restart() {
 }
 
 #[tokio::test]
+async fn twelve_character_installed_revision_matches_full_checkout_head() {
+    let fixture = UpgradeFixture::new();
+    let full_head = git_stdout(fixture.source_root(), ["rev-parse", "HEAD"]);
+    let installed_revision = full_head[..12].to_owned();
+    fixture.make_noop_at_revision(&full_head);
+
+    let report = fixture
+        .run_upgrade_with_installed_revision(&installed_revision)
+        .await
+        .unwrap();
+
+    assert_eq!(report.old_revision, full_head);
+    assert_eq!(report.new_revision, full_head);
+    assert!(!report.tests.attempted);
+    assert!(!report.build.attempted);
+    assert!(!report.install.attempted);
+    assert!(!report.restart.attempted);
+    assert!(!report.health.attempted);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+    assert!(fixture.service_calls().is_empty());
+    assert!(fixture.commands.command_invocations.borrow().is_empty());
+}
+
+#[tokio::test]
 async fn stale_or_unknown_installed_revision_does_not_take_noop_path() {
-    for installed_revision in ["stale-revision", "unknown"] {
+    for installed_revision in ["stale-revision", "unknown", ""] {
         let fixture = UpgradeFixture::new();
         fixture.make_noop();
 

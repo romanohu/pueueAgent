@@ -192,6 +192,17 @@ fn report_status(report: &UpgradeReport) -> &'static str {
     }
 }
 
+fn revisions_match(installed_revision: &str, checkout_head: &str) -> bool {
+    if installed_revision.is_empty()
+        || installed_revision == "unknown"
+        || checkout_head.is_empty()
+    {
+        return false;
+    }
+
+    checkout_head.starts_with(installed_revision) || installed_revision.starts_with(checkout_head)
+}
+
 fn step_label(step: UpgradeStep) -> &'static str {
     if !step.attempted {
         "not_attempted"
@@ -556,8 +567,8 @@ where
             .as_deref()
             .is_some_and(|revision| revision == checkout.head);
 
-        let installed_revision_is_current = self.options.installed_revision != "unknown"
-            && self.options.installed_revision == checkout.head;
+        let installed_revision_is_current =
+            revisions_match(&self.options.installed_revision, &checkout.head);
         if !needs_fast_forward && !retry_pending_revision && installed_revision_is_current {
             report.new_revision = checkout.head;
             return Ok(report);
