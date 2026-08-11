@@ -118,9 +118,99 @@ impl ServiceControl for FakeService {
         Ok(())
     }
 
+    fn start(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn restart(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
     fn status(&self) -> Result<ServiceStatus, AppError> {
         self.status_checks.set(self.status_checks.get() + 1);
         Ok(*self.status.borrow())
+    }
+}
+
+#[derive(Default)]
+struct RecordingService {
+    calls: RefCell<Vec<String>>,
+    status: RefCell<ServiceStatus>,
+    failure: RefCell<Option<AppError>>,
+}
+
+impl RecordingService {
+    fn failing(operation: &'static str) -> Self {
+        Self {
+            failure: RefCell::new(Some(AppError::Runtime { operation })),
+            ..Self::default()
+        }
+    }
+
+    fn record(&self, operation: &str) -> Result<(), AppError> {
+        self.calls.borrow_mut().push(operation.to_owned());
+        match self.failure.borrow_mut().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl ServiceControl for RecordingService {
+    fn install(&self, _definition: &ServiceDefinition) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn start(&self) -> Result<(), AppError> {
+        self.record("start")
+    }
+
+    fn stop(&self) -> Result<(), AppError> {
+        self.record("stop")
+    }
+
+    fn restart(&self) -> Result<(), AppError> {
+        self.record("restart")
+    }
+
+    fn status(&self) -> Result<ServiceStatus, AppError> {
+        Ok(*self.status.borrow())
+    }
+}
+
+#[test]
+fn service_control_exposes_start_stop_and_restart_without_reinstalling() {
+    let fake = RecordingService::default();
+
+    fake.start().unwrap();
+    fake.stop().unwrap();
+    fake.restart().unwrap();
+
+    assert_eq!(
+        fake.calls.into_inner(),
+        vec!["start", "stop", "restart"]
+    );
+}
+
+#[test]
+fn service_control_propagates_lifecycle_manager_failures() {
+    for operation in ["start", "stop", "restart"] {
+        let fake = RecordingService::failing("fake service manager");
+
+        let error = match operation {
+            "start" => fake.start(),
+            "stop" => fake.stop(),
+            "restart" => fake.restart(),
+            _ => unreachable!(),
+        }
+        .expect_err("a non-zero service-manager status must be visible as an AppError");
+
+        assert!(error.to_string().contains("fake service manager"));
+        assert_eq!(fake.calls.into_inner(), vec![operation]);
     }
 }
 

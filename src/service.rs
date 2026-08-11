@@ -75,6 +75,12 @@ pub enum ServiceStatus {
 pub trait ServiceControl {
     fn install(&self, definition: &ServiceDefinition) -> Result<(), AppError>;
 
+    fn start(&self) -> Result<(), AppError>;
+
+    fn stop(&self) -> Result<(), AppError>;
+
+    fn restart(&self) -> Result<(), AppError>;
+
     fn status(&self) -> Result<ServiceStatus, AppError>;
 }
 
@@ -144,6 +150,32 @@ impl ServiceControl for ServiceManager {
             launchd_status()
         } else {
             systemd_status()
+        }
+    }
+
+    fn start(&self) -> Result<(), AppError> {
+        if cfg!(target_os = "macos") {
+            start_launchd()
+        } else {
+            run_service_command("systemctl", &["--user", "start", "pueue-agent.service"])
+        }
+    }
+
+    fn stop(&self) -> Result<(), AppError> {
+        if cfg!(target_os = "macos") {
+            let service = launchd_service_target()?;
+            run_service_command("launchctl", &["bootout", service.as_str()])
+        } else {
+            run_service_command("systemctl", &["--user", "stop", "pueue-agent.service"])
+        }
+    }
+
+    fn restart(&self) -> Result<(), AppError> {
+        if cfg!(target_os = "macos") {
+            let service = launchd_service_target()?;
+            run_service_command("launchctl", &["kickstart", "-k", service.as_str()])
+        } else {
+            run_service_command("systemctl", &["--user", "restart", "pueue-agent.service"])
         }
     }
 }
@@ -407,7 +439,7 @@ fn systemd_status() -> Result<ServiceStatus, AppError> {
 }
 
 fn launchd_status() -> Result<ServiceStatus, AppError> {
-    let service = format!("{}/com.pueue-agent", launchd_gui_domain()?);
+    let service = launchd_service_target()?;
     let output = Command::new("launchctl")
         .args(["print", service.as_str()])
         .output()
@@ -420,6 +452,49 @@ fn launchd_status() -> Result<ServiceStatus, AppError> {
     } else {
         Ok(ServiceStatus::Stopped)
     }
+}
+
+fn start_launchd() -> Result<(), AppError> {
+    let service = launchd_service_target()?;
+    let output = Command::new("launchctl")
+        .args(["kickstart", service.as_str()])
+        .output()
+        .map_err(|source| AppError::Io {
+            operation: "run platform service manager",
+            source,
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let details = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_lowercase();
+    if !details.contains("could not find service") {
+        return service_command_error("launchctl", output.status);
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or(AppError::Configuration { field: "HOME" })?;
+    let plist = home.join("Library/LaunchAgents/com.pueue-agent.plist");
+    run_service_command(
+        "launchctl",
+        &[
+            "bootstrap",
+            launchd_gui_domain()?.as_str(),
+            plist.to_str().ok_or(AppError::Configuration {
+                field: "launchd.plist",
+            })?,
+        ],
+    )
+}
+
+fn launchd_service_target() -> Result<String, AppError> {
+    Ok(format!("{}/com.pueue-agent", launchd_gui_domain()?))
 }
 
 fn launchd_gui_domain() -> Result<String, AppError> {
@@ -455,13 +530,14 @@ fn run_service_command(program: &str, args: &[&str]) -> Result<(), AppError> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(AppError::Message {
-            message: format!(
-                "{program} service command failed with status {}",
-                output.status
-            ),
-        })
+        service_command_error(program, output.status)
     }
+}
+
+fn service_command_error(program: &str, status: std::process::ExitStatus) -> Result<(), AppError> {
+    Err(AppError::Message {
+        message: format!("{program} service command failed with status {status}"),
+    })
 }
 
 fn parse_callback_value(line: &str) -> Option<String> {
