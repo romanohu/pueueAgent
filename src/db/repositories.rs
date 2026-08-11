@@ -476,6 +476,14 @@ impl<'db> EventRepository<'db> {
     }
 
     pub fn insert_idempotent(&self, event: &NewEvent) -> Result<Event, AppError> {
+        self.insert_idempotent_with_inserted(event)
+            .map(|(event, _)| event)
+    }
+
+    pub fn insert_idempotent_with_inserted(
+        &self,
+        event: &NewEvent,
+    ) -> Result<(Event, bool), AppError> {
         let payload_json =
             serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
                 operation: "serialize event payload",
@@ -485,7 +493,7 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin idempotent event insert"))?;
-        transaction
+        let inserted = transaction
             .execute(
                 "INSERT INTO events (
                     project_id, kind, dedup_key, payload_json, status, attempts,
@@ -512,7 +520,7 @@ impl<'db> EventRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit idempotent event insert"))?;
-        Ok(stored)
+        Ok((stored, inserted == 1))
     }
 
     pub fn find_by_id(&self, event_id: i64) -> Result<Option<Event>, AppError> {

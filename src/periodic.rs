@@ -36,13 +36,11 @@ impl<'db> PeriodicDeepCheckScheduler<'db> {
                 .collect::<Vec<_>>();
             let oldest_running_task_started_at = running_tasks
                 .iter()
-                .filter_map(|task| {
-                    Some(
-                        task.started_at
-                            .as_deref()
-                            .and_then(parse_timestamp)
-                            .unwrap_or(self.now),
-                    )
+                .map(|task| {
+                    task.started_at
+                        .as_deref()
+                        .and_then(parse_timestamp)
+                        .unwrap_or(self.now)
                 })
                 .min();
             let interval_seconds = i64::from(check.deep_check_interval_minutes) * 60;
@@ -67,12 +65,6 @@ impl<'db> PeriodicDeepCheckScheduler<'db> {
                 "{PERIODIC_DEEP_CHECK_DEDUP_PREFIX}{}",
                 periodic_bucket(self.now, interval_seconds)
             );
-            if events
-                .find_by_dedup_key(&project.project_id, &dedup_key)?
-                .is_some()
-            {
-                continue;
-            }
             let event = NewEvent::new(
                 &project.project_id,
                 EventKind::DeepCheck,
@@ -86,8 +78,8 @@ impl<'db> PeriodicDeepCheckScheduler<'db> {
                 self.now,
                 self.now,
             );
-            let _ = events.insert_idempotent(&event)?;
-            scheduled += 1;
+            let (_, inserted) = events.insert_idempotent_with_inserted(&event)?;
+            scheduled += usize::from(inserted);
         }
 
         Ok(scheduled)

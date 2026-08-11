@@ -2,7 +2,7 @@ use std::fs;
 
 use pueue_agent::{
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
-    models::{AgentRunStatus, Event, EventKind, NewAgentRun, NewEvent, NewProject},
+    models::{AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject},
     periodic::PeriodicDeepCheckScheduler,
     pueue::PueueTask,
 };
@@ -22,12 +22,12 @@ impl PeriodicHarness {
         let temp = TempDir::new().unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         let harness = Self { temp, db, now: NOW };
-        harness.register_project(interval_minutes);
+        harness.register_project("project-a", "periodic-project-a", interval_minutes);
         harness
     }
 
-    fn register_project(&self, interval_minutes: u32) {
-        let root = self.temp.path().join("project-a");
+    fn register_project(&self, project_id: &str, group: &str, interval_minutes: u32) {
+        let root = self.temp.path().join(project_id);
         let state = root.join(".pueue-agent");
         fs::create_dir_all(&state).unwrap();
         let config_path = state.join("config.toml");
@@ -35,8 +35,8 @@ impl PeriodicHarness {
             &config_path,
             format!(
                 r#"
-project_id = "project-a"
-pueue_group = "periodic-project-a"
+project_id = "{project_id}"
+pueue_group = "{group}"
 
 [agent]
 program = "/bin/echo"
@@ -66,9 +66,9 @@ max_agent_runs = 1
         .unwrap();
         ProjectRepository::new(&self.db)
             .register(&NewProject::new(
-                "project-a",
+                project_id,
                 root,
-                "periodic-project-a",
+                group,
                 config_path,
                 self.now,
             ))
@@ -106,11 +106,35 @@ max_agent_runs = 1
     }
 
     fn event_count(&self) -> i64 {
+        self.event_count_for_project("project-a")
+    }
+
+    fn event_count_for_project(&self, project_id: &str) -> i64 {
         self.db
             .connect()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
             .unwrap()
+    }
+
+    fn complete_only_event(&self) {
+        let event = self.only_event();
+        assert_eq!(
+            EventRepository::new(&self.db)
+                .transition_many(
+                    &[event.event_id],
+                    EventStatus::Completed,
+                    self.now,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            1
+        );
     }
 
     fn insert_active_agent_run(&self) -> i64 {
@@ -179,8 +203,53 @@ fn scheduler_creates_one_bounded_periodic_event_for_multiple_running_tasks() {
 fn scheduler_is_idempotent_for_the_same_periodic_bucket() {
     let harness = PeriodicHarness::with_interval(30);
     assert_eq!(harness.schedule(&[harness.running_task(41)]), 1);
+    harness.complete_only_event();
     assert_eq!(harness.schedule(&[harness.running_task(41)]), 0);
     assert_eq!(harness.event_count(), 1);
+}
+
+#[test]
+fn scheduler_keeps_tasks_in_their_registered_project_group() {
+    let harness = PeriodicHarness::with_interval(30);
+    harness.register_project("project-b", "periodic-project-b", 30);
+    let mut task = harness.running_task(99);
+    task.group = "periodic-project-b".to_owned();
+
+    assert_eq!(harness.schedule(&[task]), 1);
+    assert_eq!(harness.event_count_for_project("project-a"), 0);
+    assert_eq!(harness.event_count_for_project("project-b"), 1);
+}
+
+#[test]
+fn event_repository_reports_whether_idempotent_insert_created_a_row() {
+    let harness = PeriodicHarness::with_interval(30);
+    let first = NewEvent::new(
+        "project-a",
+        EventKind::DeepCheck,
+        "periodic-deep-check:v1:test-insert-outcome",
+        json!({"source": "periodic"}),
+        harness.now,
+        harness.now,
+    );
+    let duplicate = NewEvent::new(
+        "project-a",
+        EventKind::DeepCheck,
+        "periodic-deep-check:v1:test-insert-outcome",
+        json!({"source": "replacement"}),
+        harness.now,
+        harness.now,
+    );
+    let repository = EventRepository::new(&harness.db);
+
+    let (inserted, inserted_new) = repository.insert_idempotent_with_inserted(&first).unwrap();
+    let (existing, existing_new) = repository
+        .insert_idempotent_with_inserted(&duplicate)
+        .unwrap();
+
+    assert!(inserted_new);
+    assert!(!existing_new);
+    assert_eq!(inserted.event_id, existing.event_id);
+    assert_eq!(existing.payload, json!({"source": "periodic"}));
 }
 
 #[test]
