@@ -55,6 +55,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Resume(args) => commands::resume(args),
         Command::Steer(args) => commands::steer(args),
         Command::Wake(args) => commands::wake(args),
+        Command::Version(args) => commands::version(args),
         Command::Start(args) => commands::start(args),
         Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
@@ -70,7 +71,7 @@ mod commands {
         cli::{
             CancelArgs, DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs,
             InitArgs, InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs,
-            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, WakeArgs,
+            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, VersionArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -90,7 +91,9 @@ mod commands {
             ServiceControl, ServiceManager, ServicePaths, ServiceStatus,
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
-        submit as submit_command, AppError,
+        submit as submit_command,
+        version::{self, BuildInfo},
+        AppError,
     };
 
     pub fn init(args: InitArgs) -> Result<(), AppError> {
@@ -463,6 +466,11 @@ mod commands {
             );
             println!("{}", human_summary("operator wake queued"));
         }
+        Ok(())
+    }
+
+    pub fn version(args: VersionArgs) -> Result<(), AppError> {
+        println!("{}", version::render(BuildInfo::current()?, args.json)?);
         Ok(())
     }
 

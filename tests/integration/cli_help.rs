@@ -1,4 +1,33 @@
 #[test]
+fn version_reports_package_revision_and_json_mode() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["schema_version"].is_u64());
+    assert!(value["package_version"].is_string());
+    assert!(value["revision"].is_string());
+    assert!(value["source"].is_string());
+    assert!(value["service"].is_string() || value["service"].is_null());
+}
+
+#[test]
+fn version_help_describes_json_output() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["version", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--json"));
+}
+
+#[test]
 fn help_lists_diagnostics_commands_and_status_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()

@@ -29,5 +29,6 @@ pub mod state;
 pub mod status;
 pub mod submit;
 pub mod termination;
+pub mod version;
 
 pub use error::AppError;
