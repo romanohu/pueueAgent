@@ -1,9 +1,11 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
 };
 
 use crate::{
@@ -148,6 +150,7 @@ pub struct UpgradeCommandOutput {
     success: bool,
     stdout: String,
     stderr: String,
+    stdout_limited: bool,
 }
 
 impl UpgradeCommandOutput {
@@ -156,14 +159,17 @@ impl UpgradeCommandOutput {
             success: true,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_limited: false,
         }
     }
 
     pub fn success_with_stdout(stdout: impl AsRef<str>) -> Self {
+        let stdout = sanitize_upgrade_stdout(stdout.as_ref());
         Self {
             success: true,
-            stdout: sanitize_upgrade_stdout(stdout.as_ref()),
+            stdout: stdout.text,
             stderr: String::new(),
+            stdout_limited: stdout.limited,
         }
     }
 
@@ -172,6 +178,7 @@ impl UpgradeCommandOutput {
             success: false,
             stdout: String::new(),
             stderr: bounded_redacted_text(stderr.as_ref()),
+            stdout_limited: false,
         }
     }
 }
@@ -190,28 +197,23 @@ pub struct ProcessGitCommandRunner;
 
 impl GitCommandRunner for ProcessGitCommandRunner {
     fn run(&self, source: &Path, args: &[&str]) -> Result<GitCommandOutput, AppError> {
-        let output = Command::new("git")
-            .current_dir(source)
-            .args(args)
-            .output()
-            .map_err(|source| AppError::Io {
-                operation: "run git for upgrade",
-                source,
-            })?;
+        let mut command = Command::new("git");
+        command.current_dir(source).args(args);
+        let output = run_process_bounded(&mut command, "run git for upgrade")?;
 
         let stdout = if args == ["status", "--porcelain"] {
-            if output.stdout.is_empty() {
+            if output.stdout.bytes.is_empty() {
                 String::new()
             } else {
                 "changes present".to_owned()
             }
         } else {
-            bounded_text(&String::from_utf8_lossy(&output.stdout))
+            bounded_text(&String::from_utf8_lossy(&output.stdout.bytes))
         };
         Ok(GitCommandOutput {
-            success: output.status.success(),
+            success: output.success,
             stdout,
-            stderr: bounded_redacted_text(&String::from_utf8_lossy(&output.stderr)),
+            stderr: bounded_redacted_text(&String::from_utf8_lossy(&output.stderr.bytes)),
         })
     }
 }
@@ -232,20 +234,20 @@ impl UpgradeCommandRunner for ProcessUpgradeCommandRunner {
         program: &OsStr,
         args: &[OsString],
     ) -> Result<UpgradeCommandOutput, AppError> {
-        let output = Command::new(program)
-            .current_dir(working_directory)
-            .args(args)
-            .output()
-            .map_err(|source| AppError::Io {
-                operation: "run upgrade command",
-                source,
-            })?;
-        let stdout = sanitize_upgrade_stdout(&String::from_utf8_lossy(&output.stdout));
-        let stderr = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr));
+        let mut command = Command::new(program);
+        command.current_dir(working_directory).args(args);
+        let output = run_process_bounded(&mut command, "run upgrade command")?;
+        let stdout = if output.stdout.truncated {
+            SanitizedUpgradeStdout::limited()
+        } else {
+            sanitize_upgrade_stdout(&String::from_utf8_lossy(&output.stdout.bytes))
+        };
+        let stderr = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr.bytes));
         Ok(UpgradeCommandOutput {
-            success: output.status.success(),
-            stdout,
+            success: output.success,
+            stdout: stdout.text,
             stderr,
+            stdout_limited: stdout.limited,
         })
     }
 }
@@ -492,33 +494,37 @@ where
             &install_candidate,
             "copy built upgrade candidate to install directory",
         ) {
-            remove_file_if_present(&install_candidate);
-            remove_file_if_present(&backup);
-            return Err(UpgradeFailure::with_report(report, error));
+            return Err(UpgradeFailure::with_report(
+                report,
+                with_cleanup_failure(error, &[&install_candidate, &backup]),
+            ));
         }
         if let Err(error) = copy_file(
             &install_target,
             &backup,
             "copy installed binary to upgrade backup",
         ) {
-            remove_file_if_present(&install_candidate);
-            remove_file_if_present(&backup);
-            return Err(UpgradeFailure::with_report(report, error));
-        }
-        if let Err(error) = self.reject_active_agent_runs() {
-            remove_file_if_present(&install_candidate);
-            remove_file_if_present(&backup);
-            return Err(UpgradeFailure::with_report(report, error));
-        }
-        if let Err(error) = fs::rename(&install_candidate, &install_target) {
-            remove_file_if_present(&install_candidate);
-            remove_file_if_present(&backup);
             return Err(UpgradeFailure::with_report(
                 report,
-                AppError::Io {
-                    operation: "atomically install upgrade candidate",
-                    source: error,
-                },
+                with_cleanup_failure(error, &[&install_candidate, &backup]),
+            ));
+        }
+        if let Err(error) = self.reject_active_agent_runs() {
+            return Err(UpgradeFailure::with_report(
+                report,
+                with_cleanup_failure(error, &[&install_candidate, &backup]),
+            ));
+        }
+        if let Err(error) = fs::rename(&install_candidate, &install_target) {
+            return Err(UpgradeFailure::with_report(
+                report,
+                with_cleanup_failure(
+                    AppError::Io {
+                        operation: "atomically install upgrade candidate",
+                        source: error,
+                    },
+                    &[&install_candidate, &backup],
+                ),
             ));
         }
         report.install = UpgradeStep::succeeded();
@@ -544,7 +550,8 @@ where
             ));
         }
         report.health = UpgradeStep::succeeded();
-        remove_file_if_present(&backup);
+        remove_file_if_present(&backup)
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
         remove_retry_marker(&retry_marker_path)
             .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
         Ok(report)
@@ -626,6 +633,11 @@ where
             &args,
             "Pueue health check",
         )?;
+        if pueue_status.stdout_limited {
+            return Err(AppError::Message {
+                message: "upgrade Pueue health check output exceeded the safe limit".to_owned(),
+            });
+        }
         let status = serde_json::from_str::<serde_json::Value>(&pueue_status.stdout).map_err(
             |_| AppError::Message {
                 message: "upgrade Pueue health check returned invalid status JSON".to_owned(),
@@ -650,14 +662,14 @@ where
         };
         match (restore, restart, rollback_health) {
             (Ok(()), Ok(()), Ok(())) => {
-                remove_file_if_present(backup);
                 report.rollback = UpgradeRollback::Succeeded;
                 UpgradeFailure::with_report(
                     report,
                     AppError::Message {
                         message: format!(
-                            "upgrade failed after installation: {}; rollback succeeded",
-                            bounded_redacted_text(&failure.to_string())
+                            "upgrade failed after installation: {}; rollback succeeded{}",
+                            bounded_redacted_text(&failure.to_string()),
+                            cleanup_failure_suffix(&[backup])
                         ),
                     },
                 )
@@ -701,15 +713,16 @@ where
             &restore_candidate,
             "copy upgrade backup for rollback",
         ) {
-            remove_file_if_present(&restore_candidate);
-            return Err(error);
+            return Err(with_cleanup_failure(error, &[&restore_candidate]));
         }
         if let Err(error) = fs::rename(&restore_candidate, install_target) {
-            remove_file_if_present(&restore_candidate);
-            return Err(AppError::Io {
-                operation: "atomically restore upgrade backup",
-                source: error,
-            });
+            return Err(with_cleanup_failure(
+                AppError::Io {
+                    operation: "atomically restore upgrade backup",
+                    source: error,
+                },
+                &[&restore_candidate],
+            ));
         }
         Ok(())
     }
@@ -806,18 +819,22 @@ fn write_retry_marker(path: &Path, revision: &str) -> Result<(), AppError> {
     })?;
     let candidate = temporary_path(parent, "upgrade-pending")?;
     if let Err(source) = fs::write(&candidate, revision) {
-        remove_file_if_present(&candidate);
-        return Err(AppError::Io {
-            operation: "write upgrade retry marker",
-            source,
-        });
+        return Err(with_cleanup_failure(
+            AppError::Io {
+                operation: "write upgrade retry marker",
+                source,
+            },
+            &[&candidate],
+        ));
     }
     if let Err(source) = fs::rename(&candidate, path) {
-        remove_file_if_present(&candidate);
-        return Err(AppError::Io {
-            operation: "atomically persist upgrade retry marker",
-            source,
-        });
+        return Err(with_cleanup_failure(
+            AppError::Io {
+                operation: "atomically persist upgrade retry marker",
+                source,
+            },
+            &[&candidate],
+        ));
     }
     Ok(())
 }
@@ -854,7 +871,7 @@ impl UpgradeLock {
                 Ok(()) => {
                     let owner_token = lock_owner_token();
                     if let Err(source) = fs::write(&owner_path, &owner_token) {
-                        remove_file_if_present(&owner_path);
+                        let _ = remove_file_if_present(&owner_path);
                         let _ = fs::remove_dir(&path);
                         return Err(AppError::Io {
                             operation: "write upgrade lock PID",
@@ -927,7 +944,7 @@ fn reclaim_stale_lock(state_dir: &Path, lock_path: &Path) -> Result<(), AppError
     let reclaimed = temporary_path(state_dir, "upgrade-lock-reclaimed")?;
     match fs::rename(lock_path, &reclaimed) {
         Ok(()) => {
-            remove_file_if_present(&reclaimed.join("owner"));
+            remove_file_if_present(&reclaimed.join("owner"))?;
             if let Err(source) = fs::remove_dir(&reclaimed) {
                 if source.kind() != std::io::ErrorKind::DirectoryNotEmpty {
                     return Err(AppError::Io {
@@ -951,7 +968,7 @@ fn remove_owned_lock(path: &Path, owner_path: &Path, owner_token: &str) {
         .ok()
         .is_some_and(|owner| owner.trim() == owner_token);
     if matches_owner {
-        remove_file_if_present(owner_path);
+        let _ = remove_file_if_present(owner_path);
         let _ = fs::remove_dir(path);
     }
 }
@@ -1072,6 +1089,10 @@ fn unlock_file(file: &File) {
 static TEMPORARY_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOCK_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_UPGRADE_COMMAND_OUTPUT_BYTES: usize = 240;
+const MAX_RAW_PROCESS_OUTPUT_BYTES: usize = 1_048_576;
+const MAX_SANITIZED_PUEUE_STATUS_BYTES: usize = 262_144;
+const MAX_PUEUE_STATUS_TASKS: usize = 1_024;
+const MAX_PUEUE_STATUS_STATES: usize = 4;
 
 fn lock_owner_token() -> String {
     let sequence = LOCK_OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1093,18 +1114,122 @@ fn bounded_text(value: &str) -> String {
     format!("{prefix}...")
 }
 
-fn sanitize_upgrade_stdout(value: &str) -> String {
+struct BoundedProcessOutput {
+    success: bool,
+    stdout: CappedBytes,
+    stderr: CappedBytes,
+}
+
+struct CappedBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn run_process_bounded(
+    command: &mut Command,
+    operation: &'static str,
+) -> Result<BoundedProcessOutput, AppError> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| AppError::Io { operation, source })?;
+    let stdout = child.stdout.take().ok_or(AppError::Runtime {
+        operation: "capture bounded command stdout",
+    })?;
+    let stderr = child.stderr.take().ok_or(AppError::Runtime {
+        operation: "capture bounded command stderr",
+    })?;
+    let stdout_reader = thread::spawn(move || read_capped(stdout));
+    let stderr_reader = thread::spawn(move || read_capped(stderr));
+    let status = child.wait().map_err(|source| AppError::Io { operation, source })?;
+    let stdout = join_capped_output(stdout_reader, "read bounded command stdout")?;
+    let stderr = join_capped_output(stderr_reader, "read bounded command stderr")?;
+    Ok(BoundedProcessOutput {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+fn read_capped<R: Read>(mut reader: R) -> Result<CappedBytes, std::io::Error> {
+    let mut bytes = Vec::with_capacity(MAX_RAW_PROCESS_OUTPUT_BYTES.min(8_192));
+    let mut buffer = [0_u8; 8_192];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = MAX_RAW_PROCESS_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let retained = count.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < count;
+    }
+    Ok(CappedBytes { bytes, truncated })
+}
+
+fn join_capped_output(
+    reader: thread::JoinHandle<Result<CappedBytes, std::io::Error>>,
+    operation: &'static str,
+) -> Result<CappedBytes, AppError> {
+    reader
+        .join()
+        .map_err(|_| AppError::Runtime { operation })?
+        .map_err(|source| AppError::Io { operation, source })
+}
+
+struct SanitizedUpgradeStdout {
+    text: String,
+    limited: bool,
+}
+
+impl SanitizedUpgradeStdout {
+    fn limited() -> Self {
+        Self {
+            text: String::new(),
+            limited: true,
+        }
+    }
+}
+
+fn sanitize_upgrade_stdout(value: &str) -> SanitizedUpgradeStdout {
+    if value.len() > MAX_RAW_PROCESS_OUTPUT_BYTES {
+        return SanitizedUpgradeStdout::limited();
+    }
     let Ok(status) = serde_json::from_str::<serde_json::Value>(value) else {
-        return bounded_redacted_text(value);
+        return SanitizedUpgradeStdout {
+            text: bounded_redacted_text(value),
+            limited: false,
+        };
     };
     let Some(status) = sanitize_pueue_status_shape(&status) else {
-        return bounded_redacted_text(value);
+        return SanitizedUpgradeStdout {
+            text: bounded_redacted_text(value),
+            limited: false,
+        };
     };
-    serde_json::to_string(&status).unwrap_or_else(|_| bounded_redacted_text(value))
+    let Ok(text) = serde_json::to_string(&status) else {
+        return SanitizedUpgradeStdout {
+            text: bounded_redacted_text(value),
+            limited: false,
+        };
+    };
+    if text.len() > MAX_SANITIZED_PUEUE_STATUS_BYTES {
+        SanitizedUpgradeStdout::limited()
+    } else {
+        SanitizedUpgradeStdout {
+            text,
+            limited: false,
+        }
+    }
 }
 
 fn sanitize_pueue_status_shape(status: &serde_json::Value) -> Option<serde_json::Value> {
     let tasks = status.as_object()?.get("tasks")?.as_object()?;
+    if tasks.len() > MAX_PUEUE_STATUS_TASKS {
+        return None;
+    }
     let mut safe_tasks = serde_json::Map::new();
     for (index, task) in tasks.values().enumerate() {
         safe_tasks.insert(index.to_string(), sanitize_pueue_task_shape(task));
@@ -1159,6 +1284,9 @@ fn sanitize_pueue_task_status(value: &serde_json::Value) -> serde_json::Value {
     let Some(statuses) = value.as_object() else {
         return serde_json::Value::Null;
     };
+    if statuses.len() > MAX_PUEUE_STATUS_STATES {
+        return serde_json::Value::Null;
+    }
     let mut safe_statuses = serde_json::Map::new();
     for (index, details) in statuses.values().enumerate() {
         safe_statuses.insert(
@@ -1178,15 +1306,21 @@ fn sanitize_pueue_state_details(value: &serde_json::Value) -> serde_json::Value 
         if let Some(value) = details.get(field) {
             safe_details.insert(
                 field.to_owned(),
-                if value.is_null() {
-                    serde_json::Value::Null
-                } else {
-                    sanitize_string_shape(value)
-                },
+                sanitize_timestamp_shape(value),
             );
         }
     }
     serde_json::Value::Object(safe_details)
+}
+
+fn sanitize_timestamp_shape(value: &serde_json::Value) -> serde_json::Value {
+    if value.is_null() {
+        serde_json::Value::Null
+    } else if value.is_string() {
+        serde_json::json!("")
+    } else {
+        serde_json::Value::Bool(false)
+    }
 }
 
 fn validate_pueue_status_shape(status: &serde_json::Value) -> Result<(), AppError> {
@@ -1252,11 +1386,38 @@ fn copy_file(from: &Path, to: &Path, operation: &'static str) -> Result<(), AppE
         .map_err(|source| AppError::Io { operation, source })
 }
 
-fn remove_file_if_present(path: &Path) {
+fn remove_file_if_present(path: &Path) -> Result<(), AppError> {
     match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AppError::Io {
+            operation: "remove upgrade temporary file",
+            source,
+        }),
+    }
+}
+
+fn with_cleanup_failure(error: AppError, paths: &[&Path]) -> AppError {
+    let suffix = cleanup_failure_suffix(paths);
+    if suffix.is_empty() {
+        error
+    } else {
+        AppError::Message {
+            message: format!("{}{}", bounded_redacted_text(&error.to_string()), suffix),
+        }
+    }
+}
+
+fn cleanup_failure_suffix(paths: &[&Path]) -> String {
+    let details = paths
+        .iter()
+        .filter_map(|path| remove_file_if_present(path).err())
+        .map(|error| bounded_redacted_text(&error.to_string()))
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!("; upgrade cleanup failed: {}", details.join("; "))
     }
 }
 
@@ -1393,13 +1554,15 @@ fn git_stdout<R: GitCommandRunner>(
 mod tests {
     use std::{
         fs,
+        io::Cursor,
         path::Path,
     };
 
     use tempfile::TempDir;
 
     use super::{
-        run_git, AgentStartUpgradeGuard, GitCommandOutput, GitCommandRunner, UpgradeLock,
+        cleanup_failure_suffix, read_capped, run_git, AgentStartUpgradeGuard, GitCommandOutput,
+        GitCommandRunner, UpgradeLock, MAX_RAW_PROCESS_OUTPUT_BYTES,
     };
     use crate::{
         db::Db,
@@ -1452,5 +1615,26 @@ mod tests {
             .expect("upgrade coordination guard must exclude agent start");
 
         assert!(error.to_string().contains("upgrade"));
+    }
+
+    #[test]
+    fn process_capture_discards_bytes_after_the_safe_limit() {
+        let output = read_capped(Cursor::new(vec![b'x'; MAX_RAW_PROCESS_OUTPUT_BYTES + 1]))
+            .unwrap();
+
+        assert_eq!(output.bytes.len(), MAX_RAW_PROCESS_OUTPUT_BYTES);
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn cleanup_failure_is_retained_in_the_failure_diagnostics() {
+        let temporary = TempDir::new().unwrap();
+        let directory = temporary.path().join("not-a-file");
+        fs::create_dir(&directory).unwrap();
+
+        let suffix = cleanup_failure_suffix(&[&directory]);
+
+        assert!(suffix.contains("upgrade cleanup failed"));
+        assert!(suffix.len() < 600);
     }
 }

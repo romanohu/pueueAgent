@@ -130,6 +130,21 @@ impl UpgradeFixture {
         fixture
     }
 
+    fn pueue_malformed_timestamp_status() -> Self {
+        let fixture = Self::new();
+        *fixture.commands.pueue_status_output.borrow_mut() = Some(
+            r#"{"tasks":{"42":{"id":42,"group":"pa-project","command":"echo ready","status":{"Running":{"start":123}}}}}"#.to_owned(),
+        );
+        fixture
+    }
+
+    fn pueue_oversized_status() -> Self {
+        let fixture = Self::new();
+        *fixture.commands.pueue_status_output.borrow_mut() =
+            Some(format!(r#"{{"tasks":{{}}}}{}"#, " ".repeat(1_100_000)));
+        fixture
+    }
+
     fn source_root(&self) -> &Path {
         &self.source
     }
@@ -953,6 +968,29 @@ async fn pueue_task_status_shape_used_by_the_adapter_is_healthy() {
 
     assert!(report.health.succeeded);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::new_binary_bytes());
+}
+
+#[tokio::test]
+async fn malformed_pueue_timestamp_triggers_rollback() {
+    let fixture = UpgradeFixture::pueue_malformed_timestamp_status();
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("Pueue"));
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+}
+
+#[tokio::test]
+async fn oversized_pueue_status_triggers_rollback_without_retaining_output() {
+    let fixture = UpgradeFixture::pueue_oversized_status();
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("Pueue"));
+    assert!(failure.to_string().len() < 600);
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
 }
 
 #[tokio::test]
