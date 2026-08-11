@@ -1,6 +1,6 @@
 use crate::{
-    db::{Db, ProjectRepository, TaskObservationRepository},
-    models::{Project, TaskObservation},
+    db::{Db, EventRepository, ProjectRepository, TaskObservationRepository},
+    models::{EventKind, NewEvent, Project, TaskObservation},
     output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::{PueueApi, PueueTask},
     reconcile::task_signature,
@@ -97,12 +97,45 @@ pub async fn cancel_task_with(
         _ => unreachable!("validated cancellation action"),
     };
     let final_status = pueue.status_json().await;
-    let final_observed_state = final_status
+    let observed_final_state = final_status
         .as_ref()
         .ok()
         .and_then(|tasks| final_state_for(tasks, Some(&target_identity)));
+    let termination_confirmed = match (action, &action_result, &final_status) {
+        ("remove", Ok(()), Ok(tasks)) => matching_tasks_for(tasks, &target_identity).is_empty(),
+        ("kill", Ok(()), Ok(tasks)) => {
+            let matching = matching_tasks_for(tasks, &target_identity);
+            matching.len() == 1 && matching[0].is_terminal()
+        }
+        _ => false,
+    };
+    let final_observed_state = if termination_confirmed
+        && action == "remove"
+        && observed_final_state.is_none()
+    {
+        Some("Removed".to_owned())
+    } else {
+        observed_final_state
+    };
     let result_reason = match (&action_result, &final_status) {
-        (Ok(()), Ok(_)) => "operator cancellation result observed".to_owned(),
+        (Ok(()), Ok(_)) if termination_confirmed => {
+            "operator cancellation result observed".to_owned()
+        }
+        (Ok(()), Ok(_)) => match (action, final_observed_state.as_deref()) {
+            ("remove", Some(state)) => format!(
+                "termination failure: queued task was not removed; final state={state}"
+            ),
+            ("remove", None) => {
+                "termination failure: queued task removal was not confirmed".to_owned()
+            }
+            ("kill", Some(state)) => format!(
+                "termination failure: kill succeeded but task remained nonterminal; final state={state}"
+            ),
+            ("kill", None) => {
+                "termination failure: terminal state was not confirmed after kill".to_owned()
+            }
+            _ => unreachable!("validated cancellation action"),
+        },
         (Err(error), Ok(_)) => format!("Pueue {action} failed: {error}"),
         (Ok(()), Err(error)) => format!("post-{action} Pueue status failed: {error}"),
         (Err(action_error), Err(status_error)) => {
@@ -120,8 +153,34 @@ pub async fn cancel_task_with(
         now,
     )?;
 
+    if !termination_confirmed {
+        let _ = EventRepository::new(db).insert_idempotent(&NewEvent::new(
+            &project.project_id,
+            EventKind::TerminationFailed,
+            format!("termination:operator-cancel:v1:task={task_id}:at={now}"),
+            serde_json::json!({
+                "source": "operator_cancel",
+                "task_id": task_id,
+                "task_signature": bounded_redacted_text(&signature),
+                "action": action,
+                "requested_state": bounded_redacted_text(&task.state),
+                "final_state": final_observed_state
+                    .as_deref()
+                    .map(bounded_redacted_text),
+                "error": bounded_redacted_text(&result_reason),
+            }),
+            now,
+            now,
+        ))?;
+    }
+
     action_result?;
     final_status?;
+    if !termination_confirmed {
+        return Err(AppError::Runtime {
+            operation: "confirm task cancellation termination",
+        });
+    }
 
     Ok(CancelResult {
         task_id,
@@ -159,11 +218,15 @@ pub fn render_cancel_result(project: &Project, result: &CancelResult, json: bool
 
 fn final_state_for(tasks: &[PueueTask], target_identity: Option<&str>) -> Option<String> {
     let target_identity = target_identity?;
-    let matching = tasks
+    let matching = matching_tasks_for(tasks, target_identity);
+    (matching.len() == 1).then(|| matching[0].state.clone())
+}
+
+fn matching_tasks_for<'a>(tasks: &'a [PueueTask], target_identity: &str) -> Vec<&'a PueueTask> {
+    tasks
         .iter()
         .filter(|task| cancellation_identity_for_task(task).as_deref() == Some(target_identity))
-        .collect::<Vec<_>>();
-    (matching.len() == 1).then(|| matching[0].state.clone())
+        .collect()
 }
 
 fn cancellation_identity_for_task(task: &PueueTask) -> Option<String> {

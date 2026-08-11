@@ -86,7 +86,11 @@ impl<'db> PeriodicDeepCheckScheduler<'db> {
                 self.now,
                 self.now,
             );
-            let (_, inserted) = events.insert_idempotent_with_inserted(&event)?;
+            let inserted = events.insert_periodic_deep_check_if_due(
+                &event,
+                oldest_running_task_started_at,
+                interval_seconds,
+            )?;
             scheduled += usize::from(inserted);
         }
 

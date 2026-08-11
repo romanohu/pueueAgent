@@ -11,7 +11,8 @@ use pueue_agent::{
     db::{Db, ProjectRepository},
     pueue::{PueueApi, PueueTask},
     service::{
-        callback_command, enable_with, install_callback_once, launchd_status_from_output,
+        callback_command, enable_with, install_callback_once,
+        launchd_status_from_output, pueue_config_from_service_definition,
         systemd_status_from_load_state_output, systemd_status_from_output, CallbackRegistry,
         EnableOptions, LaunchdAgent,
         PueueConfigCallbackRegistry, ServiceCommandOutput, ServiceCommandRunner, ServiceControl,
@@ -460,6 +461,32 @@ fn systemd_definition_escapes_quotes_backslashes_and_percent_specifiers() {
     assert!(systemd
         .contains("Environment=\"PUEUE_AGENT_STATE_DIR=/Users/alice/state 100%%/pueue-agent\""));
     assert!(systemd.contains("WorkingDirectory=\"/Users/alice/project \\\"quoted\\\"\""));
+}
+
+#[test]
+fn service_definitions_expose_the_config_path_for_bare_upgrade() {
+    let paths = service_paths_with_spaces();
+
+    assert_eq!(
+        pueue_config_from_service_definition(ServicePlatform::Systemd, &ServiceDefinition::systemd(&paths).render()),
+        Some(paths.pueue_config.clone())
+    );
+    assert_eq!(
+        pueue_config_from_service_definition(ServicePlatform::Launchd, &ServiceDefinition::launchd(&paths).render()),
+        Some(paths.pueue_config)
+    );
+
+    let escaped_paths = ServicePaths {
+        pueue_config: PathBuf::from("/Users/alice/pueue\\profiles/100%/pueue.yml"),
+        ..service_paths()
+    };
+    assert_eq!(
+        pueue_config_from_service_definition(
+            ServicePlatform::Systemd,
+            &ServiceDefinition::systemd(&escaped_paths).render()
+        ),
+        Some(escaped_paths.pueue_config)
+    );
 }
 
 #[test]

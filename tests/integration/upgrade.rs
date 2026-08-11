@@ -14,7 +14,8 @@ use pueue_agent::{
     models::{AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject},
     service::{ServiceControl, ServiceDefinition, ServiceStatus},
     upgrade::{
-        render_report, resolve_pueue_config, resolve_source_root, validate_checkout,
+        render_report, resolve_pueue_config, resolve_pueue_config_with_service,
+        resolve_source_root, validate_checkout,
         validate_checkout_with, CheckoutState, GitCommandOutput, GitCommandRunner,
         UpgradeCommandOutput, UpgradeCommandRunner, UpgradeFailure, UpgradeReport, UpgradeRollback,
         UpgradeRunner, UpgradeStep,
@@ -94,6 +95,17 @@ fn pueue_config_resolution_prefers_explicit_env_and_default() {
     assert_eq!(
         resolve_pueue_config(None, None, Some(&home)),
         Some(home.join(".config/pueue/pueue.yml"))
+    );
+}
+
+#[test]
+fn pueue_config_resolution_uses_the_installed_service_before_the_default() {
+    let service = PathBuf::from("/tmp/custom-pueue.yml");
+    let home = PathBuf::from("/tmp/home");
+
+    assert_eq!(
+        resolve_pueue_config_with_service(None, None, Some(&service), Some(&home)),
+        Some(service)
     );
 }
 
@@ -579,6 +591,8 @@ struct FakeServiceRecorder {
     fail_stop_on_call: Cell<Option<u8>>,
     mutate_database_on_first_stop: Cell<bool>,
     mutate_database_on_first_restart: Cell<bool>,
+    #[cfg(unix)]
+    blocked_directory: RefCell<Option<(PathBuf, u32)>>,
 }
 
 impl Default for FakeServiceRecorder {
@@ -599,6 +613,8 @@ impl FakeServiceRecorder {
             fail_stop_on_call: Cell::new(None),
             mutate_database_on_first_stop: Cell::new(false),
             mutate_database_on_first_restart: Cell::new(false),
+            #[cfg(unix)]
+            blocked_directory: RefCell::new(None),
         }
     }
 
@@ -627,6 +643,22 @@ impl FakeServiceRecorder {
     fn fail_stop_on_call(&self, call: u8) {
         self.fail_stop_on_call.set(Some(call));
     }
+
+    #[cfg(unix)]
+    fn block_writes_on_first_stop(&self, directory: &Path) {
+        *self.blocked_directory.borrow_mut() = Some((directory.to_path_buf(), 0));
+    }
+
+    #[cfg(unix)]
+    fn restore_blocked_directory(&self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some((directory, mode)) = self.blocked_directory.borrow_mut().take() {
+            if mode != 0 {
+                fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+    }
 }
 
 impl ServiceControl for FakeServiceRecorder {
@@ -647,6 +679,13 @@ impl ServiceControl for FakeServiceRecorder {
                 message: "fake stop failure".to_owned(),
             });
         }
+        #[cfg(unix)]
+        if let Some((directory, mode)) = self.blocked_directory.borrow_mut().as_mut() {
+            use std::os::unix::fs::PermissionsExt;
+
+            *mode = fs::metadata(&*directory).unwrap().permissions().mode();
+            fs::set_permissions(&*directory, fs::Permissions::from_mode(*mode & !0o222)).unwrap();
+        }
         if self.mutate_database_on_first_stop.replace(false) {
             let connection = self.database.borrow().as_ref().unwrap().connect().unwrap();
             connection
@@ -661,6 +700,8 @@ impl ServiceControl for FakeServiceRecorder {
 
     fn restart(&self) -> Result<(), AppError> {
         self.actions.borrow_mut().push("restart".to_owned());
+        #[cfg(unix)]
+        self.restore_blocked_directory();
         let remaining = self.failed_restarts_remaining.get();
         if remaining > 0 {
             self.failed_restarts_remaining.set(remaining - 1);
@@ -1052,6 +1093,44 @@ async fn initial_service_stop_failure_leaves_installed_binary_and_database_uncha
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
     assert_eq!(fixture.database_marker(), "old");
     assert_eq!(fixture.service_calls(), ["stop"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshot_failure_restarts_the_unchanged_service() {
+    let fixture = UpgradeFixture::new();
+    fixture.set_database_marker("old");
+    fixture
+        .service
+        .block_writes_on_first_stop(fixture.state_dir());
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("recovery succeeded"));
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+    assert_eq!(fixture.database_marker(), "old");
+    assert_eq!(fixture.service_calls(), ["stop", "restart"]);
+    assert!(fixture.database_backups().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn candidate_rename_failure_restarts_the_unchanged_service() {
+    let fixture = UpgradeFixture::new();
+    fixture.set_database_marker("old");
+    fixture
+        .service
+        .block_writes_on_first_stop(fixture.installed_binary.parent().unwrap());
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("recovery succeeded"));
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+    assert_eq!(fixture.database_marker(), "old");
+    assert_eq!(fixture.service_calls(), ["stop", "restart"]);
+    assert!(fixture.database_backups().is_empty());
 }
 
 #[tokio::test]

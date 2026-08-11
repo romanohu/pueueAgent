@@ -417,6 +417,52 @@ pub fn callback_command(paths: &ServicePaths) -> String {
     )
 }
 
+pub fn pueue_config_from_service_definition(
+    platform: ServicePlatform,
+    contents: &str,
+) -> Option<PathBuf> {
+    match platform {
+        ServicePlatform::Systemd => contents
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("ExecStart="))
+            .and_then(|command| {
+                let arguments = split_systemd_arguments(command);
+                arguments
+                    .windows(2)
+                    .find(|arguments| arguments[0] == "--pueue-config")
+                    .map(|arguments| PathBuf::from(&arguments[1]))
+            }),
+        ServicePlatform::Launchd => {
+            let arguments = contents
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("<string>"))
+                .filter_map(|value| value.strip_suffix("</string>"))
+                .map(xml_unescape)
+                .collect::<Vec<_>>();
+            arguments
+                .windows(2)
+                .find(|arguments| arguments[0] == "--pueue-config")
+                .map(|arguments| PathBuf::from(&arguments[1]))
+        }
+    }
+}
+
+pub fn installed_pueue_config(home: &Path) -> Option<PathBuf> {
+    let (platform, definition_path) = if cfg!(target_os = "macos") {
+        (
+            ServicePlatform::Launchd,
+            home.join("Library/LaunchAgents/com.pueue-agent.plist"),
+        )
+    } else {
+        (
+            ServicePlatform::Systemd,
+            home.join(".config/systemd/user/pueue-agent.service"),
+        )
+    };
+    let contents = fs::read_to_string(definition_path).ok()?;
+    pueue_config_from_service_definition(platform, &contents)
+}
+
 pub fn install_callback_once(
     registry: &impl CallbackRegistry,
     expected_command: &str,
@@ -988,6 +1034,54 @@ fn systemd_quote(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn split_systemd_arguments(value: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => quoted = !quoted,
+            character if character.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    arguments.push(std::mem::take(&mut current));
+                }
+            }
+            '%' => {
+                if characters.peek() == Some(&'%') {
+                    characters.next();
+                }
+                current.push('%');
+            }
+            _ => current.push(character),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        arguments.push(current);
+    }
+    arguments
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
 }
 
 fn xml_escape(value: &str) -> String {

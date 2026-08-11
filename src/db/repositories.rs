@@ -525,6 +525,133 @@ impl<'db> EventRepository<'db> {
         Ok((stored, inserted == 1))
     }
 
+    pub fn insert_periodic_deep_check_if_due(
+        &self,
+        event: &NewEvent,
+        oldest_running_task_started_at: Option<i64>,
+        interval_seconds: i64,
+    ) -> Result<bool, AppError> {
+        let payload_json =
+            serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
+                operation: "serialize periodic deep check payload",
+                source,
+            })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin periodic deep check scheduling"))?;
+
+        let has_open_event = transaction
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                   AND status IN ('pending', 'claimed', 'retry_wait')
+                 LIMIT 1",
+                [event.project_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(database_error("recheck open periodic deep check"))?
+            .is_some();
+        if has_open_event {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let project_active = transaction
+            .query_row(
+                "SELECT enabled, paused, halted_reason
+                 FROM projects
+                 WHERE project_id = ?1",
+                [event.project_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("recheck project lifecycle for periodic deep check"))?;
+        if !project_active.is_some_and(|(enabled, paused, halted_reason)| {
+            enabled && !paused && halted_reason.is_none()
+        }) {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped inactive periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let has_active_agent = transaction
+            .query_row(
+                "SELECT 1 FROM agent_runs
+                 WHERE project_id = ?1
+                   AND status IN ('starting', 'running')
+                 LIMIT 1",
+                [event.project_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(database_error("recheck active agent run for periodic deep check"))?
+            .is_some();
+        if has_active_agent {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let last_scheduled_at = transaction
+            .query_row(
+                "SELECT created_at FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                [event.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("recheck latest periodic deep check"))?;
+        let anchor = last_scheduled_at
+            .max(oldest_running_task_started_at)
+            .unwrap_or(event.created_at);
+        if event.created_at.saturating_sub(anchor) < interval_seconds {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let inserted = transaction
+            .execute(
+                "INSERT INTO events (
+                    project_id, kind, dedup_key, payload_json, status, attempts,
+                    not_before, lease_until, created_at, completed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?6, NULL, NULL)
+                 ON CONFLICT(project_id, dedup_key) DO NOTHING",
+                params![
+                    event.project_id,
+                    event.kind,
+                    event.dedup_key,
+                    payload_json,
+                    event.not_before,
+                    event.created_at,
+                ],
+            )
+            .map_err(database_error("insert periodic deep check event"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit periodic deep check scheduling"))?;
+        Ok(inserted == 1)
+    }
+
     pub fn find_by_id(&self, event_id: i64) -> Result<Option<Event>, AppError> {
         let connection = self.db.connect()?;
         connection

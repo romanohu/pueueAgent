@@ -1,4 +1,11 @@
-use std::fs;
+use std::{
+    fs,
+    sync::{Arc, Barrier},
+    thread,
+    time::Duration,
+};
+
+use rusqlite::TransactionBehavior;
 
 use pueue_agent::{
     db::{
@@ -341,4 +348,42 @@ fn scheduler_uses_persisted_first_observation_for_an_invalid_task_start() {
     harness.observe_running_task(&task, 2_000);
 
     assert_eq!(harness.schedule_at(2_800, std::slice::from_ref(&task)), 1);
+}
+
+#[test]
+fn concurrent_schedulers_do_not_create_open_periodic_events_across_bucket_boundaries() {
+    let harness = PeriodicHarness::with_interval(30);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut lock_connection = harness.db.connect().unwrap();
+    let lock_transaction = lock_connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
+    let first_barrier = Arc::clone(&barrier);
+    let first_db = harness.db.clone();
+    let first_task = harness.running_task(41);
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        PeriodicDeepCheckScheduler::new(&first_db, 3_600)
+            .schedule(&[first_task])
+            .unwrap()
+    });
+
+    let second_barrier = Arc::clone(&barrier);
+    let second_db = harness.db.clone();
+    let second_task = harness.running_task(42);
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        PeriodicDeepCheckScheduler::new(&second_db, 5_400)
+            .schedule(&[second_task])
+            .unwrap()
+    });
+
+    barrier.wait();
+    thread::sleep(Duration::from_millis(250));
+    drop(lock_transaction);
+
+    let scheduled = first.join().unwrap() + second.join().unwrap();
+    assert_eq!(scheduled, 1);
+    assert_eq!(harness.event_count(), 1);
 }

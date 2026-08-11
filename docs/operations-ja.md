@@ -40,7 +40,7 @@ pueue-agent cancel --task-id <ID>
 pueue-agent status
 ```
 
-`cancel` は現在の project group 内で stable identity を確認した指定 task 1件だけを対象にします。running task には `kill`、queued task には `remove` を送ります。group 全体の停止、project の disable、service の stop の代用ではありません。
+`cancel` は現在の project group 内で stable identity を確認した指定 task 1件だけを対象にします。running task には `kill`、queued task には `remove` を送ります。要求後に running task が終端状態へ遷移したことを確認できない場合は成功扱いにせず、termination failure として記録します。group 全体の停止、project の disable、service の stop の代用ではありません。
 
 ### project 登録を解除する
 
@@ -52,6 +52,14 @@ pueue-agent disable --remove
 
 > 注意: `stop` と `disable` は Pueue task を kill しません。`pause` も実行中 task や current agent run を中断しません。停止対象を混同しないでください。
 
+## Periodic DeepCheck
+
+Periodic DeepCheck は、実行中の実験を一定周期で確認するための opt-in 機能です。`check.deep_check_interval_minutes = 0`（既定値）では無効です。正の値を設定した場合だけ、daemon の軽量な reconciliation で条件を確認し、必要な周期に fresh agent を起動します。`deep_check_every` は legacy 設定であり、単独では定期 agent 起動を有効にしません。
+
+正常な周期 tick の状態確認や異常検知は agent を起動せず、Codex などの agent token を消費しません。Periodic DeepCheck event が作られ、実際に agent run が dispatch されたときだけ agent token を消費します。DeepCheck は Pueue task を kill せず、異常が見つかった場合は通常の event、termination、operator intervention の経路で扱います。
+
+同じ project に対して周期 event は coalesce されます。複数の実行中 task があっても task ごとには event を作らず、project 単位で pending、claimed、retry 待ちの DeepCheck が存在する間は追加しません。`STATE.md` には確認した task、実際に取得できた metric、短い判断だけを記録し、見つからない値を補完しません。
+
 ## pueue-agent の更新
 
 通常の更新は `pueue-agent upgrade` です。
@@ -62,13 +70,13 @@ pueue-agent upgrade --json
 pueue-agent upgrade --pueue-config ~/.config/pueue/experiments.yml
 ```
 
-source は、現在の実行ファイルが `target/release/pueue-agent` の下にある場合、その project checkout を自動検出します。自動検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を設定し、特定の checkout を使う場合や fallback を明示したい場合は `--source <path>` を指定します。明示した `--source` が自動検出や環境変数より優先されます。Pueue の health check は supervisor と同じ profile を使い、設定の優先順位は `--pueue-config <path>`、`PUEUE_CONFIG`、既定の `~/.config/pueue/pueue.yml` です。
+source は、現在の実行ファイルが `target/release/pueue-agent` の下にある場合、その project checkout を自動検出します。自動検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を設定し、特定の checkout を使う場合や fallback を明示したい場合は `--source <path>` を指定します。明示した `--source` が自動検出や環境変数より優先されます。Pueue の health check は supervisor と同じ profile を使い、設定の優先順位は `--pueue-config <path>`、`PUEUE_CONFIG`、インストール済み user service 定義の `--pueue-config`、既定の `~/.config/pueue/pueue.yml` です。
 
 source checkout には `git`、Rust stable、Cargo が必要です。更新対象は clean な `main` branch で、`origin/main` を upstream とし、`origin/main` への fast-forward が可能な場合だけです。dirty worktree、branch の不一致、upstream の不一致、diverged checkout は更新前に拒否されます。
 
 enabled project に active agent run がある場合、upgrade は source の fetch や binary の置換をせずに拒否します。agent run の完了または停止を確認し、他の operator が upgrade していないことを確認してから再試行してください。同時実行は upgrade lock でも調整されます。
 
-upgrade は fetch、fast-forward、テスト、release build、binary の atomic install、service restart、health check を順に行います。revision がすでに current の場合は no-op として報告し、service を restart しません。fast-forward 後に失敗した revision は retry marker に残り、条件を直した再実行で同じ revision の処理を再試行できます。binary install の前に service を停止して SQLite の整合性境界を作り、停止後に `VACUUM INTO` で snapshot を取得します。この短い窓では operator による SQLite の直接書き込みを避けてください。更新後の restart または health check に失敗すると、SQLite snapshot と旧 binary を復元してから service を再起動し、health check を行う rollback を試みます。rollback の attempted/succeeded または failed は report で確認できます。失敗時は出力された診断コマンドを実行し、原因を直して `pueue-agent upgrade` を再実行してください。
+upgrade は fetch、fast-forward、テスト、release build、binary の atomic install、service restart、health check を順に行います。revision がすでに current の場合は no-op として報告し、service を restart しません。fast-forward 後に失敗した revision は retry marker に残り、条件を直した再実行で同じ revision の処理を再試行できます。binary install の前に service を停止して SQLite の整合性境界を作り、停止後に `VACUUM INTO` で snapshot を取得します。この短い窓では operator による SQLite の直接書き込みを避けてください。snapshot または binary install の前段で失敗した場合も、変更前の service を再起動して recovery 結果を記録します。更新後の restart または health check に失敗すると、SQLite snapshot と旧 binary を復元してから service を再起動し、health check を行う rollback を試みます。rollback の attempted/succeeded または failed は report で確認できます。失敗時は出力された診断コマンドを実行し、原因を直して `pueue-agent upgrade` を再実行してください。
 
 upgrade は supervisor service と binary だけを扱います。Pueue daemon、group、実験 task を kill、stop、cancel することはなく、実験の処理は継続します。active agent run の coordination は更新を安全側に拒否するためのもので、実験 task を停止する手順ではありません。
 

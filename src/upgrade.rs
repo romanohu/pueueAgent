@@ -13,7 +13,7 @@ use crate::{
     cli::UpgradeArgs,
     db::{AgentRunRepository, Db, ProjectRepository},
     output::{bounded_redacted_text, human_summary},
-    service::{ServiceControl, ServiceStatus},
+    service::{installed_pueue_config, ServiceControl, ServiceStatus},
     AppError,
 };
 
@@ -36,6 +36,9 @@ impl UpgradeOptions {
     pub fn from_args(args: UpgradeArgs) -> Self {
         let env_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
         let home = env::var_os("HOME").map(PathBuf::from);
+        let installed_service_pueue_config = home
+            .as_deref()
+            .and_then(installed_pueue_config);
         Self {
             source: args.source,
             json: args.json,
@@ -46,9 +49,10 @@ impl UpgradeOptions {
             pueue_binary: std::env::var_os("PUEUE_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("pueue")),
-            pueue_config: resolve_pueue_config(
+            pueue_config: resolve_pueue_config_with_service(
                 args.pueue_config.as_deref(),
                 env_pueue_config.as_deref(),
+                installed_service_pueue_config.as_deref(),
                 home.as_deref(),
             ),
             installed_revision: option_env!("PUEUE_AGENT_GIT_REVISION")
@@ -63,8 +67,18 @@ pub fn resolve_pueue_config(
     environment: Option<&Path>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
+    resolve_pueue_config_with_service(explicit, environment, None, home)
+}
+
+pub fn resolve_pueue_config_with_service(
+    explicit: Option<&Path>,
+    environment: Option<&Path>,
+    service_definition: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     explicit
         .or(environment)
+        .or(service_definition)
         .map(Path::to_path_buf)
         .or_else(|| home.map(|home| home.join(".config/pueue/pueue.yml")))
 }
@@ -673,24 +687,20 @@ where
             ));
         }
         if let Err(error) = self.snapshot_database(&database_backup) {
-            return Err(UpgradeFailure::with_report(
+            return Err(self.recover_after_pre_install_failure(
+                &[&install_candidate, &backup, &database_backup],
                 report,
-                with_cleanup_failure(
-                    error,
-                    &[&install_candidate, &backup, &database_backup],
-                ),
+                error,
             ));
         }
         if let Err(error) = fs::rename(&install_candidate, &install_target) {
-            return Err(UpgradeFailure::with_report(
+            return Err(self.recover_after_pre_install_failure(
+                &[&install_candidate, &backup, &database_backup],
                 report,
-                with_cleanup_failure(
-                    AppError::Io {
-                        operation: "atomically install upgrade candidate",
-                        source: error,
-                    },
-                    &[&install_candidate, &backup, &database_backup],
-                ),
+                AppError::Io {
+                    operation: "atomically install upgrade candidate",
+                    source: error,
+                },
             ));
         }
         report.install = UpgradeStep::succeeded();
@@ -902,6 +912,61 @@ where
                         message: format!(
                             "upgrade failed after installation: {}; rollback failed: {details}",
                             bounded_redacted_text(&failure.to_string())
+                        ),
+                    },
+                )
+            }
+        }
+    }
+
+    fn recover_after_pre_install_failure(
+        &self,
+        cleanup_paths: &[&Path],
+        mut report: UpgradeReport,
+        failure: AppError,
+    ) -> UpgradeFailure {
+        let restart = self.service.restart();
+        let health = if restart.is_ok() {
+            self.check_service_health()
+        } else {
+            Ok(())
+        };
+        let cleanup = cleanup_failure_suffix(cleanup_paths);
+
+        match (restart, health) {
+            (Ok(()), Ok(())) => {
+                report.rollback = UpgradeRollback::Succeeded;
+                UpgradeFailure::with_report(
+                    report,
+                    AppError::Message {
+                        message: format!(
+                            "upgrade failed before installation: {}; recovery succeeded{}",
+                            bounded_redacted_text(&failure.to_string()),
+                            cleanup
+                        ),
+                    },
+                )
+            }
+            (restart, health) => {
+                report.rollback = UpgradeRollback::Failed;
+                let details = [
+                    restart
+                        .err()
+                        .map(|error| format!("service restart: {error}")),
+                    health.err().map(|error| format!("service health: {error}")),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|detail| bounded_redacted_text(&detail))
+                .collect::<Vec<_>>()
+                .join("; ");
+                UpgradeFailure::with_report(
+                    report,
+                    AppError::Message {
+                        message: format!(
+                            "upgrade failed before installation: {}; recovery failed: {details}{}",
+                            bounded_redacted_text(&failure.to_string()),
+                            cleanup
                         ),
                     },
                 )
