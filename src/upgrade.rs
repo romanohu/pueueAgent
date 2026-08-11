@@ -1,7 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -10,6 +9,7 @@ use std::{
 use crate::{
     cli::UpgradeArgs,
     db::{AgentRunRepository, Db, ProjectRepository},
+    output::bounded_redacted_text,
     service::{ServiceControl, ServiceStatus},
     AppError,
 };
@@ -88,6 +88,42 @@ pub enum UpgradeRollback {
     Failed,
 }
 
+#[derive(Debug)]
+pub struct UpgradeFailure {
+    error: AppError,
+    report: Option<UpgradeReport>,
+}
+
+impl UpgradeFailure {
+    fn with_report(report: UpgradeReport, error: AppError) -> Self {
+        Self {
+            error,
+            report: Some(report),
+        }
+    }
+
+    pub fn report(&self) -> Option<&UpgradeReport> {
+        self.report.as_ref()
+    }
+}
+
+impl From<AppError> for UpgradeFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            report: None,
+        }
+    }
+}
+
+impl std::fmt::Display for UpgradeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&bounded_redacted_text(&self.error.to_string()))
+    }
+}
+
+impl std::error::Error for UpgradeFailure {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckoutState {
     pub branch: String,
@@ -110,6 +146,7 @@ pub trait GitCommandRunner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeCommandOutput {
     success: bool,
+    stdout: String,
     stderr: String,
 }
 
@@ -117,14 +154,24 @@ impl UpgradeCommandOutput {
     pub fn success() -> Self {
         Self {
             success: true,
+            stdout: String::new(),
             stderr: String::new(),
         }
     }
 
-    pub fn failure(stderr: impl Into<String>) -> Self {
+    pub fn success_with_stdout(stdout: impl AsRef<str>) -> Self {
+        Self {
+            success: true,
+            stdout: sanitize_upgrade_stdout(stdout.as_ref()),
+            stderr: String::new(),
+        }
+    }
+
+    pub fn failure(stderr: impl AsRef<str>) -> Self {
         Self {
             success: false,
-            stderr: stderr.into(),
+            stdout: String::new(),
+            stderr: bounded_redacted_text(stderr.as_ref()),
         }
     }
 }
@@ -152,10 +199,19 @@ impl GitCommandRunner for ProcessGitCommandRunner {
                 source,
             })?;
 
+        let stdout = if args == ["status", "--porcelain"] {
+            if output.stdout.is_empty() {
+                String::new()
+            } else {
+                "changes present".to_owned()
+            }
+        } else {
+            bounded_text(&String::from_utf8_lossy(&output.stdout))
+        };
         Ok(GitCommandOutput {
             success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout,
+            stderr: bounded_redacted_text(&String::from_utf8_lossy(&output.stderr)),
         })
     }
 }
@@ -184,15 +240,13 @@ impl UpgradeCommandRunner for ProcessUpgradeCommandRunner {
                 operation: "run upgrade command",
                 source,
             })?;
-        if output.status.success() {
-            Ok(UpgradeCommandOutput::success())
-        } else {
-            Ok(UpgradeCommandOutput::failure(format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
+        let stdout = sanitize_upgrade_stdout(&String::from_utf8_lossy(&output.stdout));
+        let stderr = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr));
+        Ok(UpgradeCommandOutput {
+            success: output.status.success(),
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -248,7 +302,8 @@ pub fn validate_checkout_with<R: GitCommandRunner>(
     if current_branch != branch {
         return Err(AppError::Message {
             message: format!(
-                "upgrade source checkout must be on branch `{branch}`, found `{current_branch}`"
+                "upgrade source checkout must be on branch `{branch}`, found `{}`",
+                bounded_redacted_text(&current_branch)
             ),
         });
     }
@@ -256,17 +311,19 @@ pub fn validate_checkout_with<R: GitCommandRunner>(
     let upstream_output = runner.run(
         &source,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-    )?;
+    )
+    .map_err(|error| git_runner_error(&["rev-parse", "--abbrev-ref"], error))?;
     if !upstream_output.success {
         return Err(AppError::Message {
             message: format!("upgrade source checkout must track `{expected_upstream}`"),
         });
     }
-    let upstream = upstream_output.stdout.trim().to_owned();
+    let upstream = bounded_text(upstream_output.stdout.trim());
     if upstream != expected_upstream {
         return Err(AppError::Message {
             message: format!(
-                "upgrade source checkout must track `{expected_upstream}`, found `{upstream}`"
+                "upgrade source checkout must track `{expected_upstream}`, found `{}`",
+                bounded_redacted_text(&upstream)
             ),
         });
     }
@@ -276,7 +333,8 @@ pub fn validate_checkout_with<R: GitCommandRunner>(
     let ancestry = runner.run(
         &source,
         &["merge-base", "--is-ancestor", "HEAD", &expected_upstream],
-    )?;
+    )
+    .map_err(|error| git_runner_error(&["merge-base", "--is-ancestor"], error))?;
     if !ancestry.success {
         return Err(AppError::Message {
             message: format!(
@@ -314,10 +372,10 @@ where
         }
     }
 
-    pub async fn run(&self) -> Result<UpgradeReport, AppError> {
-        self.reject_active_agent_runs()?;
+    pub async fn run(&self) -> Result<UpgradeReport, UpgradeFailure> {
         let state_dir = self.state_dir()?;
         let _lock = UpgradeLock::acquire(&state_dir)?;
+        self.reject_active_agent_runs()?;
         let source = self
             .options
             .source
@@ -333,6 +391,9 @@ where
             &self.options.remote,
             self.commands,
         )?;
+        // The lock serializes upgrades. These two checks close the observable windows before
+        // source mutation and before binary replacement without stopping Pueue experiment tasks.
+        self.reject_active_agent_runs()?;
         let upstream = format!("{}/{}", self.options.remote, self.options.branch);
         run_git(
             self.commands,
@@ -346,31 +407,54 @@ where
             self.commands,
         )?;
 
-        if checkout.head == checkout.upstream_head {
-            return Ok(UpgradeReport {
-                source,
-                checkout: checkout.clone(),
-                old_revision: before_fetch.head,
-                new_revision: checkout.head,
-                tests: UpgradeStep::default(),
-                build: UpgradeStep::default(),
-                install: UpgradeStep::default(),
-                restart: UpgradeStep::default(),
-                health: UpgradeStep::default(),
-                rollback: UpgradeRollback::NotRequired,
-            });
+        let mut report = UpgradeReport {
+            source: source.clone(),
+            checkout: checkout.clone(),
+            old_revision: before_fetch.head,
+            new_revision: checkout.upstream_head.clone(),
+            tests: UpgradeStep::default(),
+            build: UpgradeStep::default(),
+            install: UpgradeStep::default(),
+            restart: UpgradeStep::default(),
+            health: UpgradeStep::default(),
+            rollback: UpgradeRollback::NotRequired,
+        };
+        let retry_marker_path = state_dir.join("upgrade.pending");
+        let retry_marker = read_retry_marker(&retry_marker_path)
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        let needs_fast_forward = checkout.head != checkout.upstream_head;
+        let retry_pending_revision = retry_marker
+            .as_deref()
+            .is_some_and(|revision| revision == checkout.head);
+
+        if !needs_fast_forward && !retry_pending_revision {
+            report.new_revision = checkout.head;
+            return Ok(report);
         }
 
-        run_git(self.commands, &source, &["merge", "--ff-only", &upstream])?;
+        if needs_fast_forward {
+            write_retry_marker(&retry_marker_path, &checkout.upstream_head)
+                .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+            run_git(self.commands, &source, &["merge", "--ff-only", &upstream])
+                .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+            report.checkout.head = checkout.upstream_head.clone();
+        }
 
-        self.run_checked_command(
-            &source,
-            OsStr::new("cargo"),
-            &[OsString::from("test"), OsString::from("--all-targets")],
-            "cargo test",
-        )?;
+        let target_dir = TemporaryDirectory::create(&state_dir, "upgrade-target")
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        report.tests = UpgradeStep::attempted();
+        let test_args = vec![
+            OsString::from("test"),
+            OsString::from("--locked"),
+            OsString::from("--all-targets"),
+            OsString::from("--target-dir"),
+            target_dir.path().as_os_str().to_os_string(),
+        ];
+        self.run_checked_command(&source, OsStr::new("cargo"), &test_args, "cargo test")
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        report.tests = UpgradeStep::succeeded();
 
-        let target_dir = TemporaryDirectory::create(&state_dir, "upgrade-target")?;
+        report.build = UpgradeStep::attempted();
         let build_args = vec![
             OsString::from("build"),
             OsString::from("--locked"),
@@ -378,75 +462,88 @@ where
             OsString::from("--target-dir"),
             target_dir.path().as_os_str().to_os_string(),
         ];
-        self.run_checked_command(&source, OsStr::new("cargo"), &build_args, "cargo build")?;
+        self.run_checked_command(&source, OsStr::new("cargo"), &build_args, "cargo build")
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        report.build = UpgradeStep::succeeded();
 
-        let binary_name = self
-            .options
-            .release_binary
+        let install_target = resolve_install_target(&self.options.release_binary)
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        let binary_name = install_target
             .file_name()
             .filter(|name| !name.is_empty())
             .ok_or_else(|| AppError::Message {
                 message: "upgrade release binary path has no file name".to_owned(),
-            })?;
+            })
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
         let built_binary = target_dir.path().join("release").join(binary_name);
-        let install_parent = self
-            .options
-            .release_binary
+        let install_parent = install_target
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let install_candidate = temporary_path(&install_parent, "upgrade-candidate")?;
-        let backup = temporary_path(&state_dir, "upgrade-backup")?;
+        let install_candidate = temporary_path(&install_parent, "upgrade-candidate")
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
+        let backup = temporary_path(&state_dir, "upgrade-backup")
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
 
+        report.install = UpgradeStep::attempted();
         if let Err(error) = copy_file(
             &built_binary,
             &install_candidate,
             "copy built upgrade candidate to install directory",
         ) {
-            return Err(error);
+            return Err(UpgradeFailure::with_report(report, error));
         }
         if let Err(error) = copy_file(
-            &self.options.release_binary,
+            &install_target,
             &backup,
             "copy installed binary to upgrade backup",
         ) {
             remove_file_if_present(&install_candidate);
-            return Err(error);
+            return Err(UpgradeFailure::with_report(report, error));
         }
-        if let Err(error) = fs::rename(&install_candidate, &self.options.release_binary) {
+        if let Err(error) = self.reject_active_agent_runs() {
             remove_file_if_present(&install_candidate);
             remove_file_if_present(&backup);
-            return Err(AppError::Io {
-                operation: "atomically install upgrade candidate",
-                source: error,
-            });
+            return Err(UpgradeFailure::with_report(report, error));
         }
-
-        let report = UpgradeReport {
-            source: source.clone(),
-            checkout: checkout.clone(),
-            old_revision: before_fetch.head,
-            new_revision: checkout.upstream_head,
-            tests: UpgradeStep::succeeded(),
-            build: UpgradeStep::succeeded(),
-            install: UpgradeStep::succeeded(),
-            restart: UpgradeStep::attempted(),
-            health: UpgradeStep::attempted(),
-            rollback: UpgradeRollback::NotRequired,
-        };
+        if let Err(error) = fs::rename(&install_candidate, &install_target) {
+            remove_file_if_present(&install_candidate);
+            remove_file_if_present(&backup);
+            return Err(UpgradeFailure::with_report(
+                report,
+                AppError::Io {
+                    operation: "atomically install upgrade candidate",
+                    source: error,
+                },
+            ));
+        }
+        report.install = UpgradeStep::succeeded();
+        report.restart = UpgradeStep::attempted();
 
         if let Err(error) = self.service.restart() {
-            return Err(self.rollback_after_post_install_failure(&backup, error));
+            return Err(self.rollback_after_post_install_failure(
+                &backup,
+                &install_target,
+                report,
+                error,
+            ));
         }
-        let mut report = report;
         report.restart = UpgradeStep::succeeded();
 
+        report.health = UpgradeStep::attempted();
         if let Err(error) = self.check_health(&source) {
-            return Err(self.rollback_after_post_install_failure(&backup, error));
+            return Err(self.rollback_after_post_install_failure(
+                &backup,
+                &install_target,
+                report,
+                error,
+            ));
         }
         report.health = UpgradeStep::succeeded();
         remove_file_if_present(&backup);
+        remove_retry_marker(&retry_marker_path)
+            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
         Ok(report)
     }
 
@@ -483,17 +580,23 @@ where
         program: &OsStr,
         args: &[OsString],
         operation: &'static str,
-    ) -> Result<(), AppError> {
+    ) -> Result<UpgradeCommandOutput, AppError> {
         let output = self
             .commands
-            .run_command(working_directory, program, args)?;
+            .run_command(working_directory, program, args)
+            .map_err(|error| AppError::Message {
+                message: format!(
+                    "upgrade {operation} failed: {}",
+                    bounded_redacted_text(&error.to_string())
+                ),
+            })?;
         if output.success {
-            Ok(())
+            Ok(output)
         } else {
             Err(AppError::Message {
                 message: format!(
                     "upgrade {operation} failed: {}",
-                    output.stderr.trim()
+                    bounded_redacted_text(output.stderr.trim())
                 ),
             })
         }
@@ -514,44 +617,87 @@ where
         }
         args.push(OsString::from("status"));
         args.push(OsString::from("--json"));
-        self.run_checked_command(
+        let pueue_status = self.run_checked_command(
             source,
             self.options.pueue_binary.as_os_str(),
             &args,
             "Pueue health check",
-        )
-    }
-
-    fn rollback_after_post_install_failure(&self, backup: &Path, failure: AppError) -> AppError {
-        let restore = self.restore_backup(backup);
-        let restart = self.service.restart();
-        match (restore, restart) {
-            (Ok(()), Ok(())) => {
-                remove_file_if_present(backup);
-                AppError::Message {
-                    message: format!("upgrade failed after installation: {failure}; rollback succeeded"),
-                }
-            }
-            (restore, restart) => AppError::Message {
-                message: format!(
-                    "upgrade failed after installation: {failure}; rollback failed: {}{}",
-                    restore
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_default(),
-                    restart
-                        .err()
-                        .map(|error| format!(" service restart: {error}"))
-                        .unwrap_or_default(),
-                ),
+        )?;
+        let status = serde_json::from_str::<serde_json::Value>(&pueue_status.stdout).map_err(
+            |_| AppError::Message {
+                message: "upgrade Pueue health check returned invalid status JSON".to_owned(),
             },
+        )?;
+        if status
+            .as_object()
+            .and_then(|object| object.get("tasks"))
+            .is_some_and(serde_json::Value::is_object)
+        {
+            Ok(())
+        } else {
+            Err(AppError::Message {
+                message: "upgrade Pueue health check returned an invalid status schema".to_owned(),
+            })
         }
     }
 
-    fn restore_backup(&self, backup: &Path) -> Result<(), AppError> {
-        let install_parent = self
-            .options
-            .release_binary
+    fn rollback_after_post_install_failure(
+        &self,
+        backup: &Path,
+        install_target: &Path,
+        mut report: UpgradeReport,
+        failure: AppError,
+    ) -> UpgradeFailure {
+        let restore = self.restore_backup(backup, install_target);
+        let restart = self.service.restart();
+        let rollback_health = if restart.is_ok() {
+            self.check_service_health()
+        } else {
+            Ok(())
+        };
+        match (restore, restart, rollback_health) {
+            (Ok(()), Ok(()), Ok(())) => {
+                remove_file_if_present(backup);
+                report.rollback = UpgradeRollback::Succeeded;
+                UpgradeFailure::with_report(
+                    report,
+                    AppError::Message {
+                        message: format!(
+                            "upgrade failed after installation: {}; rollback succeeded",
+                            bounded_redacted_text(&failure.to_string())
+                        ),
+                    },
+                )
+            }
+            (restore, restart, rollback_health) => {
+                report.rollback = UpgradeRollback::Failed;
+                let details = [
+                    restore.err().map(|error| format!("restore: {error}")),
+                    restart.err().map(|error| format!("service restart: {error}")),
+                    rollback_health
+                        .err()
+                        .map(|error| format!("service health: {error}")),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|detail| bounded_redacted_text(&detail))
+                .collect::<Vec<_>>()
+                .join("; ");
+                UpgradeFailure::with_report(
+                    report,
+                    AppError::Message {
+                        message: format!(
+                            "upgrade failed after installation: {}; rollback failed: {details}",
+                            bounded_redacted_text(&failure.to_string())
+                        ),
+                    },
+                )
+            }
+        }
+    }
+
+    fn restore_backup(&self, backup: &Path, install_target: &Path) -> Result<(), AppError> {
+        let install_parent = install_target
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
@@ -564,7 +710,7 @@ where
         ) {
             return Err(error);
         }
-        if let Err(error) = fs::rename(&restore_candidate, &self.options.release_binary) {
+        if let Err(error) = fs::rename(&restore_candidate, install_target) {
             remove_file_if_present(&restore_candidate);
             return Err(AppError::Io {
                 operation: "atomically restore upgrade backup",
@@ -572,6 +718,17 @@ where
             });
         }
         Ok(())
+    }
+
+    fn check_service_health(&self) -> Result<(), AppError> {
+        if self.service.status()? == ServiceStatus::Running {
+            Ok(())
+        } else {
+            Err(AppError::Message {
+                message: "upgrade rollback service health check failed: service is not running"
+                    .to_owned(),
+            })
+        }
     }
 }
 
@@ -614,8 +771,77 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+fn resolve_install_target(release_binary: &Path) -> Result<PathBuf, AppError> {
+    let metadata = fs::symlink_metadata(release_binary).map_err(|source| AppError::Io {
+        operation: "inspect installed upgrade binary",
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        release_binary.canonicalize().map_err(|source| AppError::Io {
+            operation: "resolve installed upgrade binary symlink",
+            source,
+        })
+    } else {
+        Ok(release_binary.to_path_buf())
+    }
+}
+
+fn read_retry_marker(path: &Path) -> Result<Option<String>, AppError> {
+    match fs::read_to_string(path) {
+        Ok(revision) => {
+            let revision = revision.trim();
+            if revision.is_empty() {
+                Err(AppError::Message {
+                    message: "upgrade retry marker is invalid".to_owned(),
+                })
+            } else {
+                Ok(Some(revision.to_owned()))
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(AppError::Io {
+            operation: "read upgrade retry marker",
+            source,
+        }),
+    }
+}
+
+fn write_retry_marker(path: &Path, revision: &str) -> Result<(), AppError> {
+    let parent = path.parent().ok_or_else(|| AppError::Message {
+        message: "upgrade retry marker has no parent directory".to_owned(),
+    })?;
+    let candidate = temporary_path(parent, "upgrade-pending")?;
+    if let Err(source) = fs::write(&candidate, revision) {
+        remove_file_if_present(&candidate);
+        return Err(AppError::Io {
+            operation: "write upgrade retry marker",
+            source,
+        });
+    }
+    if let Err(source) = fs::rename(&candidate, path) {
+        remove_file_if_present(&candidate);
+        return Err(AppError::Io {
+            operation: "atomically persist upgrade retry marker",
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn remove_retry_marker(path: &Path) -> Result<(), AppError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AppError::Io {
+            operation: "clear upgrade retry marker",
+            source,
+        }),
+    }
+}
+
 struct UpgradeLock {
     path: PathBuf,
+    owner_path: PathBuf,
 }
 
 impl UpgradeLock {
@@ -624,36 +850,38 @@ impl UpgradeLock {
             operation: "create upgrade state directory",
             source,
         })?;
+        let _acquisition_guard = UpgradeLockAcquisitionGuard::acquire(state_dir)?;
         let path = state_dir.join("upgrade.lock");
-        for _ in 0..3 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut lock) => {
-                    if let Err(source) = writeln!(lock, "{}", std::process::id()) {
-                        remove_file_if_present(&path);
+        let owner_path = path.join("owner");
+        for _ in 0..32 {
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    if let Err(source) = fs::write(&owner_path, std::process::id().to_string()) {
+                        remove_file_if_present(&owner_path);
+                        let _ = fs::remove_dir(&path);
                         return Err(AppError::Io {
                             operation: "write upgrade lock PID",
                             source,
                         });
                     }
-                    return Ok(Self { path });
+                    return Ok(Self { path, owner_path });
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let contents = fs::read_to_string(&path).map_err(|source| AppError::Io {
-                        operation: "read upgrade lock PID",
+                    let metadata = fs::symlink_metadata(&path).map_err(|source| AppError::Io {
+                        operation: "inspect upgrade lock",
                         source,
                     })?;
-                    let pid = contents.trim().parse::<u32>().map_err(|_| AppError::Message {
-                        message: "upgrade lock contains an invalid PID".to_owned(),
-                    })?;
-                    if process_is_alive(pid) {
+                    if !metadata.is_dir() {
+                        return Err(AppError::Message {
+                            message: "upgrade lock path is not a directory".to_owned(),
+                        });
+                    }
+                    if let Some(pid) = read_live_lock_owner(&owner_path)? {
                         return Err(AppError::Message {
                             message: format!("upgrade lock is held by live PID {pid}"),
                         });
                     }
-                    fs::remove_file(&path).map_err(|source| AppError::Io {
-                        operation: "reclaim stale upgrade lock",
-                        source,
-                    })?;
+                    reclaim_stale_lock(state_dir, &path)?;
                 }
                 Err(source) => {
                     return Err(AppError::Io {
@@ -671,21 +899,166 @@ impl UpgradeLock {
 
 impl Drop for UpgradeLock {
     fn drop(&mut self) {
-        remove_file_if_present(&self.path);
+        remove_file_if_present(&self.owner_path);
+        let _ = fs::remove_dir(&self.path);
     }
 }
 
+fn read_live_lock_owner(owner_path: &Path) -> Result<Option<u32>, AppError> {
+    let contents = match fs::read_to_string(owner_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(AppError::Io {
+                operation: "read upgrade lock PID",
+                source,
+            })
+        }
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return Ok(None);
+    };
+    Ok(process_is_alive(pid).then_some(pid))
+}
+
+fn reclaim_stale_lock(state_dir: &Path, lock_path: &Path) -> Result<(), AppError> {
+    let reclaimed = temporary_path(state_dir, "upgrade-lock-reclaimed")?;
+    match fs::rename(lock_path, &reclaimed) {
+        Ok(()) => {
+            remove_file_if_present(&reclaimed.join("owner"));
+            if let Err(source) = fs::remove_dir(&reclaimed) {
+                if source.kind() != std::io::ErrorKind::DirectoryNotEmpty {
+                    return Err(AppError::Io {
+                        operation: "remove reclaimed upgrade lock directory",
+                        source,
+                    });
+                }
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AppError::Io {
+            operation: "atomically reclaim stale upgrade lock",
+            source,
+        }),
+    }
+}
+
+struct UpgradeLockAcquisitionGuard {
+    #[cfg(unix)]
+    file: File,
+}
+
+impl UpgradeLockAcquisitionGuard {
+    fn acquire(state_dir: &Path) -> Result<Self, AppError> {
+        #[cfg(unix)]
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(state_dir.join("upgrade.lock.guard"))
+                .map_err(|source| AppError::Io {
+                    operation: "open upgrade lock acquisition guard",
+                    source,
+                })?;
+            lock_file(&file)?;
+            Ok(Self { file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = state_dir;
+            Ok(Self {})
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UpgradeLockAcquisitionGuard {
+    fn drop(&mut self) {
+        unlock_file(&self.file);
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for UpgradeLockAcquisitionGuard {
+    fn drop(&mut self) {}
+}
+
+#[cfg(unix)]
+fn lock_file(file: &File) -> Result<(), AppError> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    const LOCK_EX: std::os::raw::c_int = 2;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(AppError::Io {
+            operation: "acquire upgrade lock acquisition guard",
+            source: std::io::Error::last_os_error(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    const LOCK_UN: std::os::raw::c_int = 8;
+    let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+}
+
 static TEMPORARY_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_UPGRADE_COMMAND_OUTPUT_BYTES: usize = 240;
+
+fn bounded_text(value: &str) -> String {
+    if value.len() <= MAX_UPGRADE_COMMAND_OUTPUT_BYTES {
+        return value.to_owned();
+    }
+
+    let mut prefix = String::new();
+    for character in value.chars() {
+        if prefix.len() + character.len_utf8() > MAX_UPGRADE_COMMAND_OUTPUT_BYTES - 3 {
+            break;
+        }
+        prefix.push(character);
+    }
+    format!("{prefix}...")
+}
+
+fn sanitize_upgrade_stdout(value: &str) -> String {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(value) else {
+        return bounded_redacted_text(value);
+    };
+    if status
+        .as_object()
+        .and_then(|object| object.get("tasks"))
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return r#"{"tasks":{}}"#.to_owned();
+    }
+    bounded_redacted_text(value)
+}
 
 fn temporary_path(parent: &Path, prefix: &str) -> Result<PathBuf, AppError> {
-    let sequence = TEMPORARY_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = parent.join(format!(".{prefix}-{}-{sequence}", std::process::id()));
-    if path.exists() {
-        return Err(AppError::Message {
-            message: "upgrade temporary path already exists".to_owned(),
-        });
+    for _ in 0..32 {
+        let sequence = TEMPORARY_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".{prefix}-{}-{sequence}", std::process::id()));
+        if !path.exists() {
+            return Ok(path);
+        }
     }
-    Ok(path)
+    Err(AppError::Message {
+        message: "could not allocate an upgrade temporary path".to_owned(),
+    })
 }
 
 fn copy_file(from: &Path, to: &Path, operation: &'static str) -> Result<(), AppError> {
@@ -798,7 +1171,7 @@ fn run_git<R: GitCommandRunner>(
     source: &Path,
     args: &[&str],
 ) -> Result<GitCommandOutput, AppError> {
-    let output = runner.run(source, args)?;
+    let output = runner.run(source, args).map_err(|error| git_runner_error(args, error))?;
     if output.success {
         Ok(output)
     } else {
@@ -812,10 +1185,20 @@ fn run_git<R: GitCommandRunner>(
     }
 }
 
+fn git_runner_error(args: &[&str], error: AppError) -> AppError {
+    AppError::Message {
+        message: format!(
+            "upgrade git command failed (`git {}`): {}",
+            args.join(" "),
+            bounded_redacted_text(&error.to_string())
+        ),
+    }
+}
+
 fn git_stdout<R: GitCommandRunner>(
     runner: &R,
     source: &Path,
     args: &[&str],
 ) -> Result<String, AppError> {
-    Ok(run_git(runner, source, args)?.stdout.trim().to_owned())
+    Ok(bounded_text(run_git(runner, source, args)?.stdout.trim()))
 }
