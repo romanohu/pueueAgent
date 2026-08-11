@@ -1,11 +1,12 @@
 use crate::{
     db::{Db, ProjectRepository, TaskObservationRepository},
-    models::Project,
+    models::{Project, TaskObservation},
     output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::{PueueApi, PueueTask},
-    reconcile::task_signature,
+    reconcile::{task_incident_key, task_signature},
     AppError,
 };
+use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelResult {
@@ -42,6 +43,7 @@ pub async fn cancel_task_with(
     }
 
     let signature = task_signature(task);
+    let lifecycle_identity = task_incident_key(task);
     let observed = TaskObservationRepository::new(db).find_by_pueue_task(
         &project.project_id,
         task_id,
@@ -50,7 +52,8 @@ pub async fn cancel_task_with(
     if !observed.is_empty()
         && !observed
             .iter()
-            .any(|observation| observation.task_signature == signature)
+            .filter_map(observation_lifecycle_identity)
+            .any(|identity| identity == lifecycle_identity)
     {
         return Err(AppError::Runtime {
             operation: "revalidate task cancellation signature",
@@ -73,7 +76,7 @@ pub async fn cancel_task_with(
     let final_observed_state = final_status
         .as_ref()
         .ok()
-        .and_then(|tasks| final_state_for(tasks, task));
+        .and_then(|tasks| final_state_for(tasks, &lifecycle_identity));
     let result_reason = match (&kill_result, &final_status) {
         (Ok(()), Ok(_)) => "operator cancellation result observed".to_owned(),
         (Err(error), Ok(_)) => format!("Pueue kill failed: {error}"),
@@ -127,10 +130,36 @@ pub fn render_cancel_result(project: &Project, result: &CancelResult, json: bool
     )
 }
 
-fn final_state_for(tasks: &[PueueTask], requested_task: &PueueTask) -> Option<String> {
+fn final_state_for(tasks: &[PueueTask], lifecycle_identity: &str) -> Option<String> {
     let matching = tasks
         .iter()
-        .filter(|task| task.id == requested_task.id && task.group == requested_task.group)
+        .filter(|task| task_incident_key(task) == lifecycle_identity)
         .collect::<Vec<_>>();
     (matching.len() == 1).then(|| matching[0].state.clone())
+}
+
+fn observation_lifecycle_identity(observation: &TaskObservation) -> Option<String> {
+    let encoded = observation
+        .task_signature
+        .strip_prefix("pueue-task:v1:")?;
+    let identity = serde_json::from_str::<StatefulTaskSignature>(encoded).ok()?;
+    let task = PueueTask {
+        id: identity.id,
+        group: identity.group,
+        command: String::new(),
+        state: String::new(),
+        enqueued_at: identity.enqueued_at,
+        started_at: identity.started_at,
+        ended_at: None,
+        result: None,
+    };
+    Some(task_incident_key(&task))
+}
+
+#[derive(Debug, Deserialize)]
+struct StatefulTaskSignature {
+    group: String,
+    id: i64,
+    enqueued_at: Option<String>,
+    started_at: Option<String>,
 }

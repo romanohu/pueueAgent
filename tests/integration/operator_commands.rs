@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs,
     sync::{Arc, Mutex},
@@ -188,7 +189,7 @@ fn write_service_shim(path: &std::path::Path, contents: &str) {
 
 #[derive(Clone)]
 struct OperatorPueue {
-    tasks: Arc<Mutex<Result<Vec<PueueTask>, String>>>,
+    status_responses: Arc<Mutex<VecDeque<Result<Vec<PueueTask>, String>>>>,
     kill_calls: Arc<Mutex<Vec<i64>>>,
     status_calls: Arc<Mutex<usize>>,
 }
@@ -196,7 +197,17 @@ struct OperatorPueue {
 impl OperatorPueue {
     fn with_tasks(tasks: Vec<PueueTask>) -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(Ok(tasks))),
+            status_responses: Arc::new(Mutex::new(VecDeque::from([Ok(tasks)]))),
+            kill_calls: Arc::new(Mutex::new(Vec::new())),
+            status_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn with_status_responses(statuses: Vec<Vec<PueueTask>>) -> Self {
+        Self {
+            status_responses: Arc::new(Mutex::new(
+                statuses.into_iter().map(Ok).collect(),
+            )),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
             status_calls: Arc::new(Mutex::new(0)),
         }
@@ -204,7 +215,9 @@ impl OperatorPueue {
 
     fn with_status_failure() -> Self {
         Self {
-            tasks: Arc::new(Mutex::new(Err("unavailable".to_owned()))),
+            status_responses: Arc::new(Mutex::new(VecDeque::from([Err(
+                "unavailable".to_owned(),
+            )]))),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
             status_calls: Arc::new(Mutex::new(0)),
         }
@@ -223,13 +236,15 @@ impl OperatorPueue {
 impl PueueApi for OperatorPueue {
     async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
         *self.status_calls.lock().unwrap() += 1;
-        self.tasks
-            .lock()
-            .unwrap()
-            .clone()
-            .map_err(|_| AppError::Runtime {
-                operation: "fake Pueue status",
-            })
+        let mut responses = self.status_responses.lock().unwrap();
+        let response = if responses.len() > 1 {
+            responses.pop_front().unwrap()
+        } else {
+            responses.front().cloned().unwrap()
+        };
+        response.map_err(|_| AppError::Runtime {
+            operation: "fake Pueue status",
+        })
     }
 
     async fn add(&self, _args: &[OsString]) -> Result<i64, AppError> {
@@ -341,6 +356,15 @@ async fn cancel_kills_only_a_running_task_in_the_project_group() {
     assert_eq!(harness.pueue.kill_calls(), vec![41]);
     assert_eq!(harness.pueue.status_calls(), 2);
     assert!(harness.operator_log_contains("cancel"));
+    assert_eq!(
+        harness
+            .operator
+            .operator_log_rows()
+            .iter()
+            .filter(|(action, _)| action == "cancel")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -373,7 +397,7 @@ async fn cancel_refuses_other_group_terminal_and_ambiguous_task_ids_without_kill
 }
 
 #[tokio::test]
-async fn cancel_refuses_a_reused_task_id_with_a_stale_signature() {
+async fn cancel_refuses_a_reused_task_id_with_a_different_stable_identity() {
     let harness = CancelHarness::with_tasks(vec![PueueTask {
         id: 41,
         group: "pa-project".to_owned(),
@@ -391,6 +415,41 @@ async fn cancel_refuses_a_reused_task_id_with_a_stale_signature() {
     assert!(harness.pueue.kill_calls().is_empty());
     assert_eq!(harness.pueue.status_calls(), 1);
     assert!(!harness.operator_log_contains("cancel"));
+}
+
+#[tokio::test]
+async fn cancel_allows_a_state_transition_with_the_same_stable_task_identity() {
+    let running_task = cancel_task(41, "pa-project", "Running", "100");
+    let harness = CancelHarness::with_tasks(vec![running_task]);
+    let queued_task = cancel_task(41, "pa-project", "Queued", "100");
+    harness.record_observation(&queued_task);
+
+    let result = harness.cancel(41).await.unwrap();
+
+    assert!(result.kill_sent);
+    assert_eq!(harness.pueue.kill_calls(), vec![41]);
+}
+
+#[tokio::test]
+async fn cancel_does_not_report_a_same_id_group_replacement_as_the_final_state() {
+    let requested_task = cancel_task(41, "pa-project", "Running", "100");
+    let replacement_task = PueueTask {
+        started_at: Some("201".to_owned()),
+        ..cancel_task(41, "pa-project", "Running", "200")
+    };
+    let harness = CancelHarness {
+        operator: OperatorHarness::new(),
+        pueue: OperatorPueue::with_status_responses(vec![
+            vec![requested_task],
+            vec![replacement_task],
+        ]),
+    };
+
+    let result = harness.cancel(41).await.unwrap();
+
+    assert!(result.kill_sent);
+    assert_eq!(harness.pueue.kill_calls(), vec![41]);
+    assert_eq!(result.final_observed_state, None);
 }
 
 #[tokio::test]
