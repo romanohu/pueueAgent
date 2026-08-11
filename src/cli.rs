@@ -221,6 +221,14 @@ pub struct VersionArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct UpgradeArgs {
+    #[arg(long, value_name = "SOURCE")]
+    pub source: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ServiceLifecycleArgs {
     #[arg(long)]
     pub json: bool,
