@@ -96,9 +96,12 @@ database_enum!(EventKind {
 database_enum!(EventStatus {
     Pending => "pending",
     Claimed => "claimed",
+    InFlight => "in_flight",
+    Dispatched => "dispatched",
     Completed => "completed",
     RetryWait => "retry_wait",
     Failed => "failed",
+    DeadLetter => "dead_letter",
 });
 
 database_enum!(InterventionStatus {

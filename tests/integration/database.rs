@@ -455,6 +455,135 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
 }
 
 #[test]
+fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
+    let test = TestDatabase::new();
+    let root = test.project_root("v12-project");
+    register_project(&test.db, "v12-project", &root, "pa-v12-project");
+    let event_id = insert_event(&test.db, "v12-project", "before-v13", 100);
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'",
+            params![
+                "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'",
+                "'pending', 'claimed', 'completed', 'retry_wait', 'failed'",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = OFF; PRAGMA user_version = 12;")
+        .unwrap();
+    drop(connection);
+    let before = test.db.connect().unwrap().query_row(
+        "SELECT project_id, kind, dedup_key, payload_json, status, attempts,
+                not_before, lease_until, created_at, completed_at, last_error
+         FROM events WHERE event_id = ?1",
+        [event_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        },
+    )
+    .unwrap();
+    let before_version: i64 = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before_version, 12);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+    let event_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for status in [
+        "pending",
+        "claimed",
+        "in_flight",
+        "dispatched",
+        "completed",
+        "retry_wait",
+        "failed",
+        "dead_letter",
+    ] {
+        assert!(
+            event_sql.contains(&format!("'{status}'")),
+            "missing event status {status}"
+        );
+    }
+    let error = connection
+        .execute(
+            "INSERT INTO events (
+                 project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at
+             ) VALUES ('v12-project', 'task_finished', 'unknown-status', '{}', 'unknown', 0, 100, 100)",
+            [],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("CHECK constraint failed"));
+
+    let after = connection
+        .query_row(
+            "SELECT project_id, kind, dedup_key, payload_json, status, attempts,
+                    not_before, lease_until, created_at, completed_at, last_error
+             FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    for index in ["events_claimable_idx", "events_project_status_idx"] {
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "missing {index}");
+    }
+}
+
+#[test]
 fn readonly_open_does_not_migrate_or_create_database_state() {
     let test = TestDatabase::new();
     let connection = test.db.connect().unwrap();
@@ -4035,6 +4164,9 @@ fn all_event_kind_and_status_values_round_trip_through_sqlite() {
         EventStatus::Completed,
         EventStatus::RetryWait,
         EventStatus::Failed,
+        EventStatus::InFlight,
+        EventStatus::Dispatched,
+        EventStatus::DeadLetter,
     ] {
         let value: EventStatus = connection
             .query_row("SELECT ?1", [status], |row| row.get(0))

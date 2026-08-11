@@ -1,10 +1,10 @@
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::AppError;
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 12;
+pub const LATEST_SCHEMA_VERSION: i64 = 13;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -81,7 +81,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 dedup_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN (
-                    'pending', 'claimed', 'completed', 'retry_wait', 'failed'
+                    'pending', 'claimed', 'in_flight', 'dispatched',
+                    'completed', 'retry_wait', 'failed', 'dead_letter'
                 )),
                 attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
                 not_before INTEGER NOT NULL,
@@ -390,6 +391,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version <= 11 {
         migrate_task_observations_to_v12(&transaction)?;
     }
+    if version <= 12 {
+        migrate_events_to_v13(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -410,6 +414,76 @@ fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), A
         PRAGMA writable_schema = OFF;
         PRAGMA user_version = 8;
     "#).map_err(database_error("apply SQLite v8 event migration"))
+}
+
+fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    const OLD_STATUS_LIST: &str =
+        "'pending', 'claimed', 'completed', 'retry_wait', 'failed'";
+    const NEW_STATUS_LIST: &str =
+        "'pending', 'claimed', 'in_flight', 'dispatched', 'completed', 'retry_wait', 'failed', 'dead_letter'";
+
+    let current_event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite events schema for v13 migration"))?;
+    if ["'in_flight'", "'dispatched'", "'dead_letter'"]
+        .iter()
+        .all(|status| current_event_sql.contains(status))
+    {
+        return transaction
+            .execute_batch("PRAGMA user_version = 13;")
+            .map_err(database_error("set SQLite v13 schema version"));
+    }
+
+    transaction
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .map_err(database_error("enable SQLite writable schema for v13 event migration"))?;
+    let replaced = transaction
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'
+                AND sql LIKE '%' || ?1 || '%'",
+            params![OLD_STATUS_LIST, NEW_STATUS_LIST],
+        )
+        .map_err(database_error("replace SQLite v13 event status list"));
+    let writable_schema_disabled = transaction
+        .execute_batch("PRAGMA writable_schema = OFF;")
+        .map_err(database_error("disable SQLite writable schema after v13 event migration"));
+    let replaced = replaced?;
+    writable_schema_disabled?;
+    if replaced != 1 {
+        return Err(AppError::Runtime {
+            operation: "migrate exactly one SQLite events status list to v13",
+        });
+    }
+
+    let event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite v13 events schema"))?;
+    if !event_sql.contains(NEW_STATUS_LIST) {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v13 events status list",
+        });
+    }
+    let integrity: String = transaction
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(database_error("check SQLite integrity after v13 event migration"))?;
+    if integrity != "ok" {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite integrity after v13 event migration",
+        });
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 13;")
+        .map_err(database_error("set SQLite v13 schema version"))
 }
 
 fn migrate_batches_to_v9(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

@@ -22,6 +22,7 @@ pub mod periodic;
 pub mod project;
 pub mod pueue;
 pub mod reconcile;
+pub mod retry;
 pub mod runs;
 pub mod scheduler;
 pub mod service;
@@ -33,3 +34,29 @@ pub mod upgrade;
 pub mod version;
 
 pub use error::AppError;
+
+#[cfg(test)]
+mod retry_contract_tests {
+    use super::retry::{retry_backoff_seconds, retry_decision, RetryDecision, RetryPolicy};
+
+    #[test]
+    fn retry_policy_uses_attempt_number_and_zero_retry_is_dead_letter() {
+        assert_eq!(
+            retry_decision(1, 1_000, RetryPolicy { max_retries: 0 }),
+            RetryDecision::DeadLetter
+        );
+        assert_eq!(
+            retry_decision(1, 1_000, RetryPolicy { max_retries: 2 }),
+            RetryDecision::Retry { not_before: 1_060 }
+        );
+        assert_eq!(
+            retry_decision(2, 1_000, RetryPolicy { max_retries: 2 }),
+            RetryDecision::Retry { not_before: 1_120 }
+        );
+        assert_eq!(
+            retry_decision(3, 1_000, RetryPolicy { max_retries: 2 }),
+            RetryDecision::DeadLetter
+        );
+        assert_eq!(retry_backoff_seconds(20), 3_840);
+    }
+}
