@@ -945,6 +945,8 @@ pub fn render_project_status_json(
         daemon: DaemonSummary {
             status: service_status_label(input.daemon_health),
         },
+        service: service_status_label(input.daemon_health),
+        automation: automation_status_label(project),
         pueue: pueue_summary(project, &input.pueue),
         events: EventSection {
             counts: event_counts(db, &project.project_id)?,
@@ -980,6 +982,8 @@ struct ProjectStatusReport {
     schema_version: u32,
     project: ProjectSummary,
     daemon: DaemonSummary,
+    service: &'static str,
+    automation: &'static str,
     pueue: PueueSummary,
     events: EventSection,
     incidents: IncidentSection,
@@ -1315,6 +1319,18 @@ fn service_status_label(status: ServiceStatus) -> &'static str {
         ServiceStatus::Running => "running",
         ServiceStatus::Stopped => "stopped",
         ServiceStatus::NotInstalled => "not_installed",
+    }
+}
+
+fn automation_status_label(project: &Project) -> &'static str {
+    if !project.enabled {
+        "disabled"
+    } else if project.halted_reason.is_some() {
+        "halted"
+    } else if project.paused {
+        "paused"
+    } else {
+        "active"
     }
 }
 

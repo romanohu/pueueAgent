@@ -16,6 +16,7 @@ use pueue_agent::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
         TaskObservationRepository, TerminationRequestRepository,
     },
+    diagnostics::render_project_status_json,
     models::{
         AgentContextMode, AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewIncident,
         NewProject, NewTaskObservation, NewTerminationRequest, TerminationRequestStatus,
@@ -710,11 +711,15 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
     .unwrap();
 
     assert!(output.contains("daemon: running"));
+    assert!(output.contains("service: running"));
+    assert!(output.contains("automation: active"));
     assert!(output.contains("project: project-a"));
+    assert!(output.contains("project: enabled=true paused=false halted=false"));
     assert!(output.contains("enabled: true"));
     assert!(output.contains("paused: false"));
     assert!(output.contains("halted: no"));
     assert!(output.contains("active_tasks: 1"));
+    assert!(output.contains("pueue: total=1 active=1 queued=0"));
     assert!(output.contains("task=41 state=running"));
     assert!(output.contains("events: pending=1 failed=1"));
     assert!(output.contains("event="));
@@ -733,6 +738,73 @@ fn status_shows_failed_termination_without_marking_project_idle_or_dumping_trans
     assert!(output.contains("last_lineage: session-prev -> session-current"));
     assert!(!output.contains("idle"));
     assert!(!output.contains("hidden transcript"));
+
+    let compact = status::render_project_status_compact(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(vec![harness.running_task()])),
+    )
+    .unwrap();
+    assert!(compact.contains("service: running"));
+    assert!(compact.contains("automation: active"));
+    assert!(compact.contains("project: enabled=true paused=false halted=false"));
+    assert!(compact.contains("pueue: total=1 active=1 queued=0"));
+    assert!(compact.contains("agent_runs: active=1 failed=1"));
+
+    let rendered_json = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(vec![harness.running_task()])),
+    )
+    .unwrap();
+    let status_json: serde_json::Value = serde_json::from_str(&rendered_json).unwrap();
+    assert_eq!(status_json["service"], "running");
+    assert_eq!(status_json["automation"], "active");
+}
+
+#[test]
+fn status_reports_disabled_automation_without_inferring_pueue_state() {
+    let harness = OperatorHarness::new();
+    ProjectRepository::new(&harness.db)
+        .disable("project-a", harness.now + 1, &[])
+        .unwrap();
+
+    let output = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(vec![harness.running_task()])),
+    )
+    .unwrap();
+
+    assert!(output.contains("automation: disabled"));
+    assert!(output.contains("pueue: total=1 active=1 queued=0"));
+}
+
+#[test]
+fn status_distinguishes_paused_and_halted_automation() {
+    let harness = OperatorHarness::new();
+    status::pause_project(&harness.db, "project-a", harness.now + 1).unwrap();
+
+    let paused = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    assert!(paused.contains("automation: paused"));
+    assert!(paused.contains("project: enabled=true paused=true halted=false"));
+
+    ProjectRepository::new(&harness.db)
+        .halt("project-a", "operator halt", harness.now + 2)
+        .unwrap();
+    let halted = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.status_input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    assert!(halted.contains("automation: halted"));
+    assert!(halted.contains("project: enabled=true paused=true halted=true"));
 }
 
 #[test]
@@ -962,7 +1034,7 @@ fn status_human_bounds_and_redacts_project_and_group() {
 }
 
 #[test]
-fn status_text_output_is_byte_compatible_for_an_active_project() {
+fn status_text_output_has_stable_active_project_projection() {
     let harness = OperatorHarness::new();
     let project = harness.project();
 
@@ -976,7 +1048,7 @@ fn status_text_output_is_byte_compatible_for_an_active_project() {
     assert_eq!(
         output,
         format!(
-            "pueue-agent status project=project-a\ndaemon: running\nproject: project-a\nroot: [path]\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
+            "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: [path]\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 failed=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
         )
     );
 }
