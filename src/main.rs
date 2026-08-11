@@ -54,6 +54,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Resume(args) => commands::resume(args),
         Command::Steer(args) => commands::steer(args),
         Command::Wake(args) => commands::wake(args),
+        Command::Start(args) => commands::start(args),
+        Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
     }
 }
@@ -65,8 +67,8 @@ mod commands {
         agent::{AgentRunner, AgentRunnerConfig},
         cli::{
             DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, RunsArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs,
-            SubmitBatchArgs, WakeArgs,
+            InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs, SteerAction,
+            SteerArgs, SubmitArgs, SubmitBatchArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -83,7 +85,7 @@ mod commands {
         pueue::{CommandPueue, PueueApi},
         service::{
             enable_with, CallbackRegistry, EnableOptions, PueueConfigCallbackRegistry,
-            ServiceControl, ServiceManager, ServicePaths,
+            ServiceControl, ServiceManager, ServicePaths, ServiceStatus,
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
         submit as submit_command, AppError,
@@ -448,6 +450,24 @@ mod commands {
         Ok(())
     }
 
+    pub fn start(args: ServiceLifecycleArgs) -> Result<(), AppError> {
+        let service = ServiceManager;
+        service.start()?;
+        if service.status()? != ServiceStatus::Running {
+            return Err(AppError::Runtime {
+                operation: "verify service started",
+            });
+        }
+        print_service_lifecycle("start", "running", args.json);
+        Ok(())
+    }
+
+    pub fn stop(args: ServiceLifecycleArgs) -> Result<(), AppError> {
+        ServiceManager.stop()?;
+        print_service_lifecycle("stop", "stopped", args.json);
+        Ok(())
+    }
+
     pub async fn daemon(args: DaemonArgs) -> Result<(), AppError> {
         let db = Db::open(&paths::state_db_path()?)?;
         let fixed_args = args
@@ -463,6 +483,27 @@ mod commands {
             DaemonConfig::default(),
         );
         daemon.run(production_shutdown_token()).await
+    }
+
+    fn print_service_lifecycle(operation: &str, service: &str, json: bool) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "operation": operation,
+                    "service": service,
+                })
+            );
+        } else {
+            println!("pueue-agent {operation}");
+            println!("service: {}", format_state(service));
+            println!("{}", human_summary(match operation {
+                "start" => "service started",
+                "stop" => "service stopped",
+                _ => "service lifecycle operation completed",
+            }));
+        }
     }
 
     fn unix_timestamp() -> Result<i64, AppError> {

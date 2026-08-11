@@ -15,6 +15,8 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("explain"));
     assert!(text.contains("doctor"));
     assert!(text.contains("wake"));
+    assert!(text.contains("start"));
+    assert!(text.contains("stop"));
 
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -39,6 +41,23 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("--metadata"));
     assert!(text.contains("--metadata-json"));
     assert!(text.contains("--json"));
+}
+
+#[test]
+fn help_lists_service_lifecycle_commands() {
+    for command in ["start", "stop"] {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("--json"));
+        assert!(!text.contains("PROJECT_ROOT"));
+        assert!(!text.contains("PUEUE_CONFIG"));
+    }
 }
 
 #[test]

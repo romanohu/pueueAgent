@@ -30,6 +30,8 @@ pub enum Command {
     Resume(ProjectArgs),
     Steer(SteerArgs),
     Wake(WakeArgs),
+    Start(ServiceLifecycleArgs),
+    Stop(ServiceLifecycleArgs),
     Daemon(DaemonArgs),
 }
 
@@ -196,6 +198,12 @@ pub struct WakeArgs {
     pub pueue_config: Option<PathBuf>,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceLifecycleArgs {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]

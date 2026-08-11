@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use clap::Parser;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     daemon::{Daemon, DaemonConfig},
@@ -26,6 +27,91 @@ use serde_json::json;
 use tempfile::TempDir;
 
 const CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
+
+#[test]
+fn service_lifecycle_commands_parse_without_project_state() {
+    for (command, expected_json) in [("start", true), ("stop", false)] {
+        let cli = pueue_agent::cli::Cli::try_parse_from([
+            "pueue-agent",
+            command,
+            if expected_json { "--json" } else { "" },
+        ]
+        .into_iter()
+        .filter(|argument| !argument.is_empty()))
+        .unwrap();
+
+        match cli.command {
+            pueue_agent::cli::Command::Start(args) if command == "start" => {
+                assert_eq!(args.json, expected_json);
+            }
+            pueue_agent::cli::Command::Stop(args) if command == "stop" => {
+                assert_eq!(args.json, expected_json);
+            }
+            _ => panic!("expected {command} service lifecycle command"),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn service_lifecycle_commands_report_only_verified_service_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let launchctl = bin.join("launchctl");
+    fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+    let start = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("PATH", &path)
+        .arg("start")
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "{}", String::from_utf8_lossy(&start.stderr));
+    let start_text = String::from_utf8_lossy(&start.stdout);
+    assert!(start_text.contains("service: running"));
+    assert!(!start_text.contains("project"));
+    assert!(!start_text.contains("Pueue"));
+
+    let stop = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("PATH", &path)
+        .args(["stop", "--json"])
+        .output()
+        .unwrap();
+    assert!(stop.status.success(), "{}", String::from_utf8_lossy(&stop.stderr));
+    let body: serde_json::Value = serde_json::from_slice(&stop.stdout).unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["operation"], "stop");
+    assert_eq!(body["service"], "stopped");
+    assert!(body.get("project_id").is_none());
+    assert!(body.get("pueue").is_none());
+
+    fs::write(
+        &launchctl,
+        "#!/bin/sh\nif [ \"$1\" = print ]; then exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let unverified_start = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("PATH", &path)
+        .arg("start")
+        .output()
+        .unwrap();
+    assert!(!unverified_start.status.success());
+    assert!(String::from_utf8_lossy(&unverified_start.stderr).contains("verify service started"));
+}
 
 #[derive(Clone)]
 struct OperatorPueue {
