@@ -663,6 +663,15 @@ where
                 ),
             ));
         }
+        if let Err(error) = self.service.stop() {
+            return Err(UpgradeFailure::with_report(
+                report,
+                with_cleanup_failure(
+                    error,
+                    &[&install_candidate, &backup, &database_backup],
+                ),
+            ));
+        }
         if let Err(error) = self.snapshot_database(&database_backup) {
             return Err(UpgradeFailure::with_report(
                 report,

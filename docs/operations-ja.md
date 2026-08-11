@@ -68,7 +68,7 @@ source checkout には `git`、Rust stable、Cargo が必要です。更新対�
 
 enabled project に active agent run がある場合、upgrade は source の fetch や binary の置換をせずに拒否します。agent run の完了または停止を確認し、他の operator が upgrade していないことを確認してから再試行してください。同時実行は upgrade lock でも調整されます。
 
-upgrade は fetch、fast-forward、テスト、release build、binary の atomic install、service restart、health check を順に行います。revision がすでに current の場合は no-op として報告し、service を restart しません。fast-forward 後に失敗した revision は retry marker に残り、条件を直した再実行で同じ revision の処理を再試行できます。更新後の restart または health check に失敗すると、旧 binary を復元して service を再起動する rollback を試みます。rollback の attempted/succeeded または failed は report で確認できます。失敗時は出力された診断コマンドを実行し、原因を直して `pueue-agent upgrade` を再実行してください。
+upgrade は fetch、fast-forward、テスト、release build、binary の atomic install、service restart、health check を順に行います。revision がすでに current の場合は no-op として報告し、service を restart しません。fast-forward 後に失敗した revision は retry marker に残り、条件を直した再実行で同じ revision の処理を再試行できます。binary install の前に service を停止して SQLite の整合性境界を作り、停止後に `VACUUM INTO` で snapshot を取得します。この短い窓では operator による SQLite の直接書き込みを避けてください。更新後の restart または health check に失敗すると、SQLite snapshot と旧 binary を復元してから service を再起動し、health check を行う rollback を試みます。rollback の attempted/succeeded または failed は report で確認できます。失敗時は出力された診断コマンドを実行し、原因を直して `pueue-agent upgrade` を再実行してください。
 
 upgrade は supervisor service と binary だけを扱います。Pueue daemon、group、実験 task を kill、stop、cancel することはなく、実験の処理は継続します。active agent run の coordination は更新を安全側に拒否するためのもので、実験 task を停止する手順ではありません。
 

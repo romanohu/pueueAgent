@@ -312,7 +312,12 @@ impl ServiceManager {
             ServicePlatform::Launchd => {
                 let agent = required_launchd_agent(launchd)?;
                 let service = agent.service_target();
-                run_lifecycle_command(runner, "launchctl", &["bootout", service.as_str()])
+                let output = runner.run("launchctl", &["bootout", service.as_str()])?;
+                if output.success || launchd_service_is_not_loaded(&output.details) {
+                    Ok(())
+                } else {
+                    lifecycle_command_error("launchctl", output.status)
+                }
             }
         }
     }

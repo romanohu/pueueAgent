@@ -297,6 +297,39 @@ fn service_manager_restarts_an_unloaded_installed_launchd_agent_by_bootstrapping
 }
 
 #[test]
+fn service_manager_treats_an_unloaded_launchd_stop_as_successful() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([ServiceCommandOutput::failure(
+        3,
+        "Could not find service",
+    )]);
+    let agent = LaunchdAgent::new("gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist");
+
+    manager
+        .stop_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .unwrap();
+
+    assert_eq!(runner.calls.into_inner().len(), 1);
+}
+
+#[test]
+fn service_manager_propagates_non_not_loaded_launchd_stop_failure() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([ServiceCommandOutput::failure(
+        1,
+        "permission denied",
+    )]);
+    let agent = LaunchdAgent::new("gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist");
+
+    let error = manager
+        .stop_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .expect_err("genuine launchd stop failures must propagate");
+
+    assert!(error.to_string().contains("status 1"));
+    assert_eq!(runner.calls.into_inner().len(), 1);
+}
+
+#[test]
 fn service_manager_propagates_non_not_loaded_launchd_restart_failure() {
     let manager = ServiceManager;
     let runner = RecordingCommandRunner::with_outputs([

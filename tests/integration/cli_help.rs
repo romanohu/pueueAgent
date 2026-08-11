@@ -262,6 +262,10 @@ fn documentation_contract_covers_current_operator_surface() {
         "runs --json",
         "polling 単位",
         "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
+        "VACUUM INTO",
+        "service を停止して SQLite の整合性境界",
+        "SQLite snapshot と旧 binary",
+        "operator による SQLite の直接書き込み",
     ] {
         assert!(
             readme.contains(required),
@@ -293,12 +297,18 @@ fn documentation_contract_covers_current_operator_surface() {
     }
 
     let operations = std::fs::read_to_string(root.join("docs/operations-ja.md")).unwrap();
-    assert!(
-        operations.contains(
-            "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る"
-        ),
-        "docs/operations-ja.md is missing stop shutdown behavior"
-    );
+    for required in [
+        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
+        "VACUUM INTO",
+        "service を停止して SQLite の整合性境界",
+        "SQLite snapshot と旧 binary",
+        "operator による SQLite の直接書き込み",
+    ] {
+        assert!(
+            operations.contains(required),
+            "docs/operations-ja.md is missing upgrade consistency text: {required}"
+        );
+    }
 }
 
 #[test]

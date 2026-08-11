@@ -105,7 +105,7 @@ pueue-agent upgrade --pueue-config ~/.config/pueue/experiments.yml
 
 更新対象は、clean な `main` branch が `origin/main` を追跡し、`origin/main` への fast-forward だけで更新できる checkout に限ります。dirty worktree、`main` 以外の branch、upstream の不一致、diverged checkout は拒否されます。更新前に enabled project の active agent run がある場合も拒否するため、先に agent run の完了または停止を確認してから再実行してください。upgrade のロックで同時実行も調整します。
 
-fetch、fast-forward、`cargo test --all-targets`、release build、binary の atomic install、service restart、health check の順で進みます。すでに current revision なら no-op として報告し、service は restart しません。fast-forward 後の失敗した revision は retry marker に残るため、条件を直した再実行で同じ revision の処理を再試行できます。build、install 後の restart、health check が失敗した場合は旧 binary の復元と service restart を試み、report に rollback の成否を表示します。失敗後は表示された診断コマンドで状態を確認し、条件を直して `pueue-agent upgrade` を再実行してください。
+fetch、fast-forward、`cargo test --all-targets`、release build、binary の atomic install、service restart、health check の順で進みます。すでに current revision なら no-op として報告し、service は restart しません。fast-forward 後の失敗した revision は retry marker に残るため、条件を直した再実行で同じ revision の処理を再試行できます。binary install の前に service を停止して SQLite の整合性境界を作り、停止後に `VACUUM INTO` で snapshot を取得します。この短い窓では operator による SQLite の直接書き込みを避けてください。build、install 後の restart、health check が失敗した場合は SQLite snapshot と旧 binary を復元してから service を再起動し、report に rollback の成否を表示します。失敗後は表示された診断コマンドで状態を確認し、条件を直して `pueue-agent upgrade` を再実行してください。
 
 upgrade は supervisor の binary と service だけを対象にし、Pueue daemon、group、実験 task を kill・stop・変更しません。active agent run の存在中は安全側に拒否するため、実験を止める操作と upgrade を混同しないでください。source checkout や依存関係の問題で通常経路を使えない場合だけ、復旧手順として `git pull --ff-only` の後に `./install.sh` を実行します。手動手順を通常の更新経路にはしません。
 
