@@ -596,6 +596,13 @@ async fn crash_and_deep_check_for_one_project_start_one_crash_run() {
     assert_eq!(stored_context.1, None);
     assert!(stored_context.2.contains(&crash.to_string()));
     assert!(!stored_context.2.contains("state reference"));
+    assert_eq!(harness.event_status(crash), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(deep_check), EventStatus::Dispatched);
+    let mut handle = report.started.into_iter().next().unwrap().handle;
+    assert_eq!(
+        handle.wait(&harness.db, harness.now).await.unwrap(),
+        AgentRunStatus::Completed
+    );
     assert_eq!(harness.event_status(crash), EventStatus::Completed);
     assert_eq!(harness.event_status(deep_check), EventStatus::Completed);
 }
@@ -615,7 +622,263 @@ async fn operator_wake_uses_the_existing_scheduler_dispatch_path() {
     assert_eq!(report.started.len(), 1);
     assert_eq!(report.started[0].primary_event_id, wake);
     assert_eq!(report.started[0].mode, "operator_wake");
+    assert_eq!(harness.event_status(wake), EventStatus::Dispatched);
+    let mut handle = report.started.into_iter().next().unwrap().handle;
+    assert_eq!(
+        handle.wait(&harness.db, harness.now).await.unwrap(),
+        AgentRunStatus::Completed
+    );
     assert_eq!(harness.event_status(wake), EventStatus::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_success_leaves_events_dispatched_until_process_exit() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "sleep 1"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "dispatch-ack");
+
+    let mut scheduler = harness.scheduler();
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    assert!(started
+        .handle
+        .poll(&harness.db, harness.now)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+
+    assert_eq!(
+        started
+            .handle
+            .wait(&harness.db, harness.now + 1)
+            .await
+            .unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_handle_wait_borrows_mutably_for_finalizer_retry() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "mutable-wait");
+
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    assert_eq!(
+        handle.wait(&harness.db, harness.now).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(handle.run_id, 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_finalizer_is_retried_without_losing_terminal_process_outcome() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "finalizer-retry");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal_event_finalization
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected terminal event failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    let first = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match handle.poll(&harness.db, harness.now + 1).await {
+                Ok(None) => sleep(Duration::from_millis(10)).await,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(first.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    assert_eq!(harness.active_runs("project-a"), 1);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_terminal_event_finalization;")
+        .unwrap();
+    assert_eq!(
+        handle.poll(&harness.db, harness.now + 2).await.unwrap(),
+        Some(AgentRunStatus::Completed)
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_nonzero_exit_retries_event_after_backoff() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 7"]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "nonzero-exit");
+    let intervention_id = harness.queue_intervention("keep this audit row");
+
+    let mut scheduler = harness.scheduler();
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+    let reserved_id = harness.queue_intervention("release this reserved row");
+    let reserved_token = "reserved-for-finalizer";
+    InterventionRepository::new(&harness.db)
+        .reserve_pending(
+            "project-a",
+            reserved_token,
+            harness.now,
+            harness.now + 60,
+            1,
+            "release this reserved row".len(),
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET agent_run_id = ?1
+             WHERE intervention_id = ?2",
+            params![started.run_id, reserved_id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        started
+            .handle
+            .wait(&harness.db, harness.now + 1)
+            .await
+            .unwrap(),
+        AgentRunStatus::Failed
+    );
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.attempts, 1);
+    assert_eq!(event.not_before, harness.now + 61);
+    assert!(event
+        .last_error
+        .as_deref()
+        .is_some_and(|reason| reason.contains("code 7")));
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Applied
+    );
+    assert_eq!(
+        harness.intervention_state(&reserved_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_timeout_dead_letters_when_max_retries_zero() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
+    let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, config.replace("max_retries = 2", "max_retries = 0")).unwrap();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "timeout-dead-letter");
+    let intervention_id = harness.queue_intervention("retain timeout audit");
+
+    let mut scheduler = harness.scheduler();
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+    started.handle.timeout_deadline = Instant::now();
+    assert_eq!(
+        started
+            .handle
+            .timeout_now(&harness.db, harness.now + 1)
+            .await
+            .unwrap(),
+        AgentRunStatus::TimedOut
+    );
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert!(event
+        .last_error
+        .as_deref()
+        .is_some_and(|reason| reason.len() <= 240 && reason.contains("timed out")));
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Applied
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn marker_ack_database_failure_uses_post_marker_finalizer_once() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "ack-failure");
+    let intervention_id = harness.queue_intervention("retain post-marker audit");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected dispatch acknowledgement failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert!(event
+        .last_error
+        .as_deref()
+        .is_some_and(|reason| reason.len() <= 240 && reason.contains("post_marker_dispatch_ack")));
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Applied
+    );
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE status = 'failed'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -817,7 +1080,7 @@ async fn agent_runner_passes_run_and_project_identity_to_child_environment() {
 
     let mut scheduler = harness.scheduler();
     let report = scheduler.tick().await.unwrap();
-    let started = report.started.into_iter().next().unwrap();
+    let mut started = report.started.into_iter().next().unwrap();
     let run_id = started.run_id;
     started.handle.wait(&harness.db, harness.now).await.unwrap();
 
@@ -956,7 +1219,7 @@ max_agent_runs = 10
         .is_some_and(|message| message.contains("agent.context.session_id")));
 
     let valid = harness.event(valid_event);
-    assert_eq!(valid.status, EventStatus::Completed);
+    assert_eq!(valid.status, EventStatus::Dispatched);
     assert_eq!(valid.lease_until, None);
     assert_eq!(harness.active_runs("project-b"), 1);
     assert_eq!(harness.claimed_with_lease_count(), 0);
@@ -999,7 +1262,7 @@ async fn retry_wait_events_obey_not_before_backoff() {
     harness.now += 30;
     let mut scheduler = harness.scheduler();
     assert_eq!(scheduler.tick().await.unwrap().started.len(), 1);
-    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
 }
 
 #[tokio::test]

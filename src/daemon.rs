@@ -186,10 +186,6 @@ where
         Ok(outcomes)
     }
 
-    async fn poll_agents(&mut self) -> Result<usize, AppError> {
-        self.poll_agents_at(self.now()?).await
-    }
-
     async fn poll_agents_at(&mut self, now: i64) -> Result<usize, AppError> {
         let mut finished = 0;
         let mut index = 0;
@@ -209,23 +205,46 @@ where
     }
 
     async fn drain_agents_on_shutdown(&mut self) -> Result<usize, AppError> {
-        let mut finished = self.poll_agents().await?;
-        if self.active_agents.is_empty() {
-            return Ok(finished);
-        }
-
         let deadline = Instant::now() + self.config.shutdown_grace_period;
-        while !self.active_agents.is_empty() && Instant::now() < deadline {
+        let mut finished = 0;
+
+        while !self.active_agents.is_empty() {
+            let now = self.now()?;
+            let mut index = 0;
+            while index < self.active_agents.len() {
+                match self.active_agents[index].poll(&self.db, now).await {
+                    Ok(Some(_)) => {
+                        self.active_agents.swap_remove(index);
+                        finished += 1;
+                    }
+                    Ok(None) => index += 1,
+                    Err(_) => index += 1,
+                }
+            }
+            if self.active_agents.is_empty() {
+                return Ok(finished);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_else(|| Duration::from_secs(0));
             tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
-            finished += self.poll_agents().await?;
+        }
+
+        if self.active_agents.is_empty() {
+            return Ok(finished);
         }
 
         while let Some(mut agent) = self.active_agents.pop() {
-            agent.timeout_now(&self.db, self.now()?).await?;
-            finished += 1;
+            match agent.timeout_now(&self.db, self.now()?).await {
+                Ok(_) => finished += 1,
+                Err(error) => {
+                    self.active_agents.push(agent);
+                    return Err(error);
+                }
+            }
         }
         Ok(finished)
     }

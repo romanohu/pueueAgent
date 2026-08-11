@@ -4,7 +4,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentHandle, AgentRunner},
+    agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage},
     config,
     db::{EventRepository, InterventionRepository, ProjectRepository},
     guardrails::{DispatchDecision, Guardrails},
@@ -268,13 +268,6 @@ impl Scheduler {
                 .await
             {
                 Ok(handle) => {
-                    EventRepository::new(&self.db).transition_many(
-                        &event_ids,
-                        EventStatus::Completed,
-                        self.config.now,
-                        None,
-                        None,
-                    )?;
                     report.started.push(StartedAgent {
                         run_id: handle.run_id,
                         primary_event_id: primary.event_id,
@@ -285,7 +278,8 @@ impl Scheduler {
                     });
                 }
                 Err(error) => {
-                    if matches!(&error, AppError::UpgradeInProgress) {
+                    let AgentSpawnError { stage, source } = error;
+                    if matches!(&source, AppError::UpgradeInProgress) {
                         if let Some(reservation) = reservation.as_ref() {
                             InterventionRepository::new(&self.db).release_reservation(
                                 &project.project_id,
@@ -295,12 +289,18 @@ impl Scheduler {
                         EventRepository::new(&self.db).defer_claimed(&event_ids)?;
                         continue;
                     }
+                    if !matches!(stage, AgentSpawnStage::PreBinding) {
+                        if first_error.is_none() {
+                            first_error = Some(source);
+                        }
+                        continue;
+                    }
                     let release_error = reservation.as_ref().and_then(|reservation| {
                         InterventionRepository::new(&self.db)
                             .release_reservation(&project.project_id, &reservation.token)
                             .err()
                     });
-                    let message = format!("agent spawn failed: {error}");
+                    let message = format!("agent spawn failed: {source}");
                     let retry_at = self.config.now + retry_backoff_seconds(primary.attempts);
                     let status = if primary.attempts <= i64::from(project_config.agent.max_retries)
                     {
@@ -316,7 +316,7 @@ impl Scheduler {
                         Some(&message),
                     )?;
                     if first_error.is_none() {
-                        first_error = Some(release_error.unwrap_or(error));
+                        first_error = Some(release_error.unwrap_or(source));
                     }
                     continue;
                 }

@@ -18,6 +18,7 @@ use crate::{
     db::AgentRunRepository,
     interventions::InterventionReservation,
     models::{launch_gate_marker_path, AgentContextMode, AgentRunStatus, NewAgentRun, Project},
+    retry::{EventResolution, RetryPolicy},
     upgrade::AgentStartUpgradeGuard,
     AppError,
 };
@@ -53,6 +54,31 @@ impl AgentRunnerConfig {
 pub struct AgentCommand {
     pub program: String,
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSpawnStage {
+    PreBinding,
+    RunBoundPreMarker { run_id: i64, resolved: bool },
+    PostMarker { run_id: i64, resolved: bool },
+}
+
+#[derive(Debug)]
+pub struct AgentSpawnError {
+    pub stage: AgentSpawnStage,
+    pub source: AppError,
+}
+
+impl std::fmt::Display for AgentSpawnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AgentSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[cfg(unix)]
@@ -100,11 +126,21 @@ fn configure_launch_gate(
 }
 
 pub struct AgentHandle {
+    pub project_id: String,
     pub run_id: i64,
     pub child: tokio::process::Child,
     pub pid: i64,
     pub timeout_deadline: Instant,
     pub log_path: PathBuf,
+    pub retry_policy: RetryPolicy,
+    terminal_outcome: Option<TerminalOutcome>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalOutcome {
+    status: AgentRunStatus,
+    exit_code: Option<i64>,
+    last_error: Option<String>,
 }
 
 pub struct AgentRunner {
@@ -190,27 +226,33 @@ impl AgentRunner {
         reservation: Option<&InterventionReservation>,
         prompt: &str,
         now: i64,
-    ) -> Result<AgentHandle, AppError> {
-        let agent_start_guard = AgentStartUpgradeGuard::acquire(db)?;
-        let command = self.command_for(project, config, prompt)?;
-        let log_path = self.log_path(project, primary_event_id, now)?;
+    ) -> Result<AgentHandle, AgentSpawnError> {
+        let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
+        let command = self
+            .command_for(project, config, prompt)
+            .map_err(pre_binding_error)?;
+        let log_path = self
+            .log_path(project, primary_event_id, now)
+            .map_err(pre_binding_error)?;
         let gate_marker_path = launch_gate_marker_path(&log_path);
         let repository = AgentRunRepository::new(db);
-        let run = repository.insert_with_events_and_reservation(
-            &NewAgentRun::with_context(
-                &project.project_id,
-                primary_event_id,
-                None,
-                AgentRunStatus::Starting,
-                now,
-                &log_path,
-                config.context.clone(),
-                config.context.session_id().map(str::to_owned),
-                event_ids.iter().map(i64::to_string).collect(),
-            ),
-            event_ids,
-            reservation.map(|reservation| reservation.token.as_str()),
-        )?;
+        let run = repository
+            .insert_with_events_and_reservation(
+                &NewAgentRun::with_context(
+                    &project.project_id,
+                    primary_event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    now,
+                    &log_path,
+                    config.context.clone(),
+                    config.context.session_id().map(str::to_owned),
+                    event_ids.iter().map(i64::to_string).collect(),
+                ),
+                event_ids,
+                reservation.map(|reservation| reservation.token.as_str()),
+            )
+            .map_err(pre_binding_error)?;
         drop(agent_start_guard);
         let mut spawned_child = None;
         #[cfg(unix)]
@@ -307,13 +349,17 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.fail_before_gate_release(
+                return Err(resolve_pre_marker_failure(
+                    &repository,
                     &project.project_id,
                     run.run_id,
                     now,
                     &reason,
-                )?;
-                return Err(error);
+                    RetryPolicy {
+                        max_retries: config.max_retries,
+                    },
+                    error,
+                ));
             }
         };
         #[cfg(unix)]
@@ -327,13 +373,17 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.fail_before_gate_release(
+                return Err(resolve_pre_marker_failure(
+                    &repository,
                     &project.project_id,
                     run.run_id,
                     now,
                     &reason,
-                )?;
-                return Err(error);
+                    RetryPolicy {
+                        max_retries: config.max_retries,
+                    },
+                    error,
+                ));
             };
             if let Err(source) = release.write_all(b"x\n").await {
                 drop(release);
@@ -342,16 +392,20 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = format!("release agent launch gate: {source}");
-                repository.fail_before_gate_release(
+                return Err(resolve_pre_marker_failure(
+                    &repository,
                     &project.project_id,
                     run.run_id,
                     now,
                     &reason,
-                )?;
-                return Err(AppError::Io {
-                    operation: "release agent launch gate",
-                    source,
-                });
+                    RetryPolicy {
+                        max_retries: config.max_retries,
+                    },
+                    AppError::Io {
+                        operation: "release agent launch gate",
+                        source,
+                    },
+                ));
             }
 
             let Some(gate_stdout) = gate_stdout.take() else {
@@ -363,13 +417,17 @@ impl AgentRunner {
                         .await;
                 }
                 let reason = error.to_string();
-                repository.fail_before_gate_release(
+                return Err(resolve_pre_marker_failure(
+                    &repository,
                     &project.project_id,
                     run.run_id,
                     now,
                     &reason,
-                )?;
-                return Err(error);
+                    RetryPolicy {
+                        max_retries: config.max_retries,
+                    },
+                    error,
+                ));
             };
             let mut acknowledgement = String::new();
             let read_result = timeout(
@@ -392,44 +450,33 @@ impl AgentRunner {
                     Ok(Err(source)) => format!("read agent launch gate acknowledgement: {source}"),
                     Err(_) => "timed out waiting for agent launch gate acknowledgement".to_owned(),
                 };
-                repository.fail_before_gate_release(
+                return Err(resolve_pre_marker_failure(
+                    &repository,
                     &project.project_id,
                     run.run_id,
                     now,
                     &reason,
-                )?;
-                return Err(AppError::Runtime {
-                    operation: "confirm agent launch gate release",
-                });
+                    RetryPolicy {
+                        max_retries: config.max_retries,
+                    },
+                    AppError::Runtime {
+                        operation: "confirm agent launch gate release",
+                    },
+                ));
             }
-            if let Err(error) = repository.mark_gate_released(&project.project_id, run.run_id) {
+            if let Err(error) = repository.acknowledge_dispatch(&project.project_id, run.run_id) {
                 if let Some(child) = spawned_child.as_mut() {
                     process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
                         .await;
                 }
-                let reason = error.to_string();
-                let marker_confirmed = match fs::metadata(&gate_marker_path) {
-                    Ok(metadata) => metadata.is_file(),
-                    Err(source) if source.kind() == io::ErrorKind::NotFound => false,
-                    Err(_) => true,
-                };
-                if marker_confirmed {
-                    repository.finish(
-                        run.run_id,
-                        AgentRunStatus::Failed,
-                        now,
-                        None,
-                        Some(&reason),
-                    )?;
-                } else {
-                    repository.fail_before_gate_release(
-                        &project.project_id,
-                        run.run_id,
-                        now,
-                        &reason,
-                    )?;
-                }
-                return Err(error);
+                return Err(resolve_post_marker_failure(
+                    &repository,
+                    &project.project_id,
+                    run.run_id,
+                    now,
+                    "post_marker_dispatch_ack",
+                    error,
+                ));
             }
         }
         let child = match spawned_child.take() {
@@ -439,18 +486,29 @@ impl AgentRunner {
                     operation: "take spawned agent process",
                 };
                 let reason = error.to_string();
-                repository.finish(run.run_id, AgentRunStatus::Failed, now, None, Some(&reason))?;
-                return Err(error);
+                return Err(resolve_post_marker_failure(
+                    &repository,
+                    &project.project_id,
+                    run.run_id,
+                    now,
+                    &reason,
+                    error,
+                ));
             }
         };
 
         Ok(AgentHandle {
+            project_id: project.project_id.clone(),
             run_id: run.run_id,
             child,
             pid,
             timeout_deadline: Instant::now()
                 + Duration::from_secs(u64::from(config.timeout_minutes) * 60),
             log_path,
+            retry_policy: RetryPolicy {
+                max_retries: config.max_retries,
+            },
+            terminal_outcome: None,
         })
     }
 
@@ -473,30 +531,156 @@ impl AgentRunner {
     }
 }
 
+fn pre_binding_error(source: AppError) -> AgentSpawnError {
+    AgentSpawnError {
+        stage: AgentSpawnStage::PreBinding,
+        source,
+    }
+}
+
+fn resolve_pre_marker_failure(
+    repository: &AgentRunRepository<'_>,
+    project_id: &str,
+    run_id: i64,
+    finished_at: i64,
+    reason: &str,
+    policy: RetryPolicy,
+    source: AppError,
+) -> AgentSpawnError {
+    match repository.fail_before_gate_release_with_policy(
+        project_id,
+        run_id,
+        finished_at,
+        reason,
+        policy,
+    ) {
+        Ok(_) => AgentSpawnError {
+            stage: AgentSpawnStage::RunBoundPreMarker {
+                run_id,
+                resolved: true,
+            },
+            source,
+        },
+        Err(finalizer_error) => AgentSpawnError {
+            stage: AgentSpawnStage::RunBoundPreMarker {
+                run_id,
+                resolved: false,
+            },
+            source: finalizer_error,
+        },
+    }
+}
+
+fn resolve_post_marker_failure(
+    repository: &AgentRunRepository<'_>,
+    project_id: &str,
+    run_id: i64,
+    finished_at: i64,
+    reason: &str,
+    source: AppError,
+) -> AgentSpawnError {
+    match repository.finish_after_marker_failure(project_id, run_id, finished_at, reason) {
+        Ok(_) => AgentSpawnError {
+            stage: AgentSpawnStage::PostMarker {
+                run_id,
+                resolved: true,
+            },
+            source,
+        },
+        Err(finalizer_error) => AgentSpawnError {
+            stage: AgentSpawnStage::PostMarker {
+                run_id,
+                resolved: false,
+            },
+            source: finalizer_error,
+        },
+    }
+}
+
 impl AgentHandle {
+    fn finalize_terminal_outcome(
+        &self,
+        db: &crate::db::Db,
+        now: i64,
+        outcome: &TerminalOutcome,
+    ) -> Result<AgentRunStatus, AppError> {
+        AgentRunRepository::new(db).finish_and_resolve_events(
+            &self.project_id,
+            self.run_id,
+            outcome.status,
+            now,
+            outcome.exit_code,
+            outcome.last_error.as_deref(),
+            EventResolution::RetryPolicy(self.retry_policy),
+        )?;
+        Ok(outcome.status)
+    }
+
+    fn finalize_stored_outcome(
+        &self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<AgentRunStatus, AppError> {
+        let Some(outcome) = self.terminal_outcome.as_ref() else {
+            return Err(AppError::Runtime {
+                operation: "finalize missing agent process outcome",
+            });
+        };
+        self.finalize_terminal_outcome(db, now, outcome)
+    }
+
+    fn store_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+        outcome: TerminalOutcome,
+    ) -> Result<AgentRunStatus, AppError> {
+        if self.terminal_outcome.is_none() {
+            self.terminal_outcome = Some(outcome);
+        }
+        self.finalize_stored_outcome(db, now)
+    }
+
     pub async fn poll(
         &mut self,
         db: &crate::db::Db,
         now: i64,
     ) -> Result<Option<AgentRunStatus>, AppError> {
-        if Instant::now() >= self.timeout_deadline {
-            process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
-            AgentRunRepository::new(db).finish(
-                self.run_id,
-                AgentRunStatus::TimedOut,
-                now,
-                None,
-                Some("agent timed out"),
-            )?;
-            return Ok(Some(AgentRunStatus::TimedOut));
+        if self.terminal_outcome.is_some() {
+            return self.finalize_stored_outcome(db, now).map(Some);
         }
 
-        let Some(exit) = self.child.try_wait().map_err(|source| AppError::Io {
-            operation: "poll agent process",
-            source,
-        })?
-        else {
-            return Ok(None);
+        if Instant::now() >= self.timeout_deadline {
+            process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
+            return self
+                .store_outcome(
+                    db,
+                    now,
+                    TerminalOutcome {
+                        status: AgentRunStatus::TimedOut,
+                        exit_code: None,
+                        last_error: Some("agent timed out".to_owned()),
+                    },
+                )
+                .map(Some);
+        }
+
+        let exit = match self.child.try_wait() {
+            Ok(Some(exit)) => exit,
+            Ok(None) => return Ok(None),
+            Err(source) => {
+                return self
+                    .store_outcome(
+                        db,
+                        now,
+                        TerminalOutcome {
+                            status: AgentRunStatus::Failed,
+                            exit_code: None,
+                            last_error: Some(format!("poll agent process: {source}")),
+                        },
+                    )
+                    .map(Some);
+            }
         };
 
         let code = exit.code().map(i64::from);
@@ -505,16 +689,38 @@ impl AgentHandle {
         } else {
             AgentRunStatus::Failed
         };
-        AgentRunRepository::new(db).finish(self.run_id, status, now, code, None)?;
-        Ok(Some(status))
+        let last_error = (!exit.success()).then(|| {
+            code.map_or_else(
+                || "agent exited unsuccessfully".to_owned(),
+                |code| format!("agent exited with code {code}"),
+            )
+        });
+        self.store_outcome(
+            db,
+            now,
+            TerminalOutcome {
+                status,
+                exit_code: code,
+                last_error,
+            },
+        )
+        .map(Some)
     }
 
-    pub async fn wait(mut self, db: &crate::db::Db, now: i64) -> Result<AgentRunStatus, AppError> {
+    pub async fn wait(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<AgentRunStatus, AppError> {
+        if self.terminal_outcome.is_some() {
+            return self.finalize_stored_outcome(db, now);
+        }
+
         let remaining = self
             .timeout_deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_else(|| Duration::from_secs(0));
-        let status = match tokio::time::timeout(remaining, self.child.wait()).await {
+        match tokio::time::timeout(remaining, self.child.wait()).await {
             Ok(Ok(exit)) => {
                 let code = exit.code().map(i64::from);
                 let status = if exit.success() {
@@ -522,35 +728,50 @@ impl AgentHandle {
                 } else {
                     AgentRunStatus::Failed
                 };
-                AgentRunRepository::new(db).finish(self.run_id, status, now, code, None)?;
-                status
+                let last_error = (!exit.success()).then(|| {
+                    code.map_or_else(
+                        || "agent exited unsuccessfully".to_owned(),
+                        |code| format!("agent exited with code {code}"),
+                    )
+                });
+                self.store_outcome(
+                    db,
+                    now,
+                    TerminalOutcome {
+                        status,
+                        exit_code: code,
+                        last_error,
+                    },
+                )
             }
             Ok(Err(source)) => {
-                AgentRunRepository::new(db).finish(
-                    self.run_id,
-                    AgentRunStatus::Failed,
+                let result = self.store_outcome(
+                    db,
                     now,
-                    None,
-                    Some("wait failed"),
-                )?;
-                return Err(AppError::Io {
-                    operation: "wait for agent process",
-                    source,
-                });
+                    TerminalOutcome {
+                        status: AgentRunStatus::Failed,
+                        exit_code: None,
+                        last_error: Some(format!("wait for agent process: {source}")),
+                    },
+                );
+                match result {
+                    Ok(status) => Ok(status),
+                    Err(error) => Err(error),
+                }
             }
             Err(_) => {
                 process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
-                AgentRunRepository::new(db).finish(
-                    self.run_id,
-                    AgentRunStatus::TimedOut,
+                self.store_outcome(
+                    db,
                     now,
-                    None,
-                    Some("agent timed out"),
-                )?;
-                AgentRunStatus::TimedOut
+                    TerminalOutcome {
+                        status: AgentRunStatus::TimedOut,
+                        exit_code: None,
+                        last_error: Some("agent timed out".to_owned()),
+                    },
+                )
             }
-        };
-        Ok(status)
+        }
     }
 
     pub async fn timeout_now(
@@ -558,15 +779,20 @@ impl AgentHandle {
         db: &crate::db::Db,
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
+        if self.terminal_outcome.is_some() {
+            return self.finalize_stored_outcome(db, now);
+        }
+
         process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
-        AgentRunRepository::new(db).finish(
-            self.run_id,
-            AgentRunStatus::TimedOut,
+        self.store_outcome(
+            db,
             now,
-            None,
-            Some("agent timed out"),
-        )?;
-        Ok(AgentRunStatus::TimedOut)
+            TerminalOutcome {
+                status: AgentRunStatus::TimedOut,
+                exit_code: None,
+                last_error: Some("agent timed out".to_owned()),
+            },
+        )
     }
 }
 

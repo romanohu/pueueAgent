@@ -585,6 +585,73 @@ async fn daemon_shutdown_bounds_long_running_child_agent_and_marks_it_terminal()
 }
 
 #[tokio::test]
+async fn daemon_shutdown_retains_handle_when_finalizer_exhausts_grace() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 10"],
+        1,
+    );
+    let event_id = harness.enqueue(EventKind::DeepCheck, "project-a", "shutdown-finalizer");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_shutdown_terminal_run
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status = 'timed_out'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected shutdown finalizer failure');
+             END;",
+        )
+        .unwrap();
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        AgentRunner::new(AgentRunnerConfig::for_tests(
+            harness.temp.path().join("agent.log"),
+        )),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(100),
+        },
+    );
+    let shutdown = CancellationToken::new();
+    let join = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { daemon.run(shutdown).await }
+    });
+
+    harness.wait_for_active_agent().await;
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("daemon should return after bounded shutdown grace")
+        .expect("daemon task should not panic");
+    assert!(result.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn injected_shutdown_signal_cancels_daemon_token() {
     let shutdown = CancellationToken::new();
     let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
