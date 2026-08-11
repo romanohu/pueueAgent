@@ -244,7 +244,7 @@ impl UpgradeFixture {
 
     #[cfg(unix)]
     fn install_as_symlink(&self) -> PathBuf {
-        let target = self.temp.path().join("bin/target/release/pueue-agent");
+        let target = self.temp.path().join("bin/pueue-agent-previous");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::rename(&self.installed_binary, &target).unwrap();
         symlink(&target, &self.installed_binary).unwrap();

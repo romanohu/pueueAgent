@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub const SOURCE_ROOT_ENV: &str = "PUEUE_AGENT_SOURCE_ROOT";
+const PACKAGE_BINARY_NAME: &str = "pueue-agent";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeOptions {
@@ -610,14 +611,10 @@ where
 
         let install_target = resolve_install_target(&self.options.release_binary)
             .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
-        let binary_name = install_target
-            .file_name()
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| AppError::Message {
-                message: "upgrade release binary path has no file name".to_owned(),
-            })
-            .map_err(|error| UpgradeFailure::with_report(report.clone(), error))?;
-        let built_binary = target_dir.path().join("release").join(binary_name);
+        let built_binary = target_dir
+            .path()
+            .join("release")
+            .join(PACKAGE_BINARY_NAME);
         let install_parent = install_target
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
