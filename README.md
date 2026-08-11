@@ -84,13 +84,13 @@ pueue-agent runs --follow
 
 `pause` は pending event を保持したまま、新しい agent の起動と自動終了を停止します。`resume` で保持していた event を再び処理対象にできます。通常の `disable` は Pueue group の予約を維持します。`--remove` は明示的な登録解除であり、Pueue の status を取得できない場合は実行しません。
 
-`wake` は Pueue にダミー task を投入せず、operator wake event を SQLite に記録して supervisor の次の scheduler loop の処理対象にします。`runs --follow` は新しい agent run と submission の lineage を監視し、Ctrl-C まで追加分を表示します。`--follow` は端末での追跡用で、`--json` を併用すると追加された run ごとに bounded JSON record を出力します。
+`wake` は Pueue にダミー task を投入せず、operator wake event を SQLite に記録して supervisor の次の scheduler loop の処理対象にします。`runs --follow` は新しい agent run と submission の lineage を監視し、Ctrl-C まで追加分を表示します。`--follow` は端末での追跡用で、`--json` を併用すると新しいデータを検出した polling 単位で、複数 run を含み得る bounded JSON report を出力します。
 
 ### 人間向け出力と JSON 出力
 
 既定の人間向け出力は、`pueue-agent status` のような見出し、`key=value` の状態行、最後の `summary:` で構成されます。`status --compact` は daemon、Pueue task 数、experiment 数、agent run、event、guardrail を短く確認するための表示です。`status --json` は同じプロジェクト範囲の機械可読な report で、パイプや自動処理に使えます。JSON 出力には ANSI escape を入れず、上限を超える本文や secret らしい値を展開しません。
 
-`pueue-agent` の human/JSON output は supervisor の投影です。`pueue status --json` の raw Pueue output とは形式も責務も異なり、前者は SQLite の event、incident、submission、agent run と Pueue の最新 snapshot を project scope でまとめ、後者は Pueue daemon が持つ task の生データです。raw Pueue output が必要な低レベル調査では `pueue` を直接使えますが、pueue-agent の accounting や guardrail の確認には supervisor output と `events` / `runs` を使用してください。
+`pueue-agent` の human/JSON output は supervisor の投影です。`pueue status --json` の raw Pueue output とは形式も責務も異なり、前者は SQLite の event、incident、termination、agent run と Pueue の最新 snapshot を project scope でまとめます。`status --json` には submission の一覧を含めず、submission と task の lineage は `runs --json` で確認します。後者は Pueue daemon が持つ task の生データです。raw Pueue output が必要な低レベル調査では `pueue` を直接使えますが、pueue-agent の accounting や guardrail の確認には supervisor output と `events` / `runs` を使用してください。
 
 ### batch submission
 

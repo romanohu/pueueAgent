@@ -174,6 +174,9 @@ fn documentation_contract_covers_current_operator_surface() {
         "冪等",
         "raw Pueue",
         "supervisor",
+        "`status --json` には submission の一覧を含めず",
+        "runs --json",
+        "polling 単位",
     ] {
         assert!(
             readme.contains(required),
