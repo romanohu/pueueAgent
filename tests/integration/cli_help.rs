@@ -31,6 +31,26 @@ fn version_help_describes_json_output() {
 }
 
 #[test]
+fn upgrade_pre_run_errors_include_a_safe_diagnostic_command() {
+    for args in [
+        vec!["upgrade", "--source", "/tmp/nonexistent"],
+        vec!["upgrade", "--source", "/tmp/nonexistent", "--json"],
+    ] {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("next diagnostic: pueue-agent version"));
+        assert!(stderr.len() <= 500);
+    }
+}
+
+#[test]
 fn help_lists_diagnostics_commands_and_status_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()

@@ -479,19 +479,23 @@ mod commands {
 
     pub async fn upgrade(args: UpgradeArgs) -> Result<(), AppError> {
         let json = args.json;
-        let current_exe = env::current_exe().map_err(|source| AppError::Io {
-            operation: "resolve current executable for upgrade",
-            source,
-        })?;
+        let current_exe = env::current_exe()
+            .map_err(|source| AppError::Io {
+                operation: "resolve current executable for upgrade",
+                source,
+            })
+            .map_err(upgrade_diagnostic_error)?;
         let env_source = env::var_os(upgrade::SOURCE_ROOT_ENV).map(PathBuf::from);
         let source = resolve_source_root(
             args.source.as_deref(),
             &current_exe,
             env_source.as_deref(),
-        )?;
+        )
+        .map_err(upgrade_diagnostic_error)?;
         let mut options = upgrade::UpgradeOptions::from_args(args);
         options.source = Some(source);
-        let db = Db::open(&paths::state_db_path()?)?;
+        let state_db = paths::state_db_path().map_err(upgrade_diagnostic_error)?;
+        let db = Db::open(&state_db).map_err(upgrade_diagnostic_error)?;
         let service = ServiceManager;
         let commands = ProcessUpgradeCommandRunner;
         match UpgradeRunner::new(options, &db, &service, &commands).run().await {
@@ -503,13 +507,17 @@ mod commands {
                 if let Some(report) = failure.report() {
                     println!("{}", upgrade::render_failure_report(report, json)?);
                 }
-                Err(AppError::Message {
-                    message: format!(
-                        "{}; next diagnostic: pueue-agent version",
-                        bounded_redacted_text(&failure.to_string())
-                    ),
-                })
+                Err(upgrade_diagnostic_error(failure))
             }
+        }
+    }
+
+    fn upgrade_diagnostic_error(error: impl std::fmt::Display) -> AppError {
+        AppError::Message {
+            message: format!(
+                "{}; next diagnostic: pueue-agent version",
+                bounded_redacted_text(&error.to_string())
+            ),
         }
     }
 
