@@ -126,6 +126,18 @@ impl Harness {
             .unwrap()
     }
 
+    fn observation_observed_at(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT observed_at FROM task_observations WHERE project_id = ?1",
+                ["project-a"],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn integration_event_count(&self) -> i64 {
         self.db
             .connect()
@@ -229,6 +241,19 @@ async fn reconciliation_materializes_a_completion_when_the_callback_was_missed()
     assert_eq!(report.task_finished_events, 1);
     assert_eq!(harness.pending_event_count(EventKind::TaskFinished), 1);
     assert_eq!(harness.observation_count(), 1);
+}
+
+#[tokio::test]
+async fn reconciliation_uses_the_supplied_time_for_observations() {
+    let harness = Harness::new();
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+
+    Reconciler::new(&harness.db, fake)
+        .run_once_at(3_700)
+        .await
+        .unwrap();
+
+    assert_eq!(harness.observation_observed_at(), 3_700);
 }
 
 #[tokio::test]
