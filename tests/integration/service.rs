@@ -12,9 +12,9 @@ use pueue_agent::{
     pueue::{PueueApi, PueueTask},
     service::{
         callback_command, enable_with, install_callback_once, launchd_status_from_output,
-        CallbackRegistry, EnableOptions, LaunchdAgent, PueueConfigCallbackRegistry,
-        ServiceCommandOutput, ServiceCommandRunner, ServiceControl, ServiceDefinition,
-        ServiceManager, ServicePaths, ServicePlatform, ServiceStatus,
+        systemd_status_from_output, CallbackRegistry, EnableOptions, LaunchdAgent,
+        PueueConfigCallbackRegistry, ServiceCommandOutput, ServiceCommandRunner, ServiceControl,
+        ServiceDefinition, ServiceManager, ServicePaths, ServicePlatform, ServiceStatus,
     },
     AppError,
 };
@@ -387,34 +387,54 @@ fn systemd_definition_escapes_quotes_backslashes_and_percent_specifiers() {
 }
 
 #[test]
-fn launchd_health_requires_a_running_state_from_successful_print_output() {
+fn systemd_status_classifies_active_stopped_and_unknown_units() {
     assert_eq!(
-        launchd_status_from_output(true, b"\n  StAtE = RuNnInG\n", ""),
+        systemd_status_from_output(true, b"active\n", ""),
         ServiceStatus::Running
     );
     assert_eq!(
-        launchd_status_from_output(true, b"state = exited\n", ""),
+        systemd_status_from_output(false, b"inactive\n", ""),
         ServiceStatus::Stopped
     );
     assert_eq!(
-        launchd_status_from_output(true, b"pid = 1234\n", ""),
+        systemd_status_from_output(false, b"failed\n", "permission denied\n"),
         ServiceStatus::Stopped
     );
     assert_eq!(
-        launchd_status_from_output(false, b"state = running\n", ""),
+        systemd_status_from_output(false, b"unknown\n", "Unit pueue-agent.service could not be found.\n"),
+        ServiceStatus::NotInstalled
+    );
+}
+
+#[test]
+fn launchd_health_requires_a_running_state_from_successful_print_output() {
+    assert_eq!(
+        launchd_status_from_output(true, b"\n  StAtE = RuNnInG\n", true),
+        ServiceStatus::Running
+    );
+    assert_eq!(
+        launchd_status_from_output(true, b"state = exited\n", true),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        launchd_status_from_output(true, b"pid = 1234\n", true),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        launchd_status_from_output(false, b"state = running\n", true),
         ServiceStatus::Stopped
     );
 }
 
 #[test]
-fn launchd_status_classifies_missing_service_from_bounded_failure_details() {
+fn launchd_status_classifies_unloaded_service_by_plist_presence() {
     assert_eq!(
-        launchd_status_from_output(false, b"", "Could not find service\n"),
-        ServiceStatus::NotInstalled
+        launchd_status_from_output(false, b"", true),
+        ServiceStatus::Stopped
     );
     assert_eq!(
-        launchd_status_from_output(false, b"", "permission denied\n"),
-        ServiceStatus::Stopped
+        launchd_status_from_output(false, b"", false),
+        ServiceStatus::NotInstalled
     );
 }
 

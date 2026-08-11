@@ -589,15 +589,40 @@ fn systemd_status() -> Result<ServiceStatus, AppError> {
             operation: "query systemd user service",
             source,
         })?;
-    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "active" {
-        Ok(ServiceStatus::Running)
-    } else {
-        Ok(ServiceStatus::Stopped)
+    let details = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr));
+    Ok(systemd_status_from_output(
+        output.status.success(),
+        &output.stdout,
+        &details,
+    ))
+}
+
+pub fn systemd_status_from_output(
+    command_succeeded: bool,
+    stdout: &[u8],
+    details: &str,
+) -> ServiceStatus {
+    let state = String::from_utf8_lossy(stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match state.as_str() {
+        "active" if command_succeeded => ServiceStatus::Running,
+        "unknown" => ServiceStatus::NotInstalled,
+        "inactive" | "failed" | "activating" | "deactivating" | "maintenance" => {
+            ServiceStatus::Stopped
+        }
+        _ if systemd_unit_is_not_installed(details) => ServiceStatus::NotInstalled,
+        _ => ServiceStatus::Stopped,
     }
 }
 
 fn launchd_status() -> Result<ServiceStatus, AppError> {
-    let service = launchd_service_target()?;
+    let agent = launchd_agent()?;
+    let service = agent.service_target();
     let output = Command::new("launchctl")
         .args(["print", service.as_str()])
         .output()
@@ -605,24 +630,24 @@ fn launchd_status() -> Result<ServiceStatus, AppError> {
             operation: "query launchd user service",
             source,
         })?;
-    let details = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr));
+    let plist_exists = agent.plist.exists();
     Ok(launchd_status_from_output(
         output.status.success(),
         &output.stdout,
-        &details,
+        plist_exists,
     ))
 }
 
 pub fn launchd_status_from_output(
     command_succeeded: bool,
     stdout: &[u8],
-    details: &str,
+    plist_exists: bool,
 ) -> ServiceStatus {
     if !command_succeeded {
-        return if launchd_service_is_not_loaded(details) {
-            ServiceStatus::NotInstalled
-        } else {
+        return if plist_exists {
             ServiceStatus::Stopped
+        } else {
+            ServiceStatus::NotInstalled
         };
     }
 
@@ -647,10 +672,6 @@ fn launchd_agent() -> Result<LaunchdAgent, AppError> {
     Ok(LaunchdAgent::new(launchd_gui_domain()?, plist))
 }
 
-fn launchd_service_target() -> Result<String, AppError> {
-    Ok(format!("{}/com.pueue-agent", launchd_gui_domain()?))
-}
-
 fn required_launchd_agent(agent: Option<&LaunchdAgent>) -> Result<&LaunchdAgent, AppError> {
     agent.ok_or(AppError::Configuration {
         field: "launchd agent",
@@ -659,6 +680,13 @@ fn required_launchd_agent(agent: Option<&LaunchdAgent>) -> Result<&LaunchdAgent,
 
 fn launchd_service_is_not_loaded(details: &str) -> bool {
     details.to_lowercase().contains("could not find service")
+}
+
+fn systemd_unit_is_not_installed(details: &str) -> bool {
+    let details = details.to_ascii_lowercase();
+    details.contains("could not be found")
+        || details.contains("not-found")
+        || details.contains("not loaded")
 }
 
 fn run_lifecycle_command(
