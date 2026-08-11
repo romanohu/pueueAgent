@@ -415,10 +415,29 @@ fn launchd_status() -> Result<ServiceStatus, AppError> {
             operation: "query launchd user service",
             source,
         })?;
-    if output.status.success() {
-        Ok(ServiceStatus::Running)
+    Ok(launchd_status_from_output(
+        output.status.success(),
+        &output.stdout,
+    ))
+}
+
+pub fn launchd_status_from_output(command_succeeded: bool, stdout: &[u8]) -> ServiceStatus {
+    if !command_succeeded {
+        return ServiceStatus::Stopped;
+    }
+
+    let running = String::from_utf8_lossy(stdout).lines().any(|line| {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("state")
+            && value.trim().eq_ignore_ascii_case("running")
+    });
+
+    if running {
+        ServiceStatus::Running
     } else {
-        Ok(ServiceStatus::Stopped)
+        ServiceStatus::Stopped
     }
 }
 
@@ -642,4 +661,73 @@ fn release_binary_path() -> Result<PathBuf, AppError> {
         return Ok(path);
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Mutex, OnceLock},
+    };
+    use tempfile::TempDir;
+
+    fn launchctl_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn run_launchd_status_with_output(output: &str, exit_code: i32) -> ServiceStatus {
+        let _guard = launchctl_test_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let launchctl = temp.path().join("launchctl");
+        fs::write(
+            &launchctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {}\n",
+                output.replace('\\', "\\\\").replace('\'', "'\\''"),
+                exit_code
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&launchctl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launchctl, permissions).unwrap();
+
+        let original_path = env::var_os("PATH").unwrap_or_default();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            original_path.to_string_lossy()
+        );
+        env::set_var("PATH", path);
+        let status = launchd_status().unwrap();
+        env::set_var("PATH", original_path);
+        status
+    }
+
+    #[test]
+    fn launchd_status_does_not_treat_loaded_exited_job_as_running() {
+        assert_eq!(
+            run_launchd_status_with_output("state = exited", 0),
+            ServiceStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn launchd_status_accepts_indented_mixed_case_running_state() {
+        assert_eq!(
+            run_launchd_status_with_output("\n  StAtE = RuNnInG\n", 0),
+            ServiceStatus::Running
+        );
+    }
+
+    #[test]
+    fn launchd_status_rejects_loaded_job_without_state() {
+        assert_eq!(
+            run_launchd_status_with_output("pid = 1234", 0),
+            ServiceStatus::Stopped
+        );
+    }
 }
