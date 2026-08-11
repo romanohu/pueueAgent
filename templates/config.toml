@@ -21,7 +21,10 @@ mode = "fresh" # fresh | resume | resume_latest
 
 [check]
 interval_minutes = 10
+# legacy の互換設定。Periodic DeepCheck は deep_check_interval_minutes だけで有効化し、
+# この値だけでは agent を起動しない。
 deep_check_every = 6
+# 0 は Periodic DeepCheck を無効化する（正の分数を指定した場合だけ opt in）。
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 65536

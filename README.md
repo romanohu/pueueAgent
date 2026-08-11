@@ -185,6 +185,8 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 | `agent.max_retries` | 起動に失敗した場合の retry 上限。 |
 | `agent.context.mode` | `fresh`、`resume`、`resume_latest` のいずれか。既定値は `fresh`。 |
 | `check.interval_minutes` | supervisor が reconciliation を行う間隔。 |
+| `check.deep_check_every` | legacy の互換設定。`deep_check_interval_minutes` が `0` のままでは agent DeepCheck を有効にしない。 |
+| `check.deep_check_interval_minutes` | agent DeepCheck の間隔（分）。既定値の `0` は無効で、正の値を明示した場合だけ opt in する。 |
 | `check.log_tail_bytes` | 各ログから読み取る末尾の最大 byte 数。 |
 | `check.extra_log_paths` | 追加で検査する、プロジェクトからの相対パスのログ。 |
 | `check.patterns` | 名前付き regex、確認回数、`notify` / `wake` / `kill` action。 |
@@ -194,6 +196,14 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 未知のキーや不正な範囲の値は無視せず、エラーとして拒否します。
 
 `guardrails.max_experiments` は `kind = experiment` の submission だけを数えます。control submission は制御・準備用の履歴として残りますが、この実験 budget からは除外されます。機械的な判断を `STATE.md` の自由文へ移さず、canonical `.pueue-agent/state.json` の `budgets` と現在の設定を確認してください。
+
+### Periodic DeepCheck
+
+`check.interval_minutes` の reconciliation は、Pueue の status を再照合し、callback の取りこぼしを復旧して、範囲を制限した detector を実行する supervisor の機械的な処理です。正常な reconciliation は agent を起動しないため、agent のトークンを消費しません。
+
+agent DeepCheck は別の opt-in 機能です。`check.deep_check_interval_minutes` に正の分数を設定したときだけ、長時間実行中の実験について agent を起動し、metric と artifact から進行の健全性を確認します。この run は agent のトークンを消費します。`deep_check_every` は legacy の互換設定であり、`deep_check_interval_minutes = 0` のまま agent run を有効にすることはありません。
+
+periodic DeepCheck は task ごとではなく project ごとに coalesce します。同じ project に pending、claimed、または retry 待ちの periodic DeepCheck がある間は、長時間 task が複数あっても新しい periodic DeepCheck を追加しません。正常な進行を `STATE.md` に短い health record として残し、確認できない metric、値、進捗を記録しません。`STATE.md` は補足ノートなので、canonical `state.json` の budget や lineage を上書きしません。
 
 ### Codex の会話コンテキストを明示的に継続する
 
