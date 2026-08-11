@@ -46,18 +46,17 @@ pub async fn cancel_task_with(
     }
 
     let signature = task_signature(task);
-    let target_identity = cancellation_identity_for_task(task);
+    let Some(target_identity) = cancellation_identity_for_task(task) else {
+        return Err(AppError::Runtime {
+            operation: "validate task cancellation identity",
+        });
+    };
     let observed = TaskObservationRepository::new(db).find_by_pueue_task(
         &project.project_id,
         task_id,
         100,
     )?;
     if !observed.is_empty() {
-        let Some(target_identity) = target_identity.as_deref() else {
-            return Err(AppError::Runtime {
-                operation: "revalidate task cancellation timestamp",
-            });
-        };
         if !observed
             .iter()
             .filter_map(observation_cancellation_identity)
@@ -101,7 +100,7 @@ pub async fn cancel_task_with(
     let final_observed_state = final_status
         .as_ref()
         .ok()
-        .and_then(|tasks| final_state_for(tasks, target_identity.as_deref()));
+        .and_then(|tasks| final_state_for(tasks, Some(&target_identity)));
     let result_reason = match (&action_result, &final_status) {
         (Ok(()), Ok(_)) => "operator cancellation result observed".to_owned(),
         (Err(error), Ok(_)) => format!("Pueue {action} failed: {error}"),

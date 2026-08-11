@@ -562,6 +562,28 @@ async fn cancel_refuses_task_id_reuse_when_current_and_historical_enqueued_at_ar
 }
 
 #[tokio::test]
+async fn cancel_refuses_a_task_without_enqueued_at_even_without_history() {
+    for state in ["Queued", "Running"] {
+        let harness = CancelHarness::with_tasks(vec![PueueTask {
+            id: 41,
+            group: "pa-project".to_owned(),
+            command: "python train.py".to_owned(),
+            state: state.to_owned(),
+            enqueued_at: None,
+            started_at: Some("101".to_owned()),
+            ended_at: None,
+            result: None,
+        }]);
+
+        assert!(harness.cancel(41).await.is_err());
+        assert!(harness.pueue.kill_calls().is_empty());
+        assert!(harness.pueue.remove_calls().is_empty());
+        assert_eq!(harness.pueue.status_calls(), 1);
+        assert!(!harness.operator_log_contains("cancel"));
+    }
+}
+
+#[tokio::test]
 async fn cancel_allows_a_state_transition_with_the_same_stable_task_identity() {
     let running_task = cancel_task(41, "pa-project", "Running", "100");
     let harness = CancelHarness::with_tasks(vec![running_task]);
