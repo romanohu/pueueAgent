@@ -157,7 +157,7 @@ run=30  event=17  crash       DONE   submitted task=42
 - [x] **Step 1: failing documentation contract test を書く。** README に `status --compact`、`wake`、`runs --follow`、`submit-batch`、`--kind control`、`state.json` が記載されていることを検証する。
 - [x] **Step 2: RED を確認する。** `cargo test --test cli_help documentation_contract` で、README に `pueue-agent status --compact` がないため失敗することを確認した。
 - [x] **Step 3: README/templates を更新する。** command syntax、human/JSON output、control/experiment count、batch idempotency、canonical state、raw Pueue と supervisor output の違いを日本語で記載する。
-- [x] **Step 4: 全検証を実行する。** Rust test 326件、Bats 3件、ShellCheck、targeted rustfmt、diff-check は成功。`cargo fmt --check` は既知の Task1 差分のみ、clippy は既存コード3件で失敗した。
+- [x] **Step 4: 全検証を実行する。** Rust test 326件、clippy `-D warnings`、Bats 3件、ShellCheck、targeted rustfmt、diff-check は成功。`cargo fmt --check` は既知の Task1 差分のみ。
 
 ```bash
 PATH=/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin cargo fmt --check
