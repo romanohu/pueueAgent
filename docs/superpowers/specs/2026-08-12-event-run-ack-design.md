@@ -2,11 +2,11 @@
 
 日付: 2026-08-12
 
-ステータス: 設計承認待ち
+ステータス: 設計承認済み
 
 ## 目的
 
-agent の spawn が成功したことを event の完了と誤認しない。event を一つの project に閉じた agent run に永続的に結び付け、process の終了とその結果の SQLite 更新まで成功したときだけ `completed` にする。agent の非ゼロ終了、timeout、daemon restart interruption はイベント単位で bounded exponential backoff の retry に戻し、attempt 上限を超えたものは通常の `failed` と区別できる dead-letter として SQLite に残す。
+agent の spawn が成功したことを event の完了と誤認しない。event を一つの project に閉じた agent run に永続的に結び付け、process の終了とその結果の SQLite 更新まで成功したときだけ `completed` にする。agent の非ゼロ終了と timeout はイベント単位で bounded exponential backoff の retry に戻す。daemon restart interruption は、実行された可能性がある gate marker/released/dispatched run を副作用不明として自動 retry せず dead-letter にし、pre-marker の `in_flight` だけを retry policy に従って再試行する。
 
 この slice の ack は goal の意味判定や実験結果の成功判定ではない。agent process がイベント処理を実行し、結果を永続化できたかという実行 ack だけを表す。
 
@@ -101,7 +101,7 @@ pending/retry_wait
 
 `AgentRunRepository::insert_with_events_and_reservation` は既存の run INSERT、`agent_run_events` INSERT、intervention reservation の binding に加え、全 event が同じ project の `claimed` であることを確認して `claimed → in_flight` を同一 `TransactionBehavior::Immediate` transaction で行う。run は `starting`、launch gate は `pending` のまま commit する。event lease はこの時点で NULL にする。event だけが claimed のまま、または run だけが作られる中間状態を commit しない。
 
-この transaction より前（claim 後、run INSERT 前）に daemon が落ちた場合は、startup recovery が run binding のない `claimed` row を同じ project の retry policy で解決する。これにより lease expiry を待たずに再実行できる。
+この transaction より前（claim 後、run INSERT 前）に daemon が落ちても、startup recovery は run binding のない未期限切れ `claimed` row を触らない。`EventRepository::recover_expired_claims` が通常の lease expiry 後に `claimed → pending` とし、claim で増えた `attempts` を 1 減らす。agent は実行されていないため、binding 前の crash は retry 回数を消費しない。期限切れ前の row は lease が再取得されないよう claim query が除外する。
 
 ### launch gate（第二段階）
 
@@ -112,22 +112,45 @@ pending/retry_wait
 3. `mark_running_and_apply_interventions` transaction で PID、run=`running`、intervention=`applied` を commit。
 4. `mark_gate_release_requested` を commit。
 5. stdin に release byte を送り、gate shell が child spawn 後に一時 marker を作って atomic rename し、`released\n` を返すまで待つ。
-6. `AgentRunRepository::acknowledge_dispatch(project_id, run_id)` を一つの transaction で実行し、`launch_gate_state='released'` と linked events の `in_flight → dispatched` を同時に commit。
+6. `AgentRunRepository::acknowledge_dispatch(project_id, run_id)` を一つの transaction で実行し、`launch_gate_state='released'` と linked events の `in_flight → dispatched` を同時に commit。ここで DB failure が起きたら child を terminate し、marker 後の post-marker finalizer を呼ぶ。post-marker finalizer は副作用不明として attempts に関係なく全 linked event を `dead_letter` にし、run を `failed` にし、`Applied` intervention を保持する。
 7. その後だけ `AgentHandle` を scheduler に返す。
 
-既存 marker は「child spawn と gate shell の marker commit まで進んだ」証拠であり、process の正常終了や event completed の証拠ではない。marker の ack を受けた後に SQLite 更新が失敗した場合も event は completed にしない。
+既存 marker は「child spawn と gate shell の marker commit まで進んだ」証拠であり、process の正常終了や event completed の証拠ではない。marker の ack を受けた後に SQLite 更新が失敗した場合も event は completed にしない。marker の有無を確認した post-marker finalizer が DB failure になった場合は unresolved run/event を残し、Scheduler は二重に release/transition せず、次の poll または startup recovery が同じ stage contract で再試行する。
 
 ### process 終了（最終 ack）
 
-`AgentHandle` は `project_id`、`run_id`、`retry_policy`、timeout deadline、child、PID、および最初に観測した terminal outcome を保持する。`poll`、`wait`、`timeout_now` は child の outcome を `AgentRunRepository::finish_and_resolve_events` に渡す。同関数は project と run の所有関係、linked event の project、event status（`in_flight`/`dispatched`）を検証し、以下を一つの immediate transaction で行う。
+`AgentHandle` は `project_id`、`run_id`、`retry_policy`、timeout deadline、child、PID、および最初に観測した terminal outcome を保持する。`poll(&mut self, ...)`、`wait(&mut self, ...)`、`timeout_now(&mut self, ...)` は child の outcome を `AgentRunRepository::finish_and_resolve_events` に渡す。`wait` は handle を consume しない。最初の child outcome と finalizer error を handle に保持し、DB finalizer が失敗しても同じ handle で `poll`/`wait`/`timeout_now` を再度呼べる。同関数は project と run の所有関係、linked event の project、event status（`in_flight`/`dispatched`）を検証し、以下を一つの immediate transaction で行う。
 
 - `Completed`/exit code 0: run を `completed`、全 linked event を `completed`、`completed_at=now`、lease NULL。
-- `Failed`/non-zero または `TimedOut`: run を終端化し、intervention reservation を release し、各 event の `attempts` を個別に policy 判定して `retry_wait` または `dead_letter` にする。
-- dead-letter になった event の `last_error` には bounded な terminal reason と attempt number を保存する。外部通知は送らない。
+- `Failed`/non-zero または `TimedOut`: run を終端化し、`Reserved` intervention だけを `pending` に戻し、既に `Applied` の intervention は監査履歴として保持し、各 event の `attempts` を個別に policy 判定して `retry_wait` または `dead_letter` にする。
+- dead-letter/retry になった event の `last_error` は repository 境界で `bounded_redacted_text` を通し、terminal reason、attempt number、必要なら `restart_interruption`/`post_marker_dispatch_ack` stage を byte bounded に保存する。secret-like text と ANSI/control text は保存前に redacted する。外部通知は送らない。
 
 process の outcome を観測した後にこの transaction が SQLite error で失敗したら、transaction 全体を rollback し、run/event は `in_flight`/`dispatched` のまま残す。`AgentHandle` は terminal outcome を保持して次の `poll` で同じ finalizer を再試行する。daemon は DB 更新成功を確認するまで handle を active list から削除しない。
 
-`fail_before_gate_release`（log open、spawn、PID/start transaction、gate ack の失敗）は同じ event resolver を使うが、run は `failed`、event は policy に従い retry_wait/dead_letter にする。`UpgradeInProgress` だけは既存どおり `defer_claimed` で attempts を消費せず pending に戻す。
+`fail_before_gate_release`（marker 無しの log open、spawn、PID/start transaction、gate ack の失敗）は run を `failed` にし、`Reserved` と `Applied` intervention を `pending` に戻し、event は policy に従い retry_wait/dead_letter にする。marker 後の DB failure はこの経路を使わず post-marker finalizer を使う。`UpgradeInProgress` だけは既存どおり `defer_claimed` で attempts を消費せず pending に戻す。
+
+### restart 時の副作用不明境界
+
+startup recovery は run の launch evidence を先に分類する。gate marker が存在する、`launch_gate_state='released'` である、または linked event が `dispatched` である run は child が実行された可能性があるため、自動 retry を禁止し、attempts に関係なく全 linked event を `dead_letter` にする。run は `failed`、reason は `restart_interruption: execution outcome unknown` とする。PID は再利用競合があるため、この slice の recovery は persisted PID を自動 kill しない。
+
+marker が無く、gate state が `pending` または `release_requested` の run に linked する `in_flight` event だけは、agent process が実行された証拠がないため通常の `RetryPolicy` を適用する。marker 無しの recovery は `fail_before_gate_release` と同じく `Reserved`/`Applied` intervention を pending に戻す。marker/released/dispatched の post-marker recovery は `Applied` intervention を保持し、`Reserved` だけを pending に戻す。この分類は run 単位で一つの transaction に適用し、同じ run の一部 event だけを retry して副作用を重ねない。
+
+`AgentRunner` が run-bound failure を解決した場合、Scheduler は event transition、lease release、intervention release を行わない。stage contract は次の型で表す。
+
+```rust
+pub enum AgentSpawnStage {
+    PreBinding,
+    RunBoundPreMarker { run_id: i64, resolved: bool },
+    PostMarker { run_id: i64, resolved: bool },
+}
+
+pub struct AgentSpawnError {
+    pub stage: AgentSpawnStage,
+    pub source: AppError,
+}
+```
+
+`PreBinding` のみ Scheduler が `resolve_claimed_without_run` を呼ぶ。`RunBoundPreMarker` は AgentRunner が `fail_before_gate_release` を呼び、`PostMarker` は child terminate 後に post-marker finalizer を呼ぶ。`resolved=false` は recovery に残ったことを示すだけで、Scheduler が補償 mutation を重ねてはならない。
 
 ## grouped events
 
@@ -137,19 +160,19 @@ retry された event だけが次の claim に入り、dead-letter event は再
 
 ## daemon startup recovery
 
-backoff/dead-letter 判定には project の `agent.max_retries` が必要なので、repository に config path を読ませない。`Daemon::run_once` が startup recovery の最初に `ProjectRepository::list_all()` で全 project の config を読み、`BTreeMap<ProjectId, RetryPolicy>` を構築して `AgentRunRepository::recover_interrupted(now, reason, &policies)` に渡す。disabled/paused project の run も対象になるため `list_active` ではなく全 project を使う。
+backoff/dead-letter 判定には project の `agent.max_retries` が必要なので、repository に config path を読ませない。`Daemon::run_once` が startup recovery の最初に `ProjectRepository::list_all()` で全 project の config を読み、`project_id` と `pueue_group` が DB の `Project` と一致することを検証してから `BTreeMap<ProjectId, RetryPolicy>` を構築し、`AgentRunRepository::recover_interrupted(now, reason, &policies)` に渡す。disabled/paused project の run も対象になるため `list_active` ではなく全 project を使う。
 
-config のどれかが missing/invalid の場合、daemon は recovery transaction を開始せず error を返し、`startup_recovery_pending` を true のままにする。次の tick で再試行し、設定が読めるまで run/event を部分的に mutate しない。この責務分離により repository は project-scoped policy を受け取るだけで、古い config を推測して dead-letter することがない。
+config のどれかが missing/invalid、または DB Project identity と不一致の場合、daemon は全 policy 解決を失敗させ、recovery transaction を一つも開始せず error を返す。`startup_recovery_pending` は true のままにする。次の tick で再試行し、全 project の設定と identity が検証できるまで run/event を部分的に mutate しない。この責務分離により repository は project-scoped policy を受け取るだけで、古い config を推測して dead-letter することがない。
 
 recovery は project ごとの immediate transaction とする。各 project について次を同時に行う。
 
-- `release_requested` run の marker を read-only に調べ、marker があれば gate state を released に補正する。
+- `release_requested` run の marker を read-only に調べる。marker があれば post-marker と分類し、gate state の補正後に副作用不明 dead-letter 解決を行う。
 - `starting`/`running` の run を restart interruption reason 付き `failed` にする。
-- active run に linked な `in_flight`/`dispatched` event を retry_wait/dead_letter に解決する。
-- run binding 前の `claimed` event（`agent_run_events` がないもの）も同じように解決する。
-- intervention reservation を既存 recovery 規則で applied または pending に戻す。
+- marker/released/dispatched の run に linked な全 event を attempts に関係なく `dead_letter` に解決する。marker 無し pending/release_requested run の `in_flight` event だけを retry policy で retry_wait/dead_letter にする。
+- run binding 前の未期限切れ `claimed` event（`agent_run_events` がないもの）は触らない。`recover_expired_claims` が lease expiry 後に pending へ戻し attempts を 1 減らす。
+- pre-marker run の intervention は `Reserved`/`Applied` を pending に戻し、post-marker run の `Applied` は保持して `Reserved` だけを pending に戻す。
 
-marker が確認できても process が正常終了したとは扱わない。startup recovery は常に interruption failure として retry policy を適用する。recovery transaction が失敗した project はその project の rows を変更せず error を返し、次回 tick で再試行する。
+marker が確認できても process が正常終了したとは扱わない。marker/released/dispatched の recovery は retry policy を適用せず、必ず dead-letter にする。PID の自動 kill は行わない。recovery transaction が失敗した project はその project の rows を変更せず error を返し、次回 tick で再試行する。
 
 ## local observability
 
@@ -158,18 +181,20 @@ marker が確認できても process が正常終了したとは扱わない。s
 - `events`: 既存 `--status` filter が `in-flight`、`dispatched`、`dead-letter` を受け入れる（SQLite の DB 値はそれぞれ `in_flight`、`dispatched`、`dead_letter`）。human/JSON の bounded event summary に status、attempts、`not_before`、error、project-scoped な latest `run_id` を表示する。payload や transcript は表示しない。
 - `runs`: 既存の event/run lineage に event status と run status を表示する。新しい top-level lineage source は追加しない。retry は複数 run として見える。
 - `status`: human、compact、JSON の event counts に `in_flight`、`dispatched`、`retry_wait`、`dead_letter` を追加する。既存 `failed` count はそのまま別表示する。
-- `doctor`: read-only check `events.dead_letter`（件数 0 なら ok、1 以上なら warning と `events --status dead-letter` の remediation）と `events.ack_consistency`（in_flight/dispatched に同じ project の run link がない場合 error）を追加する。doctor は repair/retry/外部通知を実行しない。
+- `doctor`: read-only check `events.dead_letter`（件数 0 なら ok、1 以上なら warning と `events --status dead-letter` の remediation）、`events.ack_consistency`（in_flight/dispatched に同じ project の run link がない場合 error）、`events.restart_uncertain`（restart interruption reason の dead-letter 件数と stage を bounded に表示）を追加する。doctor は repair/retry/外部通知を実行しない。
 
 bounded summary は既存 `bounded_redacted_text` を通し、event payload、prompt、log contents、credential-like text は追加で返さない。schema JSON version は既存の 1 を維持し、追加 fields は既存の optional/enum-compatible projection として扱う。
 
 ## 受け入れ条件
 
 - spawn 成功直後の event が `completed` ではなく `dispatched` であり、process の正常終了と final transaction 後だけ `completed` になる。
-- process non-zero、timeout、daemon restart interruption が event 単位で retry_wait になり、`max_retries=0` の最初の failure は dead_letter になる。
+- process non-zero、timeout、pre-marker daemon restart interruption が event 単位で retry_wait/dead_letter になり、`max_retries=0` の最初の failure は dead_letter になる。marker/released/dispatched の restart interruption は attempts に関係なく dead_letter になる。
 - retry delay が attempts に対して bounded exponential であり、not_before 前には claim されない。
 - 同じ project の grouped events が attempts の違いにより一部 retry、一部 dead-letter になれる。
 - launch gate の spawn 前、marker 後、SQLite ack 前、process exit 後の crash window が recovery 可能である。
-- startup recovery は全 project config を policy map に解決できない限り mutation を始めず、project transaction を跨いで別 project の event/run を参照しない。
+- startup recovery は全 project config と `project_id`/`pueue_group` identity を policy map に解決できない限り mutation を始めず、未期限切れ unbound claimed は触らず lease expiry 後に attempts を戻す。
+- marker/released/dispatched restart interruption は PID kill や自動 retry をせず dead-letter にし、pre-marker in_flight だけが retry policy 対象になる。
+- `AgentHandle::wait` は `&mut self` で terminal outcome/finalizer error を保持し、daemon shutdown drain は finalizer 成功まで handle を active collection から削除しない。
 - `events`、`runs`、`status`、`doctor` だけで dead-letter と ack 状態を bounded に確認できる。
 - 外部 Slack/webhook、batch lineage、budget、goal state、token accounting の変更がない。
 - `cargo fmt --all -- --check`、`cargo test --all-targets`、`git diff --check` が成功する。
