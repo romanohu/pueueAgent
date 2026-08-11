@@ -1387,18 +1387,18 @@ fn task_inspection_bounds_agent_runs_before_accumulating_per_event_history() {
         ))
         .unwrap();
     for run_number in 0..65 {
+        let run = AgentRunRepository::new(&harness.db)
+            .insert(&NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                None,
+                AgentRunStatus::Completed,
+                200 + run_number,
+                format!("/tmp/bounded-agent-history-{run_number}.log"),
+            ))
+            .unwrap();
         AgentRunRepository::new(&harness.db)
-            .insert_with_events(
-                &NewAgentRun::new(
-                    "project-a",
-                    event.event_id,
-                    None,
-                    AgentRunStatus::Completed,
-                    200 + run_number,
-                    format!("/tmp/bounded-agent-history-{run_number}.log"),
-                ),
-                &[event.event_id],
-            )
+            .attach_event(run.run_id, event.event_id)
             .unwrap();
     }
 

@@ -83,6 +83,29 @@ fn insert_event(db: &Db, project_id: &str, dedup_key: &str, not_before: i64) -> 
         .event_id
 }
 
+fn bind_starting_run(test: &TestDatabase, dedup_key: &str) -> (i64, i64) {
+    let root = test.project_root(dedup_key);
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", dedup_key, 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                format!("/tmp/{dedup_key}.log"),
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    (run.run_id, event_id)
+}
+
 fn create_legacy_schema_without_active_agent_index(path: &Path, version: i64) {
     let connection = Connection::open(path).unwrap();
     connection
@@ -2468,7 +2491,7 @@ fn pre_release_gate_failure_requeues_applied_interventions() {
         .unwrap();
 
     runs
-        .fail_before_gate_release(
+        .fail_before_gate_release_with_policy(
             "project-a",
             run.run_id,
             140,
@@ -3181,6 +3204,406 @@ fn resolve_claimed_without_run_applies_retry_policy_in_a_real_transaction() {
 }
 
 #[test]
+fn resolve_claimed_without_run_rejects_a_claim_linked_to_a_run() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "linked-claim-resolution", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            110,
+            "/tmp/linked-claim-resolution.log",
+        ))
+        .unwrap();
+    AgentRunRepository::new(&test.db)
+        .attach_event(run.run_id, event_id)
+        .unwrap();
+
+    let error = EventRepository::new(&test.db)
+        .resolve_claimed_without_run(
+            "project-a",
+            &[event_id],
+            300,
+            "binding crash",
+            RetryPolicy { max_retries: 2 },
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let state: (EventStatus, i64, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, attempts, lease_until FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (EventStatus::Claimed, 1, Some(200)));
+}
+
+#[test]
+fn recover_expired_claims_leaves_an_expired_claim_linked_to_a_run_untouched() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "linked-expired-claim", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 110, 1)
+        .unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            110,
+            "/tmp/linked-expired-claim.log",
+        ))
+        .unwrap();
+    AgentRunRepository::new(&test.db)
+        .attach_event(run.run_id, event_id)
+        .unwrap();
+
+    assert_eq!(EventRepository::new(&test.db).recover_expired_claims(111).unwrap(), 0);
+    let state: (EventStatus, i64, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, attempts, lease_until FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (EventStatus::Claimed, 1, Some(110)));
+}
+
+#[test]
+fn resolve_claimed_without_run_rejects_duplicate_event_ids_atomically() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "duplicate-claim-resolution", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let error = EventRepository::new(&test.db)
+        .resolve_claimed_without_run(
+            "project-a",
+            &[event_id, event_id],
+            300,
+            "duplicate event id",
+            RetryPolicy { max_retries: 2 },
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let state: (EventStatus, i64, Option<i64>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, attempts, lease_until FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (EventStatus::Claimed, 1, Some(200)));
+}
+
+#[test]
+fn resolve_claimed_without_run_rejects_missing_event_without_resolving_prior_rows() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "missing-claim-resolution", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let error = EventRepository::new(&test.db)
+        .resolve_claimed_without_run(
+            "project-a",
+            &[event_id, 999_999],
+            300,
+            "missing event",
+            RetryPolicy { max_retries: 2 },
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let status: EventStatus = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, EventStatus::Claimed);
+}
+
+#[test]
+fn resolve_claimed_without_run_rejects_a_non_claimed_event() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "pending-claim-resolution", 100);
+    let error = EventRepository::new(&test.db)
+        .resolve_claimed_without_run(
+            "project-a",
+            &[event_id],
+            300,
+            "wrong state",
+            RetryPolicy { max_retries: 2 },
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let status: EventStatus = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, EventStatus::Pending);
+}
+
+#[test]
+fn generic_finalizer_requires_released_gate_and_dispatched_events() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "generic-phase-guard");
+    let runs = AgentRunRepository::new(&test.db);
+    let error = runs
+        .finish_and_resolve_events(
+            "project-a",
+            run_id,
+            AgentRunStatus::Failed,
+            300,
+            Some(1),
+            Some("wrong phase"),
+            EventResolution::RetryPolicy(RetryPolicy { max_retries: 0 }),
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET launch_gate_state = 'release_requested'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dispatched' WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    let error = runs
+        .finish_and_resolve_events(
+            "project-a",
+            run_id,
+            AgentRunStatus::Failed,
+            300,
+            Some(1),
+            Some("wrong phase"),
+            EventResolution::RetryPolicy(RetryPolicy { max_retries: 0 }),
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let state: (AgentRunStatus, EventStatus, String) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, events.status, agent_runs.launch_gate_state
+             FROM agent_runs JOIN agent_run_events
+               ON agent_run_events.project_id = agent_runs.project_id
+              AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events
+               ON events.project_id = agent_run_events.project_id
+              AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched, "release_requested".to_owned()));
+}
+
+#[test]
+fn marker_failure_finalizer_requires_release_requested_gate_and_inflight_events() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "marker-phase-guard");
+    let runs = AgentRunRepository::new(&test.db);
+    let error = runs
+        .finish_after_marker_failure("project-a", run_id, 300, "marker failure")
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET launch_gate_state = 'release_requested'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dispatched' WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    let error = runs
+        .finish_after_marker_failure("project-a", run_id, 300, "marker failure")
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let state: (AgentRunStatus, EventStatus, String) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, events.status, agent_runs.launch_gate_state
+             FROM agent_runs JOIN agent_run_events
+               ON agent_run_events.project_id = agent_runs.project_id
+              AND agent_runs.run_id = agent_run_events.run_id
+             JOIN events
+               ON events.project_id = agent_run_events.project_id
+              AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched, "release_requested".to_owned()));
+}
+
+#[test]
+fn pre_release_policy_finalizer_requires_inflight_events() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "pre-release-phase-guard");
+    let runs = AgentRunRepository::new(&test.db);
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET launch_gate_state = 'release_requested'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dispatched' WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    let error = runs
+        .fail_before_gate_release_with_policy(
+            "project-a",
+            run_id,
+            300,
+            "pre-release phase mismatch",
+            RetryPolicy { max_retries: 0 },
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let state: (AgentRunStatus, EventStatus, String) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, events.status, agent_runs.launch_gate_state
+             FROM agent_runs JOIN agent_run_events
+               ON agent_run_events.project_id = agent_runs.project_id
+              AND agent_runs.run_id = agent_run_events.run_id
+             JOIN events
+               ON events.project_id = agent_run_events.project_id
+              AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched, "release_requested".to_owned()));
+}
+
+#[test]
+fn finalizer_rejects_non_terminal_target_status_without_mutation() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "terminal-status-guard");
+    let runs = AgentRunRepository::new(&test.db);
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dispatched' WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    let error = runs
+        .finish_and_resolve_events(
+            "project-a",
+            run_id,
+            AgentRunStatus::Starting,
+            300,
+            None,
+            Some("invalid terminal target"),
+            EventResolution::RetryPolicy(RetryPolicy { max_retries: 0 }),
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { .. }));
+    let state: (AgentRunStatus, EventStatus) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, events.status
+             FROM agent_runs JOIN agent_run_events
+               ON agent_run_events.project_id = agent_runs.project_id
+              AND agent_runs.run_id = agent_run_events.run_id
+             JOIN events
+               ON events.project_id = agent_run_events.project_id
+              AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched));
+}
+
+#[test]
 fn agent_run_binding_moves_claimed_events_to_in_flight_atomically() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
@@ -3725,6 +4148,23 @@ fn post_marker_finalizer_dead_letters_without_consuming_attempts() {
     runs.mark_gate_release_requested("project-a", run.run_id)
         .unwrap();
     runs.acknowledge_dispatch("project-a", run.run_id).unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET launch_gate_state = 'release_requested'
+             WHERE run_id = ?1",
+            [run.run_id],
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'in_flight' WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
 
     runs.finish_after_marker_failure("project-a", run.run_id, 200, "post_marker_dispatch_ack")
         .unwrap();
