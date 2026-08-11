@@ -389,19 +389,31 @@ fn systemd_definition_escapes_quotes_backslashes_and_percent_specifiers() {
 #[test]
 fn launchd_health_requires_a_running_state_from_successful_print_output() {
     assert_eq!(
-        launchd_status_from_output(true, b"\n  StAtE = RuNnInG\n"),
+        launchd_status_from_output(true, b"\n  StAtE = RuNnInG\n", ""),
         ServiceStatus::Running
     );
     assert_eq!(
-        launchd_status_from_output(true, b"state = exited\n"),
+        launchd_status_from_output(true, b"state = exited\n", ""),
         ServiceStatus::Stopped
     );
     assert_eq!(
-        launchd_status_from_output(true, b"pid = 1234\n"),
+        launchd_status_from_output(true, b"pid = 1234\n", ""),
         ServiceStatus::Stopped
     );
     assert_eq!(
-        launchd_status_from_output(false, b"state = running\n"),
+        launchd_status_from_output(false, b"state = running\n", ""),
+        ServiceStatus::Stopped
+    );
+}
+
+#[test]
+fn launchd_status_classifies_missing_service_from_bounded_failure_details() {
+    assert_eq!(
+        launchd_status_from_output(false, b"", "Could not find service\n"),
+        ServiceStatus::NotInstalled
+    );
+    assert_eq!(
+        launchd_status_from_output(false, b"", "permission denied\n"),
         ServiceStatus::Stopped
     );
 }

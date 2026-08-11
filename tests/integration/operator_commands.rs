@@ -130,7 +130,7 @@ fn service_lifecycle_commands_report_only_verified_service_state() {
 
     write_service_shim(
         &launchctl,
-        "#!/bin/sh\nif [ \"$1\" = print ]; then exit 1; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = print ]; then echo 'Could not find service' >&2; exit 1; fi\nexit 0\n",
     );
     write_service_shim(
         &systemctl,

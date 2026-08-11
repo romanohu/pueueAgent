@@ -8,6 +8,7 @@ use crate::{
     config,
     db::{Db, ProjectRepository},
     models::NewProject,
+    output::bounded_redacted_text,
     paths,
     pueue::PueueApi,
     AppError,
@@ -604,15 +605,25 @@ fn launchd_status() -> Result<ServiceStatus, AppError> {
             operation: "query launchd user service",
             source,
         })?;
+    let details = bounded_redacted_text(&String::from_utf8_lossy(&output.stderr));
     Ok(launchd_status_from_output(
         output.status.success(),
         &output.stdout,
+        &details,
     ))
 }
 
-pub fn launchd_status_from_output(command_succeeded: bool, stdout: &[u8]) -> ServiceStatus {
+pub fn launchd_status_from_output(
+    command_succeeded: bool,
+    stdout: &[u8],
+    details: &str,
+) -> ServiceStatus {
     if !command_succeeded {
-        return ServiceStatus::Stopped;
+        return if launchd_service_is_not_loaded(details) {
+            ServiceStatus::NotInstalled
+        } else {
+            ServiceStatus::Stopped
+        };
     }
 
     if String::from_utf8_lossy(stdout).lines().any(|line| {
