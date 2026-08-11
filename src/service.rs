@@ -332,7 +332,27 @@ impl ServiceManager {
             ServicePlatform::Launchd => {
                 let agent = required_launchd_agent(launchd)?;
                 let service = agent.service_target();
-                run_lifecycle_command(runner, "launchctl", &["kickstart", "-k", service.as_str()])
+                let output = runner.run(
+                    "launchctl",
+                    &["kickstart", "-k", service.as_str()],
+                )?;
+                if output.success {
+                    Ok(())
+                } else if launchd_service_is_not_loaded(&output.details) {
+                    run_lifecycle_command(
+                        runner,
+                        "launchctl",
+                        &[
+                            "bootstrap",
+                            agent.domain.as_str(),
+                            agent.plist.to_str().ok_or(AppError::Configuration {
+                                field: "launchd.plist",
+                            })?,
+                        ],
+                    )
+                } else {
+                    lifecycle_command_error("launchctl", output.status)
+                }
             }
         }
     }

@@ -112,6 +112,10 @@ impl PueueApi for FakePueue {
         Ok(())
     }
 
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        Ok(())
+    }
+
     async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
         self.state
             .group_calls
@@ -177,7 +181,7 @@ for argument in "$@"; do
     printf '%s\0' "$argument" >> "$capture_path"
     if [ -z "$operation" ]; then
         case "$argument" in
-            status|add|group|kill)
+            status|add|group|kill|remove)
                 operation="$argument"
                 ;;
         esac
@@ -214,6 +218,7 @@ case "$operation" in
         fi
         ;;
     kill) : ;;
+    remove) : ;;
     *) printf 'missing operation' >&2; exit 9 ;;
 esac
 "#,

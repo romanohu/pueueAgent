@@ -121,6 +121,10 @@ impl PueueApi for FakePueue {
         Ok(())
     }
 
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("termination tests must not remove Pueue tasks")
+    }
+
     async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
         panic!("termination tests must not provision Pueue groups")
     }

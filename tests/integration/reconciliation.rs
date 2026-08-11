@@ -63,6 +63,10 @@ impl PueueApi for FakePueue {
         panic!("reconciliation must not kill Pueue tasks")
     }
 
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("reconciliation must not remove Pueue tasks")
+    }
+
     async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
         panic!("reconciliation must not provision Pueue groups")
     }

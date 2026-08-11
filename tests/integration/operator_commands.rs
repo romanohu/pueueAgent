@@ -192,6 +192,8 @@ fn write_service_shim(path: &std::path::Path, contents: &str) {
 struct OperatorPueue {
     status_responses: Arc<Mutex<VecDeque<Result<Vec<PueueTask>, String>>>>,
     kill_calls: Arc<Mutex<Vec<i64>>>,
+    remove_calls: Arc<Mutex<Vec<i64>>>,
+    remove_error: Arc<Mutex<Option<String>>>,
     status_calls: Arc<Mutex<usize>>,
 }
 
@@ -200,6 +202,8 @@ impl OperatorPueue {
         Self {
             status_responses: Arc::new(Mutex::new(VecDeque::from([Ok(tasks)]))),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
+            remove_calls: Arc::new(Mutex::new(Vec::new())),
+            remove_error: Arc::new(Mutex::new(None)),
             status_calls: Arc::new(Mutex::new(0)),
         }
     }
@@ -210,6 +214,8 @@ impl OperatorPueue {
                 statuses.into_iter().map(Ok).collect(),
             )),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
+            remove_calls: Arc::new(Mutex::new(Vec::new())),
+            remove_error: Arc::new(Mutex::new(None)),
             status_calls: Arc::new(Mutex::new(0)),
         }
     }
@@ -220,12 +226,24 @@ impl OperatorPueue {
                 "unavailable".to_owned(),
             )]))),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
+            remove_calls: Arc::new(Mutex::new(Vec::new())),
+            remove_error: Arc::new(Mutex::new(None)),
             status_calls: Arc::new(Mutex::new(0)),
         }
     }
 
+    fn with_remove_failure(tasks: Vec<PueueTask>) -> Self {
+        let pueue = Self::with_tasks(tasks);
+        *pueue.remove_error.lock().unwrap() = Some("remove failed".to_owned());
+        pueue
+    }
+
     fn kill_calls(&self) -> Vec<i64> {
         self.kill_calls.lock().unwrap().clone()
+    }
+
+    fn remove_calls(&self) -> Vec<i64> {
+        self.remove_calls.lock().unwrap().clone()
     }
 
     fn status_calls(&self) -> usize {
@@ -254,6 +272,16 @@ impl PueueApi for OperatorPueue {
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
         self.kill_calls.lock().unwrap().push(task_id);
+        Ok(())
+    }
+
+    async fn remove(&self, task_id: i64) -> Result<(), AppError> {
+        self.remove_calls.lock().unwrap().push(task_id);
+        if self.remove_error.lock().unwrap().is_some() {
+            return Err(AppError::Runtime {
+                operation: "fake Pueue remove",
+            });
+        }
         Ok(())
     }
 
@@ -399,19 +427,73 @@ async fn cancel_refuses_other_group_terminal_and_ambiguous_task_ids_without_kill
 
 #[tokio::test]
 async fn cancel_allows_case_insensitive_queued_and_running_states() {
-    for state in ["qUeUeD", "rUnNiNg"] {
-        let harness = CancelHarness::with_tasks(vec![cancel_task(
+    let running = CancelHarness::with_tasks(vec![cancel_task(
+        41,
+        "pa-project",
+        "rUnNiNg",
+        "100",
+    )]);
+    let running_result = running.cancel(41).await.unwrap();
+    assert_eq!(running_result.action, "kill");
+    assert!(running_result.kill_sent);
+    assert_eq!(running.pueue.kill_calls(), vec![41]);
+    assert!(running.pueue.remove_calls().is_empty());
+}
+
+#[tokio::test]
+async fn cancel_removes_a_case_insensitive_queued_task() {
+    let harness = CancelHarness::with_tasks(vec![cancel_task(
+        41,
+        "pa-project",
+        "qUeUeD",
+        "100",
+    )]);
+
+    let result = harness.cancel(41).await.unwrap();
+
+    assert_eq!(result.action, "remove");
+    assert!(!result.kill_sent);
+    assert_eq!(harness.pueue.remove_calls(), vec![41]);
+    assert!(harness.pueue.kill_calls().is_empty());
+    assert!(harness.operator_log_contains("cancel"));
+    let details = harness
+        .operator
+        .operator_log_rows()
+        .into_iter()
+        .find(|(_, details)| details.contains("remove"))
+        .map(|(_, details)| details)
+        .expect("remove action must be recorded");
+    assert!(details.contains("\"action\":\"remove\""));
+    let output = render_cancel_result(&harness.operator.project(), &result, true);
+    let body: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(body["action"], "remove");
+    assert_eq!(body["kill_sent"], false);
+}
+
+#[tokio::test]
+async fn cancel_reports_queued_remove_failure_without_killing() {
+    let harness = CancelHarness {
+        operator: OperatorHarness::new(),
+        pueue: OperatorPueue::with_remove_failure(vec![cancel_task(
             41,
             "pa-project",
-            state,
+            "Queued",
             "100",
-        )]);
+        )]),
+    };
 
-        let result = harness.cancel(41).await.unwrap();
-
-        assert!(result.kill_sent);
-        assert_eq!(harness.pueue.kill_calls(), vec![41]);
-    }
+    assert!(harness.cancel(41).await.is_err());
+    assert_eq!(harness.pueue.remove_calls(), vec![41]);
+    assert!(harness.pueue.kill_calls().is_empty());
+    assert_eq!(harness.pueue.status_calls(), 2);
+    let details = harness
+        .operator
+        .operator_log_rows()
+        .into_iter()
+        .find(|(_, details)| details.contains("remove failed"))
+        .map(|(_, details)| details)
+        .expect("remove failure must be recorded");
+    assert!(details.contains("\"action\":\"remove\""));
 }
 
 #[tokio::test]
@@ -514,6 +596,7 @@ async fn cancel_renders_human_and_json_final_state() {
     assert_eq!(body["schema_version"], 1);
     assert_eq!(body["project_id"], "project-a");
     assert_eq!(body["task_id"], 41);
+    assert_eq!(body["action"], "kill");
     assert_eq!(body["kill_sent"], true);
     assert_eq!(body["state"], "Running");
 }

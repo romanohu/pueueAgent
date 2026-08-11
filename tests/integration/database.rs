@@ -352,6 +352,7 @@ fn task_cancellation_log_persists_bounded_redacted_details() {
             41,
             "signature --token SIGNATURE_SECRET",
             "Running --token REQUESTED_SECRET",
+            "kill",
             "Canceled --token FINAL_SECRET",
             &format!(
                 "operator request --token REASON_SECRET {}",
@@ -388,6 +389,7 @@ fn task_cancellation_log_persists_bounded_redacted_details() {
 
     let details: serde_json::Value = serde_json::from_str(&details_json).unwrap();
     assert_eq!(details["task_id"], 41);
+    assert_eq!(details["action"], "kill");
     for key in ["task_signature", "requested_state", "final_state", "reason"] {
         let value = details[key].as_str().unwrap();
         assert!(value.len() <= 240, "{key} was not bounded: {value}");

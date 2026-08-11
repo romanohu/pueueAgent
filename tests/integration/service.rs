@@ -78,6 +78,10 @@ impl PueueApi for FakePueueControl {
         panic!("enable must not kill Pueue tasks")
     }
 
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("enable must not remove Pueue tasks")
+    }
+
     async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
         self.groups.lock().unwrap().push(group.to_owned());
         Ok(())
@@ -267,6 +271,44 @@ fn service_manager_uses_launchd_commands_and_bootstraps_unloaded_agents() {
             ("launchctl".to_owned(), vec!["kickstart", "-k", "gui/501/com.pueue-agent"].into_iter().map(str::to_owned).collect()),
         ]
     );
+}
+
+#[test]
+fn service_manager_restarts_an_unloaded_installed_launchd_agent_by_bootstrapping_plist() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([
+        ServiceCommandOutput::failure(3, "Could not find service"),
+        ServiceCommandOutput::success(),
+    ]);
+    let agent = LaunchdAgent::new("gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist");
+
+    manager
+        .restart_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .unwrap();
+
+    assert_eq!(
+        runner.calls.into_inner(),
+        vec![
+            ("launchctl".to_owned(), vec!["kickstart", "-k", "gui/501/com.pueue-agent"].into_iter().map(str::to_owned).collect()),
+            ("launchctl".to_owned(), vec!["bootstrap", "gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist"].into_iter().map(str::to_owned).collect()),
+        ]
+    );
+}
+
+#[test]
+fn service_manager_propagates_non_not_loaded_launchd_restart_failure() {
+    let manager = ServiceManager;
+    let runner = RecordingCommandRunner::with_outputs([
+        ServiceCommandOutput::failure(1, "permission denied"),
+    ]);
+    let agent = LaunchdAgent::new("gui/501", "/Users/alice/Library/LaunchAgents/com.pueue-agent.plist");
+
+    let error = manager
+        .restart_with(ServicePlatform::Launchd, &runner, Some(&agent))
+        .expect_err("restart must propagate failures other than not-loaded");
+
+    assert!(error.to_string().contains("status 1"));
+    assert_eq!(runner.calls.into_inner().len(), 1);
 }
 
 #[test]

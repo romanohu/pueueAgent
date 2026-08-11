@@ -14,6 +14,7 @@ pub struct CancelResult {
     pub task_signature: String,
     pub requested_state: String,
     pub final_observed_state: Option<String>,
+    pub action: &'static str,
     pub kill_sent: bool,
 }
 
@@ -62,29 +63,45 @@ pub async fn cancel_task_with(
         });
     }
 
+    let action = if task.state.eq_ignore_ascii_case("running") {
+        "kill"
+    } else {
+        "remove"
+    };
+    let requested_action = match action {
+        "kill" => "kill_requested",
+        "remove" => "remove_requested",
+        _ => unreachable!("validated cancellation action"),
+    };
+
     let repository = ProjectRepository::new(db);
     repository.record_task_cancellation(
         project,
         task_id,
         &signature,
         &task.state,
-        "kill_requested",
+        action,
+        requested_action,
         "operator cancellation requested",
         now,
     )?;
 
-    let kill_result = pueue.kill(task_id).await;
+    let action_result = match action {
+        "kill" => pueue.kill(task_id).await,
+        "remove" => pueue.remove(task_id).await,
+        _ => unreachable!("validated cancellation action"),
+    };
     let final_status = pueue.status_json().await;
     let final_observed_state = final_status
         .as_ref()
         .ok()
         .and_then(|tasks| final_state_for(tasks, &target_identity));
-    let result_reason = match (&kill_result, &final_status) {
+    let result_reason = match (&action_result, &final_status) {
         (Ok(()), Ok(_)) => "operator cancellation result observed".to_owned(),
-        (Err(error), Ok(_)) => format!("Pueue kill failed: {error}"),
-        (Ok(()), Err(error)) => format!("post-kill Pueue status failed: {error}"),
-        (Err(kill_error), Err(status_error)) => {
-            format!("Pueue kill failed: {kill_error}; post-kill status failed: {status_error}")
+        (Err(error), Ok(_)) => format!("Pueue {action} failed: {error}"),
+        (Ok(()), Err(error)) => format!("post-{action} Pueue status failed: {error}"),
+        (Err(action_error), Err(status_error)) => {
+            format!("Pueue {action} failed: {action_error}; post-{action} status failed: {status_error}")
         }
     };
     repository.record_task_cancellation(
@@ -92,12 +109,13 @@ pub async fn cancel_task_with(
         task_id,
         &signature,
         &task.state,
+        action,
         final_observed_state.as_deref().unwrap_or("unobserved"),
         &result_reason,
         now,
     )?;
 
-    kill_result?;
+    action_result?;
     final_status?;
 
     Ok(CancelResult {
@@ -105,7 +123,8 @@ pub async fn cancel_task_with(
         task_signature: signature,
         requested_state: task.state.clone(),
         final_observed_state,
-        kill_sent: true,
+        action,
+        kill_sent: action == "kill",
     })
 }
 
@@ -116,6 +135,7 @@ pub fn render_cancel_result(project: &Project, result: &CancelResult, json: bool
             "schema_version": 1,
             "project_id": project.project_id,
             "task_id": result.task_id,
+            "action": result.action,
             "kill_sent": result.kill_sent,
             "state": final_state.map(bounded_redacted_text),
         })
@@ -126,7 +146,7 @@ pub fn render_cancel_result(project: &Project, result: &CancelResult, json: bool
     format!(
         "{}\n{} state={}\n{}",
         human_header("cancel", &project.project_id),
-        render_id("task", result.task_id),
+        format!("{} action={}", render_id("task", result.task_id), result.action),
         format_state(&bounded_redacted_text(state)),
         human_summary("Pueue task cancellation requested"),
     )

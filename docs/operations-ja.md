@@ -40,7 +40,7 @@ pueue-agent cancel --task-id <ID>
 pueue-agent status
 ```
 
-`cancel` は現在の project group 内で stable identity を確認した指定 task 1件だけに kill を送ります。group 全体の停止、project の disable、service の stop の代用ではありません。
+`cancel` は現在の project group 内で stable identity を確認した指定 task 1件だけを対象にします。running task には `kill`、queued task には `remove` を送ります。group 全体の停止、project の disable、service の stop の代用ではありません。
 
 ### project 登録を解除する
 
