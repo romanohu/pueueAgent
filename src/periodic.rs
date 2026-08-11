@@ -119,7 +119,7 @@ pub fn should_schedule_deep_check(input: &DeepCheckScheduleInput) -> bool {
     let interval = i64::from(input.interval_minutes) * 60;
     let anchor = input
         .last_scheduled_at
-        .or(input.oldest_running_task_started_at)
+        .max(input.oldest_running_task_started_at)
         .unwrap_or(input.now);
     input.now.saturating_sub(anchor) >= interval
 }
@@ -178,6 +178,22 @@ mod tests {
             now: 3_701,
             ..base
         }));
+    }
+
+    #[test]
+    fn periodic_check_uses_newer_running_task_start_as_anchor_than_old_schedule() {
+        let input = DeepCheckScheduleInput {
+            interval_minutes: 30,
+            now: 3_601,
+            oldest_running_task_started_at: Some(3_000),
+            last_scheduled_at: Some(1_000),
+            project_active: true,
+            has_running_task: true,
+            has_active_agent: false,
+            has_open_event: false,
+        };
+
+        assert!(!should_schedule_deep_check(&input));
     }
 
     #[test]
