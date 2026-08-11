@@ -11,7 +11,7 @@ use std::{
 use crate::{
     cli::UpgradeArgs,
     db::{AgentRunRepository, Db, ProjectRepository},
-    output::bounded_redacted_text,
+    output::{bounded_redacted_text, human_summary},
     service::{ServiceControl, ServiceStatus},
     AppError,
 };
@@ -88,6 +88,111 @@ pub enum UpgradeRollback {
     NotRequired,
     Succeeded,
     Failed,
+}
+
+pub fn render_report(report: &UpgradeReport, json: bool) -> Result<String, AppError> {
+    render_report_with_status(report, report_status(report), json)
+}
+
+pub fn render_failure_report(report: &UpgradeReport, json: bool) -> Result<String, AppError> {
+    render_report_with_status(report, "failed", json)
+}
+
+fn render_report_with_status(
+    report: &UpgradeReport,
+    status: &str,
+    json: bool,
+) -> Result<String, AppError> {
+    let source = bounded_redacted_text(&report.source.display().to_string());
+    let old_revision = bounded_redacted_text(&report.old_revision);
+    let new_revision = bounded_redacted_text(&report.new_revision);
+    let noop = status == "noop";
+
+    if json {
+        return serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "status": status,
+            "noop": noop,
+            "source": source,
+            "revisions": {
+                "old": old_revision,
+                "new": new_revision,
+                "head": bounded_redacted_text(&report.checkout.head),
+                "upstream": bounded_redacted_text(&report.checkout.upstream_head),
+            },
+            "steps": {
+                "tests": step_json(report.tests),
+                "build": step_json(report.build),
+                "install": step_json(report.install),
+                "restart": step_json(report.restart),
+                "health": step_json(report.health),
+            },
+            "rollback": rollback_label(report.rollback),
+        }))
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize upgrade report",
+            source,
+        });
+    }
+
+    let summary = match status {
+        "noop" => "upgrade already current",
+        "failed" => match report.rollback {
+            UpgradeRollback::Succeeded => "upgrade failed; rollback succeeded",
+            UpgradeRollback::Failed => "upgrade failed; rollback failed",
+            UpgradeRollback::NotRequired => "upgrade failed",
+        },
+        _ => "upgrade completed",
+    };
+    Ok(format!(
+        "pueue-agent upgrade\nstatus={status}\nnoop={noop}\nsource={source}\nold_revision={old_revision}\nnew_revision={new_revision}\ntests={}\nbuild={}\ninstall={}\nrestart={}\nhealth={}\nrollback={}\n{}",
+        step_label(report.tests),
+        step_label(report.build),
+        step_label(report.install),
+        step_label(report.restart),
+        step_label(report.health),
+        rollback_label(report.rollback),
+        human_summary(summary),
+    ))
+}
+
+fn report_status(report: &UpgradeReport) -> &'static str {
+    if report.old_revision == report.new_revision
+        && !report.tests.attempted
+        && !report.build.attempted
+        && !report.install.attempted
+        && !report.restart.attempted
+        && !report.health.attempted
+    {
+        "noop"
+    } else {
+        "updated"
+    }
+}
+
+fn step_label(step: UpgradeStep) -> &'static str {
+    if !step.attempted {
+        "not_attempted"
+    } else if step.succeeded {
+        "ok"
+    } else {
+        "failed"
+    }
+}
+
+fn step_json(step: UpgradeStep) -> serde_json::Value {
+    serde_json::json!({
+        "attempted": step.attempted,
+        "succeeded": step.succeeded,
+    })
+}
+
+fn rollback_label(rollback: UpgradeRollback) -> &'static str {
+    match rollback {
+        UpgradeRollback::NotRequired => "not_required",
+        UpgradeRollback::Succeeded => "succeeded",
+        UpgradeRollback::Failed => "failed",
+    }
 }
 
 #[derive(Debug)]

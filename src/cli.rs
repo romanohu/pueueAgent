@@ -32,6 +32,7 @@ pub enum Command {
     Steer(SteerArgs),
     Wake(WakeArgs),
     Version(VersionArgs),
+    Upgrade(UpgradeArgs),
     Start(ServiceLifecycleArgs),
     Stop(ServiceLifecycleArgs),
     Daemon(DaemonArgs),

@@ -91,6 +91,23 @@ pueue-agent runs --follow
 
 `wake` は Pueue にダミー task を投入せず、operator wake event を SQLite に記録して supervisor の次の scheduler loop の処理対象にします。`runs --follow` は新しい agent run と submission の lineage を監視し、Ctrl-C まで追加分を表示します。`--follow` は端末での追跡用で、`--json` を併用すると新しいデータを検出した polling 単位で、複数 run を含み得る bounded JSON report を出力します。
 
+### pueue-agent の更新
+
+通常の更新は、監視対象の実験を止めずに supervisor だけを更新する次のコマンドです。
+
+```bash
+pueue-agent upgrade
+pueue-agent upgrade --json
+```
+
+`upgrade` は、現在の実行ファイルがプロジェクト checkout の `target/release/pueue-agent` にある場合、その checkout を source として自動検出します。検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を使い、どちらも使えない場合や別 checkout を指定したい場合は `--source <path>` を指定します。明示した `--source` が最優先です。source checkout には `git`、Rust stable、Cargo が必要です。
+
+更新対象は、clean な `main` branch が `origin/main` を追跡し、`origin/main` への fast-forward だけで更新できる checkout に限ります。dirty worktree、`main` 以外の branch、upstream の不一致、diverged checkout は拒否されます。更新前に enabled project の active agent run がある場合も拒否するため、先に agent run の完了または停止を確認してから再実行してください。upgrade のロックで同時実行も調整します。
+
+fetch、fast-forward、`cargo test --all-targets`、release build、binary の atomic install、service restart、health check の順で進みます。すでに current revision なら no-op として報告し、service は restart しません。fast-forward 後の失敗した revision は retry marker に残るため、条件を直した再実行で同じ revision の処理を再試行できます。build、install 後の restart、health check が失敗した場合は旧 binary の復元と service restart を試み、report に rollback の成否を表示します。失敗後は表示された診断コマンドで状態を確認し、条件を直して `pueue-agent upgrade` を再実行してください。
+
+upgrade は supervisor の binary と service だけを対象にし、Pueue daemon、group、実験 task を kill・stop・変更しません。active agent run の存在中は安全側に拒否するため、実験を止める操作と upgrade を混同しないでください。source checkout や依存関係の問題で通常経路を使えない場合だけ、復旧手順として `git pull --ff-only` の後に `./install.sh` を実行します。手動手順を通常の更新経路にはしません。
+
 ### 人間向け出力と JSON 出力
 
 既定の人間向け出力は、`pueue-agent status` のような見出し、`key=value` の状態行、最後の `summary:` で構成されます。`service:` は supervisor service、`automation:` は project automation、`project:` は enabled/paused/halted、`pueue:` は task snapshot、`agent_runs:` は agent run を別々に示します。`status --compact` はこれらと experiment、event、guardrail を短く確認するための表示です。`status --json` は同じプロジェクト範囲の機械可読な report で、パイプや自動処理に使えます。JSON 出力には ANSI escape を入れず、上限を超える本文や secret らしい値を展開しません。

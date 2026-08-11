@@ -14,14 +14,68 @@ use pueue_agent::{
     models::{AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject},
     service::{ServiceControl, ServiceDefinition, ServiceStatus},
     upgrade::{
-        resolve_source_root, validate_checkout, validate_checkout_with, GitCommandOutput,
-        GitCommandRunner, UpgradeCommandOutput, UpgradeCommandRunner, UpgradeRollback,
-        UpgradeFailure, UpgradeRunner,
+        render_report, resolve_source_root, validate_checkout, validate_checkout_with,
+        CheckoutState, GitCommandOutput, GitCommandRunner, UpgradeCommandOutput,
+        UpgradeCommandRunner, UpgradeReport, UpgradeRollback, UpgradeStep, UpgradeFailure,
+        UpgradeRunner,
     },
     AppError,
 };
 use serde_json::json;
 use tempfile::TempDir;
+
+#[test]
+fn upgrade_report_rendering_is_bounded_and_redacts_sensitive_values() {
+    let report = UpgradeReport {
+        source: PathBuf::from("/tmp/SECRET_TOKEN=hidden"),
+        checkout: CheckoutState {
+            branch: "main".to_owned(),
+            upstream: "origin/main".to_owned(),
+            head: "old-revision".to_owned(),
+            upstream_head: "new-revision".to_owned(),
+        },
+        old_revision: "old-revision".to_owned(),
+        new_revision: "new-revision".to_owned(),
+        tests: UpgradeStep {
+            attempted: true,
+            succeeded: true,
+        },
+        build: UpgradeStep {
+            attempted: true,
+            succeeded: true,
+        },
+        install: UpgradeStep {
+            attempted: true,
+            succeeded: true,
+        },
+        restart: UpgradeStep {
+            attempted: true,
+            succeeded: true,
+        },
+        health: UpgradeStep {
+            attempted: true,
+            succeeded: true,
+        },
+        rollback: UpgradeRollback::NotRequired,
+    };
+
+    let human = render_report(&report, false).unwrap();
+    assert!(human.starts_with("pueue-agent upgrade\n"));
+    assert!(human.contains("status=updated"));
+    assert!(human.contains("tests=ok"));
+    assert!(human.contains("rollback=not_required"));
+    assert!(human.lines().all(|line| line.len() <= 260));
+    assert!(!human.contains("hidden"));
+
+    let json = render_report(&report, true).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["status"], "updated");
+    assert_eq!(value["noop"], false);
+    assert_eq!(value["steps"]["health"]["succeeded"], true);
+    assert_eq!(value["rollback"], "not_required");
+    assert!(!json.contains("hidden"));
+}
 
 struct UpgradeFixture {
     temp: TempDir,

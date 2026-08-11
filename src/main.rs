@@ -56,6 +56,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Steer(args) => commands::steer(args),
         Command::Wake(args) => commands::wake(args),
         Command::Version(args) => commands::version(args),
+        Command::Upgrade(args) => commands::upgrade(args).await,
         Command::Start(args) => commands::start(args),
         Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
@@ -63,7 +64,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 mod commands {
-    use std::{env, ffi::OsString};
+    use std::{env, ffi::OsString, path::PathBuf};
 
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
@@ -71,7 +72,8 @@ mod commands {
         cli::{
             CancelArgs, DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs,
             InitArgs, InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs,
-            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, VersionArgs, WakeArgs,
+            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, UpgradeArgs, VersionArgs,
+            WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -92,6 +94,7 @@ mod commands {
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
         submit as submit_command,
+        upgrade::{self, resolve_source_root, ProcessUpgradeCommandRunner, UpgradeRunner},
         version::{self, BuildInfo},
         AppError,
     };
@@ -472,6 +475,42 @@ mod commands {
     pub fn version(args: VersionArgs) -> Result<(), AppError> {
         println!("{}", version::render(BuildInfo::current()?, args.json)?);
         Ok(())
+    }
+
+    pub async fn upgrade(args: UpgradeArgs) -> Result<(), AppError> {
+        let json = args.json;
+        let current_exe = env::current_exe().map_err(|source| AppError::Io {
+            operation: "resolve current executable for upgrade",
+            source,
+        })?;
+        let env_source = env::var_os(upgrade::SOURCE_ROOT_ENV).map(PathBuf::from);
+        let source = resolve_source_root(
+            args.source.as_deref(),
+            &current_exe,
+            env_source.as_deref(),
+        )?;
+        let mut options = upgrade::UpgradeOptions::from_args(args);
+        options.source = Some(source);
+        let db = Db::open(&paths::state_db_path()?)?;
+        let service = ServiceManager;
+        let commands = ProcessUpgradeCommandRunner;
+        match UpgradeRunner::new(options, &db, &service, &commands).run().await {
+            Ok(report) => {
+                println!("{}", upgrade::render_report(&report, json)?);
+                Ok(())
+            }
+            Err(failure) => {
+                if let Some(report) = failure.report() {
+                    println!("{}", upgrade::render_failure_report(report, json)?);
+                }
+                Err(AppError::Message {
+                    message: format!(
+                        "{}; next diagnostic: pueue-agent version",
+                        bounded_redacted_text(&failure.to_string())
+                    ),
+                })
+            }
+        }
     }
 
     pub fn start(args: ServiceLifecycleArgs) -> Result<(), AppError> {
