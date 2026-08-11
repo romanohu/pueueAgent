@@ -543,6 +543,44 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("find event by deduplication key"))
     }
 
+    pub fn latest_periodic_deep_check_at(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<i64>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT created_at FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("find latest periodic deep check"))
+    }
+
+    pub fn has_open_periodic_deep_check(&self, project_id: &str) -> Result<bool, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                   AND status IN ('pending', 'claimed', 'retry_wait')
+                 LIMIT 1",
+                [project_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(database_error("check open periodic deep check"))
+    }
+
     pub fn find_terminal_by_pueue_task(
         &self,
         project_id: &str,

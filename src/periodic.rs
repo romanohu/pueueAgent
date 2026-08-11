@@ -1,3 +1,99 @@
+use serde_json::json;
+
+use crate::{
+    config,
+    db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
+    models::{EventKind, NewEvent},
+    pueue::PueueTask,
+    reconcile::parse_timestamp,
+    AppError,
+};
+
+const PERIODIC_DEEP_CHECK_DEDUP_PREFIX: &str = "periodic-deep-check:v1:";
+const MAX_PERIODIC_TASK_IDS: usize = 64;
+
+pub struct PeriodicDeepCheckScheduler<'db> {
+    db: &'db Db,
+    now: i64,
+}
+
+impl<'db> PeriodicDeepCheckScheduler<'db> {
+    pub fn new(db: &'db Db, now: i64) -> Self {
+        Self { db, now }
+    }
+
+    pub fn schedule(&self, tasks: &[PueueTask]) -> Result<usize, AppError> {
+        let projects = ProjectRepository::new(self.db).list_enabled()?;
+        let events = EventRepository::new(self.db);
+        let agents = AgentRunRepository::new(self.db);
+        let mut scheduled = 0;
+
+        for project in projects {
+            let check = config::load(&project.config_path)?.check;
+            let running_tasks = tasks
+                .iter()
+                .filter(|task| task.group == project.pueue_group && task.is_running())
+                .collect::<Vec<_>>();
+            let oldest_running_task_started_at = running_tasks
+                .iter()
+                .filter_map(|task| {
+                    Some(
+                        task.started_at
+                            .as_deref()
+                            .and_then(parse_timestamp)
+                            .unwrap_or(self.now),
+                    )
+                })
+                .min();
+            let interval_seconds = i64::from(check.deep_check_interval_minutes) * 60;
+            let input = DeepCheckScheduleInput {
+                interval_minutes: check.deep_check_interval_minutes,
+                now: self.now,
+                oldest_running_task_started_at,
+                last_scheduled_at: events.latest_periodic_deep_check_at(&project.project_id)?,
+                project_active: !project.paused && project.halted_reason.is_none(),
+                has_running_task: !running_tasks.is_empty(),
+                has_active_agent: agents.find_active_by_project(&project.project_id)?.is_some(),
+                has_open_event: events.has_open_periodic_deep_check(&project.project_id)?,
+            };
+            if !should_schedule_deep_check(&input) {
+                continue;
+            }
+
+            let mut task_ids = running_tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+            task_ids.sort_unstable();
+            task_ids.truncate(MAX_PERIODIC_TASK_IDS);
+            let dedup_key = format!(
+                "{PERIODIC_DEEP_CHECK_DEDUP_PREFIX}{}",
+                periodic_bucket(self.now, interval_seconds)
+            );
+            if events
+                .find_by_dedup_key(&project.project_id, &dedup_key)?
+                .is_some()
+            {
+                continue;
+            }
+            let event = NewEvent::new(
+                &project.project_id,
+                EventKind::DeepCheck,
+                dedup_key,
+                json!({
+                    "source": "periodic",
+                    "task_ids": task_ids,
+                    "task_count": running_tasks.len(),
+                    "scheduled_at": self.now,
+                }),
+                self.now,
+                self.now,
+            );
+            let _ = events.insert_idempotent(&event)?;
+            scheduled += 1;
+        }
+
+        Ok(scheduled)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeepCheckScheduleInput {
     pub interval_minutes: u32,

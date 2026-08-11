@@ -59,6 +59,10 @@ path = "tests/integration/init.rs"
 name = "interventions"
 path = "tests/integration/interventions.rs"
 
+[[test]]
+name = "periodic"
+path = "tests/integration/periodic.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

@@ -317,7 +317,7 @@ fn shell_quote(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', r"'\''"))
 }
 
-fn parse_timestamp(value: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp(value: &str) -> Option<i64> {
     if let Ok(seconds) = value.parse::<i64>() {
         return Some(seconds);
     }
