@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -41,6 +41,50 @@ pub struct SchedulerReport {
     pub paused: Vec<String>,
     pub halted: Vec<String>,
     pub recovered_leases: usize,
+}
+
+impl fmt::Debug for SchedulerReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SchedulerReport")
+            .field("started", &self.started.len())
+            .field("paused", &self.paused)
+            .field("halted", &self.halted)
+            .field("recovered_leases", &self.recovered_leases)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct SchedulerTickError {
+    report: SchedulerReport,
+    source: AppError,
+}
+
+impl SchedulerTickError {
+    fn new(report: SchedulerReport, source: AppError) -> Self {
+        Self { report, source }
+    }
+
+    fn from_source(source: AppError) -> Self {
+        Self::new(SchedulerReport::default(), source)
+    }
+
+    pub fn into_parts(self) -> (SchedulerReport, AppError) {
+        (self.report, self.source)
+    }
+}
+
+impl fmt::Display for SchedulerTickError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SchedulerTickError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 pub struct StartedAgent {
@@ -130,18 +174,30 @@ impl Scheduler {
         }
     }
 
-    pub async fn tick(&mut self) -> Result<SchedulerReport, AppError> {
-        let recovered_leases = self.recover_expired_leases()?;
-        let claimed = EventRepository::new(&self.db).claim_batch(
-            self.config.now,
-            self.config.now + self.config.lease_seconds,
-            self.config.claim_limit,
-        )?;
+    pub async fn tick(&mut self) -> Result<SchedulerReport, SchedulerTickError> {
+        let recovered_leases = self
+            .recover_expired_leases()
+            .map_err(SchedulerTickError::from_source)?;
+        let claimed = EventRepository::new(&self.db)
+            .claim_batch(
+                self.config.now,
+                self.config.now + self.config.lease_seconds,
+                self.config.claim_limit,
+            )
+            .map_err(SchedulerTickError::from_source)?;
         let mut report = SchedulerReport {
             recovered_leases,
             ..SchedulerReport::default()
         };
         let mut first_error = None;
+        macro_rules! return_scheduler_error {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(source) => return Err(SchedulerTickError::new(report, source)),
+                }
+            };
+        }
 
         for (project_id, mut events) in group_by_project(claimed) {
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
@@ -152,27 +208,30 @@ impl Scheduler {
             let Some(primary) = events.first().cloned() else {
                 continue;
             };
-            let Some(project) = ProjectRepository::new(&self.db).find_by_id(&project_id)? else {
-                EventRepository::new(&self.db).transition_many(
+            let project = return_scheduler_error!(
+                ProjectRepository::new(&self.db).find_by_id(&project_id)
+            );
+            let Some(project) = project else {
+                return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                     &event_ids,
                     EventStatus::Failed,
                     self.config.now,
                     None,
                     Some("project missing"),
-                )?;
+                ));
                 continue;
             };
             let project_config = match config::load(&project.config_path) {
                 Ok(project_config) => project_config,
                 Err(error) => {
                     let message = error.to_string();
-                    EventRepository::new(&self.db).transition_many(
+                    return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
                         self.config.now,
                         None,
                         Some(&message),
-                    )?;
+                    ));
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -189,13 +248,13 @@ impl Scheduler {
                 Ok(effective_guardrails) => effective_guardrails,
                 Err(error) => {
                     let message = error.to_string();
-                    EventRepository::new(&self.db).transition_many(
+                    return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
                         self.config.now,
                         None,
                         Some(&message),
-                    )?;
+                    ));
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -203,29 +262,33 @@ impl Scheduler {
                 }
             };
             let guardrails = Guardrails::new(&self.db, self.config.now);
-            match guardrails.check(&project, &effective_guardrails, &events)? {
+            match return_scheduler_error!(guardrails.check(
+                &project,
+                &effective_guardrails,
+                &events,
+            )) {
                 DispatchDecision::Allow => {}
                 DispatchDecision::Pause(reason) => {
-                    guardrails.apply_pause(&project.project_id)?;
-                    EventRepository::new(&self.db).transition_many(
+                    return_scheduler_error!(guardrails.apply_pause(&project.project_id));
+                    return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
                         self.config.now,
                         None,
                         Some(&reason),
-                    )?;
+                    ));
                     report.paused.push(project.project_id);
                     continue;
                 }
                 DispatchDecision::Halt(reason) => {
-                    guardrails.apply_halt(&project.project_id, &reason)?;
-                    EventRepository::new(&self.db).transition_many(
+                    return_scheduler_error!(guardrails.apply_halt(&project.project_id, &reason));
+                    return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
                         self.config.now,
                         None,
                         Some(&reason),
-                    )?;
+                    ));
                     report.halted.push(project.project_id);
                     continue;
                 }
@@ -237,13 +300,15 @@ impl Scheduler {
                     Ok(delivery) => delivery,
                     Err(error) => {
                         let message = format!("agent spawn failed: {error}");
-                        EventRepository::new(&self.db).resolve_claimed_without_run(
-                            &project.project_id,
-                            &event_ids,
-                            self.config.now,
-                            &message,
-                            retry_policy,
-                        )?;
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).resolve_claimed_without_run(
+                                &project.project_id,
+                                &event_ids,
+                                self.config.now,
+                                &message,
+                                retry_policy,
+                            )
+                        );
                         if first_error.is_none() {
                             first_error = Some(error);
                         }
@@ -278,13 +343,19 @@ impl Scheduler {
                 Err(error) => {
                     let AgentSpawnError { stage, source } = error;
                     if matches!(&source, AppError::UpgradeInProgress) {
-                        if let Some(reservation) = reservation.as_ref() {
-                            InterventionRepository::new(&self.db).release_reservation(
-                                &project.project_id,
-                                &reservation.token,
-                            )?;
+                        let release_error = reservation.as_ref().and_then(|reservation| {
+                            InterventionRepository::new(&self.db)
+                                .release_reservation(
+                                    &project.project_id,
+                                    &reservation.token,
+                                )
+                                .err()
+                        });
+                        let defer_error =
+                            EventRepository::new(&self.db).defer_claimed(&event_ids).err();
+                        if first_error.is_none() {
+                            first_error = release_error.or(defer_error);
                         }
-                        EventRepository::new(&self.db).defer_claimed(&event_ids)?;
                         continue;
                     }
                     if !matches!(stage, AgentSpawnStage::PreBinding) {
@@ -300,13 +371,15 @@ impl Scheduler {
                             .err()
                     });
                     let message = format!("agent spawn failed: {source}");
-                    EventRepository::new(&self.db).resolve_claimed_without_run(
-                        &project.project_id,
-                        &event_ids,
-                        self.config.now,
-                        &message,
-                        retry_policy,
-                    )?;
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).resolve_claimed_without_run(
+                            &project.project_id,
+                            &event_ids,
+                            self.config.now,
+                            &message,
+                            retry_policy,
+                        )
+                    );
                     if first_error.is_none() {
                         first_error = Some(release_error.unwrap_or(source));
                     }
@@ -316,7 +389,7 @@ impl Scheduler {
         }
 
         if let Some(error) = first_error {
-            Err(error)
+            Err(SchedulerTickError::new(report, error))
         } else {
             Ok(report)
         }

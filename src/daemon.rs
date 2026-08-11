@@ -77,7 +77,7 @@ where
     }
 
     pub async fn run(&mut self, shutdown: CancellationToken) -> Result<(), AppError> {
-        self.run_once().await?;
+        self.run_once_or_drain_on_error().await?;
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => {
@@ -85,9 +85,19 @@ where
                     return Ok(());
                 }
                 () = tokio::time::sleep(self.config.interval) => {
-                    self.run_once().await?;
+                    self.run_once_or_drain_on_error().await?;
                 }
             }
+        }
+    }
+
+    async fn run_once_or_drain_on_error(&mut self) -> Result<DaemonReport, AppError> {
+        match self.run_once().await {
+            Ok(report) => Ok(report),
+            Err(scheduler_error) => match self.drain_agents_on_shutdown().await {
+                Ok(_) => Err(scheduler_error),
+                Err(drain_error) => Err(drain_error),
+            },
         }
     }
 
@@ -126,7 +136,19 @@ where
         );
         let scheduler_result = scheduler.tick().await;
         self.runner = Some(scheduler.into_runner());
-        let mut scheduler_report = scheduler_result?;
+        let mut scheduler_report = match scheduler_result {
+            Ok(report) => report,
+            Err(error) => {
+                let (mut scheduler_report, source) = error.into_parts();
+                self.active_agents.extend(
+                    scheduler_report
+                        .started
+                        .drain(..)
+                        .map(|started| started.handle),
+                );
+                return Err(source);
+            }
+        };
         self.active_agents.extend(
             scheduler_report
                 .started

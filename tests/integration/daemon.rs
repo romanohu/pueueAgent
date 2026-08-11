@@ -801,6 +801,133 @@ async fn daemon_restores_runner_after_unresolved_scheduler_spawn_error() {
     assert!(second.is_ok(), "runner should be restored after scheduler error");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_retains_started_agent_when_a_later_project_scheduler_error_occurs() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/path/that/does/not/exist/pueue-agent",
+        &["{prompt}"],
+        1,
+    );
+    let successful_event = harness.enqueue(
+        EventKind::TaskFinished,
+        "project-a",
+        "mixed-success",
+    );
+    let failed_event = harness.enqueue(EventKind::TaskFailed, "project-b", "mixed-error");
+
+    let mut daemon = harness.daemon();
+    let first = daemon.run_once().await;
+    assert!(first.is_err());
+    assert_eq!(harness.event_status(successful_event), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(failed_event), EventStatus::RetryWait);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE project_id = 'project-a' AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(successful_event), EventStatus::Completed);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE project_id = 'project-a' AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_run_drains_started_agent_before_returning_scheduler_error() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 10"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/path/that/does/not/exist/pueue-agent",
+        &["{prompt}"],
+        1,
+    );
+    let successful_event = harness.enqueue(
+        EventKind::TaskFinished,
+        "project-a",
+        "run-mixed-success",
+    );
+    let failed_event = harness.enqueue(EventKind::TaskFailed, "project-b", "run-mixed-error");
+
+    let mut daemon = harness.daemon();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        daemon.run(CancellationToken::new()),
+    )
+    .await
+    .expect("daemon should drain retained agents before returning");
+    let error = result.expect_err("later scheduler failure should remain visible");
+    assert!(error.to_string().contains("spawn agent process"));
+    assert_eq!(harness.event_status(successful_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(failed_event), EventStatus::RetryWait);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let pid: i32 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT pid FROM agent_runs WHERE project_id = 'project-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!process_exists(pid));
+}
+
 #[tokio::test]
 async fn injected_shutdown_signal_cancels_daemon_token() {
     let shutdown = CancellationToken::new();

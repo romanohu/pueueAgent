@@ -526,6 +526,82 @@ async fn upgrade_contention_defers_claim_without_consuming_event_retry() {
         pueue_agent::interventions::InterventionStatus::Pending);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_contention_defers_claim_when_reservation_release_fails() {
+    let harness = SchedulerHarness::new();
+    let event_id = harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "upgrade-release-failure",
+    );
+    let intervention_id = harness.queue_intervention("recover after release failure");
+    let guard_path = harness.temp.path().join("upgrade.lock.guard");
+    let guard_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(guard_path)
+        .unwrap();
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    assert_eq!(unsafe { flock(guard_file.as_raw_fd(), 2) }, 0);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_upgrade_reservation_release
+             BEFORE UPDATE OF status ON interventions
+             WHEN OLD.status = 'reserved' AND NEW.status = 'pending'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected upgrade reservation release failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("upgrade reservation release failure should be surfaced"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("injected upgrade reservation release failure"));
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.attempts, 0);
+    assert_eq!(event.lease_until, None);
+    assert_eq!(event.last_error, None);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (
+            pueue_agent::interventions::InterventionStatus::Reserved,
+            None,
+            1,
+        )
+    );
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_upgrade_reservation_release;")
+        .unwrap();
+    assert_eq!(
+        InterventionRepository::new(&harness.db)
+            .recover_expired(harness.now + 61)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending
+    );
+}
+
 #[tokio::test]
 async fn operator_intervention_delivery_reserves_only_the_fifo_prefix_that_fits_the_prompt() {
     let harness = SchedulerHarness::new();
