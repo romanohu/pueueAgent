@@ -5,7 +5,10 @@ use std::{
 };
 
 use rusqlite::{
-    params, types::Type, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+    params,
+    params_from_iter,
+    types::{Type, Value},
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -1213,15 +1216,35 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("read filtered events"))
     }
 
-    pub fn latest_run_id(
+    /// Return one deterministic latest run per requested event in one bounded query.
+    pub fn latest_run_ids(
         &self,
         project_id: &str,
-        event_id: i64,
-    ) -> Result<Option<i64>, AppError> {
-        let connection = self.db.connect()?;
-        connection
-            .query_row(
-                "SELECT agent_runs.run_id
+        event_ids: &[i64],
+    ) -> Result<BTreeMap<i64, i64>, AppError> {
+        let mut unique_event_ids = BTreeSet::new();
+        for event_id in event_ids {
+            if unique_event_ids.len() >= MAX_EVENT_LIST_LIMIT {
+                break;
+            }
+            unique_event_ids.insert(*event_id);
+        }
+        let event_ids = unique_event_ids;
+        if event_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", event_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT event_id, run_id
+             FROM (
+                 SELECT agent_run_events.event_id, agent_runs.run_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY agent_run_events.event_id
+                            ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
+                        ) AS latest_rank
                  FROM agent_runs
                  JOIN agent_run_events
                    ON agent_run_events.project_id = agent_runs.project_id
@@ -1232,14 +1255,37 @@ impl<'db> EventRepository<'db> {
                  WHERE agent_runs.project_id = ?1
                    AND agent_run_events.project_id = ?1
                    AND events.project_id = ?1
-                   AND agent_run_events.event_id = ?2
-                 ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
-                 LIMIT 1",
-                params![project_id, event_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error("find latest event agent run"))
+                   AND agent_run_events.event_id IN ({placeholders})
+             )
+             WHERE latest_rank = 1
+             ORDER BY event_id",
+        );
+        let mut query_values = Vec::with_capacity(event_ids.len() + 1);
+        query_values.push(Value::Text(project_id.to_owned()));
+        query_values.extend(event_ids.iter().copied().map(Value::Integer));
+
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&query)
+            .map_err(database_error("prepare latest event agent run query"))?;
+        let rows = statement
+            .query_map(params_from_iter(query_values), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(database_error("query latest event agent runs"))?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(database_error("read latest event agent runs"))
+    }
+
+    pub fn latest_run_id(
+        &self,
+        project_id: &str,
+        event_id: i64,
+    ) -> Result<Option<i64>, AppError> {
+        Ok(self
+            .latest_run_ids(project_id, &[event_id])?
+            .get(&event_id)
+            .copied())
     }
 
     pub fn find_by_task_signature(

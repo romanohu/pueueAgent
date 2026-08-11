@@ -13,7 +13,7 @@ use pueue_agent::{
     diagnostics::{
         build_doctor_report, render_doctor_report, render_doctor_report_value, render_events,
         render_incident_explanation, render_project_status_json, render_task_inspection,
-        DoctorExternal, EventFilter,
+        DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
     },
     models::{
         AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewIncident, NewProject,
@@ -1632,6 +1632,61 @@ fn latest_run_id_is_project_scoped_and_deterministic() {
             .latest_run_id("project-a", 999_999)
             .unwrap(),
         None
+    );
+    let bulk = EventRepository::new(&harness.db)
+        .latest_run_ids("project-a", &[event.event_id, event.event_id, 999_999])
+        .unwrap();
+    assert_eq!(bulk.get(&event.event_id), Some(&second.run_id));
+    assert!(!bulk.contains_key(&999_999));
+    assert!(EventRepository::new(&harness.db)
+        .latest_run_ids("project-b", &[event.event_id])
+        .unwrap()
+        .is_empty());
+    assert!(EventRepository::new(&harness.db)
+        .latest_run_ids("project-a", &[])
+        .unwrap()
+        .is_empty());
+
+    let overflow_event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "latest-run-overflow-event",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'claimed', lease_until = 300 WHERE event_id = ?1",
+            [overflow_event.event_id],
+        )
+        .unwrap();
+    let overflow_run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                overflow_event.event_id,
+                None,
+                AgentRunStatus::Completed,
+                300,
+                "/tmp/latest-overflow.log",
+            ),
+            &[overflow_event.event_id],
+        )
+        .unwrap();
+    let mut duplicate_heavy_request = vec![event.event_id; MAX_EVENT_LIST_LIMIT];
+    duplicate_heavy_request.push(overflow_event.event_id);
+    let duplicate_heavy = EventRepository::new(&harness.db)
+        .latest_run_ids("project-a", &duplicate_heavy_request)
+        .unwrap();
+    assert_eq!(
+        duplicate_heavy.get(&overflow_event.event_id),
+        Some(&overflow_run.run_id)
     );
 }
 

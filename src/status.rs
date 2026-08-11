@@ -345,13 +345,6 @@ fn event_counts_line(counts: &BTreeMap<String, i64>) -> String {
     let in_flight = count(counts, "in_flight");
     let dispatched = count(counts, "dispatched");
     let dead_letter = count(counts, "dead_letter");
-    if retry_wait == 0 && in_flight == 0 && dispatched == 0 && dead_letter == 0 {
-        return format!(
-            "events: pending={} failed={}",
-            count(counts, "pending"),
-            count(counts, "failed")
-        );
-    }
     format!(
         "events: pending={} claimed={} retry_wait={} in_flight={} dispatched={} failed={} dead_letter={}",
         count(counts, "pending"),

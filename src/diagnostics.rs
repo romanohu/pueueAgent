@@ -63,15 +63,18 @@ pub fn render_events(
 ) -> Result<String, AppError> {
     let event_repository = EventRepository::new(db);
     let events = event_repository.list_filtered(&project.project_id, filter)?;
+    let event_ids = events.iter().map(|event| event.event_id).collect::<Vec<_>>();
+    let latest_run_ids = event_repository.latest_run_ids(&project.project_id, &event_ids)?;
     if json {
         let summaries = events
             .iter()
             .map(|event| {
-                event_repository
-                    .latest_run_id(&project.project_id, event.event_id)
-                    .map(|run_id| EventSummary::from_event(event, run_id))
+                EventSummary::from_event(
+                    event,
+                    latest_run_ids.get(&event.event_id).copied(),
+                )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         return serde_json::to_string(&EventListReport {
             schema_version: JSON_SCHEMA_VERSION,
             project_id: project.project_id.clone(),
@@ -85,11 +88,7 @@ pub fn render_events(
 
     let mut lines = vec![human_header("events", &project.project_id)];
     lines.push("EVENT STATE KIND ATTEMPTS NOT_BEFORE LEASE CREATED COMPLETED RUN ERROR".to_owned());
-    let run_ids = events
-        .iter()
-        .map(|event| event_repository.latest_run_id(&project.project_id, event.event_id))
-        .collect::<Result<Vec<_>, _>>()?;
-    lines.extend(events.iter().zip(run_ids).map(|(event, run_id)| {
+    lines.extend(events.iter().map(|event| {
         format!(
             "{} state={} kind={} attempts={} not_before={} lease={} created_at={} completed_at={} run_id={} error={}",
             render_id("event", event.event_id),
@@ -104,7 +103,9 @@ pub fn render_events(
             event
                 .completed_at
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-            run_id
+            latest_run_ids
+                .get(&event.event_id)
+                .copied()
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
             event
                 .last_error
@@ -1514,14 +1515,14 @@ fn event_summaries(
     events: &[Event],
 ) -> Result<Vec<EventSummary>, AppError> {
     let repository = EventRepository::new(db);
-    events
+    let event_ids = events.iter().map(|event| event.event_id).collect::<Vec<_>>();
+    let latest_run_ids = repository.latest_run_ids(project_id, &event_ids)?;
+    Ok(events
         .iter()
         .map(|event| {
-            repository
-                .latest_run_id(project_id, event.event_id)
-                .map(|run_id| EventSummary::from_event(event, run_id))
+            EventSummary::from_event(event, latest_run_ids.get(&event.event_id).copied())
         })
-        .collect()
+        .collect())
 }
 
 fn incident_counts(db: &Db, project_id: &str) -> Result<IncidentCounts, AppError> {
