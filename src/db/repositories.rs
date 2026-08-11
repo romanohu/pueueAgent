@@ -3408,22 +3408,6 @@ impl<'db> AgentRunRepository<'db> {
         Ok(dispatched)
     }
 
-    pub fn fail_before_gate_release(
-        &self,
-        project_id: &str,
-        run_id: i64,
-        finished_at: i64,
-        reason: &str,
-    ) -> Result<AgentRun, AppError> {
-        self.fail_before_gate_release_with_policy(
-            project_id,
-            run_id,
-            finished_at,
-            reason,
-            RetryPolicy { max_retries: 0 },
-        )
-    }
-
     pub fn fail_before_gate_release_with_policy(
         &self,
         project_id: &str,

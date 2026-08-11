@@ -124,8 +124,9 @@ where
                 claim_limit: self.config.claim_limit,
             },
         );
-        let mut scheduler_report = scheduler.tick().await?;
+        let scheduler_result = scheduler.tick().await;
         self.runner = Some(scheduler.into_runner());
+        let mut scheduler_report = scheduler_result?;
         self.active_agents.extend(
             scheduler_report
                 .started
@@ -208,44 +209,38 @@ where
         let deadline = Instant::now() + self.config.shutdown_grace_period;
         let mut finished = 0;
 
-        while !self.active_agents.is_empty() {
-            let now = self.now()?;
-            let mut index = 0;
-            while index < self.active_agents.len() {
-                match self.active_agents[index].poll(&self.db, now).await {
-                    Ok(Some(_)) => {
-                        self.active_agents.swap_remove(index);
-                        finished += 1;
-                    }
-                    Ok(None) => index += 1,
-                    Err(_) => index += 1,
-                }
-            }
-            if self.active_agents.is_empty() {
-                return Ok(finished);
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_else(|| Duration::from_secs(0));
-            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
-        }
-
-        if self.active_agents.is_empty() {
-            return Ok(finished);
-        }
-
         while let Some(mut agent) = self.active_agents.pop() {
-            match agent.timeout_now(&self.db, self.now()?).await {
-                Ok(_) => finished += 1,
-                Err(error) => {
-                    self.active_agents.push(agent);
-                    return Err(error);
+            loop {
+                let now = match self.now() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        self.active_agents.push(agent);
+                        return Err(error);
+                    }
+                };
+                match agent.timeout_now(&self.db, now).await {
+                    Ok(_) => {
+                        finished += 1;
+                        break;
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let remaining = deadline
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_else(|| Duration::from_secs(0));
+                        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+                        if Instant::now() >= deadline {
+                            self.active_agents.push(agent);
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => {
+                        self.active_agents.push(agent);
+                        return Err(error);
+                    }
                 }
             }
         }
+
         Ok(finished)
     }
 

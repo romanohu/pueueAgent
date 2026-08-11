@@ -667,11 +667,32 @@ async fn agent_handle_wait_borrows_mutably_for_finalizer_retry() {
     let harness = SchedulerHarness::new();
     harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
     let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "mutable-wait");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_wait_terminal_finalization
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status = 'completed'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected wait finalizer failure');
+             END;",
+        )
+        .unwrap();
 
     let mut scheduler = harness.scheduler();
     let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    assert!(handle.wait(&harness.db, harness.now).await.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_wait_terminal_finalization;")
+        .unwrap();
     assert_eq!(
-        handle.wait(&harness.db, harness.now).await.unwrap(),
+        handle.wait(&harness.db, harness.now + 1).await.unwrap(),
         AgentRunStatus::Completed
     );
     assert_eq!(handle.run_id, 1);
@@ -853,7 +874,11 @@ async fn marker_ack_database_failure_uses_post_marker_finalizer_once() {
         .unwrap();
 
     let mut scheduler = harness.scheduler();
-    assert!(scheduler.tick().await.is_err());
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("dispatch acknowledgement failure should be reported"),
+        Err(error) => error,
+    };
+    assert!(!error.to_string().contains("resolved=false"));
 
     let event = harness.event(event_id);
     assert_eq!(event.status, EventStatus::DeadLetter);
@@ -861,6 +886,17 @@ async fn marker_ack_database_failure_uses_post_marker_finalizer_once() {
         .last_error
         .as_deref()
         .is_some_and(|reason| reason.len() <= 240 && reason.contains("post_marker_dispatch_ack")));
+    let log_path: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT log_path FROM agent_runs WHERE run_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(std::path::PathBuf::from(format!("{log_path}.gate-started")).is_file());
     assert_eq!(
         harness.intervention_state(&intervention_id).0,
         pueue_agent::interventions::InterventionStatus::Applied
@@ -879,6 +915,44 @@ async fn marker_ack_database_failure_uses_post_marker_finalizer_once() {
             .unwrap(),
         1
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn post_marker_finalizer_failure_reports_unresolved_stage_for_recovery() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "ack-finalizer-failure");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_dispatch_ack_for_recovery
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_post_marker_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected post-marker finalizer failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    let error = match scheduler.tick().await {
+        Ok(_) => panic!("post-marker finalizer failure should be reported"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("PostMarker"));
+    assert!(error.to_string().contains("resolved=false"));
+    assert!(error.to_string().contains("run_id=1"));
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    assert_eq!(harness.active_runs("project-a"), 1);
 }
 
 #[tokio::test]

@@ -442,6 +442,14 @@ fn running_task() -> PueueTask {
     }
 }
 
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: std::os::raw::c_int, signal: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    unsafe { kill(pid, 0) == 0 }
+}
+
 #[tokio::test]
 async fn daemon_run_once_invokes_reconciliation_detection_termination_and_scheduler() {
     let harness = DaemonHarness::new();
@@ -530,7 +538,7 @@ async fn daemon_shutdown_drains_child_agent_that_finishes_promptly() {
 
     assert_eq!(
         harness.agent_run_statuses(),
-        vec![AgentRunStatus::Completed]
+        vec![AgentRunStatus::TimedOut]
     );
     assert!(AgentRunRepository::new(&harness.db)
         .find_active_by_project("project-a")
@@ -649,6 +657,148 @@ async fn daemon_shutdown_retains_handle_when_finalizer_exhausts_grace() {
             .unwrap(),
         1
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 10"],
+        1,
+    );
+    let event_id = harness.enqueue(EventKind::DeepCheck, "project-a", "shutdown-retry");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_one_shutdown_finalizer
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status = 'timed_out'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected one-shot shutdown finalizer failure');
+             END;",
+        )
+        .unwrap();
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        AgentRunner::new(AgentRunnerConfig::for_tests(
+            harness.temp.path().join("agent.log"),
+        )),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(500),
+        },
+    );
+    let shutdown = CancellationToken::new();
+    let join = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { daemon.run(shutdown).await }
+    });
+
+    harness.wait_for_active_agent().await;
+    let pid: i32 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT pid FROM agent_runs WHERE status IN ('starting', 'running')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let drop_trigger = tokio::spawn({
+        let db = harness.db.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !process_exists(pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("agent process should terminate during shutdown");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            db.connect()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_one_shutdown_finalizer;")
+                .unwrap();
+        }
+    });
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("daemon should retry the transient shutdown finalizer failure")
+        .expect("daemon task should not panic")
+        .unwrap();
+    drop_trigger.await.unwrap();
+
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.agent_run_statuses(), vec![AgentRunStatus::TimedOut]);
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn daemon_restores_runner_after_unresolved_scheduler_spawn_error() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "runner-restore");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_runner_restore_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_runner_restore_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected finalizer failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    let first = daemon.run_once().await;
+    assert!(first.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER reject_runner_restore_dispatch_ack;
+             DROP TRIGGER reject_runner_restore_finalizer;",
+        )
+        .unwrap();
+    let second = daemon.run_once().await;
+    assert!(second.is_ok(), "runner should be restored after scheduler error");
 }
 
 #[tokio::test]

@@ -290,8 +290,9 @@ impl Scheduler {
                         continue;
                     }
                     if !matches!(stage, AgentSpawnStage::PreBinding) {
+                        let unresolved_error = unresolved_spawn_error(stage, source);
                         if first_error.is_none() {
-                            first_error = Some(source);
+                            first_error = Some(unresolved_error);
                         }
                         continue;
                     }
@@ -328,6 +329,35 @@ impl Scheduler {
         } else {
             Ok(report)
         }
+    }
+}
+
+fn unresolved_spawn_error(stage: AgentSpawnStage, source: AppError) -> AppError {
+    let signal = match stage {
+        AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: false,
+        } => format!(
+            "agent spawn unresolved: RunBoundPreMarker resolved=false run_id={run_id}; source={}",
+            bounded_redacted_text(&source.to_string())
+        ),
+        AgentSpawnStage::PostMarker {
+            run_id,
+            resolved: false,
+        } => format!(
+            "agent spawn unresolved: PostMarker resolved=false run_id={run_id}; source={}",
+            bounded_redacted_text(&source.to_string())
+        ),
+        AgentSpawnStage::RunBoundPreMarker {
+            resolved: true, ..
+        }
+        | AgentSpawnStage::PostMarker {
+            resolved: true, ..
+        }
+        | AgentSpawnStage::PreBinding => return source,
+    };
+    AppError::Message {
+        message: bounded_redacted_text(&signal),
     }
 }
 
@@ -474,4 +504,37 @@ fn truncate_to_prompt_budget(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{0}{TRUNCATION_SUFFIX}", &value[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unresolved_spawn_error;
+    use crate::{agent::AgentSpawnStage, AppError};
+
+    #[test]
+    fn unresolved_error_signal_wraps_only_unresolved_stages() {
+        let resolved = unresolved_spawn_error(
+            AgentSpawnStage::PostMarker {
+                run_id: 7,
+                resolved: true,
+            },
+            AppError::Runtime {
+                operation: "finish agent run",
+            },
+        );
+        assert!(matches!(resolved, AppError::Runtime { .. }));
+
+        let unresolved = unresolved_spawn_error(
+            AgentSpawnStage::PostMarker {
+                run_id: 7,
+                resolved: false,
+            },
+            AppError::Runtime {
+                operation: "finish agent run",
+            },
+        );
+        let message = unresolved.to_string();
+        assert!(message.contains("PostMarker resolved=false run_id=7"));
+        assert!(message.len() <= 240);
+    }
 }

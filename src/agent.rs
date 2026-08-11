@@ -69,6 +69,13 @@ pub struct AgentSpawnError {
     pub source: AppError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMarkerState {
+    Confirmed,
+    Missing,
+    Indeterminate,
+}
+
 impl std::fmt::Display for AgentSpawnError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.source.fmt(formatter)
@@ -450,11 +457,12 @@ impl AgentRunner {
                     Ok(Err(source)) => format!("read agent launch gate acknowledgement: {source}"),
                     Err(_) => "timed out waiting for agent launch gate acknowledgement".to_owned(),
                 };
-                return Err(resolve_pre_marker_failure(
+                return Err(resolve_launch_gate_ack_failure(
                     &repository,
                     &project.project_id,
                     run.run_id,
                     now,
+                    inspect_launch_marker(&gate_marker_path),
                     &reason,
                     RetryPolicy {
                         max_retries: config.max_retries,
@@ -535,6 +543,54 @@ fn pre_binding_error(source: AppError) -> AgentSpawnError {
     AgentSpawnError {
         stage: AgentSpawnStage::PreBinding,
         source,
+    }
+}
+
+fn inspect_launch_marker(path: &std::path::Path) -> LaunchMarkerState {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => LaunchMarkerState::Confirmed,
+        Ok(_) => LaunchMarkerState::Indeterminate,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => LaunchMarkerState::Missing,
+        Err(_) => LaunchMarkerState::Indeterminate,
+    }
+}
+
+fn resolve_launch_gate_ack_failure(
+    repository: &AgentRunRepository<'_>,
+    project_id: &str,
+    run_id: i64,
+    finished_at: i64,
+    marker_state: LaunchMarkerState,
+    reason: &str,
+    policy: RetryPolicy,
+    source: AppError,
+) -> AgentSpawnError {
+    match marker_state {
+        LaunchMarkerState::Confirmed => resolve_post_marker_failure(
+            repository,
+            project_id,
+            run_id,
+            finished_at,
+            "post_marker_launch_gate_ack",
+            source,
+        ),
+        LaunchMarkerState::Indeterminate => resolve_post_marker_failure(
+            repository,
+            project_id,
+            run_id,
+            finished_at,
+            "post_marker_launch_gate_ack_indeterminate",
+            source,
+        ),
+        LaunchMarkerState::Missing => resolve_pre_marker_failure(
+            repository,
+            project_id,
+            run_id,
+            finished_at,
+            reason,
+            policy,
+            source,
+        ),
     }
 }
 
@@ -928,13 +984,157 @@ fn ensure_launch_gate_platform_supported() -> Result<(), AppError> {
 mod tests {
     use std::{fs, process::Stdio};
 
+    use crate::{
+        db::{AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository},
+        interventions::InterventionStatus,
+        models::{AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject},
+        retry::RetryPolicy,
+        AppError,
+    };
+    use serde_json::json;
+    use tempfile::TempDir;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt},
         process::Command,
     };
     use uuid::Uuid;
 
-    use super::{configure_launch_gate, AgentCommand};
+    use super::{
+        configure_launch_gate, inspect_launch_marker, resolve_launch_gate_ack_failure,
+        AgentCommand, LaunchMarkerState,
+    };
+
+    #[test]
+    fn launch_marker_inspection_is_conservative_after_ack_failure() {
+        let directory =
+            std::env::temp_dir().join(format!("pueue-agent-marker-{}/marker", Uuid::new_v4()));
+        let parent = directory.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        assert_eq!(inspect_launch_marker(&directory), LaunchMarkerState::Missing);
+        fs::write(&directory, "marker").unwrap();
+        assert_eq!(inspect_launch_marker(&directory), LaunchMarkerState::Confirmed);
+        fs::remove_file(&directory).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            inspect_launch_marker(&directory),
+            LaunchMarkerState::Indeterminate
+        );
+        fs::remove_dir(&directory).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn confirmed_ack_failure_dead_letters_event_and_keeps_applied_intervention() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project-a");
+        fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let marker_path = temp.path().join("confirmed-ack-failure.gate-started");
+        fs::write(&marker_path, "started").unwrap();
+        let marker_state = inspect_launch_marker(&marker_path);
+        assert_eq!(marker_state, LaunchMarkerState::Confirmed);
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &root,
+                "pa-project",
+                root.join("config.toml"),
+                100,
+            ))
+            .unwrap();
+        let event_id = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFailed,
+                "confirmed-ack-failure",
+                json!({"source": "test"}),
+                100,
+                100,
+            ))
+            .unwrap()
+            .event_id;
+        EventRepository::new(&db)
+            .claim_batch(100, 200, 1)
+            .unwrap();
+        let intervention = InterventionRepository::new(&db)
+            .insert_pending("project-a", "retain this audit", 100)
+            .unwrap();
+        let reservation = InterventionRepository::new(&db)
+            .reserve_pending("project-a", "confirmed-ack-token", 100, 200, 1, 128)
+            .unwrap();
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events_and_reservation(
+                &NewAgentRun::new(
+                    "project-a",
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    100,
+                    "/tmp/confirmed-ack-failure.log",
+                ),
+                &[event_id],
+                Some(&reservation.token),
+            )
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 110)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_gate_release_requested("project-a", run.run_id)
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE events SET status = 'in_flight' WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+
+        let error = resolve_launch_gate_ack_failure(
+            &AgentRunRepository::new(&db),
+            "project-a",
+            run.run_id,
+            120,
+            marker_state,
+            "invalid acknowledgement",
+            RetryPolicy { max_retries: 2 },
+            AppError::Runtime {
+                operation: "confirm agent launch gate release",
+            },
+        );
+        assert!(matches!(
+            error.stage,
+            super::AgentSpawnStage::PostMarker {
+                run_id,
+                resolved: true
+            } if run_id == run.run_id
+        ));
+        let state: (AgentRunStatus, EventStatus, InterventionStatus, Option<String>) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT agent_runs.status, events.status, interventions.status,
+                        events.last_error
+                 FROM agent_runs
+                 JOIN agent_run_events
+                   ON agent_run_events.run_id = agent_runs.run_id
+                  AND agent_run_events.project_id = agent_runs.project_id
+                 JOIN events
+                   ON events.event_id = agent_run_events.event_id
+                  AND events.project_id = agent_run_events.project_id
+                 JOIN interventions
+                   ON interventions.agent_run_id = agent_runs.run_id
+                  AND interventions.project_id = agent_runs.project_id
+                 WHERE agent_runs.run_id = ?1 AND interventions.intervention_id = ?2",
+                rusqlite::params![run.run_id, intervention.intervention_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, AgentRunStatus::Failed);
+        assert_eq!(state.1, EventStatus::DeadLetter);
+        assert_eq!(state.2, InterventionStatus::Applied);
+        assert_eq!(state.3.as_deref(), Some("post_marker_launch_gate_ack"));
+    }
 
     #[tokio::test]
     async fn launch_gate_exits_on_eof_without_executing_configured_agent() {
