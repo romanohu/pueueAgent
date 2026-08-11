@@ -234,6 +234,32 @@ fn negative_deep_check_interval_is_rejected() {
 }
 
 #[test]
+fn deep_check_interval_is_opt_in_and_legacy_frequency_does_not_enable_it() {
+    let disabled = load_config(valid_config()).unwrap();
+    assert_eq!(disabled.check.deep_check_interval_minutes, 0);
+    assert_eq!(disabled.check.deep_check_every, 6);
+
+    let enabled = load_config(
+        valid_config().replace("deep_check_interval_minutes = 0", "deep_check_interval_minutes = 30"),
+    )
+    .unwrap();
+    assert_eq!(enabled.check.deep_check_interval_minutes, 30);
+}
+
+#[test]
+fn periodic_deep_check_template_and_readme_explain_opt_in_health_records() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let template = fs::read_to_string(root.join("templates/config.toml")).unwrap();
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+
+    assert!(template.contains("deep_check_interval_minutes = 0"));
+    assert!(template.contains("legacy"));
+    assert!(readme.contains("deep_check_interval_minutes"));
+    assert!(readme.contains("`0` は無効"));
+    assert!(readme.contains("正常な進行を `STATE.md`"));
+}
+
+#[test]
 fn negative_retry_count_is_rejected() {
     let config = valid_config().replace("max_retries = 2", "max_retries = -1");
 

@@ -76,6 +76,9 @@ pueue-agent status --compact
 pueue-agent status --json
 pueue-agent pause
 pueue-agent resume
+pueue-agent start
+pueue-agent stop
+pueue-agent cancel --task-id <ID>
 pueue-agent disable
 pueue-agent disable --remove   # 登録と group の予約を明示的に解放する
 pueue-agent wake --reason "variant-2 の分析を始める"
@@ -84,11 +87,31 @@ pueue-agent runs --follow
 
 `pause` は pending event を保持したまま、新しい agent の起動と自動終了を停止します。`resume` で保持していた event を再び処理対象にできます。通常の `disable` は Pueue group の予約を維持します。`--remove` は明示的な登録解除であり、Pueue の status を取得できない場合は実行しません。
 
+`stop` は supervisor service を止め、`pause` は automation だけを止め、`cancel --task-id` は確認済みの Pueue task 1件を止めます。`disable` と `disable --remove` は project の automation / 登録を変更します。`stop` と `disable` は Pueue task を kill しません。Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る。操作対象と再開方法を含む日本語の手順は [運用ガイド](docs/operations-ja.md) を参照してください。
+
 `wake` は Pueue にダミー task を投入せず、operator wake event を SQLite に記録して supervisor の次の scheduler loop の処理対象にします。`runs --follow` は新しい agent run と submission の lineage を監視し、Ctrl-C まで追加分を表示します。`--follow` は端末での追跡用で、`--json` を併用すると新しいデータを検出した polling 単位で、複数 run を含み得る bounded JSON report を出力します。
+
+### pueue-agent の更新
+
+通常の更新は、監視対象の実験を止めずに supervisor だけを更新する次のコマンドです。
+
+```bash
+pueue-agent upgrade
+pueue-agent upgrade --json
+pueue-agent upgrade --pueue-config ~/.config/pueue/experiments.yml
+```
+
+`upgrade` は、現在の実行ファイルがプロジェクト checkout の `target/release/pueue-agent` にある場合、その checkout を source として自動検出します。検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を使い、どちらも使えない場合や別 checkout を指定したい場合は `--source <path>` を指定します。明示した `--source` が最優先です。source checkout には `git`、Rust stable、Cargo が必要です。Pueue の health check は supervisor と同じ profile を使い、設定の優先順位は `--pueue-config <path>`、`PUEUE_CONFIG`、インストール済み user service 定義の `--pueue-config`、既定の `~/.config/pueue/pueue.yml` です。
+
+更新対象は、clean な `main` branch が `origin/main` を追跡し、`origin/main` への fast-forward だけで更新できる checkout に限ります。dirty worktree、`main` 以外の branch、upstream の不一致、diverged checkout は拒否されます。更新前に enabled project の active agent run がある場合も拒否するため、先に agent run の完了または停止を確認してから再実行してください。upgrade のロックで同時実行も調整します。
+
+fetch、fast-forward、`cargo test --all-targets`、release build、binary の atomic install、service restart、health check の順で進みます。すでに current revision なら no-op として報告し、service は restart しません。fast-forward 後の失敗した revision は retry marker に残るため、条件を直した再実行で同じ revision の処理を再試行できます。binary install の前に service を停止して SQLite の整合性境界を作り、停止後に `VACUUM INTO` で snapshot を取得します。この短い窓では operator による SQLite の直接書き込みを避けてください。snapshot または binary install の前段で失敗した場合も、変更前の service を再起動して recovery 結果を report します。build、install 後の restart、health check が失敗した場合は SQLite snapshot と旧 binary を復元してから service を再起動し、report に rollback の成否を表示します。失敗後は表示された診断コマンドで状態を確認し、条件を直して `pueue-agent upgrade` を再実行してください。
+
+upgrade は supervisor の binary と service だけを対象にし、Pueue daemon、group、実験 task を kill・stop・変更しません。active agent run の存在中は安全側に拒否するため、実験を止める操作と upgrade を混同しないでください。source checkout や依存関係の問題で通常経路を使えない場合だけ、復旧手順として `git pull --ff-only` の後に `./install.sh` を実行します。手動手順を通常の更新経路にはしません。
 
 ### 人間向け出力と JSON 出力
 
-既定の人間向け出力は、`pueue-agent status` のような見出し、`key=value` の状態行、最後の `summary:` で構成されます。`status --compact` は daemon、Pueue task 数、experiment 数、agent run、event、guardrail を短く確認するための表示です。`status --json` は同じプロジェクト範囲の機械可読な report で、パイプや自動処理に使えます。JSON 出力には ANSI escape を入れず、上限を超える本文や secret らしい値を展開しません。
+既定の人間向け出力は、`pueue-agent status` のような見出し、`key=value` の状態行、最後の `summary:` で構成されます。`service:` は supervisor service、`automation:` は project automation、`project:` は enabled/paused/halted、`pueue:` は task snapshot、`agent_runs:` は agent run を別々に示します。`status --compact` はこれらと experiment、event、guardrail を短く確認するための表示です。`status --json` は同じプロジェクト範囲の機械可読な report で、パイプや自動処理に使えます。JSON 出力には ANSI escape を入れず、上限を超える本文や secret らしい値を展開しません。
 
 `pueue-agent` の human/JSON output は supervisor の投影です。`pueue status --json` の raw Pueue output とは形式も責務も異なり、前者は SQLite の event、incident、termination、agent run と Pueue の最新 snapshot を project scope でまとめます。`status --json` には submission の一覧を含めず、submission と task の lineage は `runs --json` で確認します。後者は Pueue daemon が持つ task の生データです。raw Pueue output が必要な低レベル調査では `pueue` を直接使えますが、pueue-agent の accounting や guardrail の確認には supervisor output と `events` / `runs` を使用してください。
 
@@ -180,6 +203,8 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 | `agent.max_retries` | 起動に失敗した場合の retry 上限。 |
 | `agent.context.mode` | `fresh`、`resume`、`resume_latest` のいずれか。既定値は `fresh`。 |
 | `check.interval_minutes` | supervisor が reconciliation を行う間隔。 |
+| `check.deep_check_every` | legacy の互換設定。`deep_check_interval_minutes` が `0` のままでは agent DeepCheck を有効にしない。 |
+| `check.deep_check_interval_minutes` | agent DeepCheck の間隔（分）。既定値の `0` は無効で、正の値を明示した場合だけ opt in する。 |
 | `check.log_tail_bytes` | 各ログから読み取る末尾の最大 byte 数。 |
 | `check.extra_log_paths` | 追加で検査する、プロジェクトからの相対パスのログ。 |
 | `check.patterns` | 名前付き regex、確認回数、`notify` / `wake` / `kill` action。 |
@@ -189,6 +214,14 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 未知のキーや不正な範囲の値は無視せず、エラーとして拒否します。
 
 `guardrails.max_experiments` は `kind = experiment` の submission だけを数えます。control submission は制御・準備用の履歴として残りますが、この実験 budget からは除外されます。機械的な判断を `STATE.md` の自由文へ移さず、canonical `.pueue-agent/state.json` の `budgets` と現在の設定を確認してください。
+
+### Periodic DeepCheck
+
+`check.interval_minutes` の reconciliation は、Pueue の status を再照合し、callback の取りこぼしを復旧して、範囲を制限した detector を実行する supervisor の機械的な処理です。正常な reconciliation は agent を起動しないため、agent のトークンを消費しません。
+
+agent DeepCheck は別の opt-in 機能です。`check.deep_check_interval_minutes` に正の分数を設定したときだけ、長時間実行中の実験について agent を起動し、metric と artifact から進行の健全性を確認します。この run は agent のトークンを消費します。`deep_check_every` は legacy の互換設定であり、`deep_check_interval_minutes = 0` のまま agent run を有効にすることはありません。
+
+periodic DeepCheck は task ごとではなく project ごとに coalesce します。同じ project に pending、claimed、または retry 待ちの periodic DeepCheck がある間は、長時間 task が複数あっても新しい periodic DeepCheck を追加しません。正常な進行を `STATE.md` に短い health record として残し、確認できない metric、値、進捗を記録しません。`STATE.md` は補足ノートなので、canonical `state.json` の budget や lineage を上書きしません。
 
 ### Codex の会話コンテキストを明示的に継続する
 

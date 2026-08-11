@@ -10,6 +10,7 @@ use crate::{
     detect::Detector,
     incidents::IncidentStore,
     pueue::PueueApi,
+    periodic::PeriodicDeepCheckScheduler,
     reconcile::{ReconcileReport, Reconciler},
     scheduler::{Scheduler, SchedulerConfig, SchedulerReport},
     termination::{TerminationManager, TerminationOutcome},
@@ -44,6 +45,7 @@ pub struct DaemonReport {
     pub reconciliation: ReconcileReport,
     pub observations: usize,
     pub termination_outcomes: Vec<TerminationOutcome>,
+    pub scheduled_deep_checks: usize,
     pub scheduler: SchedulerReport,
     pub finished_agents: usize,
     pub recovered_agent_runs: usize,
@@ -90,23 +92,26 @@ where
     }
 
     pub async fn run_once(&mut self) -> Result<DaemonReport, AppError> {
+        let now = self.now()?;
         let mut report = DaemonReport::default();
 
         if self.startup_recovery_pending {
             let recovery = AgentRunRepository::new(&self.db)
-                .recover_interrupted(self.now()?, DAEMON_RESTART_REASON)?;
+                .recover_interrupted(now, DAEMON_RESTART_REASON)?;
             self.startup_recovery_pending = false;
             report.recovered_agent_runs = recovery.failed_runs;
             report.requeued_agent_events = recovery.requeued_events;
         }
 
-        report.finished_agents += self.poll_agents().await?;
+        report.finished_agents += self.poll_agents_at(now).await?;
 
         let reconciliation = Reconciler::new(&self.db, self.pueue.clone())
-            .run_once()
+            .run_once_at(now)
             .await?;
         report.observations = self.run_detection(&reconciliation).await?;
         report.termination_outcomes = self.run_termination().await?;
+        report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
+            .schedule(&reconciliation.observed_tasks)?;
 
         let mut scheduler = Scheduler::new(
             self.db.clone(),
@@ -114,7 +119,7 @@ where
                 operation: "take daemon scheduler runner",
             })?,
             SchedulerConfig {
-                now: self.now()?,
+                now,
                 lease_seconds: self.config.lease_seconds,
                 claim_limit: self.config.claim_limit,
             },
@@ -128,7 +133,7 @@ where
                 .map(|started| started.handle),
         );
         report.scheduler = scheduler_report;
-        report.finished_agents += self.poll_agents().await?;
+        report.finished_agents += self.poll_agents_at(now).await?;
         report.reconciliation = reconciliation;
         Ok(report)
     }
@@ -182,7 +187,10 @@ where
     }
 
     async fn poll_agents(&mut self) -> Result<usize, AppError> {
-        let now = self.now()?;
+        self.poll_agents_at(self.now()?).await
+    }
+
+    async fn poll_agents_at(&mut self, now: i64) -> Result<usize, AppError> {
         let mut finished = 0;
         let mut index = 0;
         while index < self.active_agents.len() {

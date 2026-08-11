@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
-    daemon::{Daemon, DaemonConfig},
+    daemon::{Daemon, DaemonConfig, DaemonReport},
     db::{AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository},
     interventions::InterventionStatus,
     models::{
@@ -45,6 +45,10 @@ impl FakePueue {
         *self.status_calls.lock().unwrap()
     }
 
+    fn set_tasks(&self, tasks: Vec<PueueTask>) {
+        *self.tasks.lock().unwrap() = tasks;
+    }
+
     fn kill_calls(&self) -> Vec<i64> {
         self.kill_calls.lock().unwrap().clone()
     }
@@ -69,6 +73,10 @@ impl PueueApi for FakePueue {
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
         self.kill_calls.lock().unwrap().push(task_id);
         Ok(())
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("daemon loop must not remove Pueue tasks")
     }
 
     async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
@@ -184,6 +192,10 @@ max_agent_runs = 10
     }
 
     fn daemon(&self) -> Daemon<FakePueue> {
+        self.daemon_at(self.now)
+    }
+
+    fn daemon_at(&self, now: i64) -> Daemon<FakePueue> {
         Daemon::new(
             self.db.clone(),
             self.fake_pueue.clone(),
@@ -194,10 +206,29 @@ max_agent_runs = 10
                 interval: Duration::from_millis(10),
                 lease_seconds: 60,
                 claim_limit: 100,
-                now_override: Some(self.now),
+                now_override: Some(now),
                 shutdown_grace_period: Duration::from_secs(30),
             },
         )
+    }
+
+    fn running_task_with_deep_check_interval(interval_minutes: u32) -> Self {
+        let harness = Self::new();
+        let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(
+            config_path,
+            config.replace(
+                "deep_check_interval_minutes = 0",
+                &format!("deep_check_interval_minutes = {interval_minutes}"),
+            ),
+        )
+        .unwrap();
+        harness
+    }
+
+    async fn run_once_at(&self, now: i64) -> DaemonReport {
+        self.daemon_at(now).run_once().await.unwrap()
     }
 
     fn enqueue(&self, kind: EventKind, project_id: &str, dedup_key: &str) -> i64 {
@@ -220,6 +251,23 @@ max_agent_runs = 10
             .unwrap()
             .unwrap()
             .status
+    }
+
+    fn project_event_count(&self, kind: EventKind) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE project_id = ?1 AND kind = ?2",
+                rusqlite::params!["project-a", kind],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn insert_active_agent_run(&self) {
+        let event_id = self.enqueue(EventKind::TaskFailed, "project-a", "active-agent-run");
+        self.insert_active_run("project-a", event_id, AgentRunStatus::Running);
     }
 
     fn observation_count(&self) -> i64 {
@@ -409,6 +457,29 @@ async fn daemon_run_once_invokes_reconciliation_detection_termination_and_schedu
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(harness.agent_run_count(), 1);
     assert_eq!(harness.event_status(scheduled), EventStatus::Completed);
+}
+
+#[tokio::test]
+async fn daemon_schedules_deep_check_after_interval_for_running_task() {
+    let harness = DaemonHarness::running_task_with_deep_check_interval(30);
+    let report = harness.run_once_at(3_700).await;
+
+    assert_eq!(report.scheduled_deep_checks, 1);
+    assert_eq!(harness.project_event_count(EventKind::DeepCheck), 1);
+}
+
+#[tokio::test]
+async fn daemon_does_not_schedule_deep_check_while_agent_is_active() {
+    let harness = DaemonHarness::running_task_with_deep_check_interval(30);
+    harness.fake_pueue.set_tasks(Vec::new());
+    let mut daemon = harness.daemon_at(3_700);
+    daemon.run_once().await.unwrap();
+    harness.fake_pueue.set_tasks(vec![running_task()]);
+    harness.insert_active_agent_run();
+    let report = daemon.run_once().await.unwrap();
+
+    assert_eq!(report.scheduled_deep_checks, 0);
+    assert_eq!(harness.project_event_count(EventKind::DeepCheck), 0);
 }
 
 #[tokio::test]

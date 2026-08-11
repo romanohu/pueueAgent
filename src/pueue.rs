@@ -77,6 +77,8 @@ pub trait PueueApi: Send + Sync {
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError>;
 
+    async fn remove(&self, task_id: i64) -> Result<(), AppError>;
+
     async fn ensure_group(&self, group: &str) -> Result<(), AppError>;
 }
 
@@ -179,6 +181,12 @@ impl PueueApi for CommandPueue {
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
         self.execute("kill", &[OsString::from(task_id.to_string())])
+            .await?;
+        Ok(())
+    }
+
+    async fn remove(&self, task_id: i64) -> Result<(), AppError> {
+        self.execute("remove", &[OsString::from(task_id.to_string())])
             .await?;
         Ok(())
     }

@@ -25,6 +25,7 @@ use crate::{
         Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
         TerminationRequestStatus,
     },
+    output::bounded_redacted_text,
     AppError,
 };
 
@@ -378,6 +379,40 @@ impl<'db> ProjectRepository<'db> {
         Ok(project)
     }
 
+    pub fn record_task_cancellation(
+        &self,
+        project: &Project,
+        task_id: i64,
+        task_signature: &str,
+        requested_state: &str,
+        action: &str,
+        final_state: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin task cancellation operator log"))?;
+        insert_operator_log(
+            &transaction,
+            project,
+            "cancel",
+            &json!({
+                "task_id": task_id,
+                "task_signature": bounded_redacted_text(task_signature),
+                "requested_state": bounded_redacted_text(requested_state),
+                "action": bounded_redacted_text(action),
+                "final_state": bounded_redacted_text(final_state),
+                "reason": bounded_redacted_text(reason),
+            }),
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit task cancellation operator log"))
+    }
+
     pub fn find_by_root(&self, root: &std::path::Path) -> Result<Option<Project>, AppError> {
         let canonical_root = match fs::canonicalize(root) {
             Ok(path) => path,
@@ -443,6 +478,14 @@ impl<'db> EventRepository<'db> {
     }
 
     pub fn insert_idempotent(&self, event: &NewEvent) -> Result<Event, AppError> {
+        self.insert_idempotent_with_inserted(event)
+            .map(|(event, _)| event)
+    }
+
+    pub fn insert_idempotent_with_inserted(
+        &self,
+        event: &NewEvent,
+    ) -> Result<(Event, bool), AppError> {
         let payload_json =
             serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
                 operation: "serialize event payload",
@@ -452,7 +495,7 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin idempotent event insert"))?;
-        transaction
+        let inserted = transaction
             .execute(
                 "INSERT INTO events (
                     project_id, kind, dedup_key, payload_json, status, attempts,
@@ -479,7 +522,134 @@ impl<'db> EventRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit idempotent event insert"))?;
-        Ok(stored)
+        Ok((stored, inserted == 1))
+    }
+
+    pub fn insert_periodic_deep_check_if_due(
+        &self,
+        event: &NewEvent,
+        oldest_running_task_started_at: Option<i64>,
+        interval_seconds: i64,
+    ) -> Result<bool, AppError> {
+        let payload_json =
+            serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
+                operation: "serialize periodic deep check payload",
+                source,
+            })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin periodic deep check scheduling"))?;
+
+        let has_open_event = transaction
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                   AND status IN ('pending', 'claimed', 'retry_wait')
+                 LIMIT 1",
+                [event.project_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(database_error("recheck open periodic deep check"))?
+            .is_some();
+        if has_open_event {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let project_active = transaction
+            .query_row(
+                "SELECT enabled, paused, halted_reason
+                 FROM projects
+                 WHERE project_id = ?1",
+                [event.project_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("recheck project lifecycle for periodic deep check"))?;
+        if !project_active.is_some_and(|(enabled, paused, halted_reason)| {
+            enabled && !paused && halted_reason.is_none()
+        }) {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped inactive periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let has_active_agent = transaction
+            .query_row(
+                "SELECT 1 FROM agent_runs
+                 WHERE project_id = ?1
+                   AND status IN ('starting', 'running')
+                 LIMIT 1",
+                [event.project_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(database_error("recheck active agent run for periodic deep check"))?
+            .is_some();
+        if has_active_agent {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let last_scheduled_at = transaction
+            .query_row(
+                "SELECT created_at FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                [event.project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("recheck latest periodic deep check"))?;
+        let anchor = last_scheduled_at
+            .max(oldest_running_task_started_at)
+            .unwrap_or(event.created_at);
+        if event.created_at.saturating_sub(anchor) < interval_seconds {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred periodic deep check"))?;
+            return Ok(false);
+        }
+
+        let inserted = transaction
+            .execute(
+                "INSERT INTO events (
+                    project_id, kind, dedup_key, payload_json, status, attempts,
+                    not_before, lease_until, created_at, completed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?6, NULL, NULL)
+                 ON CONFLICT(project_id, dedup_key) DO NOTHING",
+                params![
+                    event.project_id,
+                    event.kind,
+                    event.dedup_key,
+                    payload_json,
+                    event.not_before,
+                    event.created_at,
+                ],
+            )
+            .map_err(database_error("insert periodic deep check event"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit periodic deep check scheduling"))?;
+        Ok(inserted == 1)
     }
 
     pub fn find_by_id(&self, event_id: i64) -> Result<Option<Event>, AppError> {
@@ -508,6 +678,44 @@ impl<'db> EventRepository<'db> {
             )
             .optional()
             .map_err(database_error("find event by deduplication key"))
+    }
+
+    pub fn latest_periodic_deep_check_at(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<i64>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT created_at FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("find latest periodic deep check"))
+    }
+
+    pub fn has_open_periodic_deep_check(&self, project_id: &str) -> Result<bool, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE project_id = ?1
+                   AND kind = 'deep_check'
+                   AND dedup_key LIKE 'periodic-deep-check:v1:%'
+                   AND status IN ('pending', 'claimed', 'retry_wait')
+                 LIMIT 1",
+                [project_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(database_error("check open periodic deep check"))
     }
 
     pub fn find_terminal_by_pueue_task(
@@ -747,6 +955,33 @@ impl<'db> EventRepository<'db> {
             .commit()
             .map_err(database_error("commit expired claim recovery"))?;
         Ok(recovered)
+    }
+
+    pub fn defer_claimed(&self, event_ids: &[i64]) -> Result<usize, AppError> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin deferred event release"))?;
+        let mut changed = 0;
+        for event_id in event_ids {
+            changed += transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'pending',
+                         lease_until = NULL,
+                         attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
+                     WHERE event_id = ?1 AND status = 'claimed'",
+                    [event_id],
+                )
+                .map_err(database_error("defer claimed event"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit deferred event release"))?;
+        Ok(changed)
     }
 
     pub fn transition_many(
@@ -3912,8 +4147,9 @@ impl<'db> TaskObservationRepository<'db> {
             .execute(
                 "INSERT INTO task_observations (
                     project_id, task_signature, pueue_task_id, pueue_group, command_json,
-                    state, enqueued_at, started_at, ended_at, result, observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    state, enqueued_at, started_at, ended_at, result, first_observed_at,
+                    observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(project_id, task_signature) DO UPDATE SET
                     pueue_task_id = excluded.pueue_task_id,
                     pueue_group = excluded.pueue_group,
@@ -3935,6 +4171,7 @@ impl<'db> TaskObservationRepository<'db> {
                     observation.started_at,
                     observation.ended_at,
                     observation.result,
+                    observation.observed_at,
                     observation.observed_at,
                 ],
             )
@@ -3972,6 +4209,23 @@ impl<'db> TaskObservationRepository<'db> {
             )
             .optional()
             .map_err(database_error("find task observation"))
+    }
+
+    pub fn first_observed_at(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+    ) -> Result<Option<i64>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT first_observed_at FROM task_observations
+                 WHERE project_id = ?1 AND task_signature = ?2",
+                params![project_id, task_signature],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("find first task observation time"))
     }
 
     pub fn find_by_pueue_task(

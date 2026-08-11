@@ -7,6 +7,7 @@ use pueue_agent::{
     db::{
         AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
         ProjectRepository, TaskObservationRepository, TerminationRequestRepository,
+        LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
         build_doctor_report, render_doctor_report, render_doctor_report_value, render_events,
@@ -433,7 +434,10 @@ fn canonical_state_doctor_reports_actual_sqlite_schema_version_in_json_and_text(
     let value: Value = serde_json::from_str(&json).unwrap();
     let schema = state_check(&value, "schema.version");
     assert_eq!(schema["status"], "ok");
-    assert!(schema["summary"].as_str().unwrap().contains("10"));
+    assert!(schema["summary"]
+        .as_str()
+        .unwrap()
+        .contains(&LATEST_SCHEMA_VERSION.to_string()));
     assert!(render_doctor_report_value(&report, false)
         .unwrap()
         .contains("schema.version: ok"));

@@ -1,4 +1,56 @@
 #[test]
+fn version_reports_package_revision_and_json_mode() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["version", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["schema_version"].is_u64());
+    assert!(value["package_version"].is_string());
+    assert!(value["revision"].is_string());
+    assert!(value["source"].is_string());
+    assert!(matches!(
+        value["service"].as_str(),
+        Some("running" | "stopped" | "not_installed" | "unknown")
+    ));
+}
+
+#[test]
+fn version_help_describes_json_output() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["version", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--json"));
+}
+
+#[test]
+fn upgrade_pre_run_errors_include_a_safe_diagnostic_command() {
+    for args in [
+        vec!["upgrade", "--source", "/tmp/nonexistent"],
+        vec!["upgrade", "--source", "/tmp/nonexistent", "--json"],
+    ] {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("next diagnostic: pueue-agent version"));
+        assert!(stderr.len() <= 500);
+    }
+}
+
+#[test]
 fn help_lists_diagnostics_commands_and_status_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -15,6 +67,21 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("explain"));
     assert!(text.contains("doctor"));
     assert!(text.contains("wake"));
+    assert!(text.contains("start"));
+    assert!(text.contains("stop"));
+    assert!(text.contains("upgrade"));
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["upgrade", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("--source"));
+    assert!(text.contains("--pueue-config"));
+    assert!(text.contains("--json"));
 
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -39,6 +106,23 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("--metadata"));
     assert!(text.contains("--metadata-json"));
     assert!(text.contains("--json"));
+}
+
+#[test]
+fn help_lists_service_lifecycle_commands() {
+    for command in ["start", "stop"] {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("--json"));
+        assert!(!text.contains("PROJECT_ROOT"));
+        assert!(!text.contains("PUEUE_CONFIG"));
+    }
 }
 
 #[test]
@@ -177,6 +261,11 @@ fn documentation_contract_covers_current_operator_surface() {
         "`status --json` には submission の一覧を含めず",
         "runs --json",
         "polling 単位",
+        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
+        "VACUUM INTO",
+        "service を停止して SQLite の整合性境界",
+        "SQLite snapshot と旧 binary",
+        "operator による SQLite の直接書き込み",
     ] {
         assert!(
             readme.contains(required),
@@ -191,6 +280,7 @@ fn documentation_contract_covers_current_operator_surface() {
         "experiment",
         "operator_wake",
         "pueue-agent steer",
+        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
     ] {
         assert!(
             instructions.contains(required),
@@ -203,6 +293,20 @@ fn documentation_contract_covers_current_operator_surface() {
         assert!(
             config.contains(required),
             "templates/config.toml is missing documentation contract text: {required}"
+        );
+    }
+
+    let operations = std::fs::read_to_string(root.join("docs/operations-ja.md")).unwrap();
+    for required in [
+        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
+        "VACUUM INTO",
+        "service を停止して SQLite の整合性境界",
+        "SQLite snapshot と旧 binary",
+        "operator による SQLite の直接書き込み",
+    ] {
+        assert!(
+            operations.contains(required),
+            "docs/operations-ja.md is missing upgrade consistency text: {required}"
         );
     }
 }

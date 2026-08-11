@@ -41,9 +41,15 @@ pub fn render_project_status(
         service_status_label(input.daemon_health)
     ));
     lines.push(format!(
+        "service: {}",
+        service_status_label(input.daemon_health)
+    ));
+    lines.push(format!("automation: {}", automation_status_label(project)));
+    lines.push(format!(
         "project: {}",
         bounded_redacted_text(&project.project_id)
     ));
+    lines.push(project_lifecycle_line(project));
     let root_path = project.root_path.to_string_lossy();
     lines.push(format!("root: {}", bounded_redacted_text(&root_path)));
     lines.push(format!(
@@ -59,15 +65,24 @@ pub fn render_project_status(
 
     let active_task_count = match &input.pueue {
         PueueSnapshot::Tasks(tasks) => {
-            let active = tasks
+            let project_tasks = tasks
                 .iter()
-                .filter(|task| {
-                    task.group == project.pueue_group
-                        && !task.is_terminal()
-                        && !task.state.eq_ignore_ascii_case("queued")
-                })
+                .filter(|task| task.group == project.pueue_group)
+                .collect::<Vec<_>>();
+            let active = project_tasks
+                .iter()
+                .filter(|task| !task.is_terminal() && !task.state.eq_ignore_ascii_case("queued"))
+                .copied()
                 .collect::<Vec<_>>();
             let active_count = active.len();
+            let queued = project_tasks
+                .iter()
+                .filter(|task| task.state.eq_ignore_ascii_case("queued"))
+                .count();
+            lines.push(format!(
+                "pueue: total={} active={active_count} queued={queued}",
+                project_tasks.len()
+            ));
             lines.push(format!("active_tasks: {active_count}"));
             for task in active {
                 lines.push(format!(
@@ -154,6 +169,12 @@ pub fn render_project_status_compact(
         "daemon: {}",
         service_status_label(input.daemon_health)
     ));
+    lines.push(format!(
+        "service: {}",
+        service_status_label(input.daemon_health)
+    ));
+    lines.push(format!("automation: {}", automation_status_label(project)));
+    lines.push(project_lifecycle_line(project));
 
     match &input.pueue {
         PueueSnapshot::Tasks(tasks) => {
@@ -254,6 +275,27 @@ fn service_status_label(status: ServiceStatus) -> &'static str {
         ServiceStatus::Stopped => "stopped",
         ServiceStatus::NotInstalled => "not_installed",
     }
+}
+
+fn automation_status_label(project: &Project) -> &'static str {
+    if !project.enabled {
+        "disabled"
+    } else if project.halted_reason.is_some() {
+        "halted"
+    } else if project.paused {
+        "paused"
+    } else {
+        "active"
+    }
+}
+
+fn project_lifecycle_line(project: &Project) -> String {
+    format!(
+        "project: enabled={} paused={} halted={}",
+        project.enabled,
+        project.paused,
+        project.halted_reason.is_some()
+    )
 }
 
 fn event_status_counts(db: &Db, project_id: &str) -> Result<BTreeMap<String, i64>, AppError> {

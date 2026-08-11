@@ -17,6 +17,7 @@ pub enum Command {
     Init(InitArgs),
     Enable(ProjectArgs),
     Disable(DisableArgs),
+    Cancel(CancelArgs),
     Submit(SubmitArgs),
     SubmitBatch(SubmitBatchArgs),
     Event(EventArgs),
@@ -30,6 +31,10 @@ pub enum Command {
     Resume(ProjectArgs),
     Steer(SteerArgs),
     Wake(WakeArgs),
+    Version(VersionArgs),
+    Upgrade(UpgradeArgs),
+    Start(ServiceLifecycleArgs),
+    Stop(ServiceLifecycleArgs),
     Daemon(DaemonArgs),
 }
 
@@ -134,6 +139,18 @@ pub struct DisableArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct CancelArgs {
+    #[arg(long, value_name = "TASK_ID")]
+    pub task_id: i64,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 pub struct SubmitArgs {
     #[arg(long, value_enum, default_value_t = SubmissionKind::Experiment)]
     pub kind: SubmissionKind,
@@ -196,6 +213,28 @@ pub struct WakeArgs {
     pub pueue_config: Option<PathBuf>,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct VersionArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UpgradeArgs {
+    #[arg(long, value_name = "SOURCE")]
+    pub source: Option<PathBuf>,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceLifecycleArgs {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]

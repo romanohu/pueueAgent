@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod batches;
+pub mod cancel;
 pub mod cli;
 pub mod codex_session;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod logs;
 pub mod models;
 pub mod output;
 pub mod paths;
+pub mod periodic;
 pub mod project;
 pub mod pueue;
 pub mod reconcile;
@@ -27,5 +29,7 @@ pub mod state;
 pub mod status;
 pub mod submit;
 pub mod termination;
+pub mod upgrade;
+pub mod version;
 
 pub use error::AppError;

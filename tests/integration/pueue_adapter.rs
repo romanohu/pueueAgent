@@ -139,6 +139,38 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
 }
 
 #[tokio::test]
+async fn command_adapter_kills_only_the_requested_task_id() {
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+
+    adapter.kill(41).await.unwrap();
+
+    assert_eq!(
+        fixture.captured_args(),
+        vec!["--config", "profile path.yml", "kill", "41"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_removes_only_the_requested_task_id() {
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+
+    adapter.remove(41).await.unwrap();
+
+    assert_eq!(
+        fixture.captured_args(),
+        vec!["--config", "profile path.yml", "remove", "41"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn command_adapter_provisions_group_without_shell() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
@@ -400,6 +432,21 @@ async fn non_zero_exit_is_a_typed_error_with_captured_output() {
             assert_eq!(exit_code, Some(7));
             assert_eq!(stdout, b"partial output");
             assert_eq!(stderr, b"daemon unavailable");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remove_non_zero_exit_is_a_typed_error_with_captured_output() {
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", Some("remove"));
+    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+
+    let error = adapter.remove(41).await.unwrap_err();
+
+    match error {
+        AppError::Pueue(PueueError::CommandFailed { operation, .. }) => {
+            assert_eq!(operation, "remove");
         }
         other => panic!("unexpected error: {other:?}"),
     }

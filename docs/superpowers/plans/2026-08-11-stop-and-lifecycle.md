@@ -4,7 +4,7 @@
 
 **Goal:** 自律 dispatch、supervisor service、Pueue task、project 登録の停止経路を分離し、`pause`、`start`、`stop`、`cancel`、`disable` を誤解なく使えるようにする。
 
-**Architecture:** Service lifecycle は `ServiceControl` の start/stop/restart API に集約する。project の pause/halt は SQLite state、task の cancel は現在の Pueue signature を再検証してから Pueue kill、登録解除は既存 disable flow のまま責務を分ける。status は service、automation、Pueue、agent を別フィールドで表示する。
+**Architecture:** Service lifecycle は `ServiceControl` の start/stop/restart API に集約する。project の pause/halt は SQLite state、task の cancel は現在の Pueue signature を再検証してから queued task には Pueue remove、running task には Pueue kill を使い、登録解除は既存 disable flow のまま責務を分ける。status は service、automation、Pueue、agent を別フィールドで表示する。
 
 **Tech Stack:** Rust 2021、Clap、Tokio、rusqlite migrations、既存 ServiceManager/PueueApi abstractions、integration tests、既存 systemd/launchd adapters。
 
@@ -12,7 +12,7 @@
 
 - `pause` は新規 agent、定期 DeepCheck、自動 termination だけを止め、Pueue task と実行中 agent を止めない。
 - `stop` は supervisor service だけを止め、Pueue task と project state を変更しない。
-- `cancel --task-id ID` は明示した project group の queued/running task だけを対象にし、初期実装では `--all` を提供しない。
+- `cancel --task-id ID` は明示した project group の queued/running task だけを対象にし、queued は remove、running は kill として確認結果を保存する。初期実装では `--all` を提供しない。
 - stale task ID、別 project group、terminal task は kill しない。
 - `disable` と `disable --remove` の既存の reservation semantics を維持する。
 - 既存の SQLite data を破壊せず、operator log の cancel action は migration で追加する。
@@ -188,8 +188,8 @@ git commit -m "feat: persist operator task cancellation"
 **Interfaces:**
 - Add `CancelArgs { task_id: i64, json: bool, pueue_config: Option<PathBuf>, project_root: Option<PathBuf> }`.
 - Add `pub async fn cancel_task_with(db: &Db, project: &Project, pueue: &impl PueueApi, task_id: i64, now: i64) -> Result<CancelResult, AppError>`.
-- `CancelResult` contains task ID, signature, request state, final observed state, and whether `kill` was sent.
-- The test step defines `CancelHarness` with a temp project database, an in-memory Pueue task list, kill-call recording, and operator-log query helpers.
+- `CancelResult` contains task ID, signature, request state, final observed state, action, and whether `kill` was sent. A confirmed queued removal is represented as `Removed`.
+- The test step defines `CancelHarness` with a temp project database, an in-memory Pueue task list, kill/remove-call recording, operator-log query helpers, and termination-failure event assertions.
 
 - [ ] **Step 1: Add failing cancel tests**
 
@@ -218,9 +218,9 @@ async fn cancel_refuses_other_group_stale_id_and_terminal_task() {
 Run: `cargo test --test operator_commands cancel_ -- --nocapture`
 Expected: FAIL because the command and cancel service do not exist.
 
-- [ ] **Step 3: Implement signature revalidation and kill**
+- [ ] **Step 3: Implement signature revalidation and action confirmation**
 
-Call `pueue.status_json()` first. Find exactly one task with the requested ID and require `task.group == project.pueue_group` and a non-terminal state. Compute the same stable task signature used by reconciliation, record an operator cancel request, call `pueue.kill(task_id)`, query status once more for the final observed state, and record the result. Do not call `kill` after status failure, group mismatch, terminal state, or ambiguous task ID. Do not use a raw OS signal.
+Call `pueue.status_json()` first. Find exactly one task with the requested ID and require `task.group == project.pueue_group` and a queued or running state. Compute the same stable task signature used by reconciliation, record an operator cancel request, call `pueue.remove(task_id)` for queued tasks or `pueue.kill(task_id)` for running tasks, query status once more for the final observed state, and record the result. A missing task after a successful queued remove is a confirmed `Removed` result. If a running task remains non-terminal, persist a `TerminationFailed` event and return an error. Do not call either action after status failure, group mismatch, terminal state, or ambiguous task ID. Do not use a raw OS signal.
 
 - [ ] **Step 4: Wire the CLI and run tests**
 
@@ -283,4 +283,4 @@ git commit -m "docs: clarify stop and lifecycle operations"
 - Run `cargo fmt --all` and then `cargo fmt --check`.
 - Run `cargo test --all-targets`.
 - Run `git diff --check`.
-- Verify manually that `stop` leaves a fake Pueue task running, `pause` leaves both the task and current agent running, and `cancel --task-id` sends exactly one kill only for the registered group.
+- Verify manually that `stop` leaves a fake Pueue task running, `pause` leaves both the task and current agent running, and `cancel --task-id` sends exactly one remove or kill only for the registered group and reports unconfirmed termination as failure.

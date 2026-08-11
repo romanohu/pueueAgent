@@ -43,6 +43,10 @@ where
     }
 
     pub async fn run_once(&mut self) -> Result<ReconcileReport, AppError> {
+        self.run_once_at(unix_timestamp()?).await
+    }
+
+    pub async fn run_once_at(&mut self, now: i64) -> Result<ReconcileReport, AppError> {
         // The status call is deliberately made before any observation write. An
         // unavailable or malformed response must never be treated as an idle
         // snapshot and must leave the previous observations untouched.
@@ -52,7 +56,6 @@ where
             .iter()
             .map(|project| (project.pueue_group.as_str(), project))
             .collect::<BTreeMap<_, _>>();
-        let now = unix_timestamp()?;
         let mut report = ReconcileReport {
             status_task_count: tasks.len(),
             ..ReconcileReport::default()
@@ -317,7 +320,7 @@ fn shell_quote(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', r"'\''"))
 }
 
-fn parse_timestamp(value: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp(value: &str) -> Option<i64> {
     if let Ok(seconds) = value.parse::<i64>() {
         return Some(seconds);
     }

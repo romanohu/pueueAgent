@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 10;
+pub const LATEST_SCHEMA_VERSION: i64 = 12;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -21,7 +21,7 @@ const OPERATOR_LOGS_SQL: &str = r#"
         project_id TEXT NOT NULL,
         pueue_group TEXT NOT NULL,
         action TEXT NOT NULL CHECK (action IN (
-            'pause', 'resume', 'halt', 'disable', 'remove'
+            'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
         )),
         details_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
@@ -199,6 +199,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 started_at INTEGER,
                 ended_at INTEGER,
                 result TEXT,
+                first_observed_at INTEGER NOT NULL,
                 observed_at INTEGER NOT NULL,
                 PRIMARY KEY(project_id, task_signature)
             );
@@ -208,7 +209,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 project_id TEXT NOT NULL,
                 pueue_group TEXT NOT NULL,
                 action TEXT NOT NULL CHECK (action IN (
-                    'pause', 'resume', 'halt', 'disable', 'remove'
+                    'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
                 )),
                 details_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL
@@ -383,6 +384,12 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version <= 9 {
         migrate_batches_to_v10(&transaction)?;
     }
+    if version <= 10 {
+        migrate_operator_logs_to_v11(&transaction)?;
+    }
+    if version <= 11 {
+        migrate_task_observations_to_v12(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -484,6 +491,78 @@ fn migrate_batches_to_v10(transaction: &rusqlite::Transaction<'_>) -> Result<(),
     transaction
         .execute_batch("PRAGMA user_version = 10;")
         .map_err(database_error("set SQLite v10 schema version"))
+}
+
+fn migrate_operator_logs_to_v11(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    transaction
+        .execute_batch(
+            r#"
+        DROP INDEX IF EXISTS operator_logs_project_created_idx;
+        ALTER TABLE operator_logs RENAME TO operator_logs_v10_legacy;
+        CREATE TABLE operator_logs (
+            log_id INTEGER PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            pueue_group TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN (
+                'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
+            )),
+            details_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO operator_logs (
+            log_id, project_id, pueue_group, action, details_json, created_at
+        )
+        SELECT log_id, project_id, pueue_group, action, details_json, created_at
+        FROM operator_logs_v10_legacy;
+        DROP TABLE operator_logs_v10_legacy;
+        CREATE INDEX operator_logs_project_created_idx
+            ON operator_logs(project_id, created_at, log_id);
+        PRAGMA user_version = 11;
+        "#,
+        )
+        .map_err(database_error("apply SQLite v11 operator log migration"))
+}
+
+fn migrate_task_observations_to_v12(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_task_observations: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_observations'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check task observations for migration"))?;
+    if has_task_observations {
+        let has_first_observed_at: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('task_observations')
+                     WHERE name = 'first_observed_at'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check task observation anchor for migration"))?;
+        if !has_first_observed_at {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE task_observations
+                         ADD COLUMN first_observed_at INTEGER NOT NULL DEFAULT 0;
+                     UPDATE task_observations
+                        SET first_observed_at = observed_at;",
+                )
+                .map_err(database_error("add task observation anchor"))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 12;")
+        .map_err(database_error("set SQLite v12 task observation migration"))
 }
 
 fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

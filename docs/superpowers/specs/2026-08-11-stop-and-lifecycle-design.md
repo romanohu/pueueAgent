@@ -51,7 +51,7 @@ daemon が SIGTERM を受けた場合は、既存の shutdown grace period の�
 
 1. 指定 task が現在の project group に属することを確認する。
 2. task の最新 signature と状態を Pueue status から再検証する。
-3. queued または running の task に対してだけ Pueue の kill API を呼ぶ。
+3. queued の task には Pueue の remove API、running の task には kill API を呼ぶ。
 4. request、operator event、最終状態を SQLite に保存する。
 5. task ID の再利用や stale status が検出された場合は kill せず停止する。
 
@@ -90,7 +90,7 @@ agent_runs: active=0
 - pause が agent dispatch、periodic DeepCheck、automatic termination を止め、Pueue task を止めない。
 - stop が supervisor service だけを止め、Pueue task と project state を変更しない。
 - start が service の起動状態を確認して戻る。
-- cancel が同じ project group の指定 task だけを kill する。
+- cancel が同じ project group の指定 task だけを対象にし、queued は remove、running は kill する。
 - 別 project の task、stale task signature、terminal task は cancel しない。
 - disable と disable --remove の違いが、group reservation と project registration に反映される。
 - daemon の SIGTERM 後に agent event が recovery され、Pueue task が継続する。

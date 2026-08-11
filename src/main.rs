@@ -41,6 +41,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Init(args) => commands::init(args),
         Command::Enable(args) => commands::enable(args).await,
         Command::Disable(args) => commands::disable(args).await,
+        Command::Cancel(args) => commands::cancel(args).await,
         Command::Submit(args) => commands::submit(args).await,
         Command::SubmitBatch(args) => commands::submit_batch(args).await,
         Command::Event(args) => commands::event(args),
@@ -54,19 +55,25 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Resume(args) => commands::resume(args),
         Command::Steer(args) => commands::steer(args),
         Command::Wake(args) => commands::wake(args),
+        Command::Version(args) => commands::version(args),
+        Command::Upgrade(args) => commands::upgrade(args).await,
+        Command::Start(args) => commands::start(args),
+        Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
     }
 }
 
 mod commands {
-    use std::{env, ffi::OsString};
+    use std::{env, ffi::OsString, path::PathBuf};
 
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
+        cancel::{cancel_task_with, render_cancel_result},
         cli::{
-            DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, RunsArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs,
-            SubmitBatchArgs, WakeArgs,
+            CancelArgs, DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs,
+            InitArgs, InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs,
+            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, UpgradeArgs, VersionArgs,
+            WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -83,10 +90,13 @@ mod commands {
         pueue::{CommandPueue, PueueApi},
         service::{
             enable_with, CallbackRegistry, EnableOptions, PueueConfigCallbackRegistry,
-            ServiceControl, ServiceManager, ServicePaths,
+            ServiceControl, ServiceManager, ServicePaths, ServiceStatus,
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
-        submit as submit_command, AppError,
+        submit as submit_command,
+        upgrade::{self, resolve_source_root, ProcessUpgradeCommandRunner, UpgradeRunner},
+        version::{self, BuildInfo},
+        AppError,
     };
 
     pub fn init(args: InitArgs) -> Result<(), AppError> {
@@ -167,6 +177,20 @@ mod commands {
                 );
             }
         }
+        Ok(())
+    }
+
+    pub async fn cancel(args: CancelArgs) -> Result<(), AppError> {
+        let CancelArgs {
+            task_id,
+            json,
+            pueue_config,
+            project_root,
+        } = args;
+        let (db, project, service_paths) = resolve_project(project_root, pueue_config)?;
+        let pueue = configured_pueue(&service_paths);
+        let result = cancel_task_with(&db, &project, &pueue, task_id, unix_timestamp()?).await?;
+        println!("{}", render_cancel_result(&project, &result, json));
         Ok(())
     }
 
@@ -448,6 +472,73 @@ mod commands {
         Ok(())
     }
 
+    pub fn version(args: VersionArgs) -> Result<(), AppError> {
+        println!("{}", version::render(BuildInfo::current()?, args.json)?);
+        Ok(())
+    }
+
+    pub async fn upgrade(args: UpgradeArgs) -> Result<(), AppError> {
+        let json = args.json;
+        let current_exe = env::current_exe()
+            .map_err(|source| AppError::Io {
+                operation: "resolve current executable for upgrade",
+                source,
+            })
+            .map_err(upgrade_diagnostic_error)?;
+        let env_source = env::var_os(upgrade::SOURCE_ROOT_ENV).map(PathBuf::from);
+        let source = resolve_source_root(
+            args.source.as_deref(),
+            &current_exe,
+            env_source.as_deref(),
+        )
+        .map_err(upgrade_diagnostic_error)?;
+        let mut options = upgrade::UpgradeOptions::from_args(args);
+        options.source = Some(source);
+        let state_db = paths::state_db_path().map_err(upgrade_diagnostic_error)?;
+        let db = Db::open(&state_db).map_err(upgrade_diagnostic_error)?;
+        let service = ServiceManager;
+        let commands = ProcessUpgradeCommandRunner;
+        match UpgradeRunner::new(options, &db, &service, &commands).run().await {
+            Ok(report) => {
+                println!("{}", upgrade::render_report(&report, json)?);
+                Ok(())
+            }
+            Err(failure) => {
+                if let Some(report) = failure.report() {
+                    println!("{}", upgrade::render_failure_report(report, json)?);
+                }
+                Err(upgrade_diagnostic_error(failure))
+            }
+        }
+    }
+
+    fn upgrade_diagnostic_error(error: impl std::fmt::Display) -> AppError {
+        AppError::Message {
+            message: format!(
+                "{}; next diagnostic: pueue-agent version",
+                bounded_redacted_text(&error.to_string())
+            ),
+        }
+    }
+
+    pub fn start(args: ServiceLifecycleArgs) -> Result<(), AppError> {
+        let service = ServiceManager;
+        service.start()?;
+        if service.status()? != ServiceStatus::Running {
+            return Err(AppError::Runtime {
+                operation: "verify service started",
+            });
+        }
+        print_service_lifecycle("start", "running", args.json);
+        Ok(())
+    }
+
+    pub fn stop(args: ServiceLifecycleArgs) -> Result<(), AppError> {
+        ServiceManager.stop()?;
+        print_service_lifecycle("stop", "stopped", args.json);
+        Ok(())
+    }
+
     pub async fn daemon(args: DaemonArgs) -> Result<(), AppError> {
         let db = Db::open(&paths::state_db_path()?)?;
         let fixed_args = args
@@ -463,6 +554,27 @@ mod commands {
             DaemonConfig::default(),
         );
         daemon.run(production_shutdown_token()).await
+    }
+
+    fn print_service_lifecycle(operation: &str, service: &str, json: bool) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "operation": operation,
+                    "service": service,
+                })
+            );
+        } else {
+            println!("pueue-agent {operation}");
+            println!("service: {}", format_state(service));
+            println!("{}", human_summary(match operation {
+                "start" => "service started",
+                "stop" => "service stopped",
+                _ => "service lifecycle operation completed",
+            }));
+        }
     }
 
     fn unix_timestamp() -> Result<i64, AppError> {
