@@ -4018,8 +4018,9 @@ impl<'db> TaskObservationRepository<'db> {
             .execute(
                 "INSERT INTO task_observations (
                     project_id, task_signature, pueue_task_id, pueue_group, command_json,
-                    state, enqueued_at, started_at, ended_at, result, observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    state, enqueued_at, started_at, ended_at, result, first_observed_at,
+                    observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(project_id, task_signature) DO UPDATE SET
                     pueue_task_id = excluded.pueue_task_id,
                     pueue_group = excluded.pueue_group,
@@ -4041,6 +4042,7 @@ impl<'db> TaskObservationRepository<'db> {
                     observation.started_at,
                     observation.ended_at,
                     observation.result,
+                    observation.observed_at,
                     observation.observed_at,
                 ],
             )
@@ -4078,6 +4080,23 @@ impl<'db> TaskObservationRepository<'db> {
             )
             .optional()
             .map_err(database_error("find task observation"))
+    }
+
+    pub fn first_observed_at(
+        &self,
+        project_id: &str,
+        task_signature: &str,
+    ) -> Result<Option<i64>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT first_observed_at FROM task_observations
+                 WHERE project_id = ?1 AND task_signature = ?2",
+                params![project_id, task_signature],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("find first task observation time"))
     }
 
     pub fn find_by_pueue_task(

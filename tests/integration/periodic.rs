@@ -1,10 +1,16 @@
 use std::fs;
 
 use pueue_agent::{
-    db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
-    models::{AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject},
+    db::{
+        AgentRunRepository, Db, EventRepository, ProjectRepository, TaskObservationRepository,
+    },
+    models::{
+        AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject,
+        NewTaskObservation,
+    },
     periodic::PeriodicDeepCheckScheduler,
     pueue::PueueTask,
+    reconcile::task_signature,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -76,9 +82,31 @@ max_agent_runs = 1
     }
 
     fn schedule(&self, tasks: &[PueueTask]) -> usize {
-        PeriodicDeepCheckScheduler::new(&self.db, self.now)
+        self.schedule_at(self.now, tasks)
+    }
+
+    fn schedule_at(&self, now: i64, tasks: &[PueueTask]) -> usize {
+        PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(tasks)
             .unwrap()
+    }
+
+    fn observe_running_task(&self, task: &PueueTask, observed_at: i64) {
+        TaskObservationRepository::new(&self.db)
+            .upsert(&NewTaskObservation::new(
+                "project-a",
+                task_signature(task),
+                task.id,
+                task.group.clone(),
+                vec![task.command.clone()],
+                task.state.clone(),
+                None,
+                None,
+                None,
+                None,
+                observed_at,
+            ))
+            .unwrap();
     }
 
     fn running_task(&self, task_id: i64) -> PueueTask {
@@ -277,10 +305,40 @@ fn scheduler_limits_task_ids_without_copying_task_contents() {
 }
 
 #[test]
-fn scheduler_uses_now_as_the_anchor_for_an_unparseable_task_start() {
+fn scheduler_uses_persisted_first_observation_for_a_missing_task_start() {
+    let harness = PeriodicHarness::with_interval(30);
+    let mut task = harness.running_task(41);
+    task.started_at = None;
+
+    harness.observe_running_task(&task, 1_000);
+    assert_eq!(harness.schedule_at(1_000, std::slice::from_ref(&task)), 0);
+
+    harness.observe_running_task(&task, 2_000);
+    assert_eq!(harness.schedule_at(2_799, std::slice::from_ref(&task)), 0);
+    assert_eq!(harness.schedule_at(2_800, std::slice::from_ref(&task)), 1);
+
+    let observation = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT first_observed_at, observed_at FROM task_observations
+             WHERE project_id = 'project-a'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(observation, (1_000, 2_000));
+}
+
+#[test]
+fn scheduler_uses_persisted_first_observation_for_an_invalid_task_start() {
     let harness = PeriodicHarness::with_interval(30);
     let mut task = harness.running_task(41);
     task.started_at = Some("not-a-timestamp".to_owned());
 
-    assert_eq!(harness.schedule(&[task]), 0);
+    harness.observe_running_task(&task, 1_000);
+    harness.observe_running_task(&task, 2_000);
+
+    assert_eq!(harness.schedule_at(2_800, std::slice::from_ref(&task)), 1);
 }

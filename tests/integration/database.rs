@@ -11,6 +11,7 @@ use pueue_agent::{
         AgentRunRepository, BatchRepository, Db, EventRepository, IncidentRepository,
         InterventionRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
         TerminationRequestRepository,
+        LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     interventions::{
@@ -289,7 +290,7 @@ fn operator_log_migration_preserves_rows_and_allows_cancel() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
 
     let rows = connection
         .prepare(
@@ -417,7 +418,7 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     connection.execute(
         "INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at)
          VALUES ('v7-project', 'operator_wake', 'wake-v8', '{}', 'pending', 0, 100, 100)",
@@ -637,7 +638,7 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
 }
 
 #[test]
@@ -748,7 +749,7 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     assert!(columns.iter().any(|column| column == "kind"));
     assert!(columns.iter().any(|column| column == "metadata_json"));
     assert!(columns.iter().any(|column| column == "origin_agent_run_id"));
@@ -1714,7 +1715,7 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     assert_eq!(intervention_table_count, 1);
     assert_eq!(preserved_event_id, event_id);
     assert_eq!(preserved_project_id, "project-a");
@@ -2627,7 +2628,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     connection
         .execute(
             "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
@@ -2664,7 +2665,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 11);
+        assert_eq!(migrated_version, LATEST_SCHEMA_VERSION);
         assert_eq!(index_count, 1);
         drop(connection);
 
@@ -3291,6 +3292,84 @@ fn typed_repositories_round_trip_future_task_records() {
             .unwrap()
             .observed_at,
         102
+    );
+    assert_eq!(
+        observation_repository
+            .first_observed_at("project-a", "signature-a")
+            .unwrap(),
+        Some(101)
+    );
+}
+
+#[test]
+fn task_observation_migration_backfills_first_observed_at_without_changing_latest() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    TaskObservationRepository::new(&test.db)
+        .upsert(&NewTaskObservation::new(
+            "project-a",
+            "signature-a",
+            41,
+            "pa-project",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "running",
+            None,
+            None,
+            None,
+            None,
+            2_000,
+        ))
+        .unwrap();
+
+    let connection = Connection::open(&test.path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE task_observations RENAME TO task_observations_v11;
+            CREATE TABLE task_observations (
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                task_signature TEXT NOT NULL,
+                pueue_task_id INTEGER NOT NULL,
+                pueue_group TEXT NOT NULL,
+                command_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                enqueued_at INTEGER,
+                started_at INTEGER,
+                ended_at INTEGER,
+                result TEXT,
+                observed_at INTEGER NOT NULL,
+                PRIMARY KEY(project_id, task_signature)
+            );
+            INSERT INTO task_observations (
+                project_id, task_signature, pueue_task_id, pueue_group, command_json,
+                state, enqueued_at, started_at, ended_at, result, observed_at
+            )
+            SELECT project_id, task_signature, pueue_task_id, pueue_group, command_json,
+                   state, enqueued_at, started_at, ended_at, result, observed_at
+            FROM task_observations_v11;
+            DROP TABLE task_observations_v11;
+            PRAGMA user_version = 11;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    let observations = TaskObservationRepository::new(&migrated);
+    assert_eq!(
+        observations
+            .first_observed_at("project-a", "signature-a")
+            .unwrap(),
+        Some(2_000)
+    );
+    assert_eq!(
+        observations
+            .find("project-a", "signature-a")
+            .unwrap()
+            .unwrap()
+            .observed_at,
+        2_000
     );
 }
 
@@ -4015,7 +4094,7 @@ fn batch_v9_migration_preserves_projects_and_installs_bounded_tables() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     assert_eq!(
         connection
             .query_row(
@@ -4092,7 +4171,7 @@ fn batch_v10_migration_adds_lease_token_to_a_v9_database() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     let columns = connection
         .prepare("PRAGMA table_info(batch_requests)")
         .unwrap()

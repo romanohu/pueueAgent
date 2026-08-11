@@ -2,10 +2,12 @@ use serde_json::json;
 
 use crate::{
     config,
-    db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
+    db::{
+        AgentRunRepository, Db, EventRepository, ProjectRepository, TaskObservationRepository,
+    },
     models::{EventKind, NewEvent},
     pueue::PueueTask,
-    reconcile::parse_timestamp,
+    reconcile::{parse_timestamp, task_signature},
     AppError,
 };
 
@@ -26,6 +28,7 @@ impl<'db> PeriodicDeepCheckScheduler<'db> {
         let projects = ProjectRepository::new(self.db).list_enabled()?;
         let events = EventRepository::new(self.db);
         let agents = AgentRunRepository::new(self.db);
+        let observations = TaskObservationRepository::new(self.db);
         let mut scheduled = 0;
 
         for project in projects {
@@ -36,12 +39,17 @@ impl<'db> PeriodicDeepCheckScheduler<'db> {
                 .collect::<Vec<_>>();
             let oldest_running_task_started_at = running_tasks
                 .iter()
-                .map(|task| {
-                    task.started_at
-                        .as_deref()
-                        .and_then(parse_timestamp)
-                        .unwrap_or(self.now)
+                .map(|task| -> Result<i64, AppError> {
+                    if let Some(started_at) = task.started_at.as_deref().and_then(parse_timestamp)
+                    {
+                        return Ok(started_at);
+                    }
+                    Ok(observations
+                        .first_observed_at(&project.project_id, &task_signature(task))?
+                        .unwrap_or(self.now))
                 })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
                 .min();
             let interval_seconds = i64::from(check.deep_check_interval_minutes) * 60;
             let input = DeepCheckScheduleInput {
