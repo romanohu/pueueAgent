@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 10;
+pub const LATEST_SCHEMA_VERSION: i64 = 11;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -21,7 +21,7 @@ const OPERATOR_LOGS_SQL: &str = r#"
         project_id TEXT NOT NULL,
         pueue_group TEXT NOT NULL,
         action TEXT NOT NULL CHECK (action IN (
-            'pause', 'resume', 'halt', 'disable', 'remove'
+            'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
         )),
         details_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
@@ -208,7 +208,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 project_id TEXT NOT NULL,
                 pueue_group TEXT NOT NULL,
                 action TEXT NOT NULL CHECK (action IN (
-                    'pause', 'resume', 'halt', 'disable', 'remove'
+                    'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
                 )),
                 details_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL
@@ -383,6 +383,9 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version <= 9 {
         migrate_batches_to_v10(&transaction)?;
     }
+    if version <= 10 {
+        migrate_operator_logs_to_v11(&transaction)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -484,6 +487,38 @@ fn migrate_batches_to_v10(transaction: &rusqlite::Transaction<'_>) -> Result<(),
     transaction
         .execute_batch("PRAGMA user_version = 10;")
         .map_err(database_error("set SQLite v10 schema version"))
+}
+
+fn migrate_operator_logs_to_v11(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    transaction
+        .execute_batch(
+            r#"
+        DROP INDEX IF EXISTS operator_logs_project_created_idx;
+        ALTER TABLE operator_logs RENAME TO operator_logs_v10_legacy;
+        CREATE TABLE operator_logs (
+            log_id INTEGER PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            pueue_group TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN (
+                'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
+            )),
+            details_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO operator_logs (
+            log_id, project_id, pueue_group, action, details_json, created_at
+        )
+        SELECT log_id, project_id, pueue_group, action, details_json, created_at
+        FROM operator_logs_v10_legacy;
+        DROP TABLE operator_logs_v10_legacy;
+        CREATE INDEX operator_logs_project_created_idx
+            ON operator_logs(project_id, created_at, log_id);
+        PRAGMA user_version = 11;
+        "#,
+        )
+        .map_err(database_error("apply SQLite v11 operator log migration"))
 }
 
 fn migrate_interventions_to_v6(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

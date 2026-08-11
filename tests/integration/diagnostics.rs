@@ -433,7 +433,7 @@ fn canonical_state_doctor_reports_actual_sqlite_schema_version_in_json_and_text(
     let value: Value = serde_json::from_str(&json).unwrap();
     let schema = state_check(&value, "schema.version");
     assert_eq!(schema["status"], "ok");
-    assert!(schema["summary"].as_str().unwrap().contains("10"));
+    assert!(schema["summary"].as_str().unwrap().contains("11"));
     assert!(render_doctor_report_value(&report, false)
         .unwrap()
         .contains("schema.version: ok"));

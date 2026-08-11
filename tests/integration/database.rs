@@ -157,6 +157,57 @@ fn create_legacy_schema_without_active_agent_index(path: &Path, version: i64) {
         .unwrap();
 }
 
+fn open_v10_operator_log_fixture() -> (TempDir, PathBuf) {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("operator-logs-v10.sqlite3");
+    Db::open(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            DROP INDEX operator_logs_project_created_idx;
+            DROP TABLE operator_logs;
+            CREATE TABLE operator_logs (
+                log_id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                pueue_group TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN (
+                    'pause', 'resume', 'halt', 'disable', 'remove'
+                )),
+                details_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX operator_logs_project_created_idx
+                ON operator_logs(project_id, created_at, log_id);
+            PRAGMA user_version = 10;
+            "#,
+        )
+        .unwrap();
+    for (offset, action) in ["pause", "resume", "halt", "disable", "remove"]
+        .into_iter()
+        .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO operator_logs (
+                    project_id, pueue_group, action, details_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "project-a",
+                    "pa-project",
+                    action,
+                    format!(r#"{{"legacy_action":"{action}"}}"#),
+                    100 + offset as i64,
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    (temp, path)
+}
+
 #[test]
 fn open_configures_sqlite_and_installs_all_tables() {
     let test = TestDatabase::new();
@@ -230,6 +281,121 @@ fn open_configures_sqlite_and_installs_all_tables() {
 }
 
 #[test]
+fn operator_log_migration_preserves_rows_and_allows_cancel() {
+    let (_database, path) = open_v10_operator_log_fixture();
+
+    let db = Db::open(&path).unwrap();
+    let connection = db.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+
+    let rows = connection
+        .prepare(
+            "SELECT action, details_json FROM operator_logs
+             ORDER BY created_at, log_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("pause".to_owned(), r#"{"legacy_action":"pause"}"#.to_owned()),
+            ("resume".to_owned(), r#"{"legacy_action":"resume"}"#.to_owned()),
+            ("halt".to_owned(), r#"{"legacy_action":"halt"}"#.to_owned()),
+            ("disable".to_owned(), r#"{"legacy_action":"disable"}"#.to_owned()),
+            ("remove".to_owned(), r#"{"legacy_action":"remove"}"#.to_owned()),
+        ]
+    );
+
+    let index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'operator_logs_project_created_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_count, 1);
+
+    connection
+        .execute(
+            "INSERT INTO operator_logs (
+                project_id, pueue_group, action, details_json, created_at
+             ) VALUES (?1, ?2, 'cancel', ?3, ?4)",
+            params!["project-a", "pa-project", "{}", 200],
+        )
+        .unwrap();
+}
+
+#[test]
+fn task_cancellation_log_persists_bounded_redacted_details() {
+    let test = TestDatabase::new();
+    let root = test.project_root("cancel-log-project");
+    let project = NewProject::new(
+        "project-a",
+        &root,
+        "pa-project",
+        root.join(".pueue-agent/config.toml"),
+        100,
+    );
+    let project = ProjectRepository::new(&test.db).register(&project).unwrap();
+
+    ProjectRepository::new(&test.db)
+        .record_task_cancellation(
+            &project,
+            41,
+            "signature --token SIGNATURE_SECRET",
+            "Running --token REQUESTED_SECRET",
+            "Canceled --token FINAL_SECRET",
+            &format!(
+                "operator request --token REASON_SECRET {}",
+                "x".repeat(400)
+            ),
+            200,
+        )
+        .unwrap();
+
+    let (stored_project, stored_group, action, details_json, created_at):
+        (String, String, String, String, i64) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT project_id, pueue_group, action, details_json, created_at
+             FROM operator_logs",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(stored_project, "project-a");
+    assert_eq!(stored_group, "pa-project");
+    assert_eq!(action, "cancel");
+    assert_eq!(created_at, 200);
+
+    let details: serde_json::Value = serde_json::from_str(&details_json).unwrap();
+    assert_eq!(details["task_id"], 41);
+    for key in ["task_signature", "requested_state", "final_state", "reason"] {
+        let value = details[key].as_str().unwrap();
+        assert!(value.len() <= 240, "{key} was not bounded: {value}");
+        assert!(!value.contains("SECRET"), "{key} leaked a secret: {value}");
+        assert!(value.contains("[REDACTED]"), "{key} was not redacted: {value}");
+    }
+}
+
+#[test]
 fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
     let test = TestDatabase::new();
     let root = test.project_root("v7-project");
@@ -251,7 +417,7 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     connection.execute(
         "INSERT INTO events (project_id, kind, dedup_key, payload_json, status, attempts, not_before, created_at)
          VALUES ('v7-project', 'operator_wake', 'wake-v8', '{}', 'pending', 0, 100, 100)",
@@ -471,7 +637,7 @@ fn concurrent_first_opens_apply_migration_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -582,7 +748,7 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(columns.iter().any(|column| column == "kind"));
     assert!(columns.iter().any(|column| column == "metadata_json"));
     assert!(columns.iter().any(|column| column == "origin_agent_run_id"));
@@ -1548,7 +1714,7 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(intervention_table_count, 1);
     assert_eq!(preserved_event_id, event_id);
     assert_eq!(preserved_project_id, "project-a");
@@ -2461,7 +2627,7 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     connection
         .execute(
             "UPDATE termination_requests SET status = 'dispatching' WHERE request_id = ?1",
@@ -2498,7 +2664,7 @@ fn legacy_migrations_create_active_agent_unique_index() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(migrated_version, 10);
+        assert_eq!(migrated_version, 11);
         assert_eq!(index_count, 1);
         drop(connection);
 
@@ -3849,7 +4015,7 @@ fn batch_v9_migration_preserves_projects_and_installs_bounded_tables() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(
         connection
             .query_row(
@@ -3926,7 +4092,7 @@ fn batch_v10_migration_adds_lease_token_to_a_v9_database() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     let columns = connection
         .prepare("PRAGMA table_info(batch_requests)")
         .unwrap()

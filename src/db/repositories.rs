@@ -25,6 +25,7 @@ use crate::{
         Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
         TerminationRequestStatus,
     },
+    output::bounded_redacted_text,
     AppError,
 };
 
@@ -376,6 +377,38 @@ impl<'db> ProjectRepository<'db> {
             .commit()
             .map_err(database_error("commit project removal"))?;
         Ok(project)
+    }
+
+    pub fn record_task_cancellation(
+        &self,
+        project: &Project,
+        task_id: i64,
+        task_signature: &str,
+        requested_state: &str,
+        final_state: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin task cancellation operator log"))?;
+        insert_operator_log(
+            &transaction,
+            project,
+            "cancel",
+            &json!({
+                "task_id": task_id,
+                "task_signature": bounded_redacted_text(task_signature),
+                "requested_state": bounded_redacted_text(requested_state),
+                "final_state": bounded_redacted_text(final_state),
+                "reason": bounded_redacted_text(reason),
+            }),
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit task cancellation operator log"))
     }
 
     pub fn find_by_root(&self, root: &std::path::Path) -> Result<Option<Project>, AppError> {
