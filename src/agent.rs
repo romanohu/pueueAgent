@@ -18,6 +18,7 @@ use crate::{
     db::AgentRunRepository,
     interventions::InterventionReservation,
     models::{launch_gate_marker_path, AgentContextMode, AgentRunStatus, NewAgentRun, Project},
+    upgrade::AgentStartUpgradeGuard,
     AppError,
 };
 
@@ -190,6 +191,7 @@ impl AgentRunner {
         prompt: &str,
         now: i64,
     ) -> Result<AgentHandle, AppError> {
+        let agent_start_guard = AgentStartUpgradeGuard::acquire(db)?;
         let command = self.command_for(project, config, prompt)?;
         let log_path = self.log_path(project, primary_event_id, now)?;
         let gate_marker_path = launch_gate_marker_path(&log_path);
@@ -209,6 +211,7 @@ impl AgentRunner {
             event_ids,
             reservation.map(|reservation| reservation.token.as_str()),
         )?;
+        drop(agent_start_guard);
         let mut spawned_child = None;
         #[cfg(unix)]
         let mut release_stdin: Option<tokio::process::ChildStdin> = None;

@@ -492,6 +492,8 @@ where
             &install_candidate,
             "copy built upgrade candidate to install directory",
         ) {
+            remove_file_if_present(&install_candidate);
+            remove_file_if_present(&backup);
             return Err(UpgradeFailure::with_report(report, error));
         }
         if let Err(error) = copy_file(
@@ -500,6 +502,7 @@ where
             "copy installed binary to upgrade backup",
         ) {
             remove_file_if_present(&install_candidate);
+            remove_file_if_present(&backup);
             return Err(UpgradeFailure::with_report(report, error));
         }
         if let Err(error) = self.reject_active_agent_runs() {
@@ -628,17 +631,7 @@ where
                 message: "upgrade Pueue health check returned invalid status JSON".to_owned(),
             },
         )?;
-        if status
-            .as_object()
-            .and_then(|object| object.get("tasks"))
-            .is_some_and(serde_json::Value::is_object)
-        {
-            Ok(())
-        } else {
-            Err(AppError::Message {
-                message: "upgrade Pueue health check returned an invalid status schema".to_owned(),
-            })
-        }
+        validate_pueue_status_shape(&status)
     }
 
     fn rollback_after_post_install_failure(
@@ -708,6 +701,7 @@ where
             &restore_candidate,
             "copy upgrade backup for rollback",
         ) {
+            remove_file_if_present(&restore_candidate);
             return Err(error);
         }
         if let Err(error) = fs::rename(&restore_candidate, install_target) {
@@ -842,6 +836,8 @@ fn remove_retry_marker(path: &Path) -> Result<(), AppError> {
 struct UpgradeLock {
     path: PathBuf,
     owner_path: PathBuf,
+    owner_token: String,
+    _coordination_guard: UpgradeCoordinationGuard,
 }
 
 impl UpgradeLock {
@@ -850,13 +846,14 @@ impl UpgradeLock {
             operation: "create upgrade state directory",
             source,
         })?;
-        let _acquisition_guard = UpgradeLockAcquisitionGuard::acquire(state_dir)?;
+        let coordination_guard = UpgradeCoordinationGuard::acquire_blocking(state_dir)?;
         let path = state_dir.join("upgrade.lock");
         let owner_path = path.join("owner");
         for _ in 0..32 {
             match fs::create_dir(&path) {
                 Ok(()) => {
-                    if let Err(source) = fs::write(&owner_path, std::process::id().to_string()) {
+                    let owner_token = lock_owner_token();
+                    if let Err(source) = fs::write(&owner_path, &owner_token) {
                         remove_file_if_present(&owner_path);
                         let _ = fs::remove_dir(&path);
                         return Err(AppError::Io {
@@ -864,7 +861,12 @@ impl UpgradeLock {
                             source,
                         });
                     }
-                    return Ok(Self { path, owner_path });
+                    return Ok(Self {
+                        path,
+                        owner_path,
+                        owner_token,
+                        _coordination_guard: coordination_guard,
+                    });
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
                     let metadata = fs::symlink_metadata(&path).map_err(|source| AppError::Io {
@@ -899,8 +901,7 @@ impl UpgradeLock {
 
 impl Drop for UpgradeLock {
     fn drop(&mut self) {
-        remove_file_if_present(&self.owner_path);
-        let _ = fs::remove_dir(&self.path);
+        remove_owned_lock(&self.path, &self.owner_path, &self.owner_token);
     }
 }
 
@@ -915,7 +916,8 @@ fn read_live_lock_owner(owner_path: &Path) -> Result<Option<u32>, AppError> {
             })
         }
     };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
+    let pid_text = contents.trim().split_once(':').map_or(contents.trim(), |(pid, _)| pid);
+    let Ok(pid) = pid_text.parse::<u32>() else {
         return Ok(None);
     };
     Ok(process_is_alive(pid).then_some(pid))
@@ -944,13 +946,55 @@ fn reclaim_stale_lock(state_dir: &Path, lock_path: &Path) -> Result<(), AppError
     }
 }
 
-struct UpgradeLockAcquisitionGuard {
+fn remove_owned_lock(path: &Path, owner_path: &Path, owner_token: &str) {
+    let matches_owner = fs::read_to_string(owner_path)
+        .ok()
+        .is_some_and(|owner| owner.trim() == owner_token);
+    if matches_owner {
+        remove_file_if_present(owner_path);
+        let _ = fs::remove_dir(path);
+    }
+}
+
+pub struct AgentStartUpgradeGuard {
+    _coordination_guard: UpgradeCoordinationGuard,
+}
+
+impl AgentStartUpgradeGuard {
+    pub fn acquire(db: &Db) -> Result<Self, AppError> {
+        let state_dir = db
+            .path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| AppError::Message {
+                message: "agent start database path has no state directory".to_owned(),
+            })?;
+        fs::create_dir_all(&state_dir).map_err(|source| AppError::Io {
+            operation: "create agent start state directory",
+            source,
+        })?;
+        Ok(Self {
+            _coordination_guard: UpgradeCoordinationGuard::try_acquire(&state_dir)?,
+        })
+    }
+}
+
+struct UpgradeCoordinationGuard {
     #[cfg(unix)]
     file: File,
 }
 
-impl UpgradeLockAcquisitionGuard {
-    fn acquire(state_dir: &Path) -> Result<Self, AppError> {
+impl UpgradeCoordinationGuard {
+    fn acquire_blocking(state_dir: &Path) -> Result<Self, AppError> {
+        Self::acquire(state_dir, false)
+    }
+
+    fn try_acquire(state_dir: &Path) -> Result<Self, AppError> {
+        Self::acquire(state_dir, true)
+    }
+
+    fn acquire(state_dir: &Path, nonblocking: bool) -> Result<Self, AppError> {
         #[cfg(unix)]
         {
             let file = OpenOptions::new()
@@ -962,31 +1006,41 @@ impl UpgradeLockAcquisitionGuard {
                     operation: "open upgrade lock acquisition guard",
                     source,
                 })?;
-            lock_file(&file)?;
+            if let Err(source) = lock_file(&file, nonblocking) {
+                if nonblocking && source.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(AppError::Message {
+                        message: "agent start deferred while an upgrade is in progress".to_owned(),
+                    });
+                }
+                return Err(AppError::Io {
+                    operation: "acquire upgrade coordination guard",
+                    source,
+                });
+            }
             Ok(Self { file })
         }
         #[cfg(not(unix))]
         {
-            let _ = state_dir;
+            let _ = (state_dir, nonblocking);
             Ok(Self {})
         }
     }
 }
 
 #[cfg(unix)]
-impl Drop for UpgradeLockAcquisitionGuard {
+impl Drop for UpgradeCoordinationGuard {
     fn drop(&mut self) {
         unlock_file(&self.file);
     }
 }
 
 #[cfg(not(unix))]
-impl Drop for UpgradeLockAcquisitionGuard {
+impl Drop for UpgradeCoordinationGuard {
     fn drop(&mut self) {}
 }
 
 #[cfg(unix)]
-fn lock_file(file: &File) -> Result<(), AppError> {
+fn lock_file(file: &File, nonblocking: bool) -> Result<(), std::io::Error> {
     use std::os::fd::AsRawFd;
 
     unsafe extern "C" {
@@ -994,13 +1048,12 @@ fn lock_file(file: &File) -> Result<(), AppError> {
             -> std::os::raw::c_int;
     }
     const LOCK_EX: std::os::raw::c_int = 2;
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
+    const LOCK_NB: std::os::raw::c_int = 4;
+    let operation = if nonblocking { LOCK_EX | LOCK_NB } else { LOCK_EX };
+    if unsafe { flock(file.as_raw_fd(), operation) } == 0 {
         Ok(())
     } else {
-        Err(AppError::Io {
-            operation: "acquire upgrade lock acquisition guard",
-            source: std::io::Error::last_os_error(),
-        })
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -1017,7 +1070,13 @@ fn unlock_file(file: &File) {
 }
 
 static TEMPORARY_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LOCK_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_UPGRADE_COMMAND_OUTPUT_BYTES: usize = 240;
+
+fn lock_owner_token() -> String {
+    let sequence = LOCK_OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{}:{sequence}", std::process::id())
+}
 
 fn bounded_text(value: &str) -> String {
     if value.len() <= MAX_UPGRADE_COMMAND_OUTPUT_BYTES {
@@ -1038,14 +1097,140 @@ fn sanitize_upgrade_stdout(value: &str) -> String {
     let Ok(status) = serde_json::from_str::<serde_json::Value>(value) else {
         return bounded_redacted_text(value);
     };
-    if status
-        .as_object()
-        .and_then(|object| object.get("tasks"))
-        .is_some_and(serde_json::Value::is_object)
-    {
-        return r#"{"tasks":{}}"#.to_owned();
+    let Some(status) = sanitize_pueue_status_shape(&status) else {
+        return bounded_redacted_text(value);
+    };
+    serde_json::to_string(&status).unwrap_or_else(|_| bounded_redacted_text(value))
+}
+
+fn sanitize_pueue_status_shape(status: &serde_json::Value) -> Option<serde_json::Value> {
+    let tasks = status.as_object()?.get("tasks")?.as_object()?;
+    let mut safe_tasks = serde_json::Map::new();
+    for (index, task) in tasks.values().enumerate() {
+        safe_tasks.insert(index.to_string(), sanitize_pueue_task_shape(task));
     }
-    bounded_redacted_text(value)
+    let mut safe_status = serde_json::Map::new();
+    safe_status.insert("tasks".to_owned(), serde_json::Value::Object(safe_tasks));
+    Some(serde_json::Value::Object(safe_status))
+}
+
+fn sanitize_pueue_task_shape(task: &serde_json::Value) -> serde_json::Value {
+    let Some(task) = task.as_object() else {
+        return serde_json::Value::Null;
+    };
+    let mut safe_task = serde_json::Map::new();
+    if let Some(id) = task.get("id") {
+        safe_task.insert("id".to_owned(), sanitize_pueue_task_id(id));
+    }
+    for field in ["group", "command"] {
+        if let Some(value) = task.get(field) {
+            safe_task.insert(field.to_owned(), sanitize_string_shape(value));
+        }
+    }
+    if let Some(status) = task.get("status") {
+        safe_task.insert("status".to_owned(), sanitize_pueue_task_status(status));
+    }
+    serde_json::Value::Object(safe_task)
+}
+
+fn sanitize_pueue_task_id(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(value) if value.as_i64().is_some_and(|id| id >= 0) => {
+            serde_json::json!(0)
+        }
+        serde_json::Value::String(value)
+            if value.parse::<i64>().is_ok_and(|id| id >= 0) =>
+        {
+            serde_json::json!("0")
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn sanitize_string_shape(value: &serde_json::Value) -> serde_json::Value {
+    if value.is_string() {
+        serde_json::json!("")
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn sanitize_pueue_task_status(value: &serde_json::Value) -> serde_json::Value {
+    let Some(statuses) = value.as_object() else {
+        return serde_json::Value::Null;
+    };
+    let mut safe_statuses = serde_json::Map::new();
+    for (index, details) in statuses.values().enumerate() {
+        safe_statuses.insert(
+            format!("state-{index}"),
+            sanitize_pueue_state_details(details),
+        );
+    }
+    serde_json::Value::Object(safe_statuses)
+}
+
+fn sanitize_pueue_state_details(value: &serde_json::Value) -> serde_json::Value {
+    let Some(details) = value.as_object() else {
+        return serde_json::Value::Null;
+    };
+    let mut safe_details = serde_json::Map::new();
+    for field in ["enqueued_at", "start", "end"] {
+        if let Some(value) = details.get(field) {
+            safe_details.insert(
+                field.to_owned(),
+                if value.is_null() {
+                    serde_json::Value::Null
+                } else {
+                    sanitize_string_shape(value)
+                },
+            );
+        }
+    }
+    serde_json::Value::Object(safe_details)
+}
+
+fn validate_pueue_status_shape(status: &serde_json::Value) -> Result<(), AppError> {
+    let tasks = status
+        .as_object()
+        .and_then(|status| status.get("tasks"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(invalid_pueue_status_shape)?;
+    for task in tasks.values() {
+        let task = task.as_object().ok_or_else(invalid_pueue_status_shape)?;
+        let valid_id = match task.get("id") {
+            Some(serde_json::Value::Number(value)) => value.as_i64().is_some_and(|id| id >= 0),
+            Some(serde_json::Value::String(value)) => {
+                value.parse::<i64>().is_ok_and(|id| id >= 0)
+            }
+            _ => false,
+        };
+        let valid_strings = ["group", "command"]
+            .into_iter()
+            .all(|field| task.get(field).is_some_and(serde_json::Value::is_string));
+        let status = task
+            .get("status")
+            .and_then(serde_json::Value::as_object)
+            .filter(|status| status.len() == 1)
+            .and_then(|status| status.values().next())
+            .and_then(serde_json::Value::as_object);
+        let valid_timestamps = status.is_some_and(|details| {
+            ["enqueued_at", "start", "end"].into_iter().all(|field| {
+                details
+                    .get(field)
+                    .is_none_or(|value| value.is_null() || value.is_string())
+            })
+        });
+        if !valid_id || !valid_strings || !valid_timestamps {
+            return Err(invalid_pueue_status_shape());
+        }
+    }
+    Ok(())
+}
+
+fn invalid_pueue_status_shape() -> AppError {
+    AppError::Message {
+        message: "upgrade Pueue health check returned an invalid status schema".to_owned(),
+    }
 }
 
 fn temporary_path(parent: &Path, prefix: &str) -> Result<PathBuf, AppError> {
@@ -1171,7 +1356,8 @@ fn run_git<R: GitCommandRunner>(
     source: &Path,
     args: &[&str],
 ) -> Result<GitCommandOutput, AppError> {
-    let output = runner.run(source, args).map_err(|error| git_runner_error(args, error))?;
+    let mut output = runner.run(source, args).map_err(|error| git_runner_error(args, error))?;
+    output.stderr = bounded_redacted_text(&output.stderr);
     if output.success {
         Ok(output)
     } else {
@@ -1201,4 +1387,70 @@ fn git_stdout<R: GitCommandRunner>(
     args: &[&str],
 ) -> Result<String, AppError> {
     Ok(bounded_text(run_git(runner, source, args)?.stdout.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::Path,
+    };
+
+    use tempfile::TempDir;
+
+    use super::{
+        run_git, AgentStartUpgradeGuard, GitCommandOutput, GitCommandRunner, UpgradeLock,
+    };
+    use crate::{
+        db::Db,
+        AppError,
+    };
+
+    struct FailingGitRunner;
+
+    impl GitCommandRunner for FailingGitRunner {
+        fn run(&self, _source: &Path, _args: &[&str]) -> Result<GitCommandOutput, AppError> {
+            Ok(GitCommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("token=adapter-secret {}", "x".repeat(10_000)),
+            })
+        }
+    }
+
+    #[test]
+    fn git_adapter_redacts_and_bounds_runner_stderr() {
+        let error = run_git(&FailingGitRunner, Path::new("."), &["fetch", "origin", "main"])
+            .unwrap_err();
+
+        assert!(!error.to_string().contains("adapter-secret"));
+        assert!(error.to_string().len() < 600);
+    }
+
+    #[test]
+    fn old_lock_cleanup_keeps_a_replaced_lock_generation() {
+        let temporary = TempDir::new().unwrap();
+        let lock = UpgradeLock::acquire(temporary.path()).unwrap();
+        let path = lock.path.clone();
+        fs::write(path.join("owner"), "new-lock-generation").unwrap();
+
+        drop(lock);
+
+        assert!(path.is_dir());
+        assert_eq!(fs::read_to_string(path.join("owner")).unwrap(), "new-lock-generation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_start_guard_cannot_enter_while_upgrade_owns_the_coordination_guard() {
+        let temporary = TempDir::new().unwrap();
+        let db = Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let _upgrade_lock = UpgradeLock::acquire(temporary.path()).unwrap();
+
+        let error = AgentStartUpgradeGuard::acquire(&db)
+            .err()
+            .expect("upgrade coordination guard must exclude agent start");
+
+        assert!(error.to_string().contains("upgrade"));
+    }
 }

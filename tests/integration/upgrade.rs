@@ -115,6 +115,21 @@ impl UpgradeFixture {
         fixture
     }
 
+    fn pueue_malformed_task_status() -> Self {
+        let fixture = Self::new();
+        *fixture.commands.pueue_status_output.borrow_mut() =
+            Some(r#"{"tasks":{"42":null}}"#.to_owned());
+        fixture
+    }
+
+    fn pueue_valid_task_status() -> Self {
+        let fixture = Self::new();
+        *fixture.commands.pueue_status_output.borrow_mut() = Some(
+            r#"{"tasks":{"42":{"id":42,"group":"pa-project","command":"echo ready","status":{"Running":{"enqueued_at":"2026-08-11T00:00:00Z","start":null}}}}}"#.to_owned(),
+        );
+        fixture
+    }
+
     fn source_root(&self) -> &Path {
         &self.source
     }
@@ -272,6 +287,7 @@ struct FakeCommandRunner {
     fail_build: Cell<bool>,
     fail_pueue_status: Cell<bool>,
     invalid_pueue_status: Cell<bool>,
+    pueue_status_output: RefCell<Option<String>>,
     fail_fetch: Cell<bool>,
     fetch_stderr: RefCell<String>,
     build_stderr: RefCell<String>,
@@ -373,6 +389,11 @@ impl UpgradeCommandRunner for FakeCommandRunner {
             }
             ("pueue", Some("status")) if self.invalid_pueue_status.get() => {
                 Ok(UpgradeCommandOutput::success_with_stdout("not Pueue JSON"))
+            }
+            ("pueue", Some("status")) if self.pueue_status_output.borrow().is_some() => {
+                Ok(UpgradeCommandOutput::success_with_stdout(
+                    self.pueue_status_output.borrow().as_deref().unwrap(),
+                ))
             }
             ("pueue", Some("status")) => {
                 Ok(UpgradeCommandOutput::success_with_stdout(r#"{"tasks":{}}"#))
@@ -911,6 +932,27 @@ async fn invalid_pueue_status_json_triggers_rollback() {
     assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
     assert_eq!(fixture.service_calls(), ["restart", "restart"]);
+}
+
+#[tokio::test]
+async fn malformed_pueue_task_entry_triggers_rollback() {
+    let fixture = UpgradeFixture::pueue_malformed_task_status();
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("Pueue"));
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+}
+
+#[tokio::test]
+async fn pueue_task_status_shape_used_by_the_adapter_is_healthy() {
+    let fixture = UpgradeFixture::pueue_valid_task_status();
+
+    let report = fixture.run_upgrade().await.unwrap();
+
+    assert!(report.health.succeeded);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::new_binary_bytes());
 }
 
 #[tokio::test]
