@@ -91,7 +91,7 @@ fn service_lifecycle_commands_report_only_verified_service_state() {
     fs::create_dir_all(&bin).unwrap();
     let launchctl = bin.join("launchctl");
     let systemctl = bin.join("systemctl");
-    write_service_shim(&launchctl, "#!/bin/sh\nexit 0\n");
+    write_service_shim(&launchctl, "#!/bin/sh\necho 'state = running'\nexit 0\n");
     write_service_shim(
         &systemctl,
         "#!/bin/sh\nif [ \"$2\" = is-active ]; then echo active; fi\nexit 0\n",

@@ -604,10 +604,27 @@ fn launchd_status() -> Result<ServiceStatus, AppError> {
             operation: "query launchd user service",
             source,
         })?;
-    if output.status.success() {
-        Ok(ServiceStatus::Running)
+    Ok(launchd_status_from_output(
+        output.status.success(),
+        &output.stdout,
+    ))
+}
+
+pub fn launchd_status_from_output(command_succeeded: bool, stdout: &[u8]) -> ServiceStatus {
+    if !command_succeeded {
+        return ServiceStatus::Stopped;
+    }
+
+    if String::from_utf8_lossy(stdout).lines().any(|line| {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("state")
+            && value.trim().eq_ignore_ascii_case("running")
+    }) {
+        ServiceStatus::Running
     } else {
-        Ok(ServiceStatus::Stopped)
+        ServiceStatus::Stopped
     }
 }
 

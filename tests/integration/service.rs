@@ -11,10 +11,10 @@ use pueue_agent::{
     db::{Db, ProjectRepository},
     pueue::{PueueApi, PueueTask},
     service::{
-        callback_command, enable_with, install_callback_once, CallbackRegistry, EnableOptions,
-        LaunchdAgent, PueueConfigCallbackRegistry, ServiceCommandOutput, ServiceCommandRunner,
-        ServiceControl, ServiceDefinition, ServiceManager, ServicePaths, ServicePlatform,
-        ServiceStatus,
+        callback_command, enable_with, install_callback_once, launchd_status_from_output,
+        CallbackRegistry, EnableOptions, LaunchdAgent, PueueConfigCallbackRegistry,
+        ServiceCommandOutput, ServiceCommandRunner, ServiceControl, ServiceDefinition,
+        ServiceManager, ServicePaths, ServicePlatform, ServiceStatus,
     },
     AppError,
 };
@@ -384,6 +384,26 @@ fn systemd_definition_escapes_quotes_backslashes_and_percent_specifiers() {
     assert!(systemd
         .contains("Environment=\"PUEUE_AGENT_STATE_DIR=/Users/alice/state 100%%/pueue-agent\""));
     assert!(systemd.contains("WorkingDirectory=\"/Users/alice/project \\\"quoted\\\"\""));
+}
+
+#[test]
+fn launchd_health_requires_a_running_state_from_successful_print_output() {
+    assert_eq!(
+        launchd_status_from_output(true, b"\n  StAtE = RuNnInG\n"),
+        ServiceStatus::Running
+    );
+    assert_eq!(
+        launchd_status_from_output(true, b"state = exited\n"),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        launchd_status_from_output(true, b"pid = 1234\n"),
+        ServiceStatus::Stopped
+    );
+    assert_eq!(
+        launchd_status_from_output(false, b"state = running\n"),
+        ServiceStatus::Stopped
+    );
 }
 
 #[test]
