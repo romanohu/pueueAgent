@@ -421,7 +421,10 @@ async fn cancel_refuses_a_reused_task_id_with_a_different_stable_identity() {
 async fn cancel_allows_a_state_transition_with_the_same_stable_task_identity() {
     let running_task = cancel_task(41, "pa-project", "Running", "100");
     let harness = CancelHarness::with_tasks(vec![running_task]);
-    let queued_task = cancel_task(41, "pa-project", "Queued", "100");
+    let queued_task = PueueTask {
+        started_at: None,
+        ..cancel_task(41, "pa-project", "Queued", "100")
+    };
     harness.record_observation(&queued_task);
 
     let result = harness.cancel(41).await.unwrap();

@@ -3,7 +3,7 @@ use crate::{
     models::{Project, TaskObservation},
     output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::{PueueApi, PueueTask},
-    reconcile::{task_incident_key, task_signature},
+    reconcile::task_signature,
     AppError,
 };
 use serde::Deserialize;
@@ -43,7 +43,7 @@ pub async fn cancel_task_with(
     }
 
     let signature = task_signature(task);
-    let lifecycle_identity = task_incident_key(task);
+    let target_identity = cancellation_identity_for_task(task);
     let observed = TaskObservationRepository::new(db).find_by_pueue_task(
         &project.project_id,
         task_id,
@@ -52,8 +52,8 @@ pub async fn cancel_task_with(
     if !observed.is_empty()
         && !observed
             .iter()
-            .filter_map(observation_lifecycle_identity)
-            .any(|identity| identity == lifecycle_identity)
+            .filter_map(observation_cancellation_identity)
+            .any(|identity| identity == target_identity)
     {
         return Err(AppError::Runtime {
             operation: "revalidate task cancellation signature",
@@ -76,7 +76,7 @@ pub async fn cancel_task_with(
     let final_observed_state = final_status
         .as_ref()
         .ok()
-        .and_then(|tasks| final_state_for(tasks, &lifecycle_identity));
+        .and_then(|tasks| final_state_for(tasks, &target_identity));
     let result_reason = match (&kill_result, &final_status) {
         (Ok(()), Ok(_)) => "operator cancellation result observed".to_owned(),
         (Err(error), Ok(_)) => format!("Pueue kill failed: {error}"),
@@ -130,30 +130,41 @@ pub fn render_cancel_result(project: &Project, result: &CancelResult, json: bool
     )
 }
 
-fn final_state_for(tasks: &[PueueTask], lifecycle_identity: &str) -> Option<String> {
+fn final_state_for(tasks: &[PueueTask], target_identity: &str) -> Option<String> {
     let matching = tasks
         .iter()
-        .filter(|task| task_incident_key(task) == lifecycle_identity)
+        .filter(|task| cancellation_identity_for_task(task) == target_identity)
         .collect::<Vec<_>>();
     (matching.len() == 1).then(|| matching[0].state.clone())
 }
 
-fn observation_lifecycle_identity(observation: &TaskObservation) -> Option<String> {
+fn cancellation_identity_for_task(task: &PueueTask) -> String {
+    cancellation_identity_from_fields(&task.group, task.id, task.enqueued_at.as_deref())
+}
+
+fn observation_cancellation_identity(observation: &TaskObservation) -> Option<String> {
     let encoded = observation
         .task_signature
         .strip_prefix("pueue-task:v1:")?;
     let identity = serde_json::from_str::<StatefulTaskSignature>(encoded).ok()?;
-    let task = PueueTask {
-        id: identity.id,
-        group: identity.group,
-        command: String::new(),
-        state: String::new(),
-        enqueued_at: identity.enqueued_at,
-        started_at: identity.started_at,
-        ended_at: None,
-        result: None,
-    };
-    Some(task_incident_key(&task))
+    Some(cancellation_identity_from_fields(
+        &identity.group,
+        identity.id,
+        identity.enqueued_at.as_deref(),
+    ))
+}
+
+fn cancellation_identity_from_fields(
+    group: &str,
+    task_id: i64,
+    enqueued_at: Option<&str>,
+) -> String {
+    let identity = serde_json::json!({
+        "group": group,
+        "id": task_id,
+        "enqueued_at": enqueued_at,
+    });
+    format!("pueue-cancel-task:v1:{identity}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,5 +172,4 @@ struct StatefulTaskSignature {
     group: String,
     id: i64,
     enqueued_at: Option<String>,
-    started_at: Option<String>,
 }
