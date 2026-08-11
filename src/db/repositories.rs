@@ -828,6 +828,33 @@ impl<'db> EventRepository<'db> {
         Ok(recovered)
     }
 
+    pub fn defer_claimed(&self, event_ids: &[i64]) -> Result<usize, AppError> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin deferred event release"))?;
+        let mut changed = 0;
+        for event_id in event_ids {
+            changed += transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'pending',
+                         lease_until = NULL,
+                         attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
+                     WHERE event_id = ?1 AND status = 'claimed'",
+                    [event_id],
+                )
+                .map_err(database_error("defer claimed event"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit deferred event release"))?;
+        Ok(changed)
+    }
+
     pub fn transition_many(
         &self,
         event_ids: &[i64],

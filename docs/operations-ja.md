@@ -59,9 +59,10 @@ pueue-agent disable --remove
 ```bash
 pueue-agent upgrade
 pueue-agent upgrade --json
+pueue-agent upgrade --pueue-config ~/.config/pueue/experiments.yml
 ```
 
-source は、現在の実行ファイルが `target/release/pueue-agent` の下にある場合、その project checkout を自動検出します。自動検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を設定し、特定の checkout を使う場合や fallback を明示したい場合は `--source <path>` を指定します。明示した `--source` が自動検出や環境変数より優先されます。
+source は、現在の実行ファイルが `target/release/pueue-agent` の下にある場合、その project checkout を自動検出します。自動検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を設定し、特定の checkout を使う場合や fallback を明示したい場合は `--source <path>` を指定します。明示した `--source` が自動検出や環境変数より優先されます。Pueue の health check は supervisor と同じ profile を使い、設定の優先順位は `--pueue-config <path>`、`PUEUE_CONFIG`、既定の `~/.config/pueue/pueue.yml` です。
 
 source checkout には `git`、Rust stable、Cargo が必要です。更新対象は clean な `main` branch で、`origin/main` を upstream とし、`origin/main` への fast-forward が可能な場合だけです。dirty worktree、branch の不一致、upstream の不一致、diverged checkout は更新前に拒否されます。
 

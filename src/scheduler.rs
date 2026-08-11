@@ -285,6 +285,16 @@ impl Scheduler {
                     });
                 }
                 Err(error) => {
+                    if matches!(&error, AppError::UpgradeInProgress) {
+                        if let Some(reservation) = reservation.as_ref() {
+                            InterventionRepository::new(&self.db).release_reservation(
+                                &project.project_id,
+                                &reservation.token,
+                            )?;
+                        }
+                        EventRepository::new(&self.db).defer_claimed(&event_ids)?;
+                        continue;
+                    }
                     let release_error = reservation.as_ref().and_then(|reservation| {
                         InterventionRepository::new(&self.db)
                             .release_reservation(&project.project_id, &reservation.token)

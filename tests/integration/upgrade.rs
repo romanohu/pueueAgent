@@ -14,10 +14,10 @@ use pueue_agent::{
     models::{AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject},
     service::{ServiceControl, ServiceDefinition, ServiceStatus},
     upgrade::{
-        render_report, resolve_source_root, validate_checkout, validate_checkout_with,
-        CheckoutState, GitCommandOutput, GitCommandRunner, UpgradeCommandOutput,
-        UpgradeCommandRunner, UpgradeReport, UpgradeRollback, UpgradeStep, UpgradeFailure,
-        UpgradeRunner,
+        render_report, resolve_pueue_config, resolve_source_root, validate_checkout,
+        validate_checkout_with, CheckoutState, GitCommandOutput, GitCommandRunner,
+        UpgradeCommandOutput, UpgradeCommandRunner, UpgradeFailure, UpgradeReport, UpgradeRollback,
+        UpgradeRunner, UpgradeStep,
     },
     AppError,
 };
@@ -75,6 +75,26 @@ fn upgrade_report_rendering_is_bounded_and_redacts_sensitive_values() {
     assert_eq!(value["steps"]["health"]["succeeded"], true);
     assert_eq!(value["rollback"], "not_required");
     assert!(!json.contains("hidden"));
+}
+
+#[test]
+fn pueue_config_resolution_prefers_explicit_env_and_default() {
+    let explicit = PathBuf::from("/tmp/explicit-pueue.yml");
+    let from_env = PathBuf::from("/tmp/env-pueue.yml");
+    let home = PathBuf::from("/tmp/home");
+
+    assert_eq!(
+        resolve_pueue_config(Some(&explicit), Some(&from_env), Some(&home)),
+        Some(explicit.clone())
+    );
+    assert_eq!(
+        resolve_pueue_config(None, Some(&from_env), Some(&home)),
+        Some(from_env)
+    );
+    assert_eq!(
+        resolve_pueue_config(None, None, Some(&home)),
+        Some(home.join(".config/pueue/pueue.yml"))
+    );
 }
 
 struct UpgradeFixture {
@@ -251,7 +271,19 @@ impl UpgradeFixture {
             release_binary: self.installed_binary.clone(),
             pueue_binary: PathBuf::from("pueue"),
             pueue_config: None,
+            installed_revision: "old-revision".to_owned(),
         }
+    }
+
+    async fn run_upgrade_with_installed_revision(
+        &self,
+        installed_revision: &str,
+    ) -> Result<pueue_agent::upgrade::UpgradeReport, UpgradeFailure> {
+        let mut options = self.options();
+        options.installed_revision = installed_revision.to_owned();
+        UpgradeRunner::new(options, &self.db, &self.service, &self.commands)
+            .run()
+            .await
     }
 
     fn make_noop(&self) {
@@ -785,6 +817,26 @@ async fn no_op_upgrade_skips_test_build_install_and_restart() {
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
     assert_eq!(fixture.service_calls(), Vec::<String>::new());
     assert!(fixture.commands.command_invocations.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn stale_or_unknown_installed_revision_does_not_take_noop_path() {
+    for installed_revision in ["stale-revision", "unknown"] {
+        let fixture = UpgradeFixture::new();
+        fixture.make_noop();
+
+        let report = fixture
+            .run_upgrade_with_installed_revision(installed_revision)
+            .await
+            .unwrap();
+
+        assert!(report.tests.attempted);
+        assert!(report.build.attempted);
+        assert!(report.install.attempted);
+        assert!(report.restart.attempted);
+        assert!(report.health.attempted);
+        assert_eq!(fixture.service_calls(), ["restart"]);
+    }
 }
 
 #[tokio::test]

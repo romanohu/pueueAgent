@@ -1,7 +1,9 @@
-use std::{fs, path::PathBuf};
+use std::{fs, fs::OpenOptions, path::PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
@@ -487,6 +489,41 @@ async fn operator_intervention_delivery_releases_rows_when_process_spawn_fails()
             1,
         )
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_contention_defers_claim_without_consuming_event_retry() {
+    let harness = SchedulerHarness::new();
+    let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, config.replace("max_retries = 2", "max_retries = 0")).unwrap();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "upgrade-contention");
+    let intervention_id = harness.queue_intervention("defer during upgrade");
+    let guard_path = harness.temp.path().join("upgrade.lock.guard");
+    let guard_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(guard_path)
+        .unwrap();
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    assert_eq!(unsafe { flock(guard_file.as_raw_fd(), 2) }, 0);
+
+    let mut scheduler = harness.scheduler();
+    let report = scheduler.tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.attempts, 0);
+    assert_eq!(event.lease_until, None);
+    assert_eq!(event.last_error, None);
+    assert_eq!(harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending);
 }
 
 #[tokio::test]

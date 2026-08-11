@@ -42,6 +42,9 @@ pub enum AppError {
     #[error("unknown Pueue group `{group}`; callback was not associated with a project")]
     UnknownPueueGroup { group: String },
 
+    #[error("agent start deferred while an upgrade is in progress")]
+    UpgradeInProgress,
+
     #[error("failed to {operation}: {source}")]
     Serialization {
         operation: &'static str,

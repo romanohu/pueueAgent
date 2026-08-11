@@ -98,9 +98,10 @@ pueue-agent runs --follow
 ```bash
 pueue-agent upgrade
 pueue-agent upgrade --json
+pueue-agent upgrade --pueue-config ~/.config/pueue/experiments.yml
 ```
 
-`upgrade` は、現在の実行ファイルがプロジェクト checkout の `target/release/pueue-agent` にある場合、その checkout を source として自動検出します。検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を使い、どちらも使えない場合や別 checkout を指定したい場合は `--source <path>` を指定します。明示した `--source` が最優先です。source checkout には `git`、Rust stable、Cargo が必要です。
+`upgrade` は、現在の実行ファイルがプロジェクト checkout の `target/release/pueue-agent` にある場合、その checkout を source として自動検出します。検出できない場合は `PUEUE_AGENT_SOURCE_ROOT` を使い、どちらも使えない場合や別 checkout を指定したい場合は `--source <path>` を指定します。明示した `--source` が最優先です。source checkout には `git`、Rust stable、Cargo が必要です。Pueue の health check は supervisor と同じ profile を使い、設定の優先順位は `--pueue-config <path>`、`PUEUE_CONFIG`、既定の `~/.config/pueue/pueue.yml` です。
 
 更新対象は、clean な `main` branch が `origin/main` を追跡し、`origin/main` への fast-forward だけで更新できる checkout に限ります。dirty worktree、`main` 以外の branch、upstream の不一致、diverged checkout は拒否されます。更新前に enabled project の active agent run がある場合も拒否するため、先に agent run の完了または停止を確認してから再実行してください。upgrade のロックで同時実行も調整します。
 

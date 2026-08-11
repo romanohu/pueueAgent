@@ -225,6 +225,8 @@ pub struct VersionArgs {
 pub struct UpgradeArgs {
     #[arg(long, value_name = "SOURCE")]
     pub source: Option<PathBuf>,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }

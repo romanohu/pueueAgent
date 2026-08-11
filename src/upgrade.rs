@@ -1,4 +1,5 @@
 use std::{
+    env,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::Read,
@@ -27,10 +28,13 @@ pub struct UpgradeOptions {
     pub release_binary: PathBuf,
     pub pueue_binary: PathBuf,
     pub pueue_config: Option<PathBuf>,
+    pub installed_revision: String,
 }
 
 impl UpgradeOptions {
     pub fn from_args(args: UpgradeArgs) -> Self {
+        let env_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
+        let home = env::var_os("HOME").map(PathBuf::from);
         Self {
             source: args.source,
             json: args.json,
@@ -41,9 +45,27 @@ impl UpgradeOptions {
             pueue_binary: std::env::var_os("PUEUE_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("pueue")),
-            pueue_config: std::env::var_os("PUEUE_CONFIG").map(PathBuf::from),
+            pueue_config: resolve_pueue_config(
+                args.pueue_config.as_deref(),
+                env_pueue_config.as_deref(),
+                home.as_deref(),
+            ),
+            installed_revision: option_env!("PUEUE_AGENT_GIT_REVISION")
+                .unwrap_or("unknown")
+                .to_owned(),
         }
     }
+}
+
+pub fn resolve_pueue_config(
+    explicit: Option<&Path>,
+    environment: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    explicit
+        .or(environment)
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|home| home.join(".config/pueue/pueue.yml")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,7 +556,9 @@ where
             .as_deref()
             .is_some_and(|revision| revision == checkout.head);
 
-        if !needs_fast_forward && !retry_pending_revision {
+        let installed_revision_is_current = self.options.installed_revision != "unknown"
+            && self.options.installed_revision == checkout.head;
+        if !needs_fast_forward && !retry_pending_revision && installed_revision_is_current {
             report.new_revision = checkout.head;
             return Ok(report);
         }
@@ -1130,9 +1154,7 @@ impl UpgradeCoordinationGuard {
                 })?;
             if let Err(source) = lock_file(&file, nonblocking) {
                 if nonblocking && source.kind() == std::io::ErrorKind::WouldBlock {
-                    return Err(AppError::Message {
-                        message: "agent start deferred while an upgrade is in progress".to_owned(),
-                    });
+                    return Err(AppError::UpgradeInProgress);
                 }
                 return Err(AppError::Io {
                     operation: "acquire upgrade coordination guard",
@@ -1719,7 +1741,7 @@ mod tests {
             .err()
             .expect("upgrade coordination guard must exclude agent start");
 
-        assert!(error.to_string().contains("upgrade"));
+        assert!(matches!(error, AppError::UpgradeInProgress));
     }
 
     #[test]
