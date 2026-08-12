@@ -96,12 +96,12 @@
 **Interfaces:**
 
 - Consumes: 現行の `config::load`、`ProjectConfig.check.deep_check_interval_minutes`、`RawCheckConfig` の `deny_unknown_fields`。
-- Produces: 旧 field のない `CheckConfig`/`RawCheckConfig`、interval の `0`/正値を受理する config test、未定義 `[check]` key を `config.toml` error として拒否する test、旧 field のない全 fixture。
+- Produces: 旧 field のない `CheckConfig`/`RawCheckConfig`、interval の `0`/正値を受理する `zero_deep_check_interval_is_disabled`/`positive_deep_check_interval_is_opt_in`、未定義 `[check]` key を `config.toml` error として拒否する `unknown_check_key_is_rejected`、template を実際に load/validate する `generated_template_loads_with_current_check_schema`、旧 field のない全 fixture。
 - Does not change: `deep_check_interval_minutes` の `non_negative` validation、既存の positive interval/stall/guardrail validation、Periodic scheduler、Pueue adapter、SQLite code。
 
 - [ ] **Step 1: Write the RED config tests and remove the obsolete config assertions**
 
-  `tests/integration/config.rs` の `valid_config()` から旧 field の TOML 行を削除する。`zero_deep_check_frequency_is_rejected` と、旧 frequency を参照する `deep_check_interval_is_opt_in_and_legacy_frequency_does_not_enable_it` は削除し、次の2テストに置き換える。既存の `negative_deep_check_interval_is_rejected` は維持する。
+  `tests/integration/config.rs` の `valid_config()` から旧 field の TOML 行を削除する。`zero_deep_check_frequency_is_rejected`、`deep_check_interval_is_opt_in_and_legacy_frequency_does_not_enable_it`、`periodic_deep_check_template_and_readme_explain_opt_in_health_records` は test function と本文を全体削除する。既存の `negative_deep_check_interval_is_rejected` は維持する。README の文面 assertion は追加しない。
 
   ```rust
   #[test]
@@ -135,9 +135,20 @@
 
       assert!(error.to_string().contains("config.toml"));
   }
-  ```
 
-  `periodic_deep_check_template_and_readme_explain_opt_in_health_records` から、旧 key/legacy を期待する assertion を削除し、template については `deep_check_interval_minutes = 0` が含まれ、`legacy` が含まれないことを、README については既存の interval、無効化、`STATE.md` の assertion を確認する形にする。test source に削除対象の key 名を文字列として再導入しない。
+  #[test]
+  fn generated_template_loads_with_current_check_schema() {
+      let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+      let template = fs::read_to_string(root.join("templates/config.toml")).unwrap();
+      let template = template
+          .replace("{{PROJECT_ID}}", "project-template-1234567890")
+          .replace("{{PUEUE_GROUP}}", "pa-template-123456");
+
+      let config = load_config(template).unwrap();
+
+      assert_eq!(config.check.deep_check_interval_minutes, 0);
+  }
+  ```
 
 - [ ] **Step 2: Run the config test suite to prove RED before production edits**
 
@@ -147,7 +158,7 @@
   cargo test --test config
   ```
 
-  Expected: FAIL. `valid_config()` が旧 field を含まなくなった一方で、現行 `RawCheckConfig::validate` が default の `0` に positive validation を適用するため、`check.deep_check_every` の configuration error が発生する。また template の `legacy` assertion を削除したため、template をまだ更新していないことによる assertion failure も許容される。この失敗を確認してから production source を変更する。
+  Expected: FAIL。`valid_config()` が旧 field を含まなくなった一方で、現行 `RawCheckConfig::validate` が未指定 field の default `0` に positive validation を適用するため、valid fixture を使う test が `check.deep_check_every` の configuration error になる。新しい generated-template test はこの時点では現行 raw model が template の旧 field を受理するため PASS するが、config test 全体の RED は valid fixture の failure で確認する。
 
 - [ ] **Step 3: Remove the field from the Rust public/raw config model after RED**
 
@@ -189,7 +200,17 @@
 
   `#[serde(default, deny_unknown_fields)]` は削除、緩和、alias 追加をせず、そのまま維持する。
 
-- [ ] **Step 4: Update the generated template without changing current interval semantics**
+- [ ] **Step 4: Run the generated-template test after the schema change to prove the template is RED**
+
+  Step 3 の production source 変更後、template はまだ更新せず、次の test だけを実行する。
+
+  ```bash
+  cargo test --test config generated_template_loads_with_current_check_schema -- --exact
+  ```
+
+  Expected: FAIL。`RawCheckConfig` の `deny_unknown_fields` が、未更新の `templates/config.toml` に残る旧 field を unknown field として `config.toml` configuration error にする。この failure を確認してから template を変更する。
+
+- [ ] **Step 5: Update the generated template without changing current interval semantics**
 
   `templates/config.toml` の `[check]` 部分を次の順序にする。旧 key と互換コメントはなくし、interval の既定値と opt-in 説明は残す。
 
@@ -201,7 +222,7 @@
   stall_minutes = 30
   ```
 
-- [ ] **Step 5: Remove the obsolete field from every fixture and literal**
+- [ ] **Step 6: Remove the obsolete field from every fixture and literal**
 
   次の各ファイルで、指定した embedded TOML 行または struct field だけを削除する。scheduler、detector、service、Pueue の他の fixture 値、Bash の起動手順、assertion は変更しない。
 
@@ -222,7 +243,7 @@
 
   Expected: no output。`rg` の no-match exit status 1 はこの negative check の成功条件であり、通常の test failure とは区別する。
 
-- [ ] **Step 6: Run the focused config and affected integration tests to verify GREEN**
+- [ ] **Step 7: Run the focused config and affected integration tests to verify GREEN**
 
   Run each command separately:
 
@@ -237,9 +258,9 @@
   cargo test --test service
   ```
 
-  Expected: すべて PASS。特に `zero_deep_check_interval_is_disabled`、`positive_deep_check_interval_is_opt_in`、`unknown_check_key_is_rejected` が PASS し、未定義 key の error は `config.toml` を含む。旧 field を含む fixture が残っていれば `deny_unknown_fields` による error になるため、commit 前に Step 5 の検索結果を確認する。
+  Expected: すべて PASS。特に `zero_deep_check_interval_is_disabled`、`positive_deep_check_interval_is_opt_in`、`unknown_check_key_is_rejected`、`generated_template_loads_with_current_check_schema` が PASS し、未定義 key の error は `config.toml` を含む。旧 field を含む fixture が残っていれば `deny_unknown_fields` による error になるため、commit 前に Step 6 の検索結果を確認する。
 
-- [ ] **Step 7: Commit the schema/fixture review gate**
+- [ ] **Step 8: Commit the schema/fixture review gate**
 
   ```bash
   git add src/config.rs templates/config.toml \
