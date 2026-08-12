@@ -22,6 +22,9 @@ use crate::{
     AppError,
 };
 
+const MAX_PRIVATE_RUN_COMPONENT_BYTES: usize = 128;
+const MAX_PRIVATE_ROOT_COMPONENTS: usize = 16;
+
 /// Capabilities discovered from the installed Codex CLI.
 ///
 /// The adapter intentionally requires an explicit positive result for every
@@ -109,6 +112,7 @@ impl CodexArgvBuilder {
         let private_tmp = validate_private_tmp(
             private_tmp,
             &self.policy.root_anchor.canonical_path,
+            &self.policy.private_temp_relative_root,
         )?;
         let mut argv = vec![
             OsString::from("--ask-for-approval"),
@@ -197,6 +201,7 @@ impl CodexArgvBuilder {
                 argv.push(OsString::from(owned));
             }
         }
+        argv.push(OsString::from("--"));
         argv.push(OsString::from(prompt));
         Ok(argv)
     }
@@ -218,14 +223,36 @@ fn validate_compatibility_args(args: &[String]) -> Result<(), PolicyViolation> {
     valid.then_some(()).ok_or_else(unsafe_argument)
 }
 
-fn validate_private_tmp(path: &Path, project_root: &Path) -> Result<String, PolicyViolation> {
+fn validate_private_tmp(
+    path: &Path,
+    project_root: &Path,
+    private_root: &Path,
+) -> Result<String, PolicyViolation> {
+    let private_root_components = private_root.components().collect::<Vec<_>>();
+    if private_root.is_absolute()
+        || private_root_components.is_empty()
+        || private_root_components.len() > MAX_PRIVATE_ROOT_COMPONENTS
+        || private_root_components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(unsafe_argument());
+    }
+    let fixed_root = project_root.join(private_root);
+    let Some(run_component) = path.file_name().and_then(|value| value.to_str()) else {
+        return Err(unsafe_argument());
+    };
     if !path.is_absolute()
         || path.components().any(|component| {
             matches!(component, Component::CurDir | Component::ParentDir)
         })
         || path == Path::new("/")
-        || path == project_root
-        || !path.starts_with(project_root)
+        || path.parent() != Some(fixed_root.as_path())
+        || run_component.is_empty()
+        || run_component == "."
+        || run_component == ".."
+        || run_component.len() > MAX_PRIVATE_RUN_COMPONENT_BYTES
+        || run_component.chars().any(char::is_control)
     {
         return Err(unsafe_argument());
     }

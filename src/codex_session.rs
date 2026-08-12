@@ -1,10 +1,14 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde::Deserialize;
 use uuid::Uuid;
@@ -98,9 +102,11 @@ pub fn verify_project_ownership(
         ));
     }
 
-    let canonical_project_root = fs::canonicalize(project_root).map_err(|source| AppError::Io {
-        operation: "canonicalize project root for Codex resume",
-        source,
+    let canonical_project_root = canonical_project_root(project_root).map_err(|source| {
+        AppError::Io {
+            operation: "canonicalize project root for Codex resume",
+            source,
+        }
     })?;
     let canonical_session_cwd = fs::canonicalize(&metadata.payload.cwd)
         .map_err(|_| metadata_error(&session_id, "metadata cwd cannot be canonicalized"))?;
@@ -124,7 +130,7 @@ pub fn resolve_latest_owned_session(
     codex_home: &Path,
     project_root: &Path,
 ) -> Result<String, PolicyViolation> {
-    let canonical_project_root = fs::canonicalize(project_root).map_err(|_| {
+    let canonical_project_root = canonical_project_root(project_root).map_err(|_| {
         PolicyViolation::new(
             PolicyViolationCode::RootChanged,
             PolicyViolationStage::PreBinding,
@@ -197,7 +203,19 @@ fn collect_latest_candidates(
         let Some(filename_id) = filename_session_id(&path) else {
             continue;
         };
-        let Ok(metadata) = read_metadata(&path, &filename_id) else {
+        let Ok(file) = open_metadata_nofollow(&path, &filename_id) else {
+            continue;
+        };
+        let Ok(file_metadata) = file.metadata() else {
+            continue;
+        };
+        let Ok(modified) = file_metadata.modified() else {
+            continue;
+        };
+        let Ok(modified_nanos) = modified.duration_since(UNIX_EPOCH) else {
+            continue;
+        };
+        let Ok(metadata) = read_metadata_from_file(file, &filename_id) else {
             continue;
         };
         if metadata.kind != "session_meta"
@@ -215,15 +233,6 @@ fn collect_latest_candidates(
         if !canonical_cwd.starts_with(canonical_project_root) {
             continue;
         }
-        let Ok(file_metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let Ok(modified) = file_metadata.modified() else {
-            continue;
-        };
-        let Ok(modified_nanos) = modified.duration_since(UNIX_EPOCH) else {
-            continue;
-        };
         let candidate = LatestSessionCandidate {
             id: filename_id.clone(),
             path,
@@ -279,7 +288,7 @@ fn locate_metadata_in_stores(
 
     for store_name in store_names {
         let store = codex_home.join(store_name);
-        match fs::metadata(&store) {
+        match fs::symlink_metadata(&store) {
             Ok(metadata) if metadata.is_dir() => {
                 collect_matching_metadata(
                     &store,
@@ -369,8 +378,14 @@ fn collect_matching_metadata(
 }
 
 fn read_metadata(path: &Path, session_id: &str) -> Result<SessionMetadata, AppError> {
-    let file =
-        fs::File::open(path).map_err(|_| metadata_error(session_id, "metadata is unreadable"))?;
+    let file = open_metadata_nofollow(path, session_id)?;
+    read_metadata_from_file(file, session_id)
+}
+
+fn read_metadata_from_file(
+    file: File,
+    session_id: &str,
+) -> Result<SessionMetadata, AppError> {
     let reader = BufReader::new(file);
     let mut limited = reader.take((MAX_SESSION_METADATA_BYTES + 1) as u64);
     let mut first_record = Vec::new();
@@ -387,6 +402,52 @@ fn read_metadata(path: &Path, session_id: &str) -> Result<SessionMetadata, AppEr
 
     serde_json::from_slice(&first_record)
         .map_err(|_| metadata_error(session_id, "metadata is malformed"))
+}
+
+fn open_metadata_nofollow(path: &Path, session_id: &str) -> Result<File, AppError> {
+    #[cfg(unix)]
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| metadata_error(session_id, "metadata is unreadable"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| metadata_error(session_id, "metadata is unreadable"))?;
+        if !metadata.is_file() {
+            return Err(metadata_error(
+                session_id,
+                "metadata path is not a regular file",
+            ));
+        }
+        return Ok(file);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| metadata_error(session_id, "metadata is unreadable"))?;
+        if !metadata.is_file() {
+            return Err(metadata_error(
+                session_id,
+                "metadata path is not a regular file",
+            ));
+        }
+        File::open(path).map_err(|_| metadata_error(session_id, "metadata is unreadable"))
+    }
+}
+
+fn canonical_project_root(project_root: &Path) -> std::io::Result<PathBuf> {
+    let canonical = fs::canonicalize(project_root)?;
+    let metadata = fs::symlink_metadata(&canonical)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "canonical project root is not a directory",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn normalize_metadata_id(value: &str, session_id: &str) -> Result<String, AppError> {
@@ -576,6 +637,30 @@ mod tests {
                 reason: "metadata is empty or exceeds the size limit",
             } if session_id == SESSION_ID
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_reader_does_not_follow_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside.jsonl");
+        let candidate = temp.path().join("candidate.jsonl");
+        fs::write(
+            &outside,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": SESSION_ID, "cwd": temp.path()},
+                })
+            ),
+        )
+        .unwrap();
+        symlink(&outside, &candidate).unwrap();
+
+        assert!(read_metadata(&candidate, SESSION_ID).is_err());
     }
 
     fn write_metadata(directory: &Path, filename_id: &str, payload_id: &str, cwd: &Path) {

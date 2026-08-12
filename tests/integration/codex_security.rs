@@ -8,7 +8,7 @@ use std::{
 
 use pueue_agent::{
     codex_command::{CodexArgvBuilder, CodexCapabilities},
-    codex_session::resolve_latest_owned_session,
+    codex_session::{resolve_latest_owned_session, verify_project_ownership},
     config::{
         AgentConfig, AgentCodexConfig, AgentExecutionConfig, CodexReasoningEffort,
     },
@@ -58,6 +58,45 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
             .unwrap_err();
         assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
     }
+}
+
+#[test]
+fn prompts_are_literal_after_separator_for_fresh_and_resume() {
+    let harness = Harness::new();
+    write_session(&harness.home, "old", &harness.root);
+    let prompts = [
+        "-",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "resume",
+        "review",
+        "help",
+        "",
+        "こんにちは — literal prompt",
+    ];
+
+    for prompt in prompts {
+        let fresh = harness
+            .builder()
+            .build(&config_with_args(vec!["exec", "{prompt}"]), prompt, &harness.private_tmp)
+            .unwrap();
+        assert_prompt_after_separator(&fresh, prompt);
+
+        let mut resume_config = config_with_args(vec!["{prompt}"]);
+        resume_config.context = AgentContextMode::Resume {
+            session_id: harness.id("old"),
+        };
+        let resumed = harness
+            .builder()
+            .build(&resume_config, prompt, &harness.private_tmp)
+            .unwrap();
+        assert_prompt_after_separator(&resumed, prompt);
+    }
+}
+
+fn assert_prompt_after_separator(argv: &[OsString], prompt: &str) {
+    let prompt = OsString::from(prompt);
+    assert_eq!(argv.last(), Some(&prompt));
+    assert_eq!(argv.get(argv.len().saturating_sub(2)), Some(&OsString::from("--")));
 }
 
 #[test]
@@ -139,6 +178,63 @@ fn latest_rejects_symlinked_session_store() {
     assert_eq!(error.code, PolicyViolationCode::SessionNotOwned);
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_resume_rejects_symlinked_session_store() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    let outside_store = harness._temp.path().join("outside-sessions");
+    fs::create_dir_all(&outside_store).unwrap();
+    let id = harness.id("old");
+    fs::write(
+        outside_store.join(format!("rollout-{id}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{:?}}}}}\n",
+            harness.root.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::remove_dir(harness.home.join("sessions")).unwrap();
+    symlink(&outside_store, harness.home.join("sessions")).unwrap();
+
+    assert!(matches!(
+        verify_project_ownership(&harness.home, &harness.root, &id),
+        Err(pueue_agent::AppError::CodexSessionMetadata { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_and_latest_resume_reject_symlinked_candidate_files() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    let id = harness.id("old");
+    let outside = harness._temp.path().join("outside-session.jsonl");
+    fs::write(
+        &outside,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{:?}}}}}\n",
+            harness.root.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let candidate = harness.home.join("sessions/rollout-{id}.jsonl");
+    symlink(&outside, &candidate).unwrap();
+
+    assert!(matches!(
+        verify_project_ownership(&harness.home, &harness.root, &id),
+        Err(pueue_agent::AppError::CodexSessionMetadata { .. })
+    ));
+    assert_eq!(
+        resolve_latest_owned_session(&harness.home, &harness.root)
+            .unwrap_err()
+            .code,
+        PolicyViolationCode::SessionMissing
+    );
+}
+
 #[test]
 fn private_tmp_under_trusted_project_root_is_allowed_when_root_is_in_tmp() {
     let harness = Harness::new();
@@ -149,6 +245,41 @@ fn private_tmp_under_trusted_project_root_is_allowed_when_root_is_in_tmp() {
     CodexArgvBuilder::new(policy, CodexCapabilities::all())
         .build(&config_with_args(vec!["{prompt}"]), "p", &private_tmp)
         .expect("trusted project temp must remain an allowed writable root");
+}
+
+#[test]
+fn private_tmp_requires_fixed_root_and_one_bounded_run_component() {
+    let harness = Harness::new();
+    let fixed_root = harness.root.join(".pueue-agent/tmp");
+    for private_tmp in [
+        fixed_root.clone(),
+        fixed_root.join("run/nested"),
+        harness.root.join("other/run"),
+        harness.root.join(".pueue-agent/tmp/../tmp/run"),
+    ] {
+        let error = harness
+            .builder()
+            .build(&config_with_args(vec!["{prompt}"]), "p", &private_tmp)
+            .unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
+    }
+
+    for relative_root in [
+        PathBuf::from("/absolute/private-tmp"),
+        PathBuf::from("."),
+        PathBuf::from(".pueue-agent/tmp/nested"),
+    ] {
+        let mut policy = harness.builder().policy().clone();
+        policy.private_temp_relative_root = relative_root;
+        let error = CodexArgvBuilder::new(policy, CodexCapabilities::all())
+            .build(
+                &config_with_args(vec!["{prompt}"]),
+                "p",
+                &harness.private_tmp,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
+    }
 }
 
 #[test]

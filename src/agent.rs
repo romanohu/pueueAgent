@@ -192,7 +192,7 @@ impl AgentRunner {
                     .root_anchor
                     .canonical_path
                     .join(&policy.private_temp_relative_root)
-                    .join("command");
+                    .join("run");
                 let argv = CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
                     .build(config, prompt, &private_tmp)
                     .map_err(AppError::from)?;
