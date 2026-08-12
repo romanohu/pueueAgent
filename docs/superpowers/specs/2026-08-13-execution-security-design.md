@@ -106,9 +106,10 @@ installations. Service-account compromise is out of scope.
    cannot express the resolved mode, dispatch is blocked.
 8. Agent/task processes use `env_clear`/default-deny. Codex may write only the
    project root and its per-run private `TMPDIR`; global `/tmp` is excluded.
-9. Agent logs are owner-only regular files opened no-follow. Task/extra logs
-   are opened descriptor-relative beneath project root, not from a prior
-   `canonicalize` result.
+9. Agent, task, and extra logs are opened component-by-component relative to a
+   pinned project-root descriptor with no-follow. Agent logs are owner-only
+   regular files; no log uses a prior `canonicalize` result as its later open
+   target.
 10. Policy violations are nonretryable and linked events go directly to
     `dead_letter` with `policy_blocked:<code>`. Transient pre-exec OS/resource
     failures retain retry. Post-marker uncertainty always dead-letters.
@@ -131,6 +132,18 @@ The daemon resolves the global policy before constructing `Daemon`.
 `Scheduler::tick` resolves the project policy before intervention reservation;
 `AgentRunner::spawn` receives it and never consults ambient PATH or a
 privileged file. Active `AgentHandle` retains it.
+Each resolved project policy contains a `ProjectRootAnchor`, not only a path:
+device/inode/owner/mode are recorded at resolution, and the gate reopens the
+directory no-follow and consumes the verified descriptor before log/temp/launch
+work. A changed root is a bounded policy violation before marker release.
+
+Policy loading has two explicit entry points. Only `enable` and daemon startup
+may call `load_or_create_policy`; read-only/operator paths call
+`load_existing_policy` and never create, repair, migrate, chmod, or rewrite the
+policy. On first enable, the root inventory used for validation is the union of
+all registered canonical roots and the candidate canonical root, even before
+the candidate is inserted into SQLite. Policy/anchor validation completes
+before project registration or Pueue/callback side effects.
 
 Service installation records canonical `HOME`, `CODEX_HOME` (explicit or
 derived once), trusted `PATH`, `PUEUE_AGENT_STATE_DIR`, and the Pueue config
@@ -183,6 +196,11 @@ Existing project TOML stays valid. Add only narrowing options:
 ```toml
 [agent.execution]
 network = "enabled" # enabled | disabled; default enabled
+
+[agent.codex]
+# Optional, non-security execution controls. Valid only for program = "codex".
+# model = "<installed-model-id>"
+# reasoning_effort = "high" # low | medium | high | xhigh
 ```
 
 The project may change `enabled` to `disabled`, but cannot override a
@@ -205,6 +223,29 @@ danger-full-access, sandbox bypass, add-dir, cwd/`-C`, approval/security,
 network, and other security-setting overrides. An explicit allowlist preserves
 model/reasoning-effort and other safe behavior controls; unknown future
 security flags are not implicitly safe.
+
+For Codex CLI 0.147.0, the forced invocation contract is the global
+`--ask-for-approval never`, followed by `exec --ignore-user-config
+--ignore-rules --strict-config --sandbox workspace-write -C <root>`. The
+adapter supplies only supervisor-generated `-c` overrides using documented
+keys: `sandbox_workspace_write.network_access`,
+`sandbox_workspace_write.exclude_slash_tmp`,
+`sandbox_workspace_write.exclude_tmpdir_env_var`,
+`sandbox_workspace_write.writable_roots`, `projects` with the canonical root's
+`trust_level="untrusted"`, `allow_login_shell=false`, and the
+`shell_environment_policy` table. The environment table uses
+`inherit="all"`, `ignore_default_excludes=false`,
+`experimental_use_profile=false`, and name-only `filters` containing only the
+resolved task baseline/allowlist; Codex auth names are omitted. This keeps
+auth in the Codex process while excluding it from model-launched subprocesses.
+
+Existing `args = ["exec", "{prompt}"]` is accepted as a compatibility
+envelope, not copied verbatim. Codex arguments must contain exactly one prompt
+placeholder and may not inject `-c`, profiles, hooks, sandbox, cwd, or other
+flags. Model and reasoning effort are represented by the structured
+`[agent.codex]` fields and converted by the adapter to `--model` and the
+documented `model_reasoning_effort` override. Custom agents retain their
+service-enrolled argv contract.
 
 The adapter also forces the project trust/config layer that skips
 project-scoped `.codex` configuration, hooks, and MCP declarations. The
@@ -254,16 +295,49 @@ not shared, and no add-dir or second project root is granted.
 Replace `/bin/sh` and `LAUNCH_GATE_SCRIPT` with a private native mode in the
 trusted Rust executable (for example `pueue-agent __launch-agent`), hidden from
 normal help and not project-configurable. It receives anchored paths/argv but
-no credential values in argv. It revalidates root, executable/symlink identity,
+no credential, prompt, or target argv values in its process argv; the parent
+sends a bounded launch payload over an anonymous inherited control pipe. It
+revalidates root, executable/symlink identity,
 Codex/session ownership, secure log, environment, and temp facts, calls
 `setsid` and aborts on error, opens secure logs, and waits for the exact release
 byte. The executable is opened no-follow and its identity is verified on that
-descriptor. The gate forks a child that is blocked on a private release pipe
-before any target code can execute. It then atomically creates the mode-0600
-marker and releases the child to execute the already verified descriptor with
-an argv vector (`fexecve`/equivalent), never a path, shell, or PATH lookup. A
-close-on-exec status pipe confirms successful exec before the gate writes
-`released\n`; the gate remains group leader and waits for the target.
+descriptor. The platform adapter then prevents target code from running before
+the mode-0600 marker is durable:
+
+- Linux forks a child blocked on a private pipe, creates the marker, and
+  releases the child to execute the verified descriptor with `execveat`/
+  `fexecve`. A close-on-exec status pipe confirms successful exec before the
+  gate writes `released\n`.
+- macOS has no descriptor-exec API. The native launcher first becomes the
+  session/process-group leader with mandatory `setsid`, revalidates the open
+  descriptor immediately before `posix_spawn` with `START_SUSPENDED`, and
+  spawns the canonical path suspended in the launcher's group. It then
+  reopens/revalidates the path. A mismatch kills and reaps the still-suspended
+  process. After the marker is durable, `SIGCONT` releases the target and the
+  gate writes `released\n`.
+
+Both adapters use argv vectors and never invoke a shell or PATH lookup. The
+gate remains process-group leader/owner and waits for the target. On macOS, a
+malicious same-UID process that swaps an anchor for the kernel lookup and
+restores it before post-spawn verification is a documented residual risk;
+other same-UID service compromise and an explicitly enrolled malicious custom
+agent are outside this slice's threat model. Project-controlled Codex runs
+remain unable to write anchor directories under the forced sandbox.
+
+The internal launch protocol is versioned and closed. The helper argv is only
+the hidden subcommand; fixed inherited descriptors are control=3, release=4,
+exec-status=5, target=6, project-root=7, agent-log=8, Pueue-config=9, and
+release-ack=10. Unused descriptors are closed. The control stream starts with
+magic `PAEX`, version 1, an agent/Pueue mode tag, flags, and a big-endian u32
+payload length capped at 1 MiB. The length-prefixed binary payload caps argv at
+256 entries, environment at 128 names, each string/byte field at 64 KiB, and
+contains expected descriptor identities, argv, cwd, and environment. Duplicate
+environment names, unknown modes/flags/fields, trailing bytes, NULs, invalid
+relative log/marker facts, or identity mismatches fail before target creation.
+Credentials may cross only this anonymous pipe, never process argv, logs, or
+SQLite. Capture mode routes target stdout/stderr through the helper's piped
+stdio; agent mode duplicates the verified log descriptor. The dedicated ack FD
+emits only the fixed `released\n` record after release/exec confirmation.
 
 This deliberately strengthens the marker contract. The marker means target
 execution was durably authorized and may have begun, not that useful work or
@@ -288,19 +362,29 @@ preserving fixed `--config` args. Before `status`, `add`, `kill`, `remove`, or
 establish a process group with mandatory successful `setsid`. Use fixed 30
 second per-command timeout and 64 KiB independent stdout/stderr caps; timeout
 cleanup is TERM then KILL. Continue direct argv; never build a shell command.
-Pueue launch uses the same verified-descriptor execution helper, without the
-agent marker/release protocol, so revalidation and process creation are not a
-path-based check/use pair.
+Pueue launch uses the same platform execution adapter without the agent
+marker/release protocol: descriptor execution on Linux and suspended
+pre/post-verified `posix_spawn` on macOS.
 The configured Pueue YAML path must canonicalize to a service-owned regular
-file outside every project root and have no group/other write bits. Validate
-`pueue_group` against a bounded `[A-Za-z0-9][A-Za-z0-9._-]*` grammar before it
-can reach callback registration or Pueue argv.
+file outside every project root and have no group/other write bits. Each
+operation reopens and verifies the pinned identity, inherits that verified
+descriptor at the launch protocol's fixed config FD, and invokes Pueue with
+`--config /dev/fd/<fixed-fd>`. Pueue therefore reads the verified file rather
+than reopening the original path after a check. Validate
+`pueue_group` against `[A-Za-z0-9][A-Za-z0-9._-]*` with a 128-byte maximum
+before it can reach callback registration or Pueue argv.
 
-Enforce 1 MiB in `config::load` and `LogSnapshot::read_tail`. Agent logs use
-Unix no-follow/close-on-exec, create/append, regular-file, service-owner, and
-verify that no group/other permission bits are set. Symlink/device/directory/
-weak files are
-`policy_blocked:agent_log_unsafe`.
+Enforce 1 MiB in `config::load` and `LogSnapshot::read_tail`. Agent logs use a
+pinned project-root directory descriptor and walk `.pueue-agent/logs/...`
+component-by-component with Unix no-follow/close-on-exec before create/append.
+The service creates the fixed `.pueue-agent/logs` components descriptor-
+relatively with owner-only mode when absent, and rejects existing components
+that are symlinks, not directories, not owned by the service account, or
+group/other writable. The adjacent launch marker is also created, made durable,
+and inspected descriptor-relatively through the same pinned root; recovery
+never follows an ambient absolute marker path. The final descriptor must be a
+regular file owned by the service account with no group/other permission bits.
+Symlink/device/directory/weak files are `policy_blocked:agent_log_unsafe`.
 
 Task/extra paths are relative only. Open a project-root directory descriptor
 and walk components descriptor-relatively with no-follow (`openat`-style) and
@@ -376,8 +460,9 @@ and stage as necessary.
 ## Testing requirements
 
 Tests are host-independent: no real Codex/Pueue, network, or host `/bin`
-layout. Extend `tests/support/fake_agent.sh`, `fake_codex.sh`,
-`fake_pueue.rs`, existing integration tests, and
+layout. Compile small generated Rust fixture executables for native
+launcher/Pueue process tests; keep shell fixtures only for non-native argv and
+entrypoint compatibility tests. Extend existing integration tests and
 `tests/test_shell_entrypoints.bats` with generated fixtures.
 
 Cargo tests cover: secure default atomic creation/owner/perms/unknown fields;
@@ -387,8 +472,9 @@ unsafe Codex args versus safe model/reasoning; workspace-write,
 approval-never, network default and disable; owned `resume_latest` and no
 fallback; agent/task environment allowlists and auth noninheritance with no
 credential persistence; native no-shell launch, exact two-stage ack,
-pre-marker revalidation, setsid failure, TERM/KILL cleanup, retry, and
-shutdown; canonical Pueue timeout/cleanup/output; 1 MiB cap and secure/
+pre-marker revalidation, Linux descriptor exec, macOS suspended-spawn
+pre/post-verification, setsid failure, TERM/KILL cleanup, retry, and shutdown;
+canonical Pueue timeout/cleanup/output; 1 MiB cap and secure/
 descriptor-relative log reads; grouped-event/intervention semantics; and
 bounded status/doctor project/path/code/stage output without notification.
 
