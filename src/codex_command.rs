@@ -14,7 +14,7 @@ use std::{
 use crate::{
     codex_session,
     config::AgentConfig,
-    environment::{is_auth_name, shell_baseline_names},
+    environment::{is_auth_name, is_proxy_or_cert_name, shell_baseline_names},
     execution_policy::{
         AgentKind, NetworkMode, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
         ResolvedProjectExecutionPolicy,
@@ -285,7 +285,7 @@ fn environment_filters(task_allow: &BTreeSet<String>) -> Result<String, PolicyVi
     names.extend(task_allow.iter().map(String::as_str));
     let mut entries = Vec::new();
     for name in names {
-        if is_auth_name(name) {
+        if is_auth_name(name) || is_proxy_or_cert_name(name) {
             continue;
         }
         if !valid_environment_name(name) {

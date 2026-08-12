@@ -81,6 +81,60 @@ fn task_env_is_default_deny_and_auth_never_inherits() {
 }
 
 #[test]
+fn proxy_and_control_names_are_scoped_or_denied() {
+    let harness = Harness::new();
+    let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
+        ("HTTP_PROXY", "http://user:password@example.invalid"),
+        ("HTTPS_PROXY", "https://proxy.invalid"),
+        ("CODEX_HOME", "/ambient/codex"),
+        ("GOOGLE_APPLICATION_CREDENTIALS", "/secret/google.json"),
+        ("DOCKER_AUTH_CONFIG", "{\"auths\":{}}"),
+        ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+        ("GIT_ASKPASS", "/tmp/askpass"),
+        ("DATASET_ROOT", "/data"),
+    ]);
+    let mut policy = harness.builder().policy().clone();
+    policy.agent_environment_allow = [
+        "HTTP_PROXY",
+        "CODEX_HOME",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "DOCKER_AUTH_CONFIG",
+        "SSH_AUTH_SOCK",
+        "GIT_ASKPASS",
+        "DATASET_ROOT",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    policy.task_environment_allow = policy.agent_environment_allow.clone();
+
+    let agent = SanitizedEnvironment::for_codex_agent(&startup, &policy, 41).unwrap();
+    assert_eq!(agent.get("HTTP_PROXY"), Some(std::ffi::OsStr::new("http://user:password@example.invalid")));
+    assert_eq!(agent.get("CODEX_HOME"), Some(policy.codex_home.as_os_str()));
+    assert_eq!(agent.get("GOOGLE_APPLICATION_CREDENTIALS"), None);
+    assert_eq!(agent.get("DOCKER_AUTH_CONFIG"), None);
+    assert!(!format!("{agent:?}").contains("password"));
+
+    for environment in [
+        SanitizedEnvironment::for_codex_task(&startup, &policy, 41).unwrap(),
+        SanitizedEnvironment::for_custom_agent(&startup, &policy, 41).unwrap(),
+    ] {
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "CODEX_HOME",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "DOCKER_AUTH_CONFIG",
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+        ] {
+            assert_eq!(environment.get(name), None, "{name}");
+        }
+        assert!(!format!("{environment:?}").contains("password"));
+    }
+}
+
+#[test]
 fn codex_agent_env_allows_only_known_startup_auth_names() {
     let harness = Harness::new();
     let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
@@ -212,8 +266,26 @@ fn private_temp_is_0700_and_removed() {
     let temp = PrivateRunTemp::create(&root, 41).unwrap();
     assert_eq!(fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777, 0o700);
     let path = temp.path().to_owned();
+    let parent = path.parent().unwrap().to_owned();
+    fs::write(path.join("original-generation"), b"original").unwrap();
     drop(temp);
     assert!(!path.exists());
+    let tombstone = fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".pueue-agent-quarantine-"))
+        })
+        .expect("cleanup retains an unpredictable quarantine tombstone");
+    let retained_file = fs::read_dir(&tombstone)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|entry| entry.is_file())
+        .expect("file tombstone retained");
+    assert_eq!(fs::read(retained_file).unwrap(), b"original");
 }
 
 #[cfg(unix)]
@@ -271,9 +343,24 @@ fn private_temp_does_not_follow_nested_symlinks_or_delete_replacement() {
     fs::rename(&replacement_path, &moved).unwrap();
     fs::create_dir(&replacement_path).unwrap();
     fs::write(replacement_path.join("keep"), b"replacement").unwrap();
+    let replacement_parent = replacement_path.parent().unwrap().to_owned();
     drop(replacement);
-    assert!(replacement_path.join("keep").exists());
+    assert!(!replacement_path.exists());
     assert!(moved.exists());
+    let tombstone = fs::read_dir(replacement_parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(".pueue-agent-quarantine-")
+                        && entry.join("keep").is_file()
+                })
+        })
+        .unwrap();
+    assert_eq!(fs::read(tombstone.join("keep")).unwrap(), b"replacement");
 }
 
 #[cfg(unix)]
@@ -287,8 +374,18 @@ fn private_temp_retains_tree_when_cleanup_bounds_are_exceeded() {
         fs::write(temp.path().join(format!("entry-{index}")), b"x").unwrap();
     }
     let path = temp.path().to_owned();
+    let parent = path.parent().unwrap().to_owned();
     drop(temp);
-    assert!(path.exists());
+    assert!(!path.exists());
+    assert!(fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .any(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".pueue-agent-quarantine-"))
+        }));
 }
 
 #[test]

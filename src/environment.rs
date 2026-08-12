@@ -11,7 +11,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::File,
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -66,6 +66,10 @@ const CODEX_AUTH_NAMES: &[&str] = &[
     "CODEX_AUTH_TOKEN",
 ];
 
+pub(crate) fn is_proxy_or_cert_name(name: &str) -> bool {
+    PROXY_AND_CERT_NAMES.contains(&name)
+}
+
 /// Names used by the Codex shell environment filter.  This deliberately
 /// contains a fixed non-secret baseline even when a project has no task
 /// allowlist, so an empty filter can never accidentally mean "inherit all".
@@ -83,6 +87,7 @@ pub(crate) fn is_auth_name(name: &str) -> bool {
         "OPENAI_API_KEY"
             | "CODEX_API_KEY"
             | "CODEX_AUTH_TOKEN"
+            | "CODEX_HOME"
             | "AWS_ACCESS_KEY_ID"
             | "AWS_SECRET_ACCESS_KEY"
             | "GITHUB_TOKEN"
@@ -92,6 +97,46 @@ pub(crate) fn is_auth_name(name: &str) -> bool {
             | "ACCESS_TOKEN"
             | "REFRESH_TOKEN"
             | "API_KEY"
+            | "GOOGLE_APPLICATION_CREDENTIALS"
+            | "DOCKER_AUTH_CONFIG"
+            | "REGISTRY_AUTH_FILE"
+            | "KUBECONFIG"
+            | "AZURE_CLIENT_ID"
+            | "AZURE_CLIENT_SECRET"
+            | "AWS_SESSION_TOKEN"
+            | "AWS_SECURITY_TOKEN"
+            | "AWS_PROFILE"
+            | "AWS_SHARED_CREDENTIALS_FILE"
+            | "AWS_CONFIG_FILE"
+            | "AWS_WEB_IDENTITY_TOKEN_FILE"
+            | "AWS_ROLE_ARN"
+            | "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+            | "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+            | "GOOGLE_CLOUD_KEYFILE_JSON"
+            | "GOOGLE_GHA_CREDS_PATH"
+            | "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"
+            | "CLOUDSDK_AUTH_ACCESS_TOKEN"
+            | "CLOUDSDK_CONFIG"
+            | "BOTO_CONFIG"
+            | "AZURE_TENANT_ID"
+            | "AZURE_SUBSCRIPTION_ID"
+            | "AZURE_FEDERATED_TOKEN_FILE"
+            | "AZURE_USERNAME"
+            | "AZURE_PASSWORD"
+            | "AZURE_CONFIG_DIR"
+            | "AZURE_AUTH_LOCATION"
+            | "DOCKER_CONFIG"
+            | "CONTAINER_AUTH_FILE"
+            | "BUILDAH_AUTH"
+            | "HELM_KUBECONTEXT"
+            | "HELM_CONFIG_HOME"
+            | "HELM_DATA_HOME"
+            | "HELM_CACHE_HOME"
+            | "SSH_AUTH_SOCK"
+            | "GIT_ASKPASS"
+            | "GIT_SSH_COMMAND"
+            | "GIT_CREDENTIAL_HELPER"
+            | "GCM_INTERACTIVE"
     ) || upper.ends_with("_API_KEY")
         || upper.ends_with("_TOKEN")
         || upper.ends_with("_SECRET")
@@ -99,6 +144,8 @@ pub(crate) fn is_auth_name(name: &str) -> bool {
         || upper.ends_with("_PRIVATE_KEY")
         || upper.ends_with("_CREDENTIAL")
         || upper.ends_with("_CREDENTIALS")
+        || upper.starts_with("GIT_CONFIG_")
+        || upper.starts_with("GCM_")
         || upper.contains("TOKEN")
         || upper.contains("SECRET")
         || upper.contains("PASSWORD")
@@ -144,7 +191,7 @@ impl SanitizedEnvironment {
         policy: &ResolvedProjectExecutionPolicy,
         run_id: i64,
     ) -> Result<Self, PolicyViolation> {
-        let mut environment = Self::project_baseline(startup, policy, run_id)?;
+        let mut environment = Self::project_baseline(startup, policy, run_id, true)?;
         environment.insert_generated("CODEX_HOME", policy.codex_home.as_os_str());
         for name in CODEX_AUTH_NAMES {
             if let Some(value) = startup.get(name) {
@@ -159,7 +206,7 @@ impl SanitizedEnvironment {
         policy: &ResolvedProjectExecutionPolicy,
         run_id: i64,
     ) -> Result<Self, PolicyViolation> {
-        let mut environment = Self::project_baseline(startup, policy, run_id)?;
+        let mut environment = Self::project_baseline(startup, policy, run_id, false)?;
         environment.copy_allowlist(startup, &policy.agent_environment_allow);
         Ok(environment)
     }
@@ -169,7 +216,7 @@ impl SanitizedEnvironment {
         policy: &ResolvedProjectExecutionPolicy,
         run_id: i64,
     ) -> Result<Self, PolicyViolation> {
-        let mut environment = Self::project_baseline(startup, policy, run_id)?;
+        let mut environment = Self::project_baseline(startup, policy, run_id, false)?;
         environment.copy_allowlist(startup, &policy.task_environment_allow);
         Ok(environment)
     }
@@ -180,6 +227,7 @@ impl SanitizedEnvironment {
             &policy.trusted_path,
             None,
             None,
+            false,
         )?;
         // The caller launches the startup-pinned executable itself.  Keep the
         // anchor in this API to make it impossible to accidentally substitute
@@ -193,6 +241,7 @@ impl SanitizedEnvironment {
         startup: &StartupEnvironment,
         policy: &ResolvedProjectExecutionPolicy,
         run_id: i64,
+        include_proxy_cert: bool,
     ) -> Result<Self, PolicyViolation> {
         validate_run_id(run_id)?;
         let temp_path = policy
@@ -205,6 +254,7 @@ impl SanitizedEnvironment {
             &policy.trusted_path,
             Some(temp_path.as_os_str()),
             Some((run_id, policy.project_id.as_str())),
+            include_proxy_cert,
         )
     }
 
@@ -213,6 +263,7 @@ impl SanitizedEnvironment {
         trusted_path: &[PathBuf],
         temp_path: Option<&OsStr>,
         ids: Option<(i64, &str)>,
+        include_proxy_cert: bool,
     ) -> Result<Self, PolicyViolation> {
         let mut environment = Self::default();
         for name in ["HOME"] {
@@ -237,8 +288,10 @@ impl SanitizedEnvironment {
                 environment.copy_startup_name(startup, name);
             }
         }
-        for name in PROXY_AND_CERT_NAMES {
-            environment.copy_startup_name(startup, name);
+        if include_proxy_cert {
+            for name in PROXY_AND_CERT_NAMES {
+                environment.copy_startup_name(startup, name);
+            }
         }
         if let Some((run_id, project_id)) = ids {
             environment.insert_generated("PUEUE_AGENT_RUN_ID", OsString::from(run_id.to_string()));
@@ -249,7 +302,9 @@ impl SanitizedEnvironment {
 
     fn copy_allowlist(&mut self, startup: &StartupEnvironment, allowlist: &BTreeSet<String>) {
         for name in allowlist {
-            if !is_auth_name(name) {
+            if !is_auth_name(name)
+                && !is_proxy_or_cert_name(name)
+            {
                 if let Some(value) = startup.get(name) {
                     self.insert_os(OsString::from(name), value.to_os_string());
                 }
@@ -350,6 +405,7 @@ pub struct PrivateRunTemp {
     name: OsString,
     path: PathBuf,
     identity: (u64, u64),
+    quarantined: bool,
 }
 
 impl fmt::Debug for PrivateRunTemp {
@@ -383,14 +439,28 @@ impl PrivateRunTemp {
             let directory = match open_directory_nofollow(&tmp, &name) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    let _ = unlinkat_raw(&tmp, &name, false);
+                    quarantine_created_directory(&tmp, &name);
                     return Err(map_temp_io(error));
                 }
             };
-            validate_private_directory(&directory)?;
-            let metadata = directory.metadata().map_err(|_| temp_error())?;
-            directory.sync_all().map_err(|_| temp_error())?;
-            tmp.sync_all().map_err(|_| temp_error())?;
+            if let Err(error) = validate_private_directory(&directory) {
+                drop(directory);
+                quarantine_created_directory(&tmp, &name);
+                return Err(error);
+            }
+            let metadata = match directory.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    drop(directory);
+                    quarantine_created_directory(&tmp, &name);
+                    return Err(temp_error());
+                }
+            };
+            if directory.sync_all().is_err() || tmp.sync_all().is_err() {
+                drop(directory);
+                quarantine_created_directory(&tmp, &name);
+                return Err(temp_error());
+            }
             let path = root
                 .anchor
                 .canonical_path
@@ -403,6 +473,7 @@ impl PrivateRunTemp {
                 name,
                 path,
                 identity: (device(&metadata), inode(&metadata)),
+                quarantined: false,
             })
         }
     }
@@ -430,6 +501,9 @@ impl PrivateRunTemp {
 
 impl Drop for PrivateRunTemp {
     fn drop(&mut self) {
+        if self.quarantined {
+            return;
+        }
         let _ = self.cleanup();
     }
 }
@@ -443,16 +517,35 @@ fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, PolicyV
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             mkdirat_private(parent, name)?;
-            let directory = open_directory_nofollow(parent, name).map_err(map_temp_io)?;
+            let directory = match open_directory_nofollow(parent, name) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    quarantine_created_directory(parent, name);
+                    return Err(map_temp_io(error));
+                }
+            };
             if let Err(error) = validate_private_directory(&directory) {
-                let _ = unlinkat_raw(parent, name, true);
+                drop(directory);
+                quarantine_created_directory(parent, name);
                 return Err(error);
             }
-            parent.sync_all().map_err(|_| temp_error())?;
+            if parent.sync_all().is_err() {
+                drop(directory);
+                quarantine_created_directory(parent, name);
+                return Err(temp_error());
+            }
             Ok(directory)
         }
         Err(error) => Err(map_temp_io(error)),
     }
+}
+
+#[cfg(unix)]
+fn quarantine_created_directory(parent: &File, name: &OsStr) {
+    let Some(stat) = statat_nofollow(parent, name).ok().filter(|stat| stat.is_dir) else {
+        return;
+    };
+    let _ = quarantine_entry(parent, name, Some((stat.device, stat.inode)));
 }
 
 #[cfg(unix)]
@@ -505,27 +598,24 @@ fn open_directory_nofollow(parent: &File, name: &OsStr) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn unlinkat_raw(parent: &File, name: &OsStr, directory: bool) -> io::Result<()> {
-    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
-    let name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
-    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
-    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
 fn cleanup_private(temp: &mut PrivateRunTemp) -> Result<(), PolicyViolation> {
+    if temp.quarantined {
+        return Ok(());
+    }
+    match quarantine_entry(&temp.parent, &temp.name, Some(temp.identity)) {
+        Ok(_) => temp.quarantined = true,
+        Err(failure) => {
+            // A successful rename can be followed by an identity mismatch or
+            // another error.  The source name is then gone, so never retry a
+            // second path operation against a potentially new generation.
+            if failure.renamed || !entry_exists(&temp.parent, &temp.name) {
+                temp.quarantined = true;
+            }
+            return Err(failure.error);
+        }
+    }
     let mut state = CleanupState { entries: 0 };
     cleanup_directory(&temp.directory, 0, &mut state)?;
-    if !same_generation(&temp.parent, &temp.name, temp.identity)? {
-        return Err(temp_error());
-    }
-    unlinkat_raw(&temp.parent, &temp.name, true).map_err(map_temp_io)?;
     temp.parent.sync_all().map_err(|_| temp_error())?;
     Ok(())
 }
@@ -551,17 +641,20 @@ fn cleanup_directory(
             return Err(temp_error());
         }
         let item = statat_nofollow(directory, &name).map_err(map_temp_io)?;
-        if item.is_dir {
+        let child = if item.is_dir {
             let child = open_directory_nofollow(directory, &name).map_err(map_temp_io)?;
             validate_private_child(&child)?;
-            let child_identity = child_identity(&child)?;
-            cleanup_directory(&child, depth + 1, state)?;
-            if !same_generation(directory, &name, child_identity)? {
-                return Err(temp_error());
-            }
-            unlinkat_raw(directory, &name, true).map_err(map_temp_io)?;
+            Some(child)
         } else {
-            unlinkat_raw(directory, &name, false).map_err(map_temp_io)?;
+            None
+        };
+        // Rename-to-private is the only removal operation.  The destination
+        // is no-replace and unpredictable; the moved entry is retained as a
+        // bounded diagnostic tombstone rather than unlinked.
+        quarantine_entry(directory, &name, Some((item.device, item.inode)))
+            .map_err(|failure| failure.error)?;
+        if let Some(child) = child {
+            cleanup_directory(&child, depth + 1, state)?;
         }
     }
     Ok(())
@@ -578,26 +671,139 @@ fn validate_private_child(directory: &File) -> Result<(), PolicyViolation> {
 }
 
 #[cfg(unix)]
-fn child_identity(directory: &File) -> Result<(u64, u64), PolicyViolation> {
-    let metadata = directory.metadata().map_err(|_| temp_error())?;
-    Ok((device(&metadata), inode(&metadata)))
-}
-
-#[cfg(unix)]
-fn same_generation(
-    parent: &File,
-    name: &OsStr,
-    expected: (u64, u64),
-) -> Result<bool, PolicyViolation> {
-    let stat = statat_nofollow(parent, name).map_err(map_temp_io)?;
-    Ok(stat.is_dir && (stat.device, stat.inode) == expected)
-}
-
-#[cfg(unix)]
 struct StatAt {
     is_dir: bool,
     device: u64,
     inode: u64,
+}
+
+#[cfg(unix)]
+fn entry_exists(parent: &File, name: &OsStr) -> bool {
+    statat_nofollow(parent, name).is_ok()
+}
+
+#[cfg(unix)]
+struct QuarantineFailure {
+    error: PolicyViolation,
+    renamed: bool,
+}
+
+#[cfg(unix)]
+fn quarantine_entry(
+    parent: &File,
+    name: &OsStr,
+    expected: Option<(u64, u64)>,
+) -> Result<OsString, QuarantineFailure> {
+    for _ in 0..16 {
+        let destination = random_quarantine_name()
+            .map_err(map_temp_io)
+            .map_err(|error| QuarantineFailure {
+                error,
+                renamed: false,
+            })?;
+        match rename_noreplace(parent, name, parent, &destination) {
+            Ok(()) => {
+                let moved = statat_nofollow(parent, &destination)
+                    .map_err(map_temp_io)
+                    .map_err(|error| QuarantineFailure {
+                        error,
+                        renamed: true,
+                    })?;
+                if expected.is_some_and(|expected| {
+                    (moved.device, moved.inode) != expected
+                }) {
+                    return Err(QuarantineFailure {
+                        error: temp_error(),
+                        renamed: true,
+                    });
+                }
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(QuarantineFailure {
+                    error: map_temp_io(error),
+                    renamed: false,
+                })
+            }
+        }
+    }
+    Err(QuarantineFailure {
+        error: temp_error(),
+        renamed: false,
+    })
+}
+
+#[cfg(unix)]
+fn random_quarantine_name() -> io::Result<OsString> {
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let mut name = String::from(".pueue-agent-quarantine-");
+    for byte in random {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    Ok(OsString::from(name))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(
+    old_parent: &File,
+    old_name: &OsStr,
+    new_parent: &File,
+    new_name: &OsStr,
+) -> io::Result<()> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let old_name = std::ffi::CString::new(old_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
+    let new_name = std::ffi::CString::new(new_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
+    let result = unsafe {
+        libc::renameat2(
+            old_parent.as_raw_fd(),
+            old_name.as_ptr(),
+            new_parent.as_raw_fd(),
+            new_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(
+    old_parent: &File,
+    old_name: &OsStr,
+    new_parent: &File,
+    new_name: &OsStr,
+) -> io::Result<()> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let old_name = std::ffi::CString::new(old_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
+    let new_name = std::ffi::CString::new(new_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
+    let result = unsafe {
+        libc::renameatx_np(
+            old_parent.as_raw_fd(),
+            old_name.as_ptr(),
+            new_parent.as_raw_fd(),
+            new_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn rename_noreplace(
+    _old_parent: &File,
+    _old_name: &OsStr,
+    _new_parent: &File,
+    _new_name: &OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable",
+    ))
 }
 
 #[cfg(unix)]
