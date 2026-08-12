@@ -926,12 +926,35 @@ pub fn resolve_project_policy(
     let (agent_anchor, agent_kind) = if config.agent.program == "codex" {
         (global.codex_anchor.clone(), AgentKind::BuiltInCodex)
     } else {
+        let configured_path = Path::new(&config.agent.program);
+        if !configured_path.is_absolute()
+            || configured_path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::CustomAgentNotEnrolled,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        if inside_any_root(configured_path, &global.project_roots) {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::ProjectRootExecutable,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
         let Some(anchor) = global.custom_allowlist.get(&project.project_id) else {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::CustomAgentNotEnrolled,
                 PolicyViolationStage::PreBinding,
             ));
         };
+        if anchor.canonical_path != configured_path {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::CustomAgentNotEnrolled,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
         (anchor.clone(), AgentKind::Custom)
     };
     let (agent_environment_allow, task_environment_allow) = global
@@ -944,7 +967,13 @@ pub fn resolve_project_policy(
         root_anchor,
         agent_anchor,
         agent_kind,
-        network: global.default_network,
+        network: if matches!(global.default_network, NetworkMode::Disabled)
+            || matches!(config.agent.execution.network, NetworkMode::Disabled)
+        {
+            NetworkMode::Disabled
+        } else {
+            NetworkMode::Enabled
+        },
         agent_environment_allow,
         task_environment_allow,
         codex_home: global.codex_home.clone(),

@@ -4,10 +4,12 @@ use std::{
 };
 
 use pueue_agent::{
+    config::{AgentConfig, AgentCodexConfig, AgentExecutionConfig, ProjectConfig},
     execution_policy::{
-        load_existing_policy, load_or_create_policy, NetworkMode, PolicyLoadInput,
-        PolicyViolationCode, StartupEnvironment,
+        load_existing_policy, load_or_create_policy, resolve_project_policy, AgentKind,
+        NetworkMode, PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
     },
+    models::{AgentContextMode, Project},
 };
 use tempfile::{tempdir, TempDir};
 
@@ -77,6 +79,56 @@ impl PolicyHarness {
             pueue_config: self.pueue_config.clone(),
             launcher_path: self.launcher.clone(),
         }
+    }
+
+    fn project(&self, project_id: &str) -> Project {
+        Project {
+            project_id: project_id.to_owned(),
+            root_path: self.project_root.clone(),
+            pueue_group: "pa-test".to_owned(),
+            config_path: self.project_root.join("config.toml"),
+            enabled: true,
+            paused: false,
+            halted_reason: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+}
+
+fn custom_config(project_id: &str, program: &str, network: NetworkMode) -> ProjectConfig {
+    ProjectConfig {
+        project_id: project_id.to_owned(),
+        pueue_group: "pa-test".to_owned(),
+        agent: AgentConfig {
+            program: program.to_owned(),
+            args: vec!["{prompt}".to_owned()],
+            timeout_minutes: 1,
+            max_retries: 0,
+            context: AgentContextMode::Fresh,
+            execution: AgentExecutionConfig { network },
+            codex: AgentCodexConfig {
+                model: None,
+                reasoning_effort: None,
+            },
+        },
+        check: pueue_agent::config::CheckConfig {
+            interval_minutes: 1,
+            deep_check_interval_minutes: 0,
+            stall_minutes: 1,
+            log_tail_bytes: 1,
+            extra_log_paths: Vec::new(),
+            patterns: Vec::new(),
+            stall: pueue_agent::config::StallConfig {
+                action: pueue_agent::config::PatternAction::Notify,
+                kill_after_minutes: 0,
+            },
+        },
+        guardrails: pueue_agent::config::GuardrailsConfig {
+            max_consecutive_failures: 1,
+            max_experiments: 1,
+            max_agent_runs: 1,
+        },
     }
 }
 
@@ -203,6 +255,97 @@ fn existing_policy_schema_resolves_defaults_and_enrollment() {
     assert_eq!(p.default_network, NetworkMode::Disabled);
     assert_eq!(p.trusted_path, vec![fs::canonicalize(&h.trusted_bin).unwrap()]);
     assert_eq!(p.custom_allowlist["project-a"].canonical_path, custom);
+}
+
+#[test]
+fn project_network_can_only_narrow_global_policy() {
+    let h = PolicyHarness::new();
+    let global = load_or_create_policy(&h.input()).unwrap();
+    let project = h.project("project-a");
+
+    let enabled = custom_config("project-a", "codex", NetworkMode::Enabled);
+    assert_eq!(
+        resolve_project_policy(&global, &project, &enabled)
+            .unwrap()
+            .network,
+        NetworkMode::Enabled
+    );
+
+    let disabled = custom_config("project-a", "codex", NetworkMode::Disabled);
+    assert_eq!(
+        resolve_project_policy(&global, &project, &disabled)
+            .unwrap()
+            .network,
+        NetworkMode::Disabled
+    );
+
+    fs::write(
+        h.policy(),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[defaults]\nnetwork = \"disabled\"\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+            h.trusted_bin.display().to_string(),
+            h.codex.display().to_string(),
+            h.pueue.display().to_string(),
+        ),
+    )
+    .unwrap();
+    secure_file(&h.policy());
+    let global_disabled = load_existing_policy(&h.input()).unwrap();
+    assert_eq!(
+        resolve_project_policy(&global_disabled, &project, &enabled)
+            .unwrap()
+            .network,
+        NetworkMode::Disabled
+    );
+}
+
+#[test]
+fn custom_agent_requires_exact_service_enrollment_and_absolute_canonical_path() {
+    let h = PolicyHarness::new();
+    let custom = h.trusted_bin.join("custom-agent");
+    fs::write(&custom, b"custom").unwrap();
+    secure_executable(&custom);
+    let other = h.trusted_bin.join("other-agent");
+    fs::write(&other, b"other").unwrap();
+    secure_executable(&other);
+
+    fs::write(
+        h.policy(),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[defaults]\nnetwork = \"enabled\"\n\n[executables]\ncodex = {:?}\npueue = {:?}\n\n[projects.\"project-a\"]\ncustom_agent = {:?}\n",
+            h.trusted_bin.display().to_string(),
+            h.codex.display().to_string(),
+            h.pueue.display().to_string(),
+            custom.display().to_string(),
+        ),
+    )
+    .unwrap();
+    secure_file(&h.policy());
+    let global = load_existing_policy(&h.input()).unwrap();
+    let project = h.project("project-a");
+
+    let mismatched = custom_config("project-a", &other.to_string_lossy(), NetworkMode::Enabled);
+    assert!(matches!(
+        resolve_project_policy(&global, &project, &mismatched),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::CustomAgentNotEnrolled,
+            ..
+        })
+    ));
+
+    let bare = custom_config("project-a", "custom-agent", NetworkMode::Enabled);
+    assert!(matches!(
+        resolve_project_policy(&global, &project, &bare),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::CustomAgentNotEnrolled,
+            ..
+        })
+    ));
+
+    let exact = custom_config("project-a", &custom.to_string_lossy(), NetworkMode::Enabled);
+    let resolved = resolve_project_policy(&global, &project, &exact).unwrap();
+    assert_eq!(resolved.agent_kind, AgentKind::Custom);
+    assert_eq!(resolved.agent_anchor.canonical_path, custom);
 }
 
 #[test]

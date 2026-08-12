@@ -5,6 +5,7 @@ use std::{
 
 use pueue_agent::{
     config::{self, PatternAction},
+    execution_policy::NetworkMode,
     models::AgentContextMode,
     paths, project,
 };
@@ -200,6 +201,40 @@ fn missing_agent_program_is_rejected() {
     let error = load_config(config).unwrap_err();
 
     assert!(error.to_string().contains("agent.program"));
+}
+
+#[test]
+fn network_defaults_enabled_and_only_narrows() {
+    let config = load_config(valid_config()).unwrap();
+    assert_eq!(config.agent.execution.network, NetworkMode::Enabled);
+
+    let disabled = valid_config().replace(
+        "[check]",
+        "[agent.execution]\nnetwork = \"disabled\"\n\n[agent.codex]\nreasoning_effort = \"high\"\n\n[check]",
+    );
+    let config = load_config(disabled).unwrap();
+    assert_eq!(config.agent.execution.network, NetworkMode::Disabled);
+    assert_eq!(
+        config.agent.codex.reasoning_effort,
+        Some(config::CodexReasoningEffort::High)
+    );
+
+    let invalid = valid_config().replace(
+        "[check]",
+        "[agent.execution]\nnetwork = \"unsafe\"\n\n[check]",
+    );
+    assert!(load_config(invalid).is_err());
+}
+
+#[test]
+fn codex_structured_fields_are_rejected_for_custom_programs() {
+    let custom = valid_config()
+        .replace("program = \"codex\"", "program = \"/opt/custom\"")
+        .replace(
+            "[check]",
+            "[agent.codex]\nmodel = \"model-a\"\n\n[check]",
+        );
+    assert!(load_config(custom).is_err());
 }
 
 #[test]

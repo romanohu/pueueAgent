@@ -5,7 +5,12 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::{codex_session, models::AgentContextMode, AppError};
+use crate::{
+    codex_session,
+    execution_policy::NetworkMode,
+    models::AgentContextMode,
+    AppError,
+};
 
 pub const DEFAULT_LOG_TAIL_BYTES: u32 = 64 * 1024;
 pub const MAX_LOG_TAIL_BYTES: u32 = 1_048_576;
@@ -27,6 +32,38 @@ pub struct AgentConfig {
     pub timeout_minutes: u32,
     pub max_retries: u32,
     pub context: AgentContextMode,
+    pub execution: AgentExecutionConfig,
+    pub codex: AgentCodexConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExecutionConfig {
+    pub network: NetworkMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCodexConfig {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<CodexReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexReasoningEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+impl CodexReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,12 +169,16 @@ struct RawAgentConfig {
     timeout_minutes: i64,
     max_retries: i64,
     context: RawAgentContextConfig,
+    execution: RawAgentExecutionConfig,
+    codex: RawAgentCodexConfig,
 }
 
 impl RawAgentConfig {
     fn validate(self) -> Result<AgentConfig, AppError> {
         required(&self.program, "agent.program")?;
         let context = self.context.validate(&self.program)?;
+        let execution = self.execution.validate()?;
+        let codex = self.codex.validate(&self.program)?;
 
         Ok(AgentConfig {
             program: self.program,
@@ -145,6 +186,83 @@ impl RawAgentConfig {
             timeout_minutes: positive(self.timeout_minutes, "agent.timeout_minutes")?,
             max_retries: non_negative(self.max_retries, "agent.max_retries")?,
             context,
+            execution,
+            codex,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawAgentExecutionConfig {
+    #[serde(default = "default_network")]
+    network: String,
+}
+
+impl Default for RawAgentExecutionConfig {
+    fn default() -> Self {
+        Self {
+            network: default_network(),
+        }
+    }
+}
+
+impl RawAgentExecutionConfig {
+    fn validate(self) -> Result<AgentExecutionConfig, AppError> {
+        let network = match self.network.trim() {
+            "enabled" => NetworkMode::Enabled,
+            "disabled" => NetworkMode::Disabled,
+            _ => {
+                return Err(AppError::Configuration {
+                    field: "agent.execution.network",
+                })
+            }
+        };
+        Ok(AgentExecutionConfig { network })
+    }
+}
+
+fn default_network() -> String {
+    "enabled".to_owned()
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawAgentCodexConfig {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+impl RawAgentCodexConfig {
+    fn validate(self, program: &str) -> Result<AgentCodexConfig, AppError> {
+        if program != "codex"
+            && (self.model.is_some() || self.reasoning_effort.is_some())
+        {
+            return Err(AppError::Configuration {
+                field: "agent.codex",
+            });
+        }
+
+        let model = self.model.map(|model| model.trim().to_owned());
+        if model.as_deref().is_some_and(str::is_empty) {
+            return Err(AppError::Configuration {
+                field: "agent.codex.model",
+            });
+        }
+
+        let reasoning_effort = self.reasoning_effort.map(|value| match value.trim() {
+            "low" => Ok(CodexReasoningEffort::Low),
+            "medium" => Ok(CodexReasoningEffort::Medium),
+            "high" => Ok(CodexReasoningEffort::High),
+            "xhigh" => Ok(CodexReasoningEffort::XHigh),
+            _ => Err(AppError::Configuration {
+                field: "agent.codex.reasoning_effort",
+            }),
+        }).transpose()?;
+
+        Ok(AgentCodexConfig {
+            model,
+            reasoning_effort,
         })
     }
 }
