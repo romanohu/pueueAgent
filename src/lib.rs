@@ -2,6 +2,7 @@ pub mod agent;
 pub mod batches;
 pub mod cancel;
 pub mod cli;
+pub mod codex_command;
 pub mod codex_session;
 pub mod config;
 pub mod daemon;

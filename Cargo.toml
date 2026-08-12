@@ -71,6 +71,10 @@ path = "tests/integration/upgrade.rs"
 name = "execution_policy"
 path = "tests/integration/execution_policy.rs"
 
+[[test]]
+name = "codex_security"
+path = "tests/integration/codex_security.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

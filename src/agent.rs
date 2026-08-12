@@ -13,9 +13,11 @@ use tokio::{
 };
 
 use crate::{
+    codex_command::{CodexArgvBuilder, CodexCapabilities},
     codex_session,
     config::AgentConfig,
     db::AgentRunRepository,
+    execution_policy::ResolvedProjectExecutionPolicy,
     interventions::InterventionReservation,
     models::{launch_gate_marker_path, AgentContextMode, AgentRunStatus, NewAgentRun, Project},
     retry::{EventResolution, RetryPolicy},
@@ -27,6 +29,8 @@ use crate::{
 pub struct AgentRunnerConfig {
     pub log_dir_override: Option<PathBuf>,
     pub codex_home_override: Option<PathBuf>,
+    codex_policy: Option<ResolvedProjectExecutionPolicy>,
+    codex_capabilities: CodexCapabilities,
 }
 
 impl AgentRunnerConfig {
@@ -34,6 +38,8 @@ impl AgentRunnerConfig {
         Self {
             log_dir_override: None,
             codex_home_override: None,
+            codex_policy: None,
+            codex_capabilities: CodexCapabilities::none(),
         }
     }
 
@@ -41,11 +47,26 @@ impl AgentRunnerConfig {
         Self {
             log_dir_override: log_path.parent().map(PathBuf::from),
             codex_home_override: None,
+            codex_policy: None,
+            codex_capabilities: CodexCapabilities::none(),
         }
     }
 
     pub fn with_codex_home(mut self, codex_home: PathBuf) -> Self {
         self.codex_home_override = Some(codex_home);
+        self
+    }
+
+    /// Bind this runner to the immutable project policy resolved at startup.
+    /// Codex command construction remains unavailable until both the policy
+    /// and capability probe have succeeded.
+    pub fn with_codex_policy(
+        mut self,
+        policy: ResolvedProjectExecutionPolicy,
+        capabilities: CodexCapabilities,
+    ) -> Self {
+        self.codex_policy = Some(policy);
+        self.codex_capabilities = capabilities;
         self
     }
 }
@@ -165,6 +186,36 @@ impl AgentRunner {
         config: &AgentConfig,
         prompt: &str,
     ) -> Result<AgentCommand, AppError> {
+        if config.program == "codex" {
+            if let Some(policy) = self.config.codex_policy.as_ref() {
+                let private_tmp = policy
+                    .root_anchor
+                    .canonical_path
+                    .join(&policy.private_temp_relative_root)
+                    .join("command");
+                let argv = CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
+                    .build(config, prompt, &private_tmp)
+                    .map_err(AppError::from)?;
+                return Ok(AgentCommand {
+                    program: policy
+                        .agent_anchor
+                        .canonical_path
+                        .to_str()
+                        .ok_or(AppError::Configuration {
+                            field: "agent.program",
+                        })?
+                        .to_owned(),
+                    args: argv
+                        .into_iter()
+                        .map(|arg| {
+                            arg.to_str()
+                                .map(str::to_owned)
+                                .ok_or(AppError::Configuration { field: "agent.args" })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                });
+            }
+        }
         match &config.context {
             AgentContextMode::Fresh => Ok(AgentCommand {
                 program: config.program.clone(),

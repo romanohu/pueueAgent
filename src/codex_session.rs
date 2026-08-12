@@ -1,18 +1,30 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::AppError;
+use crate::{
+    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
+    AppError,
+};
 
 const SESSION_STORES: [&str; 2] = ["sessions", "archived_sessions"];
 const MAX_SESSION_STORE_DEPTH: usize = 32;
 const MAX_SESSION_STORE_ENTRIES: usize = 4096;
 const MAX_SESSION_METADATA_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct LatestSessionCandidate {
+    id: String,
+    path: PathBuf,
+    modified_nanos: u128,
+}
 
 #[derive(Debug, Deserialize)]
 struct SessionMetadata {
@@ -100,6 +112,150 @@ pub fn verify_project_ownership(
     }
 
     Ok(session_id)
+}
+
+/// Resolve the most recently modified valid session owned by `project_root`.
+///
+/// This is intentionally an explicit, bounded supervisor operation.  It does
+/// not use Codex's ambient `--last` state and never falls back to a fresh
+/// session.  Candidate metadata is treated as untrusted: malformed, foreign,
+/// and symlinked entries are skipped; duplicate valid ownership is rejected.
+pub fn resolve_latest_owned_session(
+    codex_home: &Path,
+    project_root: &Path,
+) -> Result<String, PolicyViolation> {
+    let canonical_project_root = fs::canonicalize(project_root).map_err(|_| {
+        PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        )
+    })?;
+    let mut remaining_entries = MAX_SESSION_STORE_ENTRIES;
+    let mut candidates = BTreeMap::<String, LatestSessionCandidate>::new();
+
+    for store_name in SESSION_STORES {
+        let store = codex_home.join(store_name);
+        match fs::metadata(&store) {
+            Ok(metadata) if metadata.is_dir() => collect_latest_candidates(
+                &store,
+                0,
+                &canonical_project_root,
+                &mut remaining_entries,
+                &mut candidates,
+            )?,
+            Ok(_) => return Err(session_not_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(session_not_owned()),
+        }
+    }
+
+    candidates
+        .into_values()
+        .max_by(|left, right| {
+            left.modified_nanos
+                .cmp(&right.modified_nanos)
+                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| left.path.cmp(&right.path))
+        })
+        .map(|candidate| candidate.id)
+        .ok_or_else(session_missing)
+}
+
+fn collect_latest_candidates(
+    directory: &Path,
+    depth: usize,
+    canonical_project_root: &Path,
+    remaining_entries: &mut usize,
+    candidates: &mut BTreeMap<String, LatestSessionCandidate>,
+) -> Result<(), PolicyViolation> {
+    let entries = fs::read_dir(directory).map_err(|_| session_not_owned())?;
+    for entry in entries {
+        if *remaining_entries == 0 {
+            return Err(session_not_owned());
+        }
+        *remaining_entries -= 1;
+
+        let entry = entry.map_err(|_| session_not_owned())?;
+        let file_type = entry.file_type().map_err(|_| session_not_owned())?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if depth == MAX_SESSION_STORE_DEPTH {
+                return Err(session_not_owned());
+            }
+            collect_latest_candidates(
+                &path,
+                depth + 1,
+                canonical_project_root,
+                remaining_entries,
+                candidates,
+            )?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(filename_id) = filename_session_id(&path) else {
+            continue;
+        };
+        let Ok(metadata) = read_metadata(&path, &filename_id) else {
+            continue;
+        };
+        if metadata.kind != "session_meta"
+            || normalize_metadata_id(&metadata.payload.id, &filename_id)
+                .ok()
+                .as_deref()
+                != Some(filename_id.as_str())
+            || !metadata.payload.cwd.is_absolute()
+        {
+            continue;
+        }
+        let Ok(canonical_cwd) = fs::canonicalize(&metadata.payload.cwd) else {
+            continue;
+        };
+        if !canonical_cwd.starts_with(canonical_project_root) {
+            continue;
+        }
+        let Ok(file_metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = file_metadata.modified() else {
+            continue;
+        };
+        let Ok(modified_nanos) = modified.duration_since(UNIX_EPOCH) else {
+            continue;
+        };
+        let candidate = LatestSessionCandidate {
+            id: filename_id.clone(),
+            path,
+            modified_nanos: modified_nanos.as_nanos(),
+        };
+        if candidates.insert(filename_id, candidate).is_some() {
+            return Err(session_not_owned());
+        }
+    }
+    Ok(())
+}
+
+fn filename_session_id(path: &Path) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    let stem = filename.strip_suffix(".jsonl")?;
+    stem.match_indices('-')
+        .filter_map(|(index, _)| stem.get(index + 1..))
+        .find_map(|candidate| normalize_session_id(candidate).ok())
+}
+
+fn session_missing() -> PolicyViolation {
+    PolicyViolation::new(
+        PolicyViolationCode::SessionMissing,
+        PolicyViolationStage::PreBinding,
+    )
+}
+
+fn session_not_owned() -> PolicyViolation {
+    PolicyViolation::new(
+        PolicyViolationCode::SessionNotOwned,
+        PolicyViolationStage::PreBinding,
+    )
 }
 
 fn locate_metadata(codex_home: &Path, session_id: &str) -> Result<PathBuf, AppError> {
