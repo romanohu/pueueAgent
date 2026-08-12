@@ -1,12 +1,16 @@
 use std::{
     fs,
-    io::{self, Read, Seek, SeekFrom},
+    io,
     path::Path,
     time::UNIX_EPOCH,
 };
 
 #[cfg(unix)]
-use std::os::unix::{ffi::OsStrExt, io::FromRawFd};
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::FileExt,
+    io::FromRawFd,
+};
 
 use crate::{
     config::bounded_log_tail,
@@ -42,24 +46,7 @@ impl LogSnapshot {
         })?;
         let byte_size = metadata.len();
         let tail_len = tail_len.min(byte_size);
-        let mut reader = file.try_clone().map_err(|source| AppError::Io {
-            operation: "clone log file",
-            source,
-        })?;
-        reader
-            .seek(SeekFrom::Start(byte_size.saturating_sub(tail_len)))
-            .map_err(|source| AppError::Io {
-                operation: "seek log tail",
-                source,
-            })?;
-        let mut bytes = Vec::with_capacity(usize::try_from(tail_len).unwrap_or(usize::MAX));
-        reader
-            .take(tail_len)
-            .read_to_end(&mut bytes)
-            .map_err(|source| AppError::Io {
-                operation: "read log tail",
-                source,
-            })?;
+        let bytes = read_tail_bytes(file, byte_size.saturating_sub(tail_len), tail_len)?;
         let modified_at_nanos = metadata
             .modified()
             .ok()
@@ -80,6 +67,41 @@ impl LogSnapshot {
             evidence: String::from_utf8_lossy(&bytes).into_owned(),
         })
     }
+}
+
+#[cfg(unix)]
+fn read_tail_bytes(file: &fs::File, offset: u64, tail_len: u64) -> Result<Vec<u8>, AppError> {
+    let length = usize::try_from(tail_len).map_err(|_| AppError::Io {
+        operation: "allocate log tail",
+        source: io::Error::new(io::ErrorKind::InvalidInput, "log tail is too large"),
+    })?;
+    let mut bytes = vec![0_u8; length];
+    let mut read = 0;
+    while read < length {
+        match file.read_at(&mut bytes[read..], offset + read as u64) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(AppError::Io {
+                    operation: "read log tail",
+                    source,
+                });
+            }
+        }
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_tail_bytes(_file: &fs::File, _offset: u64, _tail_len: u64) -> Result<Vec<u8>, AppError> {
+    Err(AppError::PolicyViolation {
+        violation: PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Startup,
+        ),
+    })
 }
 
 fn log_unsafe(reason: LogUnsafeReason) -> AppError {

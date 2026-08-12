@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Seek, SeekFrom},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -141,6 +142,24 @@ fn log_snapshot_read_boundary_rejects_out_of_range_tail() {
         let error = LogSnapshot::read_tail(temp.path(), value).unwrap_err();
         assert!(error.to_string().contains("check.log_tail_bytes"));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_tail_read_preserves_caller_offset() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), b"0123456789abcdef").unwrap();
+    let mut file = std::fs::File::open(temp.path()).unwrap();
+    file.seek(SeekFrom::Start(5)).unwrap();
+    let caller_offset = file.stream_position().unwrap();
+
+    let snapshot = LogSnapshot::read_tail_from_file(&file, 4).unwrap();
+
+    assert_eq!(snapshot.byte_size, 16);
+    assert_eq!(snapshot.evidence, "cdef");
+    assert!(snapshot.fingerprint.starts_with("log:v1:size=16:mtime="));
+    assert!(snapshot.fingerprint.ends_with(":tail=ce57cb90f6547719"));
+    assert_eq!(file.stream_position().unwrap(), caller_offset);
 }
 
 #[cfg(unix)]
