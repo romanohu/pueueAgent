@@ -140,6 +140,18 @@ fn latest_rejects_symlinked_session_store() {
 }
 
 #[test]
+fn private_tmp_under_trusted_project_root_is_allowed_when_root_is_in_tmp() {
+    let harness = Harness::new();
+    let mut policy = harness.builder().policy().clone();
+    policy.root_anchor.canonical_path = PathBuf::from("/tmp/trusted-project");
+    let private_tmp = PathBuf::from("/tmp/trusted-project/.pueue-agent/tmp/run");
+
+    CodexArgvBuilder::new(policy, CodexCapabilities::all())
+        .build(&config_with_args(vec!["{prompt}"]), "p", &private_tmp)
+        .expect("trusted project temp must remain an allowed writable root");
+}
+
+#[test]
 fn latest_chooses_verified_same_project_and_never_last_or_fresh() {
     let harness = Harness::new();
     write_session(&harness.home, "old", &harness.root);

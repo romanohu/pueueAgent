@@ -226,8 +226,6 @@ fn validate_private_tmp(path: &Path, project_root: &Path) -> Result<String, Poli
         || path == Path::new("/")
         || path == project_root
         || !path.starts_with(project_root)
-        || path.starts_with("/tmp")
-        || path.starts_with("/private/tmp")
     {
         return Err(unsafe_argument());
     }
