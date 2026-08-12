@@ -5,6 +5,11 @@ use thiserror::Error;
 #[allow(dead_code)] // Command handlers intentionally become fallible in later tasks.
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(transparent)]
+    PolicyViolation {
+        violation: crate::execution_policy::PolicyViolation,
+    },
+
     #[error("configuration error in {field}; update the project configuration and try again")]
     Configuration { field: &'static str },
 
@@ -60,6 +65,12 @@ pub enum AppError {
 
     #[error("{operation} failed; inspect pueue-agent logs for details")]
     Runtime { operation: &'static str },
+}
+
+impl From<crate::execution_policy::PolicyViolation> for AppError {
+    fn from(violation: crate::execution_policy::PolicyViolation) -> Self {
+        Self::PolicyViolation { violation }
+    }
 }
 
 impl AppError {

@@ -447,6 +447,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "libc",
  "regex-automata",
  "rusqlite",
  "serde",

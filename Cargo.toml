@@ -67,9 +67,14 @@ path = "tests/integration/periodic.rs"
 name = "upgrade"
 path = "tests/integration/upgrade.rs"
 
+[[test]]
+name = "execution_policy"
+path = "tests/integration/execution_policy.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
 regex-automata = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
