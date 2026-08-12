@@ -341,7 +341,11 @@ impl Scheduler {
                     });
                 }
                 Err(error) => {
-                    let AgentSpawnError { stage, source } = error;
+                    let AgentSpawnError {
+                        stage,
+                        source,
+                        policy,
+                    } = error;
                     if matches!(&source, AppError::UpgradeInProgress) {
                         let release_error = reservation.as_ref().and_then(|reservation| {
                             InterventionRepository::new(&self.db)
@@ -357,6 +361,30 @@ impl Scheduler {
                             first_error = release_error.or(defer_error);
                         }
                         continue;
+                    }
+                    if matches!(stage, AgentSpawnStage::PreBinding) {
+                        if let Some(violation) = policy {
+                            let release_error = reservation.as_ref().and_then(|reservation| {
+                                InterventionRepository::new(&self.db)
+                                    .release_reservation(
+                                        &project.project_id,
+                                        &reservation.token,
+                                    )
+                                    .err()
+                            });
+                            return_scheduler_error!(
+                                EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                                    &project.project_id,
+                                    &event_ids,
+                                    self.config.now,
+                                    &violation,
+                                )
+                            );
+                            if first_error.is_none() {
+                                first_error = release_error.or(Some(source));
+                            }
+                            continue;
+                        }
                     }
                     if !matches!(stage, AgentSpawnStage::PreBinding) {
                         let unresolved_error = unresolved_spawn_error(stage, source);

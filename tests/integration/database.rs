@@ -15,6 +15,7 @@ use pueue_agent::{
         LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
+    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
     interventions::{
         InterventionStatus, MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES,
         MAX_INTERVENTION_BYTES_PER_RUN,
@@ -2851,6 +2852,152 @@ fn pre_release_gate_failure_requeues_applied_interventions() {
 }
 
 #[test]
+fn pre_marker_policy_failure_dead_letters_and_releases_applied_interventions() {
+    let test = TestDatabase::new();
+    let root = test.project_root("policy-pre-marker");
+    register_project(&test.db, "project-a", &root, "pa-policy-pre-marker");
+    let interventions = InterventionRepository::new(&test.db);
+    let intervention = interventions
+        .insert_pending("project-a", "release on policy block", 100)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "policy-pre-marker-token", 110, 210, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "policy-pre-marker", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/policy-pre-marker.log",
+            ),
+            &[event_id],
+            Some("policy-pre-marker-token"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 4242, 130)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::RunBoundPreMarker,
+    );
+    runs.fail_before_gate_release_with_policy("project-a", run.run_id, 140, "ignored detail", &violation)
+        .unwrap();
+
+    let state: (AgentRunStatus, EventStatus, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, events.status, agent_runs.last_error
+             FROM agent_runs
+             JOIN agent_run_events ON agent_run_events.project_id = agent_runs.project_id
+                AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events ON events.project_id = agent_run_events.project_id
+                AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Failed,
+            EventStatus::DeadLetter,
+            Some("policy_blocked:unsafe_codex_argument".to_owned()),
+        )
+    );
+    assert_eq!(intervention.intervention_id, interventions
+        .list("project-a", InterventionStatus::Pending, 8)
+        .unwrap()[0]
+        .intervention_id);
+}
+
+#[test]
+fn post_marker_policy_failure_dead_letters_and_retains_applied_interventions() {
+    let test = TestDatabase::new();
+    let root = test.project_root("policy-post-marker");
+    register_project(&test.db, "project-a", &root, "pa-policy-post-marker");
+    let interventions = InterventionRepository::new(&test.db);
+    let intervention = interventions
+        .insert_pending("project-a", "retain after marker", 100)
+        .unwrap();
+    interventions
+        .reserve_pending("project-a", "policy-post-marker-token", 110, 210, 1, 1024)
+        .unwrap();
+    let event_id = insert_event(&test.db, "project-a", "policy-post-marker", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/policy-post-marker.log",
+            ),
+            &[event_id],
+            Some("policy-post-marker-token"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 4242, 130)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::AnchorReplaced,
+        PolicyViolationStage::PostMarker,
+    );
+    runs.finish_after_marker_policy_failure("project-a", run.run_id, 140, &violation)
+        .unwrap();
+
+    let state: (AgentRunStatus, EventStatus, InterventionStatus, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, events.status, interventions.status, agent_runs.last_error
+             FROM agent_runs
+             JOIN agent_run_events ON agent_run_events.project_id = agent_runs.project_id
+                AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events ON events.project_id = agent_run_events.project_id
+                AND events.event_id = agent_run_events.event_id
+             JOIN interventions ON interventions.agent_run_id = agent_runs.run_id
+             WHERE agent_runs.run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Failed,
+            EventStatus::DeadLetter,
+            InterventionStatus::Applied,
+            Some("policy_blocked:anchor_replaced".to_owned()),
+        )
+    );
+    assert_eq!(intervention.intervention_id, interventions
+        .list("project-a", InterventionStatus::Applied, 8)
+        .unwrap()[0]
+        .intervention_id);
+}
+
+#[test]
 fn startup_recovery_requeues_applied_interventions_after_release_request_before_ack() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
@@ -3745,6 +3892,114 @@ fn resolve_claimed_without_run_applies_retry_policy_in_a_real_transaction() {
     assert_eq!(state.2, None);
     assert!(state.3.contains("[REDACTED]"));
     assert!(!state.3.contains("SECRET"));
+}
+
+#[test]
+fn policy_blocked_claim_dead_letters_without_retry_or_run() {
+    let test = TestDatabase::new();
+    let root = test.project_root("policy-blocked-claim");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let first = insert_event(&test.db, "project-a", "policy-blocked-first", 100);
+    let second = insert_event(&test.db, "project-a", "policy-blocked-second", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 2)
+        .unwrap();
+
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PreBinding,
+    );
+    let changed = EventRepository::new(&test.db)
+        .dead_letter_claimed_without_run("project-a", &[first, second], 200, &violation)
+        .unwrap();
+    assert_eq!(changed, 2);
+    for event_id in [first, second] {
+        let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+        assert_eq!(event.status, EventStatus::DeadLetter);
+        assert_eq!(event.lease_until, None);
+        assert_eq!(event.last_error.as_deref(), Some("policy_blocked:unsafe_codex_argument"));
+    }
+    assert!(AgentRunRepository::new(&test.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn policy_blocked_claim_validation_is_atomic_for_grouped_and_foreign_inputs() {
+    let test = TestDatabase::new();
+    let root_a = test.project_root("policy-atomic-a");
+    let root_b = test.project_root("policy-atomic-b");
+    register_project(&test.db, "project-a", &root_a, "pa-policy-atomic");
+    register_project(&test.db, "project-b", &root_b, "pb-policy-atomic");
+    let first = insert_event(&test.db, "project-a", "policy-atomic-first", 100);
+    let _second = insert_event(&test.db, "project-a", "policy-atomic-second", 100);
+    let foreign = insert_event(&test.db, "project-b", "policy-atomic-foreign", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 3)
+        .unwrap();
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PreBinding,
+    );
+
+    for ids in [[first, first], [first, 999_999], [first, foreign]] {
+        assert!(EventRepository::new(&test.db)
+            .dead_letter_claimed_without_run("project-a", &ids, 200, &violation)
+            .is_err());
+        for event_id in ids {
+            if let Some(event) = EventRepository::new(&test.db).find_by_id(event_id).unwrap() {
+                assert_eq!(event.status, EventStatus::Claimed);
+            }
+        }
+    }
+
+    let pending = insert_event(&test.db, "project-a", "policy-atomic-pending", 100);
+    test.db
+        .connect()
+        .unwrap()
+        .execute("UPDATE events SET not_before = 999 WHERE event_id = ?1", [pending])
+        .unwrap();
+    assert!(EventRepository::new(&test.db)
+        .dead_letter_claimed_without_run("project-a", &[pending], 200, &violation)
+        .is_err());
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(pending)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Pending
+    );
+
+    let linked = insert_event(&test.db, "project-a", "policy-atomic-linked", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            linked,
+            None,
+            AgentRunStatus::Starting,
+            110,
+            "/tmp/policy-atomic-linked.log",
+        ))
+        .unwrap();
+    AgentRunRepository::new(&test.db)
+        .attach_event(run.run_id, linked)
+        .unwrap();
+    assert!(EventRepository::new(&test.db)
+        .dead_letter_claimed_without_run("project-a", &[linked], 200, &violation)
+        .is_err());
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(linked)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Claimed
+    );
 }
 
 #[test]

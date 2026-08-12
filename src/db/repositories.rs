@@ -19,6 +19,7 @@ use crate::{
         BatchJobResult, MAX_BATCH_ARGV_JSON_BYTES, MAX_BATCH_METADATA_JSON_BYTES,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
+    execution_policy::PolicyViolation,
     interventions::{
         validate_message, Intervention, InterventionCounts, InterventionReservation,
         MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
@@ -1099,6 +1100,101 @@ impl<'db> EventRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit unbound claimed event resolution"))?;
+        Ok(changed)
+    }
+
+    /// Atomically dead-letter a claimed batch when dispatch is blocked by a
+    /// policy violation.  This path intentionally does not consult attempts
+    /// or retry policy and cannot create an agent run.  Validate every event
+    /// before changing any row so grouped claims never partially transition.
+    pub fn dead_letter_claimed_without_run(
+        &self,
+        project_id: &str,
+        event_ids: &[i64],
+        now: i64,
+        violation: &PolicyViolation,
+    ) -> Result<usize, AppError> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin policy-blocked event resolution"))?;
+        let mut seen_event_ids = BTreeSet::new();
+        for event_id in event_ids {
+            if !seen_event_ids.insert(*event_id) {
+                return Err(AppError::Validation {
+                    field: "event_ids",
+                    message: "event IDs must be unique",
+                });
+            }
+            let Some((event_project_id, status)) = transaction
+                .query_row(
+                    "SELECT project_id, status FROM events WHERE event_id = ?1",
+                    [event_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, EventStatus>(1)?)),
+                )
+                .optional()
+                .map_err(database_error("validate policy-blocked event"))?
+            else {
+                return Err(AppError::Validation {
+                    field: "event_id",
+                    message: "event does not exist",
+                });
+            };
+            if event_project_id != project_id {
+                return Err(AppError::Validation {
+                    field: "project_id",
+                    message: "event belongs to another project",
+                });
+            }
+            if status != EventStatus::Claimed {
+                return Err(AppError::Validation {
+                    field: "event_status",
+                    message: "event must be claimed without a run",
+                });
+            }
+            let linked_to_run: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM agent_run_events
+                         WHERE project_id = ?1 AND event_id = ?2
+                     )",
+                    params![project_id, event_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error("validate policy-blocked event link"))?;
+            if linked_to_run {
+                return Err(AppError::Validation {
+                    field: "event_id",
+                    message: "event must not already be linked to an agent run",
+                });
+            }
+        }
+
+        let bounded_error = format!("policy_blocked:{}", violation.code.as_str());
+        let mut changed = 0;
+        for event_id in event_ids {
+            let event_changed = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'dead_letter', lease_until = NULL,
+                         completed_at = ?1, last_error = ?2
+                     WHERE project_id = ?3 AND event_id = ?4 AND status = 'claimed'",
+                    params![now, bounded_error, project_id, event_id],
+                )
+                .map_err(database_error("dead-letter policy-blocked event"))?;
+            if event_changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "dead-letter policy-blocked event",
+                });
+            }
+            changed += event_changed;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit policy-blocked event resolution"))?;
         Ok(changed)
     }
 
@@ -2998,6 +3094,33 @@ enum AgentRunFinalizationPhase {
     PreRelease,
 }
 
+/// The two classes of failures that can occur while a run is still blocked
+/// behind its launch gate.  The retry form is retained for transient setup
+/// failures; policy failures bypass retry calculation entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateFailurePolicy {
+    Retry(RetryPolicy),
+    Policy(PolicyViolation),
+}
+
+impl From<RetryPolicy> for GateFailurePolicy {
+    fn from(policy: RetryPolicy) -> Self {
+        Self::Retry(policy)
+    }
+}
+
+impl From<PolicyViolation> for GateFailurePolicy {
+    fn from(violation: PolicyViolation) -> Self {
+        Self::Policy(violation)
+    }
+}
+
+impl From<&PolicyViolation> for GateFailurePolicy {
+    fn from(violation: &PolicyViolation) -> Self {
+        Self::Policy(*violation)
+    }
+}
+
 impl<'db> AgentRunRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
         Self { db }
@@ -3673,14 +3796,21 @@ impl<'db> AgentRunRepository<'db> {
         Ok(dispatched)
     }
 
-    pub fn fail_before_gate_release_with_policy(
+    pub fn fail_before_gate_release_with_policy<P: Into<GateFailurePolicy>>(
         &self,
         project_id: &str,
         run_id: i64,
         finished_at: i64,
         reason: &str,
-        policy: RetryPolicy,
+        policy: P,
     ) -> Result<AgentRun, AppError> {
+        let resolution = match policy.into() {
+            GateFailurePolicy::Retry(policy) => EventResolution::RetryPolicy(policy),
+            GateFailurePolicy::Policy(violation) => EventResolution::PolicyBlocked {
+                code: violation.code,
+                stage: violation.stage,
+            },
+        };
         self.finish_and_resolve_events_inner(
             project_id,
             run_id,
@@ -3688,7 +3818,7 @@ impl<'db> AgentRunRepository<'db> {
             finished_at,
             None,
             Some(reason),
-            EventResolution::RetryPolicy(policy),
+            resolution,
             true,
             AgentRunFinalizationPhase::PreRelease,
         )
@@ -3733,6 +3863,32 @@ impl<'db> AgentRunRepository<'db> {
             Some(reason),
             EventResolution::ExecutionUnknown {
                 reason: reason.to_owned(),
+            },
+            false,
+            AgentRunFinalizationPhase::MarkerFailure,
+        )
+    }
+
+    /// Finalize a run after the durable launch marker when a policy violation
+    /// is discovered.  Execution is already possible at this point, so linked
+    /// events are dead-lettered and applied interventions remain applied.
+    pub fn finish_after_marker_policy_failure(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+        violation: &PolicyViolation,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_and_resolve_events_inner(
+            project_id,
+            run_id,
+            AgentRunStatus::Failed,
+            finished_at,
+            None,
+            Some("policy violation after launch marker"),
+            EventResolution::PolicyBlocked {
+                code: violation.code,
+                stage: violation.stage,
             },
             false,
             AgentRunFinalizationPhase::MarkerFailure,
@@ -3870,6 +4026,9 @@ impl<'db> AgentRunRepository<'db> {
         let bounded_run_error = match &resolution {
             EventResolution::ExecutionUnknown { reason } => Some(bounded_redacted_text(reason)),
             EventResolution::RetryPolicy(_) => last_error.map(bounded_redacted_text),
+            EventResolution::PolicyBlocked { code, .. } => {
+                Some(format!("policy_blocked:{}", code.as_str()))
+            }
         };
         let bounded_event_error = bounded_run_error.clone();
         let expected_event_status = match phase {
@@ -3882,6 +4041,7 @@ impl<'db> AgentRunRepository<'db> {
             let (event_status, not_before, completed_at) = if matches!(
                 &resolution,
                 EventResolution::ExecutionUnknown { .. }
+                    | EventResolution::PolicyBlocked { .. }
             ) {
                 (EventStatus::DeadLetter, None, Some(finished_at))
             } else if status == AgentRunStatus::Completed {
@@ -3892,7 +4052,8 @@ impl<'db> AgentRunRepository<'db> {
                     finished_at,
                     match &resolution {
                         EventResolution::RetryPolicy(policy) => *policy,
-                        EventResolution::ExecutionUnknown { .. } => unreachable!(),
+                        EventResolution::ExecutionUnknown { .. }
+                        | EventResolution::PolicyBlocked { .. } => unreachable!(),
                     },
                 ) {
                     RetryDecision::Retry { not_before } => {

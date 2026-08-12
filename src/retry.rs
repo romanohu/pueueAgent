@@ -12,6 +12,10 @@ pub enum RetryDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventResolution {
     RetryPolicy(RetryPolicy),
+    PolicyBlocked {
+        code: crate::execution_policy::PolicyViolationCode,
+        stage: crate::execution_policy::PolicyViolationStage,
+    },
     ExecutionUnknown { reason: String },
 }
 

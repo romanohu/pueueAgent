@@ -17,7 +17,7 @@ use crate::{
     codex_session,
     config::AgentConfig,
     db::AgentRunRepository,
-    execution_policy::ResolvedProjectExecutionPolicy,
+    execution_policy::{PolicyViolation, ResolvedProjectExecutionPolicy},
     interventions::InterventionReservation,
     models::{launch_gate_marker_path, AgentContextMode, AgentRunStatus, NewAgentRun, Project},
     retry::{EventResolution, RetryPolicy},
@@ -88,6 +88,10 @@ pub enum AgentSpawnStage {
 pub struct AgentSpawnError {
     pub stage: AgentSpawnStage,
     pub source: AppError,
+    /// Present when `source` is a bounded policy classification.  The
+    /// scheduler uses this field to select direct dead-letter semantics at
+    /// the event boundary; ordinary AppError values retain retry behavior.
+    pub policy: Option<PolicyViolation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,9 +584,21 @@ impl AgentRunner {
 }
 
 fn pre_binding_error(source: AppError) -> AgentSpawnError {
+    let policy = match &source {
+        AppError::PolicyViolation { violation } => Some(*violation),
+        _ => None,
+    };
     AgentSpawnError {
         stage: AgentSpawnStage::PreBinding,
         source,
+        policy,
+    }
+}
+
+fn policy_from_error(source: &AppError) -> Option<PolicyViolation> {
+    match source {
+        AppError::PolicyViolation { violation } => Some(*violation),
+        _ => None,
     }
 }
 
@@ -643,19 +659,31 @@ fn resolve_pre_marker_failure(
     policy: RetryPolicy,
     source: AppError,
 ) -> AgentSpawnError {
-    match repository.fail_before_gate_release_with_policy(
-        project_id,
-        run_id,
-        finished_at,
-        reason,
-        policy,
-    ) {
+    let violation = policy_from_error(&source);
+    let result = match violation.as_ref() {
+        Some(violation) => repository.fail_before_gate_release_with_policy(
+            project_id,
+            run_id,
+            finished_at,
+            reason,
+            violation,
+        ),
+        None => repository.fail_before_gate_release_with_policy(
+            project_id,
+            run_id,
+            finished_at,
+            reason,
+            policy,
+        ),
+    };
+    match result {
         Ok(_) => AgentSpawnError {
             stage: AgentSpawnStage::RunBoundPreMarker {
                 run_id,
                 resolved: true,
             },
             source,
+            policy: violation,
         },
         Err(finalizer_error) => AgentSpawnError {
             stage: AgentSpawnStage::RunBoundPreMarker {
@@ -663,6 +691,7 @@ fn resolve_pre_marker_failure(
                 resolved: false,
             },
             source: finalizer_error,
+            policy: violation,
         },
     }
 }
@@ -675,13 +704,24 @@ fn resolve_post_marker_failure(
     reason: &str,
     source: AppError,
 ) -> AgentSpawnError {
-    match repository.finish_after_marker_failure(project_id, run_id, finished_at, reason) {
+    let violation = policy_from_error(&source);
+    let result = match violation.as_ref() {
+        Some(violation) => repository.finish_after_marker_policy_failure(
+            project_id,
+            run_id,
+            finished_at,
+            violation,
+        ),
+        None => repository.finish_after_marker_failure(project_id, run_id, finished_at, reason),
+    };
+    match result {
         Ok(_) => AgentSpawnError {
             stage: AgentSpawnStage::PostMarker {
                 run_id,
                 resolved: true,
             },
             source,
+            policy: violation,
         },
         Err(finalizer_error) => AgentSpawnError {
             stage: AgentSpawnStage::PostMarker {
@@ -689,6 +729,7 @@ fn resolve_post_marker_failure(
                 resolved: false,
             },
             source: finalizer_error,
+            policy: violation,
         },
     }
 }
