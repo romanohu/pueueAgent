@@ -151,6 +151,39 @@ fn latest_without_owned_candidate_is_missing_and_duplicate_id_is_not_owned() {
     assert_eq!(error.code, PolicyViolationCode::SessionNotOwned);
 }
 
+#[test]
+fn latest_rejects_duplicate_id_regardless_of_ownership_or_store_order() {
+    for (case, sessions_owned, archived_sessions_owned) in [
+        ("owned + owned", true, true),
+        ("foreign + foreign", false, false),
+        ("owned + foreign", true, false),
+        ("foreign + owned", false, true),
+    ] {
+        let harness = Harness::new();
+        let id = harness.id("old");
+        let sessions_cwd = if sessions_owned {
+            &harness.root
+        } else {
+            &harness.other
+        };
+        let archived_sessions_cwd = if archived_sessions_owned {
+            &harness.root
+        } else {
+            &harness.other
+        };
+        write_session_with_id(&harness.home, "sessions", &id, sessions_cwd);
+        write_session_with_id(
+            &harness.home,
+            "archived_sessions",
+            &id,
+            archived_sessions_cwd,
+        );
+
+        let error = resolve_latest_owned_session(&harness.home, &harness.root).unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::SessionNotOwned, "{case}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn latest_rejects_symlinked_session_store() {
@@ -406,13 +439,17 @@ fn write_session(home: &Path, label: &str, cwd: &Path) {
         "foreign" => "019f9f30-cf19-7d4a-ae2c-3a2ce6a7e534",
         _ => unreachable!(),
     };
-    let store = if label == "old" {
-        home.join("sessions")
+    let store_name = if label == "old" {
+        "sessions"
     } else {
-        home.join("archived_sessions")
+        "archived_sessions"
     };
+    write_session_with_id(home, store_name, id, cwd);
+}
+
+fn write_session_with_id(home: &Path, store_name: &str, id: &str, cwd: &Path) {
     fs::write(
-        store.join(format!("rollout-{id}.jsonl")),
+        home.join(store_name).join(format!("rollout-{id}.jsonl")),
         format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":{cwd:?}}}}}\n",
             cwd = cwd.to_string_lossy()

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs::{self, File},
@@ -276,6 +276,7 @@ fn resolve_latest_owned_session_unix(
     })?;
     let mut remaining_entries = MAX_SESSION_STORE_ENTRIES;
     let mut candidates = BTreeMap::<String, LatestSessionCandidate>::new();
+    let mut seen_ids = BTreeSet::<String>::new();
 
     let (codex_home, codex_home_path) =
         open_session_home(codex_home).map_err(|_| session_not_owned())?;
@@ -316,6 +317,9 @@ fn resolve_latest_owned_session_unix(
                 || !metadata.payload.cwd.is_absolute()
             {
                 return Ok(());
+            }
+            if !seen_ids.insert(filename_id.clone()) {
+                return Err(());
             }
             let Ok(canonical_cwd) = fs::canonicalize(&metadata.payload.cwd) else {
                 return Ok(());
