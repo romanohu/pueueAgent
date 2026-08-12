@@ -37,7 +37,6 @@ deep_check_interval_minutes = 30
 - `0`: 定期 DeepCheck を無効化する。既存 project に突然 agent 起動を発生させない。
 - `1` 以上: 実行中 task がある project で有効化する。
 - `interval_minutes`: Pueue reconciliation の周期であり、agent 起動周期ではない。
-- 既存の `deep_check_every` は旧設定との互換性のため読み取り可能なまま残すが、定期起動を有効化しない。README と template では deprecated と明記する。
 
 ## アーキテクチャ
 

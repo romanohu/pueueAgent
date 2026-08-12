@@ -203,7 +203,6 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 | `agent.max_retries` | 起動に失敗した場合の retry 上限。 |
 | `agent.context.mode` | `fresh`、`resume`、`resume_latest` のいずれか。既定値は `fresh`。 |
 | `check.interval_minutes` | supervisor が reconciliation を行う間隔。 |
-| `check.deep_check_every` | legacy の互換設定。`deep_check_interval_minutes` が `0` のままでは agent DeepCheck を有効にしない。 |
 | `check.deep_check_interval_minutes` | agent DeepCheck の間隔（分）。既定値の `0` は無効で、正の値を明示した場合だけ opt in する。 |
 | `check.log_tail_bytes` | 各ログから読み取る末尾の最大 byte 数。 |
 | `check.extra_log_paths` | 追加で検査する、プロジェクトからの相対パスのログ。 |
@@ -219,7 +218,7 @@ Unix では、agent process は prompt を受け取る前に起動 gate で待�
 
 `check.interval_minutes` の reconciliation は、Pueue の status を再照合し、callback の取りこぼしを復旧して、範囲を制限した detector を実行する supervisor の機械的な処理です。正常な reconciliation は agent を起動しないため、agent のトークンを消費しません。
 
-agent DeepCheck は別の opt-in 機能です。`check.deep_check_interval_minutes` に正の分数を設定したときだけ、長時間実行中の実験について agent を起動し、metric と artifact から進行の健全性を確認します。この run は agent のトークンを消費します。`deep_check_every` は legacy の互換設定であり、`deep_check_interval_minutes = 0` のまま agent run を有効にすることはありません。
+agent DeepCheck は別の opt-in 機能です。`check.deep_check_interval_minutes` に正の分数を設定したときだけ、長時間実行中の実験について agent を起動し、metric と artifact から進行の健全性を確認します。この run は agent のトークンを消費します。
 
 periodic DeepCheck は task ごとではなく project ごとに coalesce します。同じ project に pending、claimed、または retry 待ちの periodic DeepCheck がある間は、長時間 task が複数あっても新しい periodic DeepCheck を追加しません。正常な進行を `STATE.md` に短い health record として残し、確認できない metric、値、進捗を記録しません。`STATE.md` は補足ノートなので、canonical `state.json` の budget や lineage を上書きしません。
 
@@ -278,17 +277,3 @@ confirm_matches = 2
 `enable` はプロジェクトを登録し、Pueue group を作成し、daemon 単位の Pueue callback を1つ設定し、user service をインストールして、service が正常であることを確認します。service file には binary path、Pueue config path、`PATH`、state directory、working directory が明示されます。対話式 shell の startup file には依存しません。
 
 SQLite database は、`XDG_STATE_HOME` が絶対パスの場合は `XDG_STATE_HOME/pueue-agent/state.sqlite3` に置かれます。それ以外の場合は platform の state directory を使います。service の state directory を指定する場合は `PUEUE_AGENT_STATE_DIR` を設定してください。
-
-## Bash/YAML 版からの移行
-
-Rust supervisor は、旧 global text registry、PID lock、cron entry、`.pueue-agent/config.yml` を自動では取り込みません。
-
-旧 Bash supervisor と cron/sentinel の test suite は、Rust E2E scenario が同等の動作を確認した後に削除されました。現在の `bin/pueue-agent` は Rust binary 用の開発 launcher であり、別の supervisor 実装ではありません。
-
-1. 旧版を使っている各プロジェクトで disable を実行するか、`pueue-agent sentinel` の cron entry を削除します。
-2. `./install.sh` で Rust release をインストールします。
-3. 既存プロジェクトごとに `pueue-agent init` を実行します。既存の `STATE.md` と `instructions.md` は保持され、新しい `config.toml` が作成されます。
-4. 旧 agent command を `agent.program` と `agent.args` に移し、detector action を確認します。`kill` は引き続き opt in です。
-5. すべてのプロジェクトで `pueue-agent enable` を実行し、`pueue-agent status` を確認します。
-
-SQLite-backed status の表示で各プロジェクトが正しく現れるまで、旧 YAML と registry のバックアップは保持してください。

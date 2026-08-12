@@ -11,7 +11,6 @@
 ## Global Constraints
 
 - `check.deep_check_interval_minutes = 0` は定期起動を無効にする。
-- `check.deep_check_every` は既存設定との互換性のため受理するが、定期起動の条件には使わない。
 - task ごとではなく project ごとに最大1つの定期 event を作る。
 - event payload は task ID、件数、時刻だけの bounded projection とし、command、env、prompt、transcript を保存しない。
 - Pueue に dummy task を投入しない。
@@ -297,7 +296,7 @@ git commit -m "feat: run periodic checks from daemon loop"
 
 - [ ] **Step 1: Add the failing configuration/documentation assertions**
 
-Add config tests that load `deep_check_interval_minutes = 0` and `30`, assert both parse, and assert that `deep_check_every = 6` does not enable the interval when the interval is zero. Add a text assertion that the README contains `deep_check_interval_minutes`, `0` disables it, and the agent records healthy progress in `STATE.md`.
+Add config tests that load `deep_check_interval_minutes = 0` and `30`, assert disabled and enabled behavior, validate the current schema by loading the real template, and verify with a focused negative grep that README and retained documents contain no obsolete settings or migration wording.
 
 - [ ] **Step 2: Run tests to verify the documentation/config assertions fail**
 
@@ -306,7 +305,7 @@ Expected: FAIL only for the new README/template assertions.
 
 - [ ] **Step 3: Update the Japanese user-facing documentation**
 
-Set the template default to `deep_check_interval_minutes = 0`. Mark `deep_check_every` as legacy. Add a Japanese section explaining the difference between reconciliation and agent DeepCheck, the token-cost condition, the project-level coalescing rule, and the `STATE.md` recording behavior. Add a `deep_check` instruction that asks for a short health record and forbids inventing metrics not found in the project.
+Set the template default to `deep_check_interval_minutes = 0`. Add a Japanese section explaining the interval default, that zero disables and a positive value opts in, the difference between reconciliation and agent DeepCheck, the token-cost condition, the project-level coalescing rule, and the bounded `STATE.md` health record. Add a `deep_check` instruction that asks for a short health record and forbids inventing metrics not found in the project.
 
 - [ ] **Step 4: Run documentation/config tests**
 

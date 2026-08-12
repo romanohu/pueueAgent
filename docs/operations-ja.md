@@ -54,7 +54,7 @@ pueue-agent disable --remove
 
 ## Periodic DeepCheck
 
-Periodic DeepCheck は、実行中の実験を一定周期で確認するための opt-in 機能です。`check.deep_check_interval_minutes = 0`（既定値）では無効です。正の値を設定した場合だけ、daemon の軽量な reconciliation で条件を確認し、必要な周期に fresh agent を起動します。`deep_check_every` は legacy 設定であり、単独では定期 agent 起動を有効にしません。
+Periodic DeepCheck は、実行中の実験を一定周期で確認するための opt-in 機能です。`check.deep_check_interval_minutes = 0`（既定値）では無効です。正の値を設定した場合だけ、daemon の軽量な reconciliation で条件を確認し、必要な周期に fresh agent を起動します。
 
 正常な周期 tick の状態確認や異常検知は agent を起動せず、Codex などの agent token を消費しません。Periodic DeepCheck event が作られ、実際に agent run が dispatch されたときだけ agent token を消費します。DeepCheck は Pueue task を kill せず、異常が見つかった場合は通常の event、termination、operator intervention の経路で扱います。
 

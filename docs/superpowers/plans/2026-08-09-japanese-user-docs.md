@@ -26,7 +26,7 @@
 
 **Interfaces:**
 - Consumes: 現行 CLI のサブコマンド、設定項目、README に記載済みの運用仕様。
-- Produces: 日本語で導入から移行までを説明する単一の `README.md`。コマンドブロックとリンクのパスは利用可能なままにする。
+- Produces: 日本語で導入・設定・運用を説明する単一の `README.md`。コマンドブロックとリンクのパスは利用可能なままにする。
 
 - [ ] **Step 1: 現行の CLI と設定表記を照合する**
 
@@ -45,7 +45,6 @@
   7. Codex の `fresh` / `resume` / `resume_latest`
   8. 異常検知と Pueue タスクの自動終了
   9. サービスと状態ファイル
-  10. Bash/YAML 版からの移行
 
   `pueue-agent submit -- python train.py --lr 0.001`、TOML、ASCII 図、リンク先は維持する。自動終了の説明には、`notify` / `wake` / `kill`、Pueue 境界での kill、再検証、重複防止、失敗の可視化を含める。
 
