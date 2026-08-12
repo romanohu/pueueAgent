@@ -389,11 +389,7 @@ mod tests {
 
     #[test]
     fn marker_io_failures_cleanup_created_marker_and_allow_retry() {
-        for failure in [
-            MarkerIoFailure::Write,
-            MarkerIoFailure::FileSync,
-            MarkerIoFailure::DirectorySync,
-        ] {
+        for failure in [MarkerIoFailure::Write, MarkerIoFailure::FileSync] {
             let temp = tempfile::tempdir().unwrap();
             let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
             let relative = Path::new("marker");
@@ -403,6 +399,27 @@ mod tests {
             assert!(!temp.path().join(relative).exists());
             assert!(create_gate_marker(&reader, relative).is_ok());
         }
+
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
+        let relative = Path::new("directory-sync-marker");
+        set_test_marker_failure(Some(MarkerIoFailure::DirectorySync));
+        let error = create_gate_marker(&reader, relative).unwrap_err();
+        assert!(matches!(error, AppError::Io { .. }));
+        let marker = temp.path().join(relative);
+        assert_eq!(fs::read(&marker).unwrap(), b"authorized\n");
+        assert!(inspect_gate_marker(&reader, relative).unwrap().is_some());
+        assert!(create_gate_marker(&reader, relative).is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
+        let relative = Path::new("before-publish-marker");
+        set_test_marker_failure(Some(MarkerIoFailure::BeforePublish));
+        let error = create_gate_marker(&reader, relative).unwrap_err();
+        assert!(matches!(error, AppError::Io { .. }));
+        assert!(!temp.path().join(relative).exists());
+        assert!(create_gate_marker(&reader, relative).is_ok());
+
         set_test_marker_failure(None);
     }
 
