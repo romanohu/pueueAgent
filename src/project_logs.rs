@@ -14,7 +14,7 @@ use std::{
 use crate::{
     execution_policy::{
         LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail,
-        PolicyViolationStage, ProjectRootAnchor, VerifiedProjectRoot,
+        PolicyViolationStage, VerifiedProjectRoot,
     },
     logs::LogSnapshot,
     AppError,
@@ -23,9 +23,59 @@ use crate::{
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+#[cfg(test)]
+use crate::execution_policy::ProjectRootAnchor;
+
+#[cfg(test)]
+use std::sync::Mutex;
+
 const AGENT_DIRECTORY_MODE: u32 = 0o700;
 const AGENT_FILE_MODE: u32 = 0o600;
 const GATE_MARKER_CONTENT: &[u8] = b"authorized\n";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MarkerIoFailure {
+    Write,
+    FileSync,
+    DirectorySync,
+}
+
+#[derive(Clone, Copy)]
+enum MarkerIoStage {
+    Write,
+    FileSync,
+    DirectorySync,
+}
+
+#[cfg(test)]
+static TEST_MARKER_FAILURE: Mutex<Option<MarkerIoFailure>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_test_marker_failure(failure: Option<MarkerIoFailure>) {
+    *TEST_MARKER_FAILURE.lock().unwrap() = failure;
+}
+
+#[cfg(test)]
+fn take_test_marker_failure(stage: MarkerIoStage) -> Option<io::Error> {
+    let expected = match stage {
+        MarkerIoStage::Write => MarkerIoFailure::Write,
+        MarkerIoStage::FileSync => MarkerIoFailure::FileSync,
+        MarkerIoStage::DirectorySync => MarkerIoFailure::DirectorySync,
+    };
+    let mut failure = TEST_MARKER_FAILURE.lock().unwrap();
+    if *failure == Some(expected) {
+        *failure = None;
+        Some(io::Error::new(io::ErrorKind::Other, "injected marker I/O failure"))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(test))]
+fn take_test_marker_failure(_stage: MarkerIoStage) -> Option<io::Error> {
+    None
+}
 
 pub struct ProjectRootLogReader {
     root: VerifiedProjectRoot,
@@ -64,9 +114,10 @@ impl ProjectRootLogReader {
         Self { root }
     }
 
-    /// Fixture/helper constructor.  It performs the same anchor resolution
-    /// and immediate identity verification used by production callers.
-    pub fn open(path: &Path) -> Result<Self, AppError> {
+    /// Test-only fixture constructor. Production callers must pass the
+    /// descriptor verified by execution policy through `from_verified`.
+    #[cfg(test)]
+    pub(crate) fn open_for_tests(path: &Path) -> Result<Self, AppError> {
         #[cfg(not(unix))]
         {
             let _ = path;
@@ -93,24 +144,32 @@ impl ProjectRootLogReader {
     /// This is consumed by the detector task; agent logs use `open_agent_log`
     /// below for the stricter owner-only contract.
     pub fn open_relative(&self, relative: &Path) -> Result<OpenedProjectLog, AppError> {
-        let (file, _) = self.open_final_with_parent(
-            relative,
-            libc::O_RDONLY | libc::O_NONBLOCK,
-            0,
-        )?;
-        let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|source| {
-            AppError::Io {
-                operation: "read project log metadata",
-                source,
-            }
-        })?;
-        if !identity.is_regular() {
-            return Err(log_unsafe(identity.nonregular_reason()));
+        #[cfg(not(unix))]
+        {
+            let _ = (self, relative);
+            return Err(unsupported_platform(PolicyViolationStage::PreBinding));
         }
-        Ok(OpenedProjectLog {
-            file,
-            relative_path: relative.to_owned(),
-        })
+        #[cfg(unix)]
+        {
+            let (file, _) = self.open_final_with_parent(
+                relative,
+                libc::O_RDONLY | libc::O_NONBLOCK,
+                0,
+            )?;
+            let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|source| {
+                AppError::Io {
+                    operation: "read project log metadata",
+                    source,
+                }
+            })?;
+            if !identity.is_regular() {
+                return Err(log_unsafe(identity.nonregular_reason()));
+            }
+            Ok(OpenedProjectLog {
+                file,
+                relative_path: relative.to_owned(),
+            })
+        }
     }
 
     /// Internal descriptor-relative final-component open used by the native
@@ -139,29 +198,32 @@ impl ProjectRootLogReader {
         }
         #[cfg(unix)]
         {
-            let components = relative_components(relative)?;
-            let mut parent = self.root.directory.try_clone().map_err(|source| AppError::Io {
-                operation: "clone project root descriptor",
-                source,
-            })?;
-            for component in &components[..components.len() - 1] {
-                let child = open_directory_at(&parent, component)
-                    .map_err(|source| map_component_open_error(&parent, component, source))?;
-                validate_directory(&child)?;
-                parent = child;
-            }
-            let final_name = components
-                .last()
-                .expect("relative_components always returns one component");
-            let file = openat_file(&parent, final_name, flags, mode).map_err(|source| {
-                map_component_open_error(&parent, final_name, source)
-            })?;
-            let parent = parent.try_clone().map_err(|source| AppError::Io {
-                operation: "clone log parent descriptor",
-                source,
+            let (parent, final_name) = self.open_parent_for(relative)?;
+            let file = openat_file(&parent, &final_name, flags, mode).map_err(|source| {
+                map_component_open_error(&parent, &final_name, source)
             })?;
             Ok((file, parent))
         }
+    }
+
+    #[cfg(unix)]
+    fn open_parent_for(&self, relative: &Path) -> Result<(File, std::ffi::OsString), AppError> {
+        let components = relative_components(relative)?;
+        let final_name = components
+            .last()
+            .expect("relative_components always returns one component")
+            .to_os_string();
+        let mut parent = self.root.directory.try_clone().map_err(|source| AppError::Io {
+            operation: "clone project root descriptor",
+            source,
+        })?;
+        for component in &components[..components.len() - 1] {
+            let child = open_directory_at(&parent, component)
+                .map_err(|source| map_component_open_error(&parent, component, source))?;
+            validate_directory(&child)?;
+            parent = child;
+        }
+        Ok((parent, final_name))
     }
 }
 
@@ -320,30 +382,89 @@ pub fn create_gate_marker(
     }
     #[cfg(unix)]
     {
+        let final_name = relative_components(relative)?
+            .pop()
+            .expect("relative_components always returns one component");
         let (file, parent) = root.open_final_with_parent(
             relative,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             AGENT_FILE_MODE,
         )
         .map_err(|error| classify_marker_create_error(root, relative, error))?;
-        let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|source| AppError::Io {
-            operation: "read gate marker metadata",
-            source,
-        })?;
-        validate_owner_only_file(identity)?;
+        let identity = match LogFileIdentity::from_open_descriptor(&file) {
+            Ok(identity) => identity,
+            Err(source) => {
+                let primary = AppError::Io {
+                    operation: "read gate marker metadata",
+                    source,
+                };
+                return Err(cleanup_created_marker(
+                    &parent,
+                    &final_name,
+                    &file,
+                    None,
+                    primary,
+                ));
+            }
+        };
+        if let Err(primary) = validate_owner_only_file(identity) {
+            return Err(cleanup_created_marker(
+                &parent,
+                &final_name,
+                &file,
+                Some(identity),
+                primary,
+            ));
+        }
         use std::io::Write;
-        (&file).write_all(GATE_MARKER_CONTENT).map_err(|source| AppError::Io {
-            operation: "write gate marker",
-            source,
-        })?;
-        file.sync_all().map_err(|source| AppError::Io {
-            operation: "sync gate marker",
-            source,
-        })?;
-        parent.sync_all().map_err(|source| AppError::Io {
-            operation: "sync gate marker directory",
-            source,
-        })?;
+        if let Err(source) = take_test_marker_failure(MarkerIoStage::Write)
+            .map_or_else(
+                || (&file).write_all(GATE_MARKER_CONTENT),
+                Err,
+            )
+        {
+            let primary = AppError::Io {
+                operation: "write gate marker",
+                source,
+            };
+            return Err(cleanup_created_marker(
+                &parent,
+                &final_name,
+                &file,
+                Some(identity),
+                primary,
+            ));
+        }
+        if let Err(source) = take_test_marker_failure(MarkerIoStage::FileSync)
+            .map_or_else(|| file.sync_all(), Err)
+        {
+            let primary = AppError::Io {
+                operation: "sync gate marker",
+                source,
+            };
+            return Err(cleanup_created_marker(
+                &parent,
+                &final_name,
+                &file,
+                Some(identity),
+                primary,
+            ));
+        }
+        if let Err(source) = take_test_marker_failure(MarkerIoStage::DirectorySync)
+            .map_or_else(|| parent.sync_all(), Err)
+        {
+            let primary = AppError::Io {
+                operation: "sync gate marker directory",
+                source,
+            };
+            return Err(cleanup_created_marker(
+                &parent,
+                &final_name,
+                &file,
+                Some(identity),
+                primary,
+            ));
+        }
         Ok(identity)
     }
 }
@@ -575,6 +696,12 @@ fn map_component_open_error(parent: &File, name: &OsStr, source: io::Error) -> A
 
 #[cfg(unix)]
 fn is_symlink_at(parent: &File, name: &OsStr) -> io::Result<bool> {
+    let identity = identity_at(parent, name)?;
+    Ok(identity.mode & libc::S_IFMT as u32 == libc::S_IFLNK as u32)
+}
+
+#[cfg(unix)]
+fn identity_at(parent: &File, name: &OsStr) -> io::Result<LogFileIdentity> {
     use std::os::unix::ffi::OsStrExt;
     let name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"))?;
@@ -592,7 +719,12 @@ fn is_symlink_at(parent: &File, name: &OsStr) -> io::Result<bool> {
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(stat_buf.st_mode & libc::S_IFMT as libc::mode_t == libc::S_IFLNK as libc::mode_t)
+    Ok(LogFileIdentity {
+        device: stat_buf.st_dev as u64,
+        inode: stat_buf.st_ino as u64,
+        owner: stat_buf.st_uid as u32,
+        mode: stat_buf.st_mode as u32,
+    })
 }
 
 #[cfg(unix)]
@@ -608,17 +740,57 @@ fn classify_marker_create_error(
         return error;
     }
     // O_EXCL intentionally reports EEXIST for both a regular existing marker
-    // and a symlink.  A no-follow probe lets us preserve the typed symlink
-    // distinction without ever opening the marker's target.
-    match root.open_final(relative, libc::O_RDONLY, 0) {
-        Err(AppError::PolicyViolation { violation })
-            if violation.detail
-                == PolicyViolationDetail::LogUnsafe(LogUnsafeReason::Symlink) =>
-        {
-            log_unsafe(LogUnsafeReason::Symlink)
-        }
-        _ => error,
+    // and a symlink. A no-follow fstatat probe preserves the typed symlink
+    // distinction without opening a FIFO/device or following any target.
+    match root.open_parent_for(relative) {
+        Ok((parent, name)) => match is_symlink_at(&parent, &name) {
+            Ok(true) => log_unsafe(LogUnsafeReason::Symlink),
+            Ok(false) | Err(_) => error,
+        },
+        Err(_) => error,
     }
+}
+
+#[cfg(unix)]
+fn cleanup_created_marker(
+    parent: &File,
+    name: &OsStr,
+    file: &File,
+    expected: Option<LogFileIdentity>,
+    primary: AppError,
+) -> AppError {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(expected) = expected else {
+        // Without an identity proof, retain the marker. The primary error is
+        // still the only error exposed to callers.
+        return primary;
+    };
+    let Ok(current) = LogFileIdentity::from_open_descriptor(file) else {
+        return primary;
+    };
+    if current != expected {
+        return primary;
+    }
+    let Ok(named) = identity_at(parent, name) else {
+        return primary;
+    };
+    if named != expected {
+        // The pathname was removed/replaced; never unlink the new generation.
+        return primary;
+    }
+    let name = match std::ffi::CString::new(name.as_bytes()) {
+        Ok(name) => name,
+        Err(_) => return primary,
+    };
+    // SAFETY: parent is an owned directory descriptor and name remains alive
+    // for the call. We unlink only after matching the open descriptor's inode.
+    let unlinked = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0;
+    if unlinked {
+        // Durability of cleanup is best effort. Never replace the primary
+        // write/sync/policy error with cleanup diagnostics.
+        let _ = parent.sync_all();
+    }
+    primary
 }
 
 fn log_unsafe(reason: LogUnsafeReason) -> AppError {
@@ -633,4 +805,41 @@ fn log_unsafe(reason: LogUnsafeReason) -> AppError {
 #[cfg(not(unix))]
 fn unsupported_platform(stage: PolicyViolationStage) -> AppError {
     PolicyViolation::new(PolicyViolationCode::UnsupportedPlatform, stage).into()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+    };
+
+    #[test]
+    fn cleanup_created_marker_does_not_remove_a_replaced_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
+        let relative = Path::new("marker");
+        let name = std::ffi::OsString::from("marker");
+        let (file, parent) = root
+            .open_final_with_parent(
+                relative,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                AGENT_FILE_MODE,
+            )
+            .unwrap();
+        let identity = LogFileIdentity::from_open_descriptor(&file).unwrap();
+        fs::rename(temp.path().join(relative), temp.path().join("old-marker")).unwrap();
+        fs::write(temp.path().join(relative), b"replacement").unwrap();
+        fs::set_permissions(temp.path().join(relative), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let primary = AppError::Io {
+            operation: "injected marker failure",
+            source: io::Error::new(io::ErrorKind::Other, "injected"),
+        };
+        let returned = cleanup_created_marker(&parent, &name, &file, Some(identity), primary);
+        assert!(matches!(returned, AppError::Io { operation: "injected marker failure", .. }));
+        assert_eq!(fs::read(temp.path().join(relative)).unwrap(), b"replacement");
+        assert!(temp.path().join("old-marker").exists());
+    }
 }

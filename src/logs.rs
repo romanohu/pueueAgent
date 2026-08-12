@@ -182,14 +182,21 @@ mod tests {
         },
         project_logs::{
             create_gate_marker, ensure_agent_log_dir, inspect_existing_agent_log,
-            inspect_gate_marker, open_agent_log, ProjectRootLogReader,
+            inspect_gate_marker, open_agent_log, MarkerIoFailure, ProjectRootLogReader,
+            set_test_marker_failure,
         },
         AppError,
     };
     use std::{
         fs,
-        os::unix::fs::{MetadataExt, PermissionsExt},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+        },
         path::{Path, PathBuf},
+        process::Command,
+        sync::mpsc,
+        time::{Duration, Instant},
     };
 
     fn assert_log_unsafe(error: AppError, reason: LogUnsafeReason) {
@@ -208,7 +215,7 @@ mod tests {
     #[test]
     fn secure_agent_log_creation_is_owner_only_regular_and_offset_neutral() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         let relative = Path::new("agent.log");
 
         let opened = open_agent_log(&reader, relative).unwrap();
@@ -233,7 +240,7 @@ mod tests {
     #[test]
     fn secure_agent_log_rejects_weak_directory_and_symlink_files() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         let weak = temp.path().join("weak.log");
         fs::write(&weak, b"x").unwrap();
         fs::set_permissions(&weak, fs::Permissions::from_mode(0o640)).unwrap();
@@ -262,7 +269,7 @@ mod tests {
     #[test]
     fn secure_agent_log_directory_is_fixed_owner_only_and_no_follow() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         ensure_agent_log_dir(&reader).unwrap();
         for relative in [Path::new(".pueue-agent"), Path::new(".pueue-agent/logs")] {
             let metadata = fs::symlink_metadata(temp.path().join(relative)).unwrap();
@@ -279,20 +286,20 @@ mod tests {
             fs::Permissions::from_mode(0o770),
         )
         .unwrap();
-        let weak_reader = ProjectRootLogReader::open(weak_root.path()).unwrap();
+        let weak_reader = ProjectRootLogReader::open_for_tests(weak_root.path()).unwrap();
         assert_log_unsafe(ensure_agent_log_dir(&weak_reader).unwrap_err(), LogUnsafeReason::WeakPermissions);
 
         let link_root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), link_root.path().join(".pueue-agent")).unwrap();
-        let link_reader = ProjectRootLogReader::open(link_root.path()).unwrap();
+        let link_reader = ProjectRootLogReader::open_for_tests(link_root.path()).unwrap();
         assert_log_unsafe(ensure_agent_log_dir(&link_reader).unwrap_err(), LogUnsafeReason::Symlink);
     }
 
     #[test]
     fn gate_marker_is_exclusive_durable_exact_and_no_follow() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         ensure_agent_log_dir(&reader).unwrap();
         let relative = Path::new(".pueue-agent/logs/agent.log.gate-started");
 
@@ -305,6 +312,7 @@ mod tests {
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert_eq!(inspect_gate_marker(&reader, relative).unwrap(), Some(created));
         assert!(create_gate_marker(&reader, relative).is_err());
+        assert_eq!(inspect_gate_marker(&reader, relative).unwrap(), Some(created));
 
         fs::write(&marker, b"authorized\nextra").unwrap();
         assert_log_unsafe(
@@ -325,7 +333,7 @@ mod tests {
     #[test]
     fn marker_inspection_distinguishes_missing_and_unsafe_states() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         ensure_agent_log_dir(&reader).unwrap();
         let relative = Path::new(".pueue-agent/logs/missing.gate-started");
         assert_eq!(inspect_gate_marker(&reader, relative).unwrap(), None);
@@ -340,7 +348,7 @@ mod tests {
     #[test]
     fn inspect_existing_agent_log_does_not_create_or_read() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         let missing = Path::new("missing.log");
         assert_log_unsafe(
             inspect_existing_agent_log(&reader, missing).unwrap_err(),
@@ -362,7 +370,7 @@ mod tests {
     #[test]
     fn relative_log_paths_reject_ambiguous_components() {
         let temp = tempfile::tempdir().unwrap();
-        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
         for (path, reason) in [
             (PathBuf::new(), LogUnsafeReason::EmptyPath),
             (PathBuf::from("."), LogUnsafeReason::CurDir),
@@ -371,5 +379,79 @@ mod tests {
         ] {
             assert_log_unsafe(open_agent_log(&reader, &path).unwrap_err(), reason);
         }
+    }
+
+    #[test]
+    fn test_only_project_root_constructor_compiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn marker_io_failures_cleanup_created_marker_and_allow_retry() {
+        for failure in [
+            MarkerIoFailure::Write,
+            MarkerIoFailure::FileSync,
+            MarkerIoFailure::DirectorySync,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let reader = ProjectRootLogReader::open_for_tests(temp.path()).unwrap();
+            let relative = Path::new("marker");
+            set_test_marker_failure(Some(failure));
+            let error = create_gate_marker(&reader, relative).unwrap_err();
+            assert!(matches!(error, AppError::Io { .. }));
+            assert!(!temp.path().join(relative).exists());
+            assert!(create_gate_marker(&reader, relative).is_ok());
+        }
+        set_test_marker_failure(None);
+    }
+
+    #[test]
+    fn marker_fifo_existing_probe_completes_without_blocking() {
+        const ROOT_ENV: &str = "PUEUE_AGENT_MARKER_FIFO_ROOT";
+        if let Ok(root) = std::env::var(ROOT_ENV) {
+            let reader = ProjectRootLogReader::open_for_tests(Path::new(&root)).unwrap();
+            let error = create_gate_marker(&reader, Path::new("marker.fifo")).unwrap_err();
+            assert!(matches!(error, AppError::Io { .. }));
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("marker.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path and mode is bounded.
+        let result = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "mkfifo failed: {:?}", std::io::Error::last_os_error());
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("logs::tests::marker_fifo_existing_probe_completes_without_blocking")
+            .arg("--nocapture")
+            .env(ROOT_ENV, temp.path())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let (sender, receiver) = mpsc::channel();
+        let waiter = std::thread::spawn(move || sender.send(child.wait()).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(status)) => assert!(status.success(), "FIFO probe child failed: {status}"),
+            Ok(Err(error)) => panic!("FIFO probe child wait failed: {error}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The pre-fix classifier blocks opening a FIFO here. Kill the
+                // child and join its waiter so the test never leaks a thread.
+                // SAFETY: pid came from the child process just spawned above.
+                let kill_result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                assert_eq!(kill_result, 0, "failed to kill blocked FIFO probe");
+                let _ = receiver.recv_timeout(Duration::from_secs(1));
+                waiter.join().unwrap();
+                panic!("existing FIFO marker probe exceeded bounded timeout");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                waiter.join().unwrap();
+                panic!("FIFO probe waiter disconnected");
+            }
+        }
+        waiter.join().unwrap();
     }
 }
