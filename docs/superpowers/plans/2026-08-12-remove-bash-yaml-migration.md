@@ -1,6 +1,6 @@
 # Bash/YAML 移行痕跡の削除 実装計画
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or **superpowers:executing-plans** to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 現行の Rust + SQLite supervisor だけを `pueue-agent` の実装として説明できるよう、旧 Bash/YAML 移行痕跡と未使用の設定キーを、現役の Bash 経路・Pueue profile・SQLite migration を壊さずに削除する。
 
@@ -477,16 +477,16 @@
 
   Expected: PASS。全 integration target、config unknown-key rejection、interval zero/positive behavior、SQLite migration regression test を含む。失敗した場合は Task 3 commit を作らず、失敗した target と出力を review gate の blocker として扱う。
 
-- [ ] **Step 7: Verify the implementation diff has only the spec matrix files**
+- [ ] **Step 7: Verify the pre-commit net diff against the fixed base**
 
-  Task commit がちょうど3つ（Task 1、Task 2、Task 3）であることを確認した後、次を実行する。
+  Task 3 の cleanup deletion が index に staged された状態で、固定 base `1e3d7f4` と現在の index/working tree の net diff を確認する。commit 数や HEAD の相対位置を前提にしない。
 
   ```bash
-  git diff --name-only HEAD~3..HEAD
+  git diff --name-only 1e3d7f4
   git status --short
   ```
 
-  Expected: `git diff --name-only HEAD~3..HEAD` は次のファイルだけを列挙する（Task 3 の spec/plan deletion と Task 1/2 の変更を含む）。
+  Expected: `git diff --name-only 1e3d7f4` は Task 1/2 の実装変更だけを次のファイルとして列挙する。base に存在せず final tree にも存在しない cleanup spec/plan の2パスは一覧に含めない。
 
   ```text
   README.md
@@ -495,12 +495,10 @@
   docs/superpowers/plans/2026-08-09-japanese-user-docs.md
   docs/superpowers/plans/2026-08-09-rust-sqlite-agent-supervisor.md
   docs/superpowers/plans/2026-08-11-periodic-deep-check.md
-  docs/superpowers/plans/2026-08-12-remove-bash-yaml-migration.md
   docs/superpowers/specs/2026-08-04-pueue-agent-design.md
   docs/superpowers/specs/2026-08-09-japanese-user-docs-design.md
   docs/superpowers/specs/2026-08-09-rust-sqlite-agent-supervisor-design.md
   docs/superpowers/specs/2026-08-11-periodic-deep-check-design.md
-  docs/superpowers/specs/2026-08-12-remove-bash-yaml-migration-design.md
   src/config.rs
   templates/config.toml
   tests/e2e/rust_supervisor.sh
@@ -514,7 +512,7 @@
   tests/integration/service.rs
   ```
 
-  `git status --short` は Task 3 commit 前なら上記2 deletion の staged state、commit 後なら無出力であること。`src/db/migrations.rs` と `tests/integration/database.rs`、install/launcher/E2E/support の無関係な変更が一覧にあれば commit を止める。
+  `git status --short` は Task 3 commit 前なら上記2 deletion の staged state だけを追加で示す。`src/db/migrations.rs` と `tests/integration/database.rs`、install/launcher/E2E/support の無関係な変更が一覧にあれば commit を止める。
 
 - [ ] **Step 8: Commit the final cleanup gate, including spec and plan deletion**
 
@@ -526,6 +524,17 @@
   ```
 
   Review gate: Task 3 commit はこの spec とこの plan の削除を含み、full-tree negative grep、retention check、`git diff --check`、`cargo test --all-targets` を確認済みであること。cargo fmt が unavailable だった場合だけ、その事実を成功結果と混同せず handoff に明記する。
+
+- [ ] **Step 9: Verify the committed final net diff and clean status**
+
+  Task 3 cleanup commit の直後に、同じ固定 base から HEAD までの committed diff と working tree を確認する。
+
+  ```bash
+  git diff --name-only 1e3d7f4..HEAD
+  git status --short
+  ```
+
+  Expected: range diff は Step 7 の21個の Task 1/2 path と完全に一致し、cleanup spec/plan の2パスは含まれない。`git status --short` は無出力であること。これにより、cleanup deletion を含む commit 後の final tree が plan の対象範囲だけであることを確認する。
 
 ---
 
