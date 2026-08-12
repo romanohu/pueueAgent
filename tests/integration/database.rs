@@ -799,7 +799,7 @@ fn reservation_token_attachment_requires_unbound_rows_and_attaches_all_rows() {
     let first_event = insert_event(&test.db, "project-a", "reservation-first", 100);
     let second_event = insert_event(&test.db, "project-a", "reservation-second", 100);
     EventRepository::new(&test.db)
-        .claim_batch(100, 200, 2)
+        .claim_batch(100, 300, 2)
         .unwrap();
     let run = AgentRunRepository::new(&test.db)
         .insert_with_events_and_reservation(
@@ -3902,7 +3902,7 @@ fn policy_blocked_claim_dead_letters_without_retry_or_run() {
     let first = insert_event(&test.db, "project-a", "policy-blocked-first", 100);
     let second = insert_event(&test.db, "project-a", "policy-blocked-second", 100);
     EventRepository::new(&test.db)
-        .claim_batch(100, 200, 2)
+        .claim_batch(100, 300, 2)
         .unwrap();
 
     let violation = PolicyViolation::new(
@@ -4000,6 +4000,113 @@ fn policy_blocked_claim_validation_is_atomic_for_grouped_and_foreign_inputs() {
             .status,
         EventStatus::Claimed
     );
+}
+
+#[test]
+fn policy_blocked_claim_rejects_expired_or_boundary_lease_atomically() {
+    let test = TestDatabase::new();
+    let root = test.project_root("policy-lease-validation");
+    register_project(&test.db, "project-a", &root, "pa-policy-lease-validation");
+    let expired = insert_event(&test.db, "project-a", "policy-expired-lease", 100);
+    let valid = insert_event(&test.db, "project-a", "policy-valid-lease", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 250, 2)
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute("UPDATE events SET lease_until = 199 WHERE event_id = ?1", [expired])
+        .unwrap();
+
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PreBinding,
+    );
+    assert!(EventRepository::new(&test.db)
+        .dead_letter_claimed_without_run("project-a", &[expired, valid], 200, &violation)
+        .is_err());
+    for event_id in [expired, valid] {
+        let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+        assert_eq!(event.status, EventStatus::Claimed);
+    }
+
+    let exact = insert_event(&test.db, "project-a", "policy-exact-lease", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(200, 250, 1)
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute("UPDATE events SET lease_until = 200 WHERE event_id = ?1", [exact])
+        .unwrap();
+    assert!(EventRepository::new(&test.db)
+        .dead_letter_claimed_without_run("project-a", &[exact], 200, &violation)
+        .is_err());
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(exact)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Claimed
+    );
+}
+
+#[test]
+fn policy_blocked_claim_rejects_null_lease_before_mutation() {
+    let test = TestDatabase::new();
+    let root = test.project_root("policy-null-lease");
+    register_project(&test.db, "project-a", &root, "pa-policy-null-lease");
+    let event_id = insert_event(&test.db, "project-a", "policy-null-lease", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 250, 1)
+        .unwrap();
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .unwrap();
+    connection
+        .execute("UPDATE events SET lease_until = NULL WHERE event_id = ?1", [event_id])
+        .unwrap();
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PreBinding,
+    );
+    assert!(EventRepository::new(&test.db)
+        .dead_letter_claimed_without_run("project-a", &[event_id], 200, &violation)
+        .is_err());
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Claimed
+    );
+}
+
+#[test]
+fn event_repository_rejects_oversized_claim_and_policy_batches() {
+    let test = TestDatabase::new();
+    assert!(matches!(
+        EventRepository::new(&test.db).claim_batch(100, 200, MAX_EVENT_LIST_LIMIT + 1),
+        Err(AppError::Configuration {
+            field: "event_claim_limit"
+        })
+    ));
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PreBinding,
+    );
+    let ids = vec![1_i64; MAX_EVENT_LIST_LIMIT + 1];
+    assert!(matches!(
+        EventRepository::new(&test.db)
+            .dead_letter_claimed_without_run("project-a", &ids, 200, &violation),
+        Err(AppError::Validation {
+            field: "event_ids",
+            ..
+        })
+    ));
 }
 
 #[test]

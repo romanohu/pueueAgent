@@ -897,6 +897,11 @@ impl<'db> EventRepository<'db> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        if limit > MAX_EVENT_LIST_LIMIT {
+            return Err(AppError::Configuration {
+                field: "event_claim_limit",
+            });
+        }
         let limit = i64::try_from(limit).map_err(|_| AppError::Configuration {
             field: "event_claim_limit",
         })?;
@@ -1117,6 +1122,12 @@ impl<'db> EventRepository<'db> {
         if event_ids.is_empty() {
             return Ok(0);
         }
+        if event_ids.len() > MAX_EVENT_LIST_LIMIT {
+            return Err(AppError::Validation {
+                field: "event_ids",
+                message: "event ID list exceeds bounded limit",
+            });
+        }
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1129,11 +1140,17 @@ impl<'db> EventRepository<'db> {
                     message: "event IDs must be unique",
                 });
             }
-            let Some((event_project_id, status)) = transaction
+            let Some((event_project_id, status, lease_until)) = transaction
                 .query_row(
-                    "SELECT project_id, status FROM events WHERE event_id = ?1",
+                    "SELECT project_id, status, lease_until FROM events WHERE event_id = ?1",
                     [event_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, EventStatus>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, EventStatus>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(database_error("validate policy-blocked event"))?
@@ -1153,6 +1170,12 @@ impl<'db> EventRepository<'db> {
                 return Err(AppError::Validation {
                     field: "event_status",
                     message: "event must be claimed without a run",
+                });
+            }
+            if lease_until.is_none_or(|lease_until| lease_until <= now) {
+                return Err(AppError::Validation {
+                    field: "lease_until",
+                    message: "event claim lease is expired or missing",
                 });
             }
             let linked_to_run: bool = transaction
@@ -1181,8 +1204,9 @@ impl<'db> EventRepository<'db> {
                     "UPDATE events
                      SET status = 'dead_letter', lease_until = NULL,
                          completed_at = ?1, last_error = ?2
-                     WHERE project_id = ?3 AND event_id = ?4 AND status = 'claimed'",
-                    params![now, bounded_error, project_id, event_id],
+                     WHERE project_id = ?3 AND event_id = ?4 AND status = 'claimed'
+                       AND lease_until > ?5",
+                    params![now, bounded_error, project_id, event_id, now],
                 )
                 .map_err(database_error("dead-letter policy-blocked event"))?;
             if event_changed != 1 {
