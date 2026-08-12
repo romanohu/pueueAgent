@@ -714,28 +714,59 @@ fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
 
 #[test]
 fn redact_sensitive_session_id_field_preserves_label_but_hides_values() {
-    let inline = redact_sensitive_text("agent.context.session_id=REALVALUE");
-    assert!(!inline.contains("REALVALUE"));
-    assert!(inline.contains("[REDACTED]"));
-
-    let spaced_assignment = redact_sensitive_text("agent.context.session_id = REALVALUE");
-    assert!(spaced_assignment.contains("agent.context.session_id"));
-    assert!(spaced_assignment.contains("[REDACTED]"));
-    assert!(!spaced_assignment.contains("REALVALUE"));
-
-    let next_token = redact_sensitive_text("agent.context.session_id REALVALUE");
-    assert!(next_token.contains("agent.context.session_id"));
-    assert!(next_token.contains("[REDACTED]"));
-    assert!(!next_token.contains("REALVALUE"));
-
-    let punctuation = redact_sensitive_text("agent.context.session_id: REALVALUE");
-    assert!(punctuation.contains("agent.context.session_id:"));
-    assert!(punctuation.contains("[REDACTED]"));
-    assert!(!punctuation.contains("REALVALUE"));
-
-    let label_only = redact_sensitive_text("invalid field `agent.context.session_id`");
-    assert!(label_only.contains("agent.context.session_id"));
-    assert!(!label_only.contains("REALVALUE"));
+    let cases = [
+        (
+            "agent.context.session_id=REAL_INLINE_EQUAL",
+            Some("REAL_INLINE_EQUAL"),
+        ),
+        (
+            "agent.context.session_id= REAL_TRAILING_EQUAL",
+            Some("REAL_TRAILING_EQUAL"),
+        ),
+        (
+            "agent.context.session_id = REAL_SPACED_EQUAL",
+            Some("REAL_SPACED_EQUAL"),
+        ),
+        (
+            "agent.context.session_id : REAL_SPACED_COLON",
+            Some("REAL_SPACED_COLON"),
+        ),
+        (
+            "agent.context.session_id := REAL_SPACED_COLON_EQUAL",
+            Some("REAL_SPACED_COLON_EQUAL"),
+        ),
+        (
+            "agent.context.session_id:=REAL_INLINE_COLON_EQUAL",
+            Some("REAL_INLINE_COLON_EQUAL"),
+        ),
+        (
+            "agent.context.session_id REAL_NEXT_TOKEN",
+            Some("REAL_NEXT_TOKEN"),
+        ),
+        (
+            "agent.context.session_id = \"REAL QUOTED VALUE\" trailing",
+            Some("REAL QUOTED VALUE"),
+        ),
+        ("agent.context.session_id, is required", None),
+        ("invalid field `agent.context.session_id`", None),
+    ];
+    for (input, real_value) in cases {
+        let rendered = redact_sensitive_text(input);
+        assert!(
+            rendered.contains("agent.context.session_id"),
+            "session-id field label was lost: {rendered}"
+        );
+        if let Some(real_value) = real_value {
+            assert!(
+                rendered.contains("[REDACTED]"),
+                "session-id value was not marked redacted: {rendered}"
+            );
+            assert!(
+                !rendered.contains(real_value),
+                "session-id value leaked: {rendered}"
+            );
+        }
+    }
 }
 
 #[test]

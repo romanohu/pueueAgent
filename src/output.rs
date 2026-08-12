@@ -157,19 +157,41 @@ pub fn redact_sensitive_text(value: &str) -> String {
             }
         }
 
-        if is_session_id_field_label(&token.value) {
-            redacted.push(token.value.to_owned());
-            if tokens
-                .get(index + 1)
-                .is_some_and(|next| !next.quoted && next.value == "=")
-            {
-                redacted.push("=".to_owned());
-                redact_assignment_value = true;
-                assignment_redaction_emitted = false;
-                index += 2;
-            } else {
-                redact_next = true;
-                index += 1;
+        if let Some(session_id_token) = classify_session_id_token(&token.value) {
+            match session_id_token {
+                SessionIdToken::Label { raw } => {
+                    redacted.push(raw.to_owned());
+                    if let Some(separator) = tokens
+                        .get(index + 1)
+                        .filter(|next| !next.quoted)
+                        .and_then(|next| match next.value.as_str() {
+                            "=" | ":" | ":=" => Some(next.value.as_str()),
+                            _ => None,
+                        })
+                    {
+                        redacted.push(separator.to_owned());
+                        redact_assignment_value = true;
+                        assignment_redaction_emitted = false;
+                        index += 2;
+                    } else {
+                        redact_next = true;
+                        index += 1;
+                    }
+                }
+                SessionIdToken::Assignment {
+                    label,
+                    separator,
+                    inline_value,
+                } => {
+                    redact_assignment_value = true;
+                    assignment_redaction_emitted = inline_value;
+                    if inline_value {
+                        redacted.push(format!("{label}{separator}[REDACTED]"));
+                    } else {
+                        redacted.push(format!("{label}{separator}"));
+                    }
+                    index += 1;
+                }
             }
             continue;
         }
@@ -288,11 +310,6 @@ fn is_sensitive_marker(value: &str) -> bool {
     let normalized = lower.trim_matches(|character| {
         matches!(character, ':' | '=' | '`' | ',' | ';' | '"' | '\'')
     });
-    if normalized == "agent.context.session_id" {
-        // Preserve the diagnostic field label; any attached assignment value
-        // is still handled by the sensitive-key branches above.
-        return false;
-    }
     [
         "token",
         "secret",
@@ -314,12 +331,52 @@ fn is_sensitive_marker(value: &str) -> bool {
     .any(|marker| normalized.contains(marker))
 }
 
-fn is_session_id_field_label(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
-    let normalized = normalized.trim_matches(|character| {
-        matches!(character, ':' | '`' | ',' | ';' | '"' | '\'' | '.')
-    });
-    normalized == "agent.context.session_id"
+enum SessionIdToken<'a> {
+    Label {
+        raw: &'a str,
+    },
+    Assignment {
+        label: &'a str,
+        separator: &'a str,
+        inline_value: bool,
+    },
+}
+
+fn classify_session_id_token(value: &str) -> Option<SessionIdToken<'_>> {
+    const LABEL: &str = "agent.context.session_id";
+    let leading_trimmed = value.trim_start_matches(is_session_id_punctuation);
+    let leading_len = value.len() - leading_trimmed.len();
+    let lower = leading_trimmed.to_ascii_lowercase();
+    if !lower.starts_with(LABEL) {
+        return None;
+    }
+    let label_end = leading_len + LABEL.len();
+    let label = &value[..label_end];
+    let suffix = &value[label_end..];
+    for separator in [":=", "=", ":"] {
+        if let Some(rest) = suffix.strip_prefix(separator) {
+            let inline_value = !rest.is_empty()
+                && !rest
+                    .chars()
+                    .all(is_session_id_punctuation);
+            return Some(SessionIdToken::Assignment {
+                label,
+                separator,
+                inline_value,
+            });
+        }
+    }
+    if suffix.chars().all(is_session_id_punctuation) {
+        return Some(SessionIdToken::Label { raw: value });
+    }
+    None
+}
+
+fn is_session_id_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ':' | '`' | ',' | ';' | '"' | '\'' | '.' | '(' | ')' | '[' | ']' | '{' | '}'
+    )
 }
 
 fn is_bare_secret_token(value: &str) -> bool {
