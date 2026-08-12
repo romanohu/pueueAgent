@@ -8,12 +8,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt,
-    fs::{self, File, Metadata, OpenOptions},
+    fs::{self, File, Metadata},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 use serde::Deserialize;
 
@@ -32,6 +35,25 @@ pueue = "pueue"
 "#;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static POLICY_PUBLISH_HOOK: std::sync::Mutex<Option<fn(&Path)>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static POLICY_OPEN_HOOK: std::sync::Mutex<Option<fn(&Path)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn invoke_policy_publish_hook(state_dir: &Path) {
+    if let Some(hook) = *POLICY_PUBLISH_HOOK.lock().unwrap() {
+        hook(state_dir);
+    }
+}
+
+#[cfg(test)]
+fn invoke_policy_open_hook(state_dir: &Path) {
+    if let Some(hook) = *POLICY_OPEN_HOOK.lock().unwrap() {
+        hook(state_dir);
+    }
+}
 
 /// Startup environment values are held in memory only.  The custom Debug and
 /// Display implementations expose names/counts, never values.
@@ -139,6 +161,7 @@ pub struct VerifiedPueueConfig {
 pub struct ProjectRootAnchor {
     pub canonical_path: PathBuf,
     pub identity: ExecutableIdentity,
+    pub resolution_fingerprint: String,
 }
 
 pub struct VerifiedProjectRoot {
@@ -171,6 +194,8 @@ pub struct ResolvedExecutionPolicy {
     pub default_network: NetworkMode,
     pub custom_allowlist: BTreeMap<String, ExecutableAnchor>,
     project_environment_allow: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
+    #[allow(dead_code)]
+    trusted_path_descriptors: Vec<Arc<File>>,
 }
 
 impl fmt::Debug for ResolvedExecutionPolicy {
@@ -339,12 +364,216 @@ impl fmt::Display for PolicyViolation {
 
 impl std::error::Error for PolicyViolation {}
 
+#[allow(dead_code)]
+const fn unsupported_platform() -> PolicyViolation {
+    PolicyViolation::new(
+        PolicyViolationCode::UnsupportedPlatform,
+        PolicyViolationStage::Startup,
+    )
+}
+
+struct OpenedPath {
+    canonical_path: PathBuf,
+    file: File,
+    resolution_fingerprint: String,
+}
+
+#[cfg(unix)]
+fn open_path_nofollow(path: &Path) -> io::Result<OpenedPath> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution policy paths must be canonical absolute paths",
+        ));
+    }
+    let root = std::ffi::CString::new("/").expect("literal contains no NUL");
+    // SAFETY: root is a valid NUL-terminated path and the flags do not expose
+    // a borrowed pointer after this call.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: root_fd is freshly returned by open and is owned here.
+    let mut directory = unsafe { File::from_raw_fd(root_fd) };
+    let mut fingerprint = String::new();
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported path component",
+            ));
+        };
+        let bytes = name.as_bytes();
+        if bytes.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"));
+        }
+        let name = std::ffi::CString::new(bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "NUL path component")
+        })?;
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            libc::O_RDONLY
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY
+        } | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW;
+        // SAFETY: directory is an owned directory descriptor and name points
+        // to a NUL-terminated component for the duration of the call.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is freshly returned by openat and is owned here.
+        let opened = unsafe { File::from_raw_fd(fd) };
+        let metadata = opened.metadata()?;
+        if !secure_component_metadata(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "weak or foreign path component",
+            ));
+        }
+        let item = identity(&metadata);
+        use std::fmt::Write as _;
+        write!(
+            &mut fingerprint,
+            "{:?}:{:x}:{:x}:{:x}:{:x};",
+            name, item.device, item.inode, item.owner, item.mode
+        )
+        .expect("writing to String cannot fail");
+        if final_component {
+            let canonical_path = fs::canonicalize(path)?;
+            return Ok(OpenedPath {
+                canonical_path,
+                file: opened,
+                resolution_fingerprint: fingerprint,
+            });
+        }
+        directory = opened;
+    }
+    let canonical_path = fs::canonicalize(path)?;
+    Ok(OpenedPath {
+        canonical_path,
+        file: directory,
+        resolution_fingerprint: fingerprint,
+    })
+}
+
+#[cfg(not(unix))]
+fn open_path_nofollow(_path: &Path) -> io::Result<OpenedPath> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "execution policy requires Unix no-follow descriptors",
+    ))
+}
+
+#[cfg(unix)]
+fn openat_nofollow(directory: &File, name: &OsStr, flags: i32, mode: u32) -> io::Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"))?;
+    // SAFETY: directory is an owned descriptor and name is NUL terminated.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is freshly returned by openat and is owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_child_path_nofollow(parent: &OpenedPath, name: &OsStr) -> io::Result<OpenedPath> {
+    let file = openat_nofollow(&parent.file, name, libc::O_RDONLY, 0)?;
+    let metadata = file.metadata()?;
+    let canonical_path = fs::canonicalize(parent.canonical_path.join(name))?;
+    let mut resolution_fingerprint = parent.resolution_fingerprint.clone();
+    let item = identity(&metadata);
+    use std::fmt::Write as _;
+    write!(
+        &mut resolution_fingerprint,
+        "{:?}:{:x}:{:x}:{:x}:{:x};",
+        name, item.device, item.inode, item.owner, item.mode
+    )
+    .expect("writing to String cannot fail");
+    Ok(OpenedPath {
+        canonical_path,
+        file,
+        resolution_fingerprint,
+    })
+}
+
+#[cfg(unix)]
+fn unlinkat(directory: &File, name: &OsStr) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"))?;
+    // SAFETY: directory is an owned descriptor and name is NUL terminated.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn linkat(directory: &File, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"))?;
+    let destination = std::ffi::CString::new(destination.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"))?;
+    // SAFETY: directory is an owned descriptor and both names are NUL terminated.
+    let result = unsafe {
+        libc::linkat(
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl ExecutableAnchor {
     pub fn resolve(
         program: &OsStr,
         trusted_path: &[PathBuf],
         roots: &[PathBuf],
     ) -> Result<Self, PolicyViolation> {
+        #[cfg(not(unix))]
+        {
+            let _ = (program, trusted_path, roots);
+            return Err(unsupported_platform());
+        }
+        #[cfg(unix)]
+        {
         if program.is_empty() || program.to_string_lossy().contains('\0') {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::AnchorMissing,
@@ -367,10 +596,15 @@ impl ExecutableAnchor {
         }
 
         for directory in trusted_path {
-            validate_trusted_directory(directory, roots)?;
-            let candidate = directory.join(program_path);
-            match fs::symlink_metadata(&candidate) {
-                Ok(_) => return Self::from_absolute(&candidate, roots),
+            let opened_directory = open_path_nofollow(directory).map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::TrustedPathUnsafe,
+                    PolicyViolationStage::Startup,
+                )
+            })?;
+            validate_opened_trusted_directory(&opened_directory, roots)?;
+            match open_child_path_nofollow(&opened_directory, program_path.as_os_str()) {
+                Ok(opened) => return Self::from_opened_executable(opened, roots),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => {
                     return Err(PolicyViolation::new(
@@ -385,23 +619,39 @@ impl ExecutableAnchor {
             PolicyViolationCode::AnchorMissing,
             PolicyViolationStage::Startup,
         ))
+        }
     }
 
     pub fn from_absolute(path: &Path, roots: &[PathBuf]) -> Result<Self, PolicyViolation> {
-        let canonical = canonical_path(path, PolicyViolationCode::AnchorMissing)?;
-        if inside_any_root(&canonical, roots) {
-            return Err(PolicyViolation::new(
-                PolicyViolationCode::ProjectRootExecutable,
-                PolicyViolationStage::Startup,
-            ));
+        #[cfg(not(unix))]
+        {
+            let _ = (path, roots);
+            return Err(unsupported_platform());
         }
-        let file = open_nofollow(&canonical).map_err(|_| {
+        #[cfg(unix)]
+        {
+        let opened = open_path_nofollow(path).map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorMissing,
                 PolicyViolationStage::Startup,
             )
         })?;
-        let metadata = file.metadata().map_err(|_| {
+        Self::from_opened_executable(opened, roots)
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_opened_executable(
+        opened: OpenedPath,
+        roots: &[PathBuf],
+    ) -> Result<Self, PolicyViolation> {
+        if inside_any_root(&opened.canonical_path, roots) {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::ProjectRootExecutable,
+                PolicyViolationStage::Startup,
+            ));
+        }
+        let metadata = opened.file.metadata().map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorMissing,
                 PolicyViolationStage::Startup,
@@ -420,51 +670,38 @@ impl ExecutableAnchor {
             ));
         }
         let identity = identity(&metadata);
-        let resolution_fingerprint = fingerprint(&canonical).map_err(|_| {
-            PolicyViolation::new(
-                PolicyViolationCode::AnchorMissing,
-                PolicyViolationStage::Startup,
-            )
-        })?;
         Ok(Self {
-            canonical_path: canonical,
+            canonical_path: opened.canonical_path,
             identity,
-            resolution_fingerprint,
+            resolution_fingerprint: opened.resolution_fingerprint,
         })
     }
 
     pub fn verify_identity(&self) -> Result<VerifiedExecutable, PolicyViolation> {
-        let current = canonical_path(&self.canonical_path, PolicyViolationCode::AnchorReplaced)
-            .map_err(|_| {
-                PolicyViolation::new(
-                    PolicyViolationCode::AnchorReplaced,
-                    PolicyViolationStage::RunBoundPreMarker,
-                )
-            })?;
-        let file = open_nofollow(&current).map_err(|_| {
+        #[cfg(not(unix))]
+        {
+            return Err(unsupported_platform());
+        }
+        #[cfg(unix)]
+        {
+        let opened = open_path_nofollow(&self.canonical_path).map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorReplaced,
                 PolicyViolationStage::RunBoundPreMarker,
             )
         })?;
-        let metadata = file.metadata().map_err(|_| {
+        let metadata = opened.file.metadata().map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorReplaced,
                 PolicyViolationStage::RunBoundPreMarker,
             )
         })?;
         let current_identity = identity(&metadata);
-        let current_fingerprint = fingerprint(&current).map_err(|_| {
-            PolicyViolation::new(
-                PolicyViolationCode::AnchorReplaced,
-                PolicyViolationStage::RunBoundPreMarker,
-            )
-        })?;
-        if current != self.canonical_path
+        if opened.canonical_path != self.canonical_path
             || !metadata.is_file()
             || !secure_metadata(&metadata)
             || current_identity != self.identity
-            || current_fingerprint != self.resolution_fingerprint
+            || opened.resolution_fingerprint != self.resolution_fingerprint
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::AnchorReplaced,
@@ -472,19 +709,26 @@ impl ExecutableAnchor {
             ));
         }
         Ok(VerifiedExecutable {
-            file,
+            file: opened.file,
             anchor: self.clone(),
         })
+        }
     }
 }
 
 impl ProjectRootAnchor {
     pub fn resolve(path: &Path) -> Result<Self, PolicyViolation> {
-        let canonical = canonical_path(path, PolicyViolationCode::RootChanged)?;
-        let file = open_nofollow(&canonical).map_err(|_| {
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(unsupported_platform());
+        }
+        #[cfg(unix)]
+        {
+        let opened = open_path_nofollow(path).map_err(|_| {
             PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
         })?;
-        let metadata = file.metadata().map_err(|_| {
+        let metadata = opened.file.metadata().map_err(|_| {
             PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
         })?;
         if !metadata.is_dir() || !secure_metadata(&metadata) {
@@ -494,35 +738,37 @@ impl ProjectRootAnchor {
             ));
         }
         Ok(Self {
-            canonical_path: canonical,
+            canonical_path: opened.canonical_path,
             identity: identity(&metadata),
+            resolution_fingerprint: opened.resolution_fingerprint,
         })
+        }
     }
 
     pub fn verify_identity(&self) -> Result<VerifiedProjectRoot, PolicyViolation> {
-        let current = canonical_path(&self.canonical_path, PolicyViolationCode::RootChanged)
-            .map_err(|_| {
+        #[cfg(not(unix))]
+        {
+            return Err(unsupported_platform());
+        }
+        #[cfg(unix)]
+        {
+        let opened = open_path_nofollow(&self.canonical_path).map_err(|_| {
                 PolicyViolation::new(
                     PolicyViolationCode::RootChanged,
                     PolicyViolationStage::RunBoundPreMarker,
                 )
             })?;
-        let directory = open_nofollow(&current).map_err(|_| {
+        let metadata = opened.file.metadata().map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::RootChanged,
                 PolicyViolationStage::RunBoundPreMarker,
             )
         })?;
-        let metadata = directory.metadata().map_err(|_| {
-            PolicyViolation::new(
-                PolicyViolationCode::RootChanged,
-                PolicyViolationStage::RunBoundPreMarker,
-            )
-        })?;
-        if current != self.canonical_path
+        if opened.canonical_path != self.canonical_path
             || !metadata.is_dir()
             || !secure_metadata(&metadata)
             || identity(&metadata) != self.identity
+            || opened.resolution_fingerprint != self.resolution_fingerprint
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::RootChanged,
@@ -530,9 +776,10 @@ impl ProjectRootAnchor {
             ));
         }
         Ok(VerifiedProjectRoot {
-            directory,
+            directory: opened.file,
             anchor: self.clone(),
         })
+        }
     }
 }
 
@@ -551,20 +798,26 @@ impl VerifiedProjectRoot {
 
 impl PueueConfigAnchor {
     pub fn from_absolute(path: &Path, roots: &[PathBuf]) -> Result<Self, PolicyViolation> {
-        let canonical = canonical_path(path, PolicyViolationCode::AnchorMissing)?;
-        if inside_any_root(&canonical, roots) {
-            return Err(PolicyViolation::new(
-                PolicyViolationCode::TrustedPathUnsafe,
-                PolicyViolationStage::Startup,
-            ));
+        #[cfg(not(unix))]
+        {
+            let _ = (path, roots);
+            return Err(unsupported_platform());
         }
-        let file = open_nofollow(&canonical).map_err(|_| {
+        #[cfg(unix)]
+        {
+        let opened = open_path_nofollow(path).map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorMissing,
                 PolicyViolationStage::Startup,
             )
         })?;
-        let metadata = file.metadata().map_err(|_| {
+        if inside_any_root(&opened.canonical_path, roots) {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::TrustedPathUnsafe,
+                PolicyViolationStage::Startup,
+            ));
+        }
+        let metadata = opened.file.metadata().map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorMissing,
                 PolicyViolationStage::Startup,
@@ -577,55 +830,50 @@ impl PueueConfigAnchor {
             ));
         }
         let identity = identity(&metadata);
-        let resolution_fingerprint = fingerprint(&canonical).map_err(|_| {
-            PolicyViolation::new(
-                PolicyViolationCode::AnchorMissing,
-                PolicyViolationStage::Startup,
-            )
-        })?;
         Ok(Self {
-            canonical_path: canonical,
+            canonical_path: opened.canonical_path,
             identity,
-            resolution_fingerprint,
+            resolution_fingerprint: opened.resolution_fingerprint,
         })
+        }
     }
 
     pub fn verify_identity(
         &self,
         roots: &[PathBuf],
     ) -> Result<VerifiedPueueConfig, AppError> {
-        let current = canonical_path(&self.canonical_path, PolicyViolationCode::AnchorReplaced)?;
-        if inside_any_root(&current, roots) {
+        #[cfg(not(unix))]
+        {
+            let _ = roots;
+            return Err(unsupported_platform().into());
+        }
+        #[cfg(unix)]
+        {
+        let opened = open_path_nofollow(&self.canonical_path).map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::AnchorReplaced,
+                PolicyViolationStage::RunBoundPreMarker,
+            )
+        })?;
+        if inside_any_root(&opened.canonical_path, roots) {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::TrustedPathUnsafe,
                 PolicyViolationStage::RunBoundPreMarker,
             )
             .into());
         }
-        let file = open_nofollow(&current).map_err(|_| {
-            PolicyViolation::new(
-                PolicyViolationCode::AnchorReplaced,
-                PolicyViolationStage::RunBoundPreMarker,
-            )
-        })?;
-        let metadata = file.metadata().map_err(|_| {
+        let metadata = opened.file.metadata().map_err(|_| {
             PolicyViolation::new(
                 PolicyViolationCode::AnchorReplaced,
                 PolicyViolationStage::RunBoundPreMarker,
             )
         })?;
         let current_identity = identity(&metadata);
-        let current_fingerprint = fingerprint(&current).map_err(|_| {
-            PolicyViolation::new(
-                PolicyViolationCode::AnchorReplaced,
-                PolicyViolationStage::RunBoundPreMarker,
-            )
-        })?;
-        if current != self.canonical_path
+        if opened.canonical_path != self.canonical_path
             || !metadata.is_file()
             || !secure_metadata(&metadata)
             || current_identity != self.identity
-            || current_fingerprint != self.resolution_fingerprint
+            || opened.resolution_fingerprint != self.resolution_fingerprint
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::AnchorReplaced,
@@ -634,22 +882,39 @@ impl PueueConfigAnchor {
             .into());
         }
         Ok(VerifiedPueueConfig {
-            file,
+            file: opened.file,
             anchor: self.clone(),
         })
+        }
     }
 }
 
 pub fn load_or_create_policy(
     input: &PolicyLoadInput,
 ) -> Result<ResolvedExecutionPolicy, PolicyViolation> {
-    load_policy(input, true)
+    #[cfg(not(unix))]
+    {
+        let _ = input;
+        return Err(unsupported_platform());
+    }
+    #[cfg(unix)]
+    {
+        load_policy(input, true)
+    }
 }
 
 pub fn load_existing_policy(
     input: &PolicyLoadInput,
 ) -> Result<ResolvedExecutionPolicy, PolicyViolation> {
-    load_policy(input, false)
+    #[cfg(not(unix))]
+    {
+        let _ = input;
+        return Err(unsupported_platform());
+    }
+    #[cfg(unix)]
+    {
+        load_policy(input, false)
+    }
 }
 
 pub fn resolve_project_policy(
@@ -687,34 +952,35 @@ pub fn resolve_project_policy(
     })
 }
 
+#[cfg(unix)]
 fn load_policy(
     input: &PolicyLoadInput,
     create_missing: bool,
 ) -> Result<ResolvedExecutionPolicy, PolicyViolation> {
     let project_roots = canonical_project_roots(&input.project_roots)?;
     let state_dir = validate_service_directory(&input.state_dir, &project_roots)?;
-    let codex_home = validate_service_directory(&input.codex_home, &project_roots)?;
-    let policy_path = state_dir.join(POLICY_FILENAME);
-
-    match fs::symlink_metadata(&policy_path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || !secure_metadata(&metadata)
-                || mode(&metadata) & 0o077 != 0
-            {
-                return Err(PolicyViolation::new(
-                    PolicyViolationCode::PolicyWeakPermissions,
-                    PolicyViolationStage::Startup,
-                ));
-            }
-        }
+    let codex_home = validate_service_directory(&input.codex_home, &project_roots)?.canonical_path;
+    let policy_name = OsStr::new(POLICY_FILENAME);
+    let policy_file = match openat_nofollow(&state_dir.file, policy_name, libc::O_RDONLY, 0) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound && create_missing => {
             create_policy_file(&state_dir)?;
+            openat_nofollow(&state_dir.file, policy_name, libc::O_RDONLY, 0).map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::PolicyUnreadable,
+                    PolicyViolationStage::Startup,
+                )
+            })?
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::PolicyMissing,
+                PolicyViolationStage::Startup,
+            ));
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::PolicyWeakPermissions,
                 PolicyViolationStage::Startup,
             ));
         }
@@ -724,14 +990,21 @@ fn load_policy(
                 PolicyViolationStage::Startup,
             ));
         }
-    }
-
-    let policy_file = open_nofollow(&policy_path).map_err(|_| {
+    };
+    #[cfg(test)]
+    invoke_policy_open_hook(&state_dir.canonical_path);
+    let policy_metadata = policy_file.metadata().map_err(|_| {
         PolicyViolation::new(
             PolicyViolationCode::PolicyUnreadable,
             PolicyViolationStage::Startup,
         )
     })?;
+    if !policy_metadata.is_file() || !secure_metadata(&policy_metadata) || mode(&policy_metadata) & 0o077 != 0 {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyWeakPermissions,
+            PolicyViolationStage::Startup,
+        ));
+    }
     let mut contents = String::new();
     (&policy_file)
         .take(1024 * 1024 + 1)
@@ -754,20 +1027,34 @@ fn load_policy(
             PolicyViolationStage::Startup,
         )
     })?;
-    if raw.version.unwrap_or(POLICY_VERSION) != POLICY_VERSION {
+    if raw.version != Some(POLICY_VERSION) {
         return Err(PolicyViolation::new(
             PolicyViolationCode::PolicyUnknownField,
             PolicyViolationStage::Startup,
         ));
     }
 
-    let trusted_path = parse_trusted_path(raw.trusted_path.as_deref(), &input.inherited_path)?;
-    for directory in &trusted_path {
-        validate_trusted_directory(directory, &project_roots)?;
+    let trusted_path_descriptors = parse_trusted_path(raw.trusted_path.as_deref(), &input.inherited_path)?;
+    for directory in &trusted_path_descriptors {
+        validate_opened_trusted_directory(directory, &project_roots)?;
     }
+    let trusted_path: Vec<PathBuf> = trusted_path_descriptors
+        .iter()
+        .map(|directory| directory.canonical_path.clone())
+        .collect();
 
-    let codex_anchor = resolve_policy_executable(&raw.executables.codex, &trusted_path, &project_roots)?;
-    let pueue_anchor = resolve_policy_executable(&raw.executables.pueue, &trusted_path, &project_roots)?;
+    let codex_anchor = resolve_policy_executable(
+        &raw.executables.codex,
+        &trusted_path_descriptors,
+        &trusted_path,
+        &project_roots,
+    )?;
+    let pueue_anchor = resolve_policy_executable(
+        &raw.executables.pueue,
+        &trusted_path_descriptors,
+        &trusted_path,
+        &project_roots,
+    )?;
     let launcher_anchor = ExecutableAnchor::from_absolute(&input.launcher_path, &project_roots)?;
     let pueue_config_anchor = PueueConfigAnchor::from_absolute(&input.pueue_config, &project_roots)?;
     let default_network = parse_network(raw.defaults.network.as_deref())?;
@@ -799,11 +1086,17 @@ fn load_policy(
         default_network,
         custom_allowlist,
         project_environment_allow,
+        trusted_path_descriptors: trusted_path_descriptors
+            .into_iter()
+            .map(|directory| Arc::new(directory.file))
+            .collect(),
     })
 }
 
+#[cfg(unix)]
 fn resolve_policy_executable(
     configured: &str,
+    trusted_path_descriptors: &[OpenedPath],
     trusted_path: &[PathBuf],
     roots: &[PathBuf],
 ) -> Result<ExecutableAnchor, PolicyViolation> {
@@ -813,13 +1106,42 @@ fn resolve_policy_executable(
             PolicyViolationStage::Startup,
         ));
     }
-    ExecutableAnchor::resolve(OsStr::new(configured), trusted_path, roots)
+    let configured_path = Path::new(configured);
+    if configured_path.is_absolute() {
+        return ExecutableAnchor::from_absolute(configured_path, roots);
+    }
+    if configured_path.components().count() != 1
+        || configured_path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::AnchorMissing,
+            PolicyViolationStage::Startup,
+        ));
+    }
+    for (directory, _path) in trusted_path_descriptors.iter().zip(trusted_path) {
+        match open_child_path_nofollow(directory, OsStr::new(configured)) {
+            Ok(opened) => return ExecutableAnchor::from_opened_executable(opened, roots),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::AnchorMissing,
+                    PolicyViolationStage::Startup,
+                ))
+            }
+        }
+    }
+    Err(PolicyViolation::new(
+        PolicyViolationCode::AnchorMissing,
+        PolicyViolationStage::Startup,
+    ))
 }
 
 fn parse_trusted_path(
     configured: Option<&str>,
     inherited: &OsStr,
-) -> Result<Vec<PathBuf>, PolicyViolation> {
+) -> Result<Vec<OpenedPath>, PolicyViolation> {
     let source = configured.map(OsString::from).unwrap_or_else(|| inherited.to_os_string());
     let paths: Vec<PathBuf> = std::env::split_paths(&source).collect();
     if paths.is_empty() || paths.iter().any(|path| path.as_os_str().is_empty()) {
@@ -830,7 +1152,15 @@ fn parse_trusted_path(
     }
     paths
         .into_iter()
-        .map(|path| canonical_path(&path, PolicyViolationCode::TrustedPathUnsafe))
+        .map(|path| {
+            open_path_nofollow(&path)
+                .map_err(|_| {
+                    PolicyViolation::new(
+                        PolicyViolationCode::TrustedPathUnsafe,
+                        PolicyViolationStage::Startup,
+                    )
+                })
+        })
         .collect()
 }
 
@@ -870,11 +1200,10 @@ fn canonical_project_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, PolicyViol
     roots
         .iter()
         .map(|root| {
-            let canonical = canonical_path(root, PolicyViolationCode::RootChanged)?;
-            let file = open_nofollow(&canonical).map_err(|_| {
+            let opened = open_path_nofollow(root).map_err(|_| {
                 PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
             })?;
-            let metadata = file.metadata().map_err(|_| {
+            let metadata = opened.file.metadata().map_err(|_| {
                 PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
             })?;
             if !metadata.is_dir() || !secure_metadata(&metadata) {
@@ -883,7 +1212,7 @@ fn canonical_project_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, PolicyViol
                     PolicyViolationStage::Startup,
                 ));
             }
-            Ok(canonical)
+            Ok(opened.canonical_path)
         })
         .collect()
 }
@@ -891,21 +1220,20 @@ fn canonical_project_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, PolicyViol
 fn validate_service_directory(
     path: &Path,
     roots: &[PathBuf],
-) -> Result<PathBuf, PolicyViolation> {
-    let canonical = canonical_path(path, PolicyViolationCode::PolicyUnreadable)?;
-    if inside_any_root(&canonical, roots) {
-        return Err(PolicyViolation::new(
-            PolicyViolationCode::TrustedPathUnsafe,
-            PolicyViolationStage::Startup,
-        ));
-    }
-    let file = open_nofollow(&canonical).map_err(|_| {
+) -> Result<OpenedPath, PolicyViolation> {
+    let opened = open_path_nofollow(path).map_err(|_| {
         PolicyViolation::new(
             PolicyViolationCode::PolicyUnreadable,
             PolicyViolationStage::Startup,
         )
     })?;
-    let metadata = file.metadata().map_err(|_| {
+    if inside_any_root(&opened.canonical_path, roots) {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::TrustedPathUnsafe,
+            PolicyViolationStage::Startup,
+        ));
+    }
+    let metadata = opened.file.metadata().map_err(|_| {
         PolicyViolation::new(
             PolicyViolationCode::PolicyUnreadable,
             PolicyViolationStage::Startup,
@@ -917,27 +1245,20 @@ fn validate_service_directory(
             PolicyViolationStage::Startup,
         ));
     }
-    Ok(canonical)
+    Ok(opened)
 }
 
-fn validate_trusted_directory(
-    path: &Path,
+fn validate_opened_trusted_directory(
+    opened: &OpenedPath,
     roots: &[PathBuf],
 ) -> Result<(), PolicyViolation> {
-    let canonical = canonical_path(path, PolicyViolationCode::TrustedPathUnsafe)?;
-    if inside_any_root(&canonical, roots) {
+    if inside_any_root(&opened.canonical_path, roots) {
         return Err(PolicyViolation::new(
             PolicyViolationCode::TrustedPathUnsafe,
             PolicyViolationStage::Startup,
         ));
     }
-    let file = open_nofollow(&canonical).map_err(|_| {
-        PolicyViolation::new(
-            PolicyViolationCode::TrustedPathUnsafe,
-            PolicyViolationStage::Startup,
-        )
-    })?;
-    let metadata = file.metadata().map_err(|_| {
+    let metadata = opened.file.metadata().map_err(|_| {
         PolicyViolation::new(
             PolicyViolationCode::TrustedPathUnsafe,
             PolicyViolationStage::Startup,
@@ -952,76 +1273,29 @@ fn validate_trusted_directory(
     Ok(())
 }
 
-fn canonical_path(path: &Path, missing_code: PolicyViolationCode) -> Result<PathBuf, PolicyViolation> {
-    if !path.is_absolute() {
-        return Err(PolicyViolation::new(
-            missing_code,
-            PolicyViolationStage::Startup,
-        ));
-    }
-    reject_symlink_components(path, missing_code)?;
-    let canonical = fs::canonicalize(path).map_err(|_| {
-        PolicyViolation::new(missing_code, PolicyViolationStage::Startup)
-    })?;
-    if !canonical.is_absolute() {
-        return Err(PolicyViolation::new(missing_code, PolicyViolationStage::Startup));
-    }
-    reject_symlink_components(&canonical, missing_code)?;
-    Ok(canonical)
-}
-
-fn reject_symlink_components(
-    path: &Path,
-    code: PolicyViolationCode,
-) -> Result<(), PolicyViolation> {
-    if !path.is_absolute() {
-        return Err(PolicyViolation::new(code, PolicyViolationStage::Startup));
-    }
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => current.push(".."),
-            Component::Normal(name) => {
-                current.push(name);
-                let metadata = fs::symlink_metadata(&current).map_err(|_| {
-                    PolicyViolation::new(code, PolicyViolationStage::Startup)
-                })?;
-                if metadata.file_type().is_symlink() {
-                    return Err(PolicyViolation::new(code, PolicyViolationStage::Startup));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn inside_any_root(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path == root || path.starts_with(root))
 }
 
-fn create_policy_file(state_dir: &Path) -> Result<(), PolicyViolation> {
+#[cfg(unix)]
+fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
     for _ in 0..32 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        let temporary = state_dir.join(format!(
+        let temporary = OsString::from(format!(
             ".{POLICY_FILENAME}.{}.{}.tmp",
             std::process::id(),
             timestamp ^ u128::from(counter)
         ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
-        let mut file = match options.open(&temporary) {
+        let mut file = match openat_nofollow(
+            &state_dir.file,
+            &temporary,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
@@ -1038,20 +1312,17 @@ fn create_policy_file(state_dir: &Path) -> Result<(), PolicyViolation> {
                 PolicyViolationStage::Startup,
             ));
         }
-        if fs::symlink_metadata(state_dir.join(POLICY_FILENAME)).is_ok() {
-            let _ = fs::remove_file(&temporary);
-            return Ok(());
-        }
-        drop(file);
-        match fs::rename(&temporary, state_dir.join(POLICY_FILENAME)) {
+        #[cfg(test)]
+        invoke_policy_publish_hook(&state_dir.canonical_path);
+        match linkat(&state_dir.file, &temporary, OsStr::new(POLICY_FILENAME)) {
             Ok(()) => {
-                let directory = File::open(state_dir).map_err(|_| {
+                unlinkat(&state_dir.file, &temporary).map_err(|_| {
                     PolicyViolation::new(
                         PolicyViolationCode::PolicyUnreadable,
                         PolicyViolationStage::Startup,
                     )
                 })?;
-                directory.sync_all().map_err(|_| {
+                state_dir.file.sync_all().map_err(|_| {
                     PolicyViolation::new(
                         PolicyViolationCode::PolicyUnreadable,
                         PolicyViolationStage::Startup,
@@ -1060,11 +1331,16 @@ fn create_policy_file(state_dir: &Path) -> Result<(), PolicyViolation> {
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&temporary);
+                unlinkat(&state_dir.file, &temporary).map_err(|_| {
+                    PolicyViolation::new(
+                        PolicyViolationCode::PolicyUnreadable,
+                        PolicyViolationStage::Startup,
+                    )
+                })?;
                 return Ok(());
             }
             Err(_) => {
-                let _ = fs::remove_file(&temporary);
+                let _ = unlinkat(&state_dir.file, &temporary);
                 return Err(PolicyViolation::new(
                     PolicyViolationCode::PolicyUnreadable,
                     PolicyViolationStage::Startup,
@@ -1078,19 +1354,17 @@ fn create_policy_file(state_dir: &Path) -> Result<(), PolicyViolation> {
     ))
 }
 
-fn open_nofollow(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    options.open(path)
-}
-
 fn secure_metadata(metadata: &Metadata) -> bool {
     owner(metadata) == current_uid() && mode(metadata) & 0o022 == 0
+}
+
+fn secure_component_metadata(metadata: &Metadata) -> bool {
+    if mode(metadata) & 0o022 == 0 {
+        return true;
+    }
+    // A root-owned sticky directory such as the host temporary directory does
+    // not allow another uid to replace an entry owned by this service account.
+    owner(metadata) == 0 && mode(metadata) & 0o1000 != 0
 }
 
 fn current_uid() -> u32 {
@@ -1162,33 +1436,6 @@ fn mode(metadata: &Metadata) -> u32 {
     }
 }
 
-fn fingerprint(path: &Path) -> io::Result<String> {
-    let canonical = fs::canonicalize(path)?;
-    let mut current = PathBuf::new();
-    let mut result = String::new();
-    for component in canonical.components() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => current.push(".."),
-            Component::Normal(name) => {
-                current.push(name);
-                let metadata = fs::symlink_metadata(&current)?;
-                let item = identity(&metadata);
-                use std::fmt::Write as _;
-                write!(
-                    &mut result,
-                    "{:?}:{:x}:{:x}:{:x}:{:x};",
-                    name, item.device, item.inode, item.owner, item.mode
-                )
-                .expect("writing to String cannot fail");
-            }
-        }
-    }
-    Ok(result)
-}
-
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawPolicy {
@@ -1227,4 +1474,110 @@ struct RawProjectPolicy {
     custom_agent: Option<String>,
     agent_environment_allow: Vec<String>,
     task_environment_allow: Vec<String>,
+}
+
+#[cfg(all(test, unix))]
+mod fix_round_tests {
+    use super::*;
+
+    fn install_policy_publish_hook(hook: Option<fn(&Path)>) {
+        *POLICY_PUBLISH_HOOK.lock().unwrap() = hook;
+    }
+
+    fn publish_winner(state_dir: &Path) {
+        let path = state_dir.join(POLICY_FILENAME);
+        fs::write(&path, DEFAULT_POLICY).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn replace_policy_with_weak_file(state_dir: &Path) {
+        let path = state_dir.join(POLICY_FILENAME);
+        fs::rename(&path, state_dir.join("policy-old")).unwrap();
+        fs::write(&path, DEFAULT_POLICY).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    fn startup_fixture() -> (tempfile::TempDir, PolicyLoadInput) {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let state_dir = base.join("state");
+        let project_root = base.join("project");
+        let trusted_bin = base.join("trusted-bin");
+        let codex_home = base.join("codex-home");
+        for directory in [&state_dir, &project_root, &trusted_bin, &codex_home] {
+            fs::create_dir(directory).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        for name in ["codex", "pueue", "launcher"] {
+            let path = trusted_bin.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let pueue_config = base.join("pueue.yml");
+        fs::write(&pueue_config, b"fixture: true\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::write(state_dir.join(POLICY_FILENAME), DEFAULT_POLICY).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                state_dir.join(POLICY_FILENAME),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        (
+            temporary,
+            PolicyLoadInput {
+                state_dir,
+                project_roots: vec![project_root],
+                inherited_path: trusted_bin.into_os_string(),
+                startup_environment: StartupEnvironment::default(),
+                codex_home,
+                pueue_config,
+                launcher_path: base.join("trusted-bin/launcher"),
+            },
+        )
+    }
+
+    #[test]
+    fn concurrent_policy_creator_cannot_overwrite_the_winner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = fs::canonicalize(temporary.path()).unwrap();
+        let opened = open_path_nofollow(&state_dir).unwrap();
+        install_policy_publish_hook(Some(publish_winner));
+        create_policy_file(&opened).unwrap();
+        install_policy_publish_hook(None);
+        assert_eq!(fs::read_to_string(state_dir.join(POLICY_FILENAME)).unwrap(), DEFAULT_POLICY);
+    }
+
+    #[test]
+    fn policy_validation_is_bound_to_the_opened_descriptor() {
+        let (_temporary, input) = startup_fixture();
+        *POLICY_OPEN_HOOK.lock().unwrap() = Some(replace_policy_with_weak_file);
+        let result = load_existing_policy(&input);
+        *POLICY_OPEN_HOOK.lock().unwrap() = None;
+        assert!(result.is_ok());
+        assert_eq!(mode(&fs::metadata(input.state_dir.join(POLICY_FILENAME)).unwrap()), 0o644);
+    }
 }

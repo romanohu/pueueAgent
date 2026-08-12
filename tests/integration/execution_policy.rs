@@ -64,7 +64,7 @@ impl PolicyHarness {
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.temp.path().join(name)
+        fs::canonicalize(self.temp.path()).unwrap().join(name)
     }
 
     fn input(&self) -> PolicyLoadInput {
@@ -97,6 +97,23 @@ fn trusted_path_rejects_project_or_weak_component() {
     fs::create_dir(h.project_root.join("bin")).unwrap();
     assert!(matches!(
         load_or_create_policy(&i),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::TrustedPathUnsafe,
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_path_rejects_a_symlink_component() {
+    let h = PolicyHarness::new();
+    let symlink = h.path("trusted-bin-link");
+    std::os::unix::fs::symlink(&h.trusted_bin, &symlink).unwrap();
+    let mut input = h.input();
+    input.inherited_path = symlink.into_os_string();
+    assert!(matches!(
+        load_or_create_policy(&input),
         Err(pueue_agent::execution_policy::PolicyViolation {
             code: PolicyViolationCode::TrustedPathUnsafe,
             ..
@@ -141,6 +158,26 @@ fn existing_loader_never_creates_missing_policy() {
         })
     ));
     assert!(!h.policy().exists());
+}
+
+#[cfg(not(unix))]
+#[test]
+fn non_unix_policy_entry_points_fail_closed() {
+    let h = PolicyHarness::new();
+    assert!(matches!(
+        load_or_create_policy(&h.input()),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::UnsupportedPlatform,
+            ..
+        })
+    ));
+    assert!(matches!(
+        load_existing_policy(&h.input()),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::UnsupportedPlatform,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -193,6 +230,45 @@ fn unknown_policy_fields_fail_closed() {
         load_existing_policy(&h.input()),
         Err(pueue_agent::execution_policy::PolicyViolation {
             code: PolicyViolationCode::PolicyUnknownField,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn existing_policy_requires_an_explicit_supported_version() {
+    let h = PolicyHarness::new();
+    fs::write(h.policy(), b"[defaults]\nnetwork = \"enabled\"\n").unwrap();
+    secure_file(&h.policy());
+    assert!(matches!(
+        load_existing_policy(&h.input()),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::PolicyUnknownField,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn project_root_parent_replacement_fails_closed_even_when_root_identity_is_preserved() {
+    let h = PolicyHarness::new();
+    let parent = h.path("root-parent");
+    let nested_root = parent.join("project");
+    fs::create_dir(&parent).unwrap();
+    secure_directory(&parent);
+    fs::create_dir(&nested_root).unwrap();
+    secure_directory(&nested_root);
+
+    let anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&nested_root).unwrap();
+    let old_parent = h.path("root-parent-old");
+    fs::rename(&parent, &old_parent).unwrap();
+    fs::create_dir(&parent).unwrap();
+    secure_directory(&parent);
+    fs::rename(old_parent.join("project"), &nested_root).unwrap();
+    assert!(matches!(
+        anchor.verify_identity(),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::RootChanged,
             ..
         })
     ));
