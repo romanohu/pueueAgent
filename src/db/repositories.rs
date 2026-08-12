@@ -1137,9 +1137,19 @@ impl<'db> EventRepository<'db> {
         not_before: Option<i64>,
         last_error: Option<&str>,
     ) -> Result<usize, AppError> {
+        if matches!(
+            status,
+            EventStatus::InFlight | EventStatus::Dispatched | EventStatus::DeadLetter
+        ) {
+            return Err(AppError::Validation {
+                field: "event_status",
+                message: "acknowledgement-owned event states require their repository finalizer",
+            });
+        }
         if event_ids.is_empty() {
             return Ok(0);
         }
+        let bounded_last_error = last_error.map(bounded_redacted_text);
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1155,7 +1165,13 @@ impl<'db> EventRepository<'db> {
                          completed_at = CASE WHEN ?1 IN ('completed', 'failed') THEN ?3 ELSE completed_at END,
                          last_error = ?4
                      WHERE event_id = ?5",
-                    params![status, not_before, now, last_error, event_id],
+                    params![
+                        status,
+                        not_before,
+                        now,
+                        bounded_last_error.as_deref(),
+                        event_id
+                    ],
                 )
                 .map_err(database_error("transition event status"))?;
         }
@@ -3047,6 +3063,35 @@ impl<'db> AgentRunRepository<'db> {
             .map_err(database_error(
                 "begin agent run, event, and intervention insertion",
             ))?;
+        let reservation_count = if let Some(reservation_token) = reservation_token {
+            let (total, bound): (i64, i64) = transaction
+                .query_row(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN agent_run_id IS NULL THEN 0 ELSE 1 END), 0)
+                     FROM interventions
+                     WHERE project_id = ?1 AND reservation_token = ?2
+                       AND status = 'reserved'",
+                    params![run.project_id, reservation_token],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(database_error("validate intervention reservation ownership"))?;
+            if total == 0 {
+                return Err(AppError::Runtime {
+                    operation: "attach intervention reservation to agent run",
+                });
+            }
+            if bound != 0 {
+                return Err(AppError::Validation {
+                    field: "reservation_token",
+                    message: "intervention reservation token is already attached to an agent run",
+                });
+            }
+            usize::try_from(total).map_err(|_| AppError::Runtime {
+                operation: "count intervention reservation rows",
+            })?
+        } else {
+            0
+        };
         let run_id = insert_agent_run(&transaction, run)?;
         for event_id in event_ids {
             let status = transaction
@@ -3085,7 +3130,8 @@ impl<'db> AgentRunRepository<'db> {
                 .execute(
                     "UPDATE interventions
                      SET agent_run_id = ?1
-                     WHERE project_id = ?2 AND reservation_token = ?3 AND status = ?4",
+                     WHERE project_id = ?2 AND reservation_token = ?3 AND status = ?4
+                       AND agent_run_id IS NULL",
                     params![
                         run_id,
                         run.project_id,
@@ -3096,7 +3142,7 @@ impl<'db> AgentRunRepository<'db> {
                 .map_err(database_error(
                     "attach intervention reservation to agent run",
                 ))?;
-            if changed == 0 {
+            if changed != reservation_count {
                 return Err(AppError::Runtime {
                     operation: "attach intervention reservation to agent run",
                 });

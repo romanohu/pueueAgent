@@ -819,13 +819,14 @@ fn status_json_counts_project_interventions_without_exposing_message_bodies() {
             100,
         ))
         .unwrap();
-    EventRepository::new(&harness.db)
-        .transition_many(
-            &[dead_letter.event_id],
-            EventStatus::DeadLetter,
-            106,
-            None,
-            Some("dead letter detail"),
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', completed_at = ?2,
+                    last_error = ?3 WHERE event_id = ?1",
+            params![dead_letter.event_id, 106, "dead letter detail"],
         )
         .unwrap();
 
@@ -1473,13 +1474,14 @@ fn events_projection_filters_project_events_and_emits_bounded_fields() {
             103,
         ))
         .unwrap();
-    EventRepository::new(&harness.db)
-        .transition_many(
-            &[dead_letter.event_id],
-            EventStatus::DeadLetter,
-            104,
-            None,
-            Some(&"dead-letter error ".repeat(100)),
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', completed_at = ?2,
+                    last_error = ?3 WHERE event_id = ?1",
+            params![dead_letter.event_id, 104, &"dead-letter error ".repeat(100)],
         )
         .unwrap();
 
@@ -1967,16 +1969,21 @@ fn doctor_reports_dead_letter_ack_consistency_and_restart_uncertainty_without_re
             100,
         ))
         .unwrap();
-    EventRepository::new(&harness.db)
-        .transition_many(
-            &[dead_letter.event_id],
-            EventStatus::DeadLetter,
-            101,
-            None,
-            Some(&format!(
-                "restart_interruption: execution outcome unknown --password hidden \x1b[31m{}\x1b[0m",
-                "reason ".repeat(100)
-            )),
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', completed_at = ?2,
+                    last_error = ?3 WHERE event_id = ?1",
+            params![
+                dead_letter.event_id,
+                101,
+                format!(
+                    "restart_interruption: execution outcome unknown --password hidden \x1b[31m{}\x1b[0m",
+                    "reason ".repeat(100)
+                )
+            ],
         )
         .unwrap();
     let pre_marker_dead_letter = EventRepository::new(&harness.db)
@@ -1989,13 +1996,18 @@ fn doctor_reports_dead_letter_ack_consistency_and_restart_uncertainty_without_re
             101,
         ))
         .unwrap();
-    EventRepository::new(&harness.db)
-        .transition_many(
-            &[pre_marker_dead_letter.event_id],
-            EventStatus::DeadLetter,
-            102,
-            None,
-            Some("restart_interruption: pre-marker execution not confirmed (retry limit)"),
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', completed_at = ?2,
+                    last_error = ?3 WHERE event_id = ?1",
+            params![
+                pre_marker_dead_letter.event_id,
+                102,
+                "restart_interruption: pre-marker execution not confirmed (retry limit)"
+            ],
         )
         .unwrap();
     let unlinked = EventRepository::new(&harness.db)
@@ -2115,6 +2127,52 @@ fn doctor_reports_missing_submission_kind_or_origin_indexes() {
         .find(|check| check["name"] == "schema.indexes")
         .unwrap();
     assert_eq!(index_check["status"], "error");
+}
+
+#[test]
+fn doctor_reports_missing_and_present_event_status_not_before_index() {
+    let harness = DiagnosticsHarness::new();
+    let present = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        present
+            .checks
+            .iter()
+            .find(|check| check.name == "schema.indexes")
+            .unwrap()
+            .status,
+        pueue_agent::diagnostics::DoctorCheckStatus::Ok
+    );
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX events_project_status_not_before_idx", [])
+        .unwrap();
+    let missing = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    assert_eq!(
+        missing
+            .checks
+            .iter()
+            .find(|check| check.name == "schema.indexes")
+            .unwrap()
+            .status,
+        pueue_agent::diagnostics::DoctorCheckStatus::Error
+    );
 }
 
 #[test]

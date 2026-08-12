@@ -268,6 +268,14 @@ fn is_sensitive_key(value: &str) -> bool {
 
 fn is_sensitive_marker(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
+    let normalized = lower.trim_matches(|character| {
+        matches!(character, ':' | '=' | '`' | ',' | ';' | '"' | '\'')
+    });
+    if normalized == "agent.context.session_id" {
+        // Preserve the diagnostic field label; any attached assignment value
+        // is still handled by the sensitive-key branches above.
+        return false;
+    }
     [
         "token",
         "secret",
@@ -286,7 +294,7 @@ fn is_sensitive_marker(value: &str) -> bool {
         "private_key",
     ]
     .iter()
-    .any(|marker| lower.contains(marker))
+    .any(|marker| normalized.contains(marker))
 }
 
 fn is_bare_secret_token(value: &str) -> bool {

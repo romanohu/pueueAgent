@@ -617,6 +617,7 @@ pub fn build_doctor_report(
     let required_indexes = [
         "events_claimable_idx",
         "events_project_status_idx",
+        "events_project_status_not_before_idx",
         "integration_events_kind_created_idx",
         "incidents_active_fingerprint_idx",
         "incidents_project_status_idx",
@@ -637,6 +638,7 @@ pub fn build_doctor_report(
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (
                  'events_claimable_idx','events_project_status_idx',
+                 'events_project_status_not_before_idx',
                  'integration_events_kind_created_idx','incidents_active_fingerprint_idx',
                  'incidents_project_status_idx','agent_runs_project_status_idx',
                  'agent_runs_one_active_per_project_idx','agent_run_events_event_idx',

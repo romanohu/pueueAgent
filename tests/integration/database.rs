@@ -596,7 +596,11 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
         )
         .unwrap();
     assert_eq!(after, before);
-    for index in ["events_claimable_idx", "events_project_status_idx"] {
+    for index in [
+        "events_claimable_idx",
+        "events_project_status_idx",
+        "events_project_status_not_before_idx",
+    ] {
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
@@ -606,6 +610,316 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
             .unwrap();
         assert_eq!(count, 1, "missing {index}");
     }
+}
+
+#[test]
+fn fresh_schema_creates_events_project_status_not_before_index() {
+    let test = TestDatabase::new();
+    let connection = test.db.connect().unwrap();
+    let index_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'events_project_status_not_before_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        index_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+        "create index events_project_status_not_before_idx on events(project_id, status, not_before, event_id)"
+    );
+}
+
+#[test]
+fn current_v13_reopen_repairs_missing_event_status_not_before_index() {
+    let test = TestDatabase::new();
+    test.db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX events_project_status_not_before_idx", [])
+        .unwrap();
+
+    Db::open(&test.path).unwrap();
+
+    let exists: bool = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'events_project_status_not_before_idx'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(exists);
+}
+
+#[test]
+fn current_v13_reopen_repairs_malformed_event_status_not_before_index() {
+    let test = TestDatabase::new();
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute("DROP INDEX events_project_status_not_before_idx", [])
+        .unwrap();
+    connection
+        .execute(
+            "CREATE INDEX events_project_status_not_before_idx
+             ON events(project_id, status, event_id)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    Db::open(&test.path).unwrap();
+
+    let index_sql: String = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'events_project_status_not_before_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        index_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+        "create index events_project_status_not_before_idx on events(project_id, status, not_before, event_id)"
+    );
+}
+
+#[test]
+fn current_v13_reopen_rejects_malformed_events_status_check() {
+    let test = TestDatabase::new();
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'",
+            params![
+                "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'",
+                "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter', 'unexpected'",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = OFF; PRAGMA user_version = 13;")
+        .unwrap();
+    drop(connection);
+
+    assert!(Db::open(&test.path).is_err());
+}
+
+#[test]
+fn transition_many_rejects_ack_owned_states_before_sql_and_redacts_legacy_errors() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let event_id = insert_event(&test.db, "project-a", "legacy-transition", 100);
+    let repository = EventRepository::new(&test.db);
+
+    for status in [
+        EventStatus::InFlight,
+        EventStatus::Dispatched,
+        EventStatus::DeadLetter,
+    ] {
+        assert!(matches!(
+            repository.transition_many(&[], status, 101, None, None),
+            Err(AppError::Validation { .. })
+        ));
+        assert!(matches!(
+            repository.transition_many(&[event_id], status, 101, None, None),
+            Err(AppError::Validation { .. })
+        ));
+        assert_eq!(
+            repository.find_by_id(event_id).unwrap().unwrap().status,
+            EventStatus::Pending
+        );
+    }
+
+    let reason = format!(
+        "legacy failure --password SECRET [31m{}\u{0007}",
+        "detail ".repeat(100)
+    );
+    repository
+        .transition_many(
+            &[event_id],
+            EventStatus::Failed,
+            101,
+            None,
+            Some(&reason),
+        )
+        .unwrap();
+    let stored = repository
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap()
+        .last_error
+        .unwrap();
+    assert!(stored.len() <= 240);
+    assert!(stored.contains("[REDACTED]"));
+    assert!(!stored.contains("SECRET"));
+    assert!(!stored.chars().any(char::is_control));
+}
+
+#[test]
+fn reservation_token_attachment_requires_unbound_rows_and_attaches_all_rows() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let interventions = InterventionRepository::new(&test.db);
+    let first = interventions
+        .insert_pending("project-a", "first", 100)
+        .unwrap();
+    let second = interventions
+        .insert_pending("project-a", "second", 101)
+        .unwrap();
+    let reservation = interventions
+        .reserve_pending("project-a", "multi-row-token", 102, 300, 2, 1024)
+        .unwrap();
+    assert_eq!(reservation.items.len(), 2);
+
+    let first_event = insert_event(&test.db, "project-a", "reservation-first", 100);
+    let second_event = insert_event(&test.db, "project-a", "reservation-second", 100);
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 2)
+        .unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                first_event,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                "/tmp/multi-row-reservation.log",
+            ),
+            &[first_event, second_event],
+            Some("multi-row-token"),
+        )
+        .unwrap();
+    let attached: Vec<(String, Option<i64>)> = test
+        .db
+        .connect()
+        .unwrap()
+        .prepare(
+            "SELECT intervention_id, agent_run_id FROM interventions
+             WHERE intervention_id IN (?1, ?2) ORDER BY intervention_id",
+        )
+        .unwrap()
+        .query_map(params![first.intervention_id, second.intervention_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(attached.len(), 2);
+    assert!(attached
+        .iter()
+        .all(|(_, agent_run_id)| *agent_run_id == Some(run.run_id)));
+    assert!(attached
+        .iter()
+        .any(|(intervention_id, _)| intervention_id == &first.intervention_id));
+    assert!(attached
+        .iter()
+        .any(|(intervention_id, _)| intervention_id == &second.intervention_id));
+
+    let conflict = TestDatabase::new();
+    let conflict_root = conflict.project_root("project");
+    register_project(&conflict.db, "project-a", &conflict_root, "pa-project");
+    let conflict_intervention = InterventionRepository::new(&conflict.db)
+        .insert_pending("project-a", "conflicting", 100)
+        .unwrap();
+    InterventionRepository::new(&conflict.db)
+        .reserve_pending("project-a", "reused-token", 101, 300, 1, 1024)
+        .unwrap();
+    let owner_event = insert_event(&conflict.db, "project-a", "owner-event", 100);
+    let owner_run = AgentRunRepository::new(&conflict.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            owner_event,
+            None,
+            AgentRunStatus::Completed,
+            102,
+            "/tmp/reservation-owner.log",
+        ))
+        .unwrap();
+    conflict
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET agent_run_id = ?1 WHERE intervention_id = ?2",
+            params![owner_run.run_id, conflict_intervention.intervention_id],
+        )
+        .unwrap();
+    conflict
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'completed', completed_at = 103
+             WHERE event_id = ?1",
+            [owner_event],
+        )
+        .unwrap();
+    let new_event = insert_event(&conflict.db, "project-a", "conflict-event", 100);
+    EventRepository::new(&conflict.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
+    let result = AgentRunRepository::new(&conflict.db).insert_with_events_and_reservation(
+        &NewAgentRun::new(
+            "project-a",
+            new_event,
+            None,
+            AgentRunStatus::Starting,
+            110,
+            "/tmp/reservation-conflict.log",
+        ),
+        &[new_event],
+        Some("reused-token"),
+    );
+    assert!(matches!(result, Err(AppError::Validation { .. })));
+    let state: (EventStatus, i64) = conflict
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT events.status,
+                    (SELECT COUNT(*) FROM agent_runs WHERE primary_event_id = ?1)
+             FROM events WHERE event_id = ?1",
+            [new_event],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (EventStatus::Claimed, 0));
+    let owner_id: Option<i64> = conflict
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_run_id FROM interventions WHERE intervention_id = ?1",
+            [conflict_intervention.intervention_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_id, Some(owner_run.run_id));
 }
 
 #[test]

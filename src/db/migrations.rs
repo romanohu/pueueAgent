@@ -15,6 +15,10 @@ const INTERVENTION_SEQUENCE_INDEX_SQL: &str =
     ON interventions(project_id, insertion_sequence);";
 const INTERVENTION_STATUS_INDEX_SQL: &str = "CREATE INDEX interventions_project_status_created_idx
     ON interventions(project_id, status, insertion_sequence, intervention_id);";
+const EVENTS_PROJECT_STATUS_NOT_BEFORE_INDEX_SQL: &str = "CREATE INDEX events_project_status_not_before_idx
+    ON events(project_id, status, not_before, event_id);";
+const EVENTS_V13_STATUS_LIST: &str =
+    "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'";
 const OPERATOR_LOGS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS operator_logs (
         log_id INTEGER PRIMARY KEY,
@@ -39,10 +43,33 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             operation: "open a database created by a newer pueue-agent",
         });
     }
-    if version == LATEST_SCHEMA_VERSION
-        && submissions_have_composite_origin_foreign_key(connection)?
-    {
-        return Ok(());
+    let current_schema_has_composite_origin_foreign_key =
+        version == LATEST_SCHEMA_VERSION
+            && submissions_have_composite_origin_foreign_key(connection)?;
+    if version == LATEST_SCHEMA_VERSION {
+        // Current-schema databases used to bypass all validation. Keep the
+        // no-write fast path only after checking the canonical status CHECK,
+        // integrity, and the new required event index.
+        verify_events_v13(connection, EVENTS_V13_STATUS_LIST)?;
+        let event_status_not_before_index_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'events_project_status_not_before_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("check current SQLite event indexes"))?;
+        let has_canonical_event_status_not_before_index = event_status_not_before_index_sql
+            .as_deref()
+            .is_some_and(|sql| {
+                compact_sql(sql) == compact_sql(EVENTS_PROJECT_STATUS_NOT_BEFORE_INDEX_SQL)
+            });
+        if current_schema_has_composite_origin_foreign_key
+            && has_canonical_event_status_not_before_index
+        {
+            return Ok(());
+        }
     }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -243,6 +270,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 WHERE status IN ('pending', 'retry_wait');
             CREATE INDEX events_project_status_idx
                 ON events(project_id, status, created_at);
+            CREATE INDEX events_project_status_not_before_idx
+                ON events(project_id, status, not_before, event_id);
             CREATE INDEX integration_events_kind_created_idx
                 ON integration_events(kind, created_at);
             CREATE UNIQUE INDEX incidents_active_fingerprint_idx
@@ -394,10 +423,20 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version <= 12 {
         migrate_events_to_v13(&transaction)?;
     }
+    if version == LATEST_SCHEMA_VERSION {
+        verify_events_v13(&transaction, EVENTS_V13_STATUS_LIST)?;
+    }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
-    ensure_submission_indexes(&transaction)?;
+    ensure_index_definition(
+        &transaction,
+        "events_project_status_not_before_idx",
+        EVENTS_PROJECT_STATUS_NOT_BEFORE_INDEX_SQL,
+    )?;
+    if version != LATEST_SCHEMA_VERSION || !current_schema_has_composite_origin_foreign_key {
+        ensure_submission_indexes(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -419,9 +458,6 @@ fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), A
 fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
     const OLD_STATUS_LIST: &str =
         "'pending', 'claimed', 'completed', 'retry_wait', 'failed'";
-    const NEW_STATUS_LIST: &str =
-        "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'";
-
     let current_event_sql: String = transaction
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
@@ -429,8 +465,8 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
             |row| row.get(0),
         )
         .map_err(database_error("read SQLite events schema for v13 migration"))?;
-    if current_event_sql.contains(NEW_STATUS_LIST) {
-        verify_events_v13(transaction, NEW_STATUS_LIST)?;
+    if current_event_sql.contains(EVENTS_V13_STATUS_LIST) {
+        verify_events_v13(transaction, EVENTS_V13_STATUS_LIST)?;
         return transaction
             .execute_batch("PRAGMA user_version = 13;")
             .map_err(database_error("set SQLite v13 schema version"));
@@ -445,7 +481,7 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
                 SET sql = replace(sql, ?1, ?2)
               WHERE type = 'table' AND name = 'events'
                 AND sql LIKE '%' || ?1 || '%'",
-            params![OLD_STATUS_LIST, NEW_STATUS_LIST],
+            params![OLD_STATUS_LIST, EVENTS_V13_STATUS_LIST],
         )
         .map_err(database_error("replace SQLite v13 event status list"));
     let writable_schema_disabled = transaction
@@ -459,17 +495,17 @@ fn migrate_events_to_v13(transaction: &rusqlite::Transaction<'_>) -> Result<(), 
         });
     }
 
-    verify_events_v13(transaction, NEW_STATUS_LIST)?;
+    verify_events_v13(transaction, EVENTS_V13_STATUS_LIST)?;
     transaction
         .execute_batch("PRAGMA user_version = 13;")
         .map_err(database_error("set SQLite v13 schema version"))
 }
 
 fn verify_events_v13(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &Connection,
     canonical_status_list: &str,
 ) -> Result<(), AppError> {
-    let event_sql: String = transaction
+    let event_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
             [],
@@ -488,7 +524,7 @@ fn verify_events_v13(
             operation: "verify SQLite v13 events status list",
         });
     }
-    let integrity: String = transaction
+    let integrity: String = connection
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(database_error("check SQLite integrity after v13 event migration"))?;
     if integrity != "ok" {
