@@ -744,6 +744,22 @@ fn redact_sensitive_session_id_field_preserves_label_but_hides_values() {
             Some("REAL_NEXT_TOKEN"),
         ),
         (
+            "agent.context.session_id . REAL_SEPARATE_DOT",
+            Some("REAL_SEPARATE_DOT"),
+        ),
+        (
+            "agent.context.session_id \":\" REAL_QUOTED_SEPARATOR",
+            Some("REAL_QUOTED_SEPARATOR"),
+        ),
+        (
+            "agent.context.session_id , REAL_PUNCTUATION_SEPARATOR",
+            Some("REAL_PUNCTUATION_SEPARATOR"),
+        ),
+        (
+            "agent.context.session_id . \"REAL NAKED MULTIWORD\"",
+            Some("REAL NAKED MULTIWORD"),
+        ),
+        (
             "agent.context.session_id = \"REAL QUOTED VALUE\" trailing",
             Some("REAL QUOTED VALUE"),
         ),
@@ -767,6 +783,12 @@ fn redact_sensitive_session_id_field_preserves_label_but_hides_values() {
             );
         }
     }
+
+    let boundary = redact_sensitive_text("agent.context.session_id VALUE --lr 0.1");
+    assert!(boundary.contains("agent.context.session_id"));
+    assert!(boundary.contains("[REDACTED]"));
+    assert!(!boundary.contains("VALUE"));
+    assert!(boundary.contains("--lr 0.1"));
 }
 
 #[test]

@@ -174,7 +174,8 @@ pub fn redact_sensitive_text(value: &str) -> String {
                         assignment_redaction_emitted = false;
                         index += 2;
                     } else {
-                        redact_next = true;
+                        redact_assignment_value = true;
+                        assignment_redaction_emitted = false;
                         index += 1;
                     }
                 }
