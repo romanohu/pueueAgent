@@ -337,7 +337,7 @@
 
   `docs/superpowers/specs/2026-08-11-periodic-deep-check-design.md` の設定節から旧設定を読み取り可能なまま残す、定期起動には使わない、deprecated と明記するという bullet を削除する。interval の TOML example、`0` disabled、`1` 以上 enabled、`interval_minutes` が reconciliation 周期である説明は保持する。
 
-  `docs/superpowers/plans/2026-08-11-periodic-deep-check.md` では Global Constraints の旧 compatibility bullet を削除し、Task 4 の config test を `deep_check_interval_minutes = 0` と `30` の parse/behavior test、および README/template の interval-only assertion として記述する。template/doc の step は、interval の default、0 disabled、positive opt-in、reconciliation と agent DeepCheck の差、token 条件、project coalescing、`STATE.md` の bounded health record を説明する内容にする。旧 field を受理する test や plan step は残さない。
+  `docs/superpowers/plans/2026-08-11-periodic-deep-check.md` では Global Constraints の旧 compatibility bullet を削除し、Task 4 の config test を `deep_check_interval_minutes = 0` と `30` の parse/behavior test、template の実ロードによる current schema validation、README/保持文書に旧設定・移行語がないことを確認する negative grep として記述する。template/doc の step は、interval の default、0 disabled、positive opt-in、reconciliation と agent DeepCheck の差、token 条件、project coalescing、`STATE.md` の bounded health record を説明する内容にする。旧 field を受理する test や plan step は残さない。
 
 - [ ] **Step 5: Delete the four historical design/plan files without editing their contents**
 
