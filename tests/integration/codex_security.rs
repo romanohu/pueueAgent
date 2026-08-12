@@ -13,8 +13,9 @@ use pueue_agent::{
         AgentConfig, AgentCodexConfig, AgentExecutionConfig, CodexReasoningEffort,
     },
     execution_policy::{
-        AgentKind, ExecutableAnchor, ExecutableIdentity, NetworkMode,
-        ProjectRootAnchor, PolicyViolationCode, ResolvedProjectExecutionPolicy,
+        load_or_create_policy, AgentKind, ExecutableAnchor, ExecutableIdentity, NetworkMode,
+        PolicyLoadInput, ProjectRootAnchor, PolicyViolationCode, ResolvedProjectExecutionPolicy,
+        StartupEnvironment,
     },
     environment::{PrivateRunTemp, SanitizedEnvironment},
     models::AgentContextMode,
@@ -220,19 +221,103 @@ fn custom_env_hard_denies_auth_names() {
     let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
         ("OPENAI_API_KEY", "secret"),
         ("CODEX_AUTH_TOKEN", "secret-token"),
+        ("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "/secret/gcloud.json"),
+        ("AZURE_STORAGE_KEY", "secret-storage-key"),
+        ("AZURE_STORAGE_CONNECTION_STRING", "DefaultEndpointsProtocol=https;AccountKey=secret"),
+        ("STORAGE_ACCESS_KEY", "secret-storage-access-key"),
         ("SAFE_VALUE", "safe"),
         ("HTTP_PROXY", "http://proxy.invalid"),
     ]);
     let mut policy = harness.builder().policy().clone();
-    policy.agent_environment_allow = ["OPENAI_API_KEY", "SAFE_VALUE"]
+    policy.agent_environment_allow = [
+        "OPENAI_API_KEY",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "AZURE_STORAGE_KEY",
+        "AZURE_STORAGE_CONNECTION_STRING",
+        "STORAGE_ACCESS_KEY",
+        "SAFE_VALUE",
+    ]
         .into_iter()
         .map(str::to_owned)
         .collect();
     let custom = SanitizedEnvironment::for_custom_agent(&startup, &policy, 41).unwrap();
     assert_eq!(custom.get("OPENAI_API_KEY"), None);
     assert_eq!(custom.get("CODEX_AUTH_TOKEN"), None);
+    assert_eq!(custom.get("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"), None);
+    assert_eq!(custom.get("AZURE_STORAGE_KEY"), None);
+    assert_eq!(custom.get("AZURE_STORAGE_CONNECTION_STRING"), None);
+    assert_eq!(custom.get("STORAGE_ACCESS_KEY"), None);
     assert_eq!(custom.get("SAFE_VALUE"), Some(std::ffi::OsStr::new("safe")));
 
+}
+
+#[cfg(unix)]
+#[test]
+fn pueue_environment_is_fixed_baseline_without_proxy_auth_or_task_values() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let base = fs::canonicalize(harness._temp.path()).unwrap();
+    let state_dir = base.join("state");
+    let trusted_bin = base.join("trusted-bin");
+    let codex_home = base.join("pueue-codex-home");
+    fs::create_dir(&state_dir).unwrap();
+    fs::create_dir(&trusted_bin).unwrap();
+    fs::create_dir(&codex_home).unwrap();
+    let pueue = trusted_bin.join("pueue");
+    let codex = trusted_bin.join("codex");
+    let launcher = trusted_bin.join("launcher");
+    for executable in [&pueue, &codex, &launcher] {
+        fs::write(executable, b"fixture").unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let pueue_config = base.join("pueue.yml");
+    fs::write(&pueue_config, b"fixture: true\n").unwrap();
+    fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+    for directory in [&state_dir, &trusted_bin, &codex_home] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::set_permissions(&harness.root, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let startup = StartupEnvironment::from_pairs([
+        ("HOME", "/service/home"),
+        ("PATH", "/ambient/bin"),
+        ("TMPDIR", "/service/tmp"),
+        ("TMP", "/service/tmp"),
+        ("TEMP", "/service/tmp"),
+        ("HTTP_PROXY", "http://proxy.invalid"),
+        ("SSL_CERT_FILE", "/secret/cert.pem"),
+        ("OPENAI_API_KEY", "secret"),
+        ("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "/secret/gcloud.json"),
+        ("AZURE_STORAGE_KEY", "secret-storage-key"),
+        ("TASK_ONLY", "task-value"),
+    ]);
+    let global = load_or_create_policy(&PolicyLoadInput {
+        state_dir,
+        project_roots: vec![harness.root.clone()],
+        inherited_path: trusted_bin.clone().into_os_string(),
+        startup_environment: startup,
+        codex_home,
+        pueue_config,
+        launcher_path: launcher,
+    })
+    .unwrap();
+    let environment = SanitizedEnvironment::for_pueue(&global).unwrap();
+    assert_eq!(environment.get("PATH"), Some(trusted_bin.as_os_str()));
+    assert_eq!(environment.get("HOME"), Some(std::ffi::OsStr::new("/service/home")));
+    assert_eq!(environment.get("LANG"), Some(std::ffi::OsStr::new("C")));
+    for name in [
+        "HTTP_PROXY",
+        "SSL_CERT_FILE",
+        "OPENAI_API_KEY",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "AZURE_STORAGE_KEY",
+        "TASK_ONLY",
+        "PUEUE_AGENT_RUN_ID",
+        "PUEUE_AGENT_PROJECT_ID",
+    ] {
+        assert_eq!(environment.get(name), None, "{name}");
+    }
 }
 
 #[test]
@@ -257,35 +342,23 @@ fn codex_shell_filters_always_have_a_nonsecret_baseline() {
 
 #[cfg(unix)]
 #[test]
-fn private_temp_is_0700_and_removed() {
+fn private_temp_is_0700_and_retained_after_cleanup_and_drop() {
     use std::os::unix::fs::PermissionsExt;
 
     let harness = Harness::new();
     let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
     let root = anchor.verify_identity().unwrap();
-    let temp = PrivateRunTemp::create(&root, 41).unwrap();
+    let mut temp = PrivateRunTemp::create(&root, 41).unwrap();
     assert_eq!(fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777, 0o700);
     let path = temp.path().to_owned();
-    let parent = path.parent().unwrap().to_owned();
     fs::write(path.join("original-generation"), b"original").unwrap();
+    let error = temp.cleanup().unwrap_err();
+    assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+    assert!(path.exists());
+    assert_eq!(fs::read(path.join("original-generation")).unwrap(), b"original");
     drop(temp);
-    assert!(!path.exists());
-    let tombstone = fs::read_dir(parent)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|entry| {
-            entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".pueue-agent-quarantine-"))
-        })
-        .expect("cleanup retains an unpredictable quarantine tombstone");
-    let retained_file = fs::read_dir(&tombstone)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|entry| entry.is_file())
-        .expect("file tombstone retained");
-    assert_eq!(fs::read(retained_file).unwrap(), b"original");
+    assert!(path.exists());
+    assert_eq!(fs::read(path.join("original-generation")).unwrap(), b"original");
 }
 
 #[cfg(unix)]
@@ -335,37 +408,27 @@ fn private_temp_does_not_follow_nested_symlinks_or_delete_replacement() {
     let path = temp.path().to_owned();
     drop(temp);
     assert!(outside.exists());
-    assert!(!path.exists());
+    assert!(path.exists());
+    assert!(path.join("link").exists());
 
     let replacement = PrivateRunTemp::create(&root, 44).unwrap();
     let replacement_path = replacement.path().to_owned();
+    fs::write(replacement_path.join("original"), b"original").unwrap();
     let moved = harness._temp.path().join("moved-generation");
     fs::rename(&replacement_path, &moved).unwrap();
     fs::create_dir(&replacement_path).unwrap();
     fs::write(replacement_path.join("keep"), b"replacement").unwrap();
-    let replacement_parent = replacement_path.parent().unwrap().to_owned();
     drop(replacement);
-    assert!(!replacement_path.exists());
+    assert!(replacement_path.exists());
+    assert_eq!(fs::read(replacement_path.join("keep")).unwrap(), b"replacement");
     assert!(moved.exists());
-    let tombstone = fs::read_dir(replacement_parent)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|entry| {
-            entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(".pueue-agent-quarantine-")
-                        && entry.join("keep").is_file()
-                })
-        })
-        .unwrap();
-    assert_eq!(fs::read(tombstone.join("keep")).unwrap(), b"replacement");
+    assert_eq!(fs::read(moved.join("original")).unwrap(), b"original");
+    assert!(!moved.join("keep").exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn private_temp_retains_tree_when_cleanup_bounds_are_exceeded() {
+fn private_temp_retains_tree_without_traversal() {
     let harness = Harness::new();
     let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
     let root = anchor.verify_identity().unwrap();
@@ -374,18 +437,10 @@ fn private_temp_retains_tree_when_cleanup_bounds_are_exceeded() {
         fs::write(temp.path().join(format!("entry-{index}")), b"x").unwrap();
     }
     let path = temp.path().to_owned();
-    let parent = path.parent().unwrap().to_owned();
     drop(temp);
-    assert!(!path.exists());
-    assert!(fs::read_dir(parent)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .any(|entry| {
-            entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".pueue-agent-quarantine-"))
-        }));
+    assert!(path.exists());
+    assert_eq!(fs::read(path.join("entry-0")).unwrap(), b"x");
+    assert_eq!(fs::read(path.join("entry-4096")).unwrap(), b"x");
 }
 
 #[test]

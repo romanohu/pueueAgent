@@ -2,16 +2,17 @@
 //! directories.
 //!
 //! Environment values are kept as `OsString`s until the final process API
-//! call.  Debug output intentionally contains names only.  Temporary
-//! directory cleanup is descriptor-relative so a replaced pathname can never
-//! cause a later generation (or a symlink target) to be removed.
+//! call.  Debug output intentionally contains names only.  Private run
+//! directories are retained at their original unique paths: portable Unix
+//! APIs do not provide an atomic conditional unlink/rename by inode, so a
+//! cleanup pathname could otherwise mutate a replacement generation.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt,
     fs::File,
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
 };
 
@@ -25,10 +26,6 @@ pub use crate::execution_policy::StartupEnvironment;
 const PRIVATE_TEMP_ROOT: &str = ".pueue-agent";
 const PRIVATE_TEMP_DIR: &str = "tmp";
 const MAX_RUN_ID_BYTES: usize = 20;
-#[cfg(unix)]
-const MAX_CLEANUP_DEPTH: usize = 32;
-#[cfg(unix)]
-const MAX_CLEANUP_ENTRIES: usize = 4096;
 
 const BASELINE_NAMES: &[&str] = &[
     "HOME",
@@ -116,6 +113,7 @@ pub(crate) fn is_auth_name(name: &str) -> bool {
             | "GOOGLE_GHA_CREDS_PATH"
             | "GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"
             | "CLOUDSDK_AUTH_ACCESS_TOKEN"
+            | "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"
             | "CLOUDSDK_CONFIG"
             | "BOTO_CONFIG"
             | "AZURE_TENANT_ID"
@@ -125,6 +123,8 @@ pub(crate) fn is_auth_name(name: &str) -> bool {
             | "AZURE_PASSWORD"
             | "AZURE_CONFIG_DIR"
             | "AZURE_AUTH_LOCATION"
+            | "AZURE_STORAGE_KEY"
+            | "AZURE_STORAGE_CONNECTION_STRING"
             | "DOCKER_CONFIG"
             | "CONTAINER_AUTH_FILE"
             | "BUILDAH_AUTH"
@@ -152,6 +152,14 @@ pub(crate) fn is_auth_name(name: &str) -> bool {
         || upper.contains("PRIVATE_KEY")
         || upper.starts_with("AWS_SECRET_")
         || upper.starts_with("AZURE_CLIENT_SECRET")
+        || upper.starts_with("AZURE_STORAGE_")
+        || (upper.contains("STORAGE")
+            && (upper.contains("KEY")
+                || upper.contains("SECRET")
+                || upper.contains("TOKEN")
+                || upper.contains("CREDENTIAL")
+                || upper.contains("PASSWORD")
+                || upper.contains("CONNECTION")))
 }
 
 /// A captured, explicit child environment.
@@ -400,12 +408,8 @@ fn temp_error() -> PolicyViolation {
 
 /// An exclusive, owner-only per-run directory.
 pub struct PrivateRunTemp {
-    directory: File,
-    parent: File,
     name: OsString,
     path: PathBuf,
-    identity: (u64, u64),
-    quarantined: bool,
 }
 
 impl fmt::Debug for PrivateRunTemp {
@@ -436,31 +440,10 @@ impl PrivateRunTemp {
             let tmp = open_or_create_directory(&service, OsStr::new(PRIVATE_TEMP_DIR))?;
             let name = OsString::from(run_id.to_string());
             mkdirat_private(&tmp, &name)?;
-            let directory = match open_directory_nofollow(&tmp, &name) {
-                Ok(directory) => directory,
-                Err(error) => {
-                    quarantine_created_directory(&tmp, &name);
-                    return Err(map_temp_io(error));
-                }
-            };
-            if let Err(error) = validate_private_directory(&directory) {
-                drop(directory);
-                quarantine_created_directory(&tmp, &name);
-                return Err(error);
-            }
-            let metadata = match directory.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    drop(directory);
-                    quarantine_created_directory(&tmp, &name);
-                    return Err(temp_error());
-                }
-            };
-            if directory.sync_all().is_err() || tmp.sync_all().is_err() {
-                drop(directory);
-                quarantine_created_directory(&tmp, &name);
-                return Err(temp_error());
-            }
+            let directory = open_directory_nofollow(&tmp, &name).map_err(map_temp_io)?;
+            validate_private_directory(&directory)?;
+            directory.sync_all().map_err(|_| temp_error())?;
+            tmp.sync_all().map_err(|_| temp_error())?;
             let path = root
                 .anchor
                 .canonical_path
@@ -468,12 +451,8 @@ impl PrivateRunTemp {
                 .join(PRIVATE_TEMP_DIR)
                 .join(&name);
             Ok(Self {
-                directory,
-                parent: tmp,
                 name,
                 path,
-                identity: (device(&metadata), inode(&metadata)),
-                quarantined: false,
             })
         }
     }
@@ -482,8 +461,11 @@ impl PrivateRunTemp {
         &self.path
     }
 
-    /// Best-effort explicit cleanup.  A failed or bounded cleanup intentionally
-    /// leaves the tree in place for diagnostics.
+    /// Cleanup is intentionally unsupported.  Retaining the complete run
+    /// directory is the only portable way to ensure a concurrent pathname
+    /// replacement can never be mutated by this handle.  Callers receive a
+    /// bounded policy error while the original generation remains available as
+    /// a diagnostic/runtime artifact.
     pub fn cleanup(&mut self) -> Result<(), PolicyViolation> {
         #[cfg(not(unix))]
         {
@@ -494,18 +476,14 @@ impl PrivateRunTemp {
         }
         #[cfg(unix)]
         {
-            cleanup_private(self)
+            let _ = self;
+            Err(temp_error())
         }
     }
 }
 
 impl Drop for PrivateRunTemp {
-    fn drop(&mut self) {
-        if self.quarantined {
-            return;
-        }
-        let _ = self.cleanup();
-    }
+    fn drop(&mut self) {}
 }
 
 #[cfg(unix)]
@@ -517,35 +495,12 @@ fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, PolicyV
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             mkdirat_private(parent, name)?;
-            let directory = match open_directory_nofollow(parent, name) {
-                Ok(directory) => directory,
-                Err(error) => {
-                    quarantine_created_directory(parent, name);
-                    return Err(map_temp_io(error));
-                }
-            };
-            if let Err(error) = validate_private_directory(&directory) {
-                drop(directory);
-                quarantine_created_directory(parent, name);
-                return Err(error);
-            }
-            if parent.sync_all().is_err() {
-                drop(directory);
-                quarantine_created_directory(parent, name);
-                return Err(temp_error());
-            }
+            let directory = open_directory_nofollow(parent, name).map_err(map_temp_io)?;
+            validate_private_directory(&directory)?;
             Ok(directory)
         }
         Err(error) => Err(map_temp_io(error)),
     }
-}
-
-#[cfg(unix)]
-fn quarantine_created_directory(parent: &File, name: &OsStr) {
-    let Some(stat) = statat_nofollow(parent, name).ok().filter(|stat| stat.is_dir) else {
-        return;
-    };
-    let _ = quarantine_entry(parent, name, Some((stat.device, stat.inode)));
 }
 
 #[cfg(unix)]
@@ -567,6 +522,9 @@ fn mkdirat_private(parent: &File, name: &OsStr) -> Result<(), PolicyViolation> {
     let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| temp_error())?;
     let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
     if result == 0 {
+        // Persist the newly visible directory before opening or validating it.
+        // If this fails, leave the directory untouched for diagnostics.
+        parent.sync_all().map_err(|_| temp_error())?;
         Ok(())
     } else {
         let error = io::Error::last_os_error();
@@ -598,306 +556,7 @@ fn open_directory_nofollow(parent: &File, name: &OsStr) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn cleanup_private(temp: &mut PrivateRunTemp) -> Result<(), PolicyViolation> {
-    if temp.quarantined {
-        return Ok(());
-    }
-    match quarantine_entry(&temp.parent, &temp.name, Some(temp.identity)) {
-        Ok(_) => temp.quarantined = true,
-        Err(failure) => {
-            // A successful rename can be followed by an identity mismatch or
-            // another error.  The source name is then gone, so never retry a
-            // second path operation against a potentially new generation.
-            if failure.renamed || !entry_exists(&temp.parent, &temp.name) {
-                temp.quarantined = true;
-            }
-            return Err(failure.error);
-        }
-    }
-    let mut state = CleanupState { entries: 0 };
-    cleanup_directory(&temp.directory, 0, &mut state)?;
-    temp.parent.sync_all().map_err(|_| temp_error())?;
-    Ok(())
-}
-
-#[cfg(unix)]
-struct CleanupState {
-    entries: usize,
-}
-
-#[cfg(unix)]
-fn cleanup_directory(
-    directory: &File,
-    depth: usize,
-    state: &mut CleanupState,
-) -> Result<(), PolicyViolation> {
-    if depth > MAX_CLEANUP_DEPTH {
-        return Err(temp_error());
-    }
-    let names = read_directory_names(directory)?;
-    for name in names {
-        state.entries += 1;
-        if state.entries > MAX_CLEANUP_ENTRIES {
-            return Err(temp_error());
-        }
-        let item = statat_nofollow(directory, &name).map_err(map_temp_io)?;
-        let child = if item.is_dir {
-            let child = open_directory_nofollow(directory, &name).map_err(map_temp_io)?;
-            validate_private_child(&child)?;
-            Some(child)
-        } else {
-            None
-        };
-        // Rename-to-private is the only removal operation.  The destination
-        // is no-replace and unpredictable; the moved entry is retained as a
-        // bounded diagnostic tombstone rather than unlinked.
-        quarantine_entry(directory, &name, Some((item.device, item.inode)))
-            .map_err(|failure| failure.error)?;
-        if let Some(child) = child {
-            cleanup_directory(&child, depth + 1, state)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_private_child(directory: &File) -> Result<(), PolicyViolation> {
-    let metadata = directory.metadata().map_err(|_| temp_error())?;
-    use std::os::unix::fs::MetadataExt;
-    if metadata.uid() != unsafe { libc::geteuid() as u32 } || metadata.mode() & 0o022 != 0 {
-        return Err(temp_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-struct StatAt {
-    is_dir: bool,
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-fn entry_exists(parent: &File, name: &OsStr) -> bool {
-    statat_nofollow(parent, name).is_ok()
-}
-
-#[cfg(unix)]
-struct QuarantineFailure {
-    error: PolicyViolation,
-    renamed: bool,
-}
-
-#[cfg(unix)]
-fn quarantine_entry(
-    parent: &File,
-    name: &OsStr,
-    expected: Option<(u64, u64)>,
-) -> Result<OsString, QuarantineFailure> {
-    for _ in 0..16 {
-        let destination = random_quarantine_name()
-            .map_err(map_temp_io)
-            .map_err(|error| QuarantineFailure {
-                error,
-                renamed: false,
-            })?;
-        match rename_noreplace(parent, name, parent, &destination) {
-            Ok(()) => {
-                let moved = statat_nofollow(parent, &destination)
-                    .map_err(map_temp_io)
-                    .map_err(|error| QuarantineFailure {
-                        error,
-                        renamed: true,
-                    })?;
-                if expected.is_some_and(|expected| {
-                    (moved.device, moved.inode) != expected
-                }) {
-                    return Err(QuarantineFailure {
-                        error: temp_error(),
-                        renamed: true,
-                    });
-                }
-                return Ok(destination);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(QuarantineFailure {
-                    error: map_temp_io(error),
-                    renamed: false,
-                })
-            }
-        }
-    }
-    Err(QuarantineFailure {
-        error: temp_error(),
-        renamed: false,
-    })
-}
-
-#[cfg(unix)]
-fn random_quarantine_name() -> io::Result<OsString> {
-    let mut random = [0_u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let mut name = String::from(".pueue-agent-quarantine-");
-    for byte in random {
-        name.push_str(&format!("{byte:02x}"));
-    }
-    Ok(OsString::from(name))
-}
-
-#[cfg(target_os = "linux")]
-fn rename_noreplace(
-    old_parent: &File,
-    old_name: &OsStr,
-    new_parent: &File,
-    new_name: &OsStr,
-) -> io::Result<()> {
-    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
-    let old_name = std::ffi::CString::new(old_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
-    let new_name = std::ffi::CString::new(new_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
-    let result = unsafe {
-        libc::renameat2(
-            old_parent.as_raw_fd(),
-            old_name.as_ptr(),
-            new_parent.as_raw_fd(),
-            new_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-}
-
-#[cfg(target_os = "macos")]
-fn rename_noreplace(
-    old_parent: &File,
-    old_name: &OsStr,
-    new_parent: &File,
-    new_name: &OsStr,
-) -> io::Result<()> {
-    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
-    let old_name = std::ffi::CString::new(old_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
-    let new_name = std::ffi::CString::new(new_name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
-    let result = unsafe {
-        libc::renameatx_np(
-            old_parent.as_raw_fd(),
-            old_name.as_ptr(),
-            new_parent.as_raw_fd(),
-            new_name.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn rename_noreplace(
-    _old_parent: &File,
-    _old_name: &OsStr,
-    _new_parent: &File,
-    _new_name: &OsStr,
-) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic no-replace rename is unavailable",
-    ))
-}
-
-#[cfg(unix)]
-fn statat_nofollow(parent: &File, name: &OsStr) -> io::Result<StatAt> {
-    use std::{mem::MaybeUninit, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
-    let name = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
-    let mut stat = MaybeUninit::<libc::stat>::zeroed();
-    let result = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let stat = unsafe { stat.assume_init() };
-    Ok(StatAt {
-        is_dir: stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
-        device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
-    })
-}
-
-#[cfg(unix)]
-fn read_directory_names(directory: &File) -> Result<Vec<OsString>, PolicyViolation> {
-    use std::{ffi::CStr, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
-    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
-        return Err(temp_error());
-    }
-    let stream = unsafe { libc::fdopendir(duplicate) };
-    if stream.is_null() {
-        unsafe { libc::close(duplicate) };
-        return Err(temp_error());
-    }
-    let mut names = Vec::new();
-    let mut read_error = None;
-    unsafe { *last_errno() = 0 };
-    loop {
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            let errno = unsafe { *last_errno() };
-            if errno != 0 {
-                read_error = Some(io::Error::from_raw_os_error(errno));
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let bytes = name.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        if bytes.is_empty() || bytes.contains(&0) {
-            read_error = Some(io::Error::new(io::ErrorKind::InvalidData, "invalid name"));
-            break;
-        }
-        names.push(OsString::from(OsStr::from_bytes(bytes)));
-        if names.len() > MAX_CLEANUP_ENTRIES {
-            read_error = Some(io::Error::new(io::ErrorKind::Other, "entry bound"));
-            break;
-        }
-    }
-    unsafe { libc::closedir(stream) };
-    read_error.map_or(Ok(names), |_| Err(temp_error()))
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-unsafe fn last_errno() -> *mut libc::c_int {
-    libc::__error()
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-unsafe fn last_errno() -> *mut libc::c_int {
-    libc::__errno_location()
-}
-
-#[cfg(unix)]
 fn map_temp_io(error: io::Error) -> PolicyViolation {
     let _ = error;
     temp_error()
-}
-
-#[cfg(unix)]
-fn device(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.dev()
-}
-
-#[cfg(unix)]
-fn inode(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.ino()
 }
