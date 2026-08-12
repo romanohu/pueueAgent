@@ -9,6 +9,7 @@ use pueue_agent::{
     config::{CheckConfig, PatternAction, PatternConfig, StallConfig},
     db::{Db, EventRepository, ProjectRepository},
     detect::{Detector, Observation, ObservationState},
+    execution_policy::{LogUnsafeReason, PolicyViolationCode, PolicyViolationDetail},
     incidents::IncidentStore,
     logs::LogSnapshot,
     models::{EventKind, IncidentStatus, IncidentTransition, NewProject},
@@ -130,6 +131,36 @@ fn task_log_path(log_dir: &Path, task_id: i64) -> PathBuf {
 fn snapshot_modified_seconds(path: &Path) -> i64 {
     let snapshot = LogSnapshot::read_tail(path, 64).unwrap();
     i64::try_from(snapshot.modified_at_nanos.unwrap() / 1_000_000_000).unwrap()
+}
+
+#[test]
+fn log_snapshot_read_boundary_rejects_out_of_range_tail() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), b"bounded").unwrap();
+    for value in [0, 1_048_577] {
+        let error = LogSnapshot::read_tail(temp.path(), value).unwrap_err();
+        assert!(error.to_string().contains("check.log_tail_bytes"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn public_path_tail_read_rejects_a_symlink_before_metadata_or_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target.log");
+    let link = temp.path().join("link.log");
+    std::fs::write(&target, b"target").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(matches!(
+        LogSnapshot::read_tail(&link, 64),
+        Err(pueue_agent::AppError::PolicyViolation {
+            violation: pueue_agent::execution_policy::PolicyViolation {
+                code: PolicyViolationCode::LogUnsafe,
+                detail: PolicyViolationDetail::LogUnsafe(LogUnsafeReason::Symlink),
+                ..
+            }
+        })
+    ));
 }
 
 fn nan_observation(task: &PueueTask) -> Observation {

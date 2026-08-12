@@ -1,11 +1,23 @@
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
     path::Path,
     time::UNIX_EPOCH,
 };
 
-use crate::AppError;
+#[cfg(unix)]
+use std::os::unix::{ffi::OsStrExt, io::FromRawFd};
+
+use crate::{
+    config::bounded_log_tail,
+    execution_policy::{
+        LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail,
+        PolicyViolationStage,
+    },
+    AppError,
+};
+
+pub use crate::config::MAX_LOG_TAIL_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogSnapshot {
@@ -17,23 +29,32 @@ pub struct LogSnapshot {
 
 impl LogSnapshot {
     pub fn read_tail(path: &Path, tail_bytes: u32) -> Result<Self, AppError> {
-        let metadata = fs::metadata(path).map_err(|source| AppError::Io {
+        bounded_log_tail(i64::from(tail_bytes))?;
+        let file = open_read_no_follow(path)?;
+        Self::read_tail_from_file(&file, tail_bytes)
+    }
+
+    pub fn read_tail_from_file(file: &fs::File, tail_bytes: u32) -> Result<Self, AppError> {
+        let tail_len = u64::from(bounded_log_tail(i64::from(tail_bytes))?);
+        let metadata = file.metadata().map_err(|source| AppError::Io {
             operation: "read log metadata",
             source,
         })?;
         let byte_size = metadata.len();
-        let tail_len = u64::from(tail_bytes).min(byte_size);
-        let mut file = fs::File::open(path).map_err(|source| AppError::Io {
-            operation: "open log file",
+        let tail_len = tail_len.min(byte_size);
+        let mut reader = file.try_clone().map_err(|source| AppError::Io {
+            operation: "clone log file",
             source,
         })?;
-        file.seek(SeekFrom::Start(byte_size - tail_len))
+        reader
+            .seek(SeekFrom::Start(byte_size.saturating_sub(tail_len)))
             .map_err(|source| AppError::Io {
                 operation: "seek log tail",
                 source,
             })?;
         let mut bytes = Vec::with_capacity(usize::try_from(tail_len).unwrap_or(usize::MAX));
-        file.take(tail_len)
+        reader
+            .take(tail_len)
             .read_to_end(&mut bytes)
             .map_err(|source| AppError::Io {
                 operation: "read log tail",
@@ -59,6 +80,66 @@ impl LogSnapshot {
             evidence: String::from_utf8_lossy(&bytes).into_owned(),
         })
     }
+}
+
+fn log_unsafe(reason: LogUnsafeReason) -> AppError {
+    PolicyViolation::with_detail(
+        PolicyViolationCode::LogUnsafe,
+        PolicyViolationStage::NativeGate,
+        PolicyViolationDetail::LogUnsafe(reason),
+    )
+    .into()
+}
+
+#[cfg(unix)]
+fn open_read_no_follow(path: &Path) -> Result<fs::File, AppError> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        AppError::Io {
+            operation: "open log file",
+            source: io::Error::new(io::ErrorKind::InvalidInput, "log path contains NUL"),
+        }
+    })?;
+    // O_NONBLOCK prevents a FIFO from making the read boundary wait forever;
+    // its descriptor is rejected as a non-regular log immediately below.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ELOOP) {
+            return Err(log_unsafe(LogUnsafeReason::Symlink));
+        }
+        return Err(AppError::Io {
+            operation: "open log file",
+            source,
+        });
+    }
+    // SAFETY: fd is freshly returned by open and is owned by this File.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|source| AppError::Io {
+        operation: "read log metadata",
+        source,
+    })?;
+    if metadata.is_dir() {
+        return Err(log_unsafe(LogUnsafeReason::Directory));
+    }
+    if !metadata.is_file() {
+        return Err(log_unsafe(LogUnsafeReason::Device));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_read_no_follow(_path: &Path) -> Result<fs::File, AppError> {
+    Err(AppError::PolicyViolation {
+        violation: PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Startup,
+        ),
+    })
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

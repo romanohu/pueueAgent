@@ -150,6 +150,29 @@ fn valid_toml_preserves_detector_actions() {
 }
 
 #[test]
+fn log_tail_bytes_accepts_one_mib_but_rejects_zero_and_one_mib_plus_one() {
+    assert_eq!(
+        load_config(
+            valid_config().replace("log_tail_bytes = 16384", "log_tail_bytes = 1048576")
+        )
+        .unwrap()
+        .check
+        .log_tail_bytes,
+        1_048_576
+    );
+    for value in ["0", "1048577"] {
+        let error = load_config(
+            valid_config().replace(
+                "log_tail_bytes = 16384",
+                &format!("log_tail_bytes = {value}"),
+            ),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("check.log_tail_bytes"));
+    }
+}
+
+#[test]
 fn omitted_future_limits_use_bounded_defaults() {
     let config = valid_config()
         .replace("log_tail_bytes = 16384\n", "")

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::{codex_session, models::AgentContextMode, AppError};
 
 pub const DEFAULT_LOG_TAIL_BYTES: u32 = 64 * 1024;
+pub const MAX_LOG_TAIL_BYTES: u32 = 1_048_576;
 pub const DEFAULT_MAX_AGENT_RUNS: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +239,7 @@ impl RawCheckConfig {
                 "check.deep_check_interval_minutes",
             )?,
             stall_minutes: positive(self.stall_minutes, "check.stall_minutes")?,
-            log_tail_bytes: positive(self.log_tail_bytes, "check.log_tail_bytes")?,
+            log_tail_bytes: bounded_log_tail(self.log_tail_bytes)?,
             extra_log_paths: self.extra_log_paths,
             patterns: self
                 .patterns
@@ -352,6 +353,16 @@ fn default_confirm_matches() -> i64 {
 
 fn default_log_tail_bytes() -> i64 {
     i64::from(DEFAULT_LOG_TAIL_BYTES)
+}
+
+pub(crate) fn bounded_log_tail(value: i64) -> Result<u32, AppError> {
+    if !(1..=i64::from(MAX_LOG_TAIL_BYTES)).contains(&value) {
+        return Err(AppError::Configuration {
+            field: "check.log_tail_bytes",
+        });
+    }
+
+    Ok(u32::try_from(value).expect("bounded log tail fits in u32"))
 }
 
 fn default_max_agent_runs() -> i64 {
