@@ -1,10 +1,14 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     env,
+    path::{Path, PathBuf},
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File},
     io::{BufRead, BufReader, Read},
-    path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
@@ -26,6 +30,7 @@ use std::os::unix::{
 ))]
 use std::sync::Mutex;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -34,11 +39,16 @@ use crate::{
     AppError,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SESSION_STORES: [&str; 2] = ["sessions", "archived_sessions"];
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_SESSION_STORE_DEPTH: usize = 32;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_SESSION_STORE_ENTRIES: usize = 4096;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_SESSION_METADATA_BYTES: usize = 1024 * 1024;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionTraversalHookPoint {
     Store,
@@ -102,10 +112,17 @@ fn invoke_session_traversal_hook(point: SessionTraversalHookPoint, path: &Path) 
     std::os::unix::fs::symlink(&state.replacement, &state.target).unwrap();
 }
 
-#[cfg(not(test))]
+#[cfg(all(
+    not(test),
+    any(
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
 #[allow(dead_code)]
 fn invoke_session_traversal_hook(_point: SessionTraversalHookPoint, _path: &Path) {}
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 struct LatestSessionCandidate {
     id: String,
@@ -119,6 +136,7 @@ struct OpenedSessionMetadata {
     file: File,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Deserialize)]
 struct SessionMetadata {
     #[serde(rename = "type")]
@@ -126,6 +144,7 @@ struct SessionMetadata {
     payload: SessionMetadataPayload,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Deserialize)]
 struct SessionMetadataPayload {
     id: String,
@@ -160,6 +179,61 @@ pub fn home_from_environment() -> Result<PathBuf, AppError> {
         .filter(|value| !value.is_empty())
         .ok_or(AppError::Configuration { field: "HOME" })?;
     Ok(PathBuf::from(home).join(".codex"))
+}
+
+#[cfg(test)]
+mod platform_cfg_contract_tests {
+    const SECURE_SESSION_HELPERS: &[&str] = &[
+        "verify_project_ownership_unix",
+        "resolve_latest_owned_session_unix",
+        "walk_session_directory",
+        "locate_metadata",
+        "locate_metadata_with_limit",
+        "read_metadata_from_file",
+        "open_session_home",
+        "open_directory_path_nofollow",
+        "open_directory_child_nofollow",
+        "open_child_nofollow",
+        "open_child_with_flags",
+        "read_directory_entries",
+        "canonical_project_root",
+        "filename_session_id",
+        "session_missing",
+        "session_not_owned",
+        "normalize_metadata_id",
+        "metadata_error",
+    ];
+
+    #[test]
+    fn secure_session_helpers_match_public_platform_gate() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/codex_session.rs"));
+        let normalized_source: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+        for helper in SECURE_SESSION_HELPERS {
+            assert!(
+                normalized_source
+                    .contains(&format!("#[cfg(any(target_os=\"linux\",target_os=\"macos\"))]fn{helper}")),
+                "helper {helper} must be gated by the supported platform cfg"
+            );
+        }
+
+        for public_entry in ["verify_project_ownership", "resolve_latest_owned_session"] {
+            let marker = format!("pub fn {public_entry}");
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("missing public entry point {public_entry}"));
+            let end = source[start + marker.len()..]
+                .find("\npub fn ")
+                .map(|offset| start + marker.len() + offset)
+                .unwrap_or(source.len());
+            let body = &source[start..end];
+            assert!(
+                body.contains("target_os = \"linux\"")
+                    && body.contains("target_os = \"macos\"")
+                    && body.contains("PolicyViolationCode::UnsupportedPlatform"),
+                "public entry point {public_entry} must fail closed on unsupported platforms"
+            );
+        }
+    }
 }
 
 pub fn verify_project_ownership(
@@ -367,6 +441,7 @@ enum SessionWalkError {
     Callback,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn walk_session_directory<F>(
     directory: &File,
     display_directory: &Path,
@@ -412,6 +487,7 @@ where
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn filename_session_id(path: &Path) -> Option<String> {
     let filename = path.file_name()?.to_str()?;
     let stem = filename.strip_suffix(".jsonl")?;
@@ -420,6 +496,7 @@ fn filename_session_id(path: &Path) -> Option<String> {
         .find_map(|candidate| normalize_session_id(candidate).ok())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn session_missing() -> PolicyViolation {
     PolicyViolation::new(
         PolicyViolationCode::SessionMissing,
@@ -427,6 +504,7 @@ fn session_missing() -> PolicyViolation {
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn session_not_owned() -> PolicyViolation {
     PolicyViolation::new(
         PolicyViolationCode::SessionNotOwned,
@@ -434,6 +512,7 @@ fn session_not_owned() -> PolicyViolation {
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn locate_metadata(codex_home: &Path, session_id: &str) -> Result<OpenedSessionMetadata, AppError> {
     locate_metadata_with_limit(
         codex_home,
@@ -442,6 +521,7 @@ fn locate_metadata(codex_home: &Path, session_id: &str) -> Result<OpenedSessionM
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn locate_metadata_with_limit(
     codex_home: &Path,
     session_id: &str,
@@ -516,6 +596,7 @@ fn locate_metadata_with_limit(
     matched_path.ok_or_else(|| metadata_error(session_id, "metadata was not found in CODEX_HOME"))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_metadata_from_file(
     file: File,
     session_id: &str,
@@ -738,6 +819,7 @@ fn last_errno() -> i32 {
     0
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn canonical_project_root(project_root: &Path) -> std::io::Result<PathBuf> {
     let canonical = fs::canonicalize(project_root)?;
     let metadata = fs::symlink_metadata(&canonical)?;
@@ -750,12 +832,14 @@ fn canonical_project_root(project_root: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn normalize_metadata_id(value: &str, session_id: &str) -> Result<String, AppError> {
     let parsed = Uuid::parse_str(value)
         .map_err(|_| metadata_error(session_id, "metadata is malformed (invalid session ID)"))?;
     Ok(parsed.hyphenated().to_string())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn metadata_error(session_id: &str, reason: &'static str) -> AppError {
     AppError::CodexSessionMetadata {
         session_id: session_id.to_owned(),
