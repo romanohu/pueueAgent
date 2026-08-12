@@ -24,10 +24,10 @@
 | 対象 | 扱い | 完了条件 |
 | --- | --- | --- |
 | `README.md` の `## Bash/YAML 版からの移行` 節 | 節を削除 | 移行手順、旧 registry/PID lock/cron/sentinel/YAML backup の説明を除去する。その他の Bash code fence、`./install.sh`、`bin/pueue-agent`、Pueue profile の説明は残す。 |
-| `docs/superpowers/specs/2026-08-04-pueue-agent-design.md` | ファイル削除 | 旧 Bash supervisor と Rust 版を並行して移行する設計書を履歴から除去する。 |
-| `docs/superpowers/plans/2026-08-04-pueue-agent.md` | ファイル削除 | 旧 Bash/YAML 実装からの移行計画を履歴から除去する。 |
-| `docs/superpowers/specs/2026-08-09-rust-sqlite-agent-supervisor-design.md` | ファイル削除 | Rust 移行期の設計書を履歴から除去する。 |
-| `docs/superpowers/plans/2026-08-09-rust-sqlite-agent-supervisor.md` | ファイル削除 | Rust 移行期の実装計画を履歴から除去する。 |
+| `docs/superpowers/specs/2026-08-04-pueue-agent-design.md` | ファイル削除 | 旧 Bash supervisor と Rust 版を並行して移行する設計書を最終 tree から除去する。 |
+| `docs/superpowers/plans/2026-08-04-pueue-agent.md` | ファイル削除 | 旧 Bash/YAML 実装からの移行計画を最終 tree から除去する。 |
+| `docs/superpowers/specs/2026-08-09-rust-sqlite-agent-supervisor-design.md` | ファイル削除 | Rust 移行期の設計書を最終 tree から除去する。 |
+| `docs/superpowers/plans/2026-08-09-rust-sqlite-agent-supervisor.md` | ファイル削除 | Rust 移行期の実装計画を最終 tree から除去する。 |
 | `docs/superpowers/specs/2026-08-09-japanese-user-docs-design.md`、`docs/superpowers/plans/2026-08-09-japanese-user-docs.md` | 保持して修正 | 旧 Bash/YAML の移行手順を対象にする記述と README 構成中の移行節を削除する。日本語化の目的・現行 CLI・テンプレート仕様は残す。 |
 | `docs/superpowers/specs/2026-08-11-periodic-deep-check-design.md`、`docs/superpowers/plans/2026-08-11-periodic-deep-check.md` | 保持して修正 | `deep_check_interval_minutes` だけを Periodic DeepCheck の設定とし、`deep_check_every` の互換受理、deprecated 表記、legacy compatibility test/plan step を削除する。project 単位の coalescing、token 消費、`STATE.md` 記録の現行仕様は残す。 |
 | `docs/operations-ja.md` | 保持して修正 | `deep_check_every` と legacy 設定の説明を削除し、`deep_check_interval_minutes = 0` が無効、正の値だけが opt-in という現行表現に統一する。更新手順、Pueue profile、`--pueue-config` は残す。 |
