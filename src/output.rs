@@ -157,6 +157,23 @@ pub fn redact_sensitive_text(value: &str) -> String {
             }
         }
 
+        if is_session_id_field_label(&token.value) {
+            redacted.push(token.value.to_owned());
+            if tokens
+                .get(index + 1)
+                .is_some_and(|next| !next.quoted && next.value == "=")
+            {
+                redacted.push("=".to_owned());
+                redact_assignment_value = true;
+                assignment_redaction_emitted = false;
+                index += 2;
+            } else {
+                redact_next = true;
+                index += 1;
+            }
+            continue;
+        }
+
         if is_sensitive_flag(&token.value) || token.value.eq_ignore_ascii_case("bearer") {
             redacted.push(token.value.to_owned());
             if tokens
@@ -295,6 +312,14 @@ fn is_sensitive_marker(value: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
+}
+
+fn is_session_id_field_label(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let normalized = normalized.trim_matches(|character| {
+        matches!(character, ':' | '`' | ',' | ';' | '"' | '\'' | '.')
+    });
+    normalized == "agent.context.session_id"
 }
 
 fn is_bare_secret_token(value: &str) -> bool {

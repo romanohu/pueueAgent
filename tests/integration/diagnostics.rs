@@ -713,6 +713,32 @@ fn bounded_redacted_text_removes_control_and_ansi_sequences_before_bounding() {
 }
 
 #[test]
+fn redact_sensitive_session_id_field_preserves_label_but_hides_values() {
+    let inline = redact_sensitive_text("agent.context.session_id=REALVALUE");
+    assert!(!inline.contains("REALVALUE"));
+    assert!(inline.contains("[REDACTED]"));
+
+    let spaced_assignment = redact_sensitive_text("agent.context.session_id = REALVALUE");
+    assert!(spaced_assignment.contains("agent.context.session_id"));
+    assert!(spaced_assignment.contains("[REDACTED]"));
+    assert!(!spaced_assignment.contains("REALVALUE"));
+
+    let next_token = redact_sensitive_text("agent.context.session_id REALVALUE");
+    assert!(next_token.contains("agent.context.session_id"));
+    assert!(next_token.contains("[REDACTED]"));
+    assert!(!next_token.contains("REALVALUE"));
+
+    let punctuation = redact_sensitive_text("agent.context.session_id: REALVALUE");
+    assert!(punctuation.contains("agent.context.session_id:"));
+    assert!(punctuation.contains("[REDACTED]"));
+    assert!(!punctuation.contains("REALVALUE"));
+
+    let label_only = redact_sensitive_text("invalid field `agent.context.session_id`");
+    assert!(label_only.contains("agent.context.session_id"));
+    assert!(!label_only.contains("REALVALUE"));
+}
+
+#[test]
 fn status_json_counts_project_interventions_without_exposing_message_bodies() {
     let harness = DiagnosticsHarness::new();
     let interventions = InterventionRepository::new(&harness.db);
