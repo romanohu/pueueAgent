@@ -16,6 +16,7 @@ use pueue_agent::{
         AgentKind, ExecutableAnchor, ExecutableIdentity, NetworkMode,
         ProjectRootAnchor, PolicyViolationCode, ResolvedProjectExecutionPolicy,
     },
+    environment::{PrivateRunTemp, SanitizedEnvironment},
     models::AgentContextMode,
 };
 use tempfile::TempDir;
@@ -58,6 +59,236 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
             .unwrap_err();
         assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
     }
+}
+
+#[test]
+fn task_env_is_default_deny_and_auth_never_inherits() {
+    let harness = Harness::new();
+    let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
+        ("OPENAI_API_KEY", "secret"),
+        ("DATASET_ROOT", "/data"),
+        ("PATH", "/trusted/bin"),
+    ]);
+    let mut policy = harness.builder().policy().clone();
+    policy.task_environment_allow = ["DATASET_ROOT", "OPENAI_API_KEY"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let environment = SanitizedEnvironment::for_codex_task(&startup, &policy, 41).unwrap();
+    assert_eq!(environment.get("DATASET_ROOT"), Some(std::ffi::OsStr::new("/data")));
+    assert_eq!(environment.get("OPENAI_API_KEY"), None);
+    assert!(!format!("{environment:?}").contains("secret"));
+}
+
+#[test]
+fn codex_agent_env_allows_only_known_startup_auth_names() {
+    let harness = Harness::new();
+    let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
+        ("OPENAI_API_KEY", "secret"),
+        ("CODEX_AUTH_TOKEN", "token"),
+        ("UNRELATED_SECRET", "must-not-appear"),
+    ]);
+    let environment = SanitizedEnvironment::for_codex_agent(
+        &startup,
+        harness.builder().policy(),
+        41,
+    )
+    .unwrap();
+    assert_eq!(environment.get("OPENAI_API_KEY"), Some(std::ffi::OsStr::new("secret")));
+    assert_eq!(environment.get("CODEX_AUTH_TOKEN"), Some(std::ffi::OsStr::new("token")));
+    assert_eq!(environment.get("UNRELATED_SECRET"), None);
+    assert!(!format!("{environment:?}").contains("secret"));
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_environment_preserves_non_utf8_names_and_values() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([(
+        OsString::from_vec(vec![b'N', b'O', b'N', b'U', b'T', b'F', b'8', 0x80]),
+        OsString::from("SENSITIVE_VALUE"),
+    )]);
+    let name = startup.names().next().unwrap();
+    assert_eq!(name.as_bytes(), b"NONUTF8\x80");
+    assert!(!format!("{startup:?}").contains("SENSITIVE_VALUE"));
+}
+
+#[test]
+fn sanitized_environment_apply_clears_before_setting_explicit_values() {
+    use pueue_agent::environment::EnvironmentCommand;
+    use std::collections::BTreeMap;
+
+    struct Probe {
+        cleared: bool,
+        values: BTreeMap<OsString, OsString>,
+    }
+    impl EnvironmentCommand for Probe {
+        fn environment_clear(&mut self) {
+            self.cleared = true;
+            self.values.clear();
+        }
+
+        fn environment_set(&mut self, name: &std::ffi::OsStr, value: &std::ffi::OsStr) {
+            self.values.insert(name.to_os_string(), value.to_os_string());
+        }
+    }
+
+    let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
+        ("HOME", "/home/service"),
+        ("DATASET_ROOT", "/data"),
+    ]);
+    let harness = Harness::new();
+    let environment = SanitizedEnvironment::for_codex_task(
+        &startup,
+        &harness.builder().policy().clone(),
+        41,
+    )
+    .unwrap();
+    let mut probe = Probe {
+        cleared: false,
+        values: [(OsString::from("AMBIENT"), OsString::from("discard"))]
+            .into_iter()
+            .collect(),
+    };
+    environment.apply(&mut probe);
+    assert!(probe.cleared);
+    assert_eq!(probe.values.get(std::ffi::OsStr::new("AMBIENT")), None);
+    assert_eq!(
+        probe.values.get(std::ffi::OsStr::new("HOME")),
+        Some(&OsString::from("/home/service"))
+    );
+}
+
+#[test]
+fn custom_env_hard_denies_auth_names() {
+    let harness = Harness::new();
+    let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([
+        ("OPENAI_API_KEY", "secret"),
+        ("CODEX_AUTH_TOKEN", "secret-token"),
+        ("SAFE_VALUE", "safe"),
+        ("HTTP_PROXY", "http://proxy.invalid"),
+    ]);
+    let mut policy = harness.builder().policy().clone();
+    policy.agent_environment_allow = ["OPENAI_API_KEY", "SAFE_VALUE"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let custom = SanitizedEnvironment::for_custom_agent(&startup, &policy, 41).unwrap();
+    assert_eq!(custom.get("OPENAI_API_KEY"), None);
+    assert_eq!(custom.get("CODEX_AUTH_TOKEN"), None);
+    assert_eq!(custom.get("SAFE_VALUE"), Some(std::ffi::OsStr::new("safe")));
+
+}
+
+#[test]
+fn codex_shell_filters_always_have_a_nonsecret_baseline() {
+    let harness = Harness::new();
+    let mut policy = harness.builder().policy().clone();
+    policy.task_environment_allow.clear();
+    let argv = CodexArgvBuilder::new(policy, CodexCapabilities::all())
+        .build(&config_with_args(vec!["{prompt}"]), "p", &harness.private_tmp)
+        .unwrap();
+    let filters = argv
+        .iter()
+        .find_map(|arg| {
+            arg.to_str()
+                .filter(|value| value.starts_with("shell_environment_policy="))
+        })
+        .unwrap();
+    assert!(filters.contains("PATH=\"include\""));
+    assert!(filters.contains("TMPDIR=\"include\""));
+    assert!(!filters.contains("OPENAI_API_KEY"));
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_is_0700_and_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
+    let root = anchor.verify_identity().unwrap();
+    let temp = PrivateRunTemp::create(&root, 41).unwrap();
+    assert_eq!(fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777, 0o700);
+    let path = temp.path().to_owned();
+    drop(temp);
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_rejects_collision_and_unsafe_fixed_parents() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
+    let root = anchor.verify_identity().unwrap();
+    let first = PrivateRunTemp::create(&root, 42).unwrap();
+    assert!(PrivateRunTemp::create(&root, 42).is_err());
+    drop(first);
+
+    let weak_harness = Harness::new();
+    fs::set_permissions(
+        weak_harness.root.join(".pueue-agent"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let weak_anchor = ProjectRootAnchor::resolve(&weak_harness.root).unwrap();
+    let weak_root = weak_anchor.verify_identity().unwrap();
+    assert!(PrivateRunTemp::create(&weak_root, 42).is_err());
+
+    let symlink_harness = Harness::new();
+    let outside = symlink_harness._temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::remove_dir_all(symlink_harness.root.join(".pueue-agent")).unwrap();
+    std::os::unix::fs::symlink(&outside, symlink_harness.root.join(".pueue-agent")).unwrap();
+    let symlink_anchor = ProjectRootAnchor::resolve(&symlink_harness.root).unwrap();
+    let symlink_root = symlink_anchor.verify_identity().unwrap();
+    assert!(PrivateRunTemp::create(&symlink_root, 42).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_does_not_follow_nested_symlinks_or_delete_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
+    let root = anchor.verify_identity().unwrap();
+    let temp = PrivateRunTemp::create(&root, 43).unwrap();
+    let outside = harness._temp.path().join("outside-file");
+    fs::write(&outside, b"keep").unwrap();
+    symlink(&outside, temp.path().join("link")).unwrap();
+    let path = temp.path().to_owned();
+    drop(temp);
+    assert!(outside.exists());
+    assert!(!path.exists());
+
+    let replacement = PrivateRunTemp::create(&root, 44).unwrap();
+    let replacement_path = replacement.path().to_owned();
+    let moved = harness._temp.path().join("moved-generation");
+    fs::rename(&replacement_path, &moved).unwrap();
+    fs::create_dir(&replacement_path).unwrap();
+    fs::write(replacement_path.join("keep"), b"replacement").unwrap();
+    drop(replacement);
+    assert!(replacement_path.join("keep").exists());
+    assert!(moved.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_retains_tree_when_cleanup_bounds_are_exceeded() {
+    let harness = Harness::new();
+    let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
+    let root = anchor.verify_identity().unwrap();
+    let temp = PrivateRunTemp::create(&root, 45).unwrap();
+    for index in 0..4097 {
+        fs::write(temp.path().join(format!("entry-{index}")), b"x").unwrap();
+    }
+    let path = temp.path().to_owned();
+    drop(temp);
+    assert!(path.exists());
 }
 
 #[test]
@@ -379,6 +610,23 @@ impl Harness {
         fs::create_dir_all(&other).unwrap();
         fs::create_dir_all(home.join("sessions")).unwrap();
         fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in [
+                root.join(".pueue-agent"),
+                root.join(".pueue-agent/tmp"),
+                other.clone(),
+                home.clone(),
+                home.join("sessions"),
+                home.join("archived_sessions"),
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let root = fs::canonicalize(root).unwrap();
+        let other = fs::canonicalize(other).unwrap();
+        let home = fs::canonicalize(home).unwrap();
         Self {
             _temp: temp,
             root,
@@ -425,6 +673,7 @@ impl Harness {
                     .into_iter()
                     .collect(),
                 codex_home: self.home.clone(),
+                trusted_path: vec![self.root.join("trusted-bin")],
                 private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
             },
             CodexCapabilities::all(),

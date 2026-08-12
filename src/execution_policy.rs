@@ -59,22 +59,22 @@ fn invoke_policy_open_hook(state_dir: &Path) {
 /// Display implementations expose names/counts, never values.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct StartupEnvironment {
-    values: BTreeMap<String, OsString>,
+    // Keep the OS spelling of both names and values.  Environment names are
+    // normally UTF-8, but a non-UTF-8 name must never be silently rewritten.
+    values: BTreeMap<OsString, OsString>,
 }
 
 impl StartupEnvironment {
     pub fn capture() -> Self {
         Self {
-            values: std::env::vars_os()
-                .filter_map(|(name, value)| name.into_string().ok().map(|name| (name, value)))
-                .collect(),
+            values: std::env::vars_os().collect(),
         }
     }
 
     pub fn from_pairs<I, K, V>(pairs: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
+        K: Into<OsString>,
         V: Into<OsString>,
     {
         Self {
@@ -85,16 +85,16 @@ impl StartupEnvironment {
         }
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.values.keys().map(String::as_str)
+    pub fn names(&self) -> impl Iterator<Item = &OsStr> {
+        self.values.keys().map(OsString::as_os_str)
     }
 
     pub fn get(&self, name: &str) -> Option<&OsStr> {
-        self.values.get(name).map(OsString::as_os_str)
+        self.values.get(OsStr::new(name)).map(OsString::as_os_str)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn values(&self) -> &BTreeMap<String, OsString> {
+    pub(crate) fn values(&self) -> &BTreeMap<OsString, OsString> {
         &self.values
     }
 }
@@ -226,6 +226,7 @@ pub struct ResolvedProjectExecutionPolicy {
     pub agent_environment_allow: BTreeSet<String>,
     pub task_environment_allow: BTreeSet<String>,
     pub codex_home: PathBuf,
+    pub trusted_path: Vec<PathBuf>,
     pub private_temp_relative_root: PathBuf,
 }
 
@@ -979,6 +980,7 @@ pub fn resolve_project_policy(
         agent_environment_allow,
         task_environment_allow,
         codex_home: global.codex_home.clone(),
+        trusted_path: global.trusted_path.clone(),
         private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
     })
 }

@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod db;
 pub mod detect;
 pub mod diagnostics;
+pub mod environment;
 pub mod error;
 pub mod execution_policy;
 pub mod events;

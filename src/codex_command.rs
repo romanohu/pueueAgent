@@ -14,6 +14,7 @@ use std::{
 use crate::{
     codex_session,
     config::AgentConfig,
+    environment::{is_auth_name, shell_baseline_names},
     execution_policy::{
         AgentKind, NetworkMode, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
         ResolvedProjectExecutionPolicy,
@@ -276,7 +277,12 @@ fn network_mode(network: NetworkMode) -> &'static str {
 }
 
 fn environment_filters(task_allow: &BTreeSet<String>) -> Result<String, PolicyViolation> {
-    let names = task_allow.iter().collect::<BTreeSet<_>>();
+    let mut names = shell_baseline_names()
+        .iter()
+        .copied()
+        .filter(|name| !is_auth_name(name))
+        .collect::<BTreeSet<_>>();
+    names.extend(task_allow.iter().map(String::as_str));
     let mut entries = Vec::new();
     for name in names {
         if is_auth_name(name) {
@@ -301,16 +307,6 @@ fn valid_environment_name(name: &str) -> bool {
     (first == '_' || first.is_ascii_alphabetic())
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
         && name.len() <= 128
-}
-
-fn is_auth_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.contains("PRIVATE_KEY")
-        || upper.ends_with("_API_KEY")
-        || upper == "CODEX_HOME"
 }
 
 fn toml_quote(value: &str) -> String {
