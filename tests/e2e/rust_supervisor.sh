@@ -180,7 +180,6 @@ $context_session_line
 
 [check]
 interval_minutes = 1
-deep_check_every = 100
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 4096

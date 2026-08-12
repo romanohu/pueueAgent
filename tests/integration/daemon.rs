@@ -146,7 +146,6 @@ max_retries = 1
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 4096

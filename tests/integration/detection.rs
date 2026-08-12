@@ -91,7 +91,6 @@ impl Harness {
 fn check_config(log_tail_bytes: u32) -> CheckConfig {
     CheckConfig {
         interval_minutes: 1,
-        deep_check_every: 3,
         deep_check_interval_minutes: 0,
         stall_minutes: 5,
         log_tail_bytes,

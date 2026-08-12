@@ -31,7 +31,6 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckConfig {
     pub interval_minutes: u32,
-    pub deep_check_every: u32,
     pub deep_check_interval_minutes: u32,
     pub stall_minutes: u32,
     pub log_tail_bytes: u32,
@@ -221,7 +220,6 @@ impl RawAgentContextConfig {
 #[serde(default, deny_unknown_fields)]
 struct RawCheckConfig {
     interval_minutes: i64,
-    deep_check_every: i64,
     deep_check_interval_minutes: i64,
     stall_minutes: i64,
     #[serde(default = "default_log_tail_bytes")]
@@ -235,7 +233,6 @@ impl RawCheckConfig {
     fn validate(self) -> Result<CheckConfig, AppError> {
         Ok(CheckConfig {
             interval_minutes: positive(self.interval_minutes, "check.interval_minutes")?,
-            deep_check_every: positive(self.deep_check_every, "check.deep_check_every")?,
             deep_check_interval_minutes: non_negative(
                 self.deep_check_interval_minutes,
                 "check.deep_check_interval_minutes",

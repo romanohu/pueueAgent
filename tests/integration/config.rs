@@ -31,7 +31,6 @@ max_retries = 2
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 16384
@@ -211,15 +210,6 @@ fn zero_agent_timeout_is_rejected() {
 }
 
 #[test]
-fn zero_deep_check_frequency_is_rejected() {
-    let config = valid_config().replace("deep_check_every = 6", "deep_check_every = 0");
-
-    let error = load_config(config).unwrap_err();
-
-    assert!(error.to_string().contains("check.deep_check_every"));
-}
-
-#[test]
 fn negative_deep_check_interval_is_rejected() {
     let config = valid_config().replace(
         "deep_check_interval_minutes = 0",
@@ -234,29 +224,48 @@ fn negative_deep_check_interval_is_rejected() {
 }
 
 #[test]
-fn deep_check_interval_is_opt_in_and_legacy_frequency_does_not_enable_it() {
-    let disabled = load_config(valid_config()).unwrap();
-    assert_eq!(disabled.check.deep_check_interval_minutes, 0);
-    assert_eq!(disabled.check.deep_check_every, 6);
+fn zero_deep_check_interval_is_disabled() {
+    let config = load_config(valid_config()).unwrap();
 
-    let enabled = load_config(
-        valid_config().replace("deep_check_interval_minutes = 0", "deep_check_interval_minutes = 30"),
-    )
-    .unwrap();
-    assert_eq!(enabled.check.deep_check_interval_minutes, 30);
+    assert_eq!(config.check.deep_check_interval_minutes, 0);
 }
 
 #[test]
-fn periodic_deep_check_template_and_readme_explain_opt_in_health_records() {
+fn positive_deep_check_interval_is_opt_in() {
+    let config = load_config(
+        valid_config().replace(
+            "deep_check_interval_minutes = 0",
+            "deep_check_interval_minutes = 30",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(config.check.deep_check_interval_minutes, 30);
+}
+
+#[test]
+fn unknown_check_key_is_rejected() {
+    let config = valid_config().replace(
+        "stall_minutes = 30",
+        "stall_minutes = 30\nunknown_check_key = 1",
+    );
+
+    let error = load_config(config).unwrap_err();
+
+    assert!(error.to_string().contains("config.toml"));
+}
+
+#[test]
+fn generated_template_loads_with_current_check_schema() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let template = fs::read_to_string(root.join("templates/config.toml")).unwrap();
-    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    let template = template
+        .replace("{{PROJECT_ID}}", "project-template-1234567890")
+        .replace("{{PUEUE_GROUP}}", "pa-template-123456");
 
-    assert!(template.contains("deep_check_interval_minutes = 0"));
-    assert!(template.contains("legacy"));
-    assert!(readme.contains("deep_check_interval_minutes"));
-    assert!(readme.contains("`0` は無効"));
-    assert!(readme.contains("正常な進行を `STATE.md`"));
+    let config = load_config(template).unwrap();
+
+    assert_eq!(config.check.deep_check_interval_minutes, 0);
 }
 
 #[test]

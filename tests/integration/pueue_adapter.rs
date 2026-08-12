@@ -62,7 +62,6 @@ max_retries = 2
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 extra_log_paths = []

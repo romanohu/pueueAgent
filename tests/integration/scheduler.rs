@@ -73,7 +73,6 @@ max_retries = 2
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 1024
@@ -252,7 +251,6 @@ max_retries = 2
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 1024
@@ -1102,7 +1100,6 @@ mode = "resume"
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 1024
@@ -1513,7 +1510,6 @@ mode = "resume"
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 1024
@@ -1969,7 +1965,6 @@ max_retries = 2
 
 [check]
 interval_minutes = 10
-deep_check_every = 6
 deep_check_interval_minutes = 0
 stall_minutes = 30
 log_tail_bytes = 1024

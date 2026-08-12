@@ -59,7 +59,6 @@ max_retries = 0
 
 [check]
 interval_minutes = 1
-deep_check_every = 1
 deep_check_interval_minutes = {interval_minutes}
 stall_minutes = 1
 log_tail_bytes = 1024
