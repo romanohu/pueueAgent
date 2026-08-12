@@ -172,3 +172,204 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     }
     hash
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::LogSnapshot;
+    use crate::{
+        execution_policy::{
+            LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail,
+        },
+        project_logs::{
+            create_gate_marker, ensure_agent_log_dir, inspect_existing_agent_log,
+            inspect_gate_marker, open_agent_log, ProjectRootLogReader,
+        },
+        AppError,
+    };
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::{Path, PathBuf},
+    };
+
+    fn assert_log_unsafe(error: AppError, reason: LogUnsafeReason) {
+        assert!(matches!(
+            &error,
+            AppError::PolicyViolation {
+                violation: PolicyViolation {
+                    code: PolicyViolationCode::LogUnsafe,
+                    detail: PolicyViolationDetail::LogUnsafe(actual),
+                    ..
+                }
+            } if *actual == reason
+        ), "unexpected error: {error:?}");
+    }
+
+    #[test]
+    fn secure_agent_log_creation_is_owner_only_regular_and_offset_neutral() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let relative = Path::new("agent.log");
+
+        let opened = open_agent_log(&reader, relative).unwrap();
+        assert_eq!(opened.path(), relative);
+        let metadata = opened.file().metadata().unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o077, 0);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+
+        fs::write(temp.path().join(relative), b"0123456789abcdef").unwrap();
+        let clone = opened.try_clone().unwrap();
+        let snapshot = LogSnapshot::read_tail_from_file(&clone, 4).unwrap();
+        assert_eq!(snapshot.evidence, "cdef");
+
+        fs::rename(temp.path().join(relative), temp.path().join("moved.log")).unwrap();
+        fs::write(temp.path().join(relative), b"replacement").unwrap();
+        let stable = LogSnapshot::read_tail_from_file(&opened.file(), 16).unwrap();
+        assert_eq!(stable.evidence, "0123456789abcdef");
+    }
+
+    #[test]
+    fn secure_agent_log_rejects_weak_directory_and_symlink_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let weak = temp.path().join("weak.log");
+        fs::write(&weak, b"x").unwrap();
+        fs::set_permissions(&weak, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_log_unsafe(
+            open_agent_log(&reader, Path::new("weak.log")).unwrap_err(),
+            LogUnsafeReason::WeakPermissions,
+        );
+
+        let directory = temp.path().join("directory.log");
+        fs::create_dir(&directory).unwrap();
+        assert_log_unsafe(
+            open_agent_log(&reader, Path::new("directory.log")).unwrap_err(),
+            LogUnsafeReason::Directory,
+        );
+
+        let outside = temp.path().join("outside.log");
+        fs::write(&outside, b"outside").unwrap();
+        let link = temp.path().join("link.log");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_log_unsafe(
+            open_agent_log(&reader, Path::new("link.log")).unwrap_err(),
+            LogUnsafeReason::Symlink,
+        );
+    }
+
+    #[test]
+    fn secure_agent_log_directory_is_fixed_owner_only_and_no_follow() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        ensure_agent_log_dir(&reader).unwrap();
+        for relative in [Path::new(".pueue-agent"), Path::new(".pueue-agent/logs")] {
+            let metadata = fs::symlink_metadata(temp.path().join(relative)).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.mode() & 0o077, 0);
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+
+        let weak_root = tempfile::tempdir().unwrap();
+        fs::create_dir(weak_root.path().join(".pueue-agent")).unwrap();
+        fs::set_permissions(
+            weak_root.path().join(".pueue-agent"),
+            fs::Permissions::from_mode(0o770),
+        )
+        .unwrap();
+        let weak_reader = ProjectRootLogReader::open(weak_root.path()).unwrap();
+        assert_log_unsafe(ensure_agent_log_dir(&weak_reader).unwrap_err(), LogUnsafeReason::WeakPermissions);
+
+        let link_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), link_root.path().join(".pueue-agent")).unwrap();
+        let link_reader = ProjectRootLogReader::open(link_root.path()).unwrap();
+        assert_log_unsafe(ensure_agent_log_dir(&link_reader).unwrap_err(), LogUnsafeReason::Symlink);
+    }
+
+    #[test]
+    fn gate_marker_is_exclusive_durable_exact_and_no_follow() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        ensure_agent_log_dir(&reader).unwrap();
+        let relative = Path::new(".pueue-agent/logs/agent.log.gate-started");
+
+        let created = create_gate_marker(&reader, relative).unwrap();
+        let marker = temp.path().join(relative);
+        let metadata = fs::symlink_metadata(&marker).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o077, 0);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(inspect_gate_marker(&reader, relative).unwrap(), Some(created));
+        assert!(create_gate_marker(&reader, relative).is_err());
+
+        fs::write(&marker, b"authorized\nextra").unwrap();
+        assert_log_unsafe(
+            inspect_gate_marker(&reader, relative).unwrap_err(),
+            LogUnsafeReason::InvalidContents,
+        );
+
+        fs::remove_file(&marker).unwrap();
+        let outside = temp.path().join("outside-marker");
+        fs::write(&outside, b"authorized\n").unwrap();
+        std::os::unix::fs::symlink(&outside, &marker).unwrap();
+        assert_log_unsafe(
+            inspect_gate_marker(&reader, relative).unwrap_err(),
+            LogUnsafeReason::Symlink,
+        );
+    }
+
+    #[test]
+    fn marker_inspection_distinguishes_missing_and_unsafe_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        ensure_agent_log_dir(&reader).unwrap();
+        let relative = Path::new(".pueue-agent/logs/missing.gate-started");
+        assert_eq!(inspect_gate_marker(&reader, relative).unwrap(), None);
+        assert!(!temp.path().join(relative).exists());
+
+        let invalid = Path::new(".pueue-agent/logs/invalid.gate-started");
+        fs::write(temp.path().join(invalid), b"authorized\n").unwrap();
+        fs::set_permissions(temp.path().join(invalid), fs::Permissions::from_mode(0o640)).unwrap();
+        assert_log_unsafe(inspect_gate_marker(&reader, invalid).unwrap_err(), LogUnsafeReason::WeakPermissions);
+    }
+
+    #[test]
+    fn inspect_existing_agent_log_does_not_create_or_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        let missing = Path::new("missing.log");
+        assert_log_unsafe(
+            inspect_existing_agent_log(&reader, missing).unwrap_err(),
+            LogUnsafeReason::Missing,
+        );
+        assert!(!temp.path().join(missing).exists());
+
+        let sentinel = Path::new("sentinel.log");
+        fs::write(temp.path().join(sentinel), b"must never be read\n").unwrap();
+        fs::set_permissions(temp.path().join(sentinel), fs::Permissions::from_mode(0o600)).unwrap();
+        let identity = inspect_existing_agent_log(&reader, sentinel).unwrap();
+        let metadata = fs::metadata(temp.path().join(sentinel)).unwrap();
+        assert_eq!(identity.device, metadata.dev());
+        assert_eq!(identity.inode, metadata.ino());
+        assert_eq!(identity.owner, metadata.uid());
+        assert_eq!(identity.mode, metadata.mode());
+    }
+
+    #[test]
+    fn relative_log_paths_reject_ambiguous_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader = ProjectRootLogReader::open(temp.path()).unwrap();
+        for (path, reason) in [
+            (PathBuf::new(), LogUnsafeReason::EmptyPath),
+            (PathBuf::from("."), LogUnsafeReason::CurDir),
+            (PathBuf::from(".."), LogUnsafeReason::ParentTraversal),
+            (PathBuf::from("/tmp/log"), LogUnsafeReason::AbsolutePath),
+        ] {
+            assert_log_unsafe(open_agent_log(&reader, &path).unwrap_err(), reason);
+        }
+    }
+}

@@ -21,6 +21,7 @@ pub mod output;
 pub mod paths;
 pub mod periodic;
 pub mod project;
+pub mod project_logs;
 pub mod pueue;
 pub mod reconcile;
 pub mod retry;
