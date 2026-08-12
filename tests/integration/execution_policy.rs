@@ -342,10 +342,111 @@ fn custom_agent_requires_exact_service_enrollment_and_absolute_canonical_path() 
         })
     ));
 
+    let traversal = custom
+        .parent()
+        .unwrap()
+        .join("..")
+        .join("trusted-bin")
+        .join(custom.file_name().unwrap());
+    let traversal = custom_config(
+        "project-a",
+        &traversal.to_string_lossy(),
+        NetworkMode::Enabled,
+    );
+    assert!(matches!(
+        resolve_project_policy(&global, &project, &traversal),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::CustomAgentNotEnrolled,
+            ..
+        })
+    ));
+
     let exact = custom_config("project-a", &custom.to_string_lossy(), NetworkMode::Enabled);
     let resolved = resolve_project_policy(&global, &project, &exact).unwrap();
     assert_eq!(resolved.agent_kind, AgentKind::Custom);
     assert_eq!(resolved.agent_anchor.canonical_path, custom);
+
+    fs::rename(&custom, h.path("custom-agent-old")).unwrap();
+    fs::write(&custom, b"replacement").unwrap();
+    secure_executable(&custom);
+    assert!(matches!(
+        resolved.agent_anchor.verify_identity(),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::AnchorReplaced,
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_agent_symlink_alias_is_not_an_exact_enrollment() {
+    let h = PolicyHarness::new();
+    let custom = h.trusted_bin.join("custom-agent");
+    let alias = h.trusted_bin.join("custom-agent-alias");
+    fs::write(&custom, b"custom").unwrap();
+    secure_executable(&custom);
+    std::os::unix::fs::symlink(&custom, &alias).unwrap();
+
+    fs::write(
+        h.policy(),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[defaults]\nnetwork = \"enabled\"\n\n[executables]\ncodex = {:?}\npueue = {:?}\n\n[projects.\"project-a\"]\ncustom_agent = {:?}\n",
+            h.trusted_bin.display().to_string(),
+            h.codex.display().to_string(),
+            h.pueue.display().to_string(),
+            custom.display().to_string(),
+        ),
+    )
+    .unwrap();
+    secure_file(&h.policy());
+    let global = load_existing_policy(&h.input()).unwrap();
+    let project = h.project("project-a");
+    let config = custom_config("project-a", &alias.to_string_lossy(), NetworkMode::Enabled);
+
+    assert!(matches!(
+        resolve_project_policy(&global, &project, &config),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::CustomAgentNotEnrolled,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn custom_agent_inside_current_project_root_is_rejected_even_when_root_is_not_in_inventory() {
+    let h = PolicyHarness::new();
+    let project_root = h.path("unregistered-project");
+    fs::create_dir(&project_root).unwrap();
+    secure_directory(&project_root);
+    let custom = project_root.join("custom-agent");
+    fs::write(&custom, b"custom").unwrap();
+    secure_executable(&custom);
+
+    fs::write(
+        h.policy(),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[defaults]\nnetwork = \"enabled\"\n\n[executables]\ncodex = {:?}\npueue = {:?}\n\n[projects.\"project-a\"]\ncustom_agent = {:?}\n",
+            h.trusted_bin.display().to_string(),
+            h.codex.display().to_string(),
+            h.pueue.display().to_string(),
+            custom.display().to_string(),
+        ),
+    )
+    .unwrap();
+    secure_file(&h.policy());
+    let global = load_existing_policy(&h.input()).unwrap();
+    let mut project = h.project("project-a");
+    project.root_path = project_root;
+    let config = custom_config("project-a", &custom.to_string_lossy(), NetworkMode::Enabled);
+
+    assert!(matches!(
+        resolve_project_policy(&global, &project, &config),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::ProjectRootExecutable,
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -937,7 +937,9 @@ pub fn resolve_project_policy(
                 PolicyViolationStage::PreBinding,
             ));
         }
-        if inside_any_root(configured_path, &global.project_roots) {
+        if inside_any_root(configured_path, &global.project_roots)
+            || configured_path.starts_with(&root_anchor.canonical_path)
+        {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::ProjectRootExecutable,
                 PolicyViolationStage::PreBinding,
