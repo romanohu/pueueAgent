@@ -135,7 +135,7 @@ pub fn resolve_latest_owned_session(
 
     for store_name in SESSION_STORES {
         let store = codex_home.join(store_name);
-        match fs::metadata(&store) {
+        match fs::symlink_metadata(&store) {
             Ok(metadata) if metadata.is_dir() => collect_latest_candidates(
                 &store,
                 0,
@@ -215,7 +215,7 @@ fn collect_latest_candidates(
         if !canonical_cwd.starts_with(canonical_project_root) {
             continue;
         }
-        let Ok(file_metadata) = fs::metadata(&path) else {
+        let Ok(file_metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
         let Ok(modified) = file_metadata.modified() else {

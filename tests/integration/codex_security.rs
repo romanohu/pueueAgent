@@ -112,6 +112,33 @@ fn latest_without_owned_candidate_is_missing_and_duplicate_id_is_not_owned() {
     assert_eq!(error.code, PolicyViolationCode::SessionNotOwned);
 }
 
+#[cfg(unix)]
+#[test]
+fn latest_rejects_symlinked_session_store() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    let outside_store = harness._temp.path().join("outside-sessions");
+    fs::create_dir_all(&outside_store).unwrap();
+    fs::write(
+        outside_store.join(format!(
+            "rollout-{}.jsonl",
+            harness.id("old")
+        )),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":{:?}}}}}\n",
+            harness.id("old"),
+            harness.root.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::remove_dir(harness.home.join("sessions")).unwrap();
+    symlink(&outside_store, harness.home.join("sessions")).unwrap();
+
+    let error = resolve_latest_owned_session(&harness.home, &harness.root).unwrap_err();
+    assert_eq!(error.code, PolicyViolationCode::SessionNotOwned);
+}
+
 #[test]
 fn latest_chooses_verified_same_project_and_never_last_or_fresh() {
     let harness = Harness::new();
