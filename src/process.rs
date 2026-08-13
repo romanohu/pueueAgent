@@ -5,7 +5,11 @@
 //! pipe.  Keeping the codec separate from launch code makes it possible to
 //! validate the untrusted byte stream before any target descriptor is used.
 
-use std::{ffi::{OsStr, OsString}, fmt};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt,
+    ops::BitOr,
+};
 
 use crate::execution_policy::ExecutableIdentity;
 
@@ -46,9 +50,10 @@ const FLAG_PROCESS_GROUP: u16 = 1 << 3;
 const FIELD_ARGV: u8 = 1;
 const FIELD_ENV: u8 = 2;
 const FIELD_TARGET_IDENTITY: u8 = 3;
-const FIELD_PROJECT_ROOT_IDENTITY: u8 = 4;
-const FIELD_AGENT_LOG_IDENTITY: u8 = 5;
-const FIELD_PUEUE_CONFIG_IDENTITY: u8 = 6;
+const FIELD_CWD: u8 = 4;
+const FIELD_PROJECT_ROOT_IDENTITY: u8 = 5;
+const FIELD_AGENT_LOG_IDENTITY: u8 = 6;
+const FIELD_PUEUE_CONFIG_IDENTITY: u8 = 7;
 const IDENTITY_SIZE: usize = 8 + 8 + 4 + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,21 +140,48 @@ impl LaunchFlags {
 
     pub const fn bits(self) -> u16 { self.0 }
     pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
+    pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
     fn from_bits(bits: u16) -> Result<Self, CodecError> {
         if bits & !KNOWN_FLAGS != 0 { Err(CodecError::UnknownFlags) } else { Ok(Self(bits)) }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl BitOr for LaunchFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.union(rhs)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControlFrame {
     pub mode: LaunchMode,
     pub flags: LaunchFlags,
     pub argv: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
+    pub cwd: Option<OsString>,
     pub target_identity: ExecutableIdentity,
     pub project_root_identity: Option<ExecutableIdentity>,
     pub agent_log_identity: Option<ExecutableIdentity>,
     pub pueue_config_identity: Option<ExecutableIdentity>,
+}
+
+impl fmt::Debug for ControlFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlFrame")
+            .field("mode", &self.mode)
+            .field("flags", &self.flags)
+            .field("argv_count", &self.argv.len())
+            .field("environment_count", &self.environment.len())
+            .field("cwd_present", &self.cwd.is_some())
+            .field("target_identity_present", &true)
+            .field("project_root_identity_present", &self.project_root_identity.is_some())
+            .field("agent_log_identity_present", &self.agent_log_identity.is_some())
+            .field("pueue_config_identity_present", &self.pueue_config_identity.is_some())
+            .finish()
+    }
 }
 
 impl ControlFrame {
@@ -177,8 +209,11 @@ pub enum CodecError {
     DuplicateField(u8),
     MissingField(u8),
     UnexpectedField(u8),
+    NonIncreasingFieldOrder,
     TrailingBytes,
     InvalidIdentity,
+    MissingProcessGroup,
+    TooManyFields,
 }
 
 impl fmt::Display for CodecError {
@@ -203,8 +238,11 @@ impl fmt::Display for CodecError {
             DuplicateField(_) => "duplicate control frame field",
             MissingField(_) => "missing control frame field",
             UnexpectedField(_) => "unexpected control frame field",
+            NonIncreasingFieldOrder => "control frame fields are not in canonical order",
             TrailingBytes => "trailing control frame bytes",
             InvalidIdentity => "invalid identity field",
+            MissingProcessGroup => "process-group flag is required",
+            TooManyFields => "too many control frame fields",
         };
         formatter.write_str(text)
     }
@@ -214,35 +252,47 @@ impl std::error::Error for CodecError {}
 
 pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError> {
     validate_frame_shape(frame)?;
-    let mut payload = Vec::new();
-    let mut fields = Vec::new();
-    fields.push((FIELD_ARGV, encode_argv(&frame.argv)?));
-    fields.push((FIELD_ENV, encode_environment(&frame.environment)?));
-    fields.push((FIELD_TARGET_IDENTITY, encode_identity(&frame.target_identity)));
-    if let Some(identity) = frame.project_root_identity {
-        fields.push((FIELD_PROJECT_ROOT_IDENTITY, encode_identity(&identity)));
+    let argv_len = argv_encoded_len(&frame.argv)?;
+    let environment_len = environment_encoded_len(&frame.environment)?;
+    let cwd_len = frame.cwd.as_ref().map(|cwd| leaf_encoded_len(cwd)).transpose()?.unwrap_or(0);
+    let field_count = 3
+        + usize::from(frame.cwd.is_some())
+        + usize::from(frame.project_root_identity.is_some())
+        + usize::from(frame.agent_log_identity.is_some())
+        + usize::from(frame.pueue_config_identity.is_some());
+    let mut payload_len = 4usize;
+    payload_len = payload_len.checked_add(encoded_field_size(argv_len))
+        .and_then(|value| value.checked_add(encoded_field_size(environment_len)))
+        .and_then(|value| value.checked_add(encoded_field_size(IDENTITY_SIZE)))
+        .ok_or(CodecError::LengthOverflow)?;
+    if frame.cwd.is_some() { payload_len = payload_len.checked_add(encoded_field_size(cwd_len)).ok_or(CodecError::LengthOverflow)?; }
+    for present in [frame.project_root_identity.is_some(), frame.agent_log_identity.is_some(), frame.pueue_config_identity.is_some()] {
+        if present { payload_len = payload_len.checked_add(encoded_field_size(IDENTITY_SIZE)).ok_or(CodecError::LengthOverflow)?; }
     }
-    if let Some(identity) = frame.agent_log_identity {
-        fields.push((FIELD_AGENT_LOG_IDENTITY, encode_identity(&identity)));
-    }
-    if let Some(identity) = frame.pueue_config_identity {
-        fields.push((FIELD_PUEUE_CONFIG_IDENTITY, encode_identity(&identity)));
-    }
-    push_u32(&mut payload, fields.len() as u32);
-    for (kind, body) in fields {
-        payload.push(kind);
-        push_u32(&mut payload, body.len() as u32);
-        payload.extend_from_slice(&body);
-    }
-    let total = HEADER_SIZE.checked_add(payload.len()).ok_or(CodecError::LengthOverflow)?;
+    let total = HEADER_SIZE.checked_add(payload_len).ok_or(CodecError::LengthOverflow)?;
     if total > MAX_FRAME_SIZE { return Err(CodecError::FrameTooLarge); }
     let mut output = Vec::with_capacity(total);
     output.extend_from_slice(b"PAEX");
     output.push(1);
     output.push(frame.mode as u8);
     push_u16(&mut output, frame.flags.bits());
-    push_u32(&mut output, payload.len() as u32);
-    output.extend_from_slice(&payload);
+    push_u32(&mut output, payload_len as u32);
+    push_u32(&mut output, field_count as u32);
+    append_argv_field(&mut output, &frame.argv, argv_len)?;
+    append_environment_field(&mut output, &frame.environment, environment_len)?;
+    append_identity_field(&mut output, FIELD_TARGET_IDENTITY, &frame.target_identity);
+    if let Some(cwd) = &frame.cwd {
+        append_os_field(&mut output, FIELD_CWD, cwd)?;
+    }
+    if let Some(identity) = frame.project_root_identity {
+        append_identity_field(&mut output, FIELD_PROJECT_ROOT_IDENTITY, &identity);
+    }
+    if let Some(identity) = frame.agent_log_identity {
+        append_identity_field(&mut output, FIELD_AGENT_LOG_IDENTITY, &identity);
+    }
+    if let Some(identity) = frame.pueue_config_identity {
+        append_identity_field(&mut output, FIELD_PUEUE_CONFIG_IDENTITY, &identity);
+    }
     Ok(output)
 }
 
@@ -259,21 +309,27 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     if bytes.len() > total { return Err(CodecError::TrailingBytes); }
     let mut cursor = Cursor::new(&bytes[HEADER_SIZE..total]);
     let field_count = cursor.u32()? as usize;
+    if field_count > 7 { return Err(CodecError::TooManyFields); }
     let mut argv = None;
     let mut environment = None;
     let mut target_identity = None;
+    let mut cwd = None;
     let mut project_root_identity = None;
     let mut agent_log_identity = None;
     let mut pueue_config_identity = None;
+    let mut previous_kind = 0;
     for _ in 0..field_count {
         let kind = cursor.u8()?;
+        if kind <= previous_kind { return Err(CodecError::NonIncreasingFieldOrder); }
+        previous_kind = kind;
         let length = cursor.u32()? as usize;
-        if length > MAX_FIELD_SIZE || length > cursor.remaining() { return Err(CodecError::FieldTooLarge); }
+        if length > cursor.remaining() { return Err(CodecError::Truncated); }
         let body = cursor.bytes(length)?;
         match kind {
             FIELD_ARGV => set_once(&mut argv, decode_argv(body), kind)?,
             FIELD_ENV => set_once(&mut environment, decode_environment(body), kind)?,
             FIELD_TARGET_IDENTITY => set_once(&mut target_identity, decode_identity(body), kind)?,
+            FIELD_CWD => set_once(&mut cwd, decode_os_field(body), kind)?,
             FIELD_PROJECT_ROOT_IDENTITY => set_once(&mut project_root_identity, decode_identity(body), kind)?,
             FIELD_AGENT_LOG_IDENTITY => set_once(&mut agent_log_identity, decode_identity(body), kind)?,
             FIELD_PUEUE_CONFIG_IDENTITY => set_once(&mut pueue_config_identity, decode_identity(body), kind)?,
@@ -287,6 +343,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
         argv: argv.ok_or(CodecError::MissingField(FIELD_ARGV))??,
         environment: environment.ok_or(CodecError::MissingField(FIELD_ENV))??,
         target_identity: target_identity.ok_or(CodecError::MissingField(FIELD_TARGET_IDENTITY))??,
+        cwd: cwd.transpose()?,
         project_root_identity: project_root_identity.transpose()?,
         agent_log_identity: agent_log_identity.transpose()?,
         pueue_config_identity: pueue_config_identity.transpose()?,
@@ -302,6 +359,19 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     let root = frame.flags.contains(LaunchFlags::PROJECT_ROOT);
     let log = frame.flags.contains(LaunchFlags::AGENT_LOG);
     let pueue = frame.flags.contains(LaunchFlags::PUEUE_CONFIG);
+    if !frame.flags.contains(LaunchFlags::PROCESS_GROUP) { return Err(CodecError::MissingProcessGroup); }
+    match frame.mode {
+        LaunchMode::Agent => {
+            if !root { return Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)); }
+            if !log { return Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)); }
+            if pueue { return Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY)); }
+        }
+        LaunchMode::Pueue => {
+            if !pueue { return Err(CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY)); }
+            if root { return Err(CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY)); }
+            if log { return Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY)); }
+        }
+    }
     if root != frame.project_root_identity.is_some() { return Err(if root { CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY) }); }
     if log != frame.agent_log_identity.is_some() { return Err(if log { CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY) }); }
     if pueue != frame.pueue_config_identity.is_some() { return Err(if pueue { CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY) }); }
@@ -316,14 +386,65 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
         if !names.insert(name_bytes.to_vec()) { return Err(CodecError::DuplicateEnvironmentName); }
     }
     for arg in &frame.argv { validate_field_bytes(arg)?; }
+    if let Some(cwd) = &frame.cwd { validate_field_bytes(cwd)?; }
     Ok(())
 }
 
-fn encode_argv(argv: &[OsString]) -> Result<Vec<u8>, CodecError> {
-    let mut bytes = Vec::new();
-    push_u32(&mut bytes, argv.len() as u32);
-    for value in argv { push_os_field(&mut bytes, value)?; }
-    Ok(bytes)
+fn leaf_encoded_len(value: &OsStr) -> Result<usize, CodecError> {
+    validate_field_bytes(value)?;
+    4usize.checked_add(os_bytes(value)?.len()).ok_or(CodecError::LengthOverflow)
+}
+
+fn argv_encoded_len(argv: &[OsString]) -> Result<usize, CodecError> {
+    let mut length = 4usize;
+    for value in argv { length = length.checked_add(leaf_encoded_len(value)?).ok_or(CodecError::LengthOverflow)?; }
+    Ok(length)
+}
+
+fn environment_encoded_len(environment: &[(OsString, OsString)]) -> Result<usize, CodecError> {
+    let mut length = 4usize;
+    for (name, value) in environment {
+        let name_len = leaf_encoded_len(name)?;
+        let value_len = leaf_encoded_len(value)?;
+        length = length.checked_add(name_len).and_then(|length| length.checked_add(value_len)).ok_or(CodecError::LengthOverflow)?;
+    }
+    Ok(length)
+}
+
+fn encoded_field_size(body_len: usize) -> usize { 1 + 4 + body_len }
+
+fn append_argv_field(output: &mut Vec<u8>, argv: &[OsString], body_len: usize) -> Result<(), CodecError> {
+    output.push(FIELD_ARGV);
+    push_u32(output, body_len as u32);
+    push_u32(output, argv.len() as u32);
+    for value in argv { push_os_field(output, value)?; }
+    Ok(())
+}
+
+fn append_environment_field(output: &mut Vec<u8>, environment: &[(OsString, OsString)], body_len: usize) -> Result<(), CodecError> {
+    output.push(FIELD_ENV);
+    push_u32(output, body_len as u32);
+    push_u32(output, environment.len() as u32);
+    for (name, value) in environment {
+        push_os_field(output, name)?;
+        push_os_field(output, value)?;
+    }
+    Ok(())
+}
+
+fn append_os_field(output: &mut Vec<u8>, kind: u8, value: &OsStr) -> Result<(), CodecError> {
+    output.push(kind);
+    push_u32(output, leaf_encoded_len(value)? as u32);
+    push_os_field(output, value)
+}
+
+fn append_identity_field(output: &mut Vec<u8>, kind: u8, identity: &ExecutableIdentity) {
+    output.push(kind);
+    push_u32(output, IDENTITY_SIZE as u32);
+    output.extend_from_slice(&identity.device.to_be_bytes());
+    output.extend_from_slice(&identity.inode.to_be_bytes());
+    output.extend_from_slice(&identity.owner.to_be_bytes());
+    output.extend_from_slice(&identity.mode.to_be_bytes());
 }
 
 fn decode_argv(bytes: &[u8]) -> Result<Vec<OsString>, CodecError> {
@@ -336,11 +457,11 @@ fn decode_argv(bytes: &[u8]) -> Result<Vec<OsString>, CodecError> {
     Ok(values)
 }
 
-fn encode_environment(environment: &[(OsString, OsString)]) -> Result<Vec<u8>, CodecError> {
-    let mut bytes = Vec::new();
-    push_u32(&mut bytes, environment.len() as u32);
-    for (name, value) in environment { push_os_field(&mut bytes, name)?; push_os_field(&mut bytes, value)?; }
-    Ok(bytes)
+fn decode_os_field(bytes: &[u8]) -> Result<OsString, CodecError> {
+    let mut cursor = Cursor::new(bytes);
+    let value = cursor.os_field()?;
+    cursor.finish()?;
+    Ok(value)
 }
 
 fn decode_environment(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, CodecError> {
@@ -362,15 +483,6 @@ fn decode_environment(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, CodecEr
     }
     cursor.finish()?;
     Ok(values)
-}
-
-fn encode_identity(identity: &ExecutableIdentity) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(IDENTITY_SIZE);
-    bytes.extend_from_slice(&identity.device.to_be_bytes());
-    bytes.extend_from_slice(&identity.inode.to_be_bytes());
-    bytes.extend_from_slice(&identity.owner.to_be_bytes());
-    bytes.extend_from_slice(&identity.mode.to_be_bytes());
-    bytes
 }
 
 fn decode_identity(bytes: &[u8]) -> Result<ExecutableIdentity, CodecError> {
@@ -449,12 +561,13 @@ mod tests {
     fn frame() -> ControlFrame {
         ControlFrame {
             mode: LaunchMode::Agent,
-            flags: LaunchFlags::PROJECT_ROOT,
+            flags: LaunchFlags::PROJECT_ROOT | LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP,
             argv: vec![OsString::from("codex"), OsString::from("prompt")],
             environment: vec![(OsString::from("LANG"), OsString::from("C"))],
+            cwd: Some(OsString::from("/trusted/project")),
             target_identity: identity(),
             project_root_identity: Some(identity()),
-            agent_log_identity: None,
+            agent_log_identity: Some(identity()),
             pueue_config_identity: None,
         }
     }
@@ -472,6 +585,7 @@ mod tests {
         let mut original = frame();
         original.argv = vec![OsString::from_vec(vec![b'a', 0xff, b'b'])];
         original.environment = vec![(OsString::from_vec(vec![b'K', 0xfe]), OsString::from_vec(vec![0xfd]))];
+        original.cwd = Some(OsString::from_vec(vec![b'/', 0xfc, b'c']));
         assert_eq!(ControlFrame::decode(&original.encode().unwrap()).unwrap(), original);
     }
 
@@ -485,11 +599,10 @@ mod tests {
         let mut trailing = encoded.clone(); trailing.push(0);
         assert_eq!(ControlFrame::decode(&trailing), Err(CodecError::TrailingBytes));
         let mut unknown = encoded.clone();
-        // The final field is the root identity. Replace its field id.
+        // Replace the first canonical field id with an unknown value.
         let field_count_offset = HEADER_SIZE;
-        assert_eq!(u32::from_be_bytes(unknown[field_count_offset..field_count_offset + 4].try_into().unwrap()), 4);
-        let mut offset = HEADER_SIZE + 4;
-        for _ in 0..2 { let length = u32::from_be_bytes(unknown[offset + 1..offset + 5].try_into().unwrap()) as usize; offset += 5 + length; }
+        assert_eq!(u32::from_be_bytes(unknown[field_count_offset..field_count_offset + 4].try_into().unwrap()), 6);
+        let offset = HEADER_SIZE + 4;
         unknown[offset] = 99;
         assert!(matches!(ControlFrame::decode(&unknown), Err(CodecError::UnknownField(99))));
     }
@@ -504,8 +617,12 @@ mod tests {
         assert_eq!(invalid_name.encode(), Err(CodecError::InvalidEnvironmentName));
         let mut too_many = frame(); too_many.argv = (0..=MAX_ARGV).map(|_| OsString::from("x")).collect();
         assert_eq!(too_many.encode(), Err(CodecError::TooManyArguments));
+        let mut too_many_env = frame(); too_many_env.environment = (0..=MAX_ENV).map(|index| (OsString::from(format!("K{index}")), OsString::from("v"))).collect();
+        assert_eq!(too_many_env.encode(), Err(CodecError::TooManyEnvironmentEntries));
         let mut too_long = frame(); too_long.argv = vec![OsString::from("x".repeat(MAX_FIELD_SIZE + 1))];
         assert_eq!(too_long.encode(), Err(CodecError::FieldTooLarge));
+        let mut bad_cwd = frame(); bad_cwd.cwd = Some(OsString::from("bad\0cwd"));
+        assert_eq!(bad_cwd.encode(), Err(CodecError::NulByte));
     }
 
     #[test]
@@ -528,11 +645,88 @@ mod tests {
     }
 
     #[test]
+    fn container_may_exceed_leaf_limit_but_frame_still_has_a_one_mib_cap() {
+        let mut aggregate = frame();
+        aggregate.argv = vec![OsString::from("x".repeat(40 * 1024)), OsString::from("y".repeat(40 * 1024))];
+        let encoded = aggregate.encode().unwrap();
+        assert!(encoded.len() > MAX_FIELD_SIZE);
+        assert_eq!(ControlFrame::decode(&encoded).unwrap(), aggregate);
+
+        let mut oversized = frame();
+        oversized.argv = (0..20).map(|_| OsString::from("z".repeat(MAX_FIELD_SIZE))).collect();
+        assert_eq!(oversized.encode(), Err(CodecError::FrameTooLarge));
+    }
+
+    #[test]
     fn optional_descriptor_flags_must_match_identity_fields() {
         let mut missing = frame(); missing.project_root_identity = None;
         assert_eq!(missing.encode(), Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)));
-        let mut unexpected = frame(); unexpected.flags = LaunchFlags::NONE;
-        assert_eq!(unexpected.encode(), Err(CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY)));
+        let mut unexpected = frame(); unexpected.flags = LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP;
+        assert_eq!(unexpected.encode(), Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)));
+    }
+
+    #[test]
+    fn mode_and_descriptor_matrix_is_closed() {
+        let mut agent = frame();
+        assert!(agent.encode().is_ok());
+        agent.flags = LaunchFlags::PROJECT_ROOT | LaunchFlags::PROCESS_GROUP;
+        assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)));
+        agent.flags = LaunchFlags::PROJECT_ROOT | LaunchFlags::AGENT_LOG | LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP;
+        assert_eq!(agent.encode(), Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY)));
+        agent.mode = LaunchMode::Pueue;
+        agent.flags = LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP;
+        agent.project_root_identity = None;
+        agent.agent_log_identity = None;
+        agent.pueue_config_identity = Some(identity());
+        assert!(agent.encode().is_ok());
+        agent.flags = LaunchFlags::PROCESS_GROUP;
+        assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY)));
+        agent.flags = LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROJECT_ROOT | LaunchFlags::PROCESS_GROUP;
+        assert_eq!(agent.encode(), Err(CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY)));
+        agent.flags = LaunchFlags::PUEUE_CONFIG | LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP;
+        assert_eq!(agent.encode(), Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY)));
+        agent.flags = LaunchFlags::PROJECT_ROOT | LaunchFlags::AGENT_LOG;
+        agent.mode = LaunchMode::Agent;
+        agent.project_root_identity = Some(identity());
+        agent.agent_log_identity = Some(identity());
+        agent.pueue_config_identity = None;
+        assert_eq!(agent.encode(), Err(CodecError::MissingProcessGroup));
+    }
+
+    #[test]
+    fn debug_is_redacted_to_shape_only() {
+        let mut value = frame();
+        value.argv = vec![OsString::from("secret-argv")];
+        value.environment = vec![(OsString::from("SECRET_NAME"), OsString::from("secret-value"))];
+        value.cwd = Some(OsString::from("secret-cwd"));
+        let debug = format!("{value:?}");
+        assert!(debug.contains("argv_count"));
+        assert!(debug.contains("environment_count"));
+        assert!(!debug.contains("secret-argv"));
+        assert!(!debug.contains("SECRET_NAME"));
+        assert!(!debug.contains("secret-value"));
+        assert!(!debug.contains("secret-cwd"));
+    }
+
+    #[test]
+    fn decoder_rejects_nul_and_duplicate_environment_names() {
+        let mut nul = Vec::new();
+        push_u32(&mut nul, 1);
+        push_u32(&mut nul, 1);
+        nul.push(b'A');
+        let nul_value = b"bad\0value";
+        push_u32(&mut nul, nul_value.len() as u32);
+        nul.extend_from_slice(nul_value);
+        assert_eq!(decode_environment(&nul), Err(CodecError::NulByte));
+        let mut duplicate = Vec::new();
+        push_u32(&mut duplicate, 2);
+        for value in [b"one".as_slice(), b"two".as_slice()] {
+            push_u32(&mut duplicate, 1);
+            duplicate.push(b'A');
+            push_u32(&mut duplicate, value.len() as u32);
+            duplicate.extend_from_slice(value);
+        }
+        assert_eq!(decode_environment(&duplicate), Err(CodecError::DuplicateEnvironmentName));
     }
 
     #[test]
@@ -540,6 +734,12 @@ mod tests {
         let fds = FixedFdContract::standard();
         assert!(fds.is_standard());
         assert_eq!(fds.control, 3);
+        assert_eq!(fds.release, 4);
+        assert_eq!(fds.exec_status, 5);
+        assert_eq!(fds.target, 6);
+        assert_eq!(fds.project_root, 7);
+        assert_eq!(fds.agent_log, 8);
+        assert_eq!(fds.pueue_config, 9);
         assert_eq!(fds.release_ack, 10);
     }
 }
