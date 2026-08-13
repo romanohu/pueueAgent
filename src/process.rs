@@ -11,7 +11,7 @@ use std::{
     io::{Read, Write},
     ops::BitOr,
     sync::{Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::execution_policy::ExecutableIdentity;
@@ -306,26 +306,27 @@ pub(crate) struct InstalledBootstrap {
 #[cfg(unix)]
 static PROCESS_LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(unix)]
+pub(crate) struct ProcessLaunchGuard(MutexGuard<'static, ()>);
+
 /// Serialize descriptor creation that cannot atomically request CLOEXEC with
 /// every supervisor spawn adapter. Trusted supervisor code must hold this
 /// guard from before it creates inheritable process resources until after
 /// spawn returns. Third-party code running inside the trusted supervisor is
 /// outside the threat model.
 #[cfg(unix)]
-pub(crate) fn process_launch_guard() -> MutexGuard<'static, ()> {
-    PROCESS_LAUNCH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+pub(crate) fn process_launch_guard() -> Result<ProcessLaunchGuard, BootstrapError> {
+    PROCESS_LAUNCH_LOCK
+        .lock()
+        .map(ProcessLaunchGuard)
+        .map_err(|_| BootstrapError::BootstrapCorrupt)
 }
 
 #[cfg(unix)]
-pub(crate) fn bootstrap_socket_pair() -> Result<(OwnedFd, OwnedFd), BootstrapError> {
-    let guard = process_launch_guard();
-    bootstrap_socket_pair_with_guard(&guard)
-}
-
-#[cfg(unix)]
-pub(crate) fn bootstrap_socket_pair_with_guard(
-    _guard: &MutexGuard<'static, ()>,
+pub(crate) fn bootstrap_socket_pair(
+    guard: &ProcessLaunchGuard,
 ) -> Result<(OwnedFd, OwnedFd), BootstrapError> {
+    let _ = &guard.0;
     let mut sockets = [-1; 2];
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
@@ -381,12 +382,23 @@ pub(crate) fn send_bootstrap_packet(
     frame: &ControlFrame,
     rights: &[RawFd],
 ) -> Result<(), BootstrapError> {
+    send_bootstrap_packet_with_timeout(socket, frame, rights, BOOTSTRAP_IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn send_bootstrap_packet_with_timeout(
+    socket: RawFd,
+    frame: &ControlFrame,
+    rights: &[RawFd],
+    timeout: Duration,
+) -> Result<(), BootstrapError> {
+    let deadline = ProtocolDeadline::new(timeout)?;
     let bytes = frame.encode()?;
     if rights.len() != bootstrap_right_slots(frame)?.len() {
         return Err(BootstrapError::WrongRightCount);
     }
     let mut stream = mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket) });
-    stream.set_write_timeout(Some(BOOTSTRAP_IO_TIMEOUT))?;
+    deadline.set_write_timeout(&stream)?;
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: 1,
@@ -419,6 +431,7 @@ pub(crate) fn send_bootstrap_packet(
             rights_bytes,
         );
         loop {
+            deadline.set_write_timeout(&stream)?;
             let sent = libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL);
             if sent < 0 {
                 let error = io::Error::last_os_error();
@@ -431,7 +444,7 @@ pub(crate) fn send_bootstrap_packet(
     }
     // SAFETY: the caller owns `socket` for this operation; ManuallyDrop keeps
     // this borrowed wrapper from closing it.
-    stream.write_all(&bytes[1..])?;
+    write_all_before(&mut stream, &bytes[1..], &deadline)?;
     if unsafe { libc::shutdown(socket, libc::SHUT_WR) } < 0 {
         return Err(BootstrapError::Io(io::Error::last_os_error()));
     }
@@ -440,8 +453,17 @@ pub(crate) fn send_bootstrap_packet(
 
 #[cfg(unix)]
 pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket, BootstrapError> {
+    receive_bootstrap_packet_with_timeout(socket, BOOTSTRAP_IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn receive_bootstrap_packet_with_timeout(
+    socket: RawFd,
+    timeout: Duration,
+) -> Result<BootstrapPacket, BootstrapError> {
+    let deadline = ProtocolDeadline::new(timeout)?;
     let mut stream = mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket) });
-    stream.set_read_timeout(Some(BOOTSTRAP_IO_TIMEOUT))?;
+    deadline.set_read_timeout(&stream)?;
     let mut first = [0u8; 1];
     // One extra slot ensures an over-cardinality sender is observed rather
     // than silently accepted at the protocol maximum.
@@ -463,6 +485,7 @@ pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket,
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let recv_flags = 0;
     let received = loop {
+        deadline.set_read_timeout(&stream)?;
         let result = unsafe { libc::recvmsg(socket, &mut message, recv_flags) };
         if result < 0 {
             let error = io::Error::last_os_error();
@@ -528,15 +551,16 @@ pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket,
     }
     let mut header = [0u8; HEADER_SIZE];
     header[0] = first[0];
-    stream.read_exact(&mut header[1..])?;
+    read_exact_before(&mut stream, &mut header[1..], &deadline)?;
     if header[..4] != *b"PAEX" { return Err(BootstrapError::Codec(CodecError::InvalidMagic)); }
     let payload_len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
     let total = HEADER_SIZE.checked_add(payload_len).ok_or(CodecError::LengthOverflow)?;
     if total > MAX_FRAME_SIZE { return Err(BootstrapError::Codec(CodecError::FrameTooLarge)); }
     let mut bytes = vec![0u8; total];
     bytes[..HEADER_SIZE].copy_from_slice(&header);
-    stream.read_exact(&mut bytes[HEADER_SIZE..])?;
+    read_exact_before(&mut stream, &mut bytes[HEADER_SIZE..], &deadline)?;
     let mut trailing = [0u8; 1];
+    deadline.set_read_timeout(&stream)?;
     if stream.read(&mut trailing)? != 0 {
         return Err(BootstrapError::Codec(CodecError::TrailingBytes));
     }
@@ -545,6 +569,64 @@ pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket,
         return Err(BootstrapError::WrongRightCount);
     }
     Ok(BootstrapPacket { frame, rights })
+}
+
+#[cfg(unix)]
+struct ProtocolDeadline { at: Instant }
+
+#[cfg(unix)]
+impl ProtocolDeadline {
+    fn new(timeout: Duration) -> Result<Self, BootstrapError> {
+        Instant::now().checked_add(timeout).map(|at| Self { at })
+            .ok_or(BootstrapError::BootstrapCorrupt)
+    }
+    fn remaining(&self) -> Result<Duration, BootstrapError> {
+        self.at.checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| BootstrapError::Io(io::Error::new(io::ErrorKind::TimedOut, "bootstrap deadline elapsed")))
+    }
+    fn set_read_timeout(&self, stream: &std::os::unix::net::UnixStream) -> Result<(), BootstrapError> {
+        stream.set_read_timeout(Some(self.remaining()?)).map_err(BootstrapError::Io)
+    }
+    fn set_write_timeout(&self, stream: &std::os::unix::net::UnixStream) -> Result<(), BootstrapError> {
+        stream.set_write_timeout(Some(self.remaining()?)).map_err(BootstrapError::Io)
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_before(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut buffer: &mut [u8],
+    deadline: &ProtocolDeadline,
+) -> Result<(), BootstrapError> {
+    while !buffer.is_empty() {
+        deadline.set_read_timeout(stream)?;
+        match stream.read(buffer) {
+            Ok(0) => return Err(BootstrapError::TruncatedPacket),
+            Ok(count) => buffer = &mut buffer[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(BootstrapError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_before(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut buffer: &[u8],
+    deadline: &ProtocolDeadline,
+) -> Result<(), BootstrapError> {
+    while !buffer.is_empty() {
+        deadline.set_write_timeout(stream)?;
+        match stream.write(buffer) {
+            Ok(0) => return Err(BootstrapError::TruncatedPacket),
+            Ok(count) => buffer = &buffer[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(BootstrapError::Io(error)),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -565,20 +647,16 @@ fn install_bootstrap_fixed_map(
     control: OwnedFd,
     packet: BootstrapPacket,
 ) -> Result<InstalledBootstrap, BootstrapError> {
-    validate_distinct_pipe_roles(&packet)?;
-    let expected_slots = bootstrap_slots(&packet.frame)?;
-    let mut moved = Vec::with_capacity(expected_slots.len());
-    moved.push(ensure_above_fixed(control)?);
-    for right in packet.rights {
-        moved.push(ensure_above_fixed(right)?);
-    }
-    if moved.len() != expected_slots.len() {
-        return Err(BootstrapError::WrongRightCount);
-    }
-    for (slot, descriptor) in expected_slots.iter().copied().zip(&moved) {
-        validate_role(slot, descriptor.as_raw_fd(), &packet.frame)?;
-    }
-
+    let prepared = match preflight_bootstrap_fixed_map(control, packet) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Preflight owns every received/moved descriptor. It has returned,
+            // so those owners are dropped before the fixed range is closed.
+            close_fixed_map();
+            return Err(error);
+        }
+    };
+    let PreparedBootstrap { frame, expected_slots, moved } = prepared;
     for slot in CONTROL_FD..=RELEASE_ACK_FD {
         if !expected_slots.contains(&slot) { close_raw(slot); }
     }
@@ -586,13 +664,14 @@ fn install_bootstrap_fixed_map(
         if dup2_retry(descriptor.as_raw_fd(), slot).is_err()
             || set_close_on_exec(slot).is_err()
         {
+            drop(moved);
             close_fixed_map();
             return Err(BootstrapError::BootstrapCorrupt);
         }
     }
     drop(moved);
     for slot in &expected_slots {
-        if validate_role(*slot, *slot, &packet.frame).is_err() {
+        if validate_role(*slot, *slot, &frame).is_err() {
             close_fixed_map();
             return Err(BootstrapError::BootstrapCorrupt);
         }
@@ -602,7 +681,36 @@ fn install_bootstrap_fixed_map(
             return Err(BootstrapError::BootstrapCorrupt);
         }
     }
-    Ok(InstalledBootstrap { frame: packet.frame })
+    Ok(InstalledBootstrap { frame })
+}
+
+#[cfg(unix)]
+struct PreparedBootstrap {
+    frame: ControlFrame,
+    expected_slots: Vec<RawFd>,
+    moved: Vec<OwnedFd>,
+}
+
+#[cfg(unix)]
+fn preflight_bootstrap_fixed_map(
+    control: OwnedFd,
+    packet: BootstrapPacket,
+) -> Result<PreparedBootstrap, BootstrapError> {
+    validate_distinct_pipe_roles(&packet)?;
+    let expected_slots = bootstrap_slots(&packet.frame)?;
+    let frame = packet.frame;
+    let mut moved = Vec::with_capacity(expected_slots.len());
+    moved.push(ensure_above_fixed(control)?);
+    for right in packet.rights {
+        moved.push(ensure_above_fixed(right)?);
+    }
+    if moved.len() != expected_slots.len() {
+        return Err(BootstrapError::WrongRightCount);
+    }
+    for (slot, descriptor) in expected_slots.iter().copied().zip(&moved) {
+        validate_role(slot, descriptor.as_raw_fd(), &frame)?;
+    }
+    Ok(PreparedBootstrap { frame, expected_slots, moved })
 }
 
 #[cfg(unix)]
@@ -1288,7 +1396,8 @@ mod tests {
 
     #[cfg(unix)]
     fn socket_pair() -> (OwnedFd, OwnedFd) {
-        bootstrap_socket_pair().unwrap()
+        let guard = process_launch_guard().unwrap();
+        bootstrap_socket_pair(&guard).unwrap()
     }
 
     #[cfg(unix)]
@@ -1357,9 +1466,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stream_receiver_uses_one_absolute_deadline_during_trickle() {
+        let guard = process_launch_guard().unwrap();
+        let (sender, receiver) = bootstrap_socket_pair(&guard).unwrap();
+        drop(guard);
+        let mut owned = Vec::new();
+        for _ in 0..6 {
+            let (read, _write) = pipe_pair();
+            owned.push(read);
+        }
+        let raw: Vec<_> = owned.iter().map(AsRawFd::as_raw_fd).collect();
+        let bytes = frame().encode().unwrap();
+        let mut iov = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: 1 };
+        let rights_bytes = raw.len() * mem::size_of::<RawFd>();
+        let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(rights_bytes as _) } as usize];
+        let mut message: libc::msghdr = unsafe { mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len() as _;
+        unsafe {
+            let ancillary = libc::CMSG_FIRSTHDR(&message);
+            (*ancillary).cmsg_level = libc::SOL_SOCKET;
+            (*ancillary).cmsg_type = libc::SCM_RIGHTS;
+            (*ancillary).cmsg_len = libc::CMSG_LEN(rights_bytes as _) as _;
+            ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(ancillary), rights_bytes);
+            assert_eq!(libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_NOSIGNAL), 1);
+        }
+        let trickle = bytes[1..HEADER_SIZE].to_vec();
+        let writer = std::thread::spawn(move || {
+            let mut stream = std::os::unix::net::UnixStream::from(sender);
+            for byte in trickle {
+                std::thread::sleep(Duration::from_millis(15));
+                if stream.write_all(&[byte]).is_err() { break; }
+            }
+        });
+        let started = Instant::now();
+        assert!(receive_bootstrap_packet_with_timeout(
+            receiver.as_raw_fd(),
+            Duration::from_millis(40),
+        ).is_err());
+        assert!(started.elapsed() < Duration::from_millis(150));
+        drop(receiver);
+        writer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bootstrap_socket_is_stream_and_close_on_exec() {
-        let guard = process_launch_guard();
-        let (left, right) = bootstrap_socket_pair_with_guard(&guard).unwrap();
+        let guard = process_launch_guard().unwrap();
+        let (left, right) = bootstrap_socket_pair(&guard).unwrap();
         for descriptor in [left.as_raw_fd(), right.as_raw_fd()] {
             prove_close_on_exec(descriptor).unwrap();
             let mut socket_type = 0;
@@ -1436,6 +1592,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "internal failing bootstrap subprocess entry"]
+    fn bootstrap_failure_subprocess_helper() {
+        assert!(receive_and_install_bootstrap(libc::STDIN_FILENO).is_err());
+        for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
+            assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_install_failure_closes_map(frame: &ControlFrame, rights: &[RawFd]) {
+        let launch_guard = process_launch_guard().unwrap();
+        let (parent_socket, child_socket) = bootstrap_socket_pair(&launch_guard).unwrap();
+        let child_input = File::from(child_socket);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored", "--exact",
+                "process::tests::bootstrap_failure_subprocess_helper", "--nocapture",
+            ])
+            .stdin(Stdio::from(child_input))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        drop(launch_guard);
+        send_bootstrap_packet(parent_socket.as_raw_fd(), frame, rights).unwrap();
+        assert!(bounded_wait(&mut child).success());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn helper_installs_exact_fixed_map_without_changing_parent_fds() {
         let temporary = tempfile::tempdir().unwrap();
         let target_path = temporary.path().join("fixture-target");
@@ -1448,7 +1634,8 @@ mod tests {
         let (release_read, release_write) = pipe_pair();
         let (exec_read, exec_write) = pipe_pair();
         let (ack_read, ack_write) = pipe_pair();
-        let (parent_socket, child_socket) = socket_pair();
+        let launch_guard = process_launch_guard().unwrap();
+        let (parent_socket, child_socket) = bootstrap_socket_pair(&launch_guard).unwrap();
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
@@ -1478,10 +1665,8 @@ mod tests {
             .stdin(Stdio::from(child_input))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = {
-            let _launch_guard = process_launch_guard();
-            command.spawn().unwrap()
-        };
+        let mut child = command.spawn().unwrap();
+        drop(launch_guard);
         send_bootstrap_packet(parent_socket.as_raw_fd(), &launch, &rights).unwrap();
         let status = bounded_wait(&mut child);
         assert!(status.success());
@@ -1504,20 +1689,13 @@ mod tests {
         let (release_read, _release_write) = pipe_pair();
         let (_exec_read, exec_write) = pipe_pair();
         let (_ack_read, ack_write) = pipe_pair();
-        let (sender, receiver) = socket_pair();
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.target_identity.inode = launch.target_identity.inode.wrapping_add(1);
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         let rights = [release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd()];
-        send_bootstrap_packet(sender.as_raw_fd(), &launch, &rights).unwrap();
-        let packet = receive_bootstrap_packet(receiver.as_raw_fd()).unwrap();
-        let control = duplicate_above_fixed(receiver.as_raw_fd()).unwrap();
-        assert!(matches!(
-            install_bootstrap_fixed_map(control, packet),
-            Err(BootstrapError::IdentityMismatch)
-        ));
+        assert_install_failure_closes_map(&launch, &rights);
     }
 
     #[cfg(unix)]
@@ -1535,19 +1713,12 @@ mod tests {
         drop(release_write);
         let (_exec_read, exec_write) = pipe_pair();
         let (_ack_read, ack_write) = pipe_pair();
-        let (sender, receiver) = socket_pair();
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         let rights = [release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd()];
-        send_bootstrap_packet(sender.as_raw_fd(), &launch, &rights).unwrap();
-        let packet = receive_bootstrap_packet(receiver.as_raw_fd()).unwrap();
-        let control = duplicate_above_fixed(receiver.as_raw_fd()).unwrap();
-        assert!(matches!(
-            install_bootstrap_fixed_map(control, packet),
-            Err(BootstrapError::GateClosed)
-        ));
+        assert_install_failure_closes_map(&launch, &rights);
     }
 
     #[cfg(unix)]
@@ -1563,7 +1734,6 @@ mod tests {
             .open(temporary.path().join("agent.log")).unwrap();
         let (release_read, release_write) = pipe_pair();
         let (_exec_read, exec_write) = pipe_pair();
-        let (sender, receiver) = socket_pair();
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
@@ -1572,12 +1742,7 @@ mod tests {
             release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(),
             root.as_raw_fd(), log.as_raw_fd(), exec_write.as_raw_fd(),
         ];
-        send_bootstrap_packet(sender.as_raw_fd(), &launch, &rights).unwrap();
-        let packet = receive_bootstrap_packet(receiver.as_raw_fd()).unwrap();
-        assert!(matches!(
-            validate_distinct_pipe_roles(&packet),
-            Err(BootstrapError::AliasedPipeRoles)
-        ));
+        assert_install_failure_closes_map(&launch, &rights);
         drop(release_write);
     }
 
