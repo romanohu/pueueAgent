@@ -7,8 +7,7 @@ use pueue_agent::{
     AppError,
 };
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -27,7 +26,23 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(cli).await {
+    // The hidden helper must not initialize ordinary command state. It only
+    // consumes the fixed inherited bootstrap ABI.
+    if matches!(cli.command, Command::InternalLaunch) {
+        return match pueue_agent::process::run_internal_launch() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}", bounded_redacted_text(&error.render()));
@@ -38,6 +53,9 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
+        Command::InternalLaunch => Err(AppError::Runtime {
+            operation: "internal launch dispatch",
+        }),
         Command::Init(args) => commands::init(args),
         Command::Enable(args) => commands::enable(args).await,
         Command::Disable(args) => commands::disable(args).await,

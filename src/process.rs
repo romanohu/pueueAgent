@@ -21,11 +21,14 @@ use std::{
     io,
     mem,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
     },
     ptr,
 };
+
+#[cfg(unix)]
+use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
 
 #[cfg(unix)]
 pub type RawFd = std::os::fd::RawFd;
@@ -264,7 +267,7 @@ impl std::error::Error for CodecError {}
 
 #[cfg(unix)]
 #[derive(Debug)]
-pub(crate) enum BootstrapError {
+pub enum BootstrapError {
     Io(io::Error),
     Codec(CodecError),
     EmptyPacket,
@@ -277,6 +280,87 @@ pub(crate) enum BootstrapError {
     DescriptorNotCloseOnExec,
     BootstrapCorrupt,
     AliasedPipeRoles,
+}
+
+#[cfg(unix)]
+impl fmt::Display for BootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(_) => formatter.write_str("bootstrap I/O failed"),
+            Self::Codec(error) => write!(formatter, "bootstrap codec rejected input: {error}"),
+            Self::EmptyPacket => formatter.write_str("bootstrap packet was empty"),
+            Self::TruncatedPacket => formatter.write_str("bootstrap packet was truncated"),
+            Self::MissingRights => formatter.write_str("bootstrap packet had no descriptor rights"),
+            Self::UnexpectedAncillary => formatter.write_str("bootstrap packet had unexpected ancillary data"),
+            Self::WrongRightCount => formatter.write_str("bootstrap packet had the wrong descriptor count"),
+            Self::IdentityMismatch => formatter.write_str("bootstrap descriptor identity mismatch"),
+            Self::GateClosed => formatter.write_str("bootstrap release gate was already closed"),
+            Self::DescriptorNotCloseOnExec => formatter.write_str("bootstrap descriptor was not close-on-exec"),
+            Self::BootstrapCorrupt => formatter.write_str("bootstrap fixed descriptor map was rejected"),
+            Self::AliasedPipeRoles => formatter.write_str("bootstrap pipe roles were aliased"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for BootstrapError {}
+
+/// Errors exposed by the parent-side hidden-helper bootstrap adapter. Their
+/// text is bounded and never contains paths, argv, environment, or OS error
+/// strings.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum ProcessLaunchError {
+    LauncherRejected,
+    Spawn,
+    Bootstrap(BootstrapError),
+    ReadinessRejected,
+    Io,
+}
+
+#[cfg(unix)]
+impl fmt::Display for ProcessLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LauncherRejected => "trusted launcher identity was rejected",
+            Self::Spawn => "trusted launcher could not be spawned",
+            Self::Bootstrap(_) => "bootstrap protocol was rejected",
+            Self::ReadinessRejected => "helper readiness record was rejected",
+            Self::Io => "helper readiness I/O failed",
+        })
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ProcessLaunchError {}
+
+/// The helper's fixed-size readiness record. It contains no target or
+/// credential data and is sent only after fixed-FD validation succeeds.
+#[cfg(unix)]
+pub const HELPER_READY_RECORD: [u8; 8] = *b"PAER\x01\x00\x00\x00";
+#[cfg(unix)]
+const HELPER_FAILED_RECORD: [u8; 8] = *b"PAER\x01\x01\x00\x00";
+#[cfg(unix)]
+const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A successfully bootstrapped hidden helper. The helper currently exits
+/// after readiness; retaining this handle lets callers reap that lifecycle.
+#[cfg(unix)]
+pub struct ValidatedHelper {
+    child: Child,
+}
+
+#[cfg(unix)]
+impl ValidatedHelper {
+    pub fn id(&self) -> u32 { self.child.id() }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcessLaunchError> {
+        self.child.try_wait().map_err(|_| ProcessLaunchError::Io)
+    }
+
+    pub fn wait(&mut self) -> Result<ExitStatus, ProcessLaunchError> {
+        self.child.wait().map_err(|_| ProcessLaunchError::Io)
+    }
 }
 
 #[cfg(unix)]
@@ -320,6 +404,174 @@ pub(crate) fn process_launch_guard() -> Result<ProcessLaunchGuard, BootstrapErro
         .lock()
         .map(ProcessLaunchGuard)
         .map_err(|_| BootstrapError::BootstrapCorrupt)
+}
+
+/// Consume the fixed bootstrap protocol in the hidden helper. This function
+/// is intentionally the only operation performed by `internal-launch`: no
+/// project paths, configuration, or ordinary command state are opened here.
+#[cfg(unix)]
+pub fn run_internal_launch() -> Result<(), BootstrapError> {
+    // Keep a duplicate of stdin solely for the bounded failure record. The
+    // fixed-map installer owns and may close fd 0 on an error path.
+    let failure_channel = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, RELEASE_ACK_FD + 1) };
+    let result = receive_and_install_bootstrap(libc::STDIN_FILENO);
+    match result {
+        Ok(_) => {
+            // Control fd 3 is the bootstrap socket peer. A readiness record is
+            // sent only after every fixed descriptor was mapped and validated.
+            write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
+            Ok(())
+        }
+        Err(error) => {
+            if failure_channel >= 0 {
+                let _ = write_fixed_record(failure_channel, &HELPER_FAILED_RECORD);
+                unsafe { libc::close(failure_channel); }
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn run_internal_launch() -> Result<(), ()> { Err(()) }
+
+#[cfg(unix)]
+fn write_fixed_record(raw: RawFd, record: &[u8; 8]) -> Result<(), BootstrapError> {
+    let mut stream = std::mem::ManuallyDrop::new(unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(raw)
+    });
+    let deadline = ProtocolDeadline::new(HELPER_READY_TIMEOUT)?;
+    write_all_before(&mut stream, record, &deadline)?;
+    // Close only the write half after the bounded record. This gives the
+    // parent an exact EOF delimiter without making readiness depend on the
+    // helper process scheduler reaching exit first.
+    if unsafe { libc::shutdown(raw, libc::SHUT_WR) } < 0 {
+        return Err(BootstrapError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Start the verified absolute-path helper with only the hidden subcommand in
+/// argv, send its bounded descriptor bootstrap frame, and await its exact
+/// readiness record. This is deliberately a bootstrap-only adapter: it does
+/// not create or execute the target. Descriptor-bound supervisor execution
+/// and OS-specific launch are added by the later native-launch layer.
+#[cfg(unix)]
+pub fn spawn_validated_helper(
+    launcher: &crate::execution_policy::ExecutableAnchor,
+    frame: ControlFrame,
+    rights: Vec<OwnedFd>,
+) -> Result<ValidatedHelper, ProcessLaunchError> {
+    // This check is immediately before command construction/spawn. The
+    // current platform adapter launches the canonical path, so the verified
+    // descriptor is retained only for the identity check until the future
+    // descriptor-bound supervisor is introduced.
+    let verified = launcher
+        .verify_identity()
+        .map_err(|_| ProcessLaunchError::LauncherRejected)?;
+
+    let launch_guard = process_launch_guard().map_err(ProcessLaunchError::Bootstrap)?;
+    let (parent_socket, child_socket) =
+        bootstrap_socket_pair(&launch_guard).map_err(ProcessLaunchError::Bootstrap)?;
+
+    let child_input = unsafe { std::fs::File::from_raw_fd(child_socket.into_raw_fd()) };
+    let mut command = StdCommand::new(&verified.anchor.canonical_path);
+    command
+        .arg("internal-launch")
+        .env_clear()
+        .stdin(Stdio::from(child_input))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // Revalidate as the final operation before spawn. This closes the normal
+    // replacement-before-spawn case; a same-UID swap in the tiny path lookup
+    // window is the documented boundary until descriptor-bound launch exists.
+    launcher
+        .verify_identity()
+        .map_err(|_| ProcessLaunchError::LauncherRejected)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return Err(ProcessLaunchError::Spawn),
+    };
+
+    // No inheritable process resources are created after this point. Keep the
+    // guard through spawn return, then use the parent endpoint for protocol I/O.
+    drop(launch_guard);
+    let parent_raw = parent_socket.into_raw_fd();
+    let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
+    if let Err(error) = send_bootstrap_packet(parent_stream.as_raw_fd(), &frame, &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()) {
+        terminate_helper(&mut child);
+        return Err(ProcessLaunchError::Bootstrap(error));
+    }
+    if let Err(error) = read_helper_readiness(&mut parent_stream) {
+        terminate_helper(&mut child);
+        return Err(error);
+    }
+
+    Ok(ValidatedHelper { child })
+}
+
+#[cfg(not(unix))]
+pub fn spawn_validated_helper(
+    _launcher: &crate::execution_policy::ExecutableAnchor,
+    _frame: ControlFrame,
+    _rights: Vec<()>,
+) -> Result<(), ()> { Err(()) }
+
+#[cfg(unix)]
+fn terminate_helper(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn read_helper_readiness(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Result<(), ProcessLaunchError> {
+    let deadline = Instant::now()
+        .checked_add(HELPER_READY_TIMEOUT)
+        .ok_or(ProcessLaunchError::Io)?;
+    let mut record = [0u8; 8];
+    let mut offset = 0usize;
+    while offset < record.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(ProcessLaunchError::ReadinessRejected)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| ProcessLaunchError::Io)?;
+        match stream.read(&mut record[offset..]) {
+            Ok(0) => return Err(ProcessLaunchError::ReadinessRejected),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(ProcessLaunchError::ReadinessRejected)
+            }
+            Err(_) => return Err(ProcessLaunchError::Io),
+        }
+    }
+    if record != HELPER_READY_RECORD {
+        return Err(ProcessLaunchError::ReadinessRejected);
+    }
+
+    // A successful helper closes the channel immediately after its fixed
+    // record. Reject any trailing byte and bound the wait by the same
+    // absolute deadline.
+    // The final exact-read iteration already installed a timeout bounded by
+    // this same deadline. Do not reset SO_RCVTIMEO after peer half-close: on
+    // some Unix implementations that transition rejects a second timeout
+    // update with EINVAL. The existing timeout still bounds this read.
+    let mut trailing = [0u8; 1];
+    match stream.read(&mut trailing) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(ProcessLaunchError::ReadinessRejected),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ProcessLaunchError::Io),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock => {
+            Err(ProcessLaunchError::ReadinessRejected)
+        }
+        Err(_) => Err(ProcessLaunchError::Io),
+    }
 }
 
 #[cfg(unix)]

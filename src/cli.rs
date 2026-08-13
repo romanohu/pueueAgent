@@ -14,6 +14,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Private supervisor bootstrap entry point. It accepts no options;
+    /// launch data arrives over the inherited bootstrap socket.
+    #[command(hide = true)]
+    InternalLaunch,
     Init(InitArgs),
     Enable(ProjectArgs),
     Disable(DisableArgs),
