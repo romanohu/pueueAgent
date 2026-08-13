@@ -14,7 +14,8 @@ use crate::{
         VerifiedProjectRoot,
     },
     project_logs::{
-        create_gate_marker, ensure_agent_log_dir, inspect_gate_marker, open_agent_log,
+        create_gate_marker, ensure_agent_log_dir, inspect_agent_log_dir,
+        inspect_existing_agent_log, inspect_gate_marker, open_agent_log, LogFileIdentity,
         ProjectRootLogReader,
     },
     AppError,
@@ -73,9 +74,9 @@ impl NativeLauncher {
         // Ensure the fixed project-owned log directory before validating the
         // marker.  Both operations remain descriptor-relative; no ambient
         // path is joined or inspected here.
-        ensure_agent_log_dir(&reader)?;
+        let log_directory_identity = ensure_agent_log_dir(&reader)?;
         if inspect_gate_marker(&reader, &spec.relative_marker_path)?.is_some() {
-            return Err(native_gate_error(PolicyViolationStage::NativeGate));
+            return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
         // This is intentionally the sole open of the agent log.  Clone the
         // resulting descriptor for stdout/stderr rather than reopening by
@@ -85,6 +86,7 @@ impl NativeLauncher {
         let stdout = agent_log.try_clone()?;
         let stderr = agent_log.into_file();
 
+        let executable_anchor = spec.executable.clone();
         let verified = crate::process::spawn_verified_command(
             crate::process::VerifiedCommandSpec {
                 launcher: spec.launcher,
@@ -107,6 +109,10 @@ impl NativeLauncher {
         Ok(NativeAgentChild {
             verified,
             reader,
+            executable_anchor,
+            relative_log_path: spec.relative_log_path,
+            log_directory_identity,
+            log_identity: identity,
             relative_marker_path: spec.relative_marker_path,
             authorization_attempted: false,
             authorization_complete: false,
@@ -133,6 +139,10 @@ impl Default for NativeLauncher {
 pub struct NativeAgentChild {
     verified: crate::process::VerifiedChild,
     reader: ProjectRootLogReader,
+    executable_anchor: ExecutableAnchor,
+    relative_log_path: PathBuf,
+    log_directory_identity: LogFileIdentity,
+    log_identity: LogFileIdentity,
     relative_marker_path: PathBuf,
     authorization_attempted: bool,
     authorization_complete: bool,
@@ -152,6 +162,34 @@ impl NativeAgentChild {
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
         self.authorization_attempted = true;
+
+        let revalidation = self
+            .reader
+            .revalidate_root_path_identity()
+            .and_then(|_| {
+                self.executable_anchor
+                    .verify_identity()
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+            .and_then(|_| {
+                let current = inspect_agent_log_dir(&self.reader)?;
+                if current != self.log_directory_identity {
+                    return Err(log_replaced_error());
+                }
+                Ok(())
+            })
+            .and_then(|_| {
+                let current = inspect_existing_agent_log(&self.reader, &self.relative_log_path)?;
+                if current != self.log_identity {
+                    return Err(log_replaced_error());
+                }
+                Ok(())
+            });
+        if let Err(error) = revalidation {
+            crate::process::terminate_process_group(&mut self.verified).await;
+            return Err(pre_marker_revalidation_error(error));
+        }
 
         let created = create_gate_marker(&self.reader, &self.relative_marker_path);
         match created {
@@ -198,6 +236,31 @@ impl NativeAgentChild {
 #[cfg(unix)]
 fn native_gate_error(stage: PolicyViolationStage) -> AppError {
     PolicyViolation::new(PolicyViolationCode::NativeGateFailed, stage).into()
+}
+
+#[cfg(unix)]
+fn log_replaced_error() -> AppError {
+    use crate::execution_policy::{LogUnsafeReason, PolicyViolationDetail};
+
+    PolicyViolation::with_detail(
+        PolicyViolationCode::LogUnsafe,
+        PolicyViolationStage::RunBoundPreMarker,
+        PolicyViolationDetail::LogUnsafe(LogUnsafeReason::RootChanged),
+    )
+    .into()
+}
+
+#[cfg(unix)]
+fn pre_marker_revalidation_error(error: AppError) -> AppError {
+    match error {
+        AppError::PolicyViolation { violation } => PolicyViolation::with_detail(
+            violation.code,
+            PolicyViolationStage::RunBoundPreMarker,
+            violation.detail,
+        )
+        .into(),
+        error => error,
+    }
 }
 
 #[cfg(unix)]

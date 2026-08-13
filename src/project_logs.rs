@@ -120,6 +120,17 @@ impl ProjectRootLogReader {
         Self { root }
     }
 
+    /// Revalidate that the canonical project-root path still resolves to the
+    /// identity pinned by this reader. The returned descriptor is used only
+    /// for the proof; all project log access remains relative to `self.root`.
+    pub fn revalidate_root_path_identity(&self) -> Result<(), AppError> {
+        self.root
+            .anchor
+            .verify_identity()
+            .map(|_| ())
+            .map_err(AppError::from)
+    }
+
     /// Test-only fixture constructor. Production callers must pass the
     /// descriptor verified by execution policy through `from_verified`.
     #[cfg(test)]
@@ -330,7 +341,7 @@ impl AgentLogFile {
     }
 }
 
-pub fn ensure_agent_log_dir(root: &ProjectRootLogReader) -> Result<(), AppError> {
+pub fn ensure_agent_log_dir(root: &ProjectRootLogReader) -> Result<LogFileIdentity, AppError> {
     #[cfg(not(unix))]
     {
         let _ = root;
@@ -344,7 +355,43 @@ pub fn ensure_agent_log_dir(root: &ProjectRootLogReader) -> Result<(), AppError>
         })?;
         let first = ensure_directory_at(&root_directory, OsStr::new(".pueue-agent"))?;
         let second = ensure_directory_at(&first, OsStr::new("logs"))?;
-        validate_directory(&second)
+        validate_directory(&second)?;
+        LogFileIdentity::from_open_descriptor(&second).map_err(|source| AppError::Io {
+            operation: "read agent log directory metadata",
+            source,
+        })
+    }
+}
+
+/// Inspect the fixed agent-log directory without creating or repairing any
+/// component. This is used immediately before marker publication to prove
+/// that the directory opened during spawn is still the active generation.
+pub fn inspect_agent_log_dir(root: &ProjectRootLogReader) -> Result<LogFileIdentity, AppError> {
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        return Err(unsupported_platform(PolicyViolationStage::NativeGate));
+    }
+    #[cfg(unix)]
+    {
+        let first = open_directory_at(&root.root.directory, OsStr::new(".pueue-agent"))
+            .map_err(|source| {
+                map_required_component_open_error(
+                    &root.root.directory,
+                    OsStr::new(".pueue-agent"),
+                    source,
+                )
+            })?;
+        validate_directory(&first)?;
+        let second = open_directory_at(&first, OsStr::new("logs"))
+            .map_err(|source| {
+                map_required_component_open_error(&first, OsStr::new("logs"), source)
+            })?;
+        validate_directory(&second)?;
+        LogFileIdentity::from_open_descriptor(&second).map_err(|source| AppError::Io {
+            operation: "read agent log directory metadata",
+            source,
+        })
     }
 }
 
@@ -790,6 +837,18 @@ fn map_component_open_error(parent: &File, name: &OsStr, source: io::Error) -> A
         return log_unsafe(LogUnsafeReason::Symlink);
     }
     map_walk_error(source)
+}
+
+#[cfg(unix)]
+fn map_required_component_open_error(
+    parent: &File,
+    name: &OsStr,
+    source: io::Error,
+) -> AppError {
+    if source.raw_os_error() == Some(libc::ENOENT) {
+        return log_unsafe(LogUnsafeReason::Missing);
+    }
+    map_component_open_error(parent, name, source)
 }
 
 #[cfg(unix)]

@@ -318,7 +318,12 @@ fn main() {
             Err(error) => error,
         };
         assert!(started.elapsed() < MAX_HELPER_WAIT);
-        assert!(matches!(identity_error, ProcessLaunchError::ReadinessRejected));
+        assert!(matches!(
+            identity_error,
+            ProcessLaunchError::HelperFailure(
+                pueue_agent::process::HelperFailureKind::Security
+            )
+        ));
         let rendered = identity_error.to_string();
         assert!(!rendered.contains("payload-sentinel"));
         assert!(!rendered.contains("fixture-value"));
@@ -343,7 +348,12 @@ fn main() {
             Err(error) => error,
         };
         assert!(started.elapsed() < MAX_HELPER_WAIT);
-        assert!(matches!(gate_error, ProcessLaunchError::ReadinessRejected));
+        assert!(matches!(
+            gate_error,
+            ProcessLaunchError::HelperFailure(
+                pueue_agent::process::HelperFailureKind::Security
+            )
+        ));
         drop((exec_read, ack_read));
     }
 
@@ -519,10 +529,14 @@ fn main() {
         child.confirm_exec().await.unwrap();
         child.wait_for_release_ack().await.unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !pid_path.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(
+            pid_path.exists(),
+            "group fixture did not publish its descendant pid before the bounded deadline"
+        );
         let descendant_pid: libc::pid_t = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
         terminate_process_group(&mut child).await;
         let gone_deadline = Instant::now() + Duration::from_secs(2);

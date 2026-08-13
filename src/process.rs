@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
 use crate::execution_policy::ExecutableIdentity;
 
 #[cfg(unix)]
@@ -303,6 +306,7 @@ pub enum BootstrapError {
     BootstrapCorrupt,
     AliasedPipeRoles,
     TargetCreate,
+    TargetCreateTransient,
 }
 
 #[cfg(unix)]
@@ -322,6 +326,9 @@ impl fmt::Display for BootstrapError {
             Self::BootstrapCorrupt => formatter.write_str("bootstrap fixed descriptor map was rejected"),
             Self::AliasedPipeRoles => formatter.write_str("bootstrap pipe roles were aliased"),
             Self::TargetCreate => formatter.write_str("native target creation failed"),
+            Self::TargetCreateTransient => {
+                formatter.write_str("native target resources were temporarily unavailable")
+            }
         }
     }
 }
@@ -339,7 +346,15 @@ pub enum ProcessLaunchError {
     Spawn,
     Bootstrap(BootstrapError),
     ReadinessRejected,
+    HelperFailure(HelperFailureKind),
     Io,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperFailureKind {
+    Transient,
+    Security,
 }
 
 #[cfg(unix)]
@@ -350,6 +365,12 @@ impl fmt::Display for ProcessLaunchError {
             Self::Spawn => "trusted launcher could not be spawned",
             Self::Bootstrap(_) => "bootstrap protocol was rejected",
             Self::ReadinessRejected => "helper readiness record was rejected",
+            Self::HelperFailure(HelperFailureKind::Transient) => {
+                "helper resources were temporarily unavailable"
+            }
+            Self::HelperFailure(HelperFailureKind::Security) => {
+                "helper rejected the verified launch contract"
+            }
             Self::Io => "helper readiness I/O failed",
         })
     }
@@ -363,7 +384,9 @@ impl std::error::Error for ProcessLaunchError {}
 #[cfg(unix)]
 pub const HELPER_READY_RECORD: [u8; 8] = *b"PAER\x01\x00\x00\x00";
 #[cfg(unix)]
-const HELPER_FAILED_RECORD: [u8; 8] = *b"PAER\x01\x01\x00\x00";
+const HELPER_TRANSIENT_FAILURE_RECORD: [u8; 8] = *b"PAER\x01\x01\x01\x00";
+#[cfg(unix)]
+const HELPER_SECURITY_FAILURE_RECORD: [u8; 8] = *b"PAER\x01\x01\x02\x00";
 #[cfg(unix)]
 const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
@@ -372,6 +395,11 @@ const HELPER_CLEANUP_INLINE_TIMEOUT: Duration = Duration::from_millis(250);
 const HELPER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(unix)]
 const TARGET_CANCEL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+static TEST_PREPARED_TARGET_PID: AtomicI32 = AtomicI32::new(0);
+#[cfg(test)]
+static TEST_REAP_TARGET_BEFORE_WAIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 static HELPER_REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
@@ -690,11 +718,19 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
         Ok(()) => Ok(()),
         Err(error) => {
             if failure_channel >= 0 {
-                let _ = write_fixed_record(failure_channel, &HELPER_FAILED_RECORD);
+                let _ = write_fixed_record(failure_channel, &helper_failure_record(&error));
                 unsafe { libc::close(failure_channel); }
             }
             Err(error)
         }
+    }
+}
+
+#[cfg(unix)]
+fn helper_failure_record(error: &BootstrapError) -> [u8; 8] {
+    match error {
+        BootstrapError::TargetCreateTransient => HELPER_TRANSIENT_FAILURE_RECORD,
+        _ => HELPER_SECURITY_FAILURE_RECORD,
     }
 }
 
@@ -712,6 +748,8 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
         }
     }
     let mut target = PlatformTarget::prepare(&frame)?;
+    #[cfg(test)]
+    TEST_PREPARED_TARGET_PID.store(target.pid(), Ordering::SeqCst);
     write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
     if read_release_authorization().is_err() {
         target.cancel_and_reap();
@@ -724,6 +762,11 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
     }
     close_raw(EXEC_STATUS_FD);
     write_release_ack()?;
+    #[cfg(test)]
+    if TEST_REAP_TARGET_BEFORE_WAIT.swap(false, Ordering::SeqCst) {
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(target.pid(), &mut status, 0) };
+    }
     if target.wait_success()? {
         Ok(())
     } else {
@@ -784,10 +827,16 @@ fn write_release_ack() -> Result<(), BootstrapError> {
 #[cfg(target_os = "macos")]
 struct PlatformTarget {
     pid: libc::pid_t,
+    owned: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl PlatformTarget {
+    #[cfg(test)]
+    fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
     fn prepare(frame: &ControlFrame) -> Result<Self, BootstrapError> {
         let path = frame.target_path.as_ref().ok_or(BootstrapError::TargetCreate)?;
         if !std::path::Path::new(path).is_absolute() {
@@ -806,21 +855,27 @@ impl PlatformTarget {
         environment_pointers.push(ptr::null_mut());
 
         let mut attributes: libc::posix_spawnattr_t = unsafe { mem::zeroed() };
-        if unsafe { libc::posix_spawnattr_init(&mut attributes) } != 0 {
-            return Err(BootstrapError::TargetCreate);
+        let attributes_result = unsafe { libc::posix_spawnattr_init(&mut attributes) };
+        if attributes_result != 0 {
+            return Err(classify_target_create_errno(attributes_result));
         }
         let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { mem::zeroed() };
-        if unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) } != 0 {
+        let actions_result = unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) };
+        if actions_result != 0 {
             unsafe { libc::posix_spawnattr_destroy(&mut attributes); }
-            return Err(BootstrapError::TargetCreate);
+            return Err(classify_target_create_errno(actions_result));
         }
         let mut config_duplicate = -1;
         let result = (|| {
             let flags = (libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_SETPGROUP) as i16;
-            if unsafe { libc::posix_spawnattr_setflags(&mut attributes, flags) } != 0
-                || unsafe { libc::posix_spawnattr_setpgroup(&mut attributes, libc::getpgrp()) } != 0
-            {
-                return Err(BootstrapError::TargetCreate);
+            let flags_result = unsafe { libc::posix_spawnattr_setflags(&mut attributes, flags) };
+            if flags_result != 0 {
+                return Err(classify_target_create_errno(flags_result));
+            }
+            let group_result =
+                unsafe { libc::posix_spawnattr_setpgroup(&mut attributes, libc::getpgrp()) };
+            if group_result != 0 {
+                return Err(classify_target_create_errno(group_result));
             }
             if frame.mode == LaunchMode::Pueue {
                 // Fixed fd 9 is CLOEXEC in the helper.  Duplicate it to a
@@ -831,22 +886,29 @@ impl PlatformTarget {
                 config_duplicate = unsafe {
                     libc::fcntl(PUEUE_CONFIG_FD, libc::F_DUPFD_CLOEXEC, RELEASE_ACK_FD + 1)
                 };
-                if config_duplicate < 0
-                    || unsafe {
-                        libc::posix_spawn_file_actions_adddup2(
-                            &mut file_actions,
-                            config_duplicate,
-                            PUEUE_CONFIG_FD,
-                        )
-                    } != 0
-                    || unsafe {
-                        libc::posix_spawn_file_actions_addclose(
-                            &mut file_actions,
-                            config_duplicate,
-                        )
-                    } != 0
-                {
-                    return Err(BootstrapError::TargetCreate);
+                if config_duplicate < 0 {
+                    return Err(classify_target_create_errno(
+                        io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    ));
+                }
+                let duplicate_result = unsafe {
+                    libc::posix_spawn_file_actions_adddup2(
+                        &mut file_actions,
+                        config_duplicate,
+                        PUEUE_CONFIG_FD,
+                    )
+                };
+                if duplicate_result != 0 {
+                    return Err(classify_target_create_errno(duplicate_result));
+                }
+                let close_result = unsafe {
+                    libc::posix_spawn_file_actions_addclose(
+                        &mut file_actions,
+                        config_duplicate,
+                    )
+                };
+                if close_result != 0 {
+                    return Err(classify_target_create_errno(close_result));
                 }
             }
             let mut pid = 0;
@@ -861,13 +923,13 @@ impl PlatformTarget {
                 )
             };
             if spawned != 0 {
-                return Err(BootstrapError::TargetCreate);
+                return Err(classify_target_create_errno(spawned));
             }
             if reverify_target_path(OsStr::from_bytes(path.as_bytes()), frame.target_identity).is_err() {
                 let _ = kill_and_reap_target_bounded(pid);
                 return Err(BootstrapError::IdentityMismatch);
             }
-            Ok(Self { pid })
+            Ok(Self { pid, owned: true })
         })();
         if config_duplicate >= 0 {
             unsafe { libc::close(config_duplicate); }
@@ -885,11 +947,18 @@ impl PlatformTarget {
     }
 
     fn cancel_and_reap(&mut self) {
-        let _ = kill_and_reap_target_bounded(self.pid);
+        if self.owned {
+            let _ = kill_and_reap_target_bounded(self.pid);
+            self.owned = false;
+        }
     }
 
     fn wait_success(&mut self) -> Result<bool, BootstrapError> {
-        wait_pid_success(self.pid)
+        let outcome = wait_pid_success(self.pid);
+        if outcome.is_ok() {
+            self.owned = false;
+        }
+        outcome
     }
 }
 
@@ -922,10 +991,16 @@ struct PlatformTarget {
     pid: libc::pid_t,
     release: Option<OwnedFd>,
     exec_status: Option<OwnedFd>,
+    owned: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 impl PlatformTarget {
+    #[cfg(test)]
+    fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
     fn prepare(frame: &ControlFrame) -> Result<Self, BootstrapError> {
         let argv = c_argv(&frame.argv)?;
         let environment = c_environment(&frame.environment)?;
@@ -934,8 +1009,10 @@ impl PlatformTarget {
         let mut environment_pointers = environment.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
         environment_pointers.push(ptr::null());
         let guard = ProcessLaunchGuard(PROCESS_LAUNCH_LOCK.lock().map_err(|_| BootstrapError::BootstrapCorrupt)?);
-        let (gate_read, gate_write) = lifecycle_pipe(&guard).map_err(|_| BootstrapError::BootstrapCorrupt)?;
-        let (exec_read, exec_write) = lifecycle_pipe(&guard).map_err(|_| BootstrapError::BootstrapCorrupt)?;
+        let (gate_read, gate_write) =
+            lifecycle_pipe(&guard).map_err(|_| BootstrapError::TargetCreateTransient)?;
+        let (exec_read, exec_write) =
+            lifecycle_pipe(&guard).map_err(|_| BootstrapError::TargetCreateTransient)?;
         drop(guard);
         let gate_read_raw = gate_read.as_raw_fd();
         let gate_write_raw = gate_write.as_raw_fd();
@@ -946,7 +1023,8 @@ impl PlatformTarget {
         let environment_raw = environment_pointers.as_ptr();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            return Err(BootstrapError::BootstrapCorrupt);
+            let error = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(classify_target_create_errno(error));
         }
         if pid == 0 {
             // After fork this branch uses only async-signal-safe libc calls
@@ -1015,7 +1093,12 @@ impl PlatformTarget {
         }
         drop(gate_read);
         drop(exec_write);
-        Ok(Self { pid, release: Some(gate_write), exec_status: Some(exec_read) })
+        Ok(Self {
+            pid,
+            release: Some(gate_write),
+            exec_status: Some(exec_read),
+            owned: true,
+        })
     }
 
     fn release_and_confirm(&mut self) -> Result<(), BootstrapError> {
@@ -1030,10 +1113,55 @@ impl PlatformTarget {
 
     fn cancel_and_reap(&mut self) {
         self.release.take();
-        let _ = kill_and_reap_target_bounded(self.pid);
+        if self.owned {
+            let _ = kill_and_reap_target_bounded(self.pid);
+            self.owned = false;
+        }
     }
 
-    fn wait_success(&mut self) -> Result<bool, BootstrapError> { wait_pid_success(self.pid) }
+    fn wait_success(&mut self) -> Result<bool, BootstrapError> {
+        let outcome = wait_pid_success(self.pid);
+        if outcome.is_ok() {
+            self.owned = false;
+        }
+        outcome
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PlatformTarget {
+    fn drop(&mut self) {
+        self.cancel_and_reap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn disarmed_platform_target_for_test(pid: libc::pid_t) -> PlatformTarget {
+    PlatformTarget { pid, owned: false }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+fn disarmed_platform_target_for_test(pid: libc::pid_t) -> PlatformTarget {
+    PlatformTarget {
+        pid,
+        release: None,
+        exec_status: None,
+        owned: false,
+    }
+}
+
+#[cfg(unix)]
+fn classify_target_create_errno(error: i32) -> BootstrapError {
+    if is_transient_resource_errno(error) {
+        BootstrapError::TargetCreateTransient
+    } else {
+        BootstrapError::TargetCreate
+    }
+}
+
+#[cfg(unix)]
+fn is_transient_resource_errno(error: i32) -> bool {
+    matches!(error, libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE)
 }
 
 #[cfg(unix)]
@@ -1440,7 +1568,7 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
     let (exec_read, exec_write) = lifecycle_pipe(&launch_guard)?;
     let (ack_read, ack_write) = lifecycle_pipe(&launch_guard)?;
     let (parent_socket, child_socket) = bootstrap_socket_pair(&launch_guard)
-        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+        .map_err(|error| map_verified_launch_error(ProcessLaunchError::Bootstrap(error)))?;
 
     let mut flags = LaunchFlags::PROCESS_GROUP.union(LaunchFlags::LIFECYCLE);
     let mut rights = vec![release_read, exec_write];
@@ -1507,31 +1635,31 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
     command.kill_on_drop(true);
     let mut child = command
         .spawn()
-        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+        .map_err(|error| map_helper_spawn_error(&error))?;
     let pid = child
         .id()
-        .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))? as i64;
+        .ok_or_else(retryable_native_launch_error)? as i64;
     drop(launch_guard);
 
     let parent_raw = parent_socket.into_raw_fd();
     let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
-    if send_bootstrap_packet(
+    if let Err(error) = send_bootstrap_packet(
         parent_stream.as_raw_fd(),
         &frame,
         &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
-    )
-    .is_err()
-    {
+    ) {
         cleanup_failed_tokio_helper(&mut child, pid);
-        return Err(native_gate_error(PolicyViolationStage::PreBinding));
+        return Err(map_verified_launch_error(ProcessLaunchError::Bootstrap(error)));
     }
     // Suspended target creation is a distinct lifecycle operation from the
     // bounded bootstrap transfer. On macOS, posix_spawn may synchronously
     // assess a newly generated executable, so this operation receives its own
     // lifecycle deadline instead of the shorter bootstrap-only budget.
-    if read_helper_readiness_with_timeout(&mut parent_stream, LIFECYCLE_IO_TIMEOUT).is_err() {
+    if let Err(error) =
+        read_helper_readiness_with_timeout(&mut parent_stream, LIFECYCLE_IO_TIMEOUT)
+    {
         cleanup_failed_tokio_helper(&mut child, pid);
-        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        return Err(map_verified_launch_error(error));
     }
     drop(rights);
 
@@ -1604,6 +1732,39 @@ fn cleanup_failed_tokio_helper(child: &mut tokio::process::Child, pid: i64) {
 }
 
 #[cfg(unix)]
+fn retryable_native_launch_error() -> AppError {
+    AppError::Runtime {
+        operation: "spawn native helper",
+    }
+}
+
+#[cfg(unix)]
+fn map_helper_spawn_error(error: &io::Error) -> AppError {
+    if error
+        .raw_os_error()
+        .is_some_and(is_transient_resource_errno)
+    {
+        retryable_native_launch_error()
+    } else {
+        native_gate_error(PolicyViolationStage::NativeGate)
+    }
+}
+
+#[cfg(unix)]
+fn map_verified_launch_error(error: ProcessLaunchError) -> AppError {
+    match error {
+        ProcessLaunchError::Spawn
+        | ProcessLaunchError::Io
+        | ProcessLaunchError::HelperFailure(HelperFailureKind::Transient)
+        | ProcessLaunchError::Bootstrap(BootstrapError::Io(_))
+        | ProcessLaunchError::Bootstrap(BootstrapError::TargetCreateTransient) => {
+            retryable_native_launch_error()
+        }
+        _ => native_gate_error(PolicyViolationStage::NativeGate),
+    }
+}
+
+#[cfg(unix)]
 fn lifecycle_pipe(_guard: &ProcessLaunchGuard) -> Result<(OwnedFd, OwnedFd), AppError> {
     let mut descriptors = [-1; 2];
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1611,7 +1772,7 @@ fn lifecycle_pipe(_guard: &ProcessLaunchGuard) -> Result<(OwnedFd, OwnedFd), App
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let result = unsafe { libc::pipe(descriptors.as_mut_ptr()) };
     if result < 0 {
-        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        return Err(retryable_native_launch_error());
     }
     let pair = unsafe {
         (OwnedFd::from_raw_fd(descriptors[0]), OwnedFd::from_raw_fd(descriptors[1]))
@@ -1630,7 +1791,7 @@ fn lifecycle_pipe(_guard: &ProcessLaunchGuard) -> Result<(OwnedFd, OwnedFd), App
 fn duplicate_owned(file: &std::fs::File) -> Result<OwnedFd, AppError> {
     file.try_clone()
         .map(|file| unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
-        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))
+        .map_err(|_| retryable_native_launch_error())
 }
 
 #[cfg(unix)]
@@ -1790,7 +1951,10 @@ fn read_helper_readiness_with_timeout(
             Err(_) => return Err(ProcessLaunchError::Io),
         }
     }
-    if record != HELPER_READY_RECORD {
+    if record != HELPER_READY_RECORD
+        && record != HELPER_TRANSIENT_FAILURE_RECORD
+        && record != HELPER_SECURITY_FAILURE_RECORD
+    {
         return Err(ProcessLaunchError::ReadinessRejected);
     }
 
@@ -1803,7 +1967,13 @@ fn read_helper_readiness_with_timeout(
     // update with EINVAL. The existing timeout still bounds this read.
     let mut trailing = [0u8; 1];
     match stream.read(&mut trailing) {
-        Ok(0) => Ok(()),
+        Ok(0) if record == HELPER_READY_RECORD => Ok(()),
+        Ok(0) if record == HELPER_TRANSIENT_FAILURE_RECORD => Err(
+            ProcessLaunchError::HelperFailure(HelperFailureKind::Transient),
+        ),
+        Ok(0) => Err(ProcessLaunchError::HelperFailure(
+            HelperFailureKind::Security,
+        )),
         Ok(_) => Err(ProcessLaunchError::ReadinessRejected),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ProcessLaunchError::Io),
         Err(error) if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock => {
@@ -3079,6 +3249,212 @@ mod tests {
         fs::rename(replacement, launcher).unwrap();
         let result = revalidate_launcher_before_spawn(&anchor);
         assert!(matches!(result, Err(ProcessLaunchError::LauncherRejected)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_failure_records_preserve_transient_and_security_classification() {
+        for (failure, expected) in [
+            (BootstrapError::TargetCreateTransient, HelperFailureKind::Transient),
+            (BootstrapError::IdentityMismatch, HelperFailureKind::Security),
+        ] {
+            let (mut parent, mut helper) = std::os::unix::net::UnixStream::pair().unwrap();
+            let record = helper_failure_record(&failure);
+            helper.write_all(&record).unwrap();
+            helper.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(matches!(
+                read_helper_readiness(&mut parent),
+                Err(ProcessLaunchError::HelperFailure(kind)) if kind == expected
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_failure_parser_rejects_unknown_trailing_and_truncated_records() {
+        for bytes in [
+            b"PAER\x01\x01\x03\x00".as_slice(),
+            b"PAER\x01\x01\x01\x00x".as_slice(),
+            b"PAER\x01\x01".as_slice(),
+        ] {
+            let (mut parent, mut helper) = std::os::unix::net::UnixStream::pair().unwrap();
+            helper.write_all(bytes).unwrap();
+            helper.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(matches!(
+                read_helper_readiness(&mut parent),
+                Err(ProcessLaunchError::ReadinessRejected)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_helper_failure_is_retryable_but_identity_failure_is_policy_blocked() {
+        assert!(matches!(
+            map_verified_launch_error(ProcessLaunchError::HelperFailure(
+                HelperFailureKind::Transient,
+            )),
+            AppError::Runtime { operation: "spawn native helper" }
+        ));
+        assert!(matches!(
+            map_verified_launch_error(ProcessLaunchError::HelperFailure(
+                HelperFailureKind::Security,
+            )),
+            AppError::PolicyViolation { .. }
+        ));
+        assert!(matches!(
+            map_helper_spawn_error(&io::Error::from_raw_os_error(libc::EAGAIN)),
+            AppError::Runtime { operation: "spawn native helper" }
+        ));
+        assert!(matches!(
+            map_helper_spawn_error(&io::Error::from_raw_os_error(libc::EACCES)),
+            AppError::PolicyViolation { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    fn duplicate_above_protocol(raw: RawFd) -> OwnedFd {
+        let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 50) };
+        assert!(duplicate >= 50);
+        unsafe { OwnedFd::from_raw_fd(duplicate) }
+    }
+
+    #[cfg(unix)]
+    fn install_test_fixed_fd(source: &OwnedFd, target: RawFd) {
+        assert_eq!(unsafe { libc::dup2(source.as_raw_fd(), target) }, target);
+        set_close_on_exec(target).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn installed_target_fault_frame(target_mode: &str) -> ControlFrame {
+        let executable = std::env::current_exe().unwrap();
+        let target = File::open(&executable).unwrap();
+        ControlFrame {
+            mode: LaunchMode::Agent,
+            flags: LaunchFlags::PROCESS_GROUP.union(LaunchFlags::LIFECYCLE),
+            argv: vec![
+                executable.as_os_str().to_os_string(),
+                OsString::from("--ignored"),
+                OsString::from("--exact"),
+                OsString::from("process::tests::platform_fault_target_subprocess"),
+                OsString::from("--nocapture"),
+            ],
+            environment: vec![(
+                OsString::from("PUEUE_AGENT_TEST_TARGET_MODE"),
+                OsString::from(target_mode),
+            )],
+            cwd: None,
+            target_identity: metadata_identity(&target.metadata().unwrap()),
+            project_root_identity: None,
+            agent_log_identity: None,
+            pueue_config_identity: None,
+            target_path: Some(executable.into_os_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal platform target subprocess entry"]
+    fn platform_fault_target_subprocess() {
+        match std::env::var("PUEUE_AGENT_TEST_TARGET_MODE").as_deref() {
+            Ok("exit") => {}
+            Ok("hold") => std::thread::sleep(Duration::from_secs(30)),
+            _ => panic!("unknown platform target mode"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal platform target fault subprocess entry"]
+    fn installed_target_fault_subprocess() {
+        let fault = std::env::var("PUEUE_AGENT_TEST_RUN_FAULT").unwrap();
+        let target_mode = if fault == "wait" { "exit" } else { "hold" };
+        let frame = installed_target_fault_frame(target_mode);
+        let executable = File::open(frame.target_path.as_ref().unwrap()).unwrap();
+
+        let (ready_parent, ready_helper) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ready_helper = duplicate_above_protocol(ready_helper.as_raw_fd());
+        let (release_read, release_write) = pipe_pair();
+        let release_read = duplicate_above_protocol(release_read.as_raw_fd());
+        let mut release_write = File::from(release_write);
+        release_write.write_all(&RELEASE_AUTHORIZATION).unwrap();
+        drop(release_write);
+        let (_exec_read, exec_write) = pipe_pair();
+        let exec_write = duplicate_above_protocol(exec_write.as_raw_fd());
+        let (ack_read, ack_write) = pipe_pair();
+        let ack_write = duplicate_above_protocol(ack_write.as_raw_fd());
+        let target = duplicate_above_protocol(executable.as_raw_fd());
+
+        install_test_fixed_fd(&ready_helper, CONTROL_FD);
+        install_test_fixed_fd(&release_read, RELEASE_FD);
+        install_test_fixed_fd(&exec_write, EXEC_STATUS_FD);
+        install_test_fixed_fd(&target, TARGET_FD);
+        install_test_fixed_fd(&ack_write, RELEASE_ACK_FD);
+
+        let mut ready_parent = Some(ready_parent);
+        let mut ack_read = Some(ack_read);
+        match fault.as_str() {
+            "ready" => drop(ready_parent.take()),
+            "ack" => drop(ack_read.take()),
+            "wait" => TEST_REAP_TARGET_BEFORE_WAIT.store(true, Ordering::SeqCst),
+            _ => panic!("unknown installed target fault"),
+        }
+
+        TEST_PREPARED_TARGET_PID.store(0, Ordering::SeqCst);
+        assert!(run_installed_target(frame).is_err());
+        let pid = TEST_PREPARED_TARGET_PID.load(Ordering::SeqCst);
+        assert!(pid > 0);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        drop((ready_parent, ack_read));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_ack_and_wait_failures_reap_target_and_leave_no_process_group() {
+        for fault in ["ready", "ack", "wait"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "process::tests::installed_target_fault_subprocess",
+                    "--nocapture",
+                ])
+                .env("PUEUE_AGENT_TEST_RUN_FAULT", fault);
+            let mut child = command.spawn().unwrap();
+            let group = child.id() as libc::pid_t;
+            assert!(
+                bounded_wait(&mut child).success(),
+                "fault path failed: {fault}"
+            );
+            assert_eq!(unsafe { libc::kill(-group, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal disarmed target subprocess entry"]
+    fn disarmed_platform_target_subprocess() {
+        let target = disarmed_platform_target_for_test(unsafe { libc::getpid() });
+        drop(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disarmed_platform_target_never_signals_its_recorded_pid() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "process::tests::disarmed_platform_target_subprocess",
+            "--nocapture",
+        ]);
+        assert!(bounded_wait(&mut command.spawn().unwrap()).success());
     }
 
     #[cfg(unix)]
