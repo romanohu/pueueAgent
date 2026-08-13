@@ -19,6 +19,28 @@ const EVENTS_PROJECT_STATUS_NOT_BEFORE_INDEX_SQL: &str = "CREATE INDEX events_pr
     ON events(project_id, status, not_before, event_id);";
 const EVENTS_V13_STATUS_LIST: &str =
     "'pending', 'claimed', 'in_flight', 'dispatched',\n                    'completed', 'retry_wait', 'failed', 'dead_letter'";
+const AGENT_RUN_V14_EXECUTION_COLUMNS: [(&str, &str); 5] = [
+    (
+        "execution_kind",
+        "ALTER TABLE agent_runs ADD COLUMN execution_kind TEXT",
+    ),
+    (
+        "executable_path",
+        "ALTER TABLE agent_runs ADD COLUMN executable_path TEXT",
+    ),
+    (
+        "executable_identity",
+        "ALTER TABLE agent_runs ADD COLUMN executable_identity TEXT",
+    ),
+    (
+        "policy_code",
+        "ALTER TABLE agent_runs ADD COLUMN policy_code TEXT",
+    ),
+    (
+        "failure_stage",
+        "ALTER TABLE agent_runs ADD COLUMN failure_stage TEXT",
+    ),
+];
 const OPERATOR_LOGS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS operator_logs (
         log_id INTEGER PRIMARY KEY,
@@ -46,8 +68,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let current_schema_has_composite_origin_foreign_key =
         version == LATEST_SCHEMA_VERSION
             && submissions_have_composite_origin_foreign_key(connection)?;
-    let current_schema_has_execution_projection =
-        version == LATEST_SCHEMA_VERSION && execution_projection_columns_exist(connection)?;
+    let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
+        && missing_execution_projection_columns(connection)?.is_empty();
     if version == LATEST_SCHEMA_VERSION {
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -429,8 +451,13 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version >= 13 {
         verify_events_v13(&transaction, EVENTS_V13_STATUS_LIST)?;
     }
-    if version <= 13 || !execution_projection_columns_exist(&transaction)? {
-        migrate_agent_run_execution_projection_to_v14(&transaction)?;
+    let missing_execution_projection_columns =
+        missing_execution_projection_columns(&transaction)?;
+    if version <= 13 || !missing_execution_projection_columns.is_empty() {
+        migrate_agent_run_execution_projection_to_v14(
+            &transaction,
+            &missing_execution_projection_columns,
+        )?;
     }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
@@ -452,62 +479,62 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
 
 fn migrate_agent_run_execution_projection_to_v14(
     transaction: &rusqlite::Transaction<'_>,
+    missing_columns: &[&str],
 ) -> Result<(), AppError> {
-    for (name, statement) in [
-        (
-            "execution_kind",
-            "ALTER TABLE agent_runs ADD COLUMN execution_kind TEXT",
-        ),
-        (
-            "executable_path",
-            "ALTER TABLE agent_runs ADD COLUMN executable_path TEXT",
-        ),
-        (
-            "executable_identity",
-            "ALTER TABLE agent_runs ADD COLUMN executable_identity TEXT",
-        ),
-        (
-            "policy_code",
-            "ALTER TABLE agent_runs ADD COLUMN policy_code TEXT",
-        ),
-        (
-            "failure_stage",
-            "ALTER TABLE agent_runs ADD COLUMN failure_stage TEXT",
-        ),
-    ] {
-        let exists: bool = transaction
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM pragma_table_info('agent_runs') WHERE name = ?1
-                 )",
-                [name],
-                |row| row.get(0),
-            )
-            .map_err(database_error("check agent run v14 projection column"))?;
-        if !exists {
+    for (name, statement) in AGENT_RUN_V14_EXECUTION_COLUMNS {
+        if missing_columns.contains(&name) {
             transaction
                 .execute_batch(statement)
                 .map_err(database_error("add agent run v14 projection column"))?;
         }
+    }
+    if !missing_execution_projection_columns(transaction)?.is_empty() {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v14 agent run execution projection schema",
+        });
     }
     transaction
         .execute_batch("PRAGMA user_version = 14;")
         .map_err(database_error("set SQLite v14 schema version"))
 }
 
-fn execution_projection_columns_exist(connection: &Connection) -> Result<bool, AppError> {
-    connection
-        .query_row(
-            "SELECT COUNT(*) = 5
-             FROM pragma_table_info('agent_runs')
-             WHERE name IN (
-                'execution_kind', 'executable_path', 'executable_identity',
-                'policy_code', 'failure_stage'
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(database_error("check agent run v14 projection columns"))
+fn missing_execution_projection_columns(
+    connection: &Connection,
+) -> Result<Vec<&'static str>, AppError> {
+    let columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(agent_runs)")
+            .map_err(database_error("inspect agent run v14 projection columns"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(database_error("query agent run v14 projection columns"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read agent run v14 projection columns"))?
+    };
+    let mut missing = Vec::new();
+    for (expected_name, _) in AGENT_RUN_V14_EXECUTION_COLUMNS {
+        let Some((name, declared_type, not_null)) = columns
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(expected_name))
+        else {
+            missing.push(expected_name);
+            continue;
+        };
+        let has_canonical_name = name == expected_name;
+        let has_text_type = declared_type.trim().eq_ignore_ascii_case("TEXT");
+        if !has_canonical_name || !has_text_type || *not_null != 0 {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite v14 agent run execution projection schema",
+            });
+        }
+    }
+    Ok(missing)
 }
 
 fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

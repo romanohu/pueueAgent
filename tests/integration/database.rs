@@ -326,6 +326,69 @@ fn schema_v13_with_run() -> (TempDir, PathBuf) {
     (temp, path)
 }
 
+fn schema_with_execution_projection_columns(
+    definitions: &[&str],
+    version: i64,
+) -> (TempDir, PathBuf) {
+    let (temp, path) = schema_v13_with_run();
+    let connection = Connection::open(&path).unwrap();
+    let alters = definitions
+        .iter()
+        .map(|definition| format!("ALTER TABLE agent_runs ADD COLUMN {definition};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    connection
+        .execute_batch(&format!("{alters}\nPRAGMA user_version = {version};"))
+        .unwrap();
+    drop(connection);
+    (temp, path)
+}
+
+fn execution_projection_column_info(path: &Path) -> Vec<(String, String, i64)> {
+    let connection = Connection::open(path).unwrap();
+    let mut statement = connection.prepare("PRAGMA table_info(agent_runs)").unwrap();
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    columns
+        .into_iter()
+        .filter(|(name, _, _)| {
+            [
+                "execution_kind",
+                "executable_path",
+                "executable_identity",
+                "policy_code",
+                "failure_stage",
+            ]
+            .contains(&name.as_str())
+        })
+        .collect()
+}
+
+fn assert_malformed_execution_projection_rejected(path: &Path) {
+    let error = match Db::open(path) {
+        Err(error) => error,
+        Ok(_) => panic!("malformed execution projection schema was accepted"),
+    };
+    assert!(matches!(
+        error,
+        AppError::Runtime {
+            operation: "verify SQLite v14 agent run execution projection schema"
+        }
+    ));
+    let rendered = error.render();
+    assert!(rendered.len() <= 240);
+    assert!(!rendered.contains(path.to_string_lossy().as_ref()));
+}
+
 fn open_v10_operator_log_fixture() -> (TempDir, PathBuf) {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("operator-logs-v10.sqlite3");
@@ -891,6 +954,81 @@ fn v14_adds_projection_and_preserves_v13_rows() {
             )
             .unwrap();
         assert!(exists, "missing {index}");
+    }
+}
+
+#[test]
+fn current_v14_rejects_non_nullable_execution_projection_column() {
+    let (_temp, path) = schema_with_execution_projection_columns(
+        &[
+            "execution_kind TEXT NOT NULL DEFAULT ''",
+            "executable_path TEXT",
+            "executable_identity TEXT",
+            "policy_code TEXT",
+            "failure_stage TEXT",
+        ],
+        14,
+    );
+
+    assert_malformed_execution_projection_rejected(&path);
+}
+
+#[test]
+fn current_v14_rejects_non_text_execution_projection_column() {
+    let (_temp, path) = schema_with_execution_projection_columns(
+        &[
+            "execution_kind TEXT",
+            "executable_path TEXT",
+            "executable_identity BLOB",
+            "policy_code TEXT",
+            "failure_stage TEXT",
+        ],
+        14,
+    );
+
+    assert_malformed_execution_projection_rejected(&path);
+}
+
+#[test]
+fn malformed_partial_projection_rolls_back_without_adding_missing_columns() {
+    let (_temp, path) = schema_with_execution_projection_columns(
+        &[
+            "execution_kind TEXT NOT NULL DEFAULT ''",
+            "executable_path TEXT",
+        ],
+        13,
+    );
+
+    assert_malformed_execution_projection_rejected(&path);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+    assert_eq!(
+        execution_projection_column_info(&path),
+        vec![
+            ("execution_kind".to_owned(), "TEXT".to_owned(), 1),
+            ("executable_path".to_owned(), "TEXT".to_owned(), 0),
+        ]
+    );
+}
+
+#[test]
+fn current_v14_repairs_missing_columns_when_existing_projection_shape_is_valid() {
+    let (_temp, path) = schema_with_execution_projection_columns(
+        &["execution_kind text", "executable_path TeXt"],
+        14,
+    );
+
+    Db::open(&path).unwrap();
+
+    let columns = execution_projection_column_info(&path);
+    assert_eq!(columns.len(), 5);
+    for (_, declared_type, not_null) in columns {
+        assert!(declared_type.eq_ignore_ascii_case("TEXT"));
+        assert_eq!(not_null, 0);
     }
 }
 
