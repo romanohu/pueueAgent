@@ -4519,10 +4519,11 @@ impl<'db> AgentRunRepository<'db> {
                 params![project_id, run_id],
             )
             .map_err(database_error("release interventions after agent run finalization"))?;
+        let finalized_run = read_agent_run_in_transaction(&transaction, run_id)?;
         transaction
             .commit()
             .map_err(database_error("commit agent run event finalization"))?;
-        read_agent_run(&connection, run_id)
+        Ok(finalized_run)
     }
 
     pub fn finish(
@@ -5956,6 +5957,36 @@ fn read_agent_run(connection: &Connection, run_id: i64) -> Result<AgentRun, AppE
         .map_err(database_error("read agent run"))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_FINALIZER_RESULT_READ_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn inject_finalizer_result_read_failure_once() {
+    FAIL_FINALIZER_RESULT_READ_ONCE.with(|fail| fail.set(true));
+}
+
+fn read_agent_run_in_transaction(
+    transaction: &Transaction<'_>,
+    run_id: i64,
+) -> Result<AgentRun, AppError> {
+    #[cfg(test)]
+    if FAIL_FINALIZER_RESULT_READ_ONCE.with(|fail| fail.replace(false)) {
+        return Err(AppError::Database {
+            operation: "read finalized agent run",
+            source: rusqlite::Error::QueryReturnedNoRows,
+        });
+    }
+    transaction
+        .query_row(
+            &format!("{} WHERE run_id = ?1", AGENT_RUN_SELECT),
+            [run_id],
+            agent_run_from_row,
+        )
+        .map_err(database_error("read finalized agent run"))
+}
+
 fn read_termination_request(
     connection: &Connection,
     request_id: i64,
@@ -6029,5 +6060,193 @@ fn project_constraint_error(source: rusqlite::Error) -> AppError {
     AppError::Database {
         operation: "register project",
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use rusqlite::params;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn terminal_finalizer_result_read_failure_rolls_back_and_retries() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &root,
+                "pa-project",
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+
+        let event_id = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFinished,
+                "finalizer-read-failure",
+                json!({"task_id": 41}),
+                100,
+                100,
+            ))
+            .unwrap()
+            .event_id;
+        EventRepository::new(&db).claim_batch(100, 200, 1).unwrap();
+        let intervention = InterventionRepository::new(&db)
+            .insert_pending("project-a", "retain until finalization", 100)
+            .unwrap();
+        InterventionRepository::new(&db)
+            .reserve_pending("project-a", "finalizer-read-token", 101, 201, 1, 1024)
+            .unwrap();
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events_and_reservation(
+                &NewAgentRun::new(
+                    "project-a",
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    110,
+                    PathBuf::from("/tmp/finalizer-read-failure.log"),
+                ),
+                &[event_id],
+                Some("finalizer-read-token"),
+            )
+            .unwrap();
+        let runs = AgentRunRepository::new(&db);
+        runs.mark_running_and_apply_interventions("project-a", run.run_id, 4242, 120)
+            .unwrap();
+
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE finalizer_event_mutations (count INTEGER NOT NULL);
+                 INSERT INTO finalizer_event_mutations VALUES (0);
+                 CREATE TRIGGER count_finalizer_event_mutations
+                 AFTER UPDATE OF status ON events
+                 WHEN NEW.status = 'dead_letter'
+                 BEGIN
+                     UPDATE finalizer_event_mutations SET count = count + 1;
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        inject_finalizer_result_read_failure_once();
+        let first = runs.fail_before_gate_release_with_policy(
+            "project-a",
+            run.run_id,
+            200,
+            "terminal finalizer read fault",
+            RetryPolicy { max_retries: 0 },
+        );
+        assert!(first.is_err());
+
+        let before_retry: (AgentRunStatus, EventStatus) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT agent_runs.status, events.status
+                 FROM agent_runs
+                 JOIN agent_run_events USING (project_id, run_id)
+                 JOIN events USING (project_id, event_id)
+                 WHERE agent_runs.run_id = ?1",
+                [run.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            before_retry,
+            (AgentRunStatus::Running, EventStatus::InFlight)
+        );
+        let intervention_before_retry: InterventionStatus = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM interventions WHERE intervention_id = ?1",
+                [&intervention.intervention_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intervention_before_retry, InterventionStatus::Applied);
+
+        let finalized = runs
+            .fail_before_gate_release_with_policy(
+                "project-a",
+                run.run_id,
+                200,
+                "terminal finalizer read fault",
+                RetryPolicy { max_retries: 0 },
+            )
+            .unwrap();
+        assert_eq!(finalized.status, AgentRunStatus::Failed);
+        let count: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM finalizer_event_mutations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let after_retry: (AgentRunStatus, EventStatus) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT agent_runs.status, events.status
+                 FROM agent_runs
+                 JOIN agent_run_events USING (project_id, run_id)
+                 JOIN events USING (project_id, event_id)
+                 WHERE agent_runs.run_id = ?1",
+                params![run.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after_retry,
+            (AgentRunStatus::Failed, EventStatus::DeadLetter)
+        );
+        let intervention_after_retry: (InterventionStatus, Option<i64>) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, agent_run_id FROM interventions WHERE intervention_id = ?1",
+                [&intervention.intervention_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            intervention_after_retry,
+            (InterventionStatus::Pending, None)
+        );
+        assert!(runs
+            .fail_before_gate_release_with_policy(
+                "project-a",
+                run.run_id,
+                201,
+                "must not finalize twice",
+                RetryPolicy { max_retries: 0 },
+            )
+            .is_err());
+        let count_after_rejection: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM finalizer_event_mutations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_rejection, 1);
     }
 }

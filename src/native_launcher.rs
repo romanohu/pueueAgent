@@ -166,6 +166,13 @@ impl NativeAgentChild {
         self.verified.terminal_observed()
     }
 
+    pub(crate) fn ownership_lost(&mut self) -> Result<bool, AppError> {
+        Ok(matches!(
+            self.verified.terminal_observed()?,
+            TerminalObservation::OwnershipLost
+        ))
+    }
+
     pub(crate) async fn reap_observed_terminal(
         &mut self,
     ) -> Result<std::process::ExitStatus, AppError> {
@@ -429,6 +436,15 @@ pub(crate) fn test_native_child_with_group_signal_error(
     (temporary, child)
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn test_native_child_with_ownership_loss_before_reap(
+    test_name: &str,
+) -> (tempfile::TempDir, NativeAgentChild) {
+    let (temporary, mut child) = test_native_child(test_name);
+    child.verified.inject_ownership_loss_before_reap();
+    (temporary, child)
+}
+
 #[cfg(not(unix))]
 pub struct NativeAgentChild;
 
@@ -444,6 +460,10 @@ impl NativeAgentChild {
             PolicyViolationStage::Dispatched,
         )
         .into())
+    }
+
+    pub(crate) fn ownership_lost(&mut self) -> Result<bool, AppError> {
+        Ok(false)
     }
 
     pub(crate) async fn reap_observed_terminal(

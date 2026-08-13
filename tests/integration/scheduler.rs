@@ -1,7 +1,7 @@
 use std::{fs, fs::OpenOptions, path::PathBuf, process::Command, sync::Arc};
 
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
@@ -15,7 +15,10 @@ use pueue_agent::{
         AgentContextMode, AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent,
         NewProject, NewSubmission, SubmissionStatus,
     },
-    execution_policy::{load_existing_policy, PolicyLoadInput, StartupEnvironment},
+    execution_policy::{
+        load_existing_policy, PolicyLoadInput, PolicyViolationDetail, StartupEnvironment,
+        TempUnsafeReason,
+    },
     scheduler::{build_prompt, Scheduler, SchedulerConfig},
 };
 use rusqlite::params;
@@ -1001,6 +1004,349 @@ async fn failed_finalizer_is_retried_without_losing_terminal_process_outcome() {
             .unwrap(),
         1
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_temp_cleanup_waits_for_process_reap_and_database_commit() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "terminal-temp-order");
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(handle.run_id.to_string());
+    fs::write(run_temp.join("retained-until-terminal"), b"owned").unwrap();
+
+    assert_eq!(
+        handle.wait(&harness.db, harness.now + 1).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert!(!run_temp.join("retained-until-terminal").exists());
+    assert!(run_temp.is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_database_failure_does_not_begin_temp_cleanup() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "terminal-temp-db-failure");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal_temp_finalization
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status = 'completed'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected terminal temp finalization failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(handle.run_id.to_string());
+    let retained = run_temp.join("retained-after-db-error");
+    fs::write(&retained, b"owned").unwrap();
+
+    assert!(handle.wait(&harness.db, harness.now + 1).await.is_err());
+    assert!(retained.exists());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_terminal_temp_finalization;")
+        .unwrap();
+    assert_eq!(
+        handle.wait(&harness.db, harness.now + 2).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert!(!retained.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_cleanup_failure_keeps_persisted_outcome_and_same_handle_for_retry() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "exit 0"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "terminal-temp-retry");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE terminal_finalizer_counts (
+                 kind TEXT PRIMARY KEY,
+                 count INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO terminal_finalizer_counts(kind) VALUES ('event');
+             CREATE TRIGGER count_terminal_finalizer
+             AFTER UPDATE OF status ON events
+             WHEN NEW.status = 'completed'
+             BEGIN
+                 UPDATE terminal_finalizer_counts SET count = count + 1 WHERE kind = 'event';
+             END;",
+        )
+        .unwrap();
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(handle.run_id.to_string());
+    let mut nested = run_temp.clone();
+    for index in 0..=pueue_agent::environment::MAX_PRIVATE_TEMP_CLEANUP_DEPTH + 1 {
+        nested.push(format!("level-{index}"));
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(nested.join("leaf"), b"owned").unwrap();
+    let overflow_subtree = nested.parent().unwrap().to_path_buf();
+    let generation_identity = fs::metadata(&run_temp).unwrap();
+    assert!(nested.is_dir());
+
+    let first_cleanup_error = handle.wait(&harness.db, harness.now + 1).await.unwrap_err();
+    assert!(matches!(
+        first_cleanup_error,
+        pueue_agent::AppError::PolicyViolation { violation }
+            if violation.detail
+                == PolicyViolationDetail::TempUnsafe(TempUnsafeReason::DepthLimit)
+    ));
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert!(!process_exists(handle.pid as i32));
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM terminal_finalizer_counts WHERE kind = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(run_temp.join("level-0").is_dir());
+    assert_eq!(handle.poll(&harness.db, harness.now + 1).await.unwrap(), None);
+
+    fs::remove_dir_all(overflow_subtree).unwrap();
+    assert_eq!(
+        handle.wait(&harness.db, harness.now + 2).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert!(run_temp.is_dir());
+    let retried_identity = fs::metadata(&run_temp).unwrap();
+    assert_eq!(
+        (generation_identity.dev(), generation_identity.ino()),
+        (retried_identity.dev(), retried_identity.ino())
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM terminal_finalizer_counts WHERE kind = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bound_spawn_cleanup_finalizes_database_before_reclaiming_temp() {
+    let harness = SchedulerHarness::new();
+    // Scheduler fixtures enroll the configured /bin/sh command as a generated
+    // Rust target before launch; no ambient shell is executed by this test.
+    harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "bound-temp-order");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE bound_finalizer_counts (
+                 kind TEXT PRIMARY KEY,
+                 count INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO bound_finalizer_counts(kind) VALUES ('event');
+             CREATE TRIGGER count_bound_finalizer
+             AFTER UPDATE OF status ON events
+             WHEN NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 UPDATE bound_finalizer_counts SET count = count + 1 WHERE kind = 'event';
+             END;
+             CREATE TRIGGER reject_bound_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected bound dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_bound_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status = 'dead_letter'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected bound finalizer failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    let error = scheduler.tick().await.unwrap_err();
+    let (mut report, _error) = error.into_parts();
+    assert_eq!(report.cleanup.len(), 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    assert_eq!(harness.active_runs("project-a"), 1);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM bound_finalizer_counts WHERE kind = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+
+    let run_id = report.cleanup[0].run_id();
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(run_id.to_string());
+    let retained = run_temp.join("created-after-db-failure");
+    fs::write(&retained, b"owned").unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_bound_finalizer;")
+        .unwrap();
+
+    let mut nested = run_temp.clone();
+    for index in 0..=pueue_agent::environment::MAX_PRIVATE_TEMP_CLEANUP_DEPTH + 1 {
+        nested.push(format!("level-{index}"));
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(nested.join("leaf"), b"owned").unwrap();
+    let overflow_subtree = nested.parent().unwrap().to_path_buf();
+    let generation_identity = fs::metadata(&run_temp).unwrap();
+
+    assert!(report.cleanup[0]
+        .retry(&harness.db, harness.now + 1)
+        .await
+        .is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM bound_finalizer_counts WHERE kind = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(retained.exists());
+    assert!(run_temp.join("level-0").is_dir());
+
+    fs::remove_dir_all(overflow_subtree).unwrap();
+    report.cleanup[0].retry(&harness.db, harness.now + 2).await.unwrap();
+    assert!(!retained.exists());
+    assert!(run_temp.is_dir());
+    let retried_identity = fs::metadata(&run_temp).unwrap();
+    assert_eq!(
+        (generation_identity.dev(), generation_identity.ino()),
+        (retried_identity.dev(), retried_identity.ino())
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count FROM bound_finalizer_counts WHERE kind = 'event'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_poll_ownership_loss_retains_run_and_temp_authority() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "poll-ownership-loss");
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(handle.run_id.to_string());
+    let retained = run_temp.join("must-remain-on-ownership-loss");
+    fs::write(&retained, b"owned").unwrap();
+
+    externally_reap_owned_group(handle.pid).await;
+    assert!(handle.poll(&harness.db, harness.now + 1).await.is_err());
+    assert!(handle
+        .timeout_now(&harness.db, harness.now + 2)
+        .await
+        .is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    assert_eq!(harness.active_runs("project-a"), 1);
+    assert!(retained.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_wait_ownership_loss_retains_run_and_temp_authority() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "wait-ownership-loss");
+    let mut scheduler = harness.scheduler();
+    let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(handle.run_id.to_string());
+    let retained = run_temp.join("must-remain-on-ownership-loss");
+    fs::write(&retained, b"owned").unwrap();
+
+    externally_reap_owned_group(handle.pid).await;
+    assert!(handle.wait(&harness.db, harness.now + 1).await.is_err());
+    assert!(handle
+        .timeout_now(&harness.db, harness.now + 2)
+        .await
+        .is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    assert_eq!(harness.active_runs("project-a"), 1);
+    assert!(retained.exists());
 }
 
 #[cfg(unix)]
@@ -2274,6 +2620,37 @@ fn process_exists(pid: i32) -> bool {
         fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
     }
     unsafe { kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+async fn externally_reap_owned_group(pid: i64) {
+    unsafe extern "C" {
+        fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
+        fn waitpid(
+            pid: std::os::raw::c_int,
+            status: *mut std::os::raw::c_int,
+            options: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+    }
+    let pid = i32::try_from(pid).unwrap();
+    assert_eq!(unsafe { kill(-pid, 9) }, 0);
+    const WNOHANG: std::os::raw::c_int = 1;
+    let mut status = 0;
+    for _ in 0..200 {
+        let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
+        if waited == pid {
+            return;
+        }
+        if waited < 0 {
+            let code = std::io::Error::last_os_error().raw_os_error();
+            if matches!(code, Some(3) | Some(10)) {
+                return;
+            }
+            panic!("waitpid failed while reaping test child: {code:?}");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("test child was not reaped before the bounded deadline");
 }
 
 #[cfg(unix)]

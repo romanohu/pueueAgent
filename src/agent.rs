@@ -95,6 +95,8 @@ pub struct AgentHandle {
     pub log_path: PathBuf,
     pub retry_policy: RetryPolicy,
     terminal_outcome: Option<TerminalOutcome>,
+    terminal_persistence: TerminalPersistence,
+    process_proof: ProcessProof,
 }
 
 enum RetainedLaunchAuthority {
@@ -213,6 +215,7 @@ enum BoundCleanupKind {
         child: NativeAgentChild,
         retained_authority: RetainedLaunchAuthority,
         terminated: bool,
+        finalized: bool,
     },
     PendingMarker,
 }
@@ -265,13 +268,33 @@ impl BoundCleanupHandle {
                 *terminated = true;
             }
         }
-        let scoped_db = deadline_scoped_db(db, deadline)?;
-        self.intent.finalize(
-            scoped_db.as_ref().unwrap_or(db),
-            &self.project_id,
-            self.run_id,
-            finished_at,
-        )?;
+        let needs_finalization = matches!(
+            &self.kind,
+            BoundCleanupKind::LiveChild {
+                finalized: false,
+                ..
+            }
+        ) || matches!(&self.kind, BoundCleanupKind::PendingMarker);
+        if needs_finalization {
+            let scoped_db = deadline_scoped_db(db, deadline)?;
+            self.intent.finalize(
+                scoped_db.as_ref().unwrap_or(db),
+                &self.project_id,
+                self.run_id,
+                finished_at,
+            )?;
+            if let BoundCleanupKind::LiveChild { finalized, .. } = &mut self.kind {
+                *finalized = true;
+            }
+        }
+        if let BoundCleanupKind::LiveChild {
+            retained_authority: RetainedLaunchAuthority::Retained { temp, .. },
+            ..
+        } = &mut self.kind
+        {
+            temp.cleanup_contents_before(deadline.map(Instant::into_std))
+                .map_err(AppError::from)?;
+        }
         if let BoundCleanupKind::LiveChild {
             retained_authority,
             ..
@@ -281,6 +304,18 @@ impl BoundCleanupHandle {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+enum TerminalPersistence {
+    Pending,
+    Persisted(AgentRunStatus),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessProof {
+    Owned,
+    OwnershipLost,
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +705,8 @@ impl AgentRunner {
             log_path,
             retry_policy,
             terminal_outcome: None,
+            terminal_persistence: TerminalPersistence::Pending,
+            process_proof: ProcessProof::Owned,
         })
     }
 }
@@ -829,6 +866,7 @@ async fn resolve_live_child_failure(
             child,
             retained_authority,
             terminated,
+            finalized: false,
         },
     };
 
@@ -1040,6 +1078,44 @@ fn resolve_post_marker_failure(
 }
 
 impl AgentHandle {
+    fn ownership_lost_error() -> AppError {
+        AppError::Runtime {
+            operation: "native child ownership was lost before process-group reap",
+        }
+    }
+
+    fn mark_ownership_lost(&mut self) -> AppError {
+        self.process_proof = ProcessProof::OwnershipLost;
+        Self::ownership_lost_error()
+    }
+
+    fn classify_reap_error(&mut self, error: AppError) -> AppError {
+        let ownership_lost = self.child.ownership_lost().unwrap_or(false);
+        if ownership_lost {
+            self.mark_ownership_lost()
+        } else {
+            error
+        }
+    }
+
+    fn reject_ownership_lost(&self) -> Result<(), AppError> {
+        if self.process_proof == ProcessProof::OwnershipLost {
+            return Err(Self::ownership_lost_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_pending(&self) -> bool {
+        matches!(self.terminal_persistence, TerminalPersistence::Persisted(_))
+            && matches!(&self.retained_authority, RetainedLaunchAuthority::Retained { .. })
+    }
+
+    // Consumed by daemon admission blocking in Task 3.
+    #[allow(dead_code)]
+    pub(crate) fn cleanup_blocked_project(&self) -> Option<&str> {
+        self.cleanup_pending().then_some(self.project_id.as_str())
+    }
+
     fn finalize_terminal_outcome(
         &self,
         db: &crate::db::Db,
@@ -1058,21 +1134,41 @@ impl AgentHandle {
         Ok(outcome.status)
     }
 
-    fn finalize_stored_outcome(
+    fn persist_terminal_outcome(
         &mut self,
         db: &crate::db::Db,
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
+        if let TerminalPersistence::Persisted(status) = &self.terminal_persistence {
+            return Ok(*status);
+        }
         let Some(outcome) = self.terminal_outcome.as_ref() else {
             return Err(AppError::Runtime {
                 operation: "finalize missing agent process outcome",
             });
         };
         let status = self.finalize_terminal_outcome(db, now, outcome)?;
+        self.terminal_persistence = TerminalPersistence::Persisted(status);
+        Ok(status)
+    }
+
+    fn retry_terminal_cleanup(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<AgentRunStatus, AppError> {
+        let status = match &self.terminal_persistence {
+            TerminalPersistence::Pending => {
+                return Err(AppError::Runtime {
+                    operation: "cleanup agent process before terminal persistence",
+                });
+            }
+            TerminalPersistence::Persisted(status) => *status,
+        };
+        if let RetainedLaunchAuthority::Retained { temp, .. } = &mut self.retained_authority {
+            temp.cleanup_contents_before(deadline.map(Instant::into_std))
+                .map_err(AppError::from)?;
+        }
         // Release retained launch authority only after terminal persistence.
-        // PrivateRunTemp's descriptor-safe deletion remains intentionally
-        // deferred by its owner; dropping the handle never mutates a replaced
-        // pathname generation.
         let retained = std::mem::replace(
             &mut self.retained_authority,
             RetainedLaunchAuthority::Released,
@@ -1089,6 +1185,15 @@ impl AgentHandle {
         Ok(status)
     }
 
+    fn finalize_stored_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<AgentRunStatus, AppError> {
+        self.persist_terminal_outcome(db, now)?;
+        self.retry_terminal_cleanup(None)
+    }
+
     fn finalize_stored_outcome_before(
         &mut self,
         db: &crate::db::Db,
@@ -1096,7 +1201,9 @@ impl AgentHandle {
         deadline: Instant,
     ) -> Result<AgentRunStatus, AppError> {
         let scoped_db = deadline_scoped_db(db, Some(deadline))?;
-        self.finalize_stored_outcome(scoped_db.as_ref().expect("deadline-scoped database"), now)
+        let db = scoped_db.as_ref().expect("deadline-scoped database");
+        self.persist_terminal_outcome(db, now)?;
+        self.retry_terminal_cleanup(Some(deadline))
     }
 
     fn store_outcome(
@@ -1111,45 +1218,68 @@ impl AgentHandle {
         self.finalize_stored_outcome(db, now)
     }
 
+    fn poll_finalize_stored_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<Option<AgentRunStatus>, AppError> {
+        match self.finalize_stored_outcome(db, now) {
+            Ok(status) => Ok(Some(status)),
+            Err(_error) if self.cleanup_pending() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn poll_store_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+        outcome: TerminalOutcome,
+    ) -> Result<Option<AgentRunStatus>, AppError> {
+        match self.store_outcome(db, now, outcome) {
+            Ok(status) => Ok(Some(status)),
+            Err(_error) if self.cleanup_pending() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn poll(
         &mut self,
         db: &crate::db::Db,
         now: i64,
     ) -> Result<Option<AgentRunStatus>, AppError> {
+        self.reject_ownership_lost()?;
         if self.terminal_outcome.is_some() {
-            return self.finalize_stored_outcome(db, now).map(Some);
+            return self.poll_finalize_stored_outcome(db, now);
         }
 
         if Instant::now() >= self.timeout_deadline {
             self.child.terminate().await?;
-            return self
-                .store_outcome(
-                    db,
-                    now,
-                    TerminalOutcome {
-                        status: AgentRunStatus::TimedOut,
-                        exit_code: None,
-                        last_error: Some("agent timed out".to_owned()),
-                    },
-                )
-                .map(Some);
+            return self.poll_store_outcome(
+                db,
+                now,
+                TerminalOutcome {
+                    status: AgentRunStatus::TimedOut,
+                    exit_code: None,
+                    last_error: Some("agent timed out".to_owned()),
+                },
+            );
         }
 
         let exit = match self.child.terminal_observed() {
-            Ok(TerminalObservation::Terminal) => self.child.reap_observed_terminal().await?,
+            Ok(TerminalObservation::Terminal) => {
+                match self.child.reap_observed_terminal().await {
+                    Ok(exit) => exit,
+                    Err(error) => return Err(self.classify_reap_error(error)),
+                }
+            }
             Ok(TerminalObservation::Running) => return Ok(None),
             Ok(TerminalObservation::OwnershipLost) => {
-                return self
-                    .store_outcome(
-                        db,
-                        now,
-                        TerminalOutcome {
-                            status: AgentRunStatus::Failed,
-                            exit_code: None,
-                            last_error: Some("native child ownership was lost before reaping".to_owned()),
-                        },
-                    )
-                    .map(Some);
+                // ECHILD only proves that this process no longer owns the
+                // leader. It does not prove that the process group is
+                // drained, so retain the unresolved handle and all of its
+                // cleanup authority rather than persisting or signalling.
+                return Err(self.mark_ownership_lost());
             }
             Err(source) => {
                 // An unknown observation failure is not a terminal outcome.
@@ -1172,7 +1302,7 @@ impl AgentHandle {
                 |code| format!("agent exited with code {code}"),
             )
         });
-        self.store_outcome(
+        self.poll_store_outcome(
             db,
             now,
             TerminalOutcome {
@@ -1181,7 +1311,6 @@ impl AgentHandle {
                 last_error,
             },
         )
-        .map(Some)
     }
 
     pub async fn wait(
@@ -1189,6 +1318,7 @@ impl AgentHandle {
         db: &crate::db::Db,
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
+        self.reject_ownership_lost()?;
         if self.terminal_outcome.is_some() {
             return self.finalize_stored_outcome(db, now);
         }
@@ -1221,18 +1351,8 @@ impl AgentHandle {
                     },
                 )
             }
-            Ok(Ok(None)) => {
-                self.store_outcome(
-                    db,
-                    now,
-                    TerminalOutcome {
-                        status: AgentRunStatus::Failed,
-                        exit_code: None,
-                        last_error: Some("native child ownership was lost before reaping".to_owned()),
-                    },
-                )
-            }
-            Ok(Err(source)) => Err(source),
+            Ok(Ok(None)) => Err(self.mark_ownership_lost()),
+            Ok(Err(source)) => Err(self.classify_reap_error(source)),
             Err(_) => {
                 self.child.terminate().await?;
                 self.store_outcome(
@@ -1253,6 +1373,7 @@ impl AgentHandle {
         db: &crate::db::Db,
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
+        self.reject_ownership_lost()?;
         if self.terminal_outcome.is_some() {
             return self.finalize_stored_outcome(db, now);
         }
@@ -1275,6 +1396,7 @@ impl AgentHandle {
         now: i64,
         deadline: Instant,
     ) -> Result<AgentRunStatus, AppError> {
+        self.reject_ownership_lost()?;
         if self.terminal_outcome.is_some() {
             return self.finalize_stored_outcome_before(db, now, deadline);
         }
@@ -1390,6 +1512,8 @@ mod tests {
             log_path: root.join(".pueue-agent/logs/agent-handle.log"),
             retry_policy: RetryPolicy { max_retries: 1 },
             terminal_outcome: None,
+            terminal_persistence: TerminalPersistence::Pending,
+            process_proof: ProcessProof::Owned,
         };
 
         assert!(handle.timeout_now(&db, 2).await.is_err());
@@ -1412,6 +1536,339 @@ mod tests {
             handle.timeout_now(&db, 3).await.unwrap(),
             AgentRunStatus::TimedOut,
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ownership_loss_remains_sticky_across_timeout_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
+                "project-a",
+                &root,
+                "pa-project-a",
+                root.join(".pueue-agent/config.toml"),
+                1,
+            ))
+            .unwrap();
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
+                "project-a",
+                crate::models::EventKind::TaskFailed,
+                "ownership-loss-sticky",
+                serde_json::json!({}),
+                1,
+                1,
+            ))
+            .unwrap();
+        crate::db::EventRepository::new(&db)
+            .claim_batch(1, 100, 1)
+            .unwrap();
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events_and_reservation(
+                &NewAgentRun::new(
+                    "project-a",
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    1,
+                    root.join(".pueue-agent/logs/agent-handle.log"),
+                ),
+                &[event.event_id],
+                None,
+            )
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 1)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_gate_release_requested("project-a", run.run_id)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .acknowledge_dispatch("project-a", run.run_id)
+            .unwrap();
+        let (_child_root, child) =
+            crate::native_launcher::test_native_child_with_group_signal_error(
+                "agent::tests::timeout_retry_subprocess",
+            );
+        let pid = child.id();
+        let mut handle = AgentHandle {
+            project_id: "project-a".to_owned(),
+            run_id: run.run_id,
+            pid,
+            child,
+            retained_authority: RetainedLaunchAuthority::Test,
+            timeout_deadline: Instant::now() + Duration::from_secs(10),
+            log_path: root.join(".pueue-agent/logs/agent-handle.log"),
+            retry_policy: RetryPolicy { max_retries: 1 },
+            terminal_outcome: None,
+            terminal_persistence: TerminalPersistence::Pending,
+            process_proof: ProcessProof::Owned,
+        };
+
+        unsafe extern "C" {
+            fn kill(pid: libc::pid_t, signal: libc::c_int) -> libc::c_int;
+            fn waitpid(
+                pid: libc::pid_t,
+                status: *mut libc::c_int,
+                options: libc::c_int,
+            ) -> libc::pid_t;
+        }
+        let group = libc::pid_t::try_from(pid).unwrap();
+        assert_eq!(unsafe { kill(-group, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        let mut ownership_disproved = false;
+        for _ in 0..200 {
+            let waited = unsafe { waitpid(group, &mut status, libc::WNOHANG) };
+            if waited == group {
+                ownership_disproved = true;
+                break;
+            }
+            if waited < 0 {
+                let code = std::io::Error::last_os_error().raw_os_error();
+                assert!(matches!(code, Some(libc::ECHILD) | Some(libc::ESRCH)));
+                ownership_disproved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            ownership_disproved,
+            "child ownership was not disproved before the deadline"
+        );
+
+        let ownership_lost = |error: AppError| {
+            assert!(matches!(
+                error,
+                AppError::Runtime {
+                    operation: "native child ownership was lost before process-group reap"
+                }
+            ));
+        };
+        ownership_lost(handle.wait(&db, 2).await.unwrap_err());
+        ownership_lost(handle.timeout_now(&db, 3).await.unwrap_err());
+        ownership_lost(
+            handle
+                .timeout_now_before(&db, 4, Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap_err(),
+        );
+        assert!(handle.terminal_outcome.is_none());
+        assert!(matches!(
+            handle.terminal_persistence,
+            TerminalPersistence::Pending
+        ));
+        assert_eq!(
+            AgentRunRepository::new(&db)
+                .find_active_by_project("project-a")
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Running,
+        );
+        assert_eq!(
+            crate::db::EventRepository::new(&db)
+                .find_by_id(event.event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::EventStatus::Dispatched,
+        );
+    }
+
+    #[cfg(unix)]
+    fn ownership_loss_between_observation_fixture(
+        child_fixture: (tempfile::TempDir, NativeAgentChild),
+        dedup_key: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::db::Db,
+        i64,
+        AgentHandle,
+    ) {
+        let (child_temp, child) = child_fixture;
+        let project_temp = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&project_temp.path().join("state.sqlite3")).unwrap();
+        let root = project_temp.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
+                "project-a",
+                &root,
+                "pa-project-a",
+                root.join(".pueue-agent/config.toml"),
+                1,
+            ))
+            .unwrap();
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
+                "project-a",
+                crate::models::EventKind::TaskFailed,
+                dedup_key,
+                serde_json::json!({}),
+                1,
+                1,
+            ))
+            .unwrap();
+        crate::db::EventRepository::new(&db)
+            .claim_batch(1, 100, 1)
+            .unwrap();
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events_and_reservation(
+                &NewAgentRun::new(
+                    "project-a",
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    1,
+                    root.join(".pueue-agent/logs/agent-handle.log"),
+                ),
+                &[event.event_id],
+                None,
+            )
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 1)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_gate_release_requested("project-a", run.run_id)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .acknowledge_dispatch("project-a", run.run_id)
+            .unwrap();
+        let pid = child.id();
+        let handle = AgentHandle {
+            project_id: "project-a".to_owned(),
+            run_id: run.run_id,
+            pid,
+            child,
+            retained_authority: RetainedLaunchAuthority::Test,
+            timeout_deadline: Instant::now() + Duration::from_secs(10),
+            log_path: root.join(".pueue-agent/logs/agent-handle.log"),
+            retry_policy: RetryPolicy { max_retries: 1 },
+            terminal_outcome: None,
+            terminal_persistence: TerminalPersistence::Pending,
+            process_proof: ProcessProof::Owned,
+        };
+        (project_temp, child_temp, db, event.event_id, handle)
+    }
+
+    #[cfg(unix)]
+    async fn reap_fixture_child(pid: i64) {
+        unsafe extern "C" {
+            fn waitpid(
+                pid: libc::pid_t,
+                status: *mut libc::c_int,
+                options: libc::c_int,
+            ) -> libc::pid_t;
+        }
+        let pid = libc::pid_t::try_from(pid).unwrap();
+        let mut status = 0;
+        for _ in 0..200 {
+            let waited = unsafe { waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                return;
+            }
+            if waited < 0 {
+                let code = std::io::Error::last_os_error().raw_os_error();
+                assert!(matches!(code, Some(libc::ECHILD) | Some(libc::ESRCH)));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fixture child was not reaped before the bounded deadline");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poll_reap_ownership_loss_remains_sticky_across_timeout_paths() {
+        let (_project_temp, _child_temp, db, event_id, mut handle) =
+            ownership_loss_between_observation_fixture(
+                crate::native_launcher::test_native_child_with_ownership_loss_before_reap(
+                    "agent::tests::terminal_retry_subprocess",
+                ),
+                "poll-reap-ownership-loss",
+            );
+        let error = handle.poll(&db, 2).await.unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "native child ownership was lost before process-group reap"
+            }
+        ));
+        assert!(handle.timeout_now(&db, 3).await.is_err());
+        assert!(handle
+            .timeout_now_before(&db, 4, Instant::now() + Duration::from_secs(2))
+            .await
+            .is_err());
+        assert!(handle.terminal_outcome.is_none());
+        assert_eq!(
+            AgentRunRepository::new(&db)
+                .find_active_by_project("project-a")
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Running,
+        );
+        assert_eq!(
+            crate::db::EventRepository::new(&db)
+                .find_by_id(event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::EventStatus::Dispatched,
+        );
+        let pid = handle.pid;
+        drop(handle);
+        reap_fixture_child(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_reap_ownership_loss_remains_sticky_across_timeout_paths() {
+        let (_project_temp, _child_temp, db, event_id, mut handle) =
+            ownership_loss_between_observation_fixture(
+                crate::native_launcher::test_native_child_with_ownership_loss_before_reap(
+                    "agent::tests::terminal_retry_subprocess",
+                ),
+                "wait-reap-ownership-loss",
+            );
+        let error = handle.wait(&db, 2).await.unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "native child ownership was lost before process-group reap"
+            }
+        ));
+        assert!(handle.timeout_now(&db, 3).await.is_err());
+        assert!(handle
+            .timeout_now_before(&db, 4, Instant::now() + Duration::from_secs(2))
+            .await
+            .is_err());
+        assert!(handle.terminal_outcome.is_none());
+        assert_eq!(
+            AgentRunRepository::new(&db)
+                .find_active_by_project("project-a")
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Running,
+        );
+        assert_eq!(
+            crate::db::EventRepository::new(&db)
+                .find_by_id(event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::EventStatus::Dispatched,
+        );
+        let pid = handle.pid;
+        drop(handle);
+        reap_fixture_child(pid).await;
     }
 
     #[tokio::test]
@@ -1476,6 +1933,7 @@ mod tests {
                 child,
                 retained_authority: RetainedLaunchAuthority::Test,
                 terminated: false,
+                finalized: false,
             },
         };
 
@@ -1589,6 +2047,8 @@ mod tests {
             log_path: root.join(".pueue-agent/logs/agent-handle.log"),
             retry_policy: RetryPolicy { max_retries: 1 },
             terminal_outcome: None,
+            terminal_persistence: TerminalPersistence::Pending,
+            process_proof: ProcessProof::Owned,
         };
 
         let deadline = Instant::now() + Duration::from_secs(2);

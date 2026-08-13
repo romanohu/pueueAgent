@@ -580,6 +580,8 @@ pub struct VerifiedChild {
     exec_confirmed: bool,
     #[cfg(test)]
     injected_group_signal_error: bool,
+    #[cfg(test)]
+    force_ownership_loss_before_reap: bool,
 }
 
 #[cfg(unix)]
@@ -591,6 +593,11 @@ impl VerifiedChild {
     #[cfg(test)]
     pub(crate) fn inject_group_signal_error(&mut self) {
         self.injected_group_signal_error = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_ownership_loss_before_reap(&mut self) {
+        self.force_ownership_loss_before_reap = true;
     }
 
     fn observation_error(
@@ -665,6 +672,10 @@ impl VerifiedChild {
     }
 
     pub(crate) async fn reap_observed_terminal(&mut self) -> Result<ExitStatus, AppError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.force_ownership_loss_before_reap) {
+            self.process_group.release();
+        }
         if self.terminal_observed()? != TerminalObservation::Terminal {
             return Err(AppError::Runtime {
                 operation: "reap verified child before terminal observation",
@@ -826,6 +837,7 @@ pub(crate) fn test_running_verified_child(test_name: &str) -> Result<VerifiedChi
         released: false,
         exec_confirmed: false,
         injected_group_signal_error: false,
+        force_ownership_loss_before_reap: false,
     })
 }
 
@@ -1933,6 +1945,8 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
         exec_confirmed: false,
         #[cfg(test)]
         injected_group_signal_error: false,
+        #[cfg(test)]
+        force_ownership_loss_before_reap: false,
     })
 }
 
@@ -3278,6 +3292,7 @@ mod tests {
             released: true,
             exec_confirmed: true,
             injected_group_signal_error: false,
+            force_ownership_loss_before_reap: false,
         }
     }
 
