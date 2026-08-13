@@ -19,6 +19,7 @@ pub mod init;
 pub mod interventions;
 pub mod logs;
 pub mod models;
+pub mod native_launcher;
 pub mod output;
 pub mod paths;
 pub mod periodic;

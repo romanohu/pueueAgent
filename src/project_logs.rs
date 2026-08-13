@@ -27,7 +27,7 @@ use std::os::unix::io::AsRawFd;
 use crate::execution_policy::ProjectRootAnchor;
 
 #[cfg(test)]
-use std::sync::Mutex;
+use std::cell::Cell;
 
 const AGENT_DIRECTORY_MODE: u32 = 0o700;
 const AGENT_FILE_MODE: u32 = 0o600;
@@ -51,11 +51,13 @@ enum MarkerIoStage {
 }
 
 #[cfg(test)]
-static TEST_MARKER_FAILURE: Mutex<Option<MarkerIoFailure>> = Mutex::new(None);
+thread_local! {
+    static TEST_MARKER_FAILURE: Cell<Option<MarkerIoFailure>> = const { Cell::new(None) };
+}
 
 #[cfg(test)]
 pub(crate) fn set_test_marker_failure(failure: Option<MarkerIoFailure>) {
-    *TEST_MARKER_FAILURE.lock().unwrap() = failure;
+    TEST_MARKER_FAILURE.with(|slot| slot.set(failure));
 }
 
 #[cfg(test)]
@@ -66,13 +68,14 @@ fn take_test_marker_failure(stage: MarkerIoStage) -> Option<io::Error> {
         MarkerIoStage::BeforePublish => MarkerIoFailure::BeforePublish,
         MarkerIoStage::DirectorySync => MarkerIoFailure::DirectorySync,
     };
-    let mut failure = TEST_MARKER_FAILURE.lock().unwrap();
-    if *failure == Some(expected) {
-        *failure = None;
-        Some(io::Error::new(io::ErrorKind::Other, "injected marker I/O failure"))
-    } else {
-        None
-    }
+    TEST_MARKER_FAILURE.with(|slot| {
+        if slot.get() == Some(expected) {
+            slot.set(None);
+            Some(io::Error::new(io::ErrorKind::Other, "injected marker I/O failure"))
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(not(test))]
