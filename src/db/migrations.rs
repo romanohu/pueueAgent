@@ -4,7 +4,7 @@ use crate::AppError;
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 13;
+pub const LATEST_SCHEMA_VERSION: i64 = 14;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -46,6 +46,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let current_schema_has_composite_origin_foreign_key =
         version == LATEST_SCHEMA_VERSION
             && submissions_have_composite_origin_foreign_key(connection)?;
+    let current_schema_has_execution_projection =
+        version == LATEST_SCHEMA_VERSION && execution_projection_columns_exist(connection)?;
     if version == LATEST_SCHEMA_VERSION {
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -66,6 +68,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
                 compact_sql(sql) == compact_sql(EVENTS_PROJECT_STATUS_NOT_BEFORE_INDEX_SQL)
             });
         if current_schema_has_composite_origin_foreign_key
+            && current_schema_has_execution_projection
             && has_canonical_event_status_not_before_index
         {
             return Ok(());
@@ -423,8 +426,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version <= 12 {
         migrate_events_to_v13(&transaction)?;
     }
-    if version == LATEST_SCHEMA_VERSION {
+    if version >= 13 {
         verify_events_v13(&transaction, EVENTS_V13_STATUS_LIST)?;
+    }
+    if version <= 13 || !execution_projection_columns_exist(&transaction)? {
+        migrate_agent_run_execution_projection_to_v14(&transaction)?;
     }
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
@@ -442,6 +448,66 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         .map_err(database_error("commit SQLite migration"))?;
 
     Ok(())
+}
+
+fn migrate_agent_run_execution_projection_to_v14(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    for (name, statement) in [
+        (
+            "execution_kind",
+            "ALTER TABLE agent_runs ADD COLUMN execution_kind TEXT",
+        ),
+        (
+            "executable_path",
+            "ALTER TABLE agent_runs ADD COLUMN executable_path TEXT",
+        ),
+        (
+            "executable_identity",
+            "ALTER TABLE agent_runs ADD COLUMN executable_identity TEXT",
+        ),
+        (
+            "policy_code",
+            "ALTER TABLE agent_runs ADD COLUMN policy_code TEXT",
+        ),
+        (
+            "failure_stage",
+            "ALTER TABLE agent_runs ADD COLUMN failure_stage TEXT",
+        ),
+    ] {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('agent_runs') WHERE name = ?1
+                 )",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check agent run v14 projection column"))?;
+        if !exists {
+            transaction
+                .execute_batch(statement)
+                .map_err(database_error("add agent run v14 projection column"))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 14;")
+        .map_err(database_error("set SQLite v14 schema version"))
+}
+
+fn execution_projection_columns_exist(connection: &Connection) -> Result<bool, AppError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) = 5
+             FROM pragma_table_info('agent_runs')
+             WHERE name IN (
+                'execution_kind', 'executable_path', 'executable_identity',
+                'policy_code', 'failure_stage'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check agent run v14 projection columns"))
 }
 
 fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

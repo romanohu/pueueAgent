@@ -211,6 +211,11 @@ struct RunSummary {
     status: Option<String>,
     started_at: i64,
     submissions: Vec<SubmissionSummary>,
+    execution_kind: Option<String>,
+    executable_path: Option<String>,
+    executable_identity: Option<String>,
+    policy_code: Option<String>,
+    failure_stage: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -472,6 +477,11 @@ impl From<&RunLineage> for RunSummary {
                 .iter()
                 .map(SubmissionSummary::from)
                 .collect(),
+            execution_kind: lineage.execution_kind.clone(),
+            executable_path: lineage.executable_path.clone(),
+            executable_identity: lineage.executable_identity.clone(),
+            policy_code: lineage.policy_code.clone(),
+            failure_stage: lineage.failure_stage.clone(),
         }
     }
 }
@@ -494,7 +504,7 @@ mod tests {
         models::{SubmissionKind, SubmissionStatus},
     };
 
-    use super::{collect_fresh, FollowCursor};
+    use super::{collect_fresh, FollowCursor, RunSummary};
 
     fn lineage(run_id: i64, started_at: i64, submission_ids: &[&str]) -> RunLineage {
         RunLineage {
@@ -515,6 +525,11 @@ mod tests {
                     pueue_task_id: None,
                 })
                 .collect(),
+            execution_kind: None,
+            executable_path: None,
+            executable_identity: None,
+            policy_code: None,
+            failure_stage: None,
         }
     }
 
@@ -528,6 +543,11 @@ mod tests {
             run_status: None,
             started_at,
             submissions: Vec::new(),
+            execution_kind: None,
+            executable_path: None,
+            executable_identity: None,
+            policy_code: None,
+            failure_stage: None,
         }
     }
 
@@ -588,6 +608,11 @@ mod tests {
                     pueue_task_id: None,
                 })
                 .collect(),
+            execution_kind: None,
+            executable_path: None,
+            executable_identity: None,
+            policy_code: None,
+            failure_stage: None,
         };
         let mut cursor = FollowCursor::default();
 
@@ -630,5 +655,27 @@ mod tests {
         };
         let third = collect_fresh(vec![updated], &mut cursor, 1);
         assert_eq!(third[0].submissions[0].pueue_task_id, Some(7));
+    }
+
+    #[test]
+    fn run_summary_serializes_only_execution_audit_facts() {
+        let lineage = RunLineage {
+            execution_kind: Some("custom".to_owned()),
+            executable_path: Some("/trusted/bin/agent".to_owned()),
+            executable_identity: Some("device=3;inode=4".to_owned()),
+            policy_code: Some("anchor_replaced".to_owned()),
+            failure_stage: Some("post_marker".to_owned()),
+            ..lineage(7, 100, &[])
+        };
+
+        let serialized = serde_json::to_value(RunSummary::from(&lineage)).unwrap();
+        assert_eq!(serialized["execution_kind"], "custom");
+        assert_eq!(serialized["executable_path"], "/trusted/bin/agent");
+        assert_eq!(serialized["executable_identity"], "device=3;inode=4");
+        assert_eq!(serialized["policy_code"], "anchor_replaced");
+        assert_eq!(serialized["failure_stage"], "post_marker");
+        for absent in ["prompt", "argv", "environment", "credentials"] {
+            assert!(serialized.get(absent).is_none(), "unexpected {absent}");
+        }
     }
 }

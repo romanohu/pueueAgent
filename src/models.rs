@@ -9,6 +9,8 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::AppError;
+
 #[derive(Debug)]
 pub struct ModelEnumParseError {
     enum_name: &'static str,
@@ -540,6 +542,89 @@ impl NewBatchRequest {
     }
 }
 
+/// The bounded, non-secret execution facts retained for an agent run.
+///
+/// This projection deliberately contains no command line, prompt, or
+/// environment data. The database stores it as three nullable text columns so
+/// runs created by older callers remain readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionProjection {
+    execution_kind: String,
+    executable_path: String,
+    executable_identity: String,
+}
+
+impl ExecutionProjection {
+    pub fn new(
+        execution_kind: impl AsRef<str>,
+        executable_path: impl AsRef<str>,
+        executable_identity: impl AsRef<str>,
+    ) -> Result<Self, AppError> {
+        let execution_kind = execution_kind.as_ref();
+        if !matches!(execution_kind, "codex" | "custom") {
+            return Err(AppError::Validation {
+                field: "execution_kind",
+                message: "must be codex or custom",
+            });
+        }
+
+        let executable_path = executable_path.as_ref();
+        validate_execution_fact(
+            "executable_path",
+            executable_path,
+            MAX_EXECUTABLE_PATH_BYTES,
+        )?;
+        if !Path::new(executable_path).is_absolute() {
+            return Err(AppError::Validation {
+                field: "executable_path",
+                message: "must be an absolute path",
+            });
+        }
+
+        let executable_identity = executable_identity.as_ref();
+        validate_execution_fact(
+            "executable_identity",
+            executable_identity,
+            MAX_EXECUTABLE_IDENTITY_BYTES,
+        )?;
+
+        Ok(Self {
+            execution_kind: execution_kind.to_owned(),
+            executable_path: executable_path.to_owned(),
+            executable_identity: executable_identity.to_owned(),
+        })
+    }
+
+    pub fn execution_kind(&self) -> &str {
+        &self.execution_kind
+    }
+
+    pub fn executable_path(&self) -> &str {
+        &self.executable_path
+    }
+
+    pub fn executable_identity(&self) -> &str {
+        &self.executable_identity
+    }
+}
+
+pub const MAX_EXECUTABLE_PATH_BYTES: usize = 4096;
+pub const MAX_EXECUTABLE_IDENTITY_BYTES: usize = 256;
+
+fn validate_execution_fact(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), AppError> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(AppError::Validation {
+            field,
+            message: "must be non-empty, bounded UTF-8 without control characters",
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
     pub run_id: i64,
@@ -556,6 +641,11 @@ pub struct AgentRun {
     pub context_mode: AgentContextMode,
     pub context_session_id: Option<String>,
     pub context_lineage: Vec<String>,
+    pub execution_kind: Option<String>,
+    pub executable_path: Option<String>,
+    pub executable_identity: Option<String>,
+    pub policy_code: Option<String>,
+    pub failure_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,6 +659,7 @@ pub struct NewAgentRun {
     pub context_mode: AgentContextMode,
     pub context_session_id: Option<String>,
     pub context_lineage: Vec<String>,
+    pub execution: Option<ExecutionProjection>,
 }
 
 impl NewAgentRun {
@@ -590,7 +681,15 @@ impl NewAgentRun {
             context_mode: AgentContextMode::Fresh,
             context_session_id: None,
             context_lineage: Vec::new(),
+            execution: None,
         }
+    }
+
+    /// Attach the bounded non-secret execution projection used by the native
+    /// binding path.  The legacy constructor intentionally leaves it empty.
+    pub fn with_execution(mut self, execution: ExecutionProjection) -> Self {
+        self.execution = Some(execution);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -615,6 +714,7 @@ impl NewAgentRun {
             context_mode,
             context_session_id,
             context_lineage,
+            execution: None,
         }
     }
 }

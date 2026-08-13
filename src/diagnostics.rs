@@ -1374,6 +1374,11 @@ struct AgentRunSummary {
     exit_code: Option<i64>,
     error_category: Option<&'static str>,
     error_summary: Option<String>,
+    execution_kind: Option<String>,
+    executable_path: Option<String>,
+    executable_identity: Option<String>,
+    policy_code: Option<String>,
+    failure_stage: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1403,6 +1408,11 @@ impl From<&AgentRun> for AgentRunSummary {
                 .last_error
                 .as_ref()
                 .map(|_| safe_error_summary("agent_run")),
+            execution_kind: run.execution_kind.clone(),
+            executable_path: run.executable_path.clone(),
+            executable_identity: run.executable_identity.clone(),
+            policy_code: run.policy_code.clone(),
+            failure_stage: run.failure_stage.clone(),
         }
     }
 }
@@ -1694,4 +1704,50 @@ fn is_shell_wrapper(executable: &str) -> bool {
 
 fn is_safe_executable_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::to_value;
+
+    use crate::models::{AgentContextMode, AgentRun, AgentRunStatus};
+
+    use super::AgentRunSummary;
+
+    #[test]
+    fn agent_run_summary_serializes_only_execution_audit_facts() {
+        let run = AgentRun {
+            run_id: 7,
+            project_id: "project-a".to_owned(),
+            primary_event_id: 11,
+            pid: Some(42),
+            status: AgentRunStatus::Failed,
+            started_at: 100,
+            finished_at: Some(110),
+            exit_code: Some(1),
+            log_path: PathBuf::from("/tmp/agent.log"),
+            last_error: Some("policy_blocked:unsafe_codex_argument".to_owned()),
+            launch_gate_state: "failed".to_owned(),
+            context_mode: AgentContextMode::Fresh,
+            context_session_id: None,
+            context_lineage: Vec::new(),
+            execution_kind: Some("codex".to_owned()),
+            executable_path: Some("/trusted/bin/codex".to_owned()),
+            executable_identity: Some("device=1;inode=2".to_owned()),
+            policy_code: Some("unsafe_codex_argument".to_owned()),
+            failure_stage: Some("run_bound_pre_marker".to_owned()),
+        };
+
+        let serialized = to_value(AgentRunSummary::from(&run)).unwrap();
+        assert_eq!(serialized["execution_kind"], "codex");
+        assert_eq!(serialized["executable_path"], "/trusted/bin/codex");
+        assert_eq!(serialized["executable_identity"], "device=1;inode=2");
+        assert_eq!(serialized["policy_code"], "unsafe_codex_argument");
+        assert_eq!(serialized["failure_stage"], "run_bound_pre_marker");
+        for absent in ["prompt", "argv", "environment", "credentials"] {
+            assert!(serialized.get(absent).is_none(), "unexpected {absent}");
+        }
+    }
 }

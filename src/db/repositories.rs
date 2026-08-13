@@ -27,8 +27,8 @@ use crate::{
     models::{
         launch_gate_marker_path, path_text, AgentContextMode, AgentRun, AgentRunEvent,
         AgentRunStatus, BatchJob, BatchJobStatus, BatchRequest, BatchStatus, Event, EventKind,
-        EventStatus, Incident, IncidentTransition, IncidentUpdate, IntegrationEvent,
-        InterventionStatus, NewAgentRun, NewBatchRequest, NewEvent, NewIncident,
+        EventStatus, ExecutionProjection, Incident, IncidentTransition, IncidentUpdate,
+        IntegrationEvent, InterventionStatus, NewAgentRun, NewBatchRequest, NewEvent, NewIncident,
         NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
         Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
         TerminationRequestStatus,
@@ -2772,6 +2772,11 @@ pub struct RunLineage {
     pub run_status: Option<AgentRunStatus>,
     pub started_at: i64,
     pub submissions: Vec<SubmissionLineage>,
+    pub execution_kind: Option<String>,
+    pub executable_path: Option<String>,
+    pub executable_identity: Option<String>,
+    pub policy_code: Option<String>,
+    pub failure_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2981,6 +2986,11 @@ impl<'db> RunLineageRepository<'db> {
                 run_status: Some(run.status),
                 started_at: run.started_at,
                 submissions: run_submissions,
+                execution_kind: run.execution_kind,
+                executable_path: run.executable_path,
+                executable_identity: run.executable_identity,
+                policy_code: run.policy_code,
+                failure_stage: run.failure_stage,
             });
         }
         let selected_primary_event_ids = lineages
@@ -3048,6 +3058,11 @@ impl<'db> RunLineageRepository<'db> {
                 run_status: None,
                 started_at: event.created_at,
                 submissions: Vec::new(),
+                execution_kind: None,
+                executable_path: None,
+                executable_identity: None,
+                policy_code: None,
+                failure_stage: None,
             });
         }
         if follow {
@@ -3062,6 +3077,11 @@ impl<'db> RunLineageRepository<'db> {
                     run_status: None,
                     started_at,
                     submissions: submissions.iter().map(SubmissionLineage::from).collect(),
+                    execution_kind: None,
+                    executable_path: None,
+                    executable_identity: None,
+                    policy_code: None,
+                    failure_stage: None,
                 });
             }
         } else {
@@ -3075,6 +3095,11 @@ impl<'db> RunLineageRepository<'db> {
                     run_status: None,
                     started_at: submission.created_at,
                     submissions: vec![SubmissionLineage::from(&submission)],
+                    execution_kind: None,
+                    executable_path: None,
+                    executable_identity: None,
+                    policy_code: None,
+                    failure_stage: None,
                 });
             }
         }
@@ -3164,6 +3189,7 @@ impl<'db> AgentRunRepository<'db> {
         } else {
             "released"
         };
+        let execution = run.execution.as_ref();
         let connection = self.db.connect()?;
         connection
             .execute(
@@ -3171,8 +3197,11 @@ impl<'db> AgentRunRepository<'db> {
                     project_id, primary_event_id, pid, status, started_at,
                     finished_at, exit_code, log_path, last_error, launch_gate_state,
                     context_mode,
-                    context_session_id, context_lineage_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
+                    context_session_id, context_lineage_json,
+                    execution_kind, executable_path, executable_identity,
+                    policy_code, failure_stage
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10,
+                           ?11, ?12, ?13, NULL, NULL)",
                 params![
                     run.project_id,
                     run.primary_event_id,
@@ -3184,6 +3213,9 @@ impl<'db> AgentRunRepository<'db> {
                     run.context_mode.as_str(),
                     run.context_session_id.as_deref(),
                     context_lineage_json,
+                    execution.map(ExecutionProjection::execution_kind),
+                    execution.map(ExecutionProjection::executable_path),
+                    execution.map(ExecutionProjection::executable_identity),
                 ],
             )
             .map_err(database_error("insert agent run"))?;
@@ -4055,6 +4087,14 @@ impl<'db> AgentRunRepository<'db> {
             }
         };
         let bounded_event_error = bounded_run_error.clone();
+        let (policy_code, failure_stage) = match &resolution {
+            EventResolution::PolicyBlocked { code, stage } => {
+                (Some(code.as_str()), Some(stage.as_str()))
+            }
+            EventResolution::ExecutionUnknown { .. } | EventResolution::RetryPolicy(_) => {
+                (None, None)
+            }
+        };
         let expected_event_status = match phase {
             AgentRunFinalizationPhase::Generic => EventStatus::Dispatched,
             AgentRunFinalizationPhase::MarkerFailure | AgentRunFinalizationPhase::PreRelease => {
@@ -4117,6 +4157,8 @@ impl<'db> AgentRunRepository<'db> {
             .execute(
                 "UPDATE agent_runs
                  SET status = ?1, finished_at = ?2, exit_code = ?3, last_error = ?4,
+                     policy_code = COALESCE(?5, policy_code),
+                     failure_stage = COALESCE(?6, failure_stage),
                      launch_gate_state = CASE
                          WHEN launch_gate_state IN ('pending', 'release_requested')
                               AND ?1 = 'failed' THEN 'failed'
@@ -4124,13 +4166,15 @@ impl<'db> AgentRunRepository<'db> {
                               AND ?1 IN ('completed', 'timed_out', 'cancelled') THEN 'released'
                          ELSE launch_gate_state
                      END
-                 WHERE project_id = ?5 AND run_id = ?6
+                 WHERE project_id = ?7 AND run_id = ?8
                    AND status IN ('starting', 'running')",
                 params![
                     status,
                     finished_at,
                     exit_code,
                     bounded_run_error.as_deref(),
+                    policy_code,
+                    failure_stage,
                     project_id,
                     run_id,
                 ],
@@ -4300,7 +4344,10 @@ impl<'db> AgentRunRepository<'db> {
                         agent_runs.finished_at, agent_runs.exit_code, agent_runs.log_path,
                         agent_runs.last_error, agent_runs.launch_gate_state,
                         agent_runs.context_mode, agent_runs.context_session_id,
-                        agent_runs.context_lineage_json
+                        agent_runs.context_lineage_json,
+                        agent_runs.execution_kind, agent_runs.executable_path,
+                        agent_runs.executable_identity, agent_runs.policy_code,
+                        agent_runs.failure_stage
                  FROM agent_runs
                  JOIN agent_run_events
                    ON agent_run_events.project_id = agent_runs.project_id
@@ -5244,7 +5291,8 @@ const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, cr
 
 const AGENT_RUN_SELECT: &str = "SELECT run_id, project_id, primary_event_id, pid, status,
             started_at, finished_at, exit_code, log_path, last_error,
-            launch_gate_state, context_mode, context_session_id, context_lineage_json
+            launch_gate_state, context_mode, context_session_id, context_lineage_json,
+            execution_kind, executable_path, executable_identity, policy_code, failure_stage
      FROM agent_runs";
 
 const TERMINATION_REQUEST_SELECT: &str = "SELECT request_id, incident_id, project_id,
@@ -5511,6 +5559,11 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
         context_mode,
         context_session_id,
         context_lineage,
+        execution_kind: row.get(14)?,
+        executable_path: row.get(15)?,
+        executable_identity: row.get(16)?,
+        policy_code: row.get(17)?,
+        failure_stage: row.get(18)?,
     })
 }
 
@@ -5526,14 +5579,18 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
     } else {
         "released"
     };
+    let execution = run.execution.as_ref();
     transaction
         .execute(
             "INSERT INTO agent_runs (
                 project_id, primary_event_id, pid, status, started_at,
                 finished_at, exit_code, log_path, last_error, launch_gate_state,
                 context_mode,
-                context_session_id, context_lineage_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10)",
+                context_session_id, context_lineage_json,
+                execution_kind, executable_path, executable_identity,
+                policy_code, failure_stage
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10,
+                       ?11, ?12, ?13, NULL, NULL)",
             params![
                 run.project_id,
                 run.primary_event_id,
@@ -5545,6 +5602,9 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
                 run.context_mode.as_str(),
                 run.context_session_id.as_deref(),
                 context_lineage_json,
+                execution.map(ExecutionProjection::execution_kind),
+                execution.map(ExecutionProjection::executable_path),
+                execution.map(ExecutionProjection::executable_identity),
             ],
         )
         .map_err(database_error("insert agent run"))?;

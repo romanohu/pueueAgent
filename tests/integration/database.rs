@@ -11,8 +11,7 @@ use pueue_agent::{
     db::{
         AgentRunRepository, BatchRepository, Db, EventRepository, IncidentRepository,
         InterventionRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
-        TerminationRequestRepository,
-        LATEST_SCHEMA_VERSION,
+        RunLineageRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
@@ -21,10 +20,12 @@ use pueue_agent::{
         MAX_INTERVENTION_BYTES_PER_RUN,
     },
     models::{
-        AgentRunStatus, BatchJobStatus, BatchStatus, EventKind, EventStatus, IncidentStatus,
+        AgentRunStatus, BatchJobStatus, BatchStatus, EventKind, EventStatus, ExecutionProjection,
+        IncidentStatus,
         IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident,
         NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, SubmissionKind,
-        SubmissionStatus, TerminationRequestStatus,
+        SubmissionStatus, TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES,
+        MAX_EXECUTABLE_PATH_BYTES,
     },
     runs::{collect_fresh, FollowCursor},
     retry::{EventResolution, RetryPolicy},
@@ -182,6 +183,147 @@ fn create_legacy_schema_without_active_agent_index(path: &Path, version: i64) {
             "#
         ))
         .unwrap();
+}
+
+fn schema_v13_with_run() -> (TempDir, PathBuf) {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("schema-v13.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY,
+                root_path TEXT NOT NULL UNIQUE,
+                pueue_group TEXT NOT NULL UNIQUE,
+                config_path TEXT NOT NULL,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+                halted_reason TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE events (
+                event_id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'task_finished', 'task_failed', 'crash', 'stalled',
+                    'deep_check', 'auto_killed', 'termination_failed', 'operator_wake'
+                )),
+                dedup_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'pending', 'claimed', 'in_flight', 'dispatched',
+                    'completed', 'retry_wait', 'failed', 'dead_letter'
+                )),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                not_before INTEGER NOT NULL,
+                lease_until INTEGER,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                last_error TEXT,
+                UNIQUE(project_id, dedup_key),
+                UNIQUE(project_id, event_id),
+                CHECK (
+                    (status = 'claimed' AND lease_until IS NOT NULL)
+                    OR (status <> 'claimed' AND lease_until IS NULL)
+                )
+            );
+
+            CREATE TABLE agent_runs (
+                run_id INTEGER PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                primary_event_id INTEGER NOT NULL,
+                pid INTEGER,
+                status TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                exit_code INTEGER,
+                log_path TEXT NOT NULL,
+                last_error TEXT,
+                launch_gate_state TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    launch_gate_state IN ('pending', 'release_requested', 'released', 'failed')
+                ),
+                context_mode TEXT NOT NULL DEFAULT 'fresh' CHECK (context_mode IN (
+                    'fresh', 'resume', 'resume_latest'
+                )),
+                context_session_id TEXT,
+                context_lineage_json TEXT NOT NULL DEFAULT '[]',
+                UNIQUE(project_id, run_id),
+                FOREIGN KEY(project_id, primary_event_id)
+                    REFERENCES events(project_id, event_id) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE agent_run_events (
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                run_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                PRIMARY KEY(run_id, event_id),
+                FOREIGN KEY(project_id, run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE CASCADE,
+                FOREIGN KEY(project_id, event_id)
+                    REFERENCES events(project_id, event_id) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE submissions (
+                submission_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                argv_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                pueue_task_id INTEGER,
+                task_signature TEXT,
+                status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'experiment',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_agent_run_id INTEGER,
+                FOREIGN KEY (project_id, origin_agent_run_id)
+                    REFERENCES agent_runs(project_id, run_id) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX events_project_status_not_before_idx
+                ON events(project_id, status, not_before, event_id);
+            CREATE INDEX agent_runs_project_status_idx
+                ON agent_runs(project_id, status, started_at);
+            CREATE UNIQUE INDEX agent_runs_one_active_per_project_idx
+                ON agent_runs(project_id)
+                WHERE status IN ('starting', 'running');
+
+            INSERT INTO projects (
+                project_id, root_path, pueue_group, config_path,
+                enabled, paused, halted_reason, created_at, updated_at
+            ) VALUES (
+                'v13-projection-project', '/tmp/v13-projection-project',
+                'pa-v13-projection', '/tmp/v13-projection-project/config.toml',
+                1, 0, NULL, 90, 90
+            );
+            INSERT INTO events (
+                event_id, project_id, kind, dedup_key, payload_json, status,
+                attempts, not_before, lease_until, created_at, completed_at, last_error
+            ) VALUES (
+                7, 'v13-projection-project', 'task_finished', 'v13-run', '{}',
+                'completed', 1, 100, NULL, 100, 101, NULL
+            );
+            INSERT INTO agent_runs (
+                run_id, project_id, primary_event_id, pid, status, started_at,
+                finished_at, exit_code, log_path, last_error, launch_gate_state,
+                context_mode, context_session_id, context_lineage_json
+            ) VALUES (
+                9, 'v13-projection-project', 7, 4242, 'completed', 101,
+                111, 0, '/tmp/v13-projection.log', NULL, 'released',
+                'fresh', NULL, '[]'
+            );
+            INSERT INTO agent_run_events (project_id, run_id, event_id)
+            VALUES ('v13-projection-project', 9, 7);
+
+            PRAGMA user_version = 13;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+    (temp, path)
 }
 
 fn open_v10_operator_log_fixture() -> (TempDir, PathBuf) {
@@ -540,7 +682,7 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     let event_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
@@ -632,6 +774,322 @@ fn fresh_schema_creates_events_project_status_not_before_index() {
             .join(" ")
             .to_ascii_lowercase(),
         "create index events_project_status_not_before_idx on events(project_id, status, not_before, event_id)"
+    );
+}
+
+#[test]
+fn v14_adds_projection_and_preserves_v13_rows() {
+    let (_temp, path) = schema_v13_with_run();
+    let pre_migration = Connection::open(&path).unwrap();
+    let columns = pre_migration
+        .prepare("PRAGMA table_info(agent_runs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!columns.iter().any(|column| {
+        [
+            "execution_kind",
+            "executable_path",
+            "executable_identity",
+            "policy_code",
+            "failure_stage",
+        ]
+        .contains(&column.as_str())
+    }));
+    assert_eq!(
+        pre_migration
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        13
+    );
+    drop(pre_migration);
+
+    let migrated = Db::open(&path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 14);
+    let columns = connection
+        .prepare("PRAGMA table_info(agent_runs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for name in [
+        "execution_kind",
+        "executable_path",
+        "executable_identity",
+        "policy_code",
+        "failure_stage",
+    ] {
+        assert!(columns.iter().any(|column| column == name), "missing {name}");
+    }
+    for forbidden in ["prompt", "argv", "environment", "credentials"] {
+        assert!(
+            !columns.iter().any(|column| column.contains(forbidden)),
+            "unexpected secret-bearing column {forbidden}"
+        );
+    }
+    let preserved: (i64, String, i64, Option<String>, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT run_id, status, started_at,
+                    execution_kind, executable_path, executable_identity
+             FROM agent_runs WHERE run_id = 9",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        preserved,
+        (9, "completed".to_owned(), 101, None, None, None)
+    );
+    let preserved_link: (String, i64, i64) = connection
+        .query_row(
+            "SELECT project_id, run_id, event_id FROM agent_run_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        preserved_link,
+        ("v13-projection-project".to_owned(), 9, 7)
+    );
+    let foreign_key_violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(foreign_key_violations, 0);
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    for index in [
+        "agent_runs_project_status_idx",
+        "agent_runs_one_active_per_project_idx",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+                 )",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing {index}");
+    }
+}
+
+#[test]
+fn execution_projection_round_trips_through_binding_transaction_and_legacy_runs_are_empty() {
+    let test = TestDatabase::new();
+    let root = test.project_root("projection-round-trip");
+    register_project(&test.db, "project-a", &root, "pa-projection-round-trip");
+    let event_id = insert_event(&test.db, "project-a", "projection-round-trip", 100);
+    EventRepository::new(&test.db).claim_batch(100, 200, 1).unwrap();
+    let projection = ExecutionProjection::new(
+        "codex",
+        "/trusted/bin/codex",
+        "device=1;inode=2;owner=3;mode=493",
+    )
+    .unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                "/tmp/projection-round-trip.log",
+            )
+            .with_execution(projection.clone()),
+            &[event_id],
+        )
+        .unwrap();
+    assert_eq!(run.execution_kind.as_deref(), Some("codex"));
+    assert_eq!(run.executable_path.as_deref(), Some("/trusted/bin/codex"));
+    assert_eq!(run.executable_identity.as_deref(), Some("device=1;inode=2;owner=3;mode=493"));
+    let linked = AgentRunRepository::new(&test.db)
+        .find_by_event("project-a", event_id, 4)
+        .unwrap();
+    assert_eq!(linked, vec![run.clone()]);
+    assert_eq!(
+        AgentRunRepository::new(&test.db)
+            .find_active_by_project("project-a")
+            .unwrap(),
+        Some(run.clone())
+    );
+    assert_eq!(
+        AgentRunRepository::new(&test.db)
+            .list_by_project("project-a", 4)
+            .unwrap(),
+        vec![run.clone()]
+    );
+    let lineage = RunLineageRepository::new(&test.db)
+        .list_by_project("project-a", 4)
+        .unwrap()
+        .into_iter()
+        .find(|lineage| lineage.run_id == Some(run.run_id))
+        .unwrap();
+    assert_eq!(lineage.execution_kind.as_deref(), Some("codex"));
+    assert_eq!(lineage.executable_path.as_deref(), Some("/trusted/bin/codex"));
+    assert_eq!(
+        lineage.executable_identity.as_deref(),
+        Some("device=1;inode=2;owner=3;mode=493")
+    );
+
+    let legacy_event_id = insert_event(&test.db, "project-a", "legacy-projection", 101);
+    let legacy = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            legacy_event_id,
+            None,
+            AgentRunStatus::Completed,
+            111,
+            "/tmp/legacy-projection.log",
+        ))
+        .unwrap();
+    assert_eq!(legacy.execution_kind, None);
+    assert_eq!(legacy.executable_path, None);
+    assert_eq!(legacy.executable_identity, None);
+
+    let direct_event_id = insert_event(&test.db, "project-a", "direct-projection", 102);
+    let direct = AgentRunRepository::new(&test.db)
+        .insert(
+            &NewAgentRun::new(
+                "project-a",
+                direct_event_id,
+                None,
+                AgentRunStatus::Completed,
+                112,
+                "/tmp/direct-projection.log",
+            )
+            .with_execution(
+                ExecutionProjection::new(
+                    "custom",
+                    "/trusted/bin/custom",
+                    "device=4;inode=5;owner=6;mode=493",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(direct.execution_kind.as_deref(), Some("custom"));
+    assert_eq!(direct.executable_path.as_deref(), Some("/trusted/bin/custom"));
+    assert_eq!(
+        direct.executable_identity.as_deref(),
+        Some("device=4;inode=5;owner=6;mode=493")
+    );
+}
+
+#[test]
+fn execution_projection_rejects_ambiguous_or_oversized_audit_facts() {
+    let exact_path = format!("/{}", "実".repeat((MAX_EXECUTABLE_PATH_BYTES - 1) / 3));
+    assert_eq!(exact_path.len(), MAX_EXECUTABLE_PATH_BYTES);
+    let exact_identity = format!("i{}", "実".repeat((MAX_EXECUTABLE_IDENTITY_BYTES - 1) / 3));
+    assert_eq!(exact_identity.len(), MAX_EXECUTABLE_IDENTITY_BYTES);
+
+    let exact = ExecutionProjection::new("custom", &exact_path, &exact_identity).unwrap();
+    assert_eq!(exact.execution_kind(), "custom");
+    assert_eq!(exact.executable_path(), exact_path);
+    assert_eq!(exact.executable_identity(), exact_identity);
+
+    for invalid in [
+        ExecutionProjection::new("unknown", "/trusted/bin/agent", "identity"),
+        ExecutionProjection::new("codex", "relative/agent", "identity"),
+        ExecutionProjection::new("codex", "", "identity"),
+        ExecutionProjection::new(
+            "codex",
+            format!("{exact_path}x"),
+            exact_identity.clone(),
+        ),
+        ExecutionProjection::new(
+            "codex",
+            exact_path.clone(),
+            format!("{exact_identity}x"),
+        ),
+        ExecutionProjection::new("codex", "/trusted/bin/agent\0spoofed", "identity"),
+        ExecutionProjection::new("codex", "/trusted/bin/agent", "identity\nspoofed"),
+    ] {
+        assert!(invalid.is_err());
+    }
+}
+
+#[test]
+fn policy_finalization_persists_only_bounded_policy_fields_and_preserves_projection() {
+    let test = TestDatabase::new();
+    let root = test.project_root("projection-policy-finalization");
+    register_project(&test.db, "project-a", &root, "pa-projection-policy-finalization");
+    let event_id = insert_event(&test.db, "project-a", "projection-policy-finalization", 100);
+    EventRepository::new(&test.db).claim_batch(100, 200, 1).unwrap();
+    let run = AgentRunRepository::new(&test.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                "/tmp/projection-policy-finalization.log",
+            )
+            .with_execution(
+                ExecutionProjection::new(
+                    "custom",
+                    "/trusted/bin/custom",
+                    "device=9;inode=8;owner=7;mode=493",
+                )
+                .unwrap(),
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    AgentRunRepository::new(&test.db)
+        .fail_before_gate_release_with_policy(
+            "project-a",
+            run.run_id,
+            120,
+            "ignored policy detail",
+            PolicyViolation::new(
+                PolicyViolationCode::UnsafeCodexArgument,
+                PolicyViolationStage::RunBoundPreMarker,
+            ),
+        )
+        .unwrap();
+    let values: (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT execution_kind, executable_path, executable_identity, policy_code, failure_stage
+             FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        values,
+        (
+            Some("custom".to_owned()),
+            Some("/trusted/bin/custom".to_owned()),
+            Some("device=9;inode=8;owner=7;mode=493".to_owned()),
+            Some("unsafe_codex_argument".to_owned()),
+            Some("run_bound_pre_marker".to_owned()),
+        )
     );
 }
 
