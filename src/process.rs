@@ -431,13 +431,11 @@ pub struct StartGate {
 #[cfg(unix)]
 pub struct ExecStatusReceiver {
     reader: Option<std::fs::File>,
-    deadline: Instant,
 }
 
 #[cfg(unix)]
 pub struct AckReceiver {
     reader: Option<std::fs::File>,
-    deadline: Instant,
 }
 
 /// A helper process that owns exactly one blocked/suspended target and remains
@@ -466,7 +464,12 @@ impl VerifiedChild {
             .writer
             .take()
             .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
-        write_all_fd_before(&mut writer, &RELEASE_AUTHORIZATION, self.ack.deadline)
+        // The parent owns the write end and closes it immediately after the
+        // exact authorization byte.  The helper may legitimately wait an
+        // unbounded amount of time for this byte while the marker is being
+        // durably created, so only the parent-side write gets a fresh
+        // operation deadline.
+        write_all_fd_before(&mut writer, &RELEASE_AUTHORIZATION, lifecycle_deadline())
             .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
         drop(writer);
         self.released = true;
@@ -482,7 +485,10 @@ impl VerifiedChild {
             .reader
             .take()
             .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
-        let deadline = self.exec_status.deadline;
+        // Do not reuse a deadline captured during spawn.  Marker creation can
+        // take an arbitrary amount of time before release; proof gets its own
+        // lifecycle budget once release has completed.
+        let deadline = lifecycle_deadline();
         tokio::task::spawn_blocking(move || read_exec_proof(reader, deadline))
             .await
             .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))??;
@@ -502,7 +508,9 @@ impl VerifiedChild {
             .reader
             .take()
             .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
-        let deadline = self.ack.deadline;
+        // Ack has an independent budget from exec proof.  In particular, a
+        // slow proof must not consume the ack operation's entire budget.
+        let deadline = lifecycle_deadline();
         tokio::task::spawn_blocking(move || read_exact_ack(reader, deadline))
             .await
             .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))??;
@@ -530,7 +538,16 @@ impl VerifiedChild {
     }
 
     pub async fn wait(&mut self) -> Result<ExitStatus, AppError> {
-        self.child.wait().await.map_err(|_| native_gate_error(PolicyViolationStage::Dispatched))
+        let result = self
+            .child
+            .wait()
+            .await
+            .map_err(|_| native_gate_error(PolicyViolationStage::Dispatched));
+        // An explicit wait owns the helper's terminal status.  Never retain a
+        // process-group id after reaping, otherwise Drop could signal a reused
+        // group number.
+        self.process_group_id = None;
+        result
     }
 }
 
@@ -538,17 +555,15 @@ impl VerifiedChild {
 impl Drop for VerifiedChild {
     fn drop(&mut self) {
         self.start_gate.writer.take();
-        if matches!(self.child.try_wait(), Ok(None)) {
-            if let Some(group) = self.process_group_id.and_then(|value| libc::pid_t::try_from(value).ok()) {
-                // A fresh try_wait immediately above proves that this owned
-                // child has not yet been reaped, so signalling its recorded
-                // process group cannot target a reused helper PID.
+        // Drop cannot await and must not call try_wait before the group kill:
+        // a reap can release the helper PID while descendants still retain
+        // the process group.  The recorded group is owned until explicit
+        // wait clears it, so kill it first, then ask Tokio to kill/reap the
+        // leader through its orphan handling.
+        if let Some(recorded_group) = self.process_group_id.take() {
+            if let Ok(group) = libc::pid_t::try_from(recorded_group) {
                 unsafe { libc::kill(-group, libc::SIGKILL); }
             }
-            // Drop cannot await. `kill_on_drop` transfers the helper to
-            // Tokio's orphan queue after this fail-closed group kill. Callers
-            // needing the bounded TERM/KILL/reap contract must invoke
-            // `terminate_process_group` before dropping the handle.
             let _ = self.child.start_kill();
         }
     }
@@ -719,18 +734,37 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
 #[cfg(unix)]
 fn read_release_authorization() -> Result<(), BootstrapError> {
     let mut reader = unsafe { std::fs::File::from_raw_fd(RELEASE_FD) };
-    let deadline = lifecycle_deadline();
     let mut authorization = [0u8; 1];
-    if read_fd_before(&mut reader, &mut authorization, deadline)? != 1
+    if read_exact_blocking(&mut reader, &mut authorization)? != 1
         || authorization != RELEASE_AUTHORIZATION
     {
         return Err(BootstrapError::GateClosed);
     }
     let mut trailing = [0u8; 1];
-    if read_fd_before(&mut reader, &mut trailing, deadline)? != 0 {
+    if read_exact_blocking(&mut reader, &mut trailing)? != 0 {
         return Err(BootstrapError::GateClosed);
     }
     Ok(())
+}
+
+/// Read exactly the requested bytes without installing a lifecycle timeout.
+/// The release gate is intentionally a blocking authorization boundary: the
+/// supervisor may spend an arbitrary amount of time creating and syncing the
+/// marker before it writes the single byte.  Closing the parent-owned writer
+/// cancels this wait and produces EOF.  EINTR is retried so signals cannot turn
+/// a legitimate delayed release into an accidental execution.
+#[cfg(unix)]
+fn read_exact_blocking(file: &mut std::fs::File, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        match file.read(&mut buffer[offset..]) {
+            Ok(0) => return Ok(offset),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(offset)
 }
 
 #[cfg(unix)]
@@ -775,6 +809,12 @@ impl PlatformTarget {
         if unsafe { libc::posix_spawnattr_init(&mut attributes) } != 0 {
             return Err(BootstrapError::TargetCreate);
         }
+        let mut file_actions: libc::posix_spawn_file_actions_t = unsafe { mem::zeroed() };
+        if unsafe { libc::posix_spawn_file_actions_init(&mut file_actions) } != 0 {
+            unsafe { libc::posix_spawnattr_destroy(&mut attributes); }
+            return Err(BootstrapError::TargetCreate);
+        }
+        let mut config_duplicate = -1;
         let result = (|| {
             let flags = (libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_SETPGROUP) as i16;
             if unsafe { libc::posix_spawnattr_setflags(&mut attributes, flags) } != 0
@@ -782,12 +822,39 @@ impl PlatformTarget {
             {
                 return Err(BootstrapError::TargetCreate);
             }
+            if frame.mode == LaunchMode::Pueue {
+                // Fixed fd 9 is CLOEXEC in the helper.  Duplicate it to a
+                // high temporary CLOEXEC descriptor and use a spawn file
+                // action to atomically create the target's inheritable fd 9.
+                // The action closes the high source before target execution,
+                // leaving no extra protocol descriptor in the child.
+                config_duplicate = unsafe {
+                    libc::fcntl(PUEUE_CONFIG_FD, libc::F_DUPFD_CLOEXEC, RELEASE_ACK_FD + 1)
+                };
+                if config_duplicate < 0
+                    || unsafe {
+                        libc::posix_spawn_file_actions_adddup2(
+                            &mut file_actions,
+                            config_duplicate,
+                            PUEUE_CONFIG_FD,
+                        )
+                    } != 0
+                    || unsafe {
+                        libc::posix_spawn_file_actions_addclose(
+                            &mut file_actions,
+                            config_duplicate,
+                        )
+                    } != 0
+                {
+                    return Err(BootstrapError::TargetCreate);
+                }
+            }
             let mut pid = 0;
             let spawned = unsafe {
                 libc::posix_spawn(
                     &mut pid,
                     path.as_ptr(),
-                    ptr::null(),
+                    &file_actions,
                     &attributes,
                     argv_pointers.as_mut_ptr(),
                     environment_pointers.as_mut_ptr(),
@@ -802,6 +869,10 @@ impl PlatformTarget {
             }
             Ok(Self { pid })
         })();
+        if config_duplicate >= 0 {
+            unsafe { libc::close(config_duplicate); }
+        }
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut file_actions); }
         unsafe { libc::posix_spawnattr_destroy(&mut attributes); }
         result
     }
@@ -900,6 +971,33 @@ impl PlatformTarget {
             if change_directory && unsafe { libc::fchdir(PROJECT_ROOT_FD) } < 0 {
                 let _ = unsafe { libc::write(exec_write_raw, EXEC_FAILURE_RECORD.as_ptr().cast(), EXEC_FAILURE_RECORD.len()) };
                 unsafe { libc::_exit(126); }
+            }
+            // The helper keeps every fixed descriptor close-on-exec.  A
+            // Pueue target is the one explicit exception: it receives its
+            // verified config at fd 9.  Clear CLOEXEC in the forked target
+            // child immediately before execveat; no supervisor/helper copy is
+            // ever made inheritable.  Failure is reported through the
+            // close-on-exec status pipe and exits before target creation.
+            if frame.mode == LaunchMode::Pueue {
+                let descriptor_flags = unsafe { libc::fcntl(PUEUE_CONFIG_FD, libc::F_GETFD) };
+                if descriptor_flags < 0
+                    || unsafe {
+                        libc::fcntl(
+                            PUEUE_CONFIG_FD,
+                            libc::F_SETFD,
+                            descriptor_flags & !libc::FD_CLOEXEC,
+                        )
+                    } < 0
+                {
+                    let _ = unsafe {
+                        libc::write(
+                            exec_write_raw,
+                            EXEC_FAILURE_RECORD.as_ptr().cast(),
+                            EXEC_FAILURE_RECORD.len(),
+                        )
+                    };
+                    unsafe { libc::_exit(126); }
+                }
             }
             let empty = b"\0";
             unsafe {
@@ -1427,13 +1525,16 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
         cleanup_failed_tokio_helper(&mut child, pid);
         return Err(native_gate_error(PolicyViolationStage::PreBinding));
     }
-    if read_helper_readiness(&mut parent_stream).is_err() {
+    // Suspended target creation is a distinct lifecycle operation from the
+    // bounded bootstrap transfer. On macOS, posix_spawn may synchronously
+    // assess a newly generated executable, so this operation receives its own
+    // lifecycle deadline instead of the shorter bootstrap-only budget.
+    if read_helper_readiness_with_timeout(&mut parent_stream, LIFECYCLE_IO_TIMEOUT).is_err() {
         cleanup_failed_tokio_helper(&mut child, pid);
         return Err(native_gate_error(PolicyViolationStage::NativeGate));
     }
     drop(rights);
 
-    let deadline = lifecycle_deadline();
     Ok(VerifiedChild {
         child,
         pid,
@@ -1441,11 +1542,9 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
         start_gate: StartGate { writer: Some(std::fs::File::from(release_write)) },
         exec_status: ExecStatusReceiver {
             reader: Some(std::fs::File::from(exec_read)),
-            deadline,
         },
         ack: AckReceiver {
             reader: Some(std::fs::File::from(ack_read)),
-            deadline,
         },
         capture,
         released: false,
@@ -1456,29 +1555,39 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
 #[cfg(unix)]
 pub async fn terminate_process_group(child: &mut VerifiedChild) {
     child.start_gate.writer.take();
-    let running = matches!(child.child.try_wait(), Ok(None));
-    if running {
-        if let Some(group) = child.process_group_id.and_then(|value| libc::pid_t::try_from(value).ok()) {
-            unsafe { libc::kill(-group, libc::SIGTERM); }
+    // A single initial try_wait establishes whether this handle still owns an
+    // unreaped leader.  During the TERM grace period we intentionally never
+    // poll/reap: the unreaped leader keeps its PID reserved, so the recorded
+    // process-group id cannot be reused while descendants are being drained.
+    match child.child.try_wait() {
+        Ok(Some(_)) => {
+            child.process_group_id = None;
+            return;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            match child.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                _ => break,
-            }
-        }
-        if matches!(child.child.try_wait(), Ok(None)) {
-            if let Some(group) = child.process_group_id.and_then(|value| libc::pid_t::try_from(value).ok()) {
-                unsafe { libc::kill(-group, libc::SIGKILL); }
-            }
-            let _ = child.child.start_kill();
+        Ok(None) => {}
+        Err(_) => {
+            // The leader's state is indeterminate (including ECHILD).  We
+            // cannot prove that the recorded group still belongs to this
+            // unreaped helper, so never signal a possibly reused PGID.
+            child.process_group_id = None;
+            return;
         }
     }
+    if let Some(group) = child
+        .process_group_id
+        .and_then(|value| libc::pid_t::try_from(value).ok())
+    {
+        unsafe { libc::kill(-group, libc::SIGTERM); }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Kill the entire recorded group unconditionally after grace.  Do not
+        // gate this on a second try_wait: a helper can exit while a descendant
+        // continues to hold the group, and reaping first would lose PID
+        // reservation before the descendant is terminated.
+        unsafe { libc::kill(-group, libc::SIGKILL); }
+    }
+    let _ = child.child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(1), child.child.wait()).await;
+    child.process_group_id = None;
 }
 
 #[cfg(unix)]
@@ -1650,8 +1759,16 @@ pub fn spawn_validated_helper(
 fn read_helper_readiness(
     stream: &mut std::os::unix::net::UnixStream,
 ) -> Result<(), ProcessLaunchError> {
+    read_helper_readiness_with_timeout(stream, HELPER_READY_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn read_helper_readiness_with_timeout(
+    stream: &mut std::os::unix::net::UnixStream,
+    timeout: Duration,
+) -> Result<(), ProcessLaunchError> {
     let deadline = Instant::now()
-        .checked_add(HELPER_READY_TIMEOUT)
+        .checked_add(timeout)
         .ok_or(ProcessLaunchError::Io)?;
     let mut record = [0u8; 8];
     let mut offset = 0usize;
@@ -2991,6 +3108,26 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
         for descriptor in descriptors { set_close_on_exec(descriptor).unwrap(); }
         unsafe { (OwnedFd::from_raw_fd(descriptors[0]), OwnedFd::from_raw_fd(descriptors[1])) }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_gate_waits_for_delayed_exact_byte_without_spawn_deadline() {
+        let (reader, writer) = pipe_pair();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            let mut writer = File::from(writer);
+            writer.write_all(&RELEASE_AUTHORIZATION).unwrap();
+            // Drop closes the gate and lets the helper's trailing EOF check
+            // complete.  The authorization itself is still exactly one byte.
+        });
+        let started = Instant::now();
+        let mut reader = File::from(reader);
+        let mut authorization = [0u8; 1];
+        assert_eq!(read_exact_blocking(&mut reader, &mut authorization).unwrap(), 1);
+        assert_eq!(authorization, RELEASE_AUTHORIZATION);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        writer.join().unwrap();
     }
 
     #[cfg(unix)]

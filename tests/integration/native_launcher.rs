@@ -14,11 +14,11 @@ mod unix {
 
     use pueue_agent::{
         environment::SanitizedEnvironment,
-        execution_policy::{ExecutableAnchor, ExecutableIdentity},
+        execution_policy::{ExecutableAnchor, ExecutableIdentity, PueueConfigAnchor},
         process::{
             spawn_validated_helper, spawn_verified_command, BootstrapError, ControlFrame,
             LaunchFlags, LaunchMode, ProcessGroupRequirement, ProcessLaunchError,
-            VerifiedChildIo, VerifiedCommandSpec,
+            VerifiedChildIo, VerifiedCommandSpec, terminate_process_group,
         },
     };
     use tempfile::tempdir;
@@ -84,6 +84,76 @@ fn main() {
         assert!(
             output.status.success(),
             "generated fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
+    }
+
+    fn compile_generated_pueue_fixture(directory: &Path) -> ExecutableAnchor {
+        let source = directory.join("generated-pueue-target.rs");
+        let executable = directory.join("generated-pueue-target");
+        fs::write(
+            &source,
+            r#"use std::{env, fs};
+fn main() {
+    let output = env::args_os().nth(1).expect("output argument");
+    let config = fs::read("/dev/fd/9").expect("verified pueue config fd");
+    let other_protocol_fd_is_closed = fs::metadata("/dev/fd/4").is_err();
+    assert!(other_protocol_fd_is_closed, "release fd leaked into target");
+    assert_eq!(config, b"pueue-config");
+    fs::write(output, b"pueue-fd9-ok").expect("write result");
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated Pueue fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
+    }
+
+    fn compile_generated_group_fixture(directory: &Path) -> ExecutableAnchor {
+        let source = directory.join("generated-group-target.rs");
+        let executable = directory.join("generated-group-target");
+        fs::write(
+            &source,
+            r#"use std::{env, fs, process::Command, thread, time::Duration};
+extern "C" { fn signal(signum: i32, handler: usize) -> usize; }
+fn main() {
+    let mut args = env::args();
+    let _program = args.next();
+    let mode = args.next().expect("mode");
+    let pid_path = args.next().expect("pid path");
+    if mode == "descendant" {
+        unsafe { let _ = signal(15, 1); }
+        fs::write(&pid_path, std::process::id().to_string()).expect("write descendant pid");
+        loop { thread::sleep(Duration::from_millis(25)); }
+    }
+    let child = Command::new(env::current_exe().expect("current executable"))
+        .args(["descendant", &pid_path])
+        .spawn()
+        .expect("spawn descendant");
+    fs::write(&pid_path, child.id().to_string()).expect("write child pid");
+    loop { thread::sleep(Duration::from_millis(25)); }
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated group fixture compilation failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
@@ -375,6 +445,92 @@ fn main() {
         let status = child.wait().await.unwrap();
         assert!(status.success());
         assert_eq!(fs::read(&started).unwrap(), b"started");
+    }
+
+    #[tokio::test]
+    async fn pueue_target_receives_verified_config_at_fd9_without_protocol_fd_leaks() {
+        let temporary = tempdir().unwrap();
+        let (launcher, _) = copy_launcher(temporary.path());
+        let target = compile_generated_pueue_fixture(temporary.path());
+        let config_path = temporary.path().join("pueue.yml");
+        fs::write(&config_path, b"pueue-config").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let config_anchor = PueueConfigAnchor::from_absolute(
+            &fs::canonicalize(&config_path).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let verified_config = config_anchor.verify_identity(&[]).unwrap();
+        let result_path = temporary.path().join("pueue-result");
+
+        let mut child = spawn_verified_command(VerifiedCommandSpec {
+            launcher,
+            executable: target,
+            argv: vec![
+                OsString::from("generated-pueue-target"),
+                result_path.as_os_str().to_os_string(),
+            ],
+            cwd: None,
+            environment: SanitizedEnvironment::default(),
+            process_group: ProcessGroupRequirement::Required,
+            start_suspended: true,
+            project_root: None,
+            pueue_config: Some(verified_config),
+            child_io: VerifiedChildIo::Capture,
+        })
+        .unwrap();
+
+        assert!(!result_path.exists(), "Pueue target executed before release");
+        child.release().unwrap();
+        child.confirm_exec().await.unwrap();
+        child.wait_for_release_ack().await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(fs::read(result_path).unwrap(), b"pueue-fd9-ok");
+    }
+
+    #[tokio::test]
+    async fn terminate_kills_descendant_that_ignores_term_without_reaping_during_grace() {
+        let temporary = tempdir().unwrap();
+        let (launcher, _) = copy_launcher(temporary.path());
+        let target = compile_generated_group_fixture(temporary.path());
+        let root_anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(
+            &fs::canonicalize(temporary.path()).unwrap(),
+        )
+        .unwrap();
+        let pid_path = temporary.path().join("descendant.pid");
+        let mut child = spawn_verified_command(VerifiedCommandSpec {
+            launcher,
+            executable: target,
+            argv: vec![
+                OsString::from("generated-group-target"),
+                OsString::from("parent"),
+                pid_path.as_os_str().to_os_string(),
+            ],
+            cwd: Some(root_anchor.canonical_path.clone()),
+            environment: SanitizedEnvironment::default(),
+            process_group: ProcessGroupRequirement::Required,
+            start_suspended: true,
+            project_root: Some(root_anchor.verify_identity().unwrap()),
+            pueue_config: None,
+            child_io: VerifiedChildIo::Capture,
+        })
+        .unwrap();
+        child.release().unwrap();
+        child.confirm_exec().await.unwrap();
+        child.wait_for_release_ack().await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let descendant_pid: libc::pid_t = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        terminate_process_group(&mut child).await;
+        let gone_deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(descendant_pid, 0) } == 0 && Instant::now() < gone_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 }
 
