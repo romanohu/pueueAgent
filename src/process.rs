@@ -648,47 +648,127 @@ fn install_bootstrap_fixed_map(
     control: OwnedFd,
     packet: BootstrapPacket,
 ) -> Result<InstalledBootstrap, BootstrapError> {
+    install_bootstrap_fixed_map_with_failure(control, packet, None)
+}
+
+#[cfg(unix)]
+fn install_bootstrap_fixed_map_with_failure(
+    control: OwnedFd,
+    packet: BootstrapPacket,
+    fail_before_slot: Option<RawFd>,
+) -> Result<InstalledBootstrap, BootstrapError> {
     let original_fixed_slots = original_fixed_slots(Some(&control), &packet.rights);
+    let expected_hint = bootstrap_slots(&packet.frame).unwrap_or_default();
+    let mut slots = FixedSlotTracker::new(expected_hint, original_fixed_slots);
     let prepared = match preflight_bootstrap_fixed_map(control, packet) {
         Ok(prepared) => prepared,
         Err(error) => {
-            // The consumed arguments have dropped all exact owners. Never
-            // close their numbers again: another thread could already have
-            // reused them. Only slots that were never owned are closed raw.
-            close_unowned_fixed_slots(&original_fixed_slots);
+            slots.finish_failure();
             return Err(error);
         }
     };
     let PreparedBootstrap { frame, expected_slots, mut sources } = prepared;
-    let retired_owned_slots = drop_unused_originals(&mut sources, &expected_slots);
-    close_unused_never_owned_slots(&expected_slots, &retired_owned_slots);
+    slots.expected = expected_slots.clone();
+    slots.drop_unused_originals(&mut sources);
+    slots.close_unused();
     for (index, slot) in expected_slots.iter().copied().enumerate() {
         let source = sources[index].source.as_raw_fd();
         release_original_at(&mut sources, slot);
-        if dup2_retry(source, slot).is_err()
+        slots.mark_original_released(slot);
+        if fail_before_slot == Some(slot)
+            || dup2_retry(source, slot).is_err()
             || set_close_on_exec(slot).is_err()
         {
-            let still_owned = remaining_original_fixed_slots(&sources);
             drop(sources);
-            let mut excluded = retired_owned_slots.clone();
-            excluded.extend(still_owned);
-            close_unowned_fixed_slots(&excluded);
+            slots.finish_failure();
             return Err(BootstrapError::BootstrapCorrupt);
         }
+        slots.mark_installed(slot);
     }
     drop(sources);
     for slot in &expected_slots {
         if validate_role(*slot, *slot, &frame).is_err() {
-            close_raw_slots(&expected_slots);
+            slots.finish_failure();
             return Err(BootstrapError::BootstrapCorrupt);
         }
         let flags = unsafe { libc::fcntl(*slot, libc::F_GETFD) };
         if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
-            close_raw_slots(&expected_slots);
+            slots.finish_failure();
             return Err(BootstrapError::BootstrapCorrupt);
         }
     }
     Ok(InstalledBootstrap { frame })
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixedSlotState { OwnedOriginal, Installed, Closed, NeverOwned }
+
+#[cfg(unix)]
+struct FixedSlotTracker {
+    base: RawFd,
+    expected: Vec<RawFd>,
+    states: Vec<FixedSlotState>,
+}
+
+#[cfg(unix)]
+impl FixedSlotTracker {
+    fn new(expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
+        Self::with_range(CONTROL_FD, RELEASE_ACK_FD, expected, owned)
+    }
+    fn with_range(base: RawFd, end: RawFd, expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
+        let states = (base..=end).map(|fd| {
+            if owned.contains(&fd) { FixedSlotState::OwnedOriginal }
+            else { FixedSlotState::NeverOwned }
+        }).collect();
+        Self { base, expected, states }
+    }
+    fn state_mut(&mut self, fd: RawFd) -> &mut FixedSlotState {
+        &mut self.states[(fd - self.base) as usize]
+    }
+    fn mark_original_released(&mut self, fd: RawFd) {
+        if *self.state_mut(fd) == FixedSlotState::OwnedOriginal {
+            *self.state_mut(fd) = FixedSlotState::NeverOwned;
+        }
+    }
+    fn mark_installed(&mut self, fd: RawFd) { *self.state_mut(fd) = FixedSlotState::Installed; }
+    fn drop_unused_originals(&mut self, sources: &mut [TrackedSource]) {
+        for tracked in sources {
+            let fd = tracked.original.as_ref().map(AsRawFd::as_raw_fd);
+            if let Some(fd) = fd
+                .filter(|fd| (*fd >= self.base) && (*fd < self.base + self.states.len() as RawFd))
+                .filter(|fd| !self.expected.contains(fd))
+            {
+                drop(tracked.original.take());
+                *self.state_mut(fd) = FixedSlotState::Closed;
+            }
+        }
+    }
+    fn close_unused(&mut self) {
+        self.close_unused_with(&mut close_raw);
+    }
+    fn close_unused_with(&mut self, close: &mut impl FnMut(RawFd)) {
+        for fd in self.base..self.base + self.states.len() as RawFd {
+            if !self.expected.contains(&fd) { self.close_once_with(fd, close); }
+        }
+    }
+    fn finish_failure(&mut self) {
+        self.finish_failure_with(&mut close_raw);
+    }
+    fn finish_failure_with(&mut self, close: &mut impl FnMut(RawFd)) {
+        for fd in self.base..self.base + self.states.len() as RawFd {
+            self.close_once_with(fd, close);
+        }
+    }
+    fn close_once_with(&mut self, fd: RawFd, close: &mut impl FnMut(RawFd)) {
+        match *self.state_mut(fd) {
+            FixedSlotState::Installed | FixedSlotState::NeverOwned => {
+                close(fd);
+                *self.state_mut(fd) = FixedSlotState::Closed;
+            }
+            FixedSlotState::OwnedOriginal | FixedSlotState::Closed => {}
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -710,33 +790,6 @@ fn original_fixed_slots(control: Option<&OwnedFd>, rights: &[OwnedFd]) -> Vec<Ra
         .map(AsRawFd::as_raw_fd)
         .filter(|fd| (CONTROL_FD..=RELEASE_ACK_FD).contains(fd))
         .collect()
-}
-
-#[cfg(unix)]
-fn remaining_original_fixed_slots(sources: &[TrackedSource]) -> Vec<RawFd> {
-    sources.iter().filter_map(|tracked| tracked.original.as_ref())
-        .map(AsRawFd::as_raw_fd)
-        .filter(|fd| (CONTROL_FD..=RELEASE_ACK_FD).contains(fd))
-        .collect()
-}
-
-#[cfg(unix)]
-fn drop_unused_originals(
-    sources: &mut [TrackedSource],
-    expected_slots: &[RawFd],
-) -> Vec<RawFd> {
-    let mut retired = Vec::new();
-    for tracked in sources {
-        let should_drop = tracked.original.as_ref()
-            .map(AsRawFd::as_raw_fd)
-            .filter(|fd| (CONTROL_FD..=RELEASE_ACK_FD).contains(fd))
-            .filter(|fd| !expected_slots.contains(fd));
-        if let Some(fd) = should_drop {
-            drop(tracked.original.take());
-            retired.push(fd);
-        }
-    }
-    retired
 }
 
 #[cfg(unix)]
@@ -803,27 +856,6 @@ fn dup2_retry(source: RawFd, destination: RawFd) -> Result<(), io::Error> {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
     }
-}
-
-#[cfg(unix)]
-fn close_unowned_fixed_slots(owned_slots: &[RawFd]) {
-    for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
-        if !owned_slots.contains(&descriptor) { close_raw(descriptor); }
-    }
-}
-
-#[cfg(unix)]
-fn close_unused_never_owned_slots(expected: &[RawFd], retired_owned: &[RawFd]) {
-    for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
-        if !expected.contains(&descriptor) && !retired_owned.contains(&descriptor) {
-            close_raw(descriptor);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn close_raw_slots(slots: &[RawFd]) {
-    for descriptor in slots { close_raw(*descriptor); }
 }
 
 #[cfg(unix)]
@@ -1685,6 +1717,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "internal mutation-failure bootstrap subprocess entry"]
+    fn bootstrap_mutation_failure_subprocess_helper() {
+        let packet = receive_bootstrap_packet(libc::STDIN_FILENO).unwrap();
+        let control = unsafe { OwnedFd::from_raw_fd(libc::STDIN_FILENO) };
+        assert!(matches!(
+            install_bootstrap_fixed_map_with_failure(control, packet, Some(EXEC_STATUS_FD)),
+            Err(BootstrapError::BootstrapCorrupt)
+        ));
+        for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
+            assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tracked_fixed_sources_keep_original_ownership_until_cleanup() {
         let (read, _write) = pipe_pair();
         let owned_raw = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100) };
@@ -1695,6 +1742,29 @@ mod tests {
         assert!(tracked.source.as_raw_fd() > owned_raw);
         drop(tracked);
         assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_slot_tracker_closes_each_synthetic_slot_once() {
+        let mut tracker = FixedSlotTracker::with_range(100, 102, vec![100, 101], vec![100]);
+        let mut closed = Vec::new();
+        tracker.close_unused_with(&mut |fd| closed.push(fd));
+        assert_eq!(closed, [102]);
+        assert_eq!(tracker.states, [
+            FixedSlotState::OwnedOriginal,
+            FixedSlotState::NeverOwned,
+            FixedSlotState::Closed,
+        ]);
+        tracker.mark_original_released(100);
+        tracker.mark_installed(100);
+        tracker.mark_installed(101);
+        tracker.finish_failure_with(&mut |fd| closed.push(fd));
+        assert_eq!(tracker.states, [FixedSlotState::Closed; 3]);
+        assert_eq!(closed, [102, 100, 101]);
+        tracker.finish_failure_with(&mut |fd| closed.push(fd));
+        assert_eq!(tracker.states, [FixedSlotState::Closed; 3]);
+        assert_eq!(closed, [102, 100, 101]);
     }
 
     #[cfg(unix)]
@@ -1770,6 +1840,46 @@ mod tests {
         assert_eq!(unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) }, libc::FD_CLOEXEC);
         assert_eq!(metadata_identity(&sentinel.metadata().unwrap()), sentinel_before);
         drop((release_write, exec_read, ack_read));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_mutation_failure_closes_the_fixed_map() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target_path = temporary.path().join("fixture-target");
+        fs::write(&target_path, b"generated fixture bytes").unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = File::open(&target_path).unwrap();
+        let root = File::open(temporary.path()).unwrap();
+        let log = OpenOptions::new().create_new(true).write(true).mode(0o600)
+            .open(temporary.path().join("agent.log")).unwrap();
+        let (release_read, _release_write) = pipe_pair();
+        let (_exec_read, exec_write) = pipe_pair();
+        let (_ack_read, ack_write) = pipe_pair();
+        let mut launch = frame();
+        launch.target_identity = metadata_identity(&target.metadata().unwrap());
+        launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
+        let rights = [
+            release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(),
+            root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(),
+        ];
+        let launch_guard = process_launch_guard().unwrap();
+        let (parent_socket, child_socket) = bootstrap_socket_pair(&launch_guard).unwrap();
+        let child_input = File::from(child_socket);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored", "--exact",
+                "process::tests::bootstrap_mutation_failure_subprocess_helper", "--nocapture",
+            ])
+            .stdin(Stdio::from(child_input))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        drop(launch_guard);
+        send_bootstrap_packet(parent_socket.as_raw_fd(), &launch, &rights).unwrap();
+        assert!(bounded_wait(&mut child).success());
     }
 
     #[cfg(unix)]
