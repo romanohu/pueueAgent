@@ -8,7 +8,9 @@
 use std::{
     ffi::{OsStr, OsString},
     fmt,
+    io::{Read, Write},
     ops::BitOr,
+    sync::{Mutex, MutexGuard},
 };
 
 use crate::execution_policy::ExecutableIdentity;
@@ -271,6 +273,8 @@ pub(crate) enum BootstrapError {
     IdentityMismatch,
     GateClosed,
     DescriptorNotCloseOnExec,
+    BootstrapCorrupt,
+    AliasedPipeRoles,
 }
 
 #[cfg(unix)]
@@ -298,23 +302,30 @@ pub(crate) struct InstalledBootstrap {
 }
 
 #[cfg(unix)]
-const fn bootstrap_socket_type() -> libc::c_int {
-    // Darwin does not implement AF_UNIX SOCK_SEQPACKET (EPROTONOSUPPORT).
-    // A connected datagram socketpair retains the same one-record receive and
-    // ancillary truncation guarantees used by this protocol.
-    #[cfg(target_vendor = "apple")]
-    { libc::SOCK_DGRAM }
-    #[cfg(not(target_vendor = "apple"))]
-    { libc::SOCK_SEQPACKET }
+static PROCESS_LAUNCH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize descriptor creation that cannot atomically request CLOEXEC with
+/// every supervisor spawn adapter. Trusted supervisor code must hold this
+/// guard from before it creates inheritable process resources until after
+/// spawn returns. Third-party code running inside the trusted supervisor is
+/// outside the threat model.
+#[cfg(unix)]
+pub(crate) fn process_launch_guard() -> MutexGuard<'static, ()> {
+    PROCESS_LAUNCH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(unix)]
 pub(crate) fn bootstrap_socket_pair() -> Result<(OwnedFd, OwnedFd), BootstrapError> {
+    let _guard = process_launch_guard();
     let mut sockets = [-1; 2];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let socket_type = libc::SOCK_STREAM;
     if unsafe {
         libc::socketpair(
             libc::AF_UNIX,
-            bootstrap_socket_type(),
+            socket_type,
             0,
             sockets.as_mut_ptr(),
         )
@@ -326,8 +337,13 @@ pub(crate) fn bootstrap_socket_pair() -> Result<(OwnedFd, OwnedFd), BootstrapErr
     let pair = unsafe {
         (OwnedFd::from_raw_fd(sockets[0]), OwnedFd::from_raw_fd(sockets[1]))
     };
-    set_close_on_exec(pair.0.as_raw_fd())?;
-    set_close_on_exec(pair.1.as_raw_fd())?;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        set_close_on_exec(pair.0.as_raw_fd())?;
+        set_close_on_exec(pair.1.as_raw_fd())?;
+    }
+    prove_close_on_exec(pair.0.as_raw_fd())?;
+    prove_close_on_exec(pair.1.as_raw_fd())?;
     Ok(pair)
 }
 
@@ -362,7 +378,7 @@ pub(crate) fn send_bootstrap_packet(
     }
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
-        iov_len: bytes.len(),
+        iov_len: 1,
     };
     let rights_bytes = rights
         .len()
@@ -391,16 +407,30 @@ pub(crate) fn send_bootstrap_packet(
             libc::CMSG_DATA(header),
             rights_bytes,
         );
-        let sent = libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL);
-        if sent < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
-        if sent as usize != bytes.len() { return Err(BootstrapError::TruncatedPacket); }
+        loop {
+            let sent = libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL);
+            if sent < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(BootstrapError::Io(error));
+            }
+            if sent != 1 { return Err(BootstrapError::TruncatedPacket); }
+            break;
+        }
+    }
+    // SAFETY: the caller owns `socket` for this operation; ManuallyDrop keeps
+    // this borrowed wrapper from closing it.
+    let mut stream = mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket) });
+    stream.write_all(&bytes[1..])?;
+    if unsafe { libc::shutdown(socket, libc::SHUT_WR) } < 0 {
+        return Err(BootstrapError::Io(io::Error::last_os_error()));
     }
     Ok(())
 }
 
 #[cfg(unix)]
 pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket, BootstrapError> {
-    let mut bytes = vec![0u8; MAX_FRAME_SIZE];
+    let mut first = [0u8; 1];
     // One extra slot ensures an over-cardinality sender is observed rather
     // than silently accepted at the protocol maximum.
     let max_rights = 8usize;
@@ -408,8 +438,8 @@ pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket,
     let control_len = unsafe { libc::CMSG_SPACE(ancillary_bytes as _) } as usize;
     let mut control = vec![0u8; control_len];
     let mut iov = libc::iovec {
-        iov_base: bytes.as_mut_ptr().cast(),
-        iov_len: bytes.len(),
+        iov_base: first.as_mut_ptr().cast(),
+        iov_len: first.len(),
     };
     let mut message: libc::msghdr = unsafe { mem::zeroed() };
     message.msg_iov = &mut iov;
@@ -420,40 +450,50 @@ pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket,
     let recv_flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let recv_flags = 0;
-    let received = unsafe { libc::recvmsg(socket, &mut message, recv_flags) };
-    if received < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
+    let received = loop {
+        let result = unsafe { libc::recvmsg(socket, &mut message, recv_flags) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted { continue; }
+            return Err(BootstrapError::Io(error));
+        }
+        break result;
+    };
     if received == 0 { return Err(BootstrapError::EmptyPacket); }
-    if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-        return Err(BootstrapError::TruncatedPacket);
-    }
-    bytes.truncate(received as usize);
 
     let mut rights = Vec::new();
+    let mut ancillary_count = 0usize;
     unsafe {
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
-            if (*header).cmsg_level != libc::SOL_SOCKET || (*header).cmsg_type != libc::SCM_RIGHTS {
-                return Err(BootstrapError::UnexpectedAncillary);
-            }
             let base_len = libc::CMSG_LEN(0) as usize;
             let header_len = (*header).cmsg_len as usize;
-            if header_len < base_len {
-                return Err(BootstrapError::TruncatedPacket);
-            }
-            let data_len = header_len - base_len;
-            if data_len == 0 || data_len % mem::size_of::<RawFd>() != 0 {
-                return Err(BootstrapError::TruncatedPacket);
-            }
-            for index in 0..(data_len / mem::size_of::<RawFd>()) {
-                let raw = ptr::read_unaligned(
-                    libc::CMSG_DATA(header).cast::<RawFd>().add(index),
-                );
-                rights.push(OwnedFd::from_raw_fd(raw));
+            if (*header).cmsg_level == libc::SOL_SOCKET
+                && (*header).cmsg_type == libc::SCM_RIGHTS
+                && header_len >= base_len
+            {
+                ancillary_count += 1;
+                let data_len = header_len - base_len;
+                if data_len % mem::size_of::<RawFd>() == 0 {
+                    for index in 0..(data_len / mem::size_of::<RawFd>()) {
+                        let raw = ptr::read_unaligned(
+                            libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                        );
+                        rights.push(OwnedFd::from_raw_fd(raw));
+                    }
+                }
             }
             header = libc::CMSG_NXTHDR(&message, header);
         }
     }
+    // Every complete received right is now RAII-owned. Any error below closes
+    // all of them, including ancillary truncation and over-cardinality.
+    if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(BootstrapError::TruncatedPacket);
+    }
+    if ancillary_count != 1 { return Err(BootstrapError::UnexpectedAncillary); }
     if rights.is_empty() { return Err(BootstrapError::MissingRights); }
+    if rights.len() > 7 { return Err(BootstrapError::WrongRightCount); }
     for right in &rights {
         let flags = unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
@@ -466,6 +506,21 @@ pub(crate) fn receive_bootstrap_packet(socket: RawFd) -> Result<BootstrapPacket,
         if proof < 0 || proof & libc::FD_CLOEXEC == 0 {
             return Err(BootstrapError::DescriptorNotCloseOnExec);
         }
+    }
+    let mut header = [0u8; HEADER_SIZE];
+    header[0] = first[0];
+    let mut stream = mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket) });
+    stream.read_exact(&mut header[1..])?;
+    if header[..4] != *b"PAEX" { return Err(BootstrapError::Codec(CodecError::InvalidMagic)); }
+    let payload_len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+    let total = HEADER_SIZE.checked_add(payload_len).ok_or(CodecError::LengthOverflow)?;
+    if total > MAX_FRAME_SIZE { return Err(BootstrapError::Codec(CodecError::FrameTooLarge)); }
+    let mut bytes = vec![0u8; total];
+    bytes[..HEADER_SIZE].copy_from_slice(&header);
+    stream.read_exact(&mut bytes[HEADER_SIZE..])?;
+    let mut trailing = [0u8; 1];
+    if stream.read(&mut trailing)? != 0 {
+        return Err(BootstrapError::Codec(CodecError::TrailingBytes));
     }
     let frame = ControlFrame::decode(&bytes)?;
     if rights.len() != bootstrap_right_slots(&frame)?.len() {
@@ -547,6 +602,16 @@ fn set_close_on_exec(raw: RawFd) -> Result<(), BootstrapError> {
     if flags < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
     if unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
         return Err(BootstrapError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prove_close_on_exec(raw: RawFd) -> Result<(), BootstrapError> {
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
+    if flags & libc::FD_CLOEXEC == 0 {
+        return Err(BootstrapError::DescriptorNotCloseOnExec);
     }
     Ok(())
 }
@@ -1185,6 +1250,63 @@ mod tests {
         for descriptor in packet.rights {
             let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
             assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_receiver_rejects_trailing_bytes_after_half_close() {
+        let (sender, receiver) = socket_pair();
+        let mut owned = Vec::new();
+        for _ in 0..6 {
+            let (read, _write) = pipe_pair();
+            owned.push(read);
+        }
+        let raw: Vec<_> = owned.iter().map(AsRawFd::as_raw_fd).collect();
+        let bytes = frame().encode().unwrap();
+        let mut iov = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
+        let rights_bytes = raw.len() * mem::size_of::<RawFd>();
+        let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(rights_bytes as _) } as usize];
+        let mut message: libc::msghdr = unsafe { mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len() as _;
+        unsafe {
+            let ancillary = libc::CMSG_FIRSTHDR(&message);
+            (*ancillary).cmsg_level = libc::SOL_SOCKET;
+            (*ancillary).cmsg_type = libc::SCM_RIGHTS;
+            (*ancillary).cmsg_len = libc::CMSG_LEN(rights_bytes as _) as _;
+            ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(ancillary), rights_bytes);
+            assert_eq!(libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_NOSIGNAL), bytes.len() as isize);
+        }
+        let mut borrowed = mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(sender.as_raw_fd()) });
+        borrowed.write_all(b"x").unwrap();
+        assert_eq!(unsafe { libc::shutdown(sender.as_raw_fd(), libc::SHUT_WR) }, 0);
+        assert!(matches!(
+            receive_bootstrap_packet(receiver.as_raw_fd()),
+            Err(BootstrapError::Codec(CodecError::TrailingBytes))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_socket_is_stream_and_close_on_exec() {
+        let (left, right) = socket_pair();
+        for descriptor in [left.as_raw_fd(), right.as_raw_fd()] {
+            prove_close_on_exec(descriptor).unwrap();
+            let mut socket_type = 0;
+            let mut length = mem::size_of_val(&socket_type) as libc::socklen_t;
+            assert_eq!(unsafe {
+                libc::getsockopt(
+                    descriptor,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut socket_type as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            }, 0);
+            assert_eq!(socket_type, libc::SOCK_STREAM);
         }
     }
 
