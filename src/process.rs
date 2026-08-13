@@ -375,18 +375,32 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     if root != frame.project_root_identity.is_some() { return Err(if root { CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY) }); }
     if log != frame.agent_log_identity.is_some() { return Err(if log { CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY) }); }
     if pueue != frame.pueue_config_identity.is_some() { return Err(if pueue { CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY) }); }
-    let mut names = std::collections::HashSet::with_capacity(frame.environment.len());
-    for (name, value) in &frame.environment {
+    validate_environment_without_allocation(&frame.environment)?;
+    for arg in &frame.argv { validate_field_bytes(arg)?; }
+    if let Some(cwd) = &frame.cwd { validate_field_bytes(cwd)?; }
+    Ok(())
+}
+
+/// Validate the caller-owned environment without building a set or cloning
+/// any names.  The wire contract bounds this list to 128 entries, making the
+/// borrowed O(n²) duplicate check both bounded and preferable to allocating
+/// before the exact frame-size preflight has completed.
+fn validate_environment_without_allocation(
+    environment: &[(OsString, OsString)],
+) -> Result<(), CodecError> {
+    for (index, (name, value)) in environment.iter().enumerate() {
         validate_field_bytes(name)?;
         validate_field_bytes(value)?;
         let name_bytes = os_bytes(name)?;
         if name_bytes.is_empty() || name_bytes.contains(&b'=') {
             return Err(CodecError::InvalidEnvironmentName);
         }
-        if !names.insert(name_bytes.to_vec()) { return Err(CodecError::DuplicateEnvironmentName); }
+        for (previous, _) in &environment[..index] {
+            if os_bytes(previous)? == name_bytes {
+                return Err(CodecError::DuplicateEnvironmentName);
+            }
+        }
     }
-    for arg in &frame.argv { validate_field_bytes(arg)?; }
-    if let Some(cwd) = &frame.cwd { validate_field_bytes(cwd)?; }
     Ok(())
 }
 
@@ -654,6 +668,20 @@ mod tests {
 
         let mut oversized = frame();
         oversized.argv = (0..20).map(|_| OsString::from("z".repeat(MAX_FIELD_SIZE))).collect();
+        assert_eq!(oversized.encode(), Err(CodecError::FrameTooLarge));
+    }
+
+    #[test]
+    fn oversized_environment_rejects_after_borrowed_preflight() {
+        let mut oversized = frame();
+        oversized.environment = (0..MAX_ENV)
+            .map(|index| {
+                (
+                    OsString::from(format!("KEY_{index}")),
+                    OsString::from("v".repeat(MAX_FIELD_SIZE)),
+                )
+            })
+            .collect();
         assert_eq!(oversized.encode(), Err(CodecError::FrameTooLarge));
     }
 
