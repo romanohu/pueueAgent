@@ -3,16 +3,28 @@ mod unix {
     use std::{
         ffi::OsString,
         fs::{self, File, OpenOptions},
-        os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+        io::Write,
+        os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        path::Path,
+        os::unix::net::UnixStream,
+        path::{Path, PathBuf},
+        process::{Child, Command, ExitStatus, Stdio},
+        time::{Duration, Instant},
     };
 
     use pueue_agent::{
         execution_policy::{ExecutableAnchor, ExecutableIdentity},
-        process::{spawn_validated_helper, ControlFrame, LaunchFlags, LaunchMode},
+        process::{
+            spawn_validated_helper, BootstrapError, ControlFrame, LaunchFlags, LaunchMode,
+            ProcessLaunchError,
+        },
     };
     use tempfile::tempdir;
+
+    // The production protocol deadline is five seconds. Keep the integration
+    // allowance slightly above it so concurrent filesystem-heavy test setup
+    // does not turn a bounded failure assertion into a scheduling race.
+    const MAX_HELPER_WAIT: Duration = Duration::from_secs(6);
 
     fn identity(metadata: &fs::Metadata) -> ExecutableIdentity {
         ExecutableIdentity {
@@ -39,20 +51,98 @@ mod unix {
         }
     }
 
+    fn copy_launcher(directory: &Path) -> (ExecutableAnchor, PathBuf) {
+        assert!(!directory.starts_with(env!("CARGO_MANIFEST_DIR")));
+        let launcher_path = directory.join("trusted-pueue-agent");
+        fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher_path).unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher_path = fs::canonicalize(launcher_path).unwrap();
+        let anchor = ExecutableAnchor::from_absolute(&launcher_path, &[]).unwrap();
+        (anchor, launcher_path)
+    }
+
+    fn bounded_wait(child: &mut Child) -> ExitStatus {
+        let deadline = Instant::now() + MAX_HELPER_WAIT;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("native bootstrap helper did not exit before its test deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn spawn_internal_with_socket(launcher: &Path) -> (Child, UnixStream) {
+        let (parent, child) = UnixStream::pair().unwrap();
+        for descriptor in [parent.as_raw_fd(), child.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+                0,
+            );
+        }
+        let child = Command::new(launcher)
+            .arg("internal-launch")
+            .env_clear()
+            .stdin(Stdio::from(OwnedFd::from(child)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        (child, parent)
+    }
+
     fn frame(target: &File, root: &File, log: &File) -> ControlFrame {
         ControlFrame {
             mode: LaunchMode::Agent,
             flags: LaunchFlags::PROCESS_GROUP
                 .union(LaunchFlags::PROJECT_ROOT)
                 .union(LaunchFlags::AGENT_LOG),
-            argv: vec![OsString::from("generated-fixture")],
-            environment: Vec::new(),
+            argv: vec![OsString::from("generated-fixture"), OsString::from("payload-sentinel")],
+            environment: vec![(OsString::from("FIXTURE_NAME"), OsString::from("fixture-value"))],
             cwd: None,
             target_identity: identity(&target.metadata().unwrap()),
             project_root_identity: Some(identity(&root.metadata().unwrap())),
             agent_log_identity: Some(identity(&log.metadata().unwrap())),
             pueue_config_identity: None,
         }
+    }
+
+    fn rights(target: &File, root: &File, log: &File) -> (Vec<OwnedFd>, Vec<OwnedFd>) {
+        let (release_read, release_write) = pipe();
+        let (exec_read, exec_write) = pipe();
+        let (ack_read, ack_write) = pipe();
+        (
+            vec![
+                release_read,
+                exec_write,
+                unsafe { OwnedFd::from_raw_fd(target.try_clone().unwrap().into_raw_fd()) },
+                unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
+                unsafe { OwnedFd::from_raw_fd(log.try_clone().unwrap().into_raw_fd()) },
+                ack_write,
+            ],
+            vec![release_write, exec_read, ack_read],
+        )
+    }
+
+    fn files(directory: &Path) -> (File, File, File) {
+        let target_path = directory.join("generated-target");
+        fs::write(&target_path, b"generated fixture bytes").unwrap();
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = File::open(&target_path).unwrap();
+        let root = File::open(directory).unwrap();
+        let log = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(directory.join("agent.log"))
+            .unwrap();
+        (target, root, log)
     }
 
     #[test]
@@ -70,25 +160,60 @@ mod unix {
     }
 
     #[test]
+    fn helper_eof_and_malformed_bootstrap_fail_within_deadline() {
+        let temporary = tempdir().unwrap();
+        let (_, launcher_path) = copy_launcher(temporary.path());
+
+        let (mut eof_child, eof_parent) = spawn_internal_with_socket(&launcher_path);
+        drop(eof_parent);
+        assert!(!bounded_wait(&mut eof_child).success());
+
+        let (mut malformed_child, mut malformed_parent) = spawn_internal_with_socket(&launcher_path);
+        malformed_parent.write_all(b"not-a-control-frame").unwrap();
+        malformed_parent
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        assert!(!bounded_wait(&mut malformed_child).success());
+    }
+
+    #[test]
     fn validated_helper_sends_readiness_and_exits_without_target_execution() {
         let temporary = tempdir().unwrap();
-        let target_path = temporary.path().join("generated-target");
-        fs::write(&target_path, b"fixture bytes").unwrap();
-        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o700)).unwrap();
-        let target = File::open(&target_path).unwrap();
-        let root = File::open(temporary.path()).unwrap();
-        let log = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(temporary.path().join("agent.log"))
-            .unwrap();
+        let (target, root, log) = files(temporary.path());
         let launch = frame(&target, &root, &log);
+        let (rights, _keepers) = rights(&target, &root, &log);
+        let (launcher, _) = copy_launcher(temporary.path());
+        let mut helper = spawn_validated_helper(&launcher, launch, rights).unwrap();
+        assert!(helper.wait().unwrap().success());
+    }
 
-        let (release_read, _release_write) = pipe();
-        let (_exec_read, exec_write) = pipe();
-        let (_ack_read, ack_write) = pipe();
-        let rights = vec![
+    #[test]
+    fn identity_and_release_gate_failures_are_bounded_and_redacted() {
+        let temporary = tempdir().unwrap();
+        let (target, root, log) = files(temporary.path());
+        let (launcher, _) = copy_launcher(temporary.path());
+
+        let mut identity_mismatch = frame(&target, &root, &log);
+        identity_mismatch.target_identity.inode = identity_mismatch.target_identity.inode.wrapping_add(1);
+        let (identity_rights, _identity_keepers) = rights(&target, &root, &log);
+        let started = Instant::now();
+        let identity_error = match spawn_validated_helper(&launcher, identity_mismatch, identity_rights) {
+            Ok(_) => panic!("identity mismatch unexpectedly produced readiness"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < MAX_HELPER_WAIT);
+        assert!(matches!(identity_error, ProcessLaunchError::ReadinessRejected));
+        let rendered = identity_error.to_string();
+        assert!(!rendered.contains("payload-sentinel"));
+        assert!(!rendered.contains("fixture-value"));
+        assert!(!rendered.contains(temporary.path().to_string_lossy().as_ref()));
+
+        let launch = frame(&target, &root, &log);
+        let (release_read, release_write) = pipe();
+        drop(release_write);
+        let (exec_read, exec_write) = pipe();
+        let (ack_read, ack_write) = pipe();
+        let gate_rights = vec![
             release_read,
             exec_write,
             unsafe { OwnedFd::from_raw_fd(target.try_clone().unwrap().into_raw_fd()) },
@@ -96,21 +221,52 @@ mod unix {
             unsafe { OwnedFd::from_raw_fd(log.try_clone().unwrap().into_raw_fd()) },
             ack_write,
         ];
+        let started = Instant::now();
+        let gate_error = match spawn_validated_helper(&launcher, launch, gate_rights) {
+            Ok(_) => panic!("closed release gate unexpectedly produced readiness"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < MAX_HELPER_WAIT);
+        assert!(matches!(gate_error, ProcessLaunchError::ReadinessRejected));
+        drop((exec_read, ack_read));
+    }
 
-        let launcher = ExecutableAnchor::from_absolute(Path::new(env!("CARGO_BIN_EXE_pueue-agent")), &[])
-            .unwrap();
-        let mut helper = spawn_validated_helper(&launcher, launch, rights).unwrap();
+    #[test]
+    fn malformed_parent_request_terminates_helper_and_preserves_parent_sentinel() {
+        let temporary = tempdir().unwrap();
+        let (target, root, log) = files(temporary.path());
+        let (launcher, _) = copy_launcher(temporary.path());
+        let launch = frame(&target, &root, &log);
+
+        let started = Instant::now();
+        let malformed_error = match spawn_validated_helper(&launcher, launch.clone(), Vec::new()) {
+            Ok(_) => panic!("missing descriptor rights unexpectedly produced readiness"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < MAX_HELPER_WAIT);
+        assert!(matches!(
+            malformed_error,
+            ProcessLaunchError::Bootstrap(BootstrapError::WrongRightCount)
+        ));
+
+        let sentinel_raw = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+        assert!(sentinel_raw >= 200);
+        let sentinel = unsafe { File::from_raw_fd(sentinel_raw) };
+        let sentinel_identity = identity(&sentinel.metadata().unwrap());
+        let (valid_rights, _keepers) = rights(&target, &root, &log);
+        let mut helper = spawn_validated_helper(&launcher, launch, valid_rights).unwrap();
         assert!(helper.wait().unwrap().success());
+        assert_eq!(identity(&sentinel.metadata().unwrap()), sentinel_identity);
+        assert_eq!(
+            unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) },
+            libc::FD_CLOEXEC,
+        );
     }
 
     #[test]
     fn launcher_replacement_before_spawn_fails_closed() {
         let temporary = tempdir().unwrap();
-        let launcher_path = temporary.path().join("trusted-launcher");
-        fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher_path).unwrap();
-        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o700)).unwrap();
-        let launcher_path = fs::canonicalize(launcher_path).unwrap();
-        let anchor = ExecutableAnchor::from_absolute(&launcher_path, &[]).unwrap();
+        let (anchor, launcher_path) = copy_launcher(temporary.path());
 
         let replacement = temporary.path().join("replacement");
         fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &replacement).unwrap();

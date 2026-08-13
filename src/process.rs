@@ -364,6 +364,16 @@ impl ValidatedHelper {
 }
 
 #[cfg(unix)]
+impl Drop for ValidatedHelper {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
 impl From<io::Error> for BootstrapError {
     fn from(value: io::Error) -> Self { Self::Io(value) }
 }
@@ -416,7 +426,11 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
     let failure_channel = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, RELEASE_ACK_FD + 1) };
     let result = receive_and_install_bootstrap(libc::STDIN_FILENO);
     match result {
-        Ok(_) => {
+        Ok(installed) => {
+            // Reading the validated mode here makes the readiness dependency
+            // explicit: this branch is reachable only after the full frame
+            // and its mode-specific descriptor map have been installed.
+            let _validated_mode = installed.frame.mode;
             // Control fd 3 is the bootstrap socket peer. A readiness record is
             // sent only after every fixed descriptor was mapped and validated.
             write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
@@ -451,6 +465,31 @@ fn write_fixed_record(raw: RawFd, record: &[u8; 8]) -> Result<(), BootstrapError
     Ok(())
 }
 
+#[cfg(unix)]
+fn build_helper_command(
+    launcher: &std::path::Path,
+    child_input: Stdio,
+) -> StdCommand {
+    let mut command = StdCommand::new(launcher);
+    command
+        .arg("internal-launch")
+        .env_clear()
+        .stdin(child_input)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(unix)]
+fn revalidate_launcher_before_spawn(
+    launcher: &crate::execution_policy::ExecutableAnchor,
+) -> Result<(), ProcessLaunchError> {
+    launcher
+        .verify_identity()
+        .map(|_| ())
+        .map_err(|_| ProcessLaunchError::LauncherRejected)
+}
+
 /// Start the verified absolute-path helper with only the hidden subcommand in
 /// argv, send its bounded descriptor bootstrap frame, and await its exact
 /// readiness record. This is deliberately a bootstrap-only adapter: it does
@@ -475,20 +514,15 @@ pub fn spawn_validated_helper(
         bootstrap_socket_pair(&launch_guard).map_err(ProcessLaunchError::Bootstrap)?;
 
     let child_input = unsafe { std::fs::File::from_raw_fd(child_socket.into_raw_fd()) };
-    let mut command = StdCommand::new(&verified.anchor.canonical_path);
-    command
-        .arg("internal-launch")
-        .env_clear()
-        .stdin(Stdio::from(child_input))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let mut command = build_helper_command(
+        &verified.anchor.canonical_path,
+        Stdio::from(child_input),
+    );
 
     // Revalidate as the final operation before spawn. This closes the normal
     // replacement-before-spawn case; a same-UID swap in the tiny path lookup
     // window is the documented boundary until descriptor-bound launch exists.
-    launcher
-        .verify_identity()
-        .map_err(|_| ProcessLaunchError::LauncherRejected)?;
+    revalidate_launcher_before_spawn(launcher)?;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return Err(ProcessLaunchError::Spawn),
@@ -1700,14 +1734,14 @@ mod tests {
     fn debug_is_redacted_to_shape_only() {
         let mut value = frame();
         value.argv = vec![OsString::from("secret-argv")];
-        value.environment = vec![(OsString::from("SECRET_NAME"), OsString::from("secret-value"))];
+        value.environment = vec![(OsString::from("FIXTURE_NAME"), OsString::from("fixture-value"))];
         value.cwd = Some(OsString::from("secret-cwd"));
         let debug = format!("{value:?}");
         assert!(debug.contains("argv_count"));
         assert!(debug.contains("environment_count"));
         assert!(!debug.contains("secret-argv"));
-        assert!(!debug.contains("SECRET_NAME"));
-        assert!(!debug.contains("secret-value"));
+        assert!(!debug.contains("FIXTURE_NAME"));
+        assert!(!debug.contains("fixture-value"));
         assert!(!debug.contains("secret-cwd"));
     }
 
@@ -1744,6 +1778,40 @@ mod tests {
         assert_eq!(fds.agent_log, 8);
         assert_eq!(fds.pueue_config, 9);
         assert_eq!(fds.release_ack, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_argv_contains_only_the_hidden_subcommand() {
+        let command = build_helper_command(
+            std::path::Path::new("/trusted/pueue-agent"),
+            Stdio::null(),
+        );
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("/trusted/pueue-agent"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("internal-launch")],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_revalidation_rejects_replacement_after_command_construction() {
+        let temporary = tempfile::tempdir().unwrap();
+        let launcher = temporary.path().join("trusted-launcher");
+        fs::copy(std::env::current_exe().unwrap(), &launcher).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = fs::canonicalize(launcher).unwrap();
+        let anchor = crate::execution_policy::ExecutableAnchor::from_absolute(&launcher, &[])
+            .unwrap();
+        let replacement = temporary.path().join("replacement-launcher");
+        fs::copy(std::env::current_exe().unwrap(), &replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let _command = build_helper_command(&launcher, Stdio::null());
+        fs::rename(replacement, launcher).unwrap();
+        let result = revalidate_launcher_before_spawn(&anchor);
+        assert!(matches!(result, Err(ProcessLaunchError::LauncherRejected)));
     }
 
     #[cfg(unix)]
@@ -1965,6 +2033,30 @@ mod tests {
         for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
             assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal validated-helper lifecycle subprocess entry"]
+    fn validated_helper_lifecycle_subprocess() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_validated_helper_terminates_and_reaps_its_child() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored", "--exact",
+            "process::tests::validated_helper_lifecycle_subprocess", "--nocapture",
+        ]);
+        let child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        drop(ValidatedHelper { child });
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 
     #[cfg(unix)]
