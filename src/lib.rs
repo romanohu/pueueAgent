@@ -22,6 +22,7 @@ pub mod models;
 pub mod output;
 pub mod paths;
 pub mod periodic;
+pub mod process;
 pub mod project;
 pub mod project_logs;
 pub mod pueue;
