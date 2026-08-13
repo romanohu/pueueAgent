@@ -17,6 +17,17 @@ use std::{
 use crate::execution_policy::ExecutableIdentity;
 
 #[cfg(unix)]
+use crate::{
+    environment::SanitizedEnvironment,
+    execution_policy::{
+        ExecutableAnchor, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
+        VerifiedProjectRoot, VerifiedPueueConfig,
+    },
+    project_logs::LogFileIdentity,
+    AppError,
+};
+
+#[cfg(unix)]
 use std::{
     io,
     mem,
@@ -54,13 +65,20 @@ pub const MAX_ARGV: usize = 256;
 pub const MAX_ENV: usize = 128;
 pub const MAX_FIELD_SIZE: usize = 64 * 1024;
 const BOOTSTRAP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const LIFECYCLE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const RELEASE_AUTHORIZATION: [u8; 1] = [0xa5];
+#[cfg(unix)]
+const EXEC_FAILURE_RECORD: [u8; 8] = *b"PAEE\x01\x01\0\0";
 
 const HEADER_SIZE: usize = 12;
-const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT | FLAG_AGENT_LOG | FLAG_PUEUE_CONFIG | FLAG_PROCESS_GROUP;
+const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT | FLAG_AGENT_LOG | FLAG_PUEUE_CONFIG | FLAG_PROCESS_GROUP | FLAG_LIFECYCLE;
 const FLAG_PROJECT_ROOT: u16 = 1 << 0;
 const FLAG_AGENT_LOG: u16 = 1 << 1;
 const FLAG_PUEUE_CONFIG: u16 = 1 << 2;
 const FLAG_PROCESS_GROUP: u16 = 1 << 3;
+const FLAG_LIFECYCLE: u16 = 1 << 4;
 
 const FIELD_ARGV: u8 = 1;
 const FIELD_ENV: u8 = 2;
@@ -69,6 +87,7 @@ const FIELD_CWD: u8 = 4;
 const FIELD_PROJECT_ROOT_IDENTITY: u8 = 5;
 const FIELD_AGENT_LOG_IDENTITY: u8 = 6;
 const FIELD_PUEUE_CONFIG_IDENTITY: u8 = 7;
+const FIELD_TARGET_PATH: u8 = 8;
 const IDENTITY_SIZE: usize = 8 + 8 + 4 + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +171,7 @@ impl LaunchFlags {
     pub const AGENT_LOG: Self = Self(FLAG_AGENT_LOG);
     pub const PUEUE_CONFIG: Self = Self(FLAG_PUEUE_CONFIG);
     pub const PROCESS_GROUP: Self = Self(FLAG_PROCESS_GROUP);
+    const LIFECYCLE: Self = Self(FLAG_LIFECYCLE);
 
     pub const fn bits(self) -> u16 { self.0 }
     pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
@@ -180,6 +200,7 @@ pub struct ControlFrame {
     pub project_root_identity: Option<ExecutableIdentity>,
     pub agent_log_identity: Option<ExecutableIdentity>,
     pub pueue_config_identity: Option<ExecutableIdentity>,
+    pub target_path: Option<OsString>,
 }
 
 impl fmt::Debug for ControlFrame {
@@ -195,6 +216,7 @@ impl fmt::Debug for ControlFrame {
             .field("project_root_identity_present", &self.project_root_identity.is_some())
             .field("agent_log_identity_present", &self.agent_log_identity.is_some())
             .field("pueue_config_identity_present", &self.pueue_config_identity.is_some())
+            .field("target_path_present", &self.target_path.is_some())
             .finish()
     }
 }
@@ -280,6 +302,7 @@ pub enum BootstrapError {
     DescriptorNotCloseOnExec,
     BootstrapCorrupt,
     AliasedPipeRoles,
+    TargetCreate,
 }
 
 #[cfg(unix)]
@@ -298,6 +321,7 @@ impl fmt::Display for BootstrapError {
             Self::DescriptorNotCloseOnExec => formatter.write_str("bootstrap descriptor was not close-on-exec"),
             Self::BootstrapCorrupt => formatter.write_str("bootstrap fixed descriptor map was rejected"),
             Self::AliasedPipeRoles => formatter.write_str("bootstrap pipe roles were aliased"),
+            Self::TargetCreate => formatter.write_str("native target creation failed"),
         }
     }
 }
@@ -346,6 +370,8 @@ const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_CLEANUP_INLINE_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const HELPER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+#[cfg(unix)]
+const TARGET_CANCEL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(unix)]
 static HELPER_REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
@@ -358,6 +384,179 @@ enum ReaperProbe {
     Done,
     Running,
     Retain,
+}
+
+/// Whether the hidden supervisor must become a new session and process-group
+/// leader before it creates the target. Native production launches require
+/// this; `NotRequired` is retained for non-agent adapters but is rejected by
+/// the current fixed protocol.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessGroupRequirement {
+    Required,
+    NotRequired,
+}
+
+/// Target standard-I/O routing. Capture owns Tokio pipes in the parent;
+/// AgentLog sends output directly to already verified owner-only files.
+#[cfg(unix)]
+pub enum VerifiedChildIo {
+    Capture,
+    AgentLog {
+        stdout: std::fs::File,
+        stderr: std::fs::File,
+        identity: LogFileIdentity,
+    },
+}
+
+#[cfg(unix)]
+pub struct VerifiedCommandSpec {
+    pub launcher: ExecutableAnchor,
+    pub executable: ExecutableAnchor,
+    pub argv: Vec<OsString>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub environment: SanitizedEnvironment,
+    pub process_group: ProcessGroupRequirement,
+    pub start_suspended: bool,
+    pub project_root: Option<VerifiedProjectRoot>,
+    pub pueue_config: Option<VerifiedPueueConfig>,
+    pub child_io: VerifiedChildIo,
+}
+
+#[cfg(unix)]
+pub struct StartGate {
+    writer: Option<std::fs::File>,
+}
+
+#[cfg(unix)]
+pub struct ExecStatusReceiver {
+    reader: Option<std::fs::File>,
+    deadline: Instant,
+}
+
+#[cfg(unix)]
+pub struct AckReceiver {
+    reader: Option<std::fs::File>,
+    deadline: Instant,
+}
+
+/// A helper process that owns exactly one blocked/suspended target and remains
+/// its process-group leader until the target has been reaped.
+#[cfg(unix)]
+pub struct VerifiedChild {
+    pub child: tokio::process::Child,
+    pub pid: i64,
+    pub process_group_id: Option<i64>,
+    pub start_gate: StartGate,
+    pub exec_status: ExecStatusReceiver,
+    pub ack: AckReceiver,
+    capture: bool,
+    released: bool,
+    exec_confirmed: bool,
+}
+
+#[cfg(unix)]
+impl VerifiedChild {
+    pub fn release(&mut self) -> Result<(), AppError> {
+        if self.released {
+            return Err(native_gate_error(PolicyViolationStage::PostMarker));
+        }
+        let mut writer = self
+            .start_gate
+            .writer
+            .take()
+            .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
+        write_all_fd_before(&mut writer, &RELEASE_AUTHORIZATION, self.ack.deadline)
+            .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
+        drop(writer);
+        self.released = true;
+        Ok(())
+    }
+
+    pub async fn confirm_exec(&mut self) -> Result<(), AppError> {
+        if !self.released {
+            return Err(native_gate_error(PolicyViolationStage::RunBoundPreMarker));
+        }
+        let reader = self
+            .exec_status
+            .reader
+            .take()
+            .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
+        let deadline = self.exec_status.deadline;
+        tokio::task::spawn_blocking(move || read_exec_proof(reader, deadline))
+            .await
+            .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))??;
+        self.exec_confirmed = true;
+        Ok(())
+    }
+
+    pub async fn wait_for_release_ack(&mut self) -> Result<(), AppError> {
+        if !self.released {
+            return Err(native_gate_error(PolicyViolationStage::RunBoundPreMarker));
+        }
+        if !self.exec_confirmed {
+            return Err(native_gate_error(PolicyViolationStage::PostMarker));
+        }
+        let reader = self
+            .ack
+            .reader
+            .take()
+            .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
+        let deadline = self.ack.deadline;
+        tokio::task::spawn_blocking(move || read_exact_ack(reader, deadline))
+            .await
+            .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))??;
+        Ok(())
+    }
+
+    pub fn take_stdout(&mut self) -> Result<tokio::process::ChildStdout, AppError> {
+        if !self.capture {
+            return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        }
+        self.child
+            .stdout
+            .take()
+            .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))
+    }
+
+    pub fn take_stderr(&mut self) -> Result<tokio::process::ChildStderr, AppError> {
+        if !self.capture {
+            return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        }
+        self.child
+            .stderr
+            .take()
+            .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))
+    }
+
+    pub async fn wait(&mut self) -> Result<ExitStatus, AppError> {
+        self.child.wait().await.map_err(|_| native_gate_error(PolicyViolationStage::Dispatched))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for VerifiedChild {
+    fn drop(&mut self) {
+        self.start_gate.writer.take();
+        if matches!(self.child.try_wait(), Ok(None)) {
+            if let Some(group) = self.process_group_id.and_then(|value| libc::pid_t::try_from(value).ok()) {
+                // A fresh try_wait immediately above proves that this owned
+                // child has not yet been reaped, so signalling its recorded
+                // process group cannot target a reused helper PID.
+                unsafe { libc::kill(-group, libc::SIGKILL); }
+            }
+            // Drop cannot await. `kill_on_drop` transfers the helper to
+            // Tokio's orphan queue after this fail-closed group kill. Callers
+            // needing the bounded TERM/KILL/reap contract must invoke
+            // `terminate_process_group` before dropping the handle.
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn native_gate_error(stage: PolicyViolationStage) -> AppError {
+    PolicyViolation::new(PolicyViolationCode::NativeGateFailed, stage).into()
 }
 
 #[cfg(unix)]
@@ -462,17 +661,18 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
     // fixed-map installer owns and may close fd 0 on an error path.
     let failure_channel = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, RELEASE_ACK_FD + 1) };
     let result = receive_and_install_bootstrap(libc::STDIN_FILENO);
-    match result {
+    let outcome = match result {
         Ok(installed) => {
-            // Reading the validated mode here makes the readiness dependency
-            // explicit: this branch is reachable only after the full frame
-            // and its mode-specific descriptor map have been installed.
-            let _validated_mode = installed.frame.mode;
-            // Control fd 3 is the bootstrap socket peer. A readiness record is
-            // sent only after every fixed descriptor was mapped and validated.
-            write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
-            Ok(())
+            if !installed.frame.flags.contains(LaunchFlags::LIFECYCLE) {
+                write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
+                return Ok(());
+            }
+            run_installed_target(installed.frame)
         }
+        Err(error) => Err(error),
+    };
+    match outcome {
+        Ok(()) => Ok(()),
         Err(error) => {
             if failure_channel >= 0 {
                 let _ = write_fixed_record(failure_channel, &HELPER_FAILED_RECORD);
@@ -480,6 +680,345 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
             }
             Err(error)
         }
+    }
+}
+
+#[cfg(unix)]
+fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
+    if unsafe { libc::setsid() } < 0 {
+        return Err(BootstrapError::TargetCreate);
+    }
+    if frame.cwd.is_some() {
+        if frame.cwd.as_deref() != Some(OsStr::new("."))
+            || !frame.flags.contains(LaunchFlags::PROJECT_ROOT)
+            || unsafe { libc::fchdir(PROJECT_ROOT_FD) } < 0
+        {
+            return Err(BootstrapError::TargetCreate);
+        }
+    }
+    let mut target = PlatformTarget::prepare(&frame)?;
+    write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
+    if read_release_authorization().is_err() {
+        target.cancel_and_reap();
+        return Err(BootstrapError::GateClosed);
+    }
+    if target.release_and_confirm().is_err() {
+        let _ = write_exec_failure();
+        target.cancel_and_reap();
+        return Err(BootstrapError::BootstrapCorrupt);
+    }
+    close_raw(EXEC_STATUS_FD);
+    write_release_ack()?;
+    if target.wait_success()? {
+        Ok(())
+    } else {
+        Err(BootstrapError::BootstrapCorrupt)
+    }
+}
+
+#[cfg(unix)]
+fn read_release_authorization() -> Result<(), BootstrapError> {
+    let mut reader = unsafe { std::fs::File::from_raw_fd(RELEASE_FD) };
+    let deadline = lifecycle_deadline();
+    let mut authorization = [0u8; 1];
+    if read_fd_before(&mut reader, &mut authorization, deadline)? != 1
+        || authorization != RELEASE_AUTHORIZATION
+    {
+        return Err(BootstrapError::GateClosed);
+    }
+    let mut trailing = [0u8; 1];
+    if read_fd_before(&mut reader, &mut trailing, deadline)? != 0 {
+        return Err(BootstrapError::GateClosed);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_exec_failure() -> Result<(), BootstrapError> {
+    let mut writer = unsafe { std::fs::File::from_raw_fd(EXEC_STATUS_FD) };
+    write_all_fd_before(&mut writer, &EXEC_FAILURE_RECORD, lifecycle_deadline())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_release_ack() -> Result<(), BootstrapError> {
+    let mut writer = unsafe { std::fs::File::from_raw_fd(RELEASE_ACK_FD) };
+    write_all_fd_before(&mut writer, RELEASE_ACK, lifecycle_deadline())?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct PlatformTarget {
+    pid: libc::pid_t,
+}
+
+#[cfg(target_os = "macos")]
+impl PlatformTarget {
+    fn prepare(frame: &ControlFrame) -> Result<Self, BootstrapError> {
+        let path = frame.target_path.as_ref().ok_or(BootstrapError::TargetCreate)?;
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(BootstrapError::TargetCreate);
+        }
+        reverify_target_path(path, frame.target_identity)?;
+        validate_role(TARGET_FD, TARGET_FD, frame)?;
+
+        let path = std::ffi::CString::new(path.as_bytes())
+            .map_err(|_| BootstrapError::TargetCreate)?;
+        let argv = c_argv(&frame.argv)?;
+        let environment = c_environment(&frame.environment)?;
+        let mut argv_pointers = argv.iter().map(|value| value.as_ptr().cast_mut()).collect::<Vec<_>>();
+        argv_pointers.push(ptr::null_mut());
+        let mut environment_pointers = environment.iter().map(|value| value.as_ptr().cast_mut()).collect::<Vec<_>>();
+        environment_pointers.push(ptr::null_mut());
+
+        let mut attributes: libc::posix_spawnattr_t = unsafe { mem::zeroed() };
+        if unsafe { libc::posix_spawnattr_init(&mut attributes) } != 0 {
+            return Err(BootstrapError::TargetCreate);
+        }
+        let result = (|| {
+            let flags = (libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_SETPGROUP) as i16;
+            if unsafe { libc::posix_spawnattr_setflags(&mut attributes, flags) } != 0
+                || unsafe { libc::posix_spawnattr_setpgroup(&mut attributes, libc::getpgrp()) } != 0
+            {
+                return Err(BootstrapError::TargetCreate);
+            }
+            let mut pid = 0;
+            let spawned = unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    path.as_ptr(),
+                    ptr::null(),
+                    &attributes,
+                    argv_pointers.as_mut_ptr(),
+                    environment_pointers.as_mut_ptr(),
+                )
+            };
+            if spawned != 0 {
+                return Err(BootstrapError::TargetCreate);
+            }
+            if reverify_target_path(OsStr::from_bytes(path.as_bytes()), frame.target_identity).is_err() {
+                let _ = kill_and_reap_target_bounded(pid);
+                return Err(BootstrapError::IdentityMismatch);
+            }
+            Ok(Self { pid })
+        })();
+        unsafe { libc::posix_spawnattr_destroy(&mut attributes); }
+        result
+    }
+
+    fn release_and_confirm(&mut self) -> Result<(), BootstrapError> {
+        if unsafe { libc::kill(self.pid, libc::SIGCONT) } < 0 {
+            return Err(BootstrapError::BootstrapCorrupt);
+        }
+        Ok(())
+    }
+
+    fn cancel_and_reap(&mut self) {
+        let _ = kill_and_reap_target_bounded(self.pid);
+    }
+
+    fn wait_success(&mut self) -> Result<bool, BootstrapError> {
+        wait_pid_success(self.pid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reverify_target_path(path: &OsStr, expected: ExecutableIdentity) -> Result<(), BootstrapError> {
+    let path = std::ffi::CString::new(path.as_bytes()).map_err(|_| BootstrapError::BootstrapCorrupt)?;
+    let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+    if raw < 0 {
+        return Err(BootstrapError::IdentityMismatch);
+    }
+    let file = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut stat: libc::stat = unsafe { mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } < 0 {
+        return Err(BootstrapError::IdentityMismatch);
+    }
+    let actual = ExecutableIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        owner: stat.st_uid as u32,
+        mode: stat.st_mode as u32 & 0o7777,
+    };
+    if actual != expected || stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(BootstrapError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct PlatformTarget {
+    pid: libc::pid_t,
+    release: Option<OwnedFd>,
+    exec_status: Option<OwnedFd>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl PlatformTarget {
+    fn prepare(frame: &ControlFrame) -> Result<Self, BootstrapError> {
+        let argv = c_argv(&frame.argv)?;
+        let environment = c_environment(&frame.environment)?;
+        let mut argv_pointers = argv.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+        argv_pointers.push(ptr::null());
+        let mut environment_pointers = environment.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+        environment_pointers.push(ptr::null());
+        let guard = ProcessLaunchGuard(PROCESS_LAUNCH_LOCK.lock().map_err(|_| BootstrapError::BootstrapCorrupt)?);
+        let (gate_read, gate_write) = lifecycle_pipe(&guard).map_err(|_| BootstrapError::BootstrapCorrupt)?;
+        let (exec_read, exec_write) = lifecycle_pipe(&guard).map_err(|_| BootstrapError::BootstrapCorrupt)?;
+        drop(guard);
+        let gate_read_raw = gate_read.as_raw_fd();
+        let gate_write_raw = gate_write.as_raw_fd();
+        let exec_read_raw = exec_read.as_raw_fd();
+        let exec_write_raw = exec_write.as_raw_fd();
+        let change_directory = frame.cwd.is_some();
+        let argv_raw = argv_pointers.as_ptr();
+        let environment_raw = environment_pointers.as_ptr();
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(BootstrapError::BootstrapCorrupt);
+        }
+        if pid == 0 {
+            // After fork this branch uses only async-signal-safe libc calls
+            // and exits with `_exit`; no Rust-owned value is dropped and no
+            // allocator or runtime state is touched.
+            unsafe {
+                libc::close(gate_write_raw);
+                libc::close(exec_read_raw);
+            }
+            let mut byte = [0u8; 1];
+            let mut read_result;
+            loop {
+                read_result = unsafe { libc::read(gate_read_raw, byte.as_mut_ptr().cast(), 1) };
+                if read_result >= 0 || unsafe { *libc::__errno_location() } != libc::EINTR {
+                    break;
+                }
+            }
+            let allowed = read_result == 1 && byte[0] == RELEASE_AUTHORIZATION[0];
+            if !allowed {
+                unsafe { libc::_exit(125); }
+            }
+            if change_directory && unsafe { libc::fchdir(PROJECT_ROOT_FD) } < 0 {
+                let _ = unsafe { libc::write(exec_write_raw, EXEC_FAILURE_RECORD.as_ptr().cast(), EXEC_FAILURE_RECORD.len()) };
+                unsafe { libc::_exit(126); }
+            }
+            let empty = b"\0";
+            unsafe {
+                libc::syscall(
+                    libc::SYS_execveat,
+                    TARGET_FD,
+                    empty.as_ptr().cast::<libc::c_char>(),
+                    argv_raw,
+                    environment_raw,
+                    libc::AT_EMPTY_PATH,
+                );
+                let _ = libc::write(exec_write_raw, EXEC_FAILURE_RECORD.as_ptr().cast(), EXEC_FAILURE_RECORD.len());
+                libc::_exit(127);
+            }
+        }
+        drop(gate_read);
+        drop(exec_write);
+        Ok(Self { pid, release: Some(gate_write), exec_status: Some(exec_read) })
+    }
+
+    fn release_and_confirm(&mut self) -> Result<(), BootstrapError> {
+        let mut release = std::fs::File::from(self.release.take().ok_or(BootstrapError::BootstrapCorrupt)?);
+        write_all_fd_before(&mut release, &RELEASE_AUTHORIZATION, lifecycle_deadline())?;
+        drop(release);
+        let mut status = std::fs::File::from(self.exec_status.take().ok_or(BootstrapError::BootstrapCorrupt)?);
+        let mut record = [0u8; 8];
+        let count = read_fd_before(&mut status, &mut record, lifecycle_deadline())?;
+        if count == 0 { Ok(()) } else { Err(BootstrapError::BootstrapCorrupt) }
+    }
+
+    fn cancel_and_reap(&mut self) {
+        self.release.take();
+        let _ = kill_and_reap_target_bounded(self.pid);
+    }
+
+    fn wait_success(&mut self) -> Result<bool, BootstrapError> { wait_pid_success(self.pid) }
+}
+
+#[cfg(unix)]
+fn c_argv(values: &[OsString]) -> Result<Vec<std::ffi::CString>, BootstrapError> {
+    if values.is_empty() {
+        return Err(BootstrapError::BootstrapCorrupt);
+    }
+    values.iter().map(|value| {
+        std::ffi::CString::new(value.as_bytes()).map_err(|_| BootstrapError::BootstrapCorrupt)
+    }).collect()
+}
+
+#[cfg(unix)]
+fn c_environment(values: &[(OsString, OsString)]) -> Result<Vec<std::ffi::CString>, BootstrapError> {
+    values.iter().map(|(name, value)| {
+        let mut entry = Vec::with_capacity(name.as_bytes().len() + value.as_bytes().len() + 1);
+        entry.extend_from_slice(name.as_bytes());
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        std::ffi::CString::new(entry).map_err(|_| BootstrapError::BootstrapCorrupt)
+    }).collect()
+}
+
+#[cfg(unix)]
+fn wait_pid_success(pid: libc::pid_t) -> Result<bool, BootstrapError> {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(BootstrapError::BootstrapCorrupt);
+    }
+}
+
+#[cfg(unix)]
+fn kill_and_reap_target_bounded(pid: libc::pid_t) -> Result<(), BootstrapError> {
+    match try_reap_target(pid)? {
+        Some(_) => return Ok(()),
+        None => {}
+    }
+    if unsafe { libc::kill(pid, libc::SIGKILL) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(BootstrapError::BootstrapCorrupt);
+        }
+    }
+    let deadline = Instant::now()
+        .checked_add(TARGET_CANCEL_REAP_TIMEOUT)
+        .ok_or(BootstrapError::BootstrapCorrupt)?;
+    loop {
+        if try_reap_target(pid)?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(BootstrapError::BootstrapCorrupt);
+        }
+        std::thread::sleep(HELPER_REAPER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn try_reap_target(pid: libc::pid_t) -> Result<Option<i32>, BootstrapError> {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if result == pid {
+            return Ok(Some(status));
+        }
+        if result == 0 {
+            return Ok(None);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(Some(status));
+        }
+        return Err(BootstrapError::BootstrapCorrupt);
     }
 }
 
@@ -763,6 +1302,341 @@ pub fn spawn_validated_helper(
     }
 
     Ok(ValidatedHelper { child: Some(child), reaper })
+}
+
+/// Spawn the anchored hidden supervisor and return only after it has created
+/// a blocked/suspended target. No target instruction can execute until the
+/// returned one-shot gate is released.
+#[cfg(unix)]
+pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild, AppError> {
+    if spec.process_group != ProcessGroupRequirement::Required || !spec.start_suspended {
+        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+    }
+    let mode = match (&spec.project_root, &spec.pueue_config) {
+        (Some(_), None) => LaunchMode::Agent,
+        (None, Some(_)) => LaunchMode::Pueue,
+        _ => return Err(native_gate_error(PolicyViolationStage::NativeGate)),
+    };
+    if spec.argv.is_empty() {
+        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+    }
+
+    let verified_launcher = spec.launcher.verify_identity()?;
+    let verified_target = spec.executable.verify_identity()?;
+    let target_file = verified_target.file;
+    let target_identity = verified_target.anchor.identity;
+
+    if let Some(cwd) = spec.cwd.as_deref() {
+        let root = spec
+            .project_root
+            .as_ref()
+            .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))?;
+        if cwd != root.anchor.canonical_path {
+            return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        }
+    }
+
+    let launch_guard = process_launch_guard()
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    let (release_read, release_write) = lifecycle_pipe(&launch_guard)?;
+    let (exec_read, exec_write) = lifecycle_pipe(&launch_guard)?;
+    let (ack_read, ack_write) = lifecycle_pipe(&launch_guard)?;
+    let (parent_socket, child_socket) = bootstrap_socket_pair(&launch_guard)
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+
+    let mut flags = LaunchFlags::PROCESS_GROUP.union(LaunchFlags::LIFECYCLE);
+    let mut rights = vec![release_read, exec_write];
+    rights.push(duplicate_owned(&target_file)?);
+
+    let project_root_identity = spec.project_root.as_ref().map(|root| root.anchor.identity);
+    if let Some(root) = spec.project_root.as_ref() {
+        flags = flags.union(LaunchFlags::PROJECT_ROOT);
+        rights.push(duplicate_owned(&root.directory)?);
+    }
+
+    let mut agent_log_identity = None;
+    let capture = matches!(&spec.child_io, VerifiedChildIo::Capture);
+    let (stdout, stderr) = match spec.child_io {
+        VerifiedChildIo::Capture => (Stdio::piped(), Stdio::piped()),
+        VerifiedChildIo::AgentLog { stdout, stderr, identity } => {
+            validate_agent_log_descriptor(&stdout, identity)?;
+            validate_agent_log_descriptor(&stderr, identity)?;
+            flags = flags.union(LaunchFlags::AGENT_LOG);
+            agent_log_identity = Some(log_identity(identity));
+            rights.push(duplicate_owned(&stdout)?);
+            (Stdio::from(stdout), Stdio::from(stderr))
+        }
+    };
+
+    let pueue_config_identity = spec.pueue_config.as_ref().map(|config| config.anchor.identity);
+    if let Some(config) = spec.pueue_config.as_ref() {
+        flags = flags.union(LaunchFlags::PUEUE_CONFIG);
+        rights.push(duplicate_owned(&config.file)?);
+    }
+    rights.push(ack_write);
+    prepare_bootstrap_rights(&launch_guard, &rights)
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+
+    let frame = ControlFrame {
+        mode,
+        flags,
+        argv: spec.argv,
+        environment: spec
+            .environment
+            .entries()
+            .map(|(name, value)| (name.to_os_string(), value.to_os_string()))
+            .collect(),
+        cwd: spec.cwd.map(|_| OsString::from(".")),
+        target_identity,
+        project_root_identity,
+        agent_log_identity,
+        pueue_config_identity,
+        target_path: Some(spec.executable.canonical_path.as_os_str().to_os_string()),
+    };
+    frame
+        .encode()
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+
+    let child_input = unsafe { std::fs::File::from_raw_fd(child_socket.into_raw_fd()) };
+    let mut command = build_helper_command(
+        &verified_launcher.anchor.canonical_path,
+        Stdio::from(child_input),
+    );
+    command.stdout(stdout).stderr(stderr);
+    revalidate_launcher_before_spawn(&spec.launcher)
+        .map_err(|_| native_gate_error(PolicyViolationStage::RunBoundPreMarker))?;
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))? as i64;
+    drop(launch_guard);
+
+    let parent_raw = parent_socket.into_raw_fd();
+    let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
+    if send_bootstrap_packet(
+        parent_stream.as_raw_fd(),
+        &frame,
+        &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+    )
+    .is_err()
+    {
+        cleanup_failed_tokio_helper(&mut child, pid);
+        return Err(native_gate_error(PolicyViolationStage::PreBinding));
+    }
+    if read_helper_readiness(&mut parent_stream).is_err() {
+        cleanup_failed_tokio_helper(&mut child, pid);
+        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+    }
+    drop(rights);
+
+    let deadline = lifecycle_deadline();
+    Ok(VerifiedChild {
+        child,
+        pid,
+        process_group_id: Some(pid),
+        start_gate: StartGate { writer: Some(std::fs::File::from(release_write)) },
+        exec_status: ExecStatusReceiver {
+            reader: Some(std::fs::File::from(exec_read)),
+            deadline,
+        },
+        ack: AckReceiver {
+            reader: Some(std::fs::File::from(ack_read)),
+            deadline,
+        },
+        capture,
+        released: false,
+        exec_confirmed: false,
+    })
+}
+
+#[cfg(unix)]
+pub async fn terminate_process_group(child: &mut VerifiedChild) {
+    child.start_gate.writer.take();
+    let running = matches!(child.child.try_wait(), Ok(None));
+    if running {
+        if let Some(group) = child.process_group_id.and_then(|value| libc::pid_t::try_from(value).ok()) {
+            unsafe { libc::kill(-group, libc::SIGTERM); }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match child.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                _ => break,
+            }
+        }
+        if matches!(child.child.try_wait(), Ok(None)) {
+            if let Some(group) = child.process_group_id.and_then(|value| libc::pid_t::try_from(value).ok()) {
+                unsafe { libc::kill(-group, libc::SIGKILL); }
+            }
+            let _ = child.child.start_kill();
+        }
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(1), child.child.wait()).await;
+}
+
+#[cfg(unix)]
+fn cleanup_failed_tokio_helper(child: &mut tokio::process::Child, pid: i64) {
+    if matches!(child.try_wait(), Ok(None)) {
+        if let Ok(group) = libc::pid_t::try_from(pid) {
+            unsafe { libc::kill(-group, libc::SIGKILL); }
+        }
+        // This synchronous error path cannot await the Tokio child.
+        // `kill_on_drop` hands it to Tokio's orphan queue after the
+        // fail-closed group kill; successful handles use the async API.
+        let _ = child.start_kill();
+    }
+}
+
+#[cfg(unix)]
+fn lifecycle_pipe(_guard: &ProcessLaunchGuard) -> Result<(OwnedFd, OwnedFd), AppError> {
+    let mut descriptors = [-1; 2];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let result = unsafe { libc::pipe(descriptors.as_mut_ptr()) };
+    if result < 0 {
+        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+    }
+    let pair = unsafe {
+        (OwnedFd::from_raw_fd(descriptors[0]), OwnedFd::from_raw_fd(descriptors[1]))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        set_close_on_exec(pair.0.as_raw_fd())
+            .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+        set_close_on_exec(pair.1.as_raw_fd())
+            .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    }
+    Ok(pair)
+}
+
+#[cfg(unix)]
+fn duplicate_owned(file: &std::fs::File) -> Result<OwnedFd, AppError> {
+    file.try_clone()
+        .map(|file| unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))
+}
+
+#[cfg(unix)]
+fn log_identity(identity: LogFileIdentity) -> ExecutableIdentity {
+    ExecutableIdentity {
+        device: identity.device,
+        inode: identity.inode,
+        owner: identity.owner,
+        mode: identity.mode & 0o7777,
+    }
+}
+
+#[cfg(unix)]
+fn validate_agent_log_descriptor(
+    file: &std::fs::File,
+    expected: LogFileIdentity,
+) -> Result<(), AppError> {
+    let actual = LogFileIdentity::from_open_descriptor(file)
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    if actual != expected || !actual.is_regular() || actual.mode & 0o777 != 0o600 {
+        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lifecycle_deadline() -> Instant {
+    Instant::now()
+        .checked_add(LIFECYCLE_IO_TIMEOUT)
+        .unwrap_or_else(Instant::now)
+}
+
+#[cfg(unix)]
+fn wait_fd(raw: RawFd, events: i16, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "native lifecycle deadline elapsed")
+        })?;
+        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd { fd: raw, events, revents: 0 };
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "native lifecycle deadline elapsed"));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_all_fd_before(file: &mut std::fs::File, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        wait_fd(file.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match file.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "native lifecycle write closed")),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_fd_before(file: &mut std::fs::File, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
+    loop {
+        wait_fd(file.as_raw_fd(), libc::POLLIN | libc::POLLHUP, deadline)?;
+        match file.read(buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_exec_proof(mut reader: std::fs::File, deadline: Instant) -> Result<(), AppError> {
+    let mut record = [0u8; 9];
+    let count = read_fd_before(&mut reader, &mut record, deadline)
+        .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
+    if count == 0 {
+        return Ok(());
+    }
+    let _known_failure = count == EXEC_FAILURE_RECORD.len()
+        && record[..EXEC_FAILURE_RECORD.len()] == EXEC_FAILURE_RECORD;
+    Err(native_gate_error(PolicyViolationStage::PostMarker))
+}
+
+#[cfg(unix)]
+fn read_exact_ack(mut reader: std::fs::File, deadline: Instant) -> Result<(), AppError> {
+    let mut received = [0u8; RELEASE_ACK.len()];
+    let mut offset = 0;
+    while offset < received.len() {
+        let count = read_fd_before(&mut reader, &mut received[offset..], deadline)
+            .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
+        if count == 0 {
+            return Err(native_gate_error(PolicyViolationStage::PostMarker));
+        }
+        offset += count;
+    }
+    if received != RELEASE_ACK {
+        return Err(native_gate_error(PolicyViolationStage::PostMarker));
+    }
+    let mut trailing = [0u8; 1];
+    if read_fd_before(&mut reader, &mut trailing, deadline)
+        .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?
+        != 0
+    {
+        return Err(native_gate_error(PolicyViolationStage::PostMarker));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -1471,11 +2345,13 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     let argv_len = argv_encoded_len(&frame.argv)?;
     let environment_len = environment_encoded_len(&frame.environment)?;
     let cwd_len = frame.cwd.as_ref().map(|cwd| leaf_encoded_len(cwd)).transpose()?.unwrap_or(0);
+    let target_path_len = frame.target_path.as_ref().map(|path| leaf_encoded_len(path)).transpose()?.unwrap_or(0);
     let field_count = 3
         + usize::from(frame.cwd.is_some())
         + usize::from(frame.project_root_identity.is_some())
         + usize::from(frame.agent_log_identity.is_some())
-        + usize::from(frame.pueue_config_identity.is_some());
+        + usize::from(frame.pueue_config_identity.is_some())
+        + usize::from(frame.target_path.is_some());
     let mut payload_len = 4usize;
     payload_len = payload_len.checked_add(encoded_field_size(argv_len))
         .and_then(|value| value.checked_add(encoded_field_size(environment_len)))
@@ -1485,6 +2361,7 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     for present in [frame.project_root_identity.is_some(), frame.agent_log_identity.is_some(), frame.pueue_config_identity.is_some()] {
         if present { payload_len = payload_len.checked_add(encoded_field_size(IDENTITY_SIZE)).ok_or(CodecError::LengthOverflow)?; }
     }
+    if frame.target_path.is_some() { payload_len = payload_len.checked_add(encoded_field_size(target_path_len)).ok_or(CodecError::LengthOverflow)?; }
     let total = HEADER_SIZE.checked_add(payload_len).ok_or(CodecError::LengthOverflow)?;
     if total > MAX_FRAME_SIZE { return Err(CodecError::FrameTooLarge); }
     let mut output = Vec::with_capacity(total);
@@ -1509,6 +2386,9 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     if let Some(identity) = frame.pueue_config_identity {
         append_identity_field(&mut output, FIELD_PUEUE_CONFIG_IDENTITY, &identity);
     }
+    if let Some(path) = &frame.target_path {
+        append_os_field(&mut output, FIELD_TARGET_PATH, path)?;
+    }
     Ok(output)
 }
 
@@ -1525,7 +2405,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     if bytes.len() > total { return Err(CodecError::TrailingBytes); }
     let mut cursor = Cursor::new(&bytes[HEADER_SIZE..total]);
     let field_count = cursor.u32()? as usize;
-    if field_count > 7 { return Err(CodecError::TooManyFields); }
+    if field_count > 8 { return Err(CodecError::TooManyFields); }
     let mut argv = None;
     let mut environment = None;
     let mut target_identity = None;
@@ -1533,6 +2413,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     let mut project_root_identity = None;
     let mut agent_log_identity = None;
     let mut pueue_config_identity = None;
+    let mut target_path = None;
     let mut previous_kind = 0;
     for _ in 0..field_count {
         let kind = cursor.u8()?;
@@ -1549,6 +2430,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
             FIELD_PROJECT_ROOT_IDENTITY => set_once(&mut project_root_identity, decode_identity(body), kind)?,
             FIELD_AGENT_LOG_IDENTITY => set_once(&mut agent_log_identity, decode_identity(body), kind)?,
             FIELD_PUEUE_CONFIG_IDENTITY => set_once(&mut pueue_config_identity, decode_identity(body), kind)?,
+            FIELD_TARGET_PATH => set_once(&mut target_path, decode_os_field(body), kind)?,
             other => return Err(CodecError::UnknownField(other)),
         }
     }
@@ -1563,6 +2445,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
         project_root_identity: project_root_identity.transpose()?,
         agent_log_identity: agent_log_identity.transpose()?,
         pueue_config_identity: pueue_config_identity.transpose()?,
+        target_path: target_path.transpose()?,
     };
     validate_frame_shape(&frame)?;
     Ok(frame)
@@ -1575,11 +2458,12 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     let root = frame.flags.contains(LaunchFlags::PROJECT_ROOT);
     let log = frame.flags.contains(LaunchFlags::AGENT_LOG);
     let pueue = frame.flags.contains(LaunchFlags::PUEUE_CONFIG);
+    let lifecycle = frame.flags.contains(LaunchFlags::LIFECYCLE);
     if !frame.flags.contains(LaunchFlags::PROCESS_GROUP) { return Err(CodecError::MissingProcessGroup); }
     match frame.mode {
         LaunchMode::Agent => {
             if !root { return Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)); }
-            if !log { return Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)); }
+            if !lifecycle && !log { return Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)); }
             if pueue { return Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY)); }
         }
         LaunchMode::Pueue => {
@@ -1591,9 +2475,19 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     if root != frame.project_root_identity.is_some() { return Err(if root { CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY) }); }
     if log != frame.agent_log_identity.is_some() { return Err(if log { CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY) }); }
     if pueue != frame.pueue_config_identity.is_some() { return Err(if pueue { CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY) }); }
+    if lifecycle != frame.target_path.is_some() {
+        return Err(if lifecycle { CodecError::MissingField(FIELD_TARGET_PATH) } else { CodecError::UnexpectedField(FIELD_TARGET_PATH) });
+    }
     validate_environment_without_allocation(&frame.environment)?;
     for arg in &frame.argv { validate_field_bytes(arg)?; }
     if let Some(cwd) = &frame.cwd { validate_field_bytes(cwd)?; }
+    if let Some(path) = &frame.target_path {
+        validate_field_bytes(path)?;
+        #[cfg(target_os = "macos")]
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(CodecError::InvalidField);
+        }
+    }
     Ok(())
 }
 
@@ -1807,6 +2701,7 @@ mod tests {
             project_root_identity: Some(identity()),
             agent_log_identity: Some(identity()),
             pueue_config_identity: None,
+            target_path: None,
         }
     }
 

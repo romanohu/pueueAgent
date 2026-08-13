@@ -169,6 +169,12 @@ pub struct SanitizedEnvironment {
 }
 
 impl SanitizedEnvironment {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.values
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    }
+
     pub fn get(&self, name: &str) -> Option<&OsStr> {
         self.values.get(OsStr::new(name)).map(OsString::as_os_str)
     }

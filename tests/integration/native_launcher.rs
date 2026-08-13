@@ -13,10 +13,12 @@ mod unix {
     };
 
     use pueue_agent::{
+        environment::SanitizedEnvironment,
         execution_policy::{ExecutableAnchor, ExecutableIdentity},
         process::{
-            spawn_validated_helper, BootstrapError, ControlFrame, LaunchFlags, LaunchMode,
-            ProcessLaunchError,
+            spawn_validated_helper, spawn_verified_command, BootstrapError, ControlFrame,
+            LaunchFlags, LaunchMode, ProcessGroupRequirement, ProcessLaunchError,
+            VerifiedChildIo, VerifiedCommandSpec,
         },
     };
     use tempfile::tempdir;
@@ -59,6 +61,32 @@ mod unix {
         let launcher_path = fs::canonicalize(launcher_path).unwrap();
         let anchor = ExecutableAnchor::from_absolute(&launcher_path, &[]).unwrap();
         (anchor, launcher_path)
+    }
+
+    fn compile_generated_fixture(directory: &Path) -> ExecutableAnchor {
+        let source = directory.join("generated-target.rs");
+        let executable = directory.join("generated-target");
+        fs::write(
+            &source,
+            r#"use std::{env, fs};
+fn main() {
+    let output = env::args_os().nth(1).expect("output argument");
+    fs::write(output, b"started").expect("write started marker");
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
     }
 
     fn bounded_wait(child: &mut Child) -> ExitStatus {
@@ -110,6 +138,7 @@ mod unix {
             project_root_identity: Some(identity(&root.metadata().unwrap())),
             agent_log_identity: Some(identity(&log.metadata().unwrap())),
             pueue_config_identity: None,
+            target_path: None,
         }
     }
 
@@ -302,10 +331,50 @@ mod unix {
                 project_root_identity: None,
                 agent_log_identity: None,
                 pueue_config_identity: Some(ExecutableIdentity { device: 0, inode: 0, owner: 0, mode: 0 }),
+                target_path: None,
             },
             Vec::new(),
         );
         assert!(matches!(result, Err(pueue_agent::process::ProcessLaunchError::LauncherRejected)));
+    }
+
+    #[tokio::test]
+    async fn verified_target_stays_blocked_until_release_then_executes_and_is_acked() {
+        let temporary = tempdir().unwrap();
+        let (launcher, _) = copy_launcher(temporary.path());
+        let target = compile_generated_fixture(temporary.path());
+        let root_anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(
+            &fs::canonicalize(temporary.path()).unwrap(),
+        )
+        .unwrap();
+        let canonical_root = root_anchor.canonical_path.clone();
+        let started = temporary.path().join("target-started");
+
+        let mut child = spawn_verified_command(VerifiedCommandSpec {
+            launcher,
+            executable: target,
+            argv: vec![
+                OsString::from("generated-target"),
+                started.as_os_str().to_os_string(),
+            ],
+            cwd: Some(canonical_root),
+            environment: SanitizedEnvironment::default(),
+            process_group: ProcessGroupRequirement::Required,
+            start_suspended: true,
+            project_root: Some(root_anchor.verify_identity().unwrap()),
+            pueue_config: None,
+            child_io: VerifiedChildIo::Capture,
+        })
+        .unwrap();
+
+        assert!(!started.exists(), "target executed before release");
+        child.release().unwrap();
+        assert!(child.wait_for_release_ack().await.is_err());
+        child.confirm_exec().await.unwrap();
+        child.wait_for_release_ack().await.unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read(&started).unwrap(), b"started");
     }
 }
 
