@@ -637,8 +637,9 @@ pub(crate) fn receive_and_install_bootstrap(
     // The Command-owned bootstrap endpoint is normally stdin.  Duplicate it
     // before touching any fixed ABI descriptor so every dup2 source is above
     // the complete 3..10 destination range.
-    let control = duplicate_above_fixed(socket)?;
-    close_raw(socket);
+    // SAFETY: after the receive finishes, the helper transfers exclusive
+    // ownership of its bootstrap descriptor into fixed-map installation.
+    let control = unsafe { OwnedFd::from_raw_fd(socket) };
     install_bootstrap_fixed_map(control, packet)
 }
 
@@ -647,37 +648,43 @@ fn install_bootstrap_fixed_map(
     control: OwnedFd,
     packet: BootstrapPacket,
 ) -> Result<InstalledBootstrap, BootstrapError> {
+    let original_fixed_slots = original_fixed_slots(Some(&control), &packet.rights);
     let prepared = match preflight_bootstrap_fixed_map(control, packet) {
         Ok(prepared) => prepared,
         Err(error) => {
-            // Preflight owns every received/moved descriptor. It has returned,
-            // so those owners are dropped before the fixed range is closed.
-            close_fixed_map();
+            // The consumed arguments have dropped all exact owners. Never
+            // close their numbers again: another thread could already have
+            // reused them. Only slots that were never owned are closed raw.
+            close_unowned_fixed_slots(&original_fixed_slots);
             return Err(error);
         }
     };
-    let PreparedBootstrap { frame, expected_slots, moved } = prepared;
-    for slot in CONTROL_FD..=RELEASE_ACK_FD {
-        if !expected_slots.contains(&slot) { close_raw(slot); }
-    }
-    for (slot, descriptor) in expected_slots.iter().copied().zip(&moved) {
-        if dup2_retry(descriptor.as_raw_fd(), slot).is_err()
+    let PreparedBootstrap { frame, expected_slots, mut sources } = prepared;
+    let retired_owned_slots = drop_unused_originals(&mut sources, &expected_slots);
+    close_unused_never_owned_slots(&expected_slots, &retired_owned_slots);
+    for (index, slot) in expected_slots.iter().copied().enumerate() {
+        let source = sources[index].source.as_raw_fd();
+        release_original_at(&mut sources, slot);
+        if dup2_retry(source, slot).is_err()
             || set_close_on_exec(slot).is_err()
         {
-            drop(moved);
-            close_fixed_map();
+            let still_owned = remaining_original_fixed_slots(&sources);
+            drop(sources);
+            let mut excluded = retired_owned_slots.clone();
+            excluded.extend(still_owned);
+            close_unowned_fixed_slots(&excluded);
             return Err(BootstrapError::BootstrapCorrupt);
         }
     }
-    drop(moved);
+    drop(sources);
     for slot in &expected_slots {
         if validate_role(*slot, *slot, &frame).is_err() {
-            close_fixed_map();
+            close_raw_slots(&expected_slots);
             return Err(BootstrapError::BootstrapCorrupt);
         }
         let flags = unsafe { libc::fcntl(*slot, libc::F_GETFD) };
         if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
-            close_fixed_map();
+            close_raw_slots(&expected_slots);
             return Err(BootstrapError::BootstrapCorrupt);
         }
     }
@@ -688,7 +695,83 @@ fn install_bootstrap_fixed_map(
 struct PreparedBootstrap {
     frame: ControlFrame,
     expected_slots: Vec<RawFd>,
-    moved: Vec<OwnedFd>,
+    sources: Vec<TrackedSource>,
+}
+
+#[cfg(unix)]
+struct TrackedSource {
+    source: OwnedFd,
+    original: Option<OwnedFd>,
+}
+
+#[cfg(unix)]
+fn original_fixed_slots(control: Option<&OwnedFd>, rights: &[OwnedFd]) -> Vec<RawFd> {
+    control.into_iter().chain(rights.iter())
+        .map(AsRawFd::as_raw_fd)
+        .filter(|fd| (CONTROL_FD..=RELEASE_ACK_FD).contains(fd))
+        .collect()
+}
+
+#[cfg(unix)]
+fn remaining_original_fixed_slots(sources: &[TrackedSource]) -> Vec<RawFd> {
+    sources.iter().filter_map(|tracked| tracked.original.as_ref())
+        .map(AsRawFd::as_raw_fd)
+        .filter(|fd| (CONTROL_FD..=RELEASE_ACK_FD).contains(fd))
+        .collect()
+}
+
+#[cfg(unix)]
+fn drop_unused_originals(
+    sources: &mut [TrackedSource],
+    expected_slots: &[RawFd],
+) -> Vec<RawFd> {
+    let mut retired = Vec::new();
+    for tracked in sources {
+        let should_drop = tracked.original.as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .filter(|fd| (CONTROL_FD..=RELEASE_ACK_FD).contains(fd))
+            .filter(|fd| !expected_slots.contains(fd));
+        if let Some(fd) = should_drop {
+            drop(tracked.original.take());
+            retired.push(fd);
+        }
+    }
+    retired
+}
+
+#[cfg(unix)]
+fn release_original_at(sources: &mut [TrackedSource], destination: RawFd) {
+    use std::os::fd::IntoRawFd;
+    for tracked in sources {
+        if tracked.original.as_ref().map(AsRawFd::as_raw_fd) == Some(destination) {
+            if let Some(original) = tracked.original.take() {
+                let raw = original.into_raw_fd();
+                debug_assert_eq!(raw, destination);
+            }
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl TrackedSource {
+    fn move_above_fixed(descriptor: OwnedFd) -> Result<Self, BootstrapError> {
+        Self::move_above_ceiling(descriptor, RELEASE_ACK_FD)
+    }
+
+    fn move_above_ceiling(
+        descriptor: OwnedFd,
+        ceiling: RawFd,
+    ) -> Result<Self, BootstrapError> {
+        if descriptor.as_raw_fd() > ceiling {
+            return Ok(Self { source: descriptor, original: None });
+        }
+        let duplicated = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, ceiling + 1) };
+        if duplicated < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
+        let source = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        Ok(Self { source, original: Some(descriptor) })
+    }
+
 }
 
 #[cfg(unix)]
@@ -699,18 +782,18 @@ fn preflight_bootstrap_fixed_map(
     validate_distinct_pipe_roles(&packet)?;
     let expected_slots = bootstrap_slots(&packet.frame)?;
     let frame = packet.frame;
-    let mut moved = Vec::with_capacity(expected_slots.len());
-    moved.push(ensure_above_fixed(control)?);
+    let mut sources = Vec::with_capacity(expected_slots.len());
+    sources.push(TrackedSource::move_above_fixed(control)?);
     for right in packet.rights {
-        moved.push(ensure_above_fixed(right)?);
+        sources.push(TrackedSource::move_above_fixed(right)?);
     }
-    if moved.len() != expected_slots.len() {
+    if sources.len() != expected_slots.len() {
         return Err(BootstrapError::WrongRightCount);
     }
-    for (slot, descriptor) in expected_slots.iter().copied().zip(&moved) {
-        validate_role(slot, descriptor.as_raw_fd(), &frame)?;
+    for (slot, tracked) in expected_slots.iter().copied().zip(&sources) {
+        validate_role(slot, tracked.source.as_raw_fd(), &frame)?;
     }
-    Ok(PreparedBootstrap { frame, expected_slots, moved })
+    Ok(PreparedBootstrap { frame, expected_slots, sources })
 }
 
 #[cfg(unix)]
@@ -723,8 +806,24 @@ fn dup2_retry(source: RawFd, destination: RawFd) -> Result<(), io::Error> {
 }
 
 #[cfg(unix)]
-fn close_fixed_map() {
-    for descriptor in CONTROL_FD..=RELEASE_ACK_FD { close_raw(descriptor); }
+fn close_unowned_fixed_slots(owned_slots: &[RawFd]) {
+    for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
+        if !owned_slots.contains(&descriptor) { close_raw(descriptor); }
+    }
+}
+
+#[cfg(unix)]
+fn close_unused_never_owned_slots(expected: &[RawFd], retired_owned: &[RawFd]) {
+    for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
+        if !expected.contains(&descriptor) && !retired_owned.contains(&descriptor) {
+            close_raw(descriptor);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn close_raw_slots(slots: &[RawFd]) {
+    for descriptor in slots { close_raw(*descriptor); }
 }
 
 #[cfg(unix)]
@@ -751,22 +850,6 @@ fn validate_distinct_pipe_roles(packet: &BootstrapPacket) -> Result<(), Bootstra
         return Err(BootstrapError::AliasedPipeRoles);
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_above_fixed(descriptor: OwnedFd) -> Result<OwnedFd, BootstrapError> {
-    if descriptor.as_raw_fd() > RELEASE_ACK_FD { return Ok(descriptor); }
-    let moved = duplicate_above_fixed(descriptor.as_raw_fd())?;
-    drop(descriptor);
-    Ok(moved)
-}
-
-#[cfg(unix)]
-fn duplicate_above_fixed(raw: RawFd) -> Result<OwnedFd, BootstrapError> {
-    let duplicated = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, RELEASE_ACK_FD + 1) };
-    if duplicated < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
-    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this call.
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 #[cfg(unix)]
@@ -1598,6 +1681,20 @@ mod tests {
         for descriptor in CONTROL_FD..=RELEASE_ACK_FD {
             assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_fixed_sources_keep_original_ownership_until_cleanup() {
+        let (read, _write) = pipe_pair();
+        let owned_raw = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100) };
+        assert!(owned_raw >= 100);
+        let owner = unsafe { OwnedFd::from_raw_fd(owned_raw) };
+        let tracked = TrackedSource::move_above_ceiling(owner, owned_raw).unwrap();
+        assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, libc::FD_CLOEXEC);
+        assert!(tracked.source.as_raw_fd() > owned_raw);
+        drop(tracked);
+        assert_eq!(unsafe { libc::fcntl(owned_raw, libc::F_GETFD) }, -1);
     }
 
     #[cfg(unix)]
