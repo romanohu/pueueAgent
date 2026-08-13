@@ -349,6 +349,26 @@ const HELPER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[cfg(unix)]
 static HELPER_REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
+#[cfg(unix)]
+static HELPER_FALLBACK_REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaperProbe {
+    Done,
+    Running,
+    Retain,
+}
+
+#[cfg(unix)]
+fn classify_reaper_probe(probe: &io::Result<Option<ExitStatus>>) -> ReaperProbe {
+    match probe {
+        Ok(Some(_)) => ReaperProbe::Done,
+        Ok(None) => ReaperProbe::Running,
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => ReaperProbe::Done,
+        Err(_) => ReaperProbe::Retain,
+    }
+}
 
 /// A successfully bootstrapped hidden helper. The helper currently exits
 /// after readiness; retaining this handle lets callers reap that lifecycle.
@@ -530,36 +550,61 @@ fn helper_reaper() -> Result<mpsc::Sender<Child>, ProcessLaunchError> {
 #[cfg(unix)]
 fn helper_reaper_loop(receiver: mpsc::Receiver<Child>) {
     let mut children: Vec<Child> = Vec::new();
+    let mut disconnected = false;
     loop {
         if children.is_empty() {
+            if disconnected {
+                return;
+            }
             match receiver.recv() {
                 Ok(child) => children.push(child),
                 Err(_) => return,
             }
-        } else {
+        } else if !disconnected {
             match receiver.recv_timeout(HELPER_REAPER_POLL_INTERVAL) {
                 Ok(child) => children.push(child),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Keep ownership until all already-submitted children have
-                    // been reaped, even during process teardown.
+                    disconnected = true;
                 }
             }
+        } else {
+            // A disconnected receiver no longer supplies a blocking timeout.
+            // Retain and poll outstanding ownership without busy-spinning.
+            std::thread::sleep(HELPER_REAPER_POLL_INTERVAL);
         }
-        while let Ok(child) = receiver.try_recv() {
-            children.push(child);
+        if !disconnected {
+            loop {
+                match receiver.try_recv() {
+                    Ok(child) => children.push(child),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
         }
 
         let mut index = 0;
         while index < children.len() {
-            // A failed status probe must not skip termination. Both operations
-            // are nonblocking syscalls on supported Unix platforms.
-            let _ = children[index].kill();
-            match children[index].try_wait() {
-                Ok(Some(_)) => {
+            let first_probe = children[index].try_wait();
+            match classify_reaper_probe(&first_probe) {
+                ReaperProbe::Done => {
                     children.swap_remove(index);
                 }
-                Ok(None) | Err(_) => index += 1,
+                ReaperProbe::Running => {
+                    // Signal only a PID proven to still belong to this Child in
+                    // this iteration. Never signal after ECHILD or any error.
+                    let _ = children[index].kill();
+                    let second_probe = children[index].try_wait();
+                    if classify_reaper_probe(&second_probe) == ReaperProbe::Done {
+                        children.swap_remove(index);
+                    } else {
+                        index += 1;
+                    }
+                }
+                ReaperProbe::Retain => index += 1,
             }
         }
     }
@@ -571,21 +616,82 @@ fn cleanup_helper(mut child: Child, reaper: &mpsc::Sender<Child>) {
         .checked_add(HELPER_CLEANUP_INLINE_TIMEOUT)
         .unwrap_or_else(Instant::now);
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) | Err(_) => {
-                // Always attempt termination, including after a failed probe.
+        let probe = child.try_wait();
+        match classify_reaper_probe(&probe) {
+            ReaperProbe::Done => return,
+            ReaperProbe::Running => {
+                // Signal only after the same iteration proved this Child still
+                // owns a running process. A later error retains ownership.
                 let _ = child.kill();
             }
+            ReaperProbe::Retain => {}
         }
         if Instant::now() >= deadline {
-            // The receiver is owned by a process-lifetime thread initialized
-            // before any helper spawn. Sending is unbounded and nonblocking;
-            // the thread retains Child ownership and polls waitpid until reap.
-            let _ = reaper.send(child);
+            transfer_helper_to_reaper(child, reaper);
             return;
         }
         std::thread::sleep(HELPER_REAPER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn transfer_helper_to_reaper(child: Child, reaper: &mpsc::Sender<Child>) {
+    if let Err(mpsc::SendError(child)) = reaper.send(child) {
+        transfer_helper_to_fallback(child);
+    }
+}
+
+#[cfg(unix)]
+fn transfer_helper_to_fallback(child: Child) {
+    if let Some(sender) = HELPER_FALLBACK_REAPER.get() {
+        if let Err(mpsc::SendError(child)) = sender.send(child) {
+            spawn_final_helper_reaper(child);
+        }
+        return;
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    match std::thread::Builder::new()
+        .name("pueue-agent-helper-fallback-reaper".to_owned())
+        .spawn(move || helper_reaper_loop(receiver))
+    {
+        Ok(_) => {
+            let selected = if HELPER_FALLBACK_REAPER.set(sender.clone()).is_ok() {
+                sender
+            } else {
+                HELPER_FALLBACK_REAPER.get().cloned().unwrap_or(sender)
+            };
+            if let Err(mpsc::SendError(child)) = selected.send(child) {
+                spawn_final_helper_reaper(child);
+            }
+        }
+        Err(_) => spawn_final_helper_reaper(child),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_final_helper_reaper(child: Child) {
+    // Both process-lifetime channels failed. The only safe final ownership
+    // state is a dedicated thread that runs the same probe-first state machine.
+    // Thread creation here is exceptional, not per normal cleanup.
+    match std::thread::Builder::new()
+        .name("pueue-agent-helper-final-reaper".to_owned())
+        .spawn(move || {
+            let (sender, receiver) = mpsc::channel();
+            if sender.send(child).is_ok() {
+                drop(sender);
+                helper_reaper_loop(receiver);
+            }
+        })
+    {
+        Ok(_) => {}
+        Err(error) => {
+            // spawn returns the I/O error, not the closure, so Child ownership
+            // cannot be recovered from this standard API. Abort is safer than
+            // continuing after losing the only reaping authority.
+            let _ = error;
+            std::process::abort();
+        }
     }
 }
 
@@ -1684,6 +1790,7 @@ mod tests {
         fs::{self, File, OpenOptions},
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
         os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        os::unix::process::ExitStatusExt,
         process::{Child, Command, Stdio},
         time::{Duration, Instant},
     };
@@ -1921,6 +2028,25 @@ mod tests {
             unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
             0,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaper_probe_classifies_running_reaped_echild_and_other_errors() {
+        let running: io::Result<Option<ExitStatus>> = Ok(None);
+        assert_eq!(classify_reaper_probe(&running), ReaperProbe::Running);
+
+        let completed = ExitStatus::from_raw(0);
+        let reaped: io::Result<Option<ExitStatus>> = Ok(Some(completed));
+        assert_eq!(classify_reaper_probe(&reaped), ReaperProbe::Done);
+
+        let echild: io::Result<Option<ExitStatus>> =
+            Err(io::Error::from_raw_os_error(libc::ECHILD));
+        assert_eq!(classify_reaper_probe(&echild), ReaperProbe::Done);
+
+        let other: io::Result<Option<ExitStatus>> =
+            Err(io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(classify_reaper_probe(&other), ReaperProbe::Retain);
     }
 
     #[cfg(unix)]
@@ -2218,6 +2344,52 @@ mod tests {
                 panic!("helper reaper did not reap before deadline");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_reaper_send_recovers_child_ownership() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored", "--exact",
+            "process::tests::validated_helper_lifecycle_subprocess", "--nocapture",
+        ]);
+        let child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        transfer_helper_to_reaper(child, &sender);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_reaper_drains_owned_children_and_exits() {
+        let (sender, receiver) = mpsc::channel();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored", "--exact",
+            "process::tests::validated_helper_lifecycle_subprocess", "--nocapture",
+        ]);
+        sender.send(command.spawn().unwrap()).unwrap();
+        drop(sender);
+
+        let worker = std::thread::spawn(move || helper_reaper_loop(receiver));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.is_finished());
+        worker.join().unwrap();
     }
 
     #[cfg(unix)]
