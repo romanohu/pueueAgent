@@ -113,6 +113,17 @@ pub struct AgentLogFile {
     path: PathBuf,
 }
 
+/// Private marker-publication authority bound to the exact directory and log
+/// generation opened during native-agent spawn. It exposes no raw descriptor
+/// and can publish only its prevalidated marker name.
+#[cfg(unix)]
+pub(crate) struct AgentGateDirectory {
+    parent: File,
+    parent_identity: LogFileIdentity,
+    log_name: std::ffi::OsString,
+    marker_name: std::ffi::OsString,
+}
+
 impl ProjectRootLogReader {
     /// Production callers pass the descriptor verified by the execution
     /// policy.  No path is reopened by this constructor.
@@ -424,6 +435,129 @@ pub fn open_agent_log(
     }
 }
 
+/// Open the agent log and retain its checked parent generation for the native
+/// launch gate. Log and marker must be distinct final names in the same fixed
+/// secure directory.
+#[cfg(unix)]
+pub(crate) fn open_agent_log_gate(
+    root: &ProjectRootLogReader,
+    log_relative: &Path,
+    marker_relative: &Path,
+) -> Result<(AgentLogFile, AgentGateDirectory), AppError> {
+    let (log_parent_components, log_name) = split_relative_parent(log_relative)?;
+    let (marker_parent_components, marker_name) = split_relative_parent(marker_relative)?;
+    if log_parent_components != marker_parent_components
+        || log_parent_components.as_slice()
+            != [OsStr::new(".pueue-agent"), OsStr::new("logs")]
+        || log_name == marker_name
+    {
+        return Err(log_unsafe(LogUnsafeReason::RootChanged));
+    }
+    let (file, parent) = root.open_final_with_parent(
+        log_relative,
+        libc::O_RDWR | libc::O_APPEND | libc::O_CREAT,
+        AGENT_FILE_MODE,
+    )?;
+    validate_directory(&parent)?;
+    let parent_identity = LogFileIdentity::from_open_descriptor(&parent).map_err(|source| {
+        AppError::Io {
+            operation: "read agent gate directory metadata",
+            source,
+        }
+    })?;
+    let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|source| AppError::Io {
+        operation: "read agent log metadata",
+        source,
+    })?;
+    validate_owner_only_file(identity)?;
+    Ok((
+        AgentLogFile {
+            file,
+            identity,
+            path: log_relative.to_owned(),
+        },
+        AgentGateDirectory {
+            parent,
+            parent_identity,
+            log_name,
+            marker_name,
+        },
+    ))
+}
+
+#[cfg(unix)]
+impl AgentGateDirectory {
+    pub(crate) fn revalidate_current(
+        &self,
+        root: &ProjectRootLogReader,
+        expected_log: LogFileIdentity,
+    ) -> Result<(), AppError> {
+        let current_parent = inspect_agent_log_dir(root)?;
+        if current_parent != self.parent_identity {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+        self.revalidate_retained(expected_log)
+    }
+
+    pub(crate) fn publish_marker(&self) -> Result<GateMarkerIdentity, AppError> {
+        create_gate_marker_in_parent(&self.parent, &self.marker_name)
+    }
+
+    pub(crate) fn revalidate_published(
+        &self,
+        root: &ProjectRootLogReader,
+        expected_log: LogFileIdentity,
+        expected_marker: GateMarkerIdentity,
+    ) -> Result<(), AppError> {
+        self.revalidate_current(root, expected_log)?;
+        let marker = inspect_gate_marker_in_parent(&self.parent, &self.marker_name)?
+            .ok_or_else(|| log_unsafe(LogUnsafeReason::Missing))?;
+        if marker != expected_marker {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inspect_marker(&self) -> Result<Option<GateMarkerIdentity>, AppError> {
+        inspect_gate_marker_in_parent(&self.parent, &self.marker_name)
+    }
+
+    fn revalidate_retained(&self, expected_log: LogFileIdentity) -> Result<(), AppError> {
+        let parent = LogFileIdentity::from_open_descriptor(&self.parent).map_err(|source| {
+            AppError::Io {
+                operation: "read agent gate directory metadata",
+                source,
+            }
+        })?;
+        if parent != self.parent_identity {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+        let log = inspect_file_identity_in_parent(&self.parent, &self.log_name)?
+            .ok_or_else(|| log_unsafe(LogUnsafeReason::Missing))?;
+        validate_owner_only_file(log)?;
+        if log != expected_log {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn split_relative_parent(
+    relative: &Path,
+) -> Result<(Vec<std::ffi::OsString>, std::ffi::OsString), AppError> {
+    let components = relative_components(relative)?;
+    let name = components
+        .last()
+        .expect("validated relative path has a final name")
+        .to_os_string();
+    let parent = components[..components.len() - 1]
+        .iter()
+        .map(|component| component.to_os_string())
+        .collect();
+    Ok((parent, name))
+}
+
 pub fn create_gate_marker(
     root: &ProjectRootLogReader,
     relative: &Path,
@@ -436,85 +570,134 @@ pub fn create_gate_marker(
     #[cfg(unix)]
     {
         let (parent, final_name) = root.open_parent_for(relative)?;
-        let (file, private_name) = create_private_marker(&parent)?;
-        let identity = match LogFileIdentity::from_open_descriptor(&file) {
-            Ok(identity) => identity,
-            Err(source) => {
-                let primary = AppError::Io {
-                    operation: "read gate marker metadata",
-                    source,
-                };
-                cleanup_private_marker(&parent, &private_name);
-                return Err(primary);
-            }
-        };
-        if let Err(primary) = validate_owner_only_file(identity) {
-            cleanup_private_marker(&parent, &private_name);
-            return Err(primary);
-        }
-        use std::io::Write;
-        if let Err(source) = take_test_marker_failure(MarkerIoStage::Write)
-            .map_or_else(
-                || (&file).write_all(GATE_MARKER_CONTENT),
-                Err,
-            )
-        {
-            let primary = AppError::Io {
-                operation: "write gate marker",
-                source,
-            };
-            cleanup_private_marker(&parent, &private_name);
-            return Err(primary);
-        }
-        if let Err(source) = take_test_marker_failure(MarkerIoStage::FileSync)
-            .map_or_else(|| file.sync_all(), Err)
-        {
-            let primary = AppError::Io {
-                operation: "sync gate marker",
-                source,
-            };
-            cleanup_private_marker(&parent, &private_name);
-            return Err(primary);
-        }
-        if let Some(source) = take_test_marker_failure(MarkerIoStage::BeforePublish) {
-            let primary = AppError::Io {
-                operation: "publish gate marker",
-                source,
-            };
-            cleanup_private_marker(&parent, &private_name);
-            return Err(primary);
-        }
-        if let Err(source) = link_private_marker(&parent, &private_name, &final_name) {
-            let primary = classify_marker_create_error(
-                root,
-                relative,
-                AppError::Io {
-                    operation: "publish gate marker",
-                    source,
-                },
-            );
-            cleanup_private_marker(&parent, &private_name);
-            return Err(primary);
-        }
-        let unlink_error = unlink_private_marker(&parent, &private_name).err();
-        let sync_error = take_test_marker_failure(MarkerIoStage::DirectorySync)
-            .map_or_else(|| parent.sync_all().err(), Some);
-        if let Some(source) = unlink_error {
-            return Err(AppError::Io {
-                operation: "remove private gate marker",
-                source,
-            });
-        }
-        if let Some(source) = sync_error {
-            // Publication has already completed. Keep the valid final marker
-            // so recovery can conservatively observe execution uncertainty.
-            return Err(AppError::Io {
-                operation: "sync gate marker directory",
-                source,
-            });
-        }
-        Ok(identity)
+        create_gate_marker_in_parent(&parent, &final_name).map_err(|error| {
+            classify_marker_create_error(root, relative, error)
+        })
     }
+}
+
+#[cfg(unix)]
+fn create_gate_marker_in_parent(
+    parent: &File,
+    final_name: &OsStr,
+) -> Result<GateMarkerIdentity, AppError> {
+    let (file, private_name) = create_private_marker(parent)?;
+    let identity = match LogFileIdentity::from_open_descriptor(&file) {
+        Ok(identity) => identity,
+        Err(source) => {
+            let primary = AppError::Io {
+                operation: "read gate marker metadata",
+                source,
+            };
+            cleanup_private_marker(parent, &private_name);
+            return Err(primary);
+        }
+    };
+    if let Err(primary) = validate_owner_only_file(identity) {
+        cleanup_private_marker(parent, &private_name);
+        return Err(primary);
+    }
+    use std::io::Write;
+    if let Err(source) = take_test_marker_failure(MarkerIoStage::Write)
+        .map_or_else(|| (&file).write_all(GATE_MARKER_CONTENT), Err)
+    {
+        let primary = AppError::Io {
+            operation: "write gate marker",
+            source,
+        };
+        cleanup_private_marker(parent, &private_name);
+        return Err(primary);
+    }
+    if let Err(source) = take_test_marker_failure(MarkerIoStage::FileSync)
+        .map_or_else(|| file.sync_all(), Err)
+    {
+        let primary = AppError::Io {
+            operation: "sync gate marker",
+            source,
+        };
+        cleanup_private_marker(parent, &private_name);
+        return Err(primary);
+    }
+    if let Some(source) = take_test_marker_failure(MarkerIoStage::BeforePublish) {
+        let primary = AppError::Io {
+            operation: "publish gate marker",
+            source,
+        };
+        cleanup_private_marker(parent, &private_name);
+        return Err(primary);
+    }
+    if let Err(source) = link_private_marker(parent, &private_name, final_name) {
+        let primary = AppError::Io {
+            operation: "publish gate marker",
+            source,
+        };
+        cleanup_private_marker(parent, &private_name);
+        return Err(primary);
+    }
+    let unlink_error = unlink_private_marker(parent, &private_name).err();
+    let sync_error = take_test_marker_failure(MarkerIoStage::DirectorySync)
+        .map_or_else(|| parent.sync_all().err(), Some);
+    if let Some(source) = unlink_error {
+        return Err(AppError::Io {
+            operation: "remove private gate marker",
+            source,
+        });
+    }
+    if let Some(source) = sync_error {
+        return Err(AppError::Io {
+            operation: "sync gate marker directory",
+            source,
+        });
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn inspect_file_identity_in_parent(
+    parent: &File,
+    name: &OsStr,
+) -> Result<Option<LogFileIdentity>, AppError> {
+    let file = match openat_file(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Ok(file) => file,
+        Err(source) if source.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(source) => return Err(map_component_open_error(parent, name, source)),
+    };
+    LogFileIdentity::from_open_descriptor(&file)
+        .map(Some)
+        .map_err(|source| AppError::Io {
+            operation: "read bound project file metadata",
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn inspect_gate_marker_in_parent(
+    parent: &File,
+    name: &OsStr,
+) -> Result<Option<GateMarkerIdentity>, AppError> {
+    let file = match openat_file(parent, name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Ok(file) => file,
+        Err(source) if source.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(source) => return Err(map_component_open_error(parent, name, source)),
+    };
+    let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|source| AppError::Io {
+        operation: "read gate marker metadata",
+        source,
+    })?;
+    validate_owner_only_file(identity)?;
+    use std::io::Read;
+    let mut contents = Vec::new();
+    (&file)
+        .take((GATE_MARKER_CONTENT.len() + 1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(|source| AppError::Io {
+            operation: "read gate marker",
+            source,
+        })?;
+    if contents != GATE_MARKER_CONTENT {
+        return Err(log_unsafe(LogUnsafeReason::InvalidContents));
+    }
+    Ok(Some(identity))
 }
 
 pub fn inspect_gate_marker(

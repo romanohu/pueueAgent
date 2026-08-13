@@ -579,6 +579,37 @@ impl VerifiedChild {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn test_running_verified_child(test_name: &str) -> Result<VerifiedChild, AppError> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(
+        std::env::current_exe()
+            .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?,
+    );
+    command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+    command.process_group(0);
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))? as i64;
+    Ok(VerifiedChild {
+        child,
+        pid,
+        process_group_id: Some(pid),
+        start_gate: StartGate { writer: None },
+        exec_status: ExecStatusReceiver { reader: None },
+        ack: AckReceiver { reader: None },
+        capture: false,
+        released: false,
+        exec_confirmed: false,
+    })
+}
+
 #[cfg(unix)]
 impl Drop for VerifiedChild {
     fn drop(&mut self) {

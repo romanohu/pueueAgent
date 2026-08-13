@@ -200,6 +200,42 @@ async fn existing_marker_rejects_before_target_creation() {
 }
 
 #[tokio::test]
+async fn published_marker_then_directory_swap_is_post_marker_and_reaps() {
+    let harness = Harness::new();
+    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let reader = harness.reader();
+    create_gate_marker(&reader, Path::new(MARKER)).expect("publish marker in bound generation");
+    let current = harness.path(".pueue-agent/logs");
+    let retired = harness.path(".pueue-agent/retired-logs");
+    fs::rename(&current, &retired).expect("retire published generation");
+    fs::create_dir(&current).expect("create replacement generation");
+    fs::set_permissions(&current, fs::Permissions::from_mode(0o700))
+        .expect("set replacement permissions");
+
+    match child
+        .authorize_marker()
+        .await
+        .expect_err("published generation swap must reject")
+    {
+        pueue_agent::AppError::PolicyViolation { violation } => {
+            assert_eq!(violation.stage, PolicyViolationStage::PostMarker);
+        }
+        _ => panic!("published generation swap lost post-marker classification"),
+    }
+    assert_eq!(
+        fs::read(retired.join("fixture.authorized")).expect("retained published marker"),
+        b"authorized\n"
+    );
+    assert!(!harness.path("target-started").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_ok(),
+        "published generation swap did not reap the blocked process group"
+    );
+}
+
+#[tokio::test]
 async fn unsafe_log_symlink_rejects_before_target_creation() {
     let harness = Harness::new();
     let reader = harness.reader();
