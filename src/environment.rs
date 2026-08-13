@@ -14,11 +14,13 @@ use std::{
     fs::File,
     io,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use crate::execution_policy::{
     PolicyViolation, PolicyViolationCode, PolicyViolationStage,
-    ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy, VerifiedProjectRoot,
+    PolicyViolationDetail, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
+    TempUnsafeReason, VerifiedProjectRoot,
 };
 
 pub use crate::execution_policy::StartupEnvironment;
@@ -26,6 +28,11 @@ pub use crate::execution_policy::StartupEnvironment;
 const PRIVATE_TEMP_ROOT: &str = ".pueue-agent";
 const PRIVATE_TEMP_DIR: &str = "tmp";
 const MAX_RUN_ID_BYTES: usize = 20;
+
+pub const MAX_PRIVATE_TEMP_CLEANUP_DEPTH: usize = 32;
+pub const MAX_PRIVATE_TEMP_CLEANUP_ENTRIES: usize = 4096;
+pub const MAX_PRIVATE_TEMP_ALLOCATED_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_PRIVATE_TEMP_GENERATIONS: usize = 4096;
 
 const BASELINE_NAMES: &[&str] = &[
     "HOME",
@@ -421,6 +428,19 @@ pub struct PrivateRunTemp {
     identity: (u64, u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TempCleanupReport {
+    pub entries_removed: usize,
+    pub allocated_bytes_reclaimed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TempInventoryReport {
+    pub generations: usize,
+    pub retained_nonempty_generations: usize,
+    pub retained_allocated_bytes: u64,
+}
+
 impl fmt::Debug for PrivateRunTemp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -474,6 +494,255 @@ impl PrivateRunTemp {
         &self.path
     }
 
+    pub fn cleanup_contents_before(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            check_cleanup_deadline(deadline)?;
+            validate_private_directory(&self.directory)?;
+            if directory_identity(&self.directory)? != self.identity {
+                return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+            }
+            let mut state = AuditState::default();
+            let entries = audit_directory(
+                &self.directory,
+                0,
+                &mut state,
+                deadline,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let mut report = TempCleanupReport {
+                entries_removed: 0,
+                allocated_bytes_reclaimed: 0,
+            };
+            remove_audited_entries(&self.directory, &entries, &mut report, deadline)?;
+            finish_cleanup_before_success(
+                &self.directory,
+                deadline,
+                #[cfg(all(test, unix))]
+                None,
+            )?;
+            Ok(report)
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn cleanup_contents_before_with_test_hook<F: FnOnce()>(
+        &mut self,
+        deadline: Option<Instant>,
+        audit_hook: F,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        validate_private_directory(&self.directory)?;
+        if directory_identity(&self.directory)? != self.identity {
+            return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+        }
+        let mut state = AuditState::default();
+        let entries = audit_directory(
+            &self.directory,
+            0,
+            &mut state,
+            deadline,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        audit_hook();
+        let mut report = TempCleanupReport {
+            entries_removed: 0,
+            allocated_bytes_reclaimed: 0,
+        };
+        let mut test_state = CleanupTestState::default();
+        remove_audited_entries_impl(
+            &self.directory,
+            &entries,
+            &mut report,
+            deadline,
+            Some(&mut test_state),
+        )?;
+        finish_cleanup_before_success(
+            &self.directory,
+            deadline,
+            Some(&mut test_state),
+        )?;
+        Ok(report)
+    }
+
+    #[cfg(all(test, unix))]
+    fn cleanup_contents_before_with_test_state(
+        &mut self,
+        deadline: Option<Instant>,
+        test_state: &mut CleanupTestState,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        validate_private_directory(&self.directory)?;
+        if directory_identity(&self.directory)? != self.identity {
+            return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+        }
+        let mut state = AuditState::default();
+        let entries = audit_directory(
+            &self.directory,
+            0,
+            &mut state,
+            deadline,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let mut report = TempCleanupReport {
+            entries_removed: 0,
+            allocated_bytes_reclaimed: 0,
+        };
+        remove_audited_entries_impl(
+            &self.directory,
+            &entries,
+            &mut report,
+            deadline,
+            Some(&mut *test_state),
+        )?;
+        finish_cleanup_before_success(
+            &self.directory,
+            deadline,
+            Some(&mut *test_state),
+        )?;
+        Ok(report)
+    }
+
+    pub fn inspect_capacity(
+        root: &VerifiedProjectRoot,
+    ) -> Result<TempInventoryReport, PolicyViolation> {
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let service = match open_directory_nofollow(&root.directory, OsStr::new(PRIVATE_TEMP_ROOT)) {
+                Ok(directory) => {
+                    validate_private_directory_at(&directory, PolicyViolationStage::PreBinding)?;
+                    directory
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(TempInventoryReport {
+                        generations: 0,
+                        retained_nonempty_generations: 0,
+                        retained_allocated_bytes: 0,
+                    });
+                }
+                Err(error) => {
+                    return Err(map_temp_io_at(error, PolicyViolationStage::PreBinding));
+                }
+            };
+            let tmp = match open_directory_nofollow(&service, OsStr::new(PRIVATE_TEMP_DIR)) {
+                Ok(directory) => {
+                    validate_private_directory_at(&directory, PolicyViolationStage::PreBinding)?;
+                    directory
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(TempInventoryReport {
+                        generations: 0,
+                        retained_nonempty_generations: 0,
+                        retained_allocated_bytes: 0,
+                    });
+                }
+                Err(error) => {
+                    return Err(map_temp_io_at(error, PolicyViolationStage::PreBinding));
+                }
+            };
+            let entries = directory_entries(
+                &tmp,
+                MAX_PRIVATE_TEMP_GENERATIONS,
+                TempUnsafeReason::GenerationLimit,
+                PolicyViolationStage::PreBinding,
+                None,
+                None,
+                #[cfg(all(test, unix))]
+                None,
+            )?;
+            let mut state = AuditState::default();
+            let mut report = TempInventoryReport {
+                generations: 0,
+                retained_nonempty_generations: 0,
+                retained_allocated_bytes: 0,
+            };
+            for entry in entries {
+                let name = entry.name.to_str().ok_or_else(|| {
+                    temp_violation_at(TempUnsafeReason::InvalidEntry, PolicyViolationStage::PreBinding)
+                })?;
+                if name.starts_with('0') || name.parse::<u64>().ok().filter(|value| *value > 0).is_none() {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::InvalidEntry,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+                if !matches!(entry.kind, AuditedEntryKind::Directory) {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::InvalidEntry,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+                let generation = open_directory_nofollow(&tmp, &entry.name)
+                    .map_err(|error| map_temp_io_at(error, PolicyViolationStage::PreBinding))?;
+                validate_private_directory_at(&generation, PolicyViolationStage::PreBinding)?;
+                if directory_identity_at(&generation, PolicyViolationStage::PreBinding)?
+                    != entry.identity
+                {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::IdentityChanged,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+                let children = audit_directory(
+                    &generation,
+                    0,
+                    &mut state,
+                    None,
+                    PolicyViolationStage::PreBinding,
+                )
+                .map_err(|error| stage_violation(error, PolicyViolationStage::PreBinding))?;
+                report.generations += 1;
+                let allocated = children
+                    .iter()
+                    .try_fold(0_u64, |total, child| {
+                        total
+                            .checked_add(
+                                child.allocated_total(PolicyViolationStage::PreBinding)?,
+                            )
+                            .ok_or_else(|| {
+                                temp_violation_at(
+                                    TempUnsafeReason::ByteLimit,
+                                    PolicyViolationStage::PreBinding,
+                                )
+                            })
+                    })?;
+                report.retained_allocated_bytes = report
+                    .retained_allocated_bytes
+                    .checked_add(allocated)
+                    .ok_or_else(|| {
+                        temp_violation_at(
+                            TempUnsafeReason::ByteLimit,
+                            PolicyViolationStage::PreBinding,
+                        )
+                    })?;
+                if !children.is_empty() {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::InvalidEntry,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+            }
+            Ok(report)
+        }
+    }
+
     /// Prove that the retained descriptor still names the exact owner-only
     /// generation visible under the fixed private-temp parent.
     pub fn revalidate_current(&self) -> Result<(), PolicyViolation> {
@@ -525,6 +794,644 @@ impl Drop for PrivateRunTemp {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct AuditedEntry {
+    name: OsString,
+    identity: (u64, u64),
+    kind: AuditedEntryKind,
+    allocated_bytes: u64,
+    children: Vec<AuditedEntry>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditedEntryKind {
+    Directory,
+    Leaf,
+}
+
+#[cfg(unix)]
+impl AuditedEntry {
+    fn allocated_total(&self, stage: PolicyViolationStage) -> Result<u64, PolicyViolation> {
+        self.children.iter().try_fold(self.allocated_bytes, |total, child| {
+            total
+                .checked_add(child.allocated_total(stage)?)
+                .ok_or_else(|| temp_violation_at(TempUnsafeReason::ByteLimit, stage))
+        })
+    }
+}
+
+#[cfg(unix)]
+struct AuditState {
+    entries: usize,
+    allocated_bytes: u64,
+    max_depth: usize,
+    max_entries: usize,
+    max_allocated_bytes: u64,
+    #[cfg(test)]
+    test_deadline_after_entries: Option<usize>,
+}
+
+#[cfg(unix)]
+impl Default for AuditState {
+    fn default() -> Self {
+        Self {
+            entries: 0,
+            allocated_bytes: 0,
+            max_depth: MAX_PRIVATE_TEMP_CLEANUP_DEPTH,
+            max_entries: MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+            max_allocated_bytes: MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+            #[cfg(test)]
+            test_deadline_after_entries: None,
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+impl AuditState {
+    fn with_limits(max_depth: usize, max_entries: usize, max_allocated_bytes: u64) -> Self {
+        Self {
+            entries: 0,
+            allocated_bytes: 0,
+            max_depth,
+            max_entries,
+            max_allocated_bytes,
+            test_deadline_after_entries: None,
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+#[derive(Default)]
+struct CleanupTestState {
+    expire_after_recursion: bool,
+    expire_before_sync: bool,
+    deadline_crossed: bool,
+    fail_after_first_unlink: bool,
+    fail_sync: bool,
+    sync_attempts: usize,
+    sync_completed: bool,
+}
+
+#[cfg(all(unix, test))]
+struct DirectoryEntriesTestState {
+    fail_after_metadata: Option<usize>,
+    close_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+fn check_audit_deadline(
+    deadline: Option<Instant>,
+    state: Option<&AuditState>,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    #[cfg(not(test))]
+    let _ = state;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+    }
+    #[cfg(test)]
+    if state.is_some_and(|state| {
+        state
+            .test_deadline_after_entries
+            .is_some_and(|limit| state.entries >= limit)
+    }) {
+        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn audit_directory(
+    directory: &File,
+    depth: usize,
+    state: &mut AuditState,
+    deadline: Option<Instant>,
+    stage: PolicyViolationStage,
+) -> Result<Vec<AuditedEntry>, PolicyViolation> {
+    check_audit_deadline(deadline, Some(state), stage)?;
+    if depth > state.max_depth {
+        return Err(temp_violation_at(TempUnsafeReason::DepthLimit, stage));
+    }
+    let mut entries = Vec::new();
+    let remaining = state.max_entries.saturating_sub(state.entries);
+    for listed in directory_entries(
+        directory,
+        remaining,
+        TempUnsafeReason::EntryLimit,
+        stage,
+        deadline,
+        Some(state),
+        #[cfg(all(test, unix))]
+        None,
+    )? {
+        check_audit_deadline(deadline, Some(state), stage)?;
+        let children = if listed.kind == AuditedEntryKind::Directory {
+            if depth == state.max_depth {
+                return Err(temp_violation_at(TempUnsafeReason::DepthLimit, stage));
+            }
+            let child = open_directory_nofollow(directory, &listed.name)
+                .map_err(|error| map_temp_io_at(error, stage))?;
+            validate_private_directory_at(&child, stage)?;
+            if directory_identity_at(&child, stage)? != listed.identity {
+                return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+            }
+            audit_directory(&child, depth + 1, state, deadline, stage)?
+        } else {
+            Vec::new()
+        };
+        entries.push(AuditedEntry {
+            name: listed.name,
+            identity: listed.identity,
+            kind: listed.kind,
+            allocated_bytes: listed.allocated_bytes,
+            children,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn remove_audited_entries(
+    directory: &File,
+    entries: &[AuditedEntry],
+    report: &mut TempCleanupReport,
+    deadline: Option<Instant>,
+) -> Result<(), PolicyViolation> {
+    #[cfg(all(test, unix))]
+    let mut test_state = CleanupTestState::default();
+    remove_audited_entries_impl(
+        directory,
+        entries,
+        report,
+        deadline,
+        #[cfg(all(test, unix))]
+        Some(&mut test_state),
+    )
+}
+
+#[cfg(unix)]
+fn remove_audited_entries_impl(
+    directory: &File,
+    entries: &[AuditedEntry],
+    report: &mut TempCleanupReport,
+    deadline: Option<Instant>,
+    #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
+) -> Result<(), PolicyViolation> {
+    let mut modified = false;
+    for entry in entries {
+        if let Err(error) = remove_audited_entry(
+            directory,
+            entry,
+            report,
+            deadline,
+            &mut modified,
+            #[cfg(all(test, unix))]
+            test_state.as_deref_mut(),
+        ) {
+            if modified {
+                if let Err(sync_error) = sync_directory(
+                    directory,
+                    #[cfg(all(test, unix))]
+                    test_state.as_deref_mut(),
+                ) {
+                    return Err(sync_error);
+                }
+            }
+            return Err(error);
+        }
+    }
+    if modified {
+        sync_directory(
+            directory,
+            #[cfg(all(test, unix))]
+            test_state.as_deref_mut(),
+        )?;
+        check_cleanup_deadline_after_sync(
+            deadline,
+            #[cfg(all(test, unix))]
+            test_state.as_deref_mut(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finish_cleanup_before_success(
+    directory: &File,
+    deadline: Option<Instant>,
+    #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
+) -> Result<(), PolicyViolation> {
+    check_cleanup_deadline(deadline)?;
+    sync_directory(
+        directory,
+        #[cfg(all(test, unix))]
+        test_state.as_deref_mut(),
+    )?;
+    check_cleanup_deadline_after_sync(
+        deadline,
+        #[cfg(all(test, unix))]
+        test_state.as_deref_mut(),
+    )
+}
+
+#[cfg(unix)]
+fn remove_audited_entry(
+    directory: &File,
+    entry: &AuditedEntry,
+    report: &mut TempCleanupReport,
+    deadline: Option<Instant>,
+    modified: &mut bool,
+    #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
+) -> Result<(), PolicyViolation> {
+    check_cleanup_deadline(deadline)?;
+    let current = entry_metadata(directory, &entry.name)?;
+    if current.identity != entry.identity || current.kind != entry.kind {
+        return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+    }
+    if entry.kind == AuditedEntryKind::Directory {
+        check_cleanup_deadline(deadline)?;
+        let child = open_directory_nofollow(directory, &entry.name)
+            .map_err(map_temp_io)?;
+        validate_private_directory(&child)?;
+        if directory_identity(&child)? != entry.identity {
+            return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+        }
+        remove_audited_entries_impl(
+            &child,
+            &entry.children,
+            report,
+            deadline,
+            #[cfg(all(test, unix))]
+            test_state.as_deref_mut(),
+        )?;
+        check_cleanup_deadline_after_recursion(
+            deadline,
+            #[cfg(all(test, unix))]
+            test_state.as_deref_mut(),
+        )?;
+        check_cleanup_deadline(deadline)?;
+        let current = entry_metadata(directory, &entry.name)?;
+        if current.identity != entry.identity || current.kind != AuditedEntryKind::Directory {
+            return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+        }
+        check_cleanup_deadline(deadline)?;
+        unlinkat(directory, &entry.name, true)?;
+    } else {
+        check_cleanup_deadline(deadline)?;
+        unlinkat(directory, &entry.name, false)?;
+    }
+    *modified = true;
+    #[cfg(all(unix, test))]
+    if let Some(test_state) = test_state.as_deref_mut() {
+        if test_state.fail_after_first_unlink {
+            test_state.fail_after_first_unlink = false;
+            return Err(temp_violation(TempUnsafeReason::IoFailure));
+        }
+    }
+    report.entries_removed = report
+        .entries_removed
+        .checked_add(1)
+        .ok_or_else(|| temp_violation(TempUnsafeReason::EntryLimit))?;
+    report.allocated_bytes_reclaimed = report
+        .allocated_bytes_reclaimed
+        .checked_add(entry.allocated_bytes)
+        .ok_or_else(|| temp_violation(TempUnsafeReason::ByteLimit))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_cleanup_deadline(deadline: Option<Instant>) -> Result<(), PolicyViolation> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(temp_violation(TempUnsafeReason::IoFailure))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn check_cleanup_deadline_after_recursion(
+    deadline: Option<Instant>,
+    #[cfg(all(test, unix))] test_state: Option<&mut CleanupTestState>,
+) -> Result<(), PolicyViolation> {
+    #[cfg(all(unix, test))]
+    if let Some(test_state) = test_state {
+        if test_state.expire_after_recursion {
+            test_state.expire_after_recursion = false;
+            return Err(temp_violation(TempUnsafeReason::IoFailure));
+        }
+    }
+    check_cleanup_deadline(deadline)
+}
+
+#[cfg(unix)]
+fn sync_directory(
+    directory: &File,
+    #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
+) -> Result<(), PolicyViolation> {
+    #[cfg(all(unix, test))]
+    if let Some(test_state) = test_state.as_deref_mut() {
+        test_state.sync_attempts += 1;
+        if test_state.expire_before_sync {
+            test_state.expire_before_sync = false;
+            test_state.deadline_crossed = true;
+        }
+        if test_state.fail_sync {
+            return Err(temp_violation(TempUnsafeReason::IoFailure));
+        }
+    }
+    let result = directory
+        .sync_all()
+        .map_err(|_| temp_violation(TempUnsafeReason::IoFailure));
+    #[cfg(all(unix, test))]
+    if result.is_ok() {
+        if let Some(test_state) = test_state.as_deref_mut() {
+            test_state.sync_completed = true;
+        }
+    }
+    result
+}
+
+#[cfg(unix)]
+fn check_cleanup_deadline_after_sync(
+    deadline: Option<Instant>,
+    #[cfg(all(test, unix))] test_state: Option<&mut CleanupTestState>,
+) -> Result<(), PolicyViolation> {
+    #[cfg(all(unix, test))]
+    if let Some(test_state) = test_state {
+        if test_state.deadline_crossed {
+            test_state.deadline_crossed = false;
+            return Err(temp_violation(TempUnsafeReason::IoFailure));
+        }
+    }
+    check_cleanup_deadline(deadline)
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ListedEntry {
+    name: OsString,
+    identity: (u64, u64),
+    kind: AuditedEntryKind,
+    allocated_bytes: u64,
+}
+
+#[cfg(unix)]
+struct OwnedDirectoryStream {
+    stream: *mut libc::DIR,
+    #[cfg(all(test, unix))]
+    close_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(unix)]
+impl OwnedDirectoryStream {
+    fn open(
+        fd: libc::c_int,
+        stage: PolicyViolationStage,
+        #[cfg(all(test, unix))]
+        close_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Result<Self, PolicyViolation> {
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe { libc::close(fd) };
+            return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+        }
+        Ok(Self {
+            stream,
+            #[cfg(all(test, unix))]
+            close_counter,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut libc::DIR {
+        self.stream
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedDirectoryStream {
+    fn drop(&mut self) {
+        if self.stream.is_null() {
+            return;
+        }
+        unsafe { libc::closedir(self.stream) };
+        self.stream = std::ptr::null_mut();
+        #[cfg(all(test, unix))]
+        if let Some(counter) = self.close_counter.as_ref() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn directory_entries(
+    directory: &File,
+    max_entries: usize,
+    overflow_reason: TempUnsafeReason,
+    stage: PolicyViolationStage,
+    deadline: Option<Instant>,
+    mut audit_state: Option<&mut AuditState>,
+    #[cfg(all(test, unix))] test_state: Option<&mut DirectoryEntriesTestState>,
+) -> Result<Vec<ListedEntry>, PolicyViolation> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    check_audit_deadline(deadline, audit_state.as_ref().map(|state| &**state), stage)?;
+    let duplicate = duplicate_directory_fd(directory, stage)?;
+    if let Err(error) = check_audit_deadline(
+        deadline,
+        audit_state.as_ref().map(|state| &**state),
+        stage,
+    ) {
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    if unsafe { libc::lseek(duplicate, 0, libc::SEEK_SET) } < 0 {
+        unsafe { libc::close(duplicate) };
+        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+    }
+    #[cfg(all(test, unix))]
+    let close_counter = test_state
+        .as_ref()
+        .map(|state| std::sync::Arc::clone(&state.close_counter));
+    let stream = OwnedDirectoryStream::open(
+        duplicate,
+        stage,
+        #[cfg(all(test, unix))]
+        close_counter,
+    )?;
+    let mut result = Vec::with_capacity(max_entries.min(64));
+    let mut count = 0_usize;
+    loop {
+        if let Err(error) = check_audit_deadline(
+            deadline,
+            audit_state.as_ref().map(|state| &**state),
+            stage,
+        ) {
+            return Err(error);
+        }
+        clear_errno();
+        let entry = unsafe { libc::readdir(stream.as_ptr()) };
+        if entry.is_null() {
+            let errno = last_errno();
+            if errno != 0 {
+                return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+            }
+            break;
+        }
+        let dirent = unsafe { &*entry };
+        let name_bytes = unsafe { CStr::from_ptr(dirent.d_name.as_ptr()) }.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." || name_bytes.is_empty() {
+            continue;
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| temp_violation_at(overflow_reason, stage))?;
+        if count > max_entries {
+            return Err(temp_violation_at(overflow_reason, stage));
+        }
+        let name = OsStr::from_bytes(name_bytes).to_os_string();
+        if let Err(error) = check_audit_deadline(
+            deadline,
+            audit_state.as_ref().map(|state| &**state),
+            stage,
+        ) {
+            return Err(error);
+        }
+        let listed = entry_metadata_at(directory, &name, stage)?;
+        if let Err(error) = check_audit_deadline(
+            deadline,
+            audit_state.as_ref().map(|state| &**state),
+            stage,
+        ) {
+            return Err(error);
+        }
+        #[cfg(all(test, unix))]
+        if test_state.as_ref().is_some_and(|state| {
+            state
+                .fail_after_metadata
+                .is_some_and(|limit| count >= limit)
+        }) {
+            return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+        }
+        if let Some(state) = audit_state.as_mut() {
+            let state = &mut **state;
+            state.entries = state
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| temp_violation_at(TempUnsafeReason::EntryLimit, stage))?;
+            if state.entries > state.max_entries {
+                return Err(temp_violation_at(TempUnsafeReason::EntryLimit, stage));
+            }
+            state.allocated_bytes = state
+                .allocated_bytes
+                .checked_add(listed.allocated_bytes)
+                .ok_or_else(|| temp_violation_at(TempUnsafeReason::ByteLimit, stage))?;
+            if state.allocated_bytes > state.max_allocated_bytes {
+                return Err(temp_violation_at(TempUnsafeReason::ByteLimit, stage));
+            }
+        }
+        result.push(ListedEntry {
+            name,
+            identity: listed.identity,
+            kind: listed.kind,
+            allocated_bytes: listed.allocated_bytes,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn duplicate_directory_fd(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<libc::c_int, PolicyViolation> {
+    use std::os::fd::AsRawFd;
+    let fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        Err(temp_violation_at(TempUnsafeReason::IoFailure, stage))
+    } else {
+        Ok(fd)
+    }
+}
+
+#[cfg(unix)]
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    unsafe { *libc::__errno_location() = 0; }
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    unsafe { *libc::__error() = 0; }
+}
+
+#[cfg(unix)]
+fn last_errno() -> i32 {
+    #[cfg(target_os = "linux")]
+    unsafe { *libc::__errno_location() }
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    unsafe { *libc::__error() }
+}
+
+#[cfg(unix)]
+struct EntryMetadata {
+    identity: (u64, u64),
+    kind: AuditedEntryKind,
+    allocated_bytes: u64,
+}
+
+#[cfg(unix)]
+fn entry_metadata(directory: &File, name: &OsStr) -> Result<EntryMetadata, PolicyViolation> {
+    entry_metadata_at(
+        directory,
+        name,
+        PolicyViolationStage::RunBoundPreMarker,
+    )
+}
+
+#[cfg(unix)]
+fn entry_metadata_at(
+    directory: &File,
+    name: &OsStr,
+    stage: PolicyViolationStage,
+) -> Result<EntryMetadata, PolicyViolation> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| temp_violation_at(TempUnsafeReason::InvalidEntry, stage))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstatat(directory.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let kind = if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+        AuditedEntryKind::Directory
+    } else {
+        AuditedEntryKind::Leaf
+    };
+    let allocated_bytes = (stat.st_blocks as u64)
+        .checked_mul(512)
+        .ok_or_else(|| temp_violation_at(TempUnsafeReason::ByteLimit, stage))?;
+    Ok(EntryMetadata {
+        identity: (stat.st_dev as u64, stat.st_ino as u64),
+        kind,
+        allocated_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn unlinkat(directory: &File, name: &OsStr, directory_entry: bool) -> Result<(), PolicyViolation> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| temp_violation(TempUnsafeReason::InvalidEntry))?;
+    let flags = if directory_entry { libc::AT_REMOVEDIR } else { 0 };
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        return Err(temp_violation(TempUnsafeReason::IoFailure));
+    }
+    Ok(())
+}
+
+fn temp_violation(reason: TempUnsafeReason) -> PolicyViolation {
+    temp_violation_at(reason, PolicyViolationStage::RunBoundPreMarker)
+}
+
+#[cfg(unix)]
 fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, PolicyViolation> {
     match open_directory_nofollow(parent, name) {
         Ok(directory) => {
@@ -543,21 +1450,41 @@ fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, PolicyV
 
 #[cfg(unix)]
 fn validate_private_directory(directory: &File) -> Result<(), PolicyViolation> {
-    let metadata = directory.metadata().map_err(|_| temp_error())?;
+    validate_private_directory_at(directory, PolicyViolationStage::RunBoundPreMarker)
+}
+
+#[cfg(unix)]
+fn validate_private_directory_at(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
     use std::os::unix::fs::MetadataExt;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() as u32 }
         || metadata.mode() & 0o777 != 0o700
     {
-        return Err(temp_error());
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
     }
     Ok(())
 }
 
 #[cfg(unix)]
 fn directory_identity(directory: &File) -> Result<(u64, u64), PolicyViolation> {
+    directory_identity_at(directory, PolicyViolationStage::RunBoundPreMarker)
+}
+
+#[cfg(unix)]
+fn directory_identity_at(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<(u64, u64), PolicyViolation> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = directory.metadata().map_err(|_| temp_error())?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
@@ -590,7 +1517,11 @@ fn open_directory_nofollow(parent: &File, name: &OsStr) -> io::Result<File> {
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -602,6 +1533,368 @@ fn open_directory_nofollow(parent: &File, name: &OsStr) -> io::Result<File> {
 
 #[cfg(unix)]
 fn map_temp_io(error: io::Error) -> PolicyViolation {
+    map_temp_io_at(error, PolicyViolationStage::RunBoundPreMarker)
+}
+
+fn map_temp_io_at(error: io::Error, stage: PolicyViolationStage) -> PolicyViolation {
     let _ = error;
-    temp_error()
+    temp_violation_at(TempUnsafeReason::IoFailure, stage)
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        time::Duration,
+    };
+
+    fn test_temp(run_id: i64) -> (tempfile::TempDir, PrivateRunTemp) {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let temp = PrivateRunTemp::create(&root, run_id).unwrap();
+        (holder, temp)
+    }
+
+    #[test]
+    fn duplicate_directory_fd_sets_cloexec_atomically() {
+        let (_holder, temp) = test_temp(701);
+        let duplicate = duplicate_directory_fd(
+            &temp.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .unwrap();
+        let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFD) };
+        unsafe { libc::close(duplicate) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn directory_entries_enforces_remaining_limit_before_collecting_more() {
+        let (_holder, temp) = test_temp(702);
+        fs::write(temp.path.join("one"), b"1").unwrap();
+        fs::write(temp.path.join("two"), b"2").unwrap();
+        let error = directory_entries(
+            &temp.directory,
+            1,
+            TempUnsafeReason::EntryLimit,
+            PolicyViolationStage::RunBoundPreMarker,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::EntryLimit));
+        assert!(temp.path.join("one").exists());
+        assert!(temp.path.join("two").exists());
+    }
+
+    #[test]
+    fn audit_byte_limit_is_checked_before_any_removal() {
+        let (_holder, temp) = test_temp(703);
+        fs::write(temp.path.join("payload"), b"payload").unwrap();
+        assert_eq!(AuditState::default().max_allocated_bytes, MAX_PRIVATE_TEMP_ALLOCATED_BYTES);
+        let mut state = AuditState::with_limits(
+            MAX_PRIVATE_TEMP_CLEANUP_DEPTH,
+            MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+            0,
+        );
+        let error = audit_directory(
+            &temp.directory,
+            0,
+            &mut state,
+            None,
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ByteLimit));
+        assert!(temp.path.join("payload").exists());
+    }
+
+    #[test]
+    fn audited_entry_allocation_uses_checked_addition() {
+        let entry = AuditedEntry {
+            name: OsString::from("parent"),
+            identity: (1, 1),
+            kind: AuditedEntryKind::Directory,
+            allocated_bytes: u64::MAX,
+            children: vec![AuditedEntry {
+                name: OsString::from("child"),
+                identity: (1, 2),
+                kind: AuditedEntryKind::Leaf,
+                allocated_bytes: 1,
+                children: Vec::new(),
+            }],
+        };
+        let error = entry
+            .allocated_total(PolicyViolationStage::RunBoundPreMarker)
+            .unwrap_err();
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ByteLimit));
+    }
+
+    #[test]
+    fn test_hook_identity_change_aborts_and_retry_remains_authorized() {
+        let (holder, mut temp) = test_temp(704);
+        let original = temp.path.join("original");
+        fs::write(&original, b"original").unwrap();
+        let retired = holder.path().join("retired");
+        let replacement = original.clone();
+        let replacement_for_hook = replacement.clone();
+        let error = temp
+            .cleanup_contents_before_with_test_hook(None, move || {
+                fs::rename(&original, &retired).unwrap();
+                fs::write(&replacement_for_hook, b"replacement").unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IdentityChanged));
+        assert_eq!(fs::read(&replacement).unwrap(), b"replacement");
+        temp.cleanup_contents_before(None).unwrap();
+        let remaining: Vec<_> = fs::read_dir(temp.path()).unwrap().collect();
+        assert!(remaining.is_empty(), "remaining entries: {remaining:?}");
+    }
+
+    #[test]
+    fn expired_deadline_performs_no_mutation() {
+        let (_holder, mut temp) = test_temp(705);
+        let file = temp.path.join("payload");
+        fs::write(&file, b"payload").unwrap();
+        let error = temp
+            .cleanup_contents_before(Some(Instant::now() - Duration::from_secs(1)))
+            .unwrap_err();
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert_eq!(fs::read(&file).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn nested_audit_budget_bounds_retained_entries_before_recursing() {
+        let (_holder, temp) = test_temp(706);
+        let first = temp.path.join("first");
+        let second = temp.path.join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(first.join("nested"), b"one").unwrap();
+        fs::write(second.join("nested"), b"two").unwrap();
+        let mut state = AuditState::with_limits(32, 2, MAX_PRIVATE_TEMP_ALLOCATED_BYTES);
+
+        let error = audit_directory(
+            &temp.directory,
+            0,
+            &mut state,
+            None,
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::EntryLimit));
+        assert!(state.entries <= state.max_entries);
+    }
+
+    #[test]
+    fn audit_deadline_is_checked_inside_readdir_and_fstat_loop() {
+        let (_holder, temp) = test_temp(707);
+        fs::write(temp.path.join("one"), b"one").unwrap();
+        fs::write(temp.path.join("two"), b"two").unwrap();
+        let mut state = AuditState::default();
+        state.test_deadline_after_entries = Some(1);
+
+        let error = audit_directory(
+            &temp.directory,
+            0,
+            &mut state,
+            Some(Instant::now() + Duration::from_secs(60)),
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert!(temp.path.join("one").exists());
+        assert!(temp.path.join("two").exists());
+    }
+
+    #[test]
+    fn deadline_after_recursive_cleanup_prevents_parent_unlink() {
+        let (_holder, mut temp) = test_temp(708);
+        let nested = temp.path.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(nested.join("payload"), b"payload").unwrap();
+        let mut test_state = CleanupTestState {
+            expire_after_recursion: true,
+            ..CleanupTestState::default()
+        };
+
+        let error = temp
+            .cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap_err();
+
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert!(nested.exists());
+        assert!(!nested.join("payload").exists());
+    }
+
+    #[test]
+    fn modified_directory_is_synced_before_cleanup_error_returns() {
+        let (_holder, mut temp) = test_temp(709);
+        fs::write(temp.path.join("first"), b"first").unwrap();
+        fs::write(temp.path.join("second"), b"second").unwrap();
+        let mut test_state = CleanupTestState {
+            fail_after_first_unlink: true,
+            ..CleanupTestState::default()
+        };
+
+        let error = temp
+            .cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap_err();
+
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert!(test_state.sync_attempts > 0);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cleanup_deadline_error_during_sync_remains_typed() {
+        let (_holder, mut temp) = test_temp(710);
+        fs::write(temp.path().join("first"), b"first").unwrap();
+        fs::write(temp.path().join("second"), b"second").unwrap();
+        let mut test_state = CleanupTestState {
+            fail_after_first_unlink: true,
+            expire_before_sync: true,
+            ..CleanupTestState::default()
+        };
+
+        let error = temp
+            .cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap_err();
+
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert_eq!(test_state.sync_attempts, 1);
+    }
+
+    #[test]
+    fn deadline_crossing_after_single_unlink_still_syncs_before_error() {
+        let (_holder, mut temp) = test_temp(712);
+        let payload = temp.path.join("payload");
+        fs::write(&payload, b"payload").unwrap();
+        let mut test_state = CleanupTestState {
+            expire_before_sync: true,
+            ..CleanupTestState::default()
+        };
+
+        let error = temp
+            .cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap_err();
+
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert!(!payload.exists());
+        assert_eq!(test_state.sync_attempts, 1);
+        assert!(test_state.sync_completed);
+        temp.cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap();
+        assert_eq!(test_state.sync_attempts, 2);
+    }
+
+    #[test]
+    fn directory_entries_closes_owned_dir_once_on_error_and_success() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+
+        let (_holder, temp) = test_temp(713);
+        fs::write(temp.path.join("payload"), b"payload").unwrap();
+        let close_counter = Arc::new(AtomicUsize::new(0));
+        let mut error_state = DirectoryEntriesTestState {
+            fail_after_metadata: Some(1),
+            close_counter: Arc::clone(&close_counter),
+        };
+        let error = directory_entries(
+            &temp.directory,
+            MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+            TempUnsafeReason::EntryLimit,
+            PolicyViolationStage::RunBoundPreMarker,
+            None,
+            None,
+            Some(&mut error_state),
+        )
+        .unwrap_err();
+        assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert_eq!(close_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let success_counter = Arc::new(AtomicUsize::new(0));
+        let mut success_state = DirectoryEntriesTestState {
+            fail_after_metadata: None,
+            close_counter: Arc::clone(&success_counter),
+        };
+        directory_entries(
+            &temp.directory,
+            MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+            TempUnsafeReason::EntryLimit,
+            PolicyViolationStage::RunBoundPreMarker,
+            None,
+            None,
+            Some(&mut success_state),
+        )
+        .unwrap();
+        assert_eq!(success_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_cleanup_syncs_modified_parent_before_return() {
+        let (_holder, mut temp) = test_temp(711);
+        fs::write(temp.path.join("payload"), b"payload").unwrap();
+        let mut test_state = CleanupTestState::default();
+
+        temp.cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap();
+
+        assert!(test_state.sync_attempts > 0);
+    }
+
+    #[test]
+    fn empty_retry_must_sync_after_prior_final_unlink_sync_failure() {
+        let (_holder, mut temp) = test_temp(714);
+        let payload = temp.path.join("payload");
+        fs::write(&payload, b"payload").unwrap();
+        let mut test_state = CleanupTestState {
+            fail_sync: true,
+            ..CleanupTestState::default()
+        };
+
+        let first = temp
+            .cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap_err();
+        assert_eq!(first.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert!(!payload.exists());
+        assert_eq!(test_state.sync_attempts, 1);
+
+        let second = temp
+            .cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap_err();
+        assert_eq!(second.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+        assert_eq!(test_state.sync_attempts, 2);
+
+        test_state.fail_sync = false;
+        temp.cleanup_contents_before_with_test_state(None, &mut test_state)
+            .unwrap();
+        assert_eq!(test_state.sync_attempts, 3);
+    }
+}
+
+fn temp_violation_at(reason: TempUnsafeReason, stage: PolicyViolationStage) -> PolicyViolation {
+    PolicyViolation::with_detail(
+        PolicyViolationCode::TempUnsafe,
+        stage,
+        PolicyViolationDetail::TempUnsafe(reason),
+    )
+}
+
+fn stage_violation(mut violation: PolicyViolation, stage: PolicyViolationStage) -> PolicyViolation {
+    violation.stage = stage;
+    violation
 }

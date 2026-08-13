@@ -14,13 +14,16 @@ use pueue_agent::{
     },
     execution_policy::{
         load_or_create_policy, AgentKind, ExecutableAnchor, ExecutableIdentity, NetworkMode,
-        PolicyLoadInput, ProjectRootAnchor, PolicyViolationCode, ResolvedProjectExecutionPolicy,
-        StartupEnvironment,
+        PolicyLoadInput, PolicyViolationCode, PolicyViolationDetail, ProjectRootAnchor,
+        ResolvedProjectExecutionPolicy, StartupEnvironment, TempUnsafeReason,
     },
     environment::{PrivateRunTemp, SanitizedEnvironment},
     models::AgentContextMode,
 };
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::time::Instant;
 
 #[test]
 fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
@@ -460,6 +463,207 @@ fn private_temp_retains_tree_without_traversal() {
     assert!(path.exists());
     assert_eq!(fs::read(path.join("entry-0")).unwrap(), b"x");
     assert_eq!(fs::read(path.join("entry-4096")).unwrap(), b"x");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_cleanup_removes_bounded_contents_but_retains_run_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+    let mut temp = PrivateRunTemp::create(&root, 101).unwrap();
+    fs::create_dir(temp.path().join("nested")).unwrap();
+    fs::set_permissions(temp.path().join("nested"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(temp.path().join("nested/file"), b"payload").unwrap();
+    fs::write(temp.path().join("top"), b"top").unwrap();
+
+    let report = temp.cleanup_contents_before(None).unwrap();
+
+    assert_eq!(report.entries_removed, 3);
+    assert!(report.allocated_bytes_reclaimed >= 2 * 512);
+    assert!(temp.path().is_dir());
+    assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_cleanup_does_not_follow_symlink_or_fifo_targets() {
+    use std::os::unix::fs::symlink;
+
+    let harness = Harness::new();
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+    let mut temp = PrivateRunTemp::create(&root, 102).unwrap();
+    let outside = harness._temp.path().join("outside");
+    fs::write(&outside, b"keep").unwrap();
+    symlink(&outside, temp.path().join("link")).unwrap();
+    let fifo = temp.path().join("fifo");
+    assert_eq!(unsafe { libc::mkfifo(std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap().as_ptr(), 0o600) }, 0);
+    let report = temp.cleanup_contents_before(None).unwrap();
+
+    assert_eq!(report.entries_removed, 2);
+    assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    assert!(temp.path().is_dir());
+    assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_cleanup_rejects_depth_entry_and_allocated_byte_overflow_before_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+
+    let mut depth = PrivateRunTemp::create(&root, 103).unwrap();
+    let mut current = depth.path().to_owned();
+    for index in 0..=pueue_agent::environment::MAX_PRIVATE_TEMP_CLEANUP_DEPTH {
+        current.push(format!("d{index}"));
+        fs::create_dir(&current).unwrap();
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let before = fs::read_dir(depth.path()).unwrap().count();
+    let error = depth.cleanup_contents_before(None).unwrap_err();
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::DepthLimit));
+    assert_eq!(fs::read_dir(depth.path()).unwrap().count(), before);
+
+    let mut entries = PrivateRunTemp::create(&root, 104).unwrap();
+    for index in 0..=pueue_agent::environment::MAX_PRIVATE_TEMP_CLEANUP_ENTRIES {
+        fs::write(entries.path().join(format!("entry-{index}")), b"x").unwrap();
+    }
+    let before = fs::read_dir(entries.path()).unwrap().count();
+    let error = entries.cleanup_contents_before(None).unwrap_err();
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::EntryLimit));
+    assert_eq!(fs::read_dir(entries.path()).unwrap().count(), before);
+
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_cleanup_expired_deadline_does_not_mutate() {
+    let harness = Harness::new();
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+    let mut temp = PrivateRunTemp::create(&root, 105).unwrap();
+    fs::write(temp.path().join("small"), b"small").unwrap();
+    let error = temp
+        .cleanup_contents_before(Some(Instant::now() - std::time::Duration::from_secs(1)))
+        .unwrap_err();
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure));
+    assert_eq!(fs::read(temp.path().join("small")).unwrap(), b"small");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_cleanup_never_touches_a_replacement_run_generation() {
+    let harness = Harness::new();
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+    let mut temp = PrivateRunTemp::create(&root, 106).unwrap();
+    let visible = temp.path().to_owned();
+    fs::write(visible.join("original"), b"original").unwrap();
+    let moved = harness._temp.path().join("retired-generation");
+    fs::rename(&visible, &moved).unwrap();
+    fs::create_dir(&visible).unwrap();
+    fs::write(visible.join("replacement"), b"replacement").unwrap();
+
+    let report = temp.cleanup_contents_before(None).unwrap();
+
+    assert_eq!(report.entries_removed, 1);
+    assert!(!moved.join("original").exists());
+    assert_eq!(fs::read(visible.join("replacement")).unwrap(), b"replacement");
+    assert!(visible.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_inventory_allows_empty_generations_and_rejects_nonempty_or_unsafe_generations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let tmp = harness.root.join(".pueue-agent/tmp");
+    fs::remove_dir_all(tmp.join("run")).unwrap();
+    for run_id in ["1", "2", "3"] {
+        fs::create_dir(tmp.join(run_id)).unwrap();
+        fs::set_permissions(tmp.join(run_id), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+    let report = PrivateRunTemp::inspect_capacity(&root).unwrap();
+    assert_eq!(report.generations, 3);
+    assert_eq!(report.retained_nonempty_generations, 0);
+    assert_eq!(report.retained_allocated_bytes, 0);
+
+    fs::write(tmp.join("2/preserved"), b"preserved").unwrap();
+    let error = PrivateRunTemp::inspect_capacity(&root).unwrap_err();
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry));
+    assert_eq!(error.stage, pueue_agent::execution_policy::PolicyViolationStage::PreBinding);
+    assert_eq!(fs::read(tmp.join("2/preserved")).unwrap(), b"preserved");
+
+    fs::remove_file(tmp.join("2/preserved")).unwrap();
+    fs::remove_dir(tmp.join("3")).unwrap();
+    std::os::unix::fs::symlink(tmp.join("1"), tmp.join("3")).unwrap();
+    let error = PrivateRunTemp::inspect_capacity(&root).unwrap_err();
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry));
+    assert_eq!(error.stage, pueue_agent::execution_policy::PolicyViolationStage::PreBinding);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_inventory_rejects_weak_fixed_components_at_prebinding() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
+    let root = anchor.verify_identity().unwrap();
+    fs::set_permissions(
+        harness.root.join(".pueue-agent/tmp"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let error = PrivateRunTemp::inspect_capacity(&root).unwrap_err();
+
+    assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+    assert_eq!(error.stage, pueue_agent::execution_policy::PolicyViolationStage::PreBinding);
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry));
+}
+
+#[cfg(unix)]
+#[test]
+fn private_temp_inventory_rejects_generation_overflow_without_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let tmp = harness.root.join(".pueue-agent/tmp");
+    fs::remove_dir_all(tmp.join("run")).unwrap();
+    for run_id in 1..=pueue_agent::environment::MAX_PRIVATE_TEMP_GENERATIONS + 1 {
+        let path = tmp.join(run_id.to_string());
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let root = ProjectRootAnchor::resolve(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+
+    let error = PrivateRunTemp::inspect_capacity(&root).unwrap_err();
+
+    assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::GenerationLimit));
+    assert_eq!(fs::read_dir(tmp).unwrap().count(), pueue_agent::environment::MAX_PRIVATE_TEMP_GENERATIONS + 1);
 }
 
 #[test]

@@ -311,6 +311,18 @@ impl PolicyViolationStage {
 pub enum PolicyViolationDetail {
     None,
     LogUnsafe(LogUnsafeReason),
+    TempUnsafe(TempUnsafeReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TempUnsafeReason {
+    DepthLimit,
+    EntryLimit,
+    ByteLimit,
+    GenerationLimit,
+    IdentityChanged,
+    InvalidEntry,
+    IoFailure,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
