@@ -543,7 +543,7 @@ fn main() {
         let descendant_pid = descendant_pid.expect(
             "group fixture did not publish a parseable descendant pid before the bounded deadline",
         );
-        terminate_process_group(&mut child).await;
+        terminate_process_group(&mut child).await.unwrap();
         let gone_deadline = Instant::now() + Duration::from_secs(2);
         while unsafe { libc::kill(descendant_pid, 0) } == 0 && Instant::now() < gone_deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;

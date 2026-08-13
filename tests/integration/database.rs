@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
@@ -3594,6 +3594,459 @@ fn post_marker_policy_failure_dead_letters_and_retains_applied_interventions() {
 }
 
 #[test]
+fn pending_marker_policy_failure_dead_letters_and_releases_only_reserved_interventions() {
+    let test = TestDatabase::new();
+    let root = test.project_root("pending-marker-policy");
+    register_project(&test.db, "project-a", &root, "pa-pending-marker-policy");
+    let runs = AgentRunRepository::new(&test.db);
+    let events = EventRepository::new(&test.db);
+    let interventions = InterventionRepository::new(&test.db);
+    let event_id = insert_event(&test.db, "project-a", "pending-marker-policy", 100);
+    events.claim_batch(100, 160, 10).unwrap();
+    let reserved = interventions
+        .insert_pending("project-a", "reserved", 90)
+        .unwrap();
+    let reservation = interventions
+        .reserve_pending("project-a", "pending-marker-token", 95, 155, 1, 8)
+        .unwrap();
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                100,
+                test._temp.path().join("agent.log"),
+            ),
+            &[event_id],
+            Some(&reservation.token),
+        )
+        .unwrap();
+    let violation = pueue_agent::execution_policy::PolicyViolation::new(
+        pueue_agent::execution_policy::PolicyViolationCode::NativeGateFailed,
+        pueue_agent::execution_policy::PolicyViolationStage::PostMarker,
+    );
+
+    let finished = runs
+        .finish_pending_marker_policy_failure("project-a", run.run_id, 140, &violation)
+        .unwrap();
+
+    assert_eq!(finished.status, AgentRunStatus::Failed);
+    assert_eq!(finished.launch_gate_state.as_str(), "failed");
+    assert_eq!(finished.policy_code.as_deref(), Some("native_gate_failed"));
+    assert_eq!(finished.failure_stage.as_deref(), Some("post_marker"));
+    let event = events.find_by_id(event_id).unwrap().unwrap();
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.attempts, 1);
+    let intervention = interventions
+        .list(
+            "project-a",
+            InterventionStatus::Pending,
+            MAX_INTERVENTIONS_PER_RUN,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|item| item.intervention_id == reserved.intervention_id)
+        .unwrap();
+    assert_eq!(intervention.agent_run_id, None);
+}
+
+#[test]
+fn pending_marker_policy_failure_rejects_non_pending_or_applied_state_atomically() {
+    let test = TestDatabase::new();
+    let root = test.project_root("pending-marker-policy-invalid");
+    register_project(
+        &test.db,
+        "project-a",
+        &root,
+        "pa-pending-marker-policy-invalid",
+    );
+    let runs = AgentRunRepository::new(&test.db);
+    let events = EventRepository::new(&test.db);
+    let interventions = InterventionRepository::new(&test.db);
+    let event_id = insert_event(&test.db, "project-a", "pending-marker-policy-invalid", 100);
+    events.claim_batch(100, 160, 10).unwrap();
+    let intervention = interventions
+        .insert_pending("project-a", "must remain applied", 90)
+        .unwrap();
+    let reservation = interventions
+        .reserve_pending("project-a", "pending-marker-invalid", 95, 155, 1, 1024)
+        .unwrap();
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                100,
+                test._temp.path().join("agent-invalid.log"),
+            ),
+            &[event_id],
+            Some(&reservation.token),
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET status = 'applied', applied_at = 101
+             WHERE intervention_id = ?1",
+            [&intervention.intervention_id],
+        )
+        .unwrap();
+    let violation = pueue_agent::execution_policy::PolicyViolation::new(
+        pueue_agent::execution_policy::PolicyViolationCode::NativeGateFailed,
+        pueue_agent::execution_policy::PolicyViolationStage::PostMarker,
+    );
+
+    assert!(runs
+        .record_pending_marker_policy_evidence("project-a", run.run_id, &violation)
+        .is_err());
+    let evidence_state: (Option<String>, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT policy_code, failure_stage FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(evidence_state, (None, None));
+    assert!(runs
+        .finish_pending_marker_policy_failure("project-a", run.run_id, 140, &violation)
+        .is_err());
+    let state: (AgentRunStatus, String, EventStatus, InterventionStatus) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, agent_runs.launch_gate_state, events.status,
+                    interventions.status
+             FROM agent_runs
+             JOIN agent_run_events ON agent_run_events.project_id = agent_runs.project_id
+                AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events ON events.project_id = agent_run_events.project_id
+                AND events.event_id = agent_run_events.event_id
+             JOIN interventions ON interventions.agent_run_id = agent_runs.run_id
+             WHERE agent_runs.run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            "pending".to_owned(),
+            EventStatus::InFlight,
+            InterventionStatus::Applied,
+        ),
+    );
+
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE interventions SET status = 'reserved', applied_at = NULL
+             WHERE intervention_id = ?1",
+            [&intervention.intervention_id],
+        )
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    assert!(runs
+        .record_pending_marker_policy_evidence("project-a", run.run_id, &violation)
+        .is_err());
+    let evidence_state: (Option<String>, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT policy_code, failure_stage FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(evidence_state, (None, None));
+    assert!(runs
+        .finish_pending_marker_policy_failure("project-a", run.run_id, 141, &violation)
+        .is_err());
+    let state: (AgentRunStatus, String, EventStatus, InterventionStatus) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, agent_runs.launch_gate_state, events.status,
+                    interventions.status
+             FROM agent_runs
+             JOIN agent_run_events ON agent_run_events.project_id = agent_runs.project_id
+                AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events ON events.project_id = agent_run_events.project_id
+                AND events.event_id = agent_run_events.event_id
+             JOIN interventions ON interventions.agent_run_id = agent_runs.run_id
+             WHERE agent_runs.run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            "release_requested".to_owned(),
+            EventStatus::InFlight,
+            InterventionStatus::Reserved,
+        ),
+    );
+}
+
+#[test]
+fn startup_recovery_preserves_durable_pending_marker_policy_evidence() {
+    let test = TestDatabase::new();
+    let root = test.project_root("pending-marker-recovery");
+    register_project(&test.db, "project-a", &root, "pa-pending-marker-recovery");
+    let events = EventRepository::new(&test.db);
+    let event_id = insert_event(&test.db, "project-a", "pending-marker-recovery", 100);
+    events.claim_batch(100, 160, 10).unwrap();
+    let runs = AgentRunRepository::new(&test.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                100,
+                root.join(".pueue-agent/logs/agent.log"),
+            ),
+            &[event_id],
+            None,
+        )
+        .unwrap();
+    let violation = pueue_agent::execution_policy::PolicyViolation::new(
+        pueue_agent::execution_policy::PolicyViolationCode::NativeGateFailed,
+        pueue_agent::execution_policy::PolicyViolationStage::PostMarker,
+    );
+    runs.record_pending_marker_policy_evidence("project-a", run.run_id, &violation)
+        .unwrap();
+    runs.record_pending_marker_policy_evidence("project-a", run.run_id, &violation)
+        .unwrap();
+    let different_violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PostMarker,
+    );
+    assert!(runs
+        .record_pending_marker_policy_evidence(
+            "project-a",
+            run.run_id,
+            &different_violation,
+        )
+        .is_err());
+    let durable_state: (AgentRunStatus, String, EventStatus, Option<String>, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, agent_runs.launch_gate_state, events.status,
+                    agent_runs.policy_code, agent_runs.failure_stage
+             FROM agent_runs
+             JOIN agent_run_events ON agent_run_events.project_id = agent_runs.project_id
+                AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events ON events.project_id = agent_run_events.project_id
+                AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1",
+            [run.run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        durable_state,
+        (
+            AgentRunStatus::Starting,
+            "pending".to_owned(),
+            EventStatus::InFlight,
+            Some("native_gate_failed".to_owned()),
+            Some("post_marker".to_owned()),
+        ),
+    );
+
+    let recovery = runs
+        .recover_interrupted(
+            200,
+            "daemon restart",
+            &std::collections::BTreeMap::from([(
+                "project-a".to_owned(),
+                RetryPolicy { max_retries: 4 },
+            )]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+    assert_eq!(recovery.dead_lettered_events, 1);
+    assert_eq!(recovery.requeued_events, 0);
+    let event = events.find_by_id(event_id).unwrap().unwrap();
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    let run_state: (AgentRunStatus, Option<String>, Option<String>) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, policy_code, failure_stage FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        run_state,
+        (
+            AgentRunStatus::Failed,
+            Some("native_gate_failed".to_owned()),
+            Some("post_marker".to_owned()),
+        )
+    );
+}
+
+#[test]
+fn startup_recovery_rejects_marker_evidence_for_the_wrong_gate_phase_atomically() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "startup-marker-phase-mismatch");
+    let runs = AgentRunRepository::new(&test.db);
+    let policies = BTreeMap::from([(
+        "project-a".to_owned(),
+        RetryPolicy { max_retries: 2 },
+    )]);
+
+    assert!(runs
+        .recover_interrupted(
+            140,
+            "daemon restarted",
+            &policies,
+            &BTreeSet::new(),
+            &BTreeSet::from([run_id]),
+        )
+        .is_err());
+    assert!(runs
+        .recover_interrupted(
+            140,
+            "daemon restarted",
+            &policies,
+            &BTreeSet::from([run_id]),
+            &BTreeSet::from([run_id]),
+        )
+        .is_err());
+    assert_eq!(
+        runs.find_active_by_project("project-a")
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Starting,
+    );
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::InFlight,
+    );
+
+    runs.mark_running_and_apply_interventions("project-a", run_id, 42_424, 130)
+        .unwrap();
+    assert!(runs
+        .recover_interrupted(
+            140,
+            "daemon restarted",
+            &policies,
+            &BTreeSet::from([run_id]),
+            &BTreeSet::new(),
+        )
+        .is_err());
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::InFlight,
+    );
+}
+
+#[test]
+fn startup_recovery_rejects_partial_pending_marker_policy_evidence_atomically() {
+    let test = TestDatabase::new();
+    let (run_id, event_id) = bind_starting_run(&test, "startup-partial-marker-evidence");
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET policy_code = 'native_gate_failed' WHERE run_id = ?1",
+            [run_id],
+        )
+        .unwrap();
+
+    assert!(AgentRunRepository::new(&test.db)
+        .recover_interrupted(
+            140,
+            "daemon restarted",
+            &BTreeMap::from([(
+                "project-a".to_owned(),
+                RetryPolicy { max_retries: 2 },
+            )]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .is_err());
+
+    let state: (AgentRunStatus, String, Option<String>, Option<String>, EventStatus) = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT agent_runs.status, agent_runs.launch_gate_state,
+                    agent_runs.policy_code, agent_runs.failure_stage, events.status
+             FROM agent_runs
+             JOIN agent_run_events ON agent_run_events.project_id = agent_runs.project_id
+                AND agent_run_events.run_id = agent_runs.run_id
+             JOIN events ON events.project_id = agent_run_events.project_id
+                AND events.event_id = agent_run_events.event_id
+             WHERE agent_runs.run_id = ?1 AND events.event_id = ?2",
+            params![run_id, event_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            "pending".to_owned(),
+            Some("native_gate_failed".to_owned()),
+            None,
+            EventStatus::InFlight,
+        ),
+    );
+}
+
+#[test]
 fn startup_recovery_requeues_applied_interventions_after_release_request_before_ack() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
@@ -3636,6 +4089,8 @@ fn startup_recovery_requeues_applied_interventions_after_release_request_before_
             "project-a".to_owned(),
             RetryPolicy { max_retries: 1 },
         )]),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
     )
         .unwrap();
 
@@ -3677,6 +4132,8 @@ fn startup_recovery_retries_pre_marker_inflight_events() {
                 "project-a".to_owned(),
                 RetryPolicy { max_retries: 2 },
             )]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -3721,6 +4178,8 @@ fn startup_recovery_dead_letters_marker_released_and_dispatched_events() {
                 "project-a".to_owned(),
                 RetryPolicy { max_retries: 99 },
             )]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -3760,6 +4219,8 @@ fn startup_recovery_leaves_unexpired_unbound_claim_until_lease_expiry() {
                 "project-a".to_owned(),
                 RetryPolicy { max_retries: 0 },
             )]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .unwrap();
     let during = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
@@ -3777,7 +4238,7 @@ fn startup_recovery_leaves_unexpired_unbound_claim_until_lease_expiry() {
 }
 
 #[test]
-fn startup_recovery_treats_non_file_marker_as_execution_unknown() {
+fn startup_recovery_never_infers_marker_evidence_from_an_ambient_path() {
     let test = TestDatabase::new();
     let root = test.project_root("project");
     register_project(&test.db, "project-a", &root, "pa-project");
@@ -3812,15 +4273,16 @@ fn startup_recovery_treats_non_file_marker_as_execution_unknown() {
             "project-a".to_owned(),
             RetryPolicy { max_retries: 99 },
         )]),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
     )
     .unwrap();
 
     let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
-    assert_eq!(event.status, EventStatus::DeadLetter);
-    assert_eq!(event.not_before, 100);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert!(event.not_before > 100);
     let reason = event.last_error.unwrap();
-    assert!(reason.contains("execution outcome unknown"));
-    assert!(!reason.contains("pre-marker"));
+    assert!(reason.contains("pre-marker"));
 }
 
 #[test]
@@ -3853,6 +4315,8 @@ fn startup_recovery_rejects_unexpected_linked_claimed_state_atomically() {
                 "project-a".to_owned(),
                 RetryPolicy { max_retries: 1 },
             )]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .is_err());
     let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
@@ -3910,6 +4374,8 @@ fn startup_recovery_promotes_marker_confirmed_release_request_and_retains_applie
             "project-a".to_owned(),
             RetryPolicy { max_retries: 1 },
         )]),
+        &BTreeSet::new(),
+        &BTreeSet::from([run.run_id]),
     )
         .unwrap();
 
@@ -4013,6 +4479,8 @@ fn startup_recovery_requeues_an_applied_intervention_before_gate_release() {
             "project-a".to_owned(),
             RetryPolicy { max_retries: 1 },
         )]),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
     )
         .unwrap();
 
@@ -4084,6 +4552,8 @@ fn confirmed_gate_release_does_not_requeue_applied_interventions_on_recovery() {
             "project-a".to_owned(),
             RetryPolicy { max_retries: 1 },
         )]),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
     )
         .unwrap();
 

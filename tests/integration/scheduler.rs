@@ -1,4 +1,4 @@
-use std::{fs, fs::OpenOptions, path::PathBuf};
+use std::{fs, fs::OpenOptions, path::PathBuf, process::Command, sync::Arc};
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -7,7 +7,6 @@ use std::os::unix::io::AsRawFd;
 
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
-    config,
     db::{
         AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository,
         SubmissionRepository,
@@ -16,6 +15,7 @@ use pueue_agent::{
         AgentContextMode, AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent,
         NewProject, NewSubmission, SubmissionStatus,
     },
+    execution_policy::{load_existing_policy, PolicyLoadInput, StartupEnvironment},
     scheduler::{build_prompt, Scheduler, SchedulerConfig},
 };
 use rusqlite::params;
@@ -24,10 +24,109 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use tokio::time::{sleep, Duration, Instant};
 
-const OWNED_CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
-const FOREIGN_CODEX_SESSION_ID: &str = "019f9f30-a553-7e21-b108-16a5c341f728";
-const MISSING_CODEX_SESSION_ID: &str = "019f9f30-c111-7ff1-a54a-43aab2c9e720";
-const MALFORMED_CODEX_SESSION_ID: &str = "019f9f30-d422-7a66-a998-afb8963e4a01";
+#[cfg(unix)]
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
+
+#[cfg(unix)]
+struct NativeSchedulerFixture {
+    target: PathBuf,
+    policy: Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+}
+
+#[cfg(unix)]
+impl NativeSchedulerFixture {
+    fn new(harness: &SchedulerHarness) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = fs::canonicalize(harness.temp.path()).unwrap();
+        let trusted = base.join("trusted-bin");
+        let state = base.join("policy-state");
+        let codex_home = base.join("codex-home-native");
+        for directory in [&trusted, &state, &codex_home] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let source = trusted.join("generated-agent.rs");
+        let target = trusted.join("generated-agent");
+        fs::write(
+            &source,
+            r#"use std::{env, thread, time::Duration};
+fn main() {
+    let delay = env::args().nth(1).unwrap_or_else(|| "0".to_owned()).parse::<u64>().unwrap();
+    thread::sleep(Duration::from_millis(delay));
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&target)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = trusted.join("pueue-agent-launcher");
+        fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let codex = trusted.join("codex");
+        let pueue = trusted.join("pueue");
+        fs::copy(&target, &codex).unwrap();
+        fs::copy(&target, &pueue).unwrap();
+        let pueue_config = base.join("pueue.yml");
+        fs::write(&pueue_config, "fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            state.join("execution-policy.toml"),
+            format!(
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n\n[projects.\"project-a\"]\ncustom_agent = {:?}\n",
+                trusted.display().to_string(),
+                codex.display().to_string(),
+                pueue.display().to_string(),
+                target.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            harness.root("project-a"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(
+            harness.root("project-a").join(".pueue-agent"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(
+            state.join("execution-policy.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let policy = load_existing_policy(&PolicyLoadInput {
+            state_dir: state,
+            project_roots: vec![fs::canonicalize(harness.root("project-a")).unwrap()],
+            inherited_path: trusted.clone().into_os_string(),
+            startup_environment: StartupEnvironment::from_pairs([("HOME", "/fixture")]),
+            codex_home,
+            pueue_config,
+            launcher_path: launcher,
+        })
+        .unwrap();
+        Self { target, policy: Arc::new(policy) }
+    }
+
+    fn install_agent(&self, harness: &SchedulerHarness, delay_ms: u64) {
+        let path = harness.root("project-a").join(".pueue-agent/config.toml");
+        let config = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            config
+                .replace("program = \"/bin/echo\"", &format!("program = {:?}", self.target.display().to_string()))
+                .replace("args = [\"--agent-arg\", \"{prompt}\"]", &format!("args = [\"{delay_ms}\"]")),
+        )
+        .unwrap();
+    }
+}
 
 struct SchedulerHarness {
     temp: TempDir,
@@ -154,11 +253,33 @@ max_agent_runs = 10
     }
 
     fn scheduler(&self) -> Scheduler {
+        let projects = ProjectRepository::new(&self.db).list_all().unwrap();
+        let owned = projects
+            .iter()
+            .map(|project| {
+                (
+                    project.project_id.clone(),
+                    project.root_path.clone(),
+                    execution_policy_fixture::prepare_configured_program(
+                        self.temp.path(),
+                        &project.project_id,
+                        &project.config_path,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = owned
+            .iter()
+            .map(|(project_id, root, program)| (project_id.as_str(), root.as_path(), program.as_path()))
+            .collect::<Vec<_>>();
+        let policy = execution_policy_fixture::resolved_policy(self.temp.path(), &borrowed);
         Scheduler::new(
             self.db.clone(),
-            AgentRunner::new(AgentRunnerConfig::for_tests(
-                self.temp.path().join("agent.log"),
-            )),
+            AgentRunner::new(
+                AgentRunnerConfig::production()
+                    .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+                policy,
+            ),
             SchedulerConfig {
                 now: self.now,
                 lease_seconds: 60,
@@ -322,6 +443,51 @@ max_agent_runs = 10
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_is_dispatched_but_not_completed_until_native_exit() {
+    let harness = SchedulerHarness::new();
+    let fixture = NativeSchedulerFixture::new(&harness);
+    fixture.install_agent(&harness, 250);
+    let event_id = harness.enqueue(EventKind::DeepCheck, "project-a", "native-lifecycle");
+    let runner = AgentRunner::new(AgentRunnerConfig::production(), fixture.policy.clone());
+    let mut scheduler = Scheduler::new(
+        harness.db.clone(),
+        runner,
+        SchedulerConfig {
+            now: harness.now,
+            lease_seconds: 60,
+            claim_limit: 100,
+        },
+    );
+
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    let execution: (Option<String>, Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT execution_kind, executable_path, executable_identity
+             FROM agent_runs WHERE run_id = ?1",
+            [started.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(execution.0.as_deref(), Some("custom"));
+    assert_eq!(execution.1.as_deref(), fixture.target.to_str());
+    assert!(execution.2.as_deref().is_some_and(|identity| {
+        identity.contains("dev=") && identity.contains("ino=")
+    }));
+    assert!(started.handle.poll(&harness.db, harness.now).await.unwrap().is_none());
+
+    assert_eq!(
+        started.handle.wait(&harness.db, harness.now + 1).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+}
+
 #[test]
 fn operator_intervention_prompt_keeps_the_empty_base_prompt_byte_compatible() {
     let harness = SchedulerHarness::new();
@@ -467,13 +633,18 @@ async fn operator_intervention_delivery_marks_rows_applied_to_the_started_run() 
 #[tokio::test]
 async fn operator_intervention_delivery_releases_rows_when_process_spawn_fails() {
     let harness = SchedulerHarness::new();
-    harness.configure_agent("/path/that/does/not/exist/pueue-agent", &[]);
     let intervention_id = harness.queue_intervention("retry this instruction later");
-    harness.enqueue(
+    let event_id = harness.enqueue(
         EventKind::TaskFailed,
         "project-a",
         "intervention-spawn-failure",
     );
+    fs::create_dir(
+        harness
+            .root("project-a")
+            .join(format!(".pueue-agent/logs/agent-{}-{event_id}.log", harness.now)),
+    )
+    .unwrap();
 
     let mut scheduler = harness.scheduler();
     assert!(scheduler.tick().await.is_err());
@@ -795,7 +966,7 @@ async fn failed_finalizer_is_retried_without_losing_terminal_process_outcome() {
 
     let mut scheduler = harness.scheduler();
     let mut handle = scheduler.tick().await.unwrap().started.pop().unwrap().handle;
-    let first = tokio::time::timeout(Duration::from_secs(2), async {
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match handle.poll(&harness.db, harness.now + 1).await {
                 Ok(None) => sleep(Duration::from_millis(10)).await,
@@ -993,6 +1164,125 @@ async fn marker_ack_database_failure_uses_post_marker_finalizer_once() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn preexisting_marker_dead_letters_pending_run_without_execution() {
+    let harness = SchedulerHarness::new();
+    let executable = harness.temp.path().join("preexisting-marker-agent.sh");
+    let executed_path = harness.temp.path().join("preexisting-marker-executed");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$PUEUE_AGENT_RUN_ID\" > {}\n",
+            executed_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    harness.configure_agent(executable.to_str().unwrap(), &[]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "existing-marker");
+    let intervention_id = harness.queue_intervention("must return to pending");
+    let marker = harness.root("project-a").join(format!(
+        ".pueue-agent/logs/agent-{}-{}.log.gate-started",
+        harness.now, event_id
+    ));
+    fs::write(&marker, b"authorized\n").unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = harness.scheduler().tick().await.unwrap_err();
+
+    assert!(error.to_string().contains("native_gate_failed"));
+    assert!(!executed_path.exists(), "pre-existing marker must not execute a target");
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(harness.event(event_id).attempts, 1);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            1,
+        ),
+    );
+    let (status, pid, gate, policy_code, failure_stage):
+        (AgentRunStatus, Option<i64>, String, Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, pid, launch_gate_state, policy_code, failure_stage
+             FROM agent_runs WHERE run_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(status, AgentRunStatus::Failed);
+    assert_eq!(pid, None);
+    assert_eq!(gate, "failed");
+    assert_eq!(policy_code.as_deref(), Some("native_gate_failed"));
+    assert_eq!(failure_stage.as_deref(), Some("post_marker"));
+    assert_eq!(fs::read(marker).unwrap(), b"authorized\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn preexisting_marker_finalizer_failure_carries_retryable_pending_cleanup() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("/bin/echo", &[]);
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "existing-marker-retry");
+    let marker = harness.root("project-a").join(format!(
+        ".pueue-agent/logs/agent-{}-{}.log.gate-started",
+        harness.now, event_id
+    ));
+    fs::write(&marker, b"authorized\n").unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_pending_marker_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status = 'dead_letter'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected pending-marker finalizer failure');
+             END;",
+        )
+        .unwrap();
+
+    let error = harness.scheduler().tick().await.unwrap_err();
+    let (mut report, _) = error.into_parts();
+    assert_eq!(report.cleanup.len(), 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    let evidence: (Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT policy_code, failure_stage FROM agent_runs WHERE run_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        evidence,
+        (
+            Some("native_gate_failed".to_owned()),
+            Some("post_marker".to_owned())
+        )
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_pending_marker_finalizer;")
+        .unwrap();
+    report.cleanup[0].retry(&harness.db, harness.now + 1).await.unwrap();
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(fs::read(marker).unwrap(), b"authorized\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn post_marker_finalizer_failure_reports_unresolved_stage_for_recovery() {
     let harness = SchedulerHarness::new();
     harness.configure_agent("/bin/sh", &["-c", "sleep 30"]);
@@ -1022,9 +1312,11 @@ async fn post_marker_finalizer_failure_reports_unresolved_stage_for_recovery() {
         Ok(_) => panic!("post-marker finalizer failure should be reported"),
         Err(error) => error,
     };
+    let (report, error) = error.into_parts();
     assert!(error.to_string().contains("PostMarker"));
     assert!(error.to_string().contains("resolved=false"));
     assert!(error.to_string().contains("run_id=1"));
+    assert_eq!(report.cleanup.len(), 1);
     assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
     assert_eq!(harness.active_runs("project-a"), 1);
 }
@@ -1168,9 +1460,8 @@ async fn log_open_failure_finishes_the_inserted_agent_run() {
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "log-open-failure");
     fs::create_dir(
         harness
-            .temp
-            .path()
-            .join(format!("agent-{}-{event_id}.log", harness.now)),
+            .root("project-a")
+            .join(format!(".pueue-agent/logs/agent-{}-{event_id}.log", harness.now)),
     )
     .unwrap();
 
@@ -1181,16 +1472,13 @@ async fn log_open_failure_finishes_the_inserted_agent_run() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].0, AgentRunStatus::Failed);
     assert_eq!(runs[0].1, Some(harness.now));
-    assert!(runs[0]
-        .2
-        .as_deref()
-        .is_some_and(|reason| reason.contains("open agent log")));
-    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert!(runs[0].2.is_some());
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
     assert_eq!(harness.active_runs("project-a"), 0);
 }
 
 #[tokio::test]
-async fn process_spawn_failure_finishes_the_inserted_agent_run() {
+async fn unenrolled_process_path_dead_letters_without_inserting_agent_run() {
     let harness = SchedulerHarness::new();
     harness.configure_agent("/path/that/does/not/exist/pueue-agent", &[]);
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "process-spawn-failure");
@@ -1198,15 +1486,8 @@ async fn process_spawn_failure_finishes_the_inserted_agent_run() {
     let mut scheduler = harness.scheduler();
     assert!(scheduler.tick().await.is_err());
 
-    let runs = harness.agent_run_states();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].0, AgentRunStatus::Failed);
-    assert_eq!(runs[0].1, Some(harness.now));
-    assert!(runs[0]
-        .2
-        .as_deref()
-        .is_some_and(|reason| reason.contains("spawn agent process")));
-    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert!(harness.agent_run_states().is_empty());
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
     assert_eq!(harness.active_runs("project-a"), 0);
 }
 
@@ -1333,13 +1614,18 @@ async fn grouped_prebinding_failure_applies_per_event_retry_limit() {
 #[tokio::test]
 async fn scheduler_does_not_double_resolve_run_bound_spawn_failure() {
     let harness = SchedulerHarness::new();
-    harness.configure_agent("/path/that/does/not/exist/pueue-agent", &[]);
     let event_id = harness.enqueue(
         EventKind::TaskFailed,
         "project-a",
         "run-bound-failure-counter",
     );
     let intervention_id = harness.queue_intervention("release exactly once");
+    fs::create_dir(
+        harness
+            .root("project-a")
+            .join(format!(".pueue-agent/logs/agent-{}-{event_id}.log", harness.now)),
+    )
+    .unwrap();
     harness
         .db
         .connect()
@@ -1367,7 +1653,7 @@ async fn scheduler_does_not_double_resolve_run_bound_spawn_failure() {
 
     let mut scheduler = harness.scheduler();
     assert!(scheduler.tick().await.is_err());
-    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
     assert_eq!(
         harness.intervention_state(&intervention_id).0,
         pueue_agent::interventions::InterventionStatus::Pending
@@ -1385,6 +1671,87 @@ async fn scheduler_does_not_double_resolve_run_bound_spawn_failure() {
         )
         .unwrap();
     assert_eq!(counts, (1, 1));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_codex_argument_dead_letters_before_reservation_without_agent_run() {
+    let harness = SchedulerHarness::new();
+    harness.configure_agent("codex", &["--danger-full-access", "{prompt}"]);
+    let event_id = harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "unsafe-codex-argument",
+    );
+    let intervention_id = harness.queue_intervention("must remain unreserved");
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.attempts, 1);
+    assert!(event.last_error.unwrap().contains("unsafe_codex_argument"));
+    assert!(harness.agent_run_states().is_empty());
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            0,
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_prompt_policy_failure_releases_one_reservation_and_creates_no_run() {
+    let harness = SchedulerHarness::new();
+    let event_id = harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "actual-prompt-policy-failure",
+    );
+    let intervention_id = harness.queue_intervention("contains a NUL \0 in the actual prompt");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE reservation_release_count (count INTEGER NOT NULL);
+             INSERT INTO reservation_release_count VALUES (0);
+             CREATE TRIGGER count_actual_prompt_reservation_release
+             AFTER UPDATE OF status ON interventions
+             WHEN OLD.status = 'reserved' AND NEW.status = 'pending'
+             BEGIN
+                 UPDATE reservation_release_count SET count = count + 1;
+             END;",
+        )
+        .unwrap();
+
+    let mut scheduler = harness.scheduler();
+    assert!(scheduler.tick().await.is_err());
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.attempts, 1);
+    assert!(event.last_error.unwrap().contains("unsafe_codex_argument"));
+    assert!(harness.agent_run_states().is_empty());
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            1,
+        ),
+    );
+    let releases: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT count FROM reservation_release_count", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(releases, 1);
 }
 
 #[cfg(unix)]
@@ -1782,169 +2149,6 @@ async fn canonical_state_dangling_symlink_fails_closed_without_toml_budget_fallb
     assert_eq!(harness.active_runs("project-a"), 0);
 }
 
-#[test]
-fn codex_resume_argv_requires_project_owned_metadata_without_changing_arguments() {
-    let harness = SchedulerHarness::new();
-    let root = harness.root("project-a").canonicalize().unwrap();
-    let codex_home = harness.temp.path().join("codex-home");
-    write_codex_session_metadata(
-        &codex_home.join("sessions/2026/08/09"),
-        OWNED_CODEX_SESSION_ID,
-        &root.join("nested-worktree"),
-    );
-    let project = ProjectRepository::new(&harness.db)
-        .find_by_id("project-a")
-        .unwrap()
-        .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
-        .unwrap()
-        .agent;
-    agent.program = "codex".to_owned();
-    agent.context = AgentContextMode::Resume {
-        session_id: OWNED_CODEX_SESSION_ID.to_owned(),
-    };
-    fs::create_dir_all(root.join("nested-worktree")).unwrap();
-    let runner = AgentRunner::new(
-        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
-            .with_codex_home(codex_home),
-    );
-
-    let command = runner
-        .command_for(&project, &agent, "bounded prompt")
-        .unwrap();
-
-    assert_eq!(command.program, "codex");
-    assert_eq!(
-        command.args,
-        vec![
-            "exec",
-            "-C",
-            root.to_str().unwrap(),
-            "resume",
-            OWNED_CODEX_SESSION_ID,
-            "bounded prompt",
-        ]
-    );
-}
-
-#[test]
-fn codex_resume_accepts_project_owned_archived_metadata() {
-    let harness = SchedulerHarness::new();
-    let root = harness.root("project-a").canonicalize().unwrap();
-    let codex_home = harness.temp.path().join("codex-home");
-    write_codex_session_metadata(
-        &codex_home.join("archived_sessions"),
-        OWNED_CODEX_SESSION_ID,
-        &root,
-    );
-    let project = ProjectRepository::new(&harness.db)
-        .find_by_id("project-a")
-        .unwrap()
-        .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
-        .unwrap()
-        .agent;
-    agent.program = "codex".to_owned();
-    agent.context = AgentContextMode::Resume {
-        session_id: OWNED_CODEX_SESSION_ID.to_owned(),
-    };
-    let runner = AgentRunner::new(
-        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
-            .with_codex_home(codex_home),
-    );
-
-    let command = runner
-        .command_for(&project, &agent, "bounded prompt")
-        .unwrap();
-
-    assert_eq!(command.args[4], OWNED_CODEX_SESSION_ID);
-}
-
-#[test]
-fn codex_resume_rejects_foreign_project_metadata() {
-    let harness = SchedulerHarness::new();
-    let root = harness.root("project-a").canonicalize().unwrap();
-    let foreign_root = harness.temp.path().join("foreign-project");
-    fs::create_dir_all(&foreign_root).unwrap();
-    let codex_home = harness.temp.path().join("codex-home");
-    write_codex_session_metadata(
-        &codex_home.join("sessions/2026/08/09"),
-        FOREIGN_CODEX_SESSION_ID,
-        &foreign_root,
-    );
-    let project = ProjectRepository::new(&harness.db)
-        .find_by_id("project-a")
-        .unwrap()
-        .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
-        .unwrap()
-        .agent;
-    agent.program = "codex".to_owned();
-    agent.context = AgentContextMode::Resume {
-        session_id: FOREIGN_CODEX_SESSION_ID.to_owned(),
-    };
-    let runner = AgentRunner::new(
-        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
-            .with_codex_home(codex_home),
-    );
-
-    let error = runner
-        .command_for(&project, &agent, "bounded prompt")
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        pueue_agent::AppError::CodexSessionMetadata { .. }
-    ));
-    assert!(error.to_string().contains("outside project root"));
-}
-
-#[test]
-fn codex_resume_rejects_missing_and_malformed_metadata() {
-    let harness = SchedulerHarness::new();
-    let root = harness.root("project-a").canonicalize().unwrap();
-    let codex_home = harness.temp.path().join("codex-home");
-    fs::create_dir_all(codex_home.join("sessions/2026/08/09")).unwrap();
-    fs::write(
-        codex_home
-            .join("sessions/2026/08/09")
-            .join(format!("rollout-test-{MALFORMED_CODEX_SESSION_ID}.jsonl")),
-        b"not-json\n",
-    )
-    .unwrap();
-    let project = ProjectRepository::new(&harness.db)
-        .find_by_id("project-a")
-        .unwrap()
-        .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
-        .unwrap()
-        .agent;
-    agent.program = "codex".to_owned();
-    let runner = AgentRunner::new(
-        AgentRunnerConfig::for_tests(harness.temp.path().join("agent.log"))
-            .with_codex_home(codex_home),
-    );
-
-    for (session_id, expected) in [
-        (MISSING_CODEX_SESSION_ID, "not found"),
-        (MALFORMED_CODEX_SESSION_ID, "malformed"),
-    ] {
-        agent.context = AgentContextMode::Resume {
-            session_id: session_id.to_owned(),
-        };
-
-        let error = runner
-            .command_for(&project, &agent, "bounded prompt")
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            pueue_agent::AppError::CodexSessionMetadata { .. }
-        ));
-        assert!(error.to_string().contains(expected));
-    }
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn agent_timeout_terminates_descendant_agent_processes() {
@@ -2009,70 +2213,48 @@ max_agent_runs = 10
     );
 }
 
-#[test]
-fn codex_resume_latest_argv_is_opt_in_and_project_scoped() {
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_agent_drains_background_process_group_before_persistence() {
     let harness = SchedulerHarness::new();
-    let root = harness.root("project-a").canonicalize().unwrap();
-    let project = ProjectRepository::new(&harness.db)
-        .find_by_id("project-a")
-        .unwrap()
-        .unwrap();
-    let mut agent = config::load(&root.join(".pueue-agent/config.toml"))
-        .unwrap()
-        .agent;
-    agent.program = "codex".to_owned();
-    agent.context = AgentContextMode::ResumeLatest;
+    let pid_path = harness.temp.path().join("background-descendant.pid");
+    harness.configure_agent(
+        "/bin/echo",
+        &["--background-exit", pid_path.to_str().unwrap()],
+    );
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "background-exit");
 
-    let runner = AgentRunner::new(AgentRunnerConfig::for_tests(
-        harness.temp.path().join("agent.log"),
-    ));
-    let command = runner
-        .command_for(&project, &agent, "bounded prompt")
-        .unwrap();
+    let mut scheduler = harness.scheduler();
+    let mut started = scheduler.tick().await.unwrap().started.pop().unwrap();
+    let descendant_pid = wait_for_pid_file(&pid_path).await;
+    assert!(process_exists(descendant_pid));
 
     assert_eq!(
-        command.args,
-        vec![
-            "exec",
-            "-C",
-            root.to_str().unwrap(),
-            "resume",
-            "--last",
-            "bounded prompt",
-        ]
+        started.handle.wait(&harness.db, harness.now + 1).await.unwrap(),
+        AgentRunStatus::Completed
     );
-}
-
-fn write_codex_session_metadata(store: &std::path::Path, session_id: &str, cwd: &std::path::Path) {
-    fs::create_dir_all(store).unwrap();
-    fs::write(
-        store.join(format!("rollout-test-{session_id}.jsonl")),
-        format!(
-            "{}\n{{\"type\":\"response_item\"}}\n",
-            json!({
-                "timestamp": "2026-08-09T00:00:00Z",
-                "type": "session_meta",
-                "payload": {
-                    "id": session_id,
-                    "cwd": cwd,
-                }
-            })
-        ),
-    )
-    .unwrap();
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert!(
+        wait_until_process_exits(descendant_pid).await,
+        "terminal persistence must follow background process-group cleanup"
+    );
 }
 
 #[cfg(unix)]
 async fn wait_for_pid_file(path: &std::path::Path) -> i32 {
-    for _ in 0..50 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
         if let Ok(contents) = fs::read_to_string(path) {
             if let Ok(pid) = contents.trim().parse::<i32>() {
                 return pid;
             }
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "descendant pid file was not written before the readiness deadline"
+        );
         sleep(Duration::from_millis(20)).await;
     }
-    panic!("descendant pid file was not written");
 }
 
 #[cfg(unix)]

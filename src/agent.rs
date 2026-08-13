@@ -1,25 +1,31 @@
 use std::{
-    fs::{self, OpenOptions},
-    io,
-    path::PathBuf,
-    process::Stdio,
+    collections::BTreeSet,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-    time::{timeout, Instant},
-};
+use tokio::time::Instant;
 
 use crate::{
     codex_command::{CodexArgvBuilder, CodexCapabilities},
-    codex_session,
-    config::AgentConfig,
-    db::AgentRunRepository,
-    execution_policy::{PolicyViolation, ResolvedProjectExecutionPolicy},
+    config::{AgentConfig, ProjectConfig},
+    db::{AgentRunRepository, GateFailurePolicy},
+    environment::{PrivateRunTemp, SanitizedEnvironment},
+    execution_policy::{
+        resolve_project_policy, AgentKind, PolicyViolation, PolicyViolationCode,
+        PolicyViolationStage, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
+    },
     interventions::InterventionReservation,
-    models::{launch_gate_marker_path, AgentContextMode, AgentRunStatus, NewAgentRun, Project},
+    models::{
+        launch_gate_marker_path, AgentContextMode, AgentRunStatus, ExecutionProjection,
+        NewAgentRun, Project,
+    },
+    native_launcher::{NativeAgentChild, NativeLaunchSpec, NativeLauncher},
+    output::bounded_redacted_text,
+    process::TerminalObservation,
+    project_logs::{inspect_gate_marker, ProjectRootLogReader},
     retry::{EventResolution, RetryPolicy},
     upgrade::AgentStartUpgradeGuard,
     AppError,
@@ -27,45 +33,17 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct AgentRunnerConfig {
-    pub log_dir_override: Option<PathBuf>,
-    pub codex_home_override: Option<PathBuf>,
-    codex_policy: Option<ResolvedProjectExecutionPolicy>,
     codex_capabilities: CodexCapabilities,
 }
 
 impl AgentRunnerConfig {
     pub fn production() -> Self {
         Self {
-            log_dir_override: None,
-            codex_home_override: None,
-            codex_policy: None,
             codex_capabilities: CodexCapabilities::none(),
         }
     }
 
-    pub fn for_tests(log_path: PathBuf) -> Self {
-        Self {
-            log_dir_override: log_path.parent().map(PathBuf::from),
-            codex_home_override: None,
-            codex_policy: None,
-            codex_capabilities: CodexCapabilities::none(),
-        }
-    }
-
-    pub fn with_codex_home(mut self, codex_home: PathBuf) -> Self {
-        self.codex_home_override = Some(codex_home);
-        self
-    }
-
-    /// Bind this runner to the immutable project policy resolved at startup.
-    /// Codex command construction remains unavailable until both the policy
-    /// and capability probe have succeeded.
-    pub fn with_codex_policy(
-        mut self,
-        policy: ResolvedProjectExecutionPolicy,
-        capabilities: CodexCapabilities,
-    ) -> Self {
-        self.codex_policy = Some(policy);
+    pub fn with_codex_capabilities(mut self, capabilities: CodexCapabilities) -> Self {
         self.codex_capabilities = capabilities;
         self
     }
@@ -92,13 +70,7 @@ pub struct AgentSpawnError {
     /// scheduler uses this field to select direct dead-letter semantics at
     /// the event boundary; ordinary AppError values retain retry behavior.
     pub policy: Option<PolicyViolation>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaunchMarkerState {
-    Confirmed,
-    Missing,
-    Indeterminate,
+    pub cleanup: Option<BoundCleanupHandle>,
 }
 
 impl std::fmt::Display for AgentSpawnError {
@@ -113,59 +85,202 @@ impl std::error::Error for AgentSpawnError {
     }
 }
 
-#[cfg(unix)]
-const LAUNCH_GATE_SCRIPT: &str = r#"
-log_path=$1
-marker_path=$2
-shift 2
-IFS= read -r release || exit 0
-[ "$release" = x ] || exit 0
-[ "$#" -gt 0 ] || exit 127
-case "$1" in
-    */*) [ -x "$1" ] || exit 127 ;;
-    *) command -v "$1" >/dev/null 2>&1 || exit 127 ;;
-esac
-
-"$@" >>"$log_path" 2>&1 &
-child_pid=$!
-marker_tmp="${marker_path}.$$"
-if ! (umask 077 && : >"$marker_tmp" && mv -f "$marker_tmp" "$marker_path"); then
-    rm -f "$marker_tmp"
-    kill "$child_pid" 2>/dev/null || true
-    wait "$child_pid" 2>/dev/null || true
-    exit 1
-fi
-printf 'released\n'
-wait "$child_pid"
-exit $?
-"#;
-
-#[cfg(unix)]
-fn configure_launch_gate(
-    process: &mut Command,
-    log_path: &std::path::Path,
-    marker_path: &std::path::Path,
-    command: &AgentCommand,
-) {
-    process
-        .arg("-c")
-        .arg(LAUNCH_GATE_SCRIPT)
-        .arg("pueue-agent-launch-gate")
-        .arg(log_path)
-        .arg(marker_path)
-        .arg(&command.program)
-        .args(&command.args);
-}
-
 pub struct AgentHandle {
     pub project_id: String,
     pub run_id: i64,
-    pub child: tokio::process::Child,
+    child: NativeAgentChild,
+    retained_authority: RetainedLaunchAuthority,
     pub pid: i64,
     pub timeout_deadline: Instant,
     pub log_path: PathBuf,
     pub retry_policy: RetryPolicy,
     terminal_outcome: Option<TerminalOutcome>,
+}
+
+enum RetainedLaunchAuthority {
+    Retained {
+        global_policy: Arc<ResolvedExecutionPolicy>,
+        project_policy: ResolvedProjectExecutionPolicy,
+        temp: PrivateRunTemp,
+        execution: ExecutionProjection,
+    },
+    Released,
+    #[cfg(test)]
+    Test,
+}
+
+enum BoundFinalizationIntent {
+    PreMarker {
+        reason: String,
+        resolution: GateFailurePolicy,
+    },
+    PostMarkerPolicy {
+        violation: PolicyViolation,
+    },
+    PostMarkerExecutionUnknown {
+        reason: String,
+    },
+    PendingMarkerPolicy {
+        violation: PolicyViolation,
+    },
+}
+
+impl BoundFinalizationIntent {
+    fn from_failure(source: &AppError, retry_policy: RetryPolicy) -> Self {
+        match policy_from_error(source) {
+            Some(violation)
+                if matches!(
+                    violation.stage,
+                    PolicyViolationStage::PostMarker
+                        | PolicyViolationStage::Dispatched
+                        | PolicyViolationStage::Finalized
+                ) => Self::PostMarkerPolicy { violation },
+            Some(violation) => Self::PreMarker {
+                reason: bounded_redacted_text(&source.to_string()),
+                resolution: GateFailurePolicy::Policy(violation),
+            },
+            None => Self::PreMarker {
+                reason: bounded_redacted_text(&source.to_string()),
+                resolution: GateFailurePolicy::Retry(retry_policy),
+            },
+        }
+    }
+
+    fn is_post_marker(&self) -> bool {
+        matches!(
+            self,
+            Self::PostMarkerPolicy { .. } | Self::PostMarkerExecutionUnknown { .. }
+                | Self::PendingMarkerPolicy { .. }
+        )
+    }
+
+    fn finalize(
+        &self,
+        db: &crate::db::Db,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+    ) -> Result<(), AppError> {
+        let repository = AgentRunRepository::new(db);
+        match self {
+            Self::PreMarker { reason, resolution } => {
+                repository.fail_before_gate_release_with_policy(
+                    project_id,
+                    run_id,
+                    finished_at,
+                    reason,
+                    *resolution,
+                )?;
+            }
+            Self::PostMarkerPolicy { violation } => {
+                repository.finish_after_marker_policy_failure(
+                    project_id,
+                    run_id,
+                    finished_at,
+                    violation,
+                )?;
+            }
+            Self::PostMarkerExecutionUnknown { reason } => {
+                repository.finish_after_marker_failure(
+                    project_id,
+                    run_id,
+                    finished_at,
+                    reason,
+                )?;
+            }
+            Self::PendingMarkerPolicy { violation } => {
+                repository.finish_pending_marker_policy_failure(
+                    project_id,
+                    run_id,
+                    finished_at,
+                    violation,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct BoundCleanupHandle {
+    project_id: String,
+    run_id: i64,
+    intent: BoundFinalizationIntent,
+    kind: BoundCleanupKind,
+}
+
+enum BoundCleanupKind {
+    LiveChild {
+        child: NativeAgentChild,
+        retained_authority: RetainedLaunchAuthority,
+        terminated: bool,
+    },
+    PendingMarker,
+}
+
+impl std::fmt::Debug for BoundCleanupHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundCleanupHandle")
+            .field("run_id", &self.run_id)
+            .finish()
+    }
+}
+
+impl BoundCleanupHandle {
+    pub fn run_id(&self) -> i64 {
+        self.run_id
+    }
+
+    pub async fn retry(
+        &mut self,
+        db: &crate::db::Db,
+        finished_at: i64,
+    ) -> Result<(), AppError> {
+        self.retry_inner(db, finished_at, None).await
+    }
+
+    pub(crate) async fn retry_before(
+        &mut self,
+        db: &crate::db::Db,
+        finished_at: i64,
+        deadline: Instant,
+    ) -> Result<(), AppError> {
+        self.retry_inner(db, finished_at, Some(deadline)).await
+    }
+
+    async fn retry_inner(
+        &mut self,
+        db: &crate::db::Db,
+        finished_at: i64,
+        deadline: Option<Instant>,
+    ) -> Result<(), AppError> {
+        if let BoundCleanupKind::LiveChild {
+            child,
+            terminated,
+            ..
+        } = &mut self.kind
+        {
+            if !*terminated {
+                child.terminate().await?;
+                *terminated = true;
+            }
+        }
+        let scoped_db = deadline_scoped_db(db, deadline)?;
+        self.intent.finalize(
+            scoped_db.as_ref().unwrap_or(db),
+            &self.project_id,
+            self.run_id,
+            finished_at,
+        )?;
+        if let BoundCleanupKind::LiveChild {
+            retained_authority,
+            ..
+        } = &mut self.kind
+        {
+            *retained_authority = RetainedLaunchAuthority::Released;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,103 +292,157 @@ struct TerminalOutcome {
 
 pub struct AgentRunner {
     config: AgentRunnerConfig,
+    policy: Arc<ResolvedExecutionPolicy>,
 }
 
 impl AgentRunner {
-    pub fn new(config: AgentRunnerConfig) -> Self {
-        Self { config }
+    pub fn new(config: AgentRunnerConfig, policy: Arc<ResolvedExecutionPolicy>) -> Self {
+        Self { config, policy }
+    }
+
+    pub fn resolve_project_policy(
+        &self,
+        project: &Project,
+        config: &ProjectConfig,
+    ) -> Result<ResolvedProjectExecutionPolicy, PolicyViolation> {
+        resolve_project_policy(&self.policy, project, config)
+    }
+
+    /// Resolve startup marker evidence through the immutable project-root
+    /// capability. Stored absolute log paths are used only to prove they are
+    /// the exact projection of a bounded production-relative name; they are
+    /// never reopened.
+    pub(crate) fn inspect_startup_gate_markers(
+        &self,
+        project: &Project,
+        config: &ProjectConfig,
+        candidates: &[(i64, String, PathBuf)],
+    ) -> Result<BTreeSet<i64>, AppError> {
+        let policy = self
+            .resolve_project_policy(project, config)
+            .map_err(AppError::from)?;
+        let verified_root = policy.root_anchor.verify_identity().map_err(AppError::from)?;
+        let reader = ProjectRootLogReader::from_verified(verified_root);
+        reader.revalidate_root_path_identity()?;
+        let mut confirmed = BTreeSet::new();
+        for (run_id, _gate_state, stored_log_path) in candidates {
+            let relative_log = recovery_relative_log_path(&policy, stored_log_path)?;
+            let relative_marker = launch_gate_marker_path(&relative_log);
+            if inspect_gate_marker(&reader, &relative_marker)?.is_some() {
+                confirmed.insert(*run_id);
+            }
+        }
+        reader.revalidate_root_path_identity()?;
+        Ok(confirmed)
+    }
+
+    pub fn preflight_project_launch(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        prompt: &str,
+    ) -> Result<(), PolicyViolation> {
+        match policy.agent_kind {
+            AgentKind::BuiltInCodex => {
+                CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
+                    .preflight(config, prompt)
+            }
+            AgentKind::Custom
+                if matches!(config.context, AgentContextMode::Fresh)
+                    && !prompt.contains('\0')
+                    && config.args.iter().all(|argument| !argument.contains('\0')) =>
+            {
+                Ok(())
+            }
+            AgentKind::Custom => Err(PolicyViolation::new(
+                crate::execution_policy::PolicyViolationCode::UnsafeCodexArgument,
+                PolicyViolationStage::PreBinding,
+            )),
+        }
     }
 
     pub fn command_for(
         &self,
-        project: &Project,
+        policy: &ResolvedProjectExecutionPolicy,
         config: &AgentConfig,
         prompt: &str,
+        private_tmp: &std::path::Path,
     ) -> Result<AgentCommand, AppError> {
-        if config.program == "codex" {
-            if let Some(policy) = self.config.codex_policy.as_ref() {
-                let private_tmp = policy
-                    .root_anchor
-                    .canonical_path
-                    .join(&policy.private_temp_relative_root)
-                    .join("run");
-                let argv = CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
-                    .build(config, prompt, &private_tmp)
-                    .map_err(AppError::from)?;
-                return Ok(AgentCommand {
-                    program: policy
-                        .agent_anchor
-                        .canonical_path
-                        .to_str()
-                        .ok_or(AppError::Configuration {
-                            field: "agent.program",
-                        })?
-                        .to_owned(),
-                    args: argv
-                        .into_iter()
-                        .map(|arg| {
-                            arg.to_str()
-                                .map(str::to_owned)
-                                .ok_or(AppError::Configuration { field: "agent.args" })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                });
+        let program = policy
+            .agent_anchor
+            .canonical_path
+            .to_str()
+            .ok_or(AppError::Configuration {
+                field: "agent.program",
+            })?
+            .to_owned();
+        let args = match policy.agent_kind {
+            AgentKind::BuiltInCodex => {
+                CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
+                    .build(config, prompt, private_tmp)
+                    .map_err(AppError::from)?
+                    .into_iter()
+                    .map(|argument| {
+                        argument
+                            .into_string()
+                            .map_err(|_| AppError::Configuration { field: "agent.args" })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
             }
-        }
-        match &config.context {
-            AgentContextMode::Fresh => Ok(AgentCommand {
-                program: config.program.clone(),
-                args: config
+            AgentKind::Custom => {
+                if !matches!(config.context, AgentContextMode::Fresh) {
+                    return Err(PolicyViolation::new(
+                        crate::execution_policy::PolicyViolationCode::UnsafeCodexArgument,
+                        PolicyViolationStage::PreBinding,
+                    )
+                    .into());
+                }
+                config
                     .args
                     .iter()
-                    .map(|arg| arg.replace("{prompt}", prompt))
-                    .collect(),
-            }),
-            AgentContextMode::Resume { session_id } => {
-                if config.program != "codex" || session_id.trim().is_empty() {
-                    return Err(AppError::Configuration {
-                        field: "agent.context",
-                    });
-                }
-                let codex_home = match &self.config.codex_home_override {
-                    Some(path) => path.clone(),
-                    None => codex_session::home_from_environment()?,
-                };
-                let session_id = codex_session::verify_project_ownership(
-                    &codex_home,
-                    &project.root_path,
-                    session_id,
-                )?;
-                Ok(AgentCommand {
-                    program: "codex".to_owned(),
-                    args: vec![
-                        "exec".to_owned(),
-                        "-C".to_owned(),
-                        path_string(&project.root_path, "project.root_path")?,
-                        "resume".to_owned(),
-                        session_id,
-                        prompt.to_owned(),
-                    ],
-                })
+                    .map(|argument| argument.replace("{prompt}", prompt))
+                    .collect()
             }
-            AgentContextMode::ResumeLatest => {
-                if config.program != "codex" {
-                    return Err(AppError::Configuration {
-                        field: "agent.context",
-                    });
-                }
-                Ok(AgentCommand {
-                    program: "codex".to_owned(),
-                    args: vec![
-                        "exec".to_owned(),
-                        "-C".to_owned(),
-                        path_string(&project.root_path, "project.root_path")?,
-                        "resume".to_owned(),
-                        "--last".to_owned(),
-                        prompt.to_owned(),
-                    ],
-                })
-            }
+        };
+        Ok(AgentCommand { program, args })
+    }
+
+    fn execution_projection(
+        policy: &ResolvedProjectExecutionPolicy,
+    ) -> Result<ExecutionProjection, AppError> {
+        let identity = policy.agent_anchor.identity;
+        let identity = format!(
+            "dev={};ino={};uid={};mode={:o}",
+            identity.device, identity.inode, identity.owner, identity.mode
+        );
+        ExecutionProjection::new(
+            match policy.agent_kind {
+                AgentKind::BuiltInCodex => "codex",
+                AgentKind::Custom => "custom",
+            },
+            policy.agent_anchor.canonical_path.to_str().ok_or(AppError::Configuration {
+                field: "agent.program",
+            })?,
+            identity,
+        )
+    }
+
+    fn environment_for(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+        run_id: i64,
+    ) -> Result<SanitizedEnvironment, PolicyViolation> {
+        match policy.agent_kind {
+            AgentKind::BuiltInCodex => SanitizedEnvironment::for_codex_agent(
+                &self.policy.startup_environment,
+                policy,
+                run_id,
+            ),
+            AgentKind::Custom => SanitizedEnvironment::for_custom_agent(
+                &self.policy.startup_environment,
+                policy,
+                run_id,
+            ),
         }
     }
 
@@ -282,6 +451,7 @@ impl AgentRunner {
         &self,
         db: &crate::db::Db,
         project: &Project,
+        project_policy: &ResolvedProjectExecutionPolicy,
         config: &AgentConfig,
         retry_policy: RetryPolicy,
         primary_event_id: i64,
@@ -291,13 +461,15 @@ impl AgentRunner {
         now: i64,
     ) -> Result<AgentHandle, AgentSpawnError> {
         let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
-        let command = self
-            .command_for(project, config, prompt)
-            .map_err(pre_binding_error)?;
-        let log_path = self
-            .log_path(project, primary_event_id, now)
-            .map_err(pre_binding_error)?;
-        let gate_marker_path = launch_gate_marker_path(&log_path);
+        self.preflight_project_launch(project_policy, config, prompt)
+            .map_err(|error| pre_binding_error(error.into()))?;
+        let relative_log_path = relative_log_path(primary_event_id, now);
+        let relative_marker_path = launch_gate_marker_path(&relative_log_path);
+        let log_path = project_policy
+            .root_anchor
+            .canonical_path
+            .join(&relative_log_path);
+        let execution = Self::execution_projection(project_policy).map_err(pre_binding_error)?;
         let repository = AgentRunRepository::new(db);
         let run = repository
             .insert_with_events_and_reservation(
@@ -311,250 +483,187 @@ impl AgentRunner {
                     config.context.clone(),
                     config.context.session_id().map(str::to_owned),
                     event_ids.iter().map(i64::to_string).collect(),
-                ),
+                )
+                .with_execution(execution.clone()),
                 event_ids,
                 reservation.map(|reservation| reservation.token.as_str()),
             )
             .map_err(pre_binding_error)?;
         drop(agent_start_guard);
-        let mut spawned_child = None;
-        #[cfg(unix)]
-        let mut release_stdin: Option<tokio::process::ChildStdin> = None;
-        #[cfg(unix)]
-        let mut gate_stdout: Option<tokio::process::ChildStdout> = None;
-        let startup = (|| -> Result<i64, AppError> {
-            ensure_launch_gate_platform_supported()?;
-            ensure_agent_program_available(&command.program)?;
-            match fs::remove_file(&gate_marker_path) {
-                Ok(()) => {}
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(AppError::Io {
-                        operation: "remove stale agent launch gate marker",
-                        source,
-                    });
-                }
-            }
-            let log_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .map_err(|source| AppError::Io {
-                    operation: "open agent log",
-                    source,
-                })?;
-            let stderr = log_file.try_clone().map_err(|source| AppError::Io {
-                operation: "clone agent log handle",
-                source,
+        let verified_root = project_policy
+            .root_anchor
+            .verify_identity()
+            .map_err(|error| {
+                resolve_bound_failure(
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    error.into(),
+                )
             })?;
-
-            let mut process = {
-                #[cfg(unix)]
-                {
-                    let mut process = Command::new("/bin/sh");
-                    configure_launch_gate(&mut process, &log_path, &gate_marker_path, &command);
-                    process.stdin(Stdio::piped());
-                    process.stdout(Stdio::piped());
-                    process
-                }
-                #[cfg(not(unix))]
-                {
-                    let mut process = Command::new(&command.program);
-                    process.args(&command.args);
-                    process.stdin(Stdio::null());
-                    process
-                }
-            };
-            process
-                .current_dir(&project.root_path)
-                .env("PUEUE_AGENT_RUN_ID", run.run_id.to_string())
-                .env("PUEUE_AGENT_PROJECT_ID", &project.project_id)
-                .stderr(Stdio::from(stderr))
-                .kill_on_drop(true);
-            #[cfg(unix)]
-            drop(log_file);
-            #[cfg(not(unix))]
-            process.stdout(Stdio::from(log_file));
-            process_tree::configure_agent_command(&mut process);
-
-            spawned_child = Some(process.spawn().map_err(|source| AppError::Io {
-                operation: "spawn agent process",
-                source,
-            })?);
-            let pid = spawned_child
-                .as_ref()
-                .and_then(tokio::process::Child::id)
-                .map(i64::from)
-                .ok_or(AppError::Runtime {
-                    operation: "read spawned agent PID",
-                })?;
-            #[cfg(unix)]
-            {
-                release_stdin = spawned_child.as_mut().and_then(|child| child.stdin.take());
-                gate_stdout = spawned_child.as_mut().and_then(|child| child.stdout.take());
-            }
-            repository.mark_running_and_apply_interventions(
+        let temp = PrivateRunTemp::create(&verified_root, run.run_id)
+            .map_err(|error| {
+                resolve_bound_failure(
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    error.into(),
+                )
+            })?;
+        let command = self
+            .command_for(project_policy, config, prompt, temp.path())
+            .map_err(|error| {
+                resolve_bound_failure(
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    error,
+                )
+            })?;
+        let environment = self
+            .environment_for(project_policy, run.run_id)
+            .map_err(|error| {
+                resolve_bound_failure(
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    error.into(),
+                )
+            })?;
+        let mut argv = Vec::with_capacity(command.args.len() + 1);
+        argv.push(OsString::from(&command.program));
+        argv.extend(command.args.into_iter().map(OsString::from));
+        let mut child = NativeLauncher::spawn(NativeLaunchSpec {
+            launcher: self.policy.launcher_anchor.clone(),
+            executable: project_policy.agent_anchor.clone(),
+            argv,
+            cwd: Some(project_policy.root_anchor.canonical_path.clone()),
+            environment,
+            project_root: verified_root,
+            relative_log_path,
+            relative_marker_path,
+        })
+        .map_err(|error| {
+            resolve_native_spawn_failure(
+                &repository,
+                project,
+                run.run_id,
+                now,
+                retry_policy,
+                error,
+            )
+        })?;
+        let pid = child.id();
+        if let Err(error) = repository.mark_running_and_apply_interventions(
+            &project.project_id,
+            run.run_id,
+            pid,
+            now,
+        ) {
+            return Err(resolve_live_child_failure(
+                db,
                 &project.project_id,
                 run.run_id,
-                pid,
                 now,
-            )?;
-            repository.mark_gate_release_requested(&project.project_id, run.run_id)?;
-            Ok(pid)
-        })();
-        let pid = match startup {
-            Ok(pid) => pid,
-            Err(error) => {
-                #[cfg(unix)]
-                drop(release_stdin.take());
-                if let Some(child) = spawned_child.as_mut() {
-                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
-                        .await;
-                }
-                let reason = error.to_string();
-                return Err(resolve_pre_marker_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    &reason,
-                    retry_policy,
-                    error,
-                ));
-            }
-        };
-        #[cfg(unix)]
-        {
-            let Some(mut release) = release_stdin.take() else {
-                let error = AppError::Runtime {
-                    operation: "open agent launch gate stdin",
-                };
-                if let Some(child) = spawned_child.as_mut() {
-                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
-                        .await;
-                }
-                let reason = error.to_string();
-                return Err(resolve_pre_marker_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    &reason,
-                    retry_policy,
-                    error,
-                ));
-            };
-            if let Err(source) = release.write_all(b"x\n").await {
-                drop(release);
-                if let Some(child) = spawned_child.as_mut() {
-                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
-                        .await;
-                }
-                let reason = format!("release agent launch gate: {source}");
-                return Err(resolve_pre_marker_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    &reason,
-                    retry_policy,
-                    AppError::Io {
-                        operation: "release agent launch gate",
-                        source,
-                    },
-                ));
-            }
-
-            let Some(gate_stdout) = gate_stdout.take() else {
-                let error = AppError::Runtime {
-                    operation: "open agent launch gate acknowledgement",
-                };
-                if let Some(child) = spawned_child.as_mut() {
-                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
-                        .await;
-                }
-                let reason = error.to_string();
-                return Err(resolve_pre_marker_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    &reason,
-                    retry_policy,
-                    error,
-                ));
-            };
-            let mut acknowledgement = String::new();
-            let read_result = timeout(
-                Duration::from_secs(5),
-                BufReader::new(gate_stdout).read_line(&mut acknowledgement),
+                child,
+                RetainedLaunchAuthority::Retained {
+                    global_policy: self.policy.clone(),
+                    project_policy: project_policy.clone(),
+                    temp,
+                    execution,
+                },
+                BoundFinalizationIntent::from_failure(&error, retry_policy),
+                error,
             )
-            .await;
-            let acknowledged = matches!(
-                &read_result,
-                Ok(Ok(count)) if *count > 0 && acknowledgement == "released\n"
-            );
-            if !acknowledged {
-                if let Some(child) = spawned_child.as_mut() {
-                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
-                        .await;
-                }
-                let reason = match read_result {
-                    Ok(Ok(0)) => "agent launch gate closed before acknowledgement".to_owned(),
-                    Ok(Ok(_)) => "agent launch gate returned an invalid acknowledgement".to_owned(),
-                    Ok(Err(source)) => format!("read agent launch gate acknowledgement: {source}"),
-                    Err(_) => "timed out waiting for agent launch gate acknowledgement".to_owned(),
-                };
-                return Err(resolve_launch_gate_ack_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    inspect_launch_marker(&gate_marker_path),
-                    &reason,
-                    retry_policy,
-                    AppError::Runtime {
-                        operation: "confirm agent launch gate release",
-                    },
-                ));
-            }
-            if let Err(error) = repository.acknowledge_dispatch(&project.project_id, run.run_id) {
-                if let Some(child) = spawned_child.as_mut() {
-                    process_tree::terminate_agent_process_tree(child, child.id().map(i64::from))
-                        .await;
-                }
-                return Err(resolve_post_marker_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    "post_marker_dispatch_ack",
-                    error,
-                ));
-            }
+            .await);
         }
-        let child = match spawned_child.take() {
-            Some(child) => child,
-            None => {
-                let error = AppError::Runtime {
-                    operation: "take spawned agent process",
-                };
-                let reason = error.to_string();
-                return Err(resolve_post_marker_failure(
-                    &repository,
-                    &project.project_id,
-                    run.run_id,
-                    now,
-                    &reason,
-                    error,
-                ));
-            }
+        if let Err(error) =
+            repository.mark_gate_release_requested(&project.project_id, run.run_id)
+        {
+            return Err(resolve_live_child_failure(
+                db,
+                &project.project_id,
+                run.run_id,
+                now,
+                child,
+                RetainedLaunchAuthority::Retained {
+                    global_policy: self.policy.clone(),
+                    project_policy: project_policy.clone(),
+                    temp,
+                    execution,
+                },
+                BoundFinalizationIntent::from_failure(&error, retry_policy),
+                error,
+            )
+            .await);
+        }
+        if let Err(error) = temp.revalidate_current() {
+            let error = AppError::from(error);
+            return Err(resolve_live_child_failure(
+                db,
+                &project.project_id,
+                run.run_id,
+                now,
+                child,
+                RetainedLaunchAuthority::Retained {
+                    global_policy: self.policy.clone(),
+                    project_policy: project_policy.clone(),
+                    temp,
+                    execution,
+                },
+                BoundFinalizationIntent::from_failure(&error, retry_policy),
+                error,
+            )
+            .await);
+        }
+        let retained_authority = RetainedLaunchAuthority::Retained {
+            global_policy: self.policy.clone(),
+            project_policy: project_policy.clone(),
+            temp,
+            execution,
         };
+        if let Err(error) = child.authorize_marker().await {
+            return Err(resolve_live_child_failure(
+                db,
+                &project.project_id,
+                run.run_id,
+                now,
+                child,
+                retained_authority,
+                BoundFinalizationIntent::from_failure(&error, retry_policy),
+                error,
+            )
+            .await);
+        }
+        if let Err(error) = repository.acknowledge_dispatch(&project.project_id, run.run_id) {
+            return Err(resolve_live_child_failure(
+                db,
+                &project.project_id,
+                run.run_id,
+                now,
+                child,
+                retained_authority,
+                BoundFinalizationIntent::PostMarkerExecutionUnknown {
+                    reason: "post_marker_dispatch_ack".to_owned(),
+                },
+                error,
+            )
+            .await);
+        }
 
         Ok(AgentHandle {
             project_id: project.project_id.clone(),
             run_id: run.run_id,
             child,
+            retained_authority,
             pid,
             timeout_deadline: Instant::now()
                 + Duration::from_secs(u64::from(config.timeout_minutes) * 60),
@@ -563,24 +672,70 @@ impl AgentRunner {
             terminal_outcome: None,
         })
     }
+}
 
-    fn log_path(
-        &self,
-        project: &Project,
-        primary_event_id: i64,
-        now: i64,
-    ) -> Result<PathBuf, AppError> {
-        let log_dir = self
-            .config
-            .log_dir_override
-            .clone()
-            .unwrap_or_else(|| project.root_path.join(".pueue-agent/logs"));
-        fs::create_dir_all(&log_dir).map_err(|source| AppError::Io {
-            operation: "create agent log directory",
-            source,
+fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
+    PathBuf::from(format!(
+        ".pueue-agent/logs/agent-{now}-{primary_event_id}.log"
+    ))
+}
+
+fn recovery_relative_log_path(
+    policy: &ResolvedProjectExecutionPolicy,
+    stored_log_path: &Path,
+) -> Result<PathBuf, AppError> {
+    let relative = stored_log_path
+        .strip_prefix(&policy.root_anchor.canonical_path)
+        .map_err(|_| {
+            AppError::from(PolicyViolation::new(
+                PolicyViolationCode::LogUnsafe,
+                PolicyViolationStage::Startup,
+            ))
         })?;
-        Ok(log_dir.join(format!("agent-{now}-{primary_event_id}.log")))
+    let mut components = relative.components();
+    let first = components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => Some(value),
+        _ => None,
+    });
+    let second = components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => Some(value),
+        _ => None,
+    });
+    let leaf = components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => value.to_str(),
+        _ => None,
+    });
+    let valid_leaf = leaf.is_some_and(|leaf| {
+        leaf.len() <= 64
+            && leaf
+                .strip_prefix("agent-")
+                .and_then(|value| value.strip_suffix(".log"))
+                .and_then(|value| value.rsplit_once('-'))
+                .is_some_and(|(started_at, event_id)| {
+                    !started_at.is_empty()
+                        && !event_id.is_empty()
+                        && started_at.bytes().all(|byte| byte.is_ascii_digit())
+                        && event_id.bytes().all(|byte| byte.is_ascii_digit())
+                })
+    });
+    if first != Some(std::ffi::OsStr::new(".pueue-agent"))
+        || second != Some(std::ffi::OsStr::new("logs"))
+        || !valid_leaf
+        || components.next().is_some()
+        || policy
+            .root_anchor
+            .canonical_path
+            .join(relative)
+            .as_os_str()
+            != stored_log_path.as_os_str()
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::LogUnsafe,
+            PolicyViolationStage::Startup,
+        )
+        .into());
     }
+    Ok(relative.to_owned())
 }
 
 fn pre_binding_error(source: AppError) -> AgentSpawnError {
@@ -592,6 +747,7 @@ fn pre_binding_error(source: AppError) -> AgentSpawnError {
         stage: AgentSpawnStage::PreBinding,
         source,
         policy,
+        cleanup: None,
     }
 }
 
@@ -602,52 +758,197 @@ fn policy_from_error(source: &AppError) -> Option<PolicyViolation> {
     }
 }
 
-fn inspect_launch_marker(path: &std::path::Path) -> LaunchMarkerState {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => LaunchMarkerState::Confirmed,
-        Ok(_) => LaunchMarkerState::Indeterminate,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => LaunchMarkerState::Missing,
-        Err(_) => LaunchMarkerState::Indeterminate,
-    }
-}
-
-fn resolve_launch_gate_ack_failure(
+fn resolve_bound_failure(
     repository: &AgentRunRepository<'_>,
-    project_id: &str,
+    project: &Project,
     run_id: i64,
     finished_at: i64,
-    marker_state: LaunchMarkerState,
-    reason: &str,
     policy: RetryPolicy,
     source: AppError,
 ) -> AgentSpawnError {
-    match marker_state {
-        LaunchMarkerState::Confirmed => resolve_post_marker_failure(
+    let post_marker = matches!(
+        policy_from_error(&source).map(|violation| violation.stage),
+        Some(
+            PolicyViolationStage::PostMarker
+                | PolicyViolationStage::Dispatched
+                | PolicyViolationStage::Finalized
+        )
+    );
+    if post_marker {
+        resolve_post_marker_failure(
             repository,
-            project_id,
+            &project.project_id,
             run_id,
             finished_at,
-            "post_marker_launch_gate_ack",
+            "post_marker_native_launch",
             source,
-        ),
-        LaunchMarkerState::Indeterminate => resolve_post_marker_failure(
+        )
+    } else {
+        let reason = source.to_string();
+        resolve_pre_marker_failure(
             repository,
-            project_id,
+            &project.project_id,
             run_id,
             finished_at,
-            "post_marker_launch_gate_ack_indeterminate",
-            source,
-        ),
-        LaunchMarkerState::Missing => resolve_pre_marker_failure(
-            repository,
-            project_id,
-            run_id,
-            finished_at,
-            reason,
+            &reason,
             policy,
             source,
-        ),
+        )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_live_child_failure(
+    db: &crate::db::Db,
+    project_id: &str,
+    run_id: i64,
+    finished_at: i64,
+    child: NativeAgentChild,
+    retained_authority: RetainedLaunchAuthority,
+    intent: BoundFinalizationIntent,
+    source: AppError,
+) -> AgentSpawnError {
+    let stage = if intent.is_post_marker() {
+        AgentSpawnStage::PostMarker {
+            run_id,
+            resolved: false,
+        }
+    } else {
+        AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: false,
+        }
+    };
+    let policy = policy_from_error(&source);
+    let terminated = child.termination_completed();
+    let mut cleanup = BoundCleanupHandle {
+        project_id: project_id.to_owned(),
+        run_id,
+        intent,
+        kind: BoundCleanupKind::LiveChild {
+            child,
+            retained_authority,
+            terminated,
+        },
+    };
+
+    let termination_uncertain = match &cleanup.kind {
+        BoundCleanupKind::LiveChild { child, .. } => child.termination_uncertain(),
+        BoundCleanupKind::PendingMarker => false,
+    };
+    if !termination_uncertain {
+        match cleanup.retry(db, finished_at).await {
+            Ok(()) => {
+                return AgentSpawnError {
+                    stage: match stage {
+                        AgentSpawnStage::RunBoundPreMarker { run_id, .. } => {
+                            AgentSpawnStage::RunBoundPreMarker {
+                                run_id,
+                                resolved: true,
+                            }
+                        }
+                        AgentSpawnStage::PostMarker { run_id, .. } => AgentSpawnStage::PostMarker {
+                            run_id,
+                            resolved: true,
+                        },
+                        AgentSpawnStage::PreBinding => unreachable!("bound cleanup stage"),
+                    },
+                    source,
+                    policy,
+                    cleanup: None,
+                };
+            }
+            Err(cleanup_error) => {
+                return AgentSpawnError {
+                    stage,
+                    source: cleanup_error,
+                    policy,
+                    cleanup: Some(cleanup),
+                };
+            }
+        }
+    }
+
+    AgentSpawnError {
+        stage,
+        source,
+        policy,
+        cleanup: Some(cleanup),
+    }
+}
+
+fn resolve_native_spawn_failure(
+    repository: &AgentRunRepository<'_>,
+    project: &Project,
+    run_id: i64,
+    finished_at: i64,
+    retry_policy: RetryPolicy,
+    source: AppError,
+) -> AgentSpawnError {
+    let violation = policy_from_error(&source);
+    if let Some(violation) = violation.filter(|violation| {
+        matches!(
+            violation.stage,
+            PolicyViolationStage::PostMarker
+                | PolicyViolationStage::Dispatched
+                | PolicyViolationStage::Finalized
+        )
+    }) {
+        let cleanup = || BoundCleanupHandle {
+            project_id: project.project_id.clone(),
+            run_id,
+            intent: BoundFinalizationIntent::PendingMarkerPolicy { violation },
+            kind: BoundCleanupKind::PendingMarker,
+        };
+        if let Err(evidence_error) = repository.record_pending_marker_policy_evidence(
+            &project.project_id,
+            run_id,
+            &violation,
+        ) {
+            return AgentSpawnError {
+                stage: AgentSpawnStage::PostMarker {
+                    run_id,
+                    resolved: false,
+                },
+                source: evidence_error,
+                policy: Some(violation),
+                cleanup: Some(cleanup()),
+            };
+        }
+        return match repository.finish_pending_marker_policy_failure(
+            &project.project_id,
+            run_id,
+            finished_at,
+            &violation,
+        ) {
+            Ok(_) => AgentSpawnError {
+                stage: AgentSpawnStage::PostMarker {
+                    run_id,
+                    resolved: true,
+                },
+                source,
+                policy: Some(violation),
+                cleanup: None,
+            },
+            Err(finalizer_error) => AgentSpawnError {
+                stage: AgentSpawnStage::PostMarker {
+                    run_id,
+                    resolved: false,
+                },
+                source: finalizer_error,
+                policy: Some(violation),
+                cleanup: Some(cleanup()),
+            },
+        };
+    }
+    resolve_bound_failure(
+        repository,
+        project,
+        run_id,
+        finished_at,
+        retry_policy,
+        source,
+    )
 }
 
 fn resolve_pre_marker_failure(
@@ -684,6 +985,7 @@ fn resolve_pre_marker_failure(
             },
             source,
             policy: violation,
+            cleanup: None,
         },
         Err(finalizer_error) => AgentSpawnError {
             stage: AgentSpawnStage::RunBoundPreMarker {
@@ -692,6 +994,7 @@ fn resolve_pre_marker_failure(
             },
             source: finalizer_error,
             policy: violation,
+            cleanup: None,
         },
     }
 }
@@ -722,6 +1025,7 @@ fn resolve_post_marker_failure(
             },
             source,
             policy: violation,
+            cleanup: None,
         },
         Err(finalizer_error) => AgentSpawnError {
             stage: AgentSpawnStage::PostMarker {
@@ -730,6 +1034,7 @@ fn resolve_post_marker_failure(
             },
             source: finalizer_error,
             policy: violation,
+            cleanup: None,
         },
     }
 }
@@ -754,7 +1059,7 @@ impl AgentHandle {
     }
 
     fn finalize_stored_outcome(
-        &self,
+        &mut self,
         db: &crate::db::Db,
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
@@ -763,7 +1068,35 @@ impl AgentHandle {
                 operation: "finalize missing agent process outcome",
             });
         };
-        self.finalize_terminal_outcome(db, now, outcome)
+        let status = self.finalize_terminal_outcome(db, now, outcome)?;
+        // Release retained launch authority only after terminal persistence.
+        // PrivateRunTemp's descriptor-safe deletion remains intentionally
+        // deferred by its owner; dropping the handle never mutates a replaced
+        // pathname generation.
+        let retained = std::mem::replace(
+            &mut self.retained_authority,
+            RetainedLaunchAuthority::Released,
+        );
+        if let RetainedLaunchAuthority::Retained {
+            global_policy,
+            project_policy,
+            temp,
+            execution,
+        } = retained
+        {
+            drop((global_policy, project_policy, temp, execution));
+        }
+        Ok(status)
+    }
+
+    fn finalize_stored_outcome_before(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+        deadline: Instant,
+    ) -> Result<AgentRunStatus, AppError> {
+        let scoped_db = deadline_scoped_db(db, Some(deadline))?;
+        self.finalize_stored_outcome(scoped_db.as_ref().expect("deadline-scoped database"), now)
     }
 
     fn store_outcome(
@@ -788,7 +1121,7 @@ impl AgentHandle {
         }
 
         if Instant::now() >= self.timeout_deadline {
-            process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
+            self.child.terminate().await?;
             return self
                 .store_outcome(
                     db,
@@ -802,10 +1135,10 @@ impl AgentHandle {
                 .map(Some);
         }
 
-        let exit = match self.child.try_wait() {
-            Ok(Some(exit)) => exit,
-            Ok(None) => return Ok(None),
-            Err(source) => {
+        let exit = match self.child.terminal_observed() {
+            Ok(TerminalObservation::Terminal) => self.child.reap_observed_terminal().await?,
+            Ok(TerminalObservation::Running) => return Ok(None),
+            Ok(TerminalObservation::OwnershipLost) => {
                 return self
                     .store_outcome(
                         db,
@@ -813,10 +1146,17 @@ impl AgentHandle {
                         TerminalOutcome {
                             status: AgentRunStatus::Failed,
                             exit_code: None,
-                            last_error: Some(format!("poll agent process: {source}")),
+                            last_error: Some("native child ownership was lost before reaping".to_owned()),
                         },
                     )
                     .map(Some);
+            }
+            Err(source) => {
+                // An unknown observation failure is not a terminal outcome.
+                // Retain the handle so a later poll can re-establish child
+                // ownership; persisting Failed here would drop an executing
+                // child without a safe process-group cleanup authority.
+                return Err(source);
             }
         };
 
@@ -857,8 +1197,8 @@ impl AgentHandle {
             .timeout_deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_else(|| Duration::from_secs(0));
-        match tokio::time::timeout(remaining, self.child.wait()).await {
-            Ok(Ok(exit)) => {
+        match tokio::time::timeout(remaining, self.child.wait_retaining_unknown()).await {
+            Ok(Ok(Some(exit))) => {
                 let code = exit.code().map(i64::from);
                 let status = if exit.success() {
                     AgentRunStatus::Completed
@@ -881,23 +1221,20 @@ impl AgentHandle {
                     },
                 )
             }
-            Ok(Err(source)) => {
-                let result = self.store_outcome(
+            Ok(Ok(None)) => {
+                self.store_outcome(
                     db,
                     now,
                     TerminalOutcome {
                         status: AgentRunStatus::Failed,
                         exit_code: None,
-                        last_error: Some(format!("wait for agent process: {source}")),
+                        last_error: Some("native child ownership was lost before reaping".to_owned()),
                     },
-                );
-                match result {
-                    Ok(status) => Ok(status),
-                    Err(error) => Err(error),
-                }
+                )
             }
+            Ok(Err(source)) => Err(source),
             Err(_) => {
-                process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
+                self.child.terminate().await?;
                 self.store_outcome(
                     db,
                     now,
@@ -920,7 +1257,7 @@ impl AgentHandle {
             return self.finalize_stored_outcome(db, now);
         }
 
-        process_tree::terminate_agent_process_tree(&mut self.child, Some(self.pid)).await;
+        self.child.terminate().await?;
         self.store_outcome(
             db,
             now,
@@ -931,396 +1268,357 @@ impl AgentHandle {
             },
         )
     }
-}
 
-#[cfg(unix)]
-mod process_tree {
-    use std::{io, os::raw::c_int, time::Duration};
+    pub(crate) async fn timeout_now_before(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+        deadline: Instant,
+    ) -> Result<AgentRunStatus, AppError> {
+        if self.terminal_outcome.is_some() {
+            return self.finalize_stored_outcome_before(db, now, deadline);
+        }
 
-    use tokio::process::{Child, Command};
-
-    const SIGTERM: c_int = 15;
-    const SIGKILL: c_int = 9;
-    const ESRCH: i32 = 3;
-
-    unsafe extern "C" {
-        fn setsid() -> c_int;
-        fn kill(pid: c_int, sig: c_int) -> c_int;
-    }
-
-    pub(super) fn configure_agent_command(command: &mut Command) {
-        unsafe {
-            command.pre_exec(|| {
-                let _ = setsid();
-                Ok(())
+        self.child.terminate().await?;
+        if self.terminal_outcome.is_none() {
+            self.terminal_outcome = Some(TerminalOutcome {
+                status: AgentRunStatus::TimedOut,
+                exit_code: None,
+                last_error: Some("agent timed out".to_owned()),
             });
         }
+        self.finalize_stored_outcome_before(db, now, deadline)
     }
+}
 
-    pub(super) async fn terminate_agent_process_tree(child: &mut Child, pid: Option<i64>) {
-        if let Some(Ok(pid)) = pid.map(c_int::try_from) {
-            let _ = signal_process_group(pid, SIGTERM);
-            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), child.wait()).await
-            {
-                return;
-            }
-
-            let _ = signal_process_group(pid, SIGKILL);
-            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), child.wait()).await
-            {
-                return;
-            }
-        }
-
-        let _ = child.kill().await;
-    }
-
-    fn signal_process_group(pid: c_int, signal: c_int) -> io::Result<()> {
-        let process_group = pid.checked_neg().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "agent pid cannot form process group",
-            )
+fn deadline_scoped_db(
+    db: &crate::db::Db,
+    deadline: Option<Instant>,
+) -> Result<Option<crate::db::Db>, AppError> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(AppError::Runtime {
+            operation: "agent finalization exceeded shutdown deadline",
         })?;
-        let result = unsafe { kill(process_group, signal) };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(ESRCH) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        } else {
-            Ok(())
-        }
+    if remaining.is_zero() {
+        return Err(AppError::Runtime {
+            operation: "agent finalization exceeded shutdown deadline",
+        });
     }
+    Ok(Some(db.with_busy_timeout(remaining)))
 }
 
-#[cfg(not(unix))]
-mod process_tree {
-    use tokio::process::{Child, Command};
-
-    pub(super) fn configure_agent_command(_command: &mut Command) {}
-
-    pub(super) async fn terminate_agent_process_tree(child: &mut Child, _pid: Option<i64>) {
-        let _ = child.kill().await;
-    }
-}
-
-fn path_string(path: &std::path::Path, field: &'static str) -> Result<String, AppError> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or(AppError::Configuration { field })
-}
-
-fn ensure_agent_program_available(program: &str) -> Result<(), AppError> {
-    let candidate = if program.contains(std::path::MAIN_SEPARATOR) {
-        PathBuf::from(program)
-    } else {
-        std::env::var_os("PATH")
-            .into_iter()
-            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-            .map(|directory| directory.join(program))
-            .find(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from(program))
-    };
-    if candidate.is_file() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            if candidate
-                .metadata()
-                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-        }
-        #[cfg(not(unix))]
-        return Ok(());
-    }
-    Err(AppError::Io {
-        operation: "spawn agent process",
-        source: io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("configured agent program not found: {program}"),
-        ),
-    })
-}
-
-#[cfg(unix)]
-fn ensure_launch_gate_platform_supported() -> Result<(), AppError> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_launch_gate_platform_supported() -> Result<(), AppError> {
-    Err(AppError::Runtime {
-        operation: "agent launch gate requires a Unix process launcher",
-    })
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::{fs, process::Stdio};
-
-    use crate::{
-        db::{AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository},
-        interventions::InterventionStatus,
-        models::{AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject},
-        retry::RetryPolicy,
-        AppError,
-    };
-    use serde_json::json;
-    use tempfile::TempDir;
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt},
-        process::Command,
-    };
-    use uuid::Uuid;
-
-    use super::{
-        configure_launch_gate, inspect_launch_marker, resolve_launch_gate_ack_failure,
-        AgentCommand, LaunchMarkerState,
-    };
+    use super::*;
 
     #[test]
-    fn launch_marker_inspection_is_conservative_after_ack_failure() {
-        let directory =
-            std::env::temp_dir().join(format!("pueue-agent-marker-{}/marker", Uuid::new_v4()));
-        let parent = directory.parent().unwrap();
-        fs::create_dir_all(parent).unwrap();
-        assert_eq!(inspect_launch_marker(&directory), LaunchMarkerState::Missing);
-        fs::write(&directory, "marker").unwrap();
-        assert_eq!(inspect_launch_marker(&directory), LaunchMarkerState::Confirmed);
-        fs::remove_file(&directory).unwrap();
-        fs::create_dir(&directory).unwrap();
-        assert_eq!(
-            inspect_launch_marker(&directory),
-            LaunchMarkerState::Indeterminate
-        );
-        fs::remove_dir(&directory).unwrap();
-        fs::remove_dir(parent).unwrap();
+    #[ignore = "internal agent-handle subprocess entry"]
+    fn timeout_retry_subprocess() {
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[test]
-    fn confirmed_ack_failure_dead_letters_event_and_keeps_applied_intervention() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("project-a");
-        fs::create_dir_all(&root).unwrap();
-        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
-        let marker_path = temp.path().join("confirmed-ack-failure.gate-started");
-        fs::write(&marker_path, "started").unwrap();
-        let marker_state = inspect_launch_marker(&marker_path);
-        assert_eq!(marker_state, LaunchMarkerState::Confirmed);
-        ProjectRepository::new(&db)
-            .register(&NewProject::new(
+    #[ignore = "internal agent-handle terminal subprocess entry"]
+    fn terminal_retry_subprocess() {}
+
+    #[tokio::test]
+    async fn timeout_termination_error_retains_db_state_and_same_handle_for_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
                 "project-a",
                 &root,
-                "pa-project",
-                root.join("config.toml"),
-                100,
+                "pa-project-a",
+                root.join(".pueue-agent/config.toml"),
+                1,
             ))
             .unwrap();
-        let event_id = EventRepository::new(&db)
-            .insert_idempotent(&NewEvent::new(
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
                 "project-a",
-                EventKind::TaskFailed,
-                "confirmed-ack-failure",
-                json!({"source": "test"}),
-                100,
-                100,
+                crate::models::EventKind::TaskFailed,
+                "timeout-observation-error",
+                serde_json::json!({}),
+                1,
+                1,
             ))
-            .unwrap()
-            .event_id;
-        EventRepository::new(&db)
-            .claim_batch(100, 200, 1)
             .unwrap();
-        let intervention = InterventionRepository::new(&db)
-            .insert_pending("project-a", "retain this audit", 100)
-            .unwrap();
-        let reservation = InterventionRepository::new(&db)
-            .reserve_pending("project-a", "confirmed-ack-token", 100, 200, 1, 128)
+        crate::db::EventRepository::new(&db)
+            .claim_batch(1, 100, 1)
             .unwrap();
         let run = AgentRunRepository::new(&db)
             .insert_with_events_and_reservation(
                 &NewAgentRun::new(
                     "project-a",
-                    event_id,
+                    event.event_id,
                     None,
                     AgentRunStatus::Starting,
-                    100,
-                    "/tmp/confirmed-ack-failure.log",
+                    1,
+                    root.join(".pueue-agent/logs/agent-handle.log"),
                 ),
-                &[event_id],
-                Some(&reservation.token),
+                &[event.event_id],
+                None,
             )
             .unwrap();
         AgentRunRepository::new(&db)
-            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 110)
+            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 1)
             .unwrap();
         AgentRunRepository::new(&db)
             .mark_gate_release_requested("project-a", run.run_id)
             .unwrap();
-        db.connect()
-            .unwrap()
-            .execute(
-                "UPDATE events SET status = 'in_flight' WHERE event_id = ?1",
-                [event_id],
-            )
+        AgentRunRepository::new(&db)
+            .acknowledge_dispatch("project-a", run.run_id)
             .unwrap();
+        let (_child_root, child) =
+            crate::native_launcher::test_native_child_with_termination_error(
+                "agent::tests::timeout_retry_subprocess",
+            );
+        let mut handle = AgentHandle {
+            project_id: "project-a".to_owned(),
+            run_id: run.run_id,
+            pid: child.id(),
+            child,
+            retained_authority: RetainedLaunchAuthority::Test,
+            timeout_deadline: Instant::now(),
+            log_path: root.join(".pueue-agent/logs/agent-handle.log"),
+            retry_policy: RetryPolicy { max_retries: 1 },
+            terminal_outcome: None,
+        };
 
-        let error = resolve_launch_gate_ack_failure(
-            &AgentRunRepository::new(&db),
-            "project-a",
-            run.run_id,
-            120,
-            marker_state,
-            "invalid acknowledgement",
-            RetryPolicy { max_retries: 2 },
-            AppError::Runtime {
-                operation: "confirm agent launch gate release",
-            },
-        );
-        assert!(matches!(
-            error.stage,
-            super::AgentSpawnStage::PostMarker {
-                run_id,
-                resolved: true
-            } if run_id == run.run_id
-        ));
-        let state: (AgentRunStatus, EventStatus, InterventionStatus, Option<String>) = db
-            .connect()
+        assert!(handle.timeout_now(&db, 2).await.is_err());
+        assert!(handle.terminal_outcome.is_none());
+        let state = AgentRunRepository::new(&db)
+            .find_active_by_project("project-a")
             .unwrap()
-            .query_row(
-                "SELECT agent_runs.status, events.status, interventions.status,
-                        events.last_error
-                 FROM agent_runs
-                 JOIN agent_run_events
-                   ON agent_run_events.run_id = agent_runs.run_id
-                  AND agent_run_events.project_id = agent_runs.project_id
-                 JOIN events
-                   ON events.event_id = agent_run_events.event_id
-                  AND events.project_id = agent_run_events.project_id
-                 JOIN interventions
-                   ON interventions.agent_run_id = agent_runs.run_id
-                  AND interventions.project_id = agent_runs.project_id
-                 WHERE agent_runs.run_id = ?1 AND interventions.intervention_id = ?2",
-                rusqlite::params![run.run_id, intervention.intervention_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
             .unwrap();
-        assert_eq!(state.0, AgentRunStatus::Failed);
-        assert_eq!(state.1, EventStatus::DeadLetter);
-        assert_eq!(state.2, InterventionStatus::Applied);
-        assert_eq!(state.3.as_deref(), Some("post_marker_launch_gate_ack"));
-    }
-
-    #[tokio::test]
-    async fn launch_gate_exits_on_eof_without_executing_configured_agent() {
-        let directory =
-            std::env::temp_dir().join(format!("pueue-agent-gate-{}/marker", Uuid::new_v4()));
-        let parent = directory.parent().unwrap();
-        fs::create_dir_all(parent).unwrap();
-        let log_path = parent.join("agent.log");
-        let gate_marker = parent.join("agent.log.gate-started");
-        let child_marker = parent.join("configured-agent-started");
-        let command = AgentCommand {
-            program: "/bin/sh".to_owned(),
-            args: vec![
-                "-c".to_owned(),
-                "printf executed > \"$1\"".to_owned(),
-                "configured-agent".to_owned(),
-                child_marker.display().to_string(),
-            ],
-        };
-        let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &log_path, &gate_marker, &command);
-        process.stdin(Stdio::piped());
-        let mut child = process.spawn().unwrap();
-        drop(child.stdin.take());
-
-        let status = child.wait().await.unwrap();
-
-        assert!(status.success());
-        assert!(!gate_marker.exists());
-        assert!(!child_marker.exists());
-        fs::remove_dir_all(parent).unwrap();
-    }
-
-    #[tokio::test]
-    async fn launch_gate_acknowledges_only_after_child_spawn_and_marker_commit() {
-        let marker =
-            std::env::temp_dir().join(format!("pueue-agent-gate-{}/marker", Uuid::new_v4()));
-        let parent = marker.parent().unwrap();
-        fs::create_dir_all(parent).unwrap();
-        let log_path = parent.join("agent.log");
-        let gate_marker = parent.join("agent.log.gate-started");
-        let command = AgentCommand {
-            program: "/bin/sh".to_owned(),
-            args: vec![
-                "-c".to_owned(),
-                "printf '%s' \"$1\" > \"$2\"".to_owned(),
-                "configured-agent".to_owned(),
-                "$(not-shell-expanded)".to_owned(),
-                marker.display().to_string(),
-            ],
-        };
-        let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &log_path, &gate_marker, &command);
-        process.stdin(Stdio::piped());
-        process.stdout(Stdio::piped());
-        let mut child = process.spawn().unwrap();
-        let mut release = child.stdin.take().unwrap();
-        let mut acknowledgement = tokio::io::BufReader::new(child.stdout.take().unwrap());
-        assert!(!marker.exists());
-        release.write_all(b"x\n").await.unwrap();
-        drop(release);
-        let mut line = String::new();
-        acknowledgement.read_line(&mut line).await.unwrap();
-        assert_eq!(line, "released\n");
-        assert!(gate_marker.exists());
-
-        let status = child.wait().await.unwrap();
-
-        assert!(status.success());
+        assert_eq!(state.status, AgentRunStatus::Running);
         assert_eq!(
-            fs::read_to_string(&marker).unwrap(),
-            "$(not-shell-expanded)"
+            crate::db::EventRepository::new(&db)
+                .find_by_id(event.event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::EventStatus::Dispatched,
         );
-        fs::remove_file(&marker).unwrap();
-        fs::remove_file(&gate_marker).unwrap();
-        fs::remove_file(&log_path).unwrap();
-        fs::remove_dir(parent).unwrap();
+
+        assert_eq!(
+            handle.timeout_now(&db, 3).await.unwrap(),
+            AgentRunStatus::TimedOut,
+        );
     }
 
     #[tokio::test]
-    async fn launch_gate_exits_without_ack_for_unavailable_configured_program() {
-        let marker =
-            std::env::temp_dir().join(format!("pueue-agent-gate-{}/marker", Uuid::new_v4()));
-        let parent = marker.parent().unwrap();
-        fs::create_dir_all(parent).unwrap();
-        let log_path = parent.join("agent.log");
-        let gate_marker = parent.join("agent.log.gate-started");
-        let command = AgentCommand {
-            program: parent.join("does-not-exist").display().to_string(),
-            args: Vec::new(),
+    async fn bound_cleanup_termination_error_retains_child_and_original_post_marker_intent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
+                "project-a",
+                &root,
+                "pa-project-a",
+                root.join(".pueue-agent/config.toml"),
+                1,
+            ))
+            .unwrap();
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
+                "project-a",
+                crate::models::EventKind::TaskFailed,
+                "bound-cleanup-termination-error",
+                serde_json::json!({}),
+                1,
+                1,
+            ))
+            .unwrap();
+        crate::db::EventRepository::new(&db)
+            .claim_batch(1, 100, 1)
+            .unwrap();
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events_and_reservation(
+                &NewAgentRun::new(
+                    "project-a",
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    1,
+                    root.join(".pueue-agent/logs/bound-cleanup.log"),
+                ),
+                &[event.event_id],
+                None,
+            )
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 1)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_gate_release_requested("project-a", run.run_id)
+            .unwrap();
+        let (_child_root, child) =
+            crate::native_launcher::test_native_child_with_termination_error(
+                "agent::tests::timeout_retry_subprocess",
+            );
+        let mut cleanup = BoundCleanupHandle {
+            project_id: "project-a".to_owned(),
+            run_id: run.run_id,
+            intent: BoundFinalizationIntent::PostMarkerExecutionUnknown {
+                reason: "original_post_marker_failure".to_owned(),
+            },
+            kind: BoundCleanupKind::LiveChild {
+                child,
+                retained_authority: RetainedLaunchAuthority::Test,
+                terminated: false,
+            },
         };
-        let mut process = Command::new("/bin/sh");
-        configure_launch_gate(&mut process, &log_path, &gate_marker, &command);
-        process.stdin(Stdio::piped());
-        process.stdout(Stdio::piped());
-        let mut child = process.spawn().unwrap();
-        let mut release = child.stdin.take().unwrap();
-        release.write_all(b"x\n").await.unwrap();
-        drop(release);
 
-        let output = child.wait_with_output().await.unwrap();
+        assert!(cleanup.retry(&db, 2).await.is_err());
+        assert!(matches!(
+            &cleanup.kind,
+            BoundCleanupKind::LiveChild {
+                terminated: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            AgentRunRepository::new(&db)
+                .find_active_by_project("project-a")
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Running,
+        );
+        assert_eq!(
+            crate::db::EventRepository::new(&db)
+                .find_by_id(event.event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::EventStatus::InFlight,
+        );
 
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        assert!(!gate_marker.exists());
-        fs::remove_dir_all(parent).unwrap();
+        cleanup.retry(&db, 3).await.unwrap();
+        assert!(matches!(
+            &cleanup.kind,
+            BoundCleanupKind::LiveChild {
+                terminated: true,
+                ..
+            }
+        ));
+        assert!(AgentRunRepository::new(&db)
+            .find_active_by_project("project-a")
+            .unwrap()
+            .is_none());
+        let event = crate::db::EventRepository::new(&db)
+            .find_by_id(event.event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, crate::models::EventStatus::DeadLetter);
+        assert_eq!(event.last_error.as_deref(), Some("original_post_marker_failure"));
+    }
+
+    #[tokio::test]
+    async fn terminal_group_cleanup_error_retains_db_state_and_same_handle_for_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
+                "project-a",
+                &root,
+                "pa-project-a",
+                root.join(".pueue-agent/config.toml"),
+                1,
+            ))
+            .unwrap();
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
+                "project-a",
+                crate::models::EventKind::TaskFailed,
+                "terminal-cleanup-error",
+                serde_json::json!({}),
+                1,
+                1,
+            ))
+            .unwrap();
+        crate::db::EventRepository::new(&db)
+            .claim_batch(1, 100, 1)
+            .unwrap();
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events_and_reservation(
+                &NewAgentRun::new(
+                    "project-a",
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    1,
+                    root.join(".pueue-agent/logs/agent-handle.log"),
+                ),
+                &[event.event_id],
+                None,
+            )
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_running_and_apply_interventions("project-a", run.run_id, 4242, 1)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .mark_gate_release_requested("project-a", run.run_id)
+            .unwrap();
+        AgentRunRepository::new(&db)
+            .acknowledge_dispatch("project-a", run.run_id)
+            .unwrap();
+        let (_child_root, child) =
+            crate::native_launcher::test_native_child_with_group_signal_error(
+                "agent::tests::terminal_retry_subprocess",
+            );
+        let mut handle = AgentHandle {
+            project_id: "project-a".to_owned(),
+            run_id: run.run_id,
+            pid: child.id(),
+            child,
+            retained_authority: RetainedLaunchAuthority::Test,
+            timeout_deadline: Instant::now() + Duration::from_secs(10),
+            log_path: root.join(".pueue-agent/logs/agent-handle.log"),
+            retry_policy: RetryPolicy { max_retries: 1 },
+            terminal_outcome: None,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match handle.poll(&db, 2).await {
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+                result => panic!("expected terminal cleanup error, got {result:?}"),
+            }
+        }
+        assert!(handle.terminal_outcome.is_none());
+        let state = AgentRunRepository::new(&db)
+            .find_active_by_project("project-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, AgentRunStatus::Running);
+        assert_eq!(
+            crate::db::EventRepository::new(&db)
+                .find_by_id(event.event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::EventStatus::Dispatched,
+        );
+
+        assert_eq!(
+            handle.poll(&db, 3).await.unwrap(),
+            Some(AgentRunStatus::Completed),
+        );
     }
 }

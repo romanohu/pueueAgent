@@ -14,6 +14,7 @@ use crate::{
         VerifiedProjectRoot,
     },
     project_logs::{ensure_agent_log_dir, LogFileIdentity, ProjectRootLogReader},
+    process::TerminalObservation,
     AppError,
 };
 
@@ -117,6 +118,10 @@ impl NativeLauncher {
             log_identity: identity,
             authorization_attempted: false,
             authorization_complete: false,
+            termination_completed: false,
+            termination_uncertain: false,
+            #[cfg(test)]
+            injected_termination_error: false,
         })
     }
 
@@ -145,10 +150,28 @@ pub struct NativeAgentChild {
     log_identity: LogFileIdentity,
     authorization_attempted: bool,
     authorization_complete: bool,
+    termination_completed: bool,
+    termination_uncertain: bool,
+    #[cfg(test)]
+    injected_termination_error: bool,
 }
 
 #[cfg(unix)]
 impl NativeAgentChild {
+    pub fn id(&self) -> i64 {
+        self.verified.id()
+    }
+
+    pub(crate) fn terminal_observed(&mut self) -> Result<TerminalObservation, AppError> {
+        self.verified.terminal_observed()
+    }
+
+    pub(crate) async fn reap_observed_terminal(
+        &mut self,
+    ) -> Result<std::process::ExitStatus, AppError> {
+        self.verified.reap_observed_terminal().await
+    }
+
     /// Publish the durable marker, release the blocked child, and wait for
     /// both the close-on-exec proof and exact release acknowledgement.
     ///
@@ -157,7 +180,7 @@ impl NativeAgentChild {
     /// classified by re-inspecting the marker before terminating the group.
     pub async fn authorize_marker(&mut self) -> Result<(), AppError> {
         if self.authorization_attempted {
-            crate::process::terminate_process_group(&mut self.verified).await;
+            self.terminate_after_authorization_error().await;
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
         self.authorization_attempted = true;
@@ -180,7 +203,7 @@ impl NativeAgentChild {
                 Ok(None) => pre_marker_revalidation_error(error),
                 Ok(Some(_)) | Err(_) => native_gate_error(PolicyViolationStage::PostMarker),
             };
-            crate::process::terminate_process_group(&mut self.verified).await;
+            self.terminate_after_authorization_error().await;
             return Err(classified);
         }
         let marker_identity = match self.gate_directory.publish_marker() {
@@ -190,7 +213,7 @@ impl NativeAgentChild {
                     error,
                     self.gate_directory.inspect_marker(),
                 );
-                crate::process::terminate_process_group(&mut self.verified).await;
+                self.terminate_after_authorization_error().await;
                 return Err(classified);
             }
         };
@@ -212,20 +235,20 @@ impl NativeAgentChild {
                 )
             });
         if post_publish.is_err() {
-            crate::process::terminate_process_group(&mut self.verified).await;
+            self.terminate_after_authorization_error().await;
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
 
         if let Err(error) = self.verified.release() {
-            crate::process::terminate_process_group(&mut self.verified).await;
+            self.terminate_after_authorization_error().await;
             return Err(native_gate_error_with_fallback(error, PolicyViolationStage::PostMarker));
         }
         if let Err(error) = self.verified.confirm_exec().await {
-            crate::process::terminate_process_group(&mut self.verified).await;
+            self.terminate_after_authorization_error().await;
             return Err(native_gate_error_with_fallback(error, PolicyViolationStage::PostMarker));
         }
         if let Err(error) = self.verified.wait_for_release_ack().await {
-            crate::process::terminate_process_group(&mut self.verified).await;
+            self.terminate_after_authorization_error().await;
             return Err(native_gate_error_with_fallback(error, PolicyViolationStage::PostMarker));
         }
         self.authorization_complete = true;
@@ -236,8 +259,63 @@ impl NativeAgentChild {
         self.verified.wait().await
     }
 
-    pub async fn terminate(&mut self) {
-        crate::process::terminate_process_group(&mut self.verified).await;
+    pub(crate) async fn wait_retaining_unknown(
+        &mut self,
+    ) -> Result<Option<std::process::ExitStatus>, AppError> {
+        loop {
+            match self.terminal_observed()? {
+                TerminalObservation::Running => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                TerminalObservation::Terminal => {
+                    return self.reap_observed_terminal().await.map(Some);
+                }
+                TerminalObservation::OwnershipLost => return Ok(None),
+            }
+        }
+    }
+
+    pub async fn terminate(&mut self) -> Result<(), AppError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.injected_termination_error) {
+            self.termination_completed = false;
+            self.termination_uncertain = true;
+            return Err(AppError::Io {
+                operation: "observe verified child without reaping",
+                source: std::io::Error::from_raw_os_error(libc::EIO),
+            });
+        }
+        let result = crate::process::terminate_process_group(&mut self.verified).await;
+        match &result {
+            Ok(()) => {
+                self.termination_completed = true;
+                self.termination_uncertain = false;
+            }
+            Err(_) => {
+                self.termination_completed = false;
+                self.termination_uncertain = true;
+            }
+        }
+        result
+    }
+
+    async fn terminate_after_authorization_error(&mut self) {
+        if self.terminate().await.is_err() {
+            self.termination_uncertain = true;
+        }
+    }
+
+    pub(crate) fn termination_uncertain(&self) -> bool {
+        self.termination_uncertain
+    }
+
+    pub(crate) fn termination_completed(&self) -> bool {
+        self.termination_completed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_termination_observation_error(&mut self) {
+        self.injected_termination_error = true;
     }
 
     pub fn is_authorized(&self) -> bool {
@@ -292,8 +370,122 @@ fn marker_failure_error(
     }
 }
 
+#[cfg(all(test, unix))]
+fn test_native_child(
+    test_name: &str,
+) -> (tempfile::TempDir, NativeAgentChild) {
+    use crate::{
+        execution_policy::ProjectRootAnchor,
+        project_logs::open_agent_log_gate,
+    };
+
+    let temporary = tempfile::tempdir().expect("temporary native-child root");
+    let root = std::fs::canonicalize(temporary.path()).expect("canonical native-child root");
+    let anchor = ProjectRootAnchor::resolve(&root).expect("native-child root anchor");
+    let reader = ProjectRootLogReader::from_verified(
+        anchor.verify_identity().expect("verified native-child root"),
+    );
+    ensure_agent_log_dir(&reader).expect("native-child log directory");
+    let log_path = PathBuf::from(".pueue-agent/logs/agent-handle.log");
+    let marker_path = PathBuf::from(".pueue-agent/logs/agent-handle.authorized");
+    let (agent_log, gate_directory) =
+        open_agent_log_gate(&reader, &log_path, &marker_path).expect("native-child gate");
+    let log_identity = *agent_log.identity();
+    let executable_path = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let executable_anchor = ExecutableAnchor::from_absolute(&executable_path, &[])
+        .expect("native-child executable anchor");
+    let verified = crate::process::test_running_verified_child(test_name)
+        .expect("running verified child");
+    let child = NativeAgentChild {
+        verified,
+        reader,
+        executable_anchor,
+        gate_directory,
+        log_identity,
+        authorization_attempted: false,
+        authorization_complete: true,
+        termination_completed: false,
+        termination_uncertain: false,
+        injected_termination_error: false,
+    };
+    (temporary, child)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn test_native_child_with_termination_error(
+    test_name: &str,
+) -> (tempfile::TempDir, NativeAgentChild) {
+    let (temporary, mut child) = test_native_child(test_name);
+    child.inject_termination_observation_error();
+    (temporary, child)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn test_native_child_with_group_signal_error(
+    test_name: &str,
+) -> (tempfile::TempDir, NativeAgentChild) {
+    let (temporary, mut child) = test_native_child(test_name);
+    child.verified.inject_group_signal_error();
+    (temporary, child)
+}
+
 #[cfg(not(unix))]
 pub struct NativeAgentChild;
+
+#[cfg(not(unix))]
+impl NativeAgentChild {
+    pub fn id(&self) -> i64 {
+        0
+    }
+
+    pub(crate) fn terminal_observed(&mut self) -> Result<TerminalObservation, AppError> {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Dispatched,
+        )
+        .into())
+    }
+
+    pub(crate) async fn reap_observed_terminal(
+        &mut self,
+    ) -> Result<std::process::ExitStatus, AppError> {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Dispatched,
+        )
+        .into())
+    }
+
+    pub async fn wait(&mut self) -> Result<std::process::ExitStatus, AppError> {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Dispatched,
+        )
+        .into())
+    }
+
+    pub(crate) async fn wait_retaining_unknown(
+        &mut self,
+    ) -> Result<Option<std::process::ExitStatus>, AppError> {
+        self.wait().await.map(Some)
+    }
+
+    pub async fn terminate(&mut self) -> Result<(), AppError> {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Dispatched,
+        )
+        .into())
+    }
+
+    pub(crate) fn termination_uncertain(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn termination_completed(&self) -> bool {
+        false
+    }
+}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -540,6 +732,9 @@ mod tests {
                 log_identity,
                 authorization_attempted: false,
                 authorization_complete: false,
+                termination_completed: false,
+                termination_uncertain: false,
+                injected_termination_error: false,
             },
         )
     }
@@ -581,5 +776,26 @@ mod tests {
                 .is_ok(),
             "post-marker uncertainty did not reap the group"
         );
+        assert!(child.termination_completed());
+    }
+
+    #[tokio::test]
+    async fn post_publish_failure_retains_classification_when_termination_is_uncertain() {
+        let _guard = test_guard();
+        let (_temporary, log_reader, mut child) =
+            marker_failure_child(MarkerIoFailure::DirectorySync).await;
+        child.inject_termination_observation_error();
+        assert_eq!(
+            policy_stage(child.authorize_marker().await.unwrap_err()),
+            Some(PolicyViolationStage::PostMarker)
+        );
+        assert!(child.termination_uncertain());
+        assert!(!child.termination_completed());
+        assert!(inspect_gate_marker(&log_reader, &marker_path())
+            .expect("inspect retained marker")
+            .is_some());
+        child.injected_termination_error = false;
+        child.terminate().await.unwrap();
+        assert!(child.termination_completed());
     }
 }

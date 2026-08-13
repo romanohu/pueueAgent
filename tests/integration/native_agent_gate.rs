@@ -264,7 +264,7 @@ async fn duplicate_authorization_terminates_the_running_group() {
     assert!(child.authorize_marker().await.is_err());
     let outcome = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     if outcome.is_err() {
-        child.terminate().await;
+        child.terminate().await.unwrap();
     }
     assert!(
         outcome.is_ok(),

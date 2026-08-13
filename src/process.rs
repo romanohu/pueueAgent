@@ -307,6 +307,7 @@ pub enum BootstrapError {
     AliasedPipeRoles,
     TargetCreate,
     TargetCreateTransient,
+    TargetExit(u8),
 }
 
 #[cfg(unix)]
@@ -329,6 +330,7 @@ impl fmt::Display for BootstrapError {
             Self::TargetCreateTransient => {
                 formatter.write_str("native target resources were temporarily unavailable")
             }
+            Self::TargetExit(code) => write!(formatter, "native target exited with code {code}"),
         }
     }
 }
@@ -395,6 +397,7 @@ const HELPER_CLEANUP_INLINE_TIMEOUT: Duration = Duration::from_millis(250);
 const HELPER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(unix)]
 const TARGET_CANCEL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 static TEST_PREPARED_TARGET_PID: AtomicI32 = AtomicI32::new(0);
@@ -466,23 +469,210 @@ pub struct AckReceiver {
     reader: Option<std::fs::File>,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct OwnedProcessGroup(i64);
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum ProcessGroupOwnership {
+    Owned(OwnedProcessGroup),
+    Released,
+}
+
+#[cfg(unix)]
+impl ProcessGroupOwnership {
+    fn id(&self) -> Option<libc::pid_t> {
+        match self {
+            Self::Owned(OwnedProcessGroup(id)) => libc::pid_t::try_from(*id).ok(),
+            Self::Released => None,
+        }
+    }
+
+    fn release(&mut self) {
+        *self = Self::Released;
+    }
+
+    fn take(&mut self) -> Option<libc::pid_t> {
+        let owned = std::mem::replace(self, Self::Released);
+        match owned {
+            Self::Owned(OwnedProcessGroup(id)) => libc::pid_t::try_from(id).ok(),
+            Self::Released => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_owned_process_group(
+    child: &mut VerifiedChild,
+    group: libc::pid_t,
+    signal: libc::c_int,
+) -> Result<(), AppError> {
+    #[cfg(test)]
+    if std::mem::take(&mut child.injected_group_signal_error) {
+        return Err(AppError::Io {
+            operation: "signal verified process group",
+            source: io::Error::from_raw_os_error(libc::EIO),
+        });
+    }
+    if unsafe { libc::kill(-group, signal) } == 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if source.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if source.raw_os_error() == Some(libc::EPERM)
+        && child.terminal_observed()? == TerminalObservation::Terminal
+    {
+        return Ok(());
+    }
+    Err(AppError::Io {
+        operation: "signal verified process group",
+        source,
+    })
+}
+
+#[cfg(unix)]
+fn process_group_exists(
+    child: &mut VerifiedChild,
+    group: libc::pid_t,
+) -> Result<bool, AppError> {
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return Ok(true);
+    }
+    let source = io::Error::last_os_error();
+    if source.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    #[cfg(target_os = "macos")]
+    if source.raw_os_error() == Some(libc::EPERM)
+        && child.terminal_observed()? == TerminalObservation::Terminal
+    {
+        return Ok(false);
+    }
+    Err(AppError::Io {
+        operation: "probe verified process group",
+        source,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalObservation {
+    Running,
+    Terminal,
+    OwnershipLost,
+}
+
 /// A helper process that owns exactly one blocked/suspended target and remains
 /// its process-group leader until the target has been reaped.
 #[cfg(unix)]
 pub struct VerifiedChild {
-    pub child: tokio::process::Child,
-    pub pid: i64,
-    pub process_group_id: Option<i64>,
+    child: tokio::process::Child,
+    pid: i64,
+    process_group: ProcessGroupOwnership,
     pub start_gate: StartGate,
     pub exec_status: ExecStatusReceiver,
     pub ack: AckReceiver,
     capture: bool,
     released: bool,
     exec_confirmed: bool,
+    #[cfg(test)]
+    injected_group_signal_error: bool,
 }
 
 #[cfg(unix)]
 impl VerifiedChild {
+    pub fn id(&self) -> i64 {
+        self.pid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_group_signal_error(&mut self) {
+        self.injected_group_signal_error = true;
+    }
+
+    fn observation_error(
+        &mut self,
+        source: io::Error,
+    ) -> Result<TerminalObservation, AppError> {
+        if source.raw_os_error() == Some(libc::ECHILD) {
+            self.process_group.release();
+            return Ok(TerminalObservation::OwnershipLost);
+        }
+        Err(AppError::Io {
+            operation: "observe verified child without reaping",
+            source,
+        })
+    }
+
+    pub(crate) fn terminal_observed(&mut self) -> Result<TerminalObservation, AppError> {
+        if matches!(self.process_group, ProcessGroupOwnership::Released) {
+            return Ok(TerminalObservation::OwnershipLost);
+        }
+        let pid = libc::id_t::try_from(self.pid).map_err(|_| AppError::Runtime {
+            operation: "convert verified child pid",
+        })?;
+        loop {
+            let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    information.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                let information = unsafe { information.assume_init() };
+                return Ok(if unsafe { information.si_pid() } == 0 {
+                    TerminalObservation::Running
+                } else {
+                    TerminalObservation::Terminal
+                });
+            }
+            let source = io::Error::last_os_error();
+            if source.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD is the only observation failure that disproves ownership.
+            // Other failures retain the private, unreaped child authority so
+            // callers can retry and Drop can fail closed.
+            return self.observation_error(source);
+        }
+    }
+
+    async fn reap_after_terminal_group_cleanup(&mut self) -> Result<ExitStatus, AppError> {
+        if let Some(group) = self.process_group.id() {
+            drain_owned_process_group(self, group).await?;
+        }
+        match self.child.wait().await {
+            Ok(status) => {
+                self.process_group.release();
+                Ok(status)
+            }
+            Err(source) => {
+                if source.raw_os_error() == Some(libc::ECHILD) {
+                    self.process_group.release();
+                }
+                Err(AppError::Io {
+                    operation: "reap verified child after process-group cleanup",
+                    source,
+                })
+            }
+        }
+    }
+
+    pub(crate) async fn reap_observed_terminal(&mut self) -> Result<ExitStatus, AppError> {
+        if self.terminal_observed()? != TerminalObservation::Terminal {
+            return Err(AppError::Runtime {
+                operation: "reap verified child before terminal observation",
+            });
+        }
+        self.reap_after_terminal_group_cleanup().await
+    }
+
     pub fn release(&mut self) -> Result<(), AppError> {
         if self.released {
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
@@ -566,17 +756,45 @@ impl VerifiedChild {
     }
 
     pub async fn wait(&mut self) -> Result<ExitStatus, AppError> {
-        let result = self
-            .child
-            .wait()
-            .await
-            .map_err(|_| native_gate_error(PolicyViolationStage::Dispatched));
-        // An explicit wait owns the helper's terminal status.  Never retain a
-        // process-group id after reaping, otherwise Drop could signal a reused
-        // group number.
-        self.process_group_id = None;
-        result
+        loop {
+            match self.terminal_observed()? {
+                TerminalObservation::Running => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                TerminalObservation::Terminal => {
+                    return self.reap_after_terminal_group_cleanup().await;
+                }
+                TerminalObservation::OwnershipLost => {
+                    return Err(AppError::Runtime {
+                        operation: "wait for verified child after ownership loss",
+                    });
+                }
+            }
+        }
     }
+}
+
+#[cfg(unix)]
+async fn drain_owned_process_group(
+    child: &mut VerifiedChild,
+    group: libc::pid_t,
+) -> Result<(), AppError> {
+    if let Err(error) = signal_owned_process_group(child, group, libc::SIGTERM) {
+        return Err(error);
+    }
+    tokio::time::sleep(PROCESS_GROUP_TERM_GRACE).await;
+    let group_exists = match process_group_exists(child, group) {
+        Ok(exists) => exists,
+        Err(error) => {
+            return Err(error);
+        }
+    };
+    if group_exists {
+        if let Err(error) = signal_owned_process_group(child, group, libc::SIGKILL) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -590,7 +808,7 @@ pub(crate) fn test_running_verified_child(test_name: &str) -> Result<VerifiedChi
     command.args(["--ignored", "--exact", test_name, "--nocapture"]);
     command.process_group(0);
     let mut command = tokio::process::Command::from(command);
-    command.kill_on_drop(true);
+    command.kill_on_drop(false);
     let child = command
         .spawn()
         .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
@@ -600,13 +818,14 @@ pub(crate) fn test_running_verified_child(test_name: &str) -> Result<VerifiedChi
     Ok(VerifiedChild {
         child,
         pid,
-        process_group_id: Some(pid),
+        process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
         start_gate: StartGate { writer: None },
         exec_status: ExecStatusReceiver { reader: None },
         ack: AckReceiver { reader: None },
         capture: false,
         released: false,
         exec_confirmed: false,
+        injected_group_signal_error: false,
     })
 }
 
@@ -617,12 +836,11 @@ impl Drop for VerifiedChild {
         // Drop cannot await and must not call try_wait before the group kill:
         // a reap can release the helper PID while descendants still retain
         // the process group.  The recorded group is owned until explicit
-        // wait clears it, so kill it first, then ask Tokio to kill/reap the
-        // leader through its orphan handling.
-        if let Some(recorded_group) = self.process_group_id.take() {
-            if let Ok(group) = libc::pid_t::try_from(recorded_group) {
-                unsafe { libc::kill(-group, libc::SIGKILL); }
-            }
+        // wait clears it, so kill it first, then ask Tokio to kill the
+        // leader. `kill_on_drop` remains disabled so this typed ownership is
+        // the only authority that can signal the process group.
+        if let Some(group) = self.process_group.take() {
+            unsafe { libc::kill(-group, libc::SIGKILL); }
             let _ = self.child.start_kill();
         }
     }
@@ -798,10 +1016,11 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
         let mut status = 0;
         let _ = unsafe { libc::waitpid(target.pid(), &mut status, 0) };
     }
-    if target.wait_success()? {
+    let exit_code = target.wait_exit_code()?;
+    if exit_code == 0 {
         Ok(())
     } else {
-        Err(BootstrapError::BootstrapCorrupt)
+        Err(BootstrapError::TargetExit(exit_code))
     }
 }
 
@@ -984,8 +1203,8 @@ impl PlatformTarget {
         }
     }
 
-    fn wait_success(&mut self) -> Result<bool, BootstrapError> {
-        let outcome = wait_pid_success(self.pid);
+    fn wait_exit_code(&mut self) -> Result<u8, BootstrapError> {
+        let outcome = wait_pid_exit_code(self.pid);
         if outcome.is_ok() {
             self.owned = false;
         }
@@ -1150,8 +1369,8 @@ impl PlatformTarget {
         }
     }
 
-    fn wait_success(&mut self) -> Result<bool, BootstrapError> {
-        let outcome = wait_pid_success(self.pid);
+    fn wait_exit_code(&mut self) -> Result<u8, BootstrapError> {
+        let outcome = wait_pid_exit_code(self.pid);
         if outcome.is_ok() {
             self.owned = false;
         }
@@ -1217,12 +1436,16 @@ fn c_environment(values: &[(OsString, OsString)]) -> Result<Vec<std::ffi::CStrin
 }
 
 #[cfg(unix)]
-fn wait_pid_success(pid: libc::pid_t) -> Result<bool, BootstrapError> {
+fn wait_pid_exit_code(pid: libc::pid_t) -> Result<u8, BootstrapError> {
     let mut status = 0;
     loop {
         let result = unsafe { libc::waitpid(pid, &mut status, 0) };
         if result == pid {
-            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            return Ok(if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status) as u8
+            } else {
+                1
+            });
         }
         if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
@@ -1663,7 +1886,7 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
     revalidate_launcher_before_spawn(&spec.launcher)
         .map_err(|_| native_gate_error(PolicyViolationStage::RunBoundPreMarker))?;
     let mut command = tokio::process::Command::from(command);
-    command.kill_on_drop(true);
+    command.kill_on_drop(false);
     let mut child = command
         .spawn()
         .map_err(|error| map_helper_spawn_error(&error))?;
@@ -1697,7 +1920,7 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
     Ok(VerifiedChild {
         child,
         pid,
-        process_group_id: Some(pid),
+        process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
         start_gate: StartGate { writer: Some(std::fs::File::from(release_write)) },
         exec_status: ExecStatusReceiver {
             reader: Some(std::fs::File::from(exec_read)),
@@ -1708,58 +1931,54 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
         capture,
         released: false,
         exec_confirmed: false,
+        #[cfg(test)]
+        injected_group_signal_error: false,
     })
 }
 
 #[cfg(unix)]
-pub async fn terminate_process_group(child: &mut VerifiedChild) {
+pub async fn terminate_process_group(child: &mut VerifiedChild) -> Result<(), AppError> {
     child.start_gate.writer.take();
-    // A single initial try_wait establishes whether this handle still owns an
-    // unreaped leader.  During the TERM grace period we intentionally never
-    // poll/reap: the unreaped leader keeps its PID reserved, so the recorded
-    // process-group id cannot be reused while descendants are being drained.
-    match child.child.try_wait() {
-        Ok(Some(_)) => {
-            child.process_group_id = None;
-            return;
+    let Some(group) = child.process_group.id() else {
+        return Ok(());
+    };
+    // The unreaped helper reserves its process-group identifier. Signal the
+    // typed owned group directly; probing/reaping first could release that
+    // reservation while a descendant remains alive.
+    drain_owned_process_group(child, group).await?;
+    match tokio::time::timeout(Duration::from_secs(1), child.child.wait()).await {
+        Ok(Ok(_)) => {
+            child.process_group.release();
+            Ok(())
         }
-        Ok(None) => {}
+        Ok(Err(source)) if source.raw_os_error() == Some(libc::ECHILD) => {
+            child.process_group.release();
+            Ok(())
+        }
+        Ok(Err(source)) => {
+            Err(AppError::Io {
+                operation: "reap terminated verified child",
+                source,
+            })
+        }
         Err(_) => {
-            // The leader's state is indeterminate (including ECHILD).  We
-            // cannot prove that the recorded group still belongs to this
-            // unreaped helper, so never signal a possibly reused PGID.
-            child.process_group_id = None;
-            return;
+            Err(AppError::Runtime {
+                operation: "reap terminated verified child before timeout",
+            })
         }
     }
-    if let Some(group) = child
-        .process_group_id
-        .and_then(|value| libc::pid_t::try_from(value).ok())
-    {
-        unsafe { libc::kill(-group, libc::SIGTERM); }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        // Kill the entire recorded group unconditionally after grace.  Do not
-        // gate this on a second try_wait: a helper can exit while a descendant
-        // continues to hold the group, and reaping first would lose PID
-        // reservation before the descendant is terminated.
-        unsafe { libc::kill(-group, libc::SIGKILL); }
-    }
-    let _ = child.child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.child.wait()).await;
-    child.process_group_id = None;
 }
 
 #[cfg(unix)]
 fn cleanup_failed_tokio_helper(child: &mut tokio::process::Child, pid: i64) {
-    if matches!(child.try_wait(), Ok(None)) {
-        if let Ok(group) = libc::pid_t::try_from(pid) {
-            unsafe { libc::kill(-group, libc::SIGKILL); }
-        }
-        // This synchronous error path cannot await the Tokio child.
-        // `kill_on_drop` hands it to Tokio's orphan queue after the
-        // fail-closed group kill; successful handles use the async API.
-        let _ = child.start_kill();
+    if let Ok(group) = libc::pid_t::try_from(pid) {
+        unsafe { libc::kill(-group, libc::SIGKILL); }
     }
+    // This synchronous error path cannot await the Tokio child. Never probe
+    // or reap first: the unreaped helper reserves this process-group id while
+    // the group kill covers descendants. Tokio may reap the leader after the
+    // explicit group/leader kill has been issued.
+    let _ = child.start_kill();
 }
 
 #[cfg(unix)]
@@ -3028,6 +3247,239 @@ mod tests {
         let original = frame();
         let encoded = original.encode().unwrap();
         assert_eq!(ControlFrame::decode(&encoded).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    fn observation_child(mode: &str) -> VerifiedChild {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::terminal_observation_subprocess",
+                "--nocapture",
+            ])
+            .env("PUEUE_AGENT_OBSERVATION_MODE", mode)
+            .process_group(0);
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(false);
+        let child = command.spawn().unwrap();
+        let pid = i64::from(child.id().unwrap());
+        VerifiedChild {
+            child,
+            pid,
+            process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
+            start_gate: StartGate { writer: None },
+            exec_status: ExecStatusReceiver { reader: None },
+            ack: AckReceiver { reader: None },
+            capture: false,
+            released: true,
+            exec_confirmed: true,
+            injected_group_signal_error: false,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn await_terminal_observation(child: &mut VerifiedChild) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.terminal_observed().unwrap() {
+                TerminalObservation::Terminal => return,
+                TerminalObservation::Running => {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                TerminalObservation::OwnershipLost => panic!("child ownership was lost"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal terminal-observation subprocess entry"]
+    fn terminal_observation_subprocess() {
+        if std::env::var_os("PUEUE_AGENT_OBSERVATION_MODE").as_deref()
+            == Some(std::ffi::OsStr::new("hold"))
+        {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "internal failed-helper cleanup subprocess entry"]
+    fn failed_helper_cleanup_subprocess() {
+        match std::env::var("PUEUE_AGENT_FAILED_HELPER_MODE").as_deref() {
+            Ok("helper") => {
+                let descendant = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "process::tests::failed_helper_cleanup_subprocess",
+                        "--nocapture",
+                    ])
+                    .env("PUEUE_AGENT_FAILED_HELPER_MODE", "descendant")
+                    .spawn()
+                    .unwrap();
+                fs::write(
+                    std::env::var_os("PUEUE_AGENT_DESCENDANT_PID_PATH").unwrap(),
+                    descendant.id().to_string(),
+                )
+                .unwrap();
+            }
+            Ok("descendant") => std::thread::sleep(Duration::from_secs(30)),
+            _ => panic!("missing failed-helper subprocess mode"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_helper_cleanup_kills_descendant_after_helper_is_terminal() {
+        use std::os::unix::process::CommandExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let descendant_pid_path = temporary.path().join("descendant.pid");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::failed_helper_cleanup_subprocess",
+                "--nocapture",
+            ])
+            .env("PUEUE_AGENT_FAILED_HELPER_MODE", "helper")
+            .env("PUEUE_AGENT_DESCENDANT_PID_PATH", &descendant_pid_path)
+            .process_group(0);
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(false);
+        let mut child = command.spawn().unwrap();
+        let helper_pid = i64::from(child.id().unwrap());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let descendant_pid = loop {
+            if let Ok(contents) = fs::read_to_string(&descendant_pid_path) {
+                break contents.parse::<libc::pid_t>().unwrap();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        loop {
+            let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            assert_eq!(unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    helper_pid as libc::id_t,
+                    information.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            }, 0);
+            if unsafe { information.assume_init().si_pid() } != 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        cleanup_failed_tokio_helper(&mut child, helper_pid);
+
+        while unsafe { libc::kill(descendant_pid, 0) } == 0 {
+            if tokio::time::Instant::now() >= deadline {
+                unsafe { libc::kill(descendant_pid, libc::SIGKILL); }
+                panic!("failed-helper cleanup left its descendant running");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_observation_classifies_running_without_reaping() {
+        let mut child = observation_child("hold");
+        assert_eq!(child.terminal_observed().unwrap(), TerminalObservation::Running);
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Owned(_)));
+        terminate_process_group(&mut child).await.unwrap();
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_observation_keeps_owned_group_until_cleanup_and_reap() {
+        let mut child = observation_child("exit");
+        await_terminal_observation(&mut child).await;
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Owned(_)));
+        assert_eq!(child.terminal_observed().unwrap(), TerminalObservation::Terminal);
+        let status = child.reap_observed_terminal().await.unwrap();
+        assert!(status.success());
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
+        assert_eq!(
+            child.terminal_observed().unwrap(),
+            TerminalObservation::OwnershipLost,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn already_reaped_child_clears_stale_group_before_drop() {
+        let mut child = observation_child("exit");
+        assert!(child.child.wait().await.unwrap().success());
+
+        let mut sentinel = observation_child("hold");
+        let sentinel_pid = sentinel.pid;
+        child.process_group =
+            ProcessGroupOwnership::Owned(OwnedProcessGroup(sentinel_pid));
+        assert_eq!(
+            child.terminal_observed().unwrap(),
+            TerminalObservation::OwnershipLost,
+        );
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
+        drop(child);
+        assert_eq!(unsafe { libc::kill(sentinel_pid as libc::pid_t, 0) }, 0);
+        terminate_process_group(&mut sentinel).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unknown_observation_error_retains_owned_handle_for_retry() {
+        let mut child = observation_child("hold");
+        assert!(child.observation_error(io::Error::from_raw_os_error(libc::EIO)).is_err());
+        assert!(matches!(
+            child.process_group,
+            ProcessGroupOwnership::Owned(_)
+        ));
+        assert_eq!(child.terminal_observed().unwrap(), TerminalObservation::Running);
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Owned(_)));
+        terminate_process_group(&mut child).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_after_unknown_observation_fails_closed_with_owned_group_kill() {
+        let mut child = observation_child("hold");
+        let pid = child.pid as libc::pid_t;
+        assert!(child.observation_error(io::Error::from_raw_os_error(libc::EIO)).is_err());
+        drop(child);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn termination_error_retains_owned_child_for_observation_retry() {
+        let mut child = observation_child("hold");
+        assert!(child.observation_error(io::Error::from_raw_os_error(libc::EIO)).is_err());
+        assert!(matches!(
+            child.process_group,
+            ProcessGroupOwnership::Owned(_)
+        ));
+        assert_eq!(child.terminal_observed().unwrap(), TerminalObservation::Running);
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Owned(_)));
+        terminate_process_group(&mut child).await.unwrap();
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
     }
 
     #[cfg(unix)]

@@ -416,6 +416,9 @@ fn temp_error() -> PolicyViolation {
 pub struct PrivateRunTemp {
     name: OsString,
     path: PathBuf,
+    parent: File,
+    directory: File,
+    identity: (u64, u64),
 }
 
 impl fmt::Debug for PrivateRunTemp {
@@ -450,6 +453,7 @@ impl PrivateRunTemp {
             validate_private_directory(&directory)?;
             directory.sync_all().map_err(|_| temp_error())?;
             tmp.sync_all().map_err(|_| temp_error())?;
+            let identity = directory_identity(&directory)?;
             let path = root
                 .anchor
                 .canonical_path
@@ -459,12 +463,40 @@ impl PrivateRunTemp {
             Ok(Self {
                 name,
                 path,
+                parent: tmp,
+                directory,
+                identity,
             })
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Prove that the retained descriptor still names the exact owner-only
+    /// generation visible under the fixed private-temp parent.
+    pub fn revalidate_current(&self) -> Result<(), PolicyViolation> {
+        #[cfg(not(unix))]
+        {
+            Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ))
+        }
+        #[cfg(unix)]
+        {
+            validate_private_directory(&self.directory)?;
+            if directory_identity(&self.directory)? != self.identity {
+                return Err(temp_error());
+            }
+            let current = open_directory_nofollow(&self.parent, &self.name).map_err(map_temp_io)?;
+            validate_private_directory(&current)?;
+            if directory_identity(&current)? != self.identity {
+                return Err(temp_error());
+            }
+            Ok(())
+        }
     }
 
     /// Cleanup is intentionally unsupported.  Retaining the complete run
@@ -520,6 +552,13 @@ fn validate_private_directory(directory: &File) -> Result<(), PolicyViolation> {
         return Err(temp_error());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn directory_identity(directory: &File) -> Result<(u64, u64), PolicyViolation> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = directory.metadata().map_err(|_| temp_error())?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(unix)]

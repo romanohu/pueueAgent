@@ -4,7 +4,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage},
+    agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle},
     config,
     db::{EventRepository, InterventionRepository, ProjectRepository},
     guardrails::{DispatchDecision, Guardrails},
@@ -38,6 +38,7 @@ pub struct Scheduler {
 #[derive(Default)]
 pub struct SchedulerReport {
     pub started: Vec<StartedAgent>,
+    pub cleanup: Vec<BoundCleanupHandle>,
     pub paused: Vec<String>,
     pub halted: Vec<String>,
     pub recovered_leases: usize,
@@ -48,6 +49,7 @@ impl fmt::Debug for SchedulerReport {
         formatter
             .debug_struct("SchedulerReport")
             .field("started", &self.started.len())
+            .field("cleanup", &self.cleanup.len())
             .field("paused", &self.paused)
             .field("halted", &self.halted)
             .field("recovered_leases", &self.recovered_leases)
@@ -241,6 +243,41 @@ impl Scheduler {
             let retry_policy = RetryPolicy {
                 max_retries: project_config.agent.max_retries,
             };
+            let project_policy = match self.runner.resolve_project_policy(&project, &project_config) {
+                Ok(policy) => policy,
+                Err(violation) => {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                            &project.project_id,
+                            &event_ids,
+                            self.config.now,
+                            &violation,
+                        )
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(violation.into());
+                    }
+                    continue;
+                }
+            };
+            if let Err(violation) = self.runner.preflight_project_launch(
+                &project_policy,
+                &project_config.agent,
+                "",
+            ) {
+                return_scheduler_error!(
+                    EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                        &project.project_id,
+                        &event_ids,
+                        self.config.now,
+                        &violation,
+                    )
+                );
+                if first_error.is_none() {
+                    first_error = Some(violation.into());
+                }
+                continue;
+            }
             let effective_guardrails = match state::load_effective_guardrails(
                 &state::path(&project.root_path),
                 &project_config.guardrails,
@@ -315,11 +352,35 @@ impl Scheduler {
                         continue;
                     }
                 };
+            if let Err(violation) = self.runner.preflight_project_launch(
+                &project_policy,
+                &project_config.agent,
+                &prompt,
+            ) {
+                let release_error = reservation.as_ref().and_then(|reservation| {
+                    InterventionRepository::new(&self.db)
+                        .release_reservation(&project.project_id, &reservation.token)
+                        .err()
+                });
+                return_scheduler_error!(
+                    EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                        &project.project_id,
+                        &event_ids,
+                        self.config.now,
+                        &violation,
+                    )
+                );
+                if first_error.is_none() {
+                    first_error = release_error.or_else(|| Some(violation.into()));
+                }
+                continue;
+            }
             match self
                 .runner
                 .spawn(
                     &self.db,
                     &project,
+                    &project_policy,
                     &project_config.agent,
                     retry_policy,
                     primary.event_id,
@@ -345,7 +406,11 @@ impl Scheduler {
                         stage,
                         source,
                         policy,
+                        cleanup,
                     } = error;
+                    if let Some(cleanup) = cleanup {
+                        report.cleanup.push(cleanup);
+                    }
                     if matches!(&source, AppError::UpgradeInProgress) {
                         let release_error = reservation.as_ref().and_then(|reservation| {
                             InterventionRepository::new(&self.db)

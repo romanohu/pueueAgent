@@ -450,6 +450,42 @@ fn custom_agent_inside_current_project_root_is_rejected_even_when_root_is_not_in
 }
 
 #[test]
+fn custom_agent_outside_an_uninventoried_project_root_fails_as_root_changed() {
+    let h = PolicyHarness::new();
+    let project_root = h.path("unregistered-project");
+    fs::create_dir(&project_root).unwrap();
+    secure_directory(&project_root);
+    let custom = h.trusted_bin.join("custom-agent");
+    fs::write(&custom, b"custom").unwrap();
+    secure_executable(&custom);
+    fs::write(
+        h.policy(),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[defaults]\nnetwork = \"enabled\"\n\n[executables]\ncodex = {:?}\npueue = {:?}\n\n[projects.\"project-a\"]\ncustom_agent = {:?}\n",
+            h.trusted_bin.display().to_string(),
+            h.codex.display().to_string(),
+            h.pueue.display().to_string(),
+            custom.display().to_string(),
+        ),
+    )
+    .unwrap();
+    secure_file(&h.policy());
+    let global = load_existing_policy(&h.input()).unwrap();
+    let mut project = h.project("project-a");
+    project.root_path = project_root;
+    let config = custom_config("project-a", &custom.to_string_lossy(), NetworkMode::Enabled);
+
+    assert!(matches!(
+        resolve_project_policy(&global, &project, &config),
+        Err(pueue_agent::execution_policy::PolicyViolation {
+            code: PolicyViolationCode::RootChanged,
+            stage: pueue_agent::execution_policy::PolicyViolationStage::Startup,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn weak_existing_policy_fails_closed_without_repairing_mode() {
     let h = PolicyHarness::new();
     fs::write(h.policy(), b"version = 1\n").unwrap();

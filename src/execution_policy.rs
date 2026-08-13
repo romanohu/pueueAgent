@@ -188,6 +188,7 @@ pub struct ResolvedExecutionPolicy {
     pub launcher_anchor: ExecutableAnchor,
     pub trusted_path: Vec<PathBuf>,
     pub project_roots: Vec<PathBuf>,
+    project_root_anchors: Vec<ProjectRootAnchor>,
     pub pueue_config_anchor: PueueConfigAnchor,
     pub startup_environment: StartupEnvironment,
     pub codex_home: PathBuf,
@@ -923,9 +924,8 @@ pub fn resolve_project_policy(
     project: &Project,
     config: &ProjectConfig,
 ) -> Result<ResolvedProjectExecutionPolicy, PolicyViolation> {
-    let root_anchor = ProjectRootAnchor::resolve(&project.root_path)?;
-    let (agent_anchor, agent_kind) = if config.agent.program == "codex" {
-        (global.codex_anchor.clone(), AgentKind::BuiltInCodex)
+    let configured_custom_path = if config.agent.program == "codex" {
+        None
     } else {
         let configured_path = Path::new(&config.agent.program);
         if !configured_path.is_absolute()
@@ -939,26 +939,40 @@ pub fn resolve_project_policy(
             ));
         }
         if inside_any_root(configured_path, &global.project_roots)
-            || configured_path.starts_with(&root_anchor.canonical_path)
+            || configured_path.starts_with(&project.root_path)
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::ProjectRootExecutable,
                 PolicyViolationStage::PreBinding,
             ));
         }
-        let Some(anchor) = global.custom_allowlist.get(&project.project_id) else {
-            return Err(PolicyViolation::new(
-                PolicyViolationCode::CustomAgentNotEnrolled,
-                PolicyViolationStage::PreBinding,
-            ));
-        };
-        if anchor.canonical_path != configured_path {
-            return Err(PolicyViolation::new(
-                PolicyViolationCode::CustomAgentNotEnrolled,
-                PolicyViolationStage::PreBinding,
-            ));
+        Some(configured_path)
+    };
+    let root_anchor = global
+        .project_root_anchors
+        .iter()
+        .find(|anchor| anchor.canonical_path == project.root_path)
+        .cloned()
+        .ok_or_else(|| {
+            PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
+        })?;
+    let (agent_anchor, agent_kind) = match configured_custom_path {
+        None => (global.codex_anchor.clone(), AgentKind::BuiltInCodex),
+        Some(configured_path) => {
+            let Some(anchor) = global.custom_allowlist.get(&project.project_id) else {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::CustomAgentNotEnrolled,
+                    PolicyViolationStage::PreBinding,
+                ));
+            };
+            if anchor.canonical_path != configured_path {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::CustomAgentNotEnrolled,
+                    PolicyViolationStage::PreBinding,
+                ));
+            }
+            (anchor.clone(), AgentKind::Custom)
         }
-        (anchor.clone(), AgentKind::Custom)
     };
     let (agent_environment_allow, task_environment_allow) = global
         .project_environment_allow
@@ -990,7 +1004,11 @@ fn load_policy(
     input: &PolicyLoadInput,
     create_missing: bool,
 ) -> Result<ResolvedExecutionPolicy, PolicyViolation> {
-    let project_roots = canonical_project_roots(&input.project_roots)?;
+    let project_root_anchors = resolved_project_root_anchors(&input.project_roots)?;
+    let project_roots = project_root_anchors
+        .iter()
+        .map(|anchor| anchor.canonical_path.clone())
+        .collect::<Vec<_>>();
     let state_dir = validate_service_directory(&input.state_dir, &project_roots)?;
     let codex_home = validate_service_directory(&input.codex_home, &project_roots)?.canonical_path;
     let policy_name = OsStr::new(POLICY_FILENAME);
@@ -1113,6 +1131,7 @@ fn load_policy(
         launcher_anchor,
         trusted_path,
         project_roots,
+        project_root_anchors,
         pueue_config_anchor,
         startup_environment: input.startup_environment.clone(),
         codex_home,
@@ -1226,27 +1245,15 @@ fn parse_environment_names(
     Ok(parsed)
 }
 
-fn canonical_project_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, PolicyViolation> {
+fn resolved_project_root_anchors(
+    roots: &[PathBuf],
+) -> Result<Vec<ProjectRootAnchor>, PolicyViolation> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
     roots
         .iter()
-        .map(|root| {
-            let opened = open_path_nofollow(root).map_err(|_| {
-                PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
-            })?;
-            let metadata = opened.file.metadata().map_err(|_| {
-                PolicyViolation::new(PolicyViolationCode::RootChanged, PolicyViolationStage::Startup)
-            })?;
-            if !metadata.is_dir() || !secure_metadata(&metadata) {
-                return Err(PolicyViolation::new(
-                    PolicyViolationCode::RootChanged,
-                    PolicyViolationStage::Startup,
-                ));
-            }
-            Ok(opened.canonical_path)
-        })
+        .map(|root| ProjectRootAnchor::resolve(root))
         .collect()
 }
 

@@ -10,9 +10,9 @@ use rusqlite::{Connection, OpenFlags};
 use crate::AppError;
 
 pub use repositories::{
-    AgentRunRecovery, AgentRunRepository, BatchRepository, EventRepository, IncidentRepository,
-    IntegrationEventRepository, InterventionRepository, ProjectRepository, RunLineage,
-    RunLineageCursor, RunLineageRepository, SubmissionLineage, SubmissionPageCursor,
+    AgentRunRecovery, AgentRunRepository, BatchRepository, EventRepository, GateFailurePolicy,
+    IncidentRepository, IntegrationEventRepository, InterventionRepository, ProjectRepository,
+    RunLineage, RunLineageCursor, RunLineageRepository, SubmissionLineage, SubmissionPageCursor,
     SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
     MAX_FOLLOW_LINEAGE_SUBMISSIONS,
 };
@@ -24,6 +24,7 @@ static OPEN_INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
 pub struct Db {
     path: PathBuf,
     read_only: bool,
+    busy_timeout: Duration,
 }
 
 impl Db {
@@ -41,12 +42,13 @@ impl Db {
             })?;
         }
 
-        let mut connection = open_connection(path)?;
+        let mut connection = open_connection(path, BUSY_TIMEOUT)?;
         migrations::migrate(&mut connection)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             read_only: false,
+            busy_timeout: BUSY_TIMEOUT,
         })
     }
 
@@ -56,6 +58,7 @@ impl Db {
         Ok(Self {
             path: path.to_path_buf(),
             read_only: true,
+            busy_timeout: BUSY_TIMEOUT,
         })
     }
 
@@ -63,7 +66,15 @@ impl Db {
         if self.read_only {
             open_read_only_connection(&self.path)
         } else {
-            open_connection(&self.path)
+            open_connection(&self.path, self.busy_timeout)
+        }
+    }
+
+    pub(crate) fn with_busy_timeout(&self, busy_timeout: Duration) -> Self {
+        Self {
+            path: self.path.clone(),
+            read_only: self.read_only,
+            busy_timeout,
         }
     }
 
@@ -72,13 +83,13 @@ impl Db {
     }
 }
 
-fn open_connection(path: &Path) -> Result<Connection, AppError> {
+fn open_connection(path: &Path, busy_timeout: Duration) -> Result<Connection, AppError> {
     let connection = Connection::open(path).map_err(|source| AppError::Database {
         operation: "open SQLite database",
         source,
     })?;
     connection
-        .busy_timeout(BUSY_TIMEOUT)
+        .busy_timeout(busy_timeout)
         .map_err(|source| AppError::Database {
             operation: "configure SQLite busy timeout",
             source,
@@ -132,4 +143,30 @@ fn open_read_only_connection(path: &Path) -> Result<Connection, AppError> {
 
 pub(crate) fn database_error(operation: &'static str) -> impl FnOnce(rusqlite::Error) -> AppError {
     move |source| AppError::Database { operation, source }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_busy_timeout_does_not_mutate_the_original_database() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let scoped = db.with_busy_timeout(Duration::from_millis(100));
+
+        let scoped_timeout: i64 = scoped
+            .connect()
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let original_timeout: i64 = db
+            .connect()
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(scoped_timeout, 100);
+        assert_eq!(original_timeout, 5_000);
+    }
 }

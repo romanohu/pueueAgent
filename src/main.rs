@@ -31,6 +31,8 @@ fn main() -> ExitCode {
     if matches!(cli.command, Command::InternalLaunch) {
         return match pueue_agent::process::run_internal_launch() {
             Ok(()) => ExitCode::SUCCESS,
+            #[cfg(unix)]
+            Err(pueue_agent::process::BootstrapError::TargetExit(code)) => ExitCode::from(code),
             Err(_) => ExitCode::FAILURE,
         };
     }
@@ -82,7 +84,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 mod commands {
-    use std::{env, ffi::OsString, path::PathBuf};
+    use std::{env, ffi::OsString, path::PathBuf, sync::Arc};
 
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
@@ -101,6 +103,7 @@ mod commands {
             DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
         },
         events::{record_callback, record_operator_wake_with, CallbackMetadata},
+        execution_policy::{load_existing_policy, PolicyLoadInput, StartupEnvironment},
         interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
         output::{bounded_redacted_text, format_state, human_header, human_summary},
@@ -558,7 +561,43 @@ mod commands {
     }
 
     pub async fn daemon(args: DaemonArgs) -> Result<(), AppError> {
-        let db = Db::open(&paths::state_db_path()?)?;
+        let state_db = paths::state_db_path()?;
+        let db = Db::open(&state_db)?;
+        let projects = ProjectRepository::new(&db).list_all()?;
+        let project_roots = projects
+            .iter()
+            .map(|project| project.root_path.clone())
+            .collect::<Vec<_>>();
+        let state_dir = state_db
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or(AppError::Configuration {
+                field: "state_db_path",
+            })?;
+        let pueue_config = match args.pueue_config.clone() {
+            Some(path) => path,
+            None => {
+                let home = env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .ok_or(AppError::Configuration { field: "HOME" })?;
+                home.join(".config/pueue/pueue.yml")
+            }
+        };
+        let policy = Arc::new(load_existing_policy(&PolicyLoadInput {
+            state_dir,
+            project_roots,
+            inherited_path: env::var_os("PATH").ok_or(AppError::Configuration {
+                field: "PATH",
+            })?,
+            startup_environment: StartupEnvironment::capture(),
+            codex_home: pueue_agent::codex_session::home_from_environment()?,
+            pueue_config,
+            launcher_path: env::current_exe().map_err(|source| AppError::Io {
+                operation: "resolve daemon launcher",
+                source,
+            })?,
+        })?);
         let fixed_args = args
             .pueue_config
             .as_ref()
@@ -568,7 +607,7 @@ mod commands {
         let mut daemon = Daemon::new(
             db,
             pueue,
-            AgentRunner::new(AgentRunnerConfig::production()),
+            AgentRunner::new(AgentRunnerConfig::production(), policy),
             DaemonConfig::default(),
         );
         daemon.run(production_shutdown_token()).await

@@ -100,14 +100,7 @@ impl CodexArgvBuilder {
         prompt: &str,
         private_tmp: &Path,
     ) -> Result<Vec<OsString>, PolicyViolation> {
-        self.validate_capabilities()?;
-        if self.policy.agent_kind != AgentKind::BuiltInCodex || config.program != "codex" {
-            return Err(unsafe_argument());
-        }
-        validate_compatibility_args(&config.args)?;
-        if prompt.contains('\0') {
-            return Err(unsafe_argument());
-        }
+        self.preflight(config, prompt)?;
 
         let root = path_text(&self.policy.root_anchor.canonical_path)?;
         let private_tmp = validate_private_tmp(
@@ -205,6 +198,43 @@ impl CodexArgvBuilder {
         argv.push(OsString::from("--"));
         argv.push(OsString::from(prompt));
         Ok(argv)
+    }
+
+    /// Validate every launch property that does not depend on the run id.
+    /// Scheduler admission calls this before reserving interventions or
+    /// binding events; `build` calls the same method before materializing the
+    /// final per-run temporary path.
+    pub fn preflight(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+    ) -> Result<(), PolicyViolation> {
+        self.validate_capabilities()?;
+        if self.policy.agent_kind != AgentKind::BuiltInCodex || config.program != "codex" {
+            return Err(unsafe_argument());
+        }
+        validate_compatibility_args(&config.args)?;
+        if prompt.contains('\0') {
+            return Err(unsafe_argument());
+        }
+        match &config.context {
+            AgentContextMode::Fresh => {}
+            AgentContextMode::Resume { session_id } => {
+                codex_session::verify_project_ownership(
+                    &self.policy.codex_home,
+                    &self.policy.root_anchor.canonical_path,
+                    session_id,
+                )
+                .map_err(map_session_error)?;
+            }
+            AgentContextMode::ResumeLatest => {
+                codex_session::resolve_latest_owned_session(
+                    &self.policy.codex_home,
+                    &self.policy.root_anchor.canonical_path,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn validate_capabilities(&self) -> Result<(), PolicyViolation> {

@@ -428,6 +428,25 @@ fn private_temp_does_not_follow_nested_symlinks_or_delete_replacement() {
 
 #[cfg(unix)]
 #[test]
+fn private_temp_revalidation_rejects_replaced_generation_before_authorization() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();
+    let root = anchor.verify_identity().unwrap();
+    let temp = PrivateRunTemp::create(&root, 46).unwrap();
+    temp.revalidate_current().unwrap();
+    let path = temp.path().to_owned();
+    fs::rename(&path, harness._temp.path().join("retired-run-46")).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = temp.revalidate_current().unwrap_err();
+    assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+}
+
+#[cfg(unix)]
+#[test]
 fn private_temp_retains_tree_without_traversal() {
     let harness = Harness::new();
     let anchor = ProjectRootAnchor::resolve(&harness.root).unwrap();

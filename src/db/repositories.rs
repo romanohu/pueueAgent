@@ -19,14 +19,14 @@ use crate::{
         BatchJobResult, MAX_BATCH_ARGV_JSON_BYTES, MAX_BATCH_METADATA_JSON_BYTES,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
-    execution_policy::PolicyViolation,
+    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
     interventions::{
         validate_message, Intervention, InterventionCounts, InterventionReservation,
         MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
     },
     models::{
-        launch_gate_marker_path, path_text, AgentContextMode, AgentRun, AgentRunEvent,
-        AgentRunStatus, BatchJob, BatchJobStatus, BatchRequest, BatchStatus, Event, EventKind,
+        path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, BatchJob,
+        BatchJobStatus, BatchRequest, BatchStatus, Event, EventKind,
         EventStatus, ExecutionProjection, Incident, IncidentTransition, IncidentUpdate,
         IntegrationEvent, InterventionStatus, NewAgentRun, NewBatchRequest, NewEvent, NewIncident,
         NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
@@ -3140,6 +3140,7 @@ pub struct AgentRunRecovery {
 enum AgentRunFinalizationPhase {
     Generic,
     MarkerFailure,
+    PendingMarkerPolicy,
     PreRelease,
 }
 
@@ -3349,12 +3350,234 @@ impl<'db> AgentRunRepository<'db> {
             .map_err(database_error("find active agent run"))
     }
 
+    pub fn list_startup_marker_candidates(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(i64, String, PathBuf)>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id, launch_gate_state, log_path
+                 FROM agent_runs
+                 WHERE project_id = ?1 AND status IN ('starting', 'running')
+                   AND (
+                       launch_gate_state = 'release_requested'
+                       OR (
+                           launch_gate_state = 'pending'
+                           AND policy_code IS NULL AND failure_stage IS NULL
+                       )
+                   )
+                 ORDER BY run_id",
+            )
+            .map_err(database_error("prepare startup marker candidates"))?;
+        let candidates = statement
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    PathBuf::from(row.get::<_, String>(2)?),
+                ))
+            })
+            .map_err(database_error("query startup marker candidates"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read startup marker candidates"))?;
+        Ok(candidates)
+    }
+
+    /// Persist the conservative evidence used when a launch marker predates a
+    /// newly bound run. This does not finalize the run: it makes the exact
+    /// pending-marker policy outcome durable so startup recovery cannot
+    /// downgrade it to a retry if the finalization transaction is interrupted.
+    pub fn record_pending_marker_policy_evidence(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        violation: &PolicyViolation,
+    ) -> Result<AgentRun, AppError> {
+        if violation.code != PolicyViolationCode::NativeGateFailed
+            || violation.stage != PolicyViolationStage::PostMarker
+        {
+            return Err(AppError::Validation {
+                field: "policy_violation",
+                message: "pending-marker evidence requires native_gate_failed/post_marker",
+            });
+        }
+
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin pending-marker policy evidence"))?;
+        let Some((stored_project_id, status, gate_state, policy_code, failure_stage)) = transaction
+            .query_row(
+                "SELECT project_id, status, launch_gate_state, policy_code, failure_stage
+                 FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, AgentRunStatus>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("validate pending-marker policy evidence run"))?
+        else {
+            return Err(AppError::Validation {
+                field: "run_id",
+                message: "agent run does not exist",
+            });
+        };
+        if stored_project_id != project_id {
+            return Err(AppError::Validation {
+                field: "project_id",
+                message: "agent run belongs to another project",
+            });
+        }
+        if status != AgentRunStatus::Starting {
+            return Err(AppError::Validation {
+                field: "status",
+                message: "pending-marker evidence requires a starting run",
+            });
+        }
+        if gate_state != "pending" {
+            return Err(AppError::Validation {
+                field: "launch_gate_state",
+                message: "pending-marker evidence requires a pending launch gate",
+            });
+        }
+        let exact_evidence = (
+            Some(violation.code.as_str().to_owned()),
+            Some(violation.stage.as_str().to_owned()),
+        );
+        if (policy_code.clone(), failure_stage.clone()) != (None, None)
+            && (policy_code, failure_stage) != exact_evidence
+        {
+            return Err(AppError::Validation {
+                field: "policy_violation",
+                message: "agent run already carries different policy evidence",
+            });
+        }
+
+        let invalid_events = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM agent_run_events
+                 JOIN events
+                   ON events.project_id = agent_run_events.project_id
+                  AND events.event_id = agent_run_events.event_id
+                 WHERE agent_run_events.project_id = ?1
+                   AND agent_run_events.run_id = ?2
+                   AND events.status <> 'in_flight'",
+                params![project_id, run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(database_error("validate pending-marker evidence events"))?;
+        if invalid_events != 0 {
+            return Err(AppError::Validation {
+                field: "event_status",
+                message: "pending-marker evidence requires in-flight linked events",
+            });
+        }
+        let invalid_interventions = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM interventions
+                 WHERE project_id = ?1 AND agent_run_id = ?2 AND status <> 'reserved'",
+                params![project_id, run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(database_error(
+                "validate pending-marker evidence interventions",
+            ))?;
+        if invalid_interventions != 0 {
+            return Err(AppError::Validation {
+                field: "intervention_status",
+                message: "pending-marker evidence requires reserved interventions",
+            });
+        }
+
+        transaction
+            .execute(
+                "UPDATE agent_runs
+                 SET policy_code = ?1, failure_stage = ?2
+                 WHERE project_id = ?3 AND run_id = ?4
+                   AND status = 'starting' AND launch_gate_state = 'pending'
+                   AND (policy_code IS NULL OR policy_code = ?1)
+                   AND (failure_stage IS NULL OR failure_stage = ?2)",
+                params![
+                    violation.code.as_str(),
+                    violation.stage.as_str(),
+                    project_id,
+                    run_id,
+                ],
+            )
+            .map_err(database_error("record pending-marker policy evidence"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit pending-marker policy evidence"))?;
+        read_agent_run(&connection, run_id)
+    }
+
     pub fn recover_interrupted(
         &self,
         finished_at: i64,
         reason: &str,
         policies: &BTreeMap<String, RetryPolicy>,
+        confirmed_pending_marker_ids: &BTreeSet<i64>,
+        confirmed_release_requested_ids: &BTreeSet<i64>,
     ) -> Result<AgentRunRecovery, AppError> {
+        if confirmed_pending_marker_ids
+            .iter()
+            .any(|run_id| confirmed_release_requested_ids.contains(run_id))
+        {
+            return Err(AppError::Validation {
+                field: "launch_gate_state",
+                message: "startup marker evidence cannot belong to two gate phases",
+            });
+        }
+        {
+            let connection = self.db.connect()?;
+            for (run_id, expected_status, expected_gate) in confirmed_pending_marker_ids
+                .iter()
+                .map(|run_id| (*run_id, AgentRunStatus::Starting, "pending"))
+                .chain(confirmed_release_requested_ids.iter().map(|run_id| {
+                    (*run_id, AgentRunStatus::Running, "release_requested")
+                }))
+            {
+                let Some((status, gate_state)) = connection
+                    .query_row(
+                        "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+                        [run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, AgentRunStatus>(0)?,
+                                row.get::<_, String>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(database_error("validate startup marker evidence phase"))?
+                else {
+                    return Err(AppError::Validation {
+                        field: "run_id",
+                        message: "startup marker evidence run does not exist",
+                    });
+                };
+                let status_matches = if expected_gate == "release_requested" {
+                    matches!(status, AgentRunStatus::Starting | AgentRunStatus::Running)
+                } else {
+                    status == expected_status
+                };
+                if !status_matches || gate_state != expected_gate {
+                    return Err(AppError::Validation {
+                        field: "launch_gate_state",
+                        message: "startup marker evidence does not match its gate phase",
+                    });
+                }
+            }
+        }
         let projects = ProjectRepository::new(self.db).list_all()?;
         for project in &projects {
             if !policies.contains_key(&project.project_id) {
@@ -3365,42 +3588,6 @@ impl<'db> AgentRunRepository<'db> {
             }
         }
 
-        let marker_confirmed_run_ids = {
-            let connection = self.db.connect()?;
-            let mut statement = connection
-                .prepare(
-                    "SELECT run_id, log_path
-                     FROM agent_runs
-                     WHERE status IN ('starting', 'running')
-                       AND launch_gate_state = 'release_requested'",
-                )
-                .map_err(database_error("prepare launch gate recovery marker query"))?;
-            let run_logs = statement
-                .query_map([], |row| {
-                    let run_id = row.get::<_, i64>(0)?;
-                    let log_path = PathBuf::from(row.get::<_, String>(1)?);
-                    Ok((run_id, log_path))
-                })
-                .map_err(database_error("inspect launch gate recovery markers"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(database_error("read launch gate recovery markers"))?;
-            let mut confirmed = BTreeSet::new();
-            for (run_id, log_path) in run_logs {
-                match fs::metadata(launch_gate_marker_path(&log_path)) {
-                    Ok(_metadata) => {
-                        confirmed.insert(run_id);
-                    }
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(source) => {
-                        return Err(AppError::Io {
-                            operation: "inspect agent launch gate marker",
-                            source,
-                        });
-                    }
-                }
-            }
-            confirmed
-        };
         let pre_marker_reason = bounded_redacted_text(&format!(
             "restart_interruption: pre-marker execution not confirmed ({reason})"
         ));
@@ -3424,7 +3611,7 @@ impl<'db> AgentRunRepository<'db> {
             let active_runs = {
                 let mut statement = transaction
                     .prepare(
-                        "SELECT run_id, launch_gate_state
+                        "SELECT run_id, status, launch_gate_state, policy_code, failure_stage
                          FROM agent_runs
                          WHERE project_id = ?1 AND status IN ('starting', 'running')
                          ORDER BY run_id",
@@ -3432,7 +3619,13 @@ impl<'db> AgentRunRepository<'db> {
                     .map_err(database_error("prepare project interrupted agent runs"))?;
                 let rows = statement
                     .query_map([&project.project_id], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, AgentRunStatus>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
                     })
                     .map_err(database_error("query project interrupted agent runs"))?
                     .collect::<Result<Vec<_>, _>>()
@@ -3440,7 +3633,36 @@ impl<'db> AgentRunRepository<'db> {
                 rows
             };
 
-            for (run_id, gate_state) in active_runs {
+            for (run_id, run_status, gate_state, policy_code, failure_stage) in active_runs {
+                if confirmed_pending_marker_ids.contains(&run_id)
+                    && !(run_status == AgentRunStatus::Starting && gate_state == "pending")
+                {
+                    return Err(AppError::Validation {
+                        field: "launch_gate_state",
+                        message: "pending marker evidence changed phase during recovery",
+                    });
+                }
+                if confirmed_release_requested_ids.contains(&run_id)
+                    && gate_state != "release_requested"
+                {
+                    return Err(AppError::Validation {
+                        field: "launch_gate_state",
+                        message: "release-requested marker evidence changed phase during recovery",
+                    });
+                }
+                if run_status == AgentRunStatus::Starting && gate_state == "pending" {
+                    let evidence_is_empty = policy_code.is_none() && failure_stage.is_none();
+                    let evidence_is_exact = policy_code.as_deref()
+                        == Some(PolicyViolationCode::NativeGateFailed.as_str())
+                        && failure_stage.as_deref()
+                            == Some(PolicyViolationStage::PostMarker.as_str());
+                    if !evidence_is_empty && !evidence_is_exact {
+                        return Err(AppError::Validation {
+                            field: "policy_violation",
+                            message: "pending run carries incomplete or conflicting policy evidence",
+                        });
+                    }
+                }
                 let linked_events = {
                     let mut statement = transaction
                         .prepare(
@@ -3467,7 +3689,34 @@ impl<'db> AgentRunRepository<'db> {
                         .map_err(database_error("read project recovery events"))?;
                     rows
                 };
-                let execution_unknown = marker_confirmed_run_ids.contains(&run_id)
+                let pending_marker_policy_evidence = run_status == AgentRunStatus::Starting
+                    && gate_state == "pending"
+                    && (confirmed_pending_marker_ids.contains(&run_id)
+                        || (policy_code.as_deref()
+                            == Some(PolicyViolationCode::NativeGateFailed.as_str())
+                            && failure_stage.as_deref()
+                                == Some(PolicyViolationStage::PostMarker.as_str())));
+                if pending_marker_policy_evidence {
+                    let invalid_interventions = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM interventions
+                             WHERE project_id = ?1 AND agent_run_id = ?2
+                               AND status <> 'reserved'",
+                            params![&project.project_id, run_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(database_error(
+                            "validate pending-marker recovery interventions",
+                        ))?;
+                    if invalid_interventions != 0 {
+                        return Err(AppError::Validation {
+                            field: "intervention_status",
+                            message: "pending-marker recovery requires reserved interventions",
+                        });
+                    }
+                }
+                let execution_unknown = (gate_state == "release_requested"
+                    && confirmed_release_requested_ids.contains(&run_id))
                     || gate_state == "released"
                     || linked_events
                         .iter()
@@ -3484,14 +3733,24 @@ impl<'db> AgentRunRepository<'db> {
                         message: "linked event is not in the expected startup recovery state",
                     });
                 }
-                let recovery_reason = if execution_unknown {
+                let pending_marker_reason = format!(
+                    "policy_blocked:{}",
+                    PolicyViolationCode::NativeGateFailed.as_str()
+                );
+                let recovery_reason = if pending_marker_policy_evidence {
+                    &pending_marker_reason
+                } else if execution_unknown {
                     &execution_unknown_reason
                 } else {
                     &pre_marker_reason
                 };
 
                 for (event_id, event_status, attempts) in linked_events {
-                    let (status, not_before, completed_at) = if execution_unknown
+                    let (status, not_before, completed_at) = if pending_marker_policy_evidence
+                        && event_status == EventStatus::InFlight
+                    {
+                        (EventStatus::DeadLetter, None, Some(finished_at))
+                    } else if execution_unknown
                         && matches!(event_status, EventStatus::InFlight | EventStatus::Dispatched)
                     {
                         (
@@ -3547,7 +3806,7 @@ impl<'db> AgentRunRepository<'db> {
                     }
                 }
 
-                let intervention_statuses = if execution_unknown {
+                let intervention_statuses = if execution_unknown || pending_marker_policy_evidence {
                     "status = 'reserved'"
                 } else {
                     "status IN ('reserved', 'applied')"
@@ -3569,13 +3828,16 @@ impl<'db> AgentRunRepository<'db> {
                     .execute(
                         "UPDATE agent_runs
                          SET status = 'failed', finished_at = ?1, last_error = ?2,
-                             launch_gate_state = ?3
-                         WHERE project_id = ?4 AND run_id = ?5
+                             launch_gate_state = ?3,
+                             policy_code = CASE WHEN ?4 THEN 'native_gate_failed' ELSE policy_code END,
+                             failure_stage = CASE WHEN ?4 THEN 'post_marker' ELSE failure_stage END
+                         WHERE project_id = ?5 AND run_id = ?6
                            AND status IN ('starting', 'running')",
                         params![
                             finished_at,
                             recovery_reason,
                             final_gate,
+                            pending_marker_policy_evidence,
                             &project.project_id,
                             run_id,
                         ],
@@ -3951,6 +4213,33 @@ impl<'db> AgentRunRepository<'db> {
         )
     }
 
+    /// Conservatively finalize a newly bound run when a durable marker is
+    /// already present before any child is created. The marker is evidence,
+    /// not proof that this run requested release, so this transition accepts
+    /// only the original Starting/pending binding state.
+    pub fn finish_pending_marker_policy_failure(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+        violation: &PolicyViolation,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_and_resolve_events_inner(
+            project_id,
+            run_id,
+            AgentRunStatus::Failed,
+            finished_at,
+            None,
+            Some("pre-existing launch marker blocked a pending run"),
+            EventResolution::PolicyBlocked {
+                code: violation.code,
+                stage: violation.stage,
+            },
+            false,
+            AgentRunFinalizationPhase::PendingMarkerPolicy,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish_and_resolve_events_inner(
         &self,
@@ -4008,10 +4297,16 @@ impl<'db> AgentRunRepository<'db> {
                 message: "agent run belongs to another project",
             });
         }
-        if !matches!(
-            current_status,
-            AgentRunStatus::Starting | AgentRunStatus::Running
-        ) {
+        let status_matches = match phase {
+            AgentRunFinalizationPhase::PendingMarkerPolicy => {
+                current_status == AgentRunStatus::Starting
+            }
+            _ => matches!(
+                current_status,
+                AgentRunStatus::Starting | AgentRunStatus::Running
+            ),
+        };
+        if !status_matches {
             return Err(AppError::Validation {
                 field: "status",
                 message: "agent run is not active",
@@ -4020,11 +4315,13 @@ impl<'db> AgentRunRepository<'db> {
         let expected_gate = match phase {
             AgentRunFinalizationPhase::Generic => "released",
             AgentRunFinalizationPhase::MarkerFailure => "release_requested",
+            AgentRunFinalizationPhase::PendingMarkerPolicy => "pending",
             AgentRunFinalizationPhase::PreRelease => "pending_or_release_requested",
         };
         let gate_matches = match phase {
             AgentRunFinalizationPhase::Generic => gate_state == "released",
             AgentRunFinalizationPhase::MarkerFailure => gate_state == "release_requested",
+            AgentRunFinalizationPhase::PendingMarkerPolicy => gate_state == "pending",
             AgentRunFinalizationPhase::PreRelease => {
                 matches!(gate_state.as_str(), "pending" | "release_requested")
             }
@@ -4066,7 +4363,9 @@ impl<'db> AgentRunRepository<'db> {
             AgentRunFinalizationPhase::Generic => linked_events
                 .iter()
                 .all(|(_, event_status, _)| *event_status == EventStatus::Dispatched),
-            AgentRunFinalizationPhase::MarkerFailure | AgentRunFinalizationPhase::PreRelease => {
+            AgentRunFinalizationPhase::MarkerFailure
+            | AgentRunFinalizationPhase::PendingMarkerPolicy
+            | AgentRunFinalizationPhase::PreRelease => {
                 linked_events
                     .iter()
                     .all(|(_, event_status, _)| *event_status == EventStatus::InFlight)
@@ -4077,6 +4376,23 @@ impl<'db> AgentRunRepository<'db> {
                 field: "event_status",
                 message: "linked events are not in the expected finalization phase",
             });
+        }
+
+        if phase == AgentRunFinalizationPhase::PendingMarkerPolicy {
+            let non_reserved_interventions = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM interventions
+                     WHERE project_id = ?1 AND agent_run_id = ?2 AND status <> 'reserved'",
+                    params![project_id, run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(database_error("validate pending-marker interventions"))?;
+            if non_reserved_interventions != 0 {
+                return Err(AppError::Validation {
+                    field: "intervention_status",
+                    message: "pending-marker interventions must remain reserved",
+                });
+            }
         }
 
         let bounded_run_error = match &resolution {
@@ -4097,7 +4413,9 @@ impl<'db> AgentRunRepository<'db> {
         };
         let expected_event_status = match phase {
             AgentRunFinalizationPhase::Generic => EventStatus::Dispatched,
-            AgentRunFinalizationPhase::MarkerFailure | AgentRunFinalizationPhase::PreRelease => {
+            AgentRunFinalizationPhase::MarkerFailure
+            | AgentRunFinalizationPhase::PendingMarkerPolicy
+            | AgentRunFinalizationPhase::PreRelease => {
                 EventStatus::InFlight
             }
         };

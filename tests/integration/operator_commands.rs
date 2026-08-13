@@ -29,6 +29,10 @@ use pueue_agent::{
 use serde_json::json;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
+
 const CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
 
 #[test]
@@ -840,6 +844,17 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn runner(&self) -> AgentRunner {
+        AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            execution_policy_fixture::resolved_policy(
+                self.temp.path(),
+                &[("project-a", self.project().root_path.as_path(), std::path::Path::new("codex"))],
+            ),
+        )
+    }
+
     fn event(&self, kind: EventKind, dedup_key: &str) -> i64 {
         EventRepository::new(&self.db)
             .insert_idempotent(&NewEvent::new(
@@ -1366,9 +1381,7 @@ async fn pause_prevents_new_agent_claims_and_automatic_termination_until_resume(
     let mut daemon = Daemon::new(
         harness.db.clone(),
         pueue.clone(),
-        AgentRunner::new(AgentRunnerConfig::for_tests(
-            harness.temp.path().join("agent.log"),
-        )),
+        harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
             lease_seconds: 60,

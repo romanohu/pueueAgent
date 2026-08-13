@@ -3,7 +3,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -22,6 +22,13 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
+
+#[cfg(unix)]
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
 
 #[derive(Clone)]
 struct FakePueue {
@@ -110,6 +117,14 @@ impl DaemonHarness {
         self.temp.path().join(project_id)
     }
 
+    fn registered_root(&self, project_id: &str) -> PathBuf {
+        ProjectRepository::new(&self.db)
+            .find_by_id(project_id)
+            .unwrap()
+            .unwrap()
+            .root_path
+    }
+
     fn register_project(&self, project_id: &str, group: &str, program: &str) {
         self.register_project_with_agent(project_id, group, program, &["{prompt}"], 1);
     }
@@ -194,13 +209,38 @@ max_agent_runs = 10
         self.daemon_at(self.now)
     }
 
+    fn runner(&self) -> AgentRunner {
+        let projects = ProjectRepository::new(&self.db).list_all().unwrap();
+        let owned = projects
+            .iter()
+            .map(|project| {
+                (
+                    project.project_id.clone(),
+                    project.root_path.clone(),
+                    execution_policy_fixture::prepare_configured_program(
+                        self.temp.path(),
+                        &project.project_id,
+                        &project.config_path,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let borrowed = owned
+            .iter()
+            .map(|(project_id, root, program)| (project_id.as_str(), root.as_path(), program.as_path()))
+            .collect::<Vec<_>>();
+        AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            execution_policy_fixture::resolved_policy(self.temp.path(), &borrowed),
+        )
+    }
+
     fn daemon_at(&self, now: i64) -> Daemon<FakePueue> {
         Daemon::new(
             self.db.clone(),
             self.fake_pueue.clone(),
-            AgentRunner::new(AgentRunnerConfig::for_tests(
-                self.temp.path().join("agent.log"),
-            )),
+            self.runner(),
             DaemonConfig {
                 interval: Duration::from_millis(10),
                 lease_seconds: 60,
@@ -313,6 +353,32 @@ max_agent_runs = 10
         .expect("agent should start");
     }
 
+    #[cfg(unix)]
+    async fn wait_for_native_dispatch(&self, event_id: i64) {
+        // Native lifecycle readiness is production-bounded at 30 seconds. Give
+        // the scheduler and SQLite status observation a small margin without
+        // including this setup in the shutdown-deadline measurement below.
+        let setup_timeout = Duration::from_secs(35);
+        if tokio::time::timeout(setup_timeout, async {
+            while self.event_status(event_id) != EventStatus::Dispatched {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            let event_status = self.event_status(event_id);
+            let run = AgentRunRepository::new(&self.db)
+                .find_active_by_project("project-a")
+                .unwrap();
+            panic!(
+                "native dispatch setup exceeded {setup_timeout:?}: event_status={event_status:?}, run_status={:?}, launch_gate_state={:?}",
+                run.as_ref().map(|run| &run.status),
+                run.as_ref().map(|run| run.launch_gate_state.as_str()),
+            );
+        }
+    }
+
     fn count(&self, table: &str) -> i64 {
         self.db
             .connect()
@@ -353,9 +419,9 @@ max_agent_runs = 10
                 (status == AgentRunStatus::Running).then_some(42_424),
                 status,
                 self.now - 10,
-                self.temp
-                    .path()
-                    .join(format!("{project_id}-interrupted.log")),
+                self.registered_root(project_id).join(format!(
+                    ".pueue-agent/logs/agent-190-{primary_event_id}.log"
+                )),
                 AgentContextMode::Fresh,
                 None,
                 vec![primary_event_id.to_string()],
@@ -463,7 +529,8 @@ async fn daemon_run_once_invokes_reconciliation_detection_termination_and_schedu
     assert_eq!(harness.incident_count(), 1);
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
     assert_eq!(harness.agent_run_count(), 1);
-    assert_eq!(harness.event_status(scheduled), EventStatus::Completed);
+    assert_eq!(harness.event_status(scheduled), EventStatus::Dispatched);
+    assert_eq!(report.finished_agents, 0);
 }
 
 #[tokio::test]
@@ -559,15 +626,13 @@ async fn daemon_shutdown_bounds_long_running_child_agent_and_marks_it_terminal()
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
-        AgentRunner::new(AgentRunnerConfig::for_tests(
-            harness.temp.path().join("agent.log"),
-        )),
+        harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
             lease_seconds: 60,
             claim_limit: 100,
             now_override: Some(harness.now),
-            shutdown_grace_period: Duration::from_millis(100),
+            shutdown_grace_period: Duration::from_secs(3),
         },
     );
     let shutdown = CancellationToken::new();
@@ -578,7 +643,7 @@ async fn daemon_shutdown_bounds_long_running_child_agent_and_marks_it_terminal()
 
     harness.wait_for_active_agent().await;
     shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(2), join)
+    tokio::time::timeout(Duration::from_secs(10), join)
         .await
         .expect("daemon should not hang indefinitely on a long-running child")
         .expect("daemon task should not panic")
@@ -618,9 +683,7 @@ async fn daemon_shutdown_retains_handle_when_finalizer_exhausts_grace() {
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
-        AgentRunner::new(AgentRunnerConfig::for_tests(
-            harness.temp.path().join("agent.log"),
-        )),
+        harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
             lease_seconds: 60,
@@ -659,6 +722,133 @@ async fn daemon_shutdown_retains_handle_when_finalizer_exhausts_grace() {
 }
 
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_shutdown_database_lock_respects_global_deadline_and_retains_terminal_outcome() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let event_id = harness.enqueue(EventKind::DeepCheck, "project-a", "shutdown-database-lock");
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        harness.runner(),
+        DaemonConfig {
+            interval: Duration::from_secs(60),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(1_500),
+        },
+    );
+    let shutdown = CancellationToken::new();
+    let join = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let result = daemon.run(shutdown).await;
+            (daemon, result)
+        }
+    });
+    harness.wait_for_active_agent().await;
+    harness.wait_for_native_dispatch(event_id).await;
+    let lock = harness.db.connect().unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+    let started = Instant::now();
+    shutdown.cancel();
+    let (mut daemon, result) = join.await.expect("daemon task should not panic");
+    assert!(result.is_err());
+    assert!(
+        started.elapsed() < Duration::from_millis(2_500),
+        "SQLite finalization must honor the shared shutdown deadline",
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    drop(lock);
+
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_shutdown_attempts_later_agent_after_first_finalizer_persists() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let event_a = harness.enqueue(EventKind::DeepCheck, "project-a", "shutdown-round-robin-a");
+    let event_b = harness.enqueue(EventKind::DeepCheck, "project-b", "shutdown-round-robin-b");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_project_a_shutdown_finalizer
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.project_id = 'project-a' AND NEW.status = 'timed_out'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected persistent project-a finalizer failure');
+             END;",
+        )
+        .unwrap();
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        harness.runner(),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(100),
+        },
+    );
+    daemon.run_once().await.unwrap();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(5), daemon.run(shutdown))
+        .await
+        .expect("all agent owners must receive a shutdown attempt");
+    assert!(
+        started.elapsed() < Duration::from_millis(750),
+        "global shutdown grace must bound the whole retained-owner pass"
+    );
+    assert!(result.is_err());
+    assert_eq!(harness.event_status(event_a), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(event_b), EventStatus::Dispatched);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2,
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() {
     let harness = DaemonHarness::new();
@@ -686,15 +876,13 @@ async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() 
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
-        AgentRunner::new(AgentRunnerConfig::for_tests(
-            harness.temp.path().join("agent.log"),
-        )),
+        harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
             lease_seconds: 60,
             claim_limit: 100,
             now_override: Some(harness.now),
-            shutdown_grace_period: Duration::from_millis(500),
+            shutdown_grace_period: Duration::from_secs(3),
         },
     );
     let shutdown = CancellationToken::new();
@@ -717,7 +905,7 @@ async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() 
     let drop_trigger = tokio::spawn({
         let db = harness.db.clone();
         async move {
-            tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     if !process_exists(pid) {
                         break;
@@ -736,7 +924,7 @@ async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() 
     });
 
     shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(2), join)
+    tokio::time::timeout(Duration::from_secs(4), join)
         .await
         .expect("daemon should retry the transient shutdown finalizer failure")
         .expect("daemon task should not panic")
@@ -752,7 +940,7 @@ async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() 
 }
 
 #[tokio::test]
-async fn daemon_restores_runner_after_unresolved_scheduler_spawn_error() {
+async fn daemon_retains_and_retries_unresolved_bound_cleanup_after_scheduler_error() {
     let harness = DaemonHarness::new();
     harness.register_project_with_agent(
         "project-a",
@@ -797,7 +985,370 @@ async fn daemon_restores_runner_after_unresolved_scheduler_spawn_error() {
         )
         .unwrap();
     let second = daemon.run_once().await;
-    assert!(second.is_ok(), "runner should be restored after scheduler error");
+    assert!(second.is_ok(), "runner and cleanup owner should survive scheduler error");
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_shutdown_keeps_bound_cleanup_after_repeated_finalizer_failure() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "bound-cleanup-shutdown");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_bound_cleanup_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_bound_cleanup_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected bound cleanup finalizer failure');
+             END;",
+        )
+        .unwrap();
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        harness.runner(),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(150),
+        },
+    );
+
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    assert!(tokio::time::timeout(Duration::from_secs(3), daemon.run(shutdown))
+        .await
+        .expect("bound cleanup shutdown retry must remain bounded")
+        .is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_some());
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER reject_bound_cleanup_dispatch_ack;
+             DROP TRIGGER reject_bound_cleanup_finalizer;",
+        )
+        .unwrap();
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project("project-a")
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_error_drain_preserves_started_and_bound_cleanup_owners_together() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let started_event = harness.enqueue(EventKind::TaskFinished, "project-a", "mixed-started");
+    let cleanup_event = harness.enqueue(EventKind::TaskFailed, "project-b", "mixed-cleanup");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_project_b_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.project_id = 'project-b' AND NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_project_b_cleanup_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.project_id = 'project-b'
+                  AND NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected cleanup finalizer failure');
+             END;",
+        )
+        .unwrap();
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        harness.runner(),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_secs(5),
+        },
+    );
+    let drop_trigger = tokio::spawn({
+        let db = harness.db.clone();
+        async move {
+            let pid = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let pid = db
+                        .connect()
+                        .unwrap()
+                        .query_row(
+                            "SELECT pid FROM agent_runs
+                             WHERE project_id = 'project-b' AND pid IS NOT NULL",
+                            [],
+                            |row| row.get::<_, i32>(0),
+                        )
+                        .ok();
+                    if let Some(pid) = pid {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("project-b cleanup child should start");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while process_exists(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("project-b cleanup child should terminate");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            db.connect()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_project_b_cleanup_finalizer;")
+                .unwrap();
+        }
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        daemon.run(CancellationToken::new()),
+    )
+    .await
+    .expect("daemon error drain must remain bounded");
+    assert!(result.is_err(), "the original scheduler error must remain visible");
+    drop_trigger.await.unwrap();
+    assert_eq!(harness.event_status(started_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(cleanup_event), EventStatus::DeadLetter);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_cleanup_queue_retries_each_owner_without_loss_across_ticks() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let event_a = harness.enqueue(EventKind::TaskFailed, "project-a", "cleanup-queue-a");
+    let event_b = harness.enqueue(EventKind::TaskFailed, "project-b", "cleanup-queue-b");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_cleanup_queue_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_cleanup_queue_a_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.project_id = 'project-a'
+                  AND NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected project-a cleanup failure');
+             END;
+             CREATE TRIGGER reject_cleanup_queue_b_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.project_id = 'project-b'
+                  AND NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected project-b cleanup failure');
+             END;",
+        )
+        .unwrap();
+    let mut daemon = harness.daemon();
+
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(event_a), EventStatus::InFlight);
+    assert_eq!(harness.event_status(event_b), EventStatus::InFlight);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_cleanup_queue_b_finalizer;")
+        .unwrap();
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(event_a), EventStatus::InFlight);
+    assert_eq!(harness.event_status(event_b), EventStatus::DeadLetter);
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_cleanup_queue_a_finalizer;")
+        .unwrap();
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(event_a), EventStatus::DeadLetter);
+    assert_eq!(harness.event_status(event_b), EventStatus::DeadLetter);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_poll_attempts_cleanup_when_an_agent_finalizer_fails_in_the_same_tick() {
+    let harness = DaemonHarness::new();
+    let release_path = harness.temp.path().join("cross-poll-agent-release");
+    let release_text = release_path.to_str().unwrap();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["--wait-for-release", release_text],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let agent_event = harness.enqueue(EventKind::TaskFinished, "project-a", "cross-poll-agent");
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(agent_event), EventStatus::Dispatched);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !PathBuf::from(format!("{}.ready", release_path.display())).exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("project-a fixture should report readiness");
+
+    let cleanup_event = harness.enqueue(EventKind::TaskFailed, "project-b", "cross-poll-cleanup");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_cross_poll_agent_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.project_id = 'project-a'
+                  AND NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected project-a finalizer failure');
+             END;
+             CREATE TRIGGER reject_cross_poll_cleanup_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.project_id = 'project-b' AND NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected project-b dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_cross_poll_cleanup_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.project_id = 'project-b'
+                  AND NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected project-b cleanup failure');
+             END;",
+        )
+        .unwrap();
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(agent_event), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(cleanup_event), EventStatus::InFlight);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_cross_poll_cleanup_finalizer;")
+        .unwrap();
+    fs::write(&release_path, b"release").unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(agent_event), EventStatus::Dispatched);
+    assert_eq!(
+        harness.event_status(cleanup_event),
+        EventStatus::DeadLetter,
+        "a failing agent finalizer must not starve a healthy cleanup owner",
+    );
 }
 
 #[cfg(unix)]
@@ -829,7 +1380,7 @@ async fn daemon_retains_started_agent_when_a_later_project_scheduler_error_occur
     let first = daemon.run_once().await;
     assert!(first.is_err());
     assert_eq!(harness.event_status(successful_event), EventStatus::Dispatched);
-    assert_eq!(harness.event_status(failed_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(failed_event), EventStatus::DeadLetter);
     assert_eq!(
         harness
             .db
@@ -845,8 +1396,12 @@ async fn daemon_retains_started_agent_when_a_later_project_scheduler_error_occur
         1
     );
 
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    daemon.run_once().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while harness.event_status(successful_event) == EventStatus::Dispatched {
+        assert!(Instant::now() < deadline, "retained agent did not reach terminal state");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        daemon.run_once().await.unwrap();
+    }
     assert_eq!(harness.event_status(successful_event), EventStatus::Completed);
     assert_eq!(
         harness
@@ -891,15 +1446,15 @@ async fn daemon_run_drains_started_agent_before_returning_scheduler_error() {
 
     let mut daemon = harness.daemon();
     let result = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(15),
         daemon.run(CancellationToken::new()),
     )
     .await
     .expect("daemon should drain retained agents before returning");
     let error = result.expect_err("later scheduler failure should remain visible");
-    assert!(error.to_string().contains("spawn agent process"));
+    assert!(error.to_string().contains("policy_blocked"));
     assert_eq!(harness.event_status(successful_event), EventStatus::RetryWait);
-    assert_eq!(harness.event_status(failed_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(failed_event), EventStatus::DeadLetter);
     assert_eq!(
         harness
             .db
@@ -966,6 +1521,228 @@ async fn daemon_restart_recovers_expired_claims_without_requiring_a_new_callback
         .unwrap();
     assert_eq!(event.status, EventStatus::Pending);
     assert_eq!(event.lease_until, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_recovery_confirms_release_marker_through_project_root_descriptor() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "descriptor-marker");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let project_root = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap()
+        .root_path;
+    let log_path = project_root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let runs = AgentRunRepository::new(&harness.db);
+    let run = runs
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 42_424, harness.now - 5)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    fs::write(&marker_path, b"authorized\n").unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    let gate: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(gate, "released");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_recovery_closes_pending_marker_evidence_crash_window() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "pending-marker-crash-window");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let project_root = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap()
+        .root_path;
+    let log_path = project_root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    fs::write(&marker_path, b"authorized\n").unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(report.requeued_agent_events, 0);
+    let event = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.attempts, 0);
+    assert!(marker_path.exists());
+    let state: (AgentRunStatus, String, Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, launch_gate_state, policy_code, failure_stage
+             FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Failed,
+            "failed".to_owned(),
+            Some("native_gate_failed".to_owned()),
+            Some("post_marker".to_owned()),
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_recovery_rejects_symlinked_log_directory_without_database_mutation() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "symlinked-log-dir");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let project_root = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap()
+        .root_path;
+    let log_path = project_root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let runs = AgentRunRepository::new(&harness.db);
+    let run = runs
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 42_424, harness.now - 5)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    let mut daemon = harness.daemon();
+    let logs = harness.root("project-a").join(".pueue-agent/logs");
+    let retained_logs = harness.root("project-a").join(".pueue-agent/logs-retained");
+    fs::rename(&logs, &retained_logs).unwrap();
+    symlink(&retained_logs, &logs).unwrap();
+
+    assert!(daemon.run_once().await.is_err());
+
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    let state: (AgentRunStatus, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Running, "release_requested".to_owned()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_recovery_rejects_replaced_project_root_without_database_mutation() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "replaced-root");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let root = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap()
+        .root_path;
+    let log_path = root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let runs = AgentRunRepository::new(&harness.db);
+    let run = runs
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 42_424, harness.now - 5)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    let mut daemon = harness.daemon();
+    let config = fs::read(root.join(".pueue-agent/config.toml")).unwrap();
+    let retained_root = harness.temp.path().join("project-a-retained");
+    fs::rename(&root, &retained_root).unwrap();
+    fs::create_dir_all(root.join(".pueue-agent")).unwrap();
+    fs::write(root.join(".pueue-agent/config.toml"), config).unwrap();
+
+    assert!(daemon.run_once().await.is_err());
+
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    let state: (AgentRunStatus, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Running, "release_requested".to_owned()));
 }
 
 #[tokio::test]
@@ -1099,7 +1876,9 @@ async fn first_daemon_cycle_recovers_persisted_runs_and_only_their_claimed_event
                 None,
                 AgentRunStatus::Starting,
                 harness.now - 10,
-                harness.temp.path().join("project-a-starting.log"),
+                harness.registered_root("project-a").join(format!(
+                    ".pueue-agent/logs/agent-190-{starting_event}.log"
+                )),
             ),
             &[starting_event],
         )
@@ -1113,7 +1892,9 @@ async fn first_daemon_cycle_recovers_persisted_runs_and_only_their_claimed_event
                 None,
                 AgentRunStatus::Running,
                 harness.now - 10,
-                harness.temp.path().join("project-b-running.log"),
+                harness.registered_root("project-b").join(format!(
+                    ".pueue-agent/logs/agent-190-{running_event}.log"
+                )),
             ),
             &[running_event],
         )
@@ -1179,7 +1960,9 @@ async fn startup_recovery_is_atomic_and_retried_after_a_database_failure() {
                 None,
                 AgentRunStatus::Starting,
                 harness.now - 10,
-                harness.temp.path().join("atomic-recovery.log"),
+                harness.registered_root("project-a").join(format!(
+                    ".pueue-agent/logs/agent-190-{event_id}.log"
+                )),
             ),
             &[event_id],
         )
@@ -1246,7 +2029,9 @@ async fn startup_recovery_loads_disabled_project_config() {
                 None,
                 AgentRunStatus::Starting,
                 harness.now - 10,
-                harness.temp.path().join("project-b-disabled.log"),
+                harness.registered_root("project-b").join(format!(
+                    ".pueue-agent/logs/agent-190-{event_id}.log"
+                )),
             ),
             &[event_id],
         )
@@ -1274,11 +2059,14 @@ async fn startup_recovery_rejects_project_identity_mismatch_before_mutation() {
                 None,
                 AgentRunStatus::Starting,
                 harness.now - 10,
-                harness.temp.path().join("identity-mismatch.log"),
+                harness.registered_root("project-a").join(format!(
+                    ".pueue-agent/logs/agent-190-{event_id}.log"
+                )),
             ),
             &[event_id],
         )
         .unwrap();
+    let mut daemon = harness.daemon();
     let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
     fs::write(
@@ -1287,7 +2075,6 @@ async fn startup_recovery_rejects_project_identity_mismatch_before_mutation() {
     )
     .unwrap();
 
-    let mut daemon = harness.daemon();
     assert!(daemon.run_once().await.is_err());
     let unchanged_event = EventRepository::new(&harness.db)
         .find_by_id(event_id)
@@ -1322,7 +2109,9 @@ async fn startup_recovery_commits_projects_independently_and_retries_failed_proj
             None,
             AgentRunStatus::Starting,
             harness.now - 10,
-            harness.temp.path().join("project-a-recovery.log"),
+            harness.registered_root("project-a").join(format!(
+                ".pueue-agent/logs/agent-190-{first_event}.log"
+            )),
         ),
         &[first_event],
     )
@@ -1334,7 +2123,9 @@ async fn startup_recovery_commits_projects_independently_and_retries_failed_proj
             None,
             AgentRunStatus::Starting,
             harness.now - 10,
-            harness.temp.path().join("project-b-recovery.log"),
+            harness.registered_root("project-b").join(format!(
+                ".pueue-agent/logs/agent-190-{second_event}.log"
+            )),
         ),
         &[second_event],
     )
@@ -1382,7 +2173,9 @@ async fn startup_recovery_runs_before_the_first_scheduling_pass() {
                 None,
                 AgentRunStatus::Running,
                 harness.now - 10,
-                harness.temp.path().join("restart-dispatch.log"),
+                harness.registered_root("project-a").join(format!(
+                    ".pueue-agent/logs/agent-190-{event_id}.log"
+                )),
             ),
             &[event_id],
         )
