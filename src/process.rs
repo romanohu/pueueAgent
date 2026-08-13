@@ -10,7 +10,7 @@ use std::{
     fmt,
     io::{Read, Write},
     ops::BitOr,
-    sync::{Mutex, MutexGuard},
+    sync::{mpsc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -342,34 +342,51 @@ pub const HELPER_READY_RECORD: [u8; 8] = *b"PAER\x01\x00\x00\x00";
 const HELPER_FAILED_RECORD: [u8; 8] = *b"PAER\x01\x01\x00\x00";
 #[cfg(unix)]
 const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const HELPER_CLEANUP_INLINE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const HELPER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+#[cfg(unix)]
+static HELPER_REAPER: OnceLock<mpsc::Sender<Child>> = OnceLock::new();
 
 /// A successfully bootstrapped hidden helper. The helper currently exits
 /// after readiness; retaining this handle lets callers reap that lifecycle.
 #[cfg(unix)]
 pub struct ValidatedHelper {
-    child: Child,
+    child: Option<Child>,
+    reaper: mpsc::Sender<Child>,
 }
 
 #[cfg(unix)]
 impl ValidatedHelper {
-    pub fn id(&self) -> u32 { self.child.id() }
+    pub fn id(&self) -> u32 {
+        self.child.as_ref().expect("validated helper child is present").id()
+    }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcessLaunchError> {
-        self.child.try_wait().map_err(|_| ProcessLaunchError::Io)
+        self.child
+            .as_mut()
+            .ok_or(ProcessLaunchError::Io)?
+            .try_wait()
+            .map_err(|_| ProcessLaunchError::Io)
     }
 
     pub fn wait(&mut self) -> Result<ExitStatus, ProcessLaunchError> {
-        self.child.wait().map_err(|_| ProcessLaunchError::Io)
+        self.child
+            .as_mut()
+            .ok_or(ProcessLaunchError::Io)?
+            .wait()
+            .map_err(|_| ProcessLaunchError::Io)
     }
 }
 
 #[cfg(unix)]
 impl Drop for ValidatedHelper {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
+        if let Some(child) = self.child.take() {
+            cleanup_helper(child, &self.reaper);
         }
-        let _ = self.child.wait();
     }
 }
 
@@ -490,6 +507,101 @@ fn revalidate_launcher_before_spawn(
         .map_err(|_| ProcessLaunchError::LauncherRejected)
 }
 
+#[cfg(unix)]
+fn helper_reaper() -> Result<mpsc::Sender<Child>, ProcessLaunchError> {
+    if let Some(sender) = HELPER_REAPER.get() {
+        return Ok(sender.clone());
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("pueue-agent-helper-reaper".to_owned())
+        .spawn(move || helper_reaper_loop(receiver))
+        .map_err(|_| ProcessLaunchError::Spawn)?;
+    if HELPER_REAPER.set(sender.clone()).is_err() {
+        return HELPER_REAPER
+            .get()
+            .cloned()
+            .ok_or(ProcessLaunchError::Spawn);
+    }
+    Ok(sender)
+}
+
+#[cfg(unix)]
+fn helper_reaper_loop(receiver: mpsc::Receiver<Child>) {
+    let mut children: Vec<Child> = Vec::new();
+    loop {
+        if children.is_empty() {
+            match receiver.recv() {
+                Ok(child) => children.push(child),
+                Err(_) => return,
+            }
+        } else {
+            match receiver.recv_timeout(HELPER_REAPER_POLL_INTERVAL) {
+                Ok(child) => children.push(child),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Keep ownership until all already-submitted children have
+                    // been reaped, even during process teardown.
+                }
+            }
+        }
+        while let Ok(child) = receiver.try_recv() {
+            children.push(child);
+        }
+
+        let mut index = 0;
+        while index < children.len() {
+            // A failed status probe must not skip termination. Both operations
+            // are nonblocking syscalls on supported Unix platforms.
+            let _ = children[index].kill();
+            match children[index].try_wait() {
+                Ok(Some(_)) => {
+                    children.swap_remove(index);
+                }
+                Ok(None) | Err(_) => index += 1,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_helper(mut child: Child, reaper: &mpsc::Sender<Child>) {
+    let deadline = Instant::now()
+        .checked_add(HELPER_CLEANUP_INLINE_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) | Err(_) => {
+                // Always attempt termination, including after a failed probe.
+                let _ = child.kill();
+            }
+        }
+        if Instant::now() >= deadline {
+            // The receiver is owned by a process-lifetime thread initialized
+            // before any helper spawn. Sending is unbounded and nonblocking;
+            // the thread retains Child ownership and polls waitpid until reap.
+            let _ = reaper.send(child);
+            return;
+        }
+        std::thread::sleep(HELPER_REAPER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn prepare_bootstrap_rights(
+    guard: &ProcessLaunchGuard,
+    rights: &[OwnedFd],
+) -> Result<(), BootstrapError> {
+    let _ = &guard.0;
+    for right in rights {
+        set_close_on_exec(right.as_raw_fd())?;
+        prove_close_on_exec(right.as_raw_fd())?;
+    }
+    Ok(())
+}
+
 /// Start the verified absolute-path helper with only the hidden subcommand in
 /// argv, send its bounded descriptor bootstrap frame, and await its exact
 /// readiness record. This is deliberately a bootstrap-only adapter: it does
@@ -508,8 +620,10 @@ pub fn spawn_validated_helper(
     let verified = launcher
         .verify_identity()
         .map_err(|_| ProcessLaunchError::LauncherRejected)?;
+    let reaper = helper_reaper()?;
 
     let launch_guard = process_launch_guard().map_err(ProcessLaunchError::Bootstrap)?;
+    prepare_bootstrap_rights(&launch_guard, &rights).map_err(ProcessLaunchError::Bootstrap)?;
     let (parent_socket, child_socket) =
         bootstrap_socket_pair(&launch_guard).map_err(ProcessLaunchError::Bootstrap)?;
 
@@ -523,7 +637,7 @@ pub fn spawn_validated_helper(
     // replacement-before-spawn case; a same-UID swap in the tiny path lookup
     // window is the documented boundary until descriptor-bound launch exists.
     revalidate_launcher_before_spawn(launcher)?;
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return Err(ProcessLaunchError::Spawn),
     };
@@ -534,15 +648,15 @@ pub fn spawn_validated_helper(
     let parent_raw = parent_socket.into_raw_fd();
     let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
     if let Err(error) = send_bootstrap_packet(parent_stream.as_raw_fd(), &frame, &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()) {
-        terminate_helper(&mut child);
+        cleanup_helper(child, &reaper);
         return Err(ProcessLaunchError::Bootstrap(error));
     }
     if let Err(error) = read_helper_readiness(&mut parent_stream) {
-        terminate_helper(&mut child);
+        cleanup_helper(child, &reaper);
         return Err(error);
     }
 
-    Ok(ValidatedHelper { child })
+    Ok(ValidatedHelper { child: Some(child), reaper })
 }
 
 #[cfg(not(unix))]
@@ -551,12 +665,6 @@ pub fn spawn_validated_helper(
     _frame: ControlFrame,
     _rights: Vec<()>,
 ) -> Result<(), ()> { Err(()) }
-
-#[cfg(unix)]
-fn terminate_helper(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
 
 #[cfg(unix)]
 fn read_helper_readiness(
@@ -1796,6 +1904,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn parent_rights_are_made_close_on_exec_before_spawn() {
+        let (right, _peer) = pipe_pair();
+        let flags = unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(right.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0,
+        );
+        assert_eq!(unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+
+        let guard = process_launch_guard().unwrap();
+        prepare_bootstrap_rights(&guard, std::slice::from_ref(&right)).unwrap();
+
+        assert_ne!(
+            unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn final_revalidation_rejects_replacement_after_command_construction() {
         let temporary = tempfile::tempdir().unwrap();
         let launcher = temporary.path().join("trusted-launcher");
@@ -2052,11 +2181,43 @@ mod tests {
         ]);
         let child = command.spawn().unwrap();
         let pid = child.id() as libc::pid_t;
-        drop(ValidatedHelper { child });
+        let reaper = helper_reaper().unwrap();
+        let started = Instant::now();
+        drop(ValidatedHelper { child: Some(child), reaper });
+        assert!(started.elapsed() <= HELPER_CLEANUP_INLINE_TIMEOUT + Duration::from_secs(1));
 
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_helper_reaper_owns_and_reaps_transferred_child() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored", "--exact",
+            "process::tests::validated_helper_lifecycle_subprocess", "--nocapture",
+        ]);
+        let child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        helper_reaper().unwrap().send(child).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let probe = unsafe { libc::kill(pid, 0) };
+            if probe == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+                break;
+            }
+            if Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            } else {
+                panic!("helper reaper did not reap before deadline");
+            }
+        }
     }
 
     #[cfg(unix)]

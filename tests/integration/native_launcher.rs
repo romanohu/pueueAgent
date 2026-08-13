@@ -188,6 +188,23 @@ mod unix {
     }
 
     #[test]
+    fn parent_right_without_cloexec_is_prepared_before_helper_spawn() {
+        let temporary = tempdir().unwrap();
+        let (target, root, log) = files(temporary.path());
+        let launch = frame(&target, &root, &log);
+        let (rights, _keepers) = rights(&target, &root, &log);
+        let raw = rights[2].as_raw_fd();
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) }, 0);
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+
+        let (launcher, _) = copy_launcher(temporary.path());
+        let mut helper = spawn_validated_helper(&launcher, launch, rights).unwrap();
+        assert!(helper.wait().unwrap().success());
+    }
+
+    #[test]
     fn identity_and_release_gate_failures_are_bounded_and_redacted() {
         let temporary = tempdir().unwrap();
         let (target, root, log) = files(temporary.path());
