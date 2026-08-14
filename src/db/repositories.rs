@@ -556,6 +556,32 @@ pub struct EventRepository<'db> {
     db: &'db Db,
 }
 
+/// The bounded execution facts attached to an event's most recent project-owned run.
+///
+/// This deliberately mirrors only persisted execution projection columns. It
+/// never selects run input such as argv, environment, prompts, transcripts, or
+/// log output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventExecutionProjection {
+    pub run_id: i64,
+    pub execution_kind: Option<String>,
+    pub executable_path: Option<String>,
+    pub executable_identity: Option<String>,
+    pub policy_code: Option<String>,
+    pub failure_stage: Option<String>,
+}
+
+/// Infer the only policy stage possible for a terminal policy-blocked event
+/// that is proven not to have an agent-run link: scheduler admission rejected
+/// it before binding.
+pub fn inferred_pre_binding_policy_code(event: &Event, has_run_link: bool) -> Option<String> {
+    if event.status != EventStatus::DeadLetter || has_run_link {
+        return None;
+    }
+    let code = event.last_error.as_deref()?.strip_prefix("policy_blocked:")?;
+    is_policy_violation_code(code).then(|| code.to_owned())
+}
+
 impl<'db> EventRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
         Self { db }
@@ -1448,6 +1474,22 @@ impl<'db> EventRepository<'db> {
         project_id: &str,
         event_ids: &[i64],
     ) -> Result<BTreeMap<i64, i64>, AppError> {
+        Ok(self
+            .latest_execution_projections(project_id, event_ids)?
+            .into_iter()
+            .map(|(event_id, projection)| (event_id, projection.run_id))
+            .collect())
+    }
+
+    /// Return the newest execution projection for each supplied event.
+    ///
+    /// All joined relations carry the requested project predicate so a
+    /// colliding foreign event or run cannot contribute diagnostics.
+    pub fn latest_execution_projections(
+        &self,
+        project_id: &str,
+        event_ids: &[i64],
+    ) -> Result<BTreeMap<i64, EventExecutionProjection>, AppError> {
         let mut unique_event_ids = BTreeSet::new();
         for event_id in event_ids {
             if unique_event_ids.len() >= MAX_EVENT_LIST_LIMIT {
@@ -1464,9 +1506,13 @@ impl<'db> EventRepository<'db> {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "SELECT event_id, run_id
+            "SELECT event_id, run_id, execution_kind, executable_path,
+                    executable_identity, policy_code, failure_stage
              FROM (
                  SELECT agent_run_events.event_id, agent_runs.run_id,
+                        agent_runs.execution_kind, agent_runs.executable_path,
+                        agent_runs.executable_identity, agent_runs.policy_code,
+                        agent_runs.failure_stage,
                         ROW_NUMBER() OVER (
                             PARTITION BY agent_run_events.event_id
                             ORDER BY agent_runs.started_at DESC, agent_runs.run_id DESC
@@ -1493,14 +1539,68 @@ impl<'db> EventRepository<'db> {
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(&query)
-            .map_err(database_error("prepare latest event agent run query"))?;
+            .map_err(database_error("prepare latest event execution projection query"))?;
         let rows = statement
             .query_map(params_from_iter(query_values), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    EventExecutionProjection {
+                        run_id: row.get(1)?,
+                        execution_kind: row.get(2)?,
+                        executable_path: row.get(3)?,
+                        executable_identity: row.get(4)?,
+                        policy_code: row.get(5)?,
+                        failure_stage: row.get(6)?,
+                    },
+                ))
             })
-            .map_err(database_error("query latest event agent runs"))?;
+            .map_err(database_error("query latest event execution projections"))?;
         rows.collect::<Result<BTreeMap<_, _>, _>>()
-            .map_err(database_error("read latest event agent runs"))
+            .map_err(database_error("read latest event execution projections"))
+    }
+
+    /// Count terminal policy blocks for this project by their bounded policy
+    /// code. The scheduler writes these errors itself; arbitrary event errors
+    /// do not enter the diagnostic projection.
+    pub fn policy_blocked_counts(
+        &self,
+        project_id: &str,
+    ) -> Result<BTreeMap<String, i64>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT substr(last_error, length('policy_blocked:') + 1), COUNT(*)
+                 FROM events
+                 WHERE project_id = ?1
+                   AND status = 'dead_letter'
+                   AND last_error IN (
+                       'policy_blocked:policy_missing', 'policy_blocked:policy_unreadable',
+                       'policy_blocked:policy_weak_permissions', 'policy_blocked:policy_unknown_field',
+                       'policy_blocked:trusted_path_unsafe', 'policy_blocked:anchor_missing',
+                       'policy_blocked:anchor_replaced', 'policy_blocked:custom_agent_not_enrolled',
+                       'policy_blocked:project_root_executable', 'policy_blocked:unsafe_codex_argument',
+                       'policy_blocked:network_override', 'policy_blocked:environment_name',
+                       'policy_blocked:session_missing', 'policy_blocked:session_not_owned',
+                       'policy_blocked:root_changed', 'policy_blocked:agent_log_unsafe',
+                       'policy_blocked:temp_unsafe', 'policy_blocked:setsid_failed',
+                       'policy_blocked:native_gate_failed', 'policy_blocked:unsupported_platform'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_run_events
+                       WHERE agent_run_events.project_id = events.project_id
+                         AND agent_run_events.event_id = events.event_id
+                   )
+                 GROUP BY substr(last_error, length('policy_blocked:') + 1)
+                 ORDER BY substr(last_error, length('policy_blocked:') + 1)",
+            )
+            .map_err(database_error("prepare policy-blocked event count query"))?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(database_error("query policy-blocked event counts"))?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(database_error("read policy-blocked event counts"))
     }
 
     pub fn latest_run_id(
@@ -3088,10 +3188,13 @@ impl<'db> RunLineageRepository<'db> {
             .filter_map(|lineage| lineage.event_id)
             .collect::<std::collections::BTreeSet<_>>();
         let remaining = limit.saturating_sub(lineages.len());
-        let events = event_repository
-            .recent_events(project_id, limit)?
-            .into_iter()
-            .filter(|event| !selected_primary_event_ids.contains(&event.event_id));
+        let events = event_repository.recent_events(project_id, limit)?;
+        let event_ids = events.iter().map(|event| event.event_id).collect::<Vec<_>>();
+        let linked_events = event_repository.latest_execution_projections(project_id, &event_ids)?;
+        let events = events.into_iter().filter(|event| {
+            !selected_primary_event_ids.contains(&event.event_id)
+                && !linked_events.contains_key(&event.event_id)
+        });
         let mut submissions = if follow {
             let mut page = if let Some(after) = after.get(&0) {
                 let mut page = submission_repository.list_originless_by_project_page_after(
@@ -3139,6 +3242,7 @@ impl<'db> RunLineageRepository<'db> {
         };
         let mut incomplete = Vec::new();
         for event in events {
+            let policy_code = inferred_pre_binding_policy_code(&event, false);
             incomplete.push(RunLineage {
                 event_id: Some(event.event_id),
                 event_kind: Some(event.kind),
@@ -3151,8 +3255,8 @@ impl<'db> RunLineageRepository<'db> {
                 execution_kind: None,
                 executable_path: None,
                 executable_identity: None,
-                policy_code: None,
-                failure_stage: None,
+                failure_stage: policy_code.as_ref().map(|_| "pre_binding".to_owned()),
+                policy_code,
             });
         }
         if follow {
@@ -4709,6 +4813,52 @@ impl<'db> AgentRunRepository<'db> {
         })
     }
 
+    /// Count policy failure evidence by its bounded code and stage for one
+    /// project. Rows with malformed legacy/corrupt text are excluded rather
+    /// than rendered as operator diagnostics.
+    pub fn policy_failure_stage_counts(
+        &self,
+        project_id: &str,
+    ) -> Result<BTreeMap<(String, String), i64>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT policy_code, failure_stage, COUNT(*)
+                 FROM agent_runs
+                 WHERE project_id = ?1
+                   AND policy_code IN (
+                       'policy_missing', 'policy_unreadable', 'policy_weak_permissions',
+                       'policy_unknown_field', 'trusted_path_unsafe', 'anchor_missing',
+                       'anchor_replaced', 'custom_agent_not_enrolled', 'project_root_executable',
+                       'unsafe_codex_argument', 'network_override', 'environment_name',
+                       'session_missing', 'session_not_owned', 'root_changed', 'agent_log_unsafe',
+                       'temp_unsafe', 'setsid_failed', 'native_gate_failed', 'unsupported_platform'
+                   )
+                   AND failure_stage IN (
+                       'startup', 'pre_binding', 'run_bound_pre_marker', 'native_gate',
+                       'post_marker', 'dispatched', 'finalized'
+                   )
+                 GROUP BY policy_code, failure_stage
+                 ORDER BY policy_code, failure_stage",
+            )
+            .map_err(database_error("prepare policy failure stage count query"))?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(database_error("query policy failure stage counts"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read policy failure stage counts"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(code, stage, count)| ((code, stage), count))
+            .collect())
+    }
+
     pub fn list_by_project(
         &self,
         project_id: &str,
@@ -5722,6 +5872,32 @@ const BATCH_JOB_SELECT: &str = "SELECT request_id, job_id, ordinal, kind, argv_j
 
 fn bounded_diagnostic_limit(limit: usize) -> i64 {
     limit.min(MAX_EVENT_LIST_LIMIT) as i64
+}
+
+fn is_policy_violation_code(value: &str) -> bool {
+    matches!(
+        value,
+        "policy_missing"
+            | "policy_unreadable"
+            | "policy_weak_permissions"
+            | "policy_unknown_field"
+            | "trusted_path_unsafe"
+            | "anchor_missing"
+            | "anchor_replaced"
+            | "custom_agent_not_enrolled"
+            | "project_root_executable"
+            | "unsafe_codex_argument"
+            | "network_override"
+            | "environment_name"
+            | "session_missing"
+            | "session_not_owned"
+            | "root_changed"
+            | "agent_log_unsafe"
+            | "temp_unsafe"
+            | "setsid_failed"
+            | "native_gate_failed"
+            | "unsupported_platform"
+    )
 }
 
 fn exists(

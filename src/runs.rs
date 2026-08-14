@@ -10,7 +10,7 @@ use crate::{
     },
     diagnostics::JSON_SCHEMA_VERSION,
     models::Project,
-    output::{bounded_redacted_text, format_state, human_header, human_summary},
+    output::{bounded_execution_path, bounded_redacted_text, format_state, human_header, human_summary},
     AppError,
 };
 
@@ -200,6 +200,7 @@ impl FollowCursor {
 struct RunsReport {
     schema_version: u32,
     project_id: String,
+    root_path: String,
     runs: Vec<RunSummary>,
 }
 
@@ -254,6 +255,8 @@ pub fn render_runs(
         return serde_json::to_string(&RunsReport {
             schema_version: JSON_SCHEMA_VERSION,
             project_id: bounded_redacted_text(&project.project_id),
+            root_path: bounded_execution_path(&project.root_path.to_string_lossy())
+                .unwrap_or_else(|| "[invalid]".to_owned()),
             runs: lineages.iter().map(RunSummary::from).collect(),
         })
         .map_err(|source| AppError::Serialization {
@@ -261,7 +264,7 @@ pub fn render_runs(
             source,
         });
     }
-    Ok(render_human(&project.project_id, &lineages))
+    Ok(render_human(project, &lineages))
 }
 
 pub async fn follow_runs(
@@ -293,10 +296,12 @@ pub async fn follow_runs(
                     serde_json::to_string(&RunsReport {
                         schema_version: JSON_SCHEMA_VERSION,
                         project_id: bounded_redacted_text(&project.project_id),
+                        root_path: bounded_execution_path(&project.root_path.to_string_lossy())
+                            .unwrap_or_else(|| "[invalid]".to_owned()),
                         runs: fresh.iter().map(RunSummary::from).collect(),
                     }).map_err(|source| AppError::Serialization { operation: "serialize followed runs diagnostics", source })?
                 } else {
-                    render_human(&project.project_id, &fresh)
+                    render_human(project, &fresh)
                 };
                 println!("{rendered}");
             }
@@ -396,8 +401,13 @@ fn stream_for_cursor(cursor: &RunLineageCursor) -> FollowStream {
         .map_or(FollowStream::Run(cursor.run_id), FollowStream::Event)
 }
 
-fn render_human(project_id: &str, lineages: &[RunLineage]) -> String {
-    let mut lines = vec![human_header("runs", project_id)];
+fn render_human(project: &Project, lineages: &[RunLineage]) -> String {
+    let mut lines = vec![human_header("runs", &project.project_id)];
+    lines.push(format!(
+        "root: {}",
+        bounded_execution_path(&project.root_path.to_string_lossy())
+            .unwrap_or_else(|| "[invalid]".to_owned())
+    ));
     lines.push("RUN EVENT MODE STATE EVENT_STATE SUBMISSION TASK".to_owned());
     lines.extend(lineages.iter().map(render_lineage));
     lines.push(human_summary(format!(
@@ -437,8 +447,31 @@ fn render_lineage(lineage: &RunLineage) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let execution = [
+        lineage
+            .execution_kind
+            .as_deref()
+            .map(|value| format!("execution_kind={}", bounded_redacted_text(value))),
+        lineage
+            .executable_path
+            .as_deref()
+            .and_then(bounded_execution_path)
+            .map(|value| format!("executable_path={value}")),
+        lineage
+            .policy_code
+            .as_deref()
+            .map(|value| format!("policy_code={}", bounded_redacted_text(value))),
+        lineage
+            .failure_stage
+            .as_deref()
+            .map(|value| format!("failure_stage={}", bounded_redacted_text(value))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
     format!(
-        "{run} {event} mode={mode} state={run_state} event_kind={event_kind} event_state={event_state} {submissions}"
+        "{run} {event} mode={mode} state={run_state} event_kind={event_kind} event_state={event_state} {submissions} {execution}"
     )
 }
 
@@ -477,11 +510,11 @@ impl From<&RunLineage> for RunSummary {
                 .iter()
                 .map(SubmissionSummary::from)
                 .collect(),
-            execution_kind: lineage.execution_kind.clone(),
-            executable_path: lineage.executable_path.clone(),
-            executable_identity: lineage.executable_identity.clone(),
-            policy_code: lineage.policy_code.clone(),
-            failure_stage: lineage.failure_stage.clone(),
+            execution_kind: lineage.execution_kind.as_deref().map(bounded_redacted_text),
+            executable_path: lineage.executable_path.as_deref().and_then(bounded_execution_path),
+            executable_identity: lineage.executable_identity.as_deref().map(bounded_redacted_text),
+            policy_code: lineage.policy_code.as_deref().map(bounded_redacted_text),
+            failure_stage: lineage.failure_stage.as_deref().map(bounded_redacted_text),
         }
     }
 }

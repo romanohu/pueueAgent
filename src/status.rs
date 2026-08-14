@@ -4,9 +4,9 @@ use rusqlite::OptionalExtension;
 
 use crate::{
     config,
-    db::{AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
+    db::{inferred_pre_binding_policy_code, AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
     models::{Event, Project},
-    output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
+    output::{bounded_execution_path, bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::PueueTask,
     service::ServiceStatus,
     AppError,
@@ -51,7 +51,10 @@ pub fn render_project_status(
     ));
     lines.push(project_lifecycle_line(project));
     let root_path = project.root_path.to_string_lossy();
-    lines.push(format!("root: {}", bounded_redacted_text(&root_path)));
+    lines.push(format!(
+        "root: {}",
+        bounded_execution_path(&root_path).unwrap_or_else(|| "[invalid]".to_owned())
+    ));
     lines.push(format!(
         "group: {}",
         bounded_redacted_text(&project.pueue_group)
@@ -102,13 +105,17 @@ pub fn render_project_status(
 
     let event_counts = event_status_counts(db, &project.project_id)?;
     lines.push(event_counts_line(&event_counts));
-    let recent_events = EventRepository::new(db).recent_events(&project.project_id, 8)?;
+    let event_repository = EventRepository::new(db);
+    let recent_events = event_repository.recent_events(&project.project_id, 8)?;
+    let recent_event_ids = recent_events.iter().map(|event| event.event_id).collect::<Vec<_>>();
+    let linked_recent_events = event_repository
+        .latest_execution_projections(&project.project_id, &recent_event_ids)?;
     if !recent_events.is_empty() {
         lines.push(format!(
             "recent_events: {}",
             recent_events
                 .iter()
-                .map(event_summary)
+                .map(|event| event_summary(event, linked_recent_events.contains_key(&event.event_id)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -144,6 +151,38 @@ pub fn render_project_status(
         active_agent_runs,
         count(&agent_counts, "failed")
     ));
+    let recent_agent_runs = AgentRunRepository::new(db).list_by_project(&project.project_id, 3)?;
+    if !recent_agent_runs.is_empty() {
+        lines.push(format!(
+            "recent_agent_runs: {}",
+            recent_agent_runs
+                .iter()
+                .map(|run| {
+                    let execution = [
+                        run.execution_kind
+                            .as_deref()
+                            .map(|value| format!("kind={}", bounded_redacted_text(value))),
+                        run.executable_path
+                            .as_deref()
+                            .and_then(bounded_execution_path)
+                            .map(|value| format!("path={value}")),
+                        run.policy_code
+                            .as_deref()
+                            .map(|value| format!("policy={}", bounded_redacted_text(value))),
+                        run.failure_stage
+                            .as_deref()
+                            .map(|value| format!("stage={}", bounded_redacted_text(value))),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    format!("run={} state={} {execution}", run.run_id, format_state(run.status.as_str()))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     lines.extend(guardrail_lines(db, project)?);
     lines.extend(context_lines(db, project)?);
@@ -206,6 +245,31 @@ pub fn render_project_status_compact(
         count(&agent_counts, "starting") + count(&agent_counts, "running"),
         count(&agent_counts, "failed")
     ));
+    let recent_agent_runs = AgentRunRepository::new(db).list_by_project(&project.project_id, 1)?;
+    if let Some(run) = recent_agent_runs.first() {
+        let execution = [
+            run.execution_kind
+                .as_deref()
+                .map(|value| format!("kind={}", bounded_redacted_text(value))),
+            run.executable_path
+                .as_deref()
+                .and_then(bounded_execution_path)
+                .map(|value| format!("path={value}")),
+            run.policy_code
+                .as_deref()
+                .map(|value| format!("policy={}", bounded_redacted_text(value))),
+            run.failure_stage
+                .as_deref()
+                .map(|value| format!("stage={}", bounded_redacted_text(value))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        if !execution.is_empty() {
+            lines.push(format!("recent_agent_run: run={} {execution}", run.run_id));
+        }
+    }
 
     let event_counts = event_status_counts(db, &project.project_id)?;
     lines.push(event_counts_line(&event_counts));
@@ -357,12 +421,17 @@ fn event_counts_line(counts: &BTreeMap<String, i64>) -> String {
     )
 }
 
-fn event_summary(event: &Event) -> String {
+fn event_summary(event: &Event, has_run_link: bool) -> String {
+    let policy = inferred_pre_binding_policy_code(event, has_run_link);
+    let policy_code = policy.as_deref().unwrap_or("none");
+    let failure_stage = if policy.is_some() { "pre_binding" } else { "none" };
     format!(
-        "{} kind={} state={}",
+        "{} kind={} state={} policy_code={} failure_stage={}",
         render_id("event", event.event_id),
         event.kind,
-        format_state(event.status.as_str())
+        format_state(event.status.as_str()),
+        policy_code,
+        failure_stage,
     )
 }
 

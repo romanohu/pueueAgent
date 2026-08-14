@@ -15,15 +15,17 @@ use pueue_agent::{
         render_incident_explanation, render_project_status_json, render_task_inspection,
         DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
     },
-    execution_policy::StartupEnvironment,
+    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage, StartupEnvironment},
     models::{
-        AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewIncident, NewProject,
-        NewTaskObservation, NewTerminationRequest, TerminationRequestStatus,
+        AgentRunStatus, EventKind, EventStatus, ExecutionProjection, NewAgentRun, NewEvent,
+        NewIncident, NewProject, NewTaskObservation, NewTerminationRequest,
+        TerminationRequestStatus,
     },
     output::redact_sensitive_text,
     pueue::PueueTask,
     service::{ServicePaths, ServiceStatus},
     status::{render_project_status, render_project_status_compact, PueueSnapshot, StatusInput},
+    runs::render_runs,
 };
 use clap::Parser;
 use rusqlite::params;
@@ -682,6 +684,160 @@ impl DiagnosticsHarness {
             daemon_health: ServiceStatus::Running,
             pueue,
         }
+    }
+}
+
+#[test]
+fn no_run_pre_binding_policy_blocks_project_through_all_diagnostics() {
+    let harness = DiagnosticsHarness::new();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "pre-binding-diagnostic-policy-block",
+            json!({"prompt": "never render this prompt", "OPENAI_API_KEY": "never render this secret"}),
+            100,
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db).claim_batch(100, 200, 1).unwrap();
+    EventRepository::new(&harness.db)
+        .dead_letter_claimed_without_run(
+            "project-a",
+            &[event.event_id],
+            110,
+            &PolicyViolation::new(
+                PolicyViolationCode::UnsafeCodexArgument,
+                PolicyViolationStage::PreBinding,
+            ),
+        )
+        .unwrap();
+
+    let events = render_events(
+        &harness.db,
+        &harness.project(),
+        &EventFilter::new(None, None, 8),
+        true,
+    )
+    .unwrap();
+    let run_list = render_runs(&harness.db, &harness.project(), 8, true).unwrap();
+    let status = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let human_status = render_project_status(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let doctor = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        120,
+        true,
+    )
+    .unwrap();
+
+    for projection in [&events, &run_list, &status, &doctor] {
+        assert!(projection.contains("unsafe_codex_argument"), "{projection}");
+        assert!(projection.contains("pre_binding"), "{projection}");
+        assert!(!projection.contains("never render this prompt"), "{projection}");
+        assert!(!projection.contains("never render this secret"), "{projection}");
+        assert!(!projection.contains("OPENAI_API_KEY"), "{projection}");
+    }
+    let event_value: Value = serde_json::from_str(&events).unwrap();
+    assert_eq!(event_value["events"][0]["run_id"], Value::Null);
+    let runs_value: Value = serde_json::from_str(&run_list).unwrap();
+    assert_eq!(runs_value["runs"][0]["run_id"], Value::Null);
+    assert!(human_status.contains("policy_code=unsafe_codex_argument"));
+    assert!(human_status.contains("failure_stage=pre_binding"));
+}
+
+#[test]
+fn execution_projections_show_policy_code_stage_and_path_without_secrets() {
+    let harness = DiagnosticsHarness::new();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::Crash,
+            "execution-projection-policy-block",
+            json!({"prompt": "never render this prompt", "OPENAI_API_KEY": "never render this secret"}),
+            100,
+            100,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db).claim_batch(100, 200, 1).unwrap();
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                harness.project().root_path.join(".pueue-agent/logs/agent.log"),
+            )
+            .with_execution(
+                ExecutionProjection::new("codex", "/usr/local/bin/codex", "device=1,inode=2")
+                    .unwrap(),
+            ),
+            &[event.event_id],
+        )
+        .unwrap();
+    let runs = AgentRunRepository::new(&harness.db);
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 42, 120)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id).unwrap();
+    runs.fail_before_gate_release_with_policy(
+        "project-a",
+        run.run_id,
+        130,
+        "ignored secret-bearing detail",
+        &PolicyViolation::new(
+            PolicyViolationCode::UnsafeCodexArgument,
+            PolicyViolationStage::RunBoundPreMarker,
+        ),
+    )
+    .unwrap();
+
+    let events = render_events(
+        &harness.db,
+        &harness.project(),
+        &EventFilter::new(None, None, 8),
+        true,
+    )
+    .unwrap();
+    let run_list = render_runs(&harness.db, &harness.project(), 8, true).unwrap();
+    let status = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let doctor = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        140,
+        true,
+    )
+    .unwrap();
+
+    for projection in [&events, &run_list, &status, &doctor] {
+        assert!(projection.contains("unsafe_codex_argument"), "{projection}");
+        assert!(!projection.contains("never render this prompt"), "{projection}");
+        assert!(!projection.contains("never render this secret"), "{projection}");
+        assert!(!projection.contains("OPENAI_API_KEY"), "{projection}");
+    }
+    for projection in [&events, &run_list, &status, &doctor] {
+        assert!(projection.contains("run_bound_pre_marker"), "{projection}");
+        assert!(projection.contains("/usr/local/bin/codex"), "{projection}");
     }
 }
 

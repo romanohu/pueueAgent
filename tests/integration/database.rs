@@ -9,7 +9,7 @@ use std::{
 use pueue_agent::{
     batches::BatchJobResult,
     db::{
-        AgentRunRepository, BatchRepository, Db, EventRepository, IncidentRepository,
+        inferred_pre_binding_policy_code, AgentRunRepository, BatchRepository, Db, EventRepository, IncidentRepository,
         InterventionRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
         RunLineageRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
@@ -1198,6 +1198,118 @@ fn execution_projection_round_trips_through_binding_transaction_and_legacy_runs_
         direct.executable_identity.as_deref(),
         Some("device=4;inode=5;owner=6;mode=493")
     );
+}
+
+#[test]
+fn policy_blocked_counts_are_project_scoped_and_exclude_other_errors() {
+    let test = TestDatabase::new();
+    let root_a = test.project_root("policy-count-a");
+    let root_b = test.project_root("policy-count-b");
+    register_project(&test.db, "project-a", &root_a, "pa-policy-count-a");
+    register_project(&test.db, "project-b", &root_b, "pb-policy-count-b");
+    let events = EventRepository::new(&test.db);
+    let project_a_policy = insert_event(&test.db, "project-a", "policy-count-a", 100);
+    let project_a_other = insert_event(&test.db, "project-a", "policy-count-other", 100);
+    let forged_pending = insert_event(&test.db, "project-a", "policy-count-forged", 100);
+    let project_b_policy = insert_event(&test.db, "project-b", "policy-count-b", 100);
+    events.claim_batch(100, 200, 8).unwrap();
+    let violation = PolicyViolation::new(
+        PolicyViolationCode::UnsafeCodexArgument,
+        PolicyViolationStage::PreBinding,
+    );
+    events
+        .dead_letter_claimed_without_run("project-a", &[project_a_policy], 101, &violation)
+        .unwrap();
+    events
+        .dead_letter_claimed_without_run("project-b", &[project_b_policy], 101, &violation)
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', lease_until = NULL, last_error = 'ordinary failure' WHERE event_id = ?1",
+            [project_a_other],
+        )
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'pending', lease_until = NULL, last_error = 'policy_blocked:unsafe_codex_argument' WHERE event_id = ?1",
+            [forged_pending],
+        )
+        .unwrap();
+    assert!(inferred_pre_binding_policy_code(
+        &events.find_by_id(forged_pending).unwrap().unwrap(),
+        false,
+    )
+    .is_none());
+
+    assert_eq!(
+        events.policy_blocked_counts("project-a").unwrap(),
+        BTreeMap::from([("unsafe_codex_argument".to_owned(), 1)]),
+    );
+    assert_eq!(
+        events.policy_blocked_counts("project-b").unwrap(),
+        BTreeMap::from([("unsafe_codex_argument".to_owned(), 1)]),
+    );
+    let pre_binding = RunLineageRepository::new(&test.db)
+        .list_by_project("project-a", 8)
+        .unwrap()
+        .into_iter()
+        .find(|lineage| lineage.event_id == Some(project_a_policy))
+        .unwrap();
+    assert_eq!(pre_binding.run_id, None);
+    assert_eq!(pre_binding.policy_code.as_deref(), Some("unsafe_codex_argument"));
+    assert_eq!(pre_binding.failure_stage.as_deref(), Some("pre_binding"));
+}
+
+#[test]
+fn bounded_run_lineages_do_not_infer_pre_binding_for_linked_older_runs() {
+    let test = TestDatabase::new();
+    let root = test.project_root("linked-older-run");
+    register_project(&test.db, "project-a", &root, "pa-linked-older-run");
+    let linked_event = insert_event(&test.db, "project-a", "linked-policy-event", 300);
+    let newer_run_event = insert_event(&test.db, "project-a", "newer-run-event", 200);
+    EventRepository::new(&test.db).claim_batch(400, 500, 8).unwrap();
+    let runs = AgentRunRepository::new(&test.db);
+    runs.insert_with_events(
+        &NewAgentRun::new(
+            "project-a", linked_event, None, AgentRunStatus::Completed, 100,
+            root.join(".pueue-agent/logs/linked.log"),
+        ),
+        &[linked_event],
+    )
+    .unwrap();
+    runs.insert_with_events(
+        &NewAgentRun::new(
+            "project-a", newer_run_event, None, AgentRunStatus::Starting, 200,
+            root.join(".pueue-agent/logs/newer.log"),
+        ),
+        &[newer_run_event],
+    )
+    .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET created_at = 300, status = 'dead_letter', last_error = 'policy_blocked:unsafe_codex_argument' WHERE event_id = ?1",
+            [linked_event],
+        )
+        .unwrap();
+    assert!(inferred_pre_binding_policy_code(
+        &EventRepository::new(&test.db)
+            .find_by_id(linked_event)
+            .unwrap()
+            .unwrap(),
+        true,
+    )
+    .is_none());
+
+    let lineages = RunLineageRepository::new(&test.db)
+        .list_by_project("project-a", 1)
+        .unwrap();
+    assert!(lineages.iter().all(|lineage| lineage.event_id != Some(linked_event)));
 }
 
 #[test]

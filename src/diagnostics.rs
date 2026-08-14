@@ -6,17 +6,21 @@ use serde::Serialize;
 use crate::{
     config,
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
-        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+        inferred_pre_binding_policy_code, AgentRunRepository, Db, EventExecutionProjection,
+        EventRepository, IncidentRepository, InterventionRepository, SubmissionRepository,
+        TaskObservationRepository,
+        TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
+    execution_policy::{load_existing_policy, resolve_project_policy, LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail, ResolvedExecutionPolicy},
     environment::MAX_PRIVATE_TEMP_RUN_ID,
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
-    output::{bounded_redacted_text, format_state, human_header, human_summary, render_id},
+    output::{bounded_execution_path, bounded_redacted_text, format_state, human_header, human_summary, render_id},
     pueue::PueueTask,
+    project_logs::{inspect_agent_log_dir, ProjectRootLogReader},
     service::{callback_command, ServicePaths, ServiceStatus},
     state,
     status::{PueueSnapshot, StatusInput},
@@ -53,6 +57,7 @@ impl EventFilter {
 struct EventListReport {
     schema_version: u32,
     project_id: String,
+    root_path: String,
     events: Vec<EventSummary>,
 }
 
@@ -65,20 +70,19 @@ pub fn render_events(
     let event_repository = EventRepository::new(db);
     let events = event_repository.list_filtered(&project.project_id, filter)?;
     let event_ids = events.iter().map(|event| event.event_id).collect::<Vec<_>>();
-    let latest_run_ids = event_repository.latest_run_ids(&project.project_id, &event_ids)?;
+    let execution = event_repository.latest_execution_projections(&project.project_id, &event_ids)?;
     if json {
         let summaries = events
             .iter()
             .map(|event| {
-                EventSummary::from_event(
-                    event,
-                    latest_run_ids.get(&event.event_id).copied(),
-                )
+                EventSummary::from_event(event, execution.get(&event.event_id))
             })
             .collect::<Vec<_>>();
         return serde_json::to_string(&EventListReport {
             schema_version: JSON_SCHEMA_VERSION,
             project_id: project.project_id.clone(),
+            root_path: bounded_execution_path(&project.root_path.to_string_lossy())
+                .unwrap_or_else(|| "[invalid]".to_owned()),
             events: summaries,
         })
         .map_err(|source| AppError::Serialization {
@@ -88,10 +92,16 @@ pub fn render_events(
     }
 
     let mut lines = vec![human_header("events", &project.project_id)];
-    lines.push("EVENT STATE KIND ATTEMPTS NOT_BEFORE LEASE CREATED COMPLETED RUN ERROR".to_owned());
+    lines.push(format!(
+        "root: {}",
+        bounded_execution_path(&project.root_path.to_string_lossy())
+            .unwrap_or_else(|| "[invalid]".to_owned())
+    ));
+    lines.push("EVENT STATE KIND ATTEMPTS NOT_BEFORE LEASE CREATED COMPLETED RUN EXECUTION PATH POLICY STAGE ERROR".to_owned());
     lines.extend(events.iter().map(|event| {
+        let projection = EventSummary::from_event(event, execution.get(&event.event_id));
         format!(
-            "{} state={} kind={} attempts={} not_before={} lease={} created_at={} completed_at={} run_id={} error={}",
+            "{} state={} kind={} attempts={} not_before={} lease={} created_at={} completed_at={} run_id={} execution_kind={} executable_path={} policy_code={} failure_stage={} error={}",
             render_id("event", event.event_id),
             format_state(event.status.as_str()),
             event.kind,
@@ -104,15 +114,19 @@ pub fn render_events(
             event
                 .completed_at
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-            latest_run_ids
+            execution
                 .get(&event.event_id)
-                .copied()
+                .map(|projection| projection.run_id)
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            projection.execution_kind.unwrap_or_else(|| "none".to_owned()),
+            projection.executable_path.unwrap_or_else(|| "none".to_owned()),
+            projection.policy_code.unwrap_or_else(|| "none".to_owned()),
+            projection.failure_stage.unwrap_or_else(|| "none".to_owned()),
             event
                 .last_error
                 .as_deref()
                 .map(bounded_summary)
-                .unwrap_or_else(|| "none".to_owned())
+                .unwrap_or_else(|| "none".to_owned()),
         )
     }));
     lines.push(human_summary(format!("{} event(s) shown", events.len())));
@@ -431,6 +445,8 @@ pub struct DoctorCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
     pub schema_version: u32,
+    pub project_id: String,
+    pub root_path: String,
     pub status: DoctorCheckStatus,
     pub checks: Vec<DoctorCheck>,
 }
@@ -461,6 +477,8 @@ pub fn render_doctor_report_value(report: &DoctorReport, json: bool) -> Result<S
         });
     }
     let mut lines = vec![format!("doctor: {}", doctor_status_label(report.status))];
+    lines.push(format!("project: {}", bounded_redacted_text(&report.project_id)));
+    lines.push(format!("root: {}", report.root_path));
     lines.extend(report.checks.iter().map(|check| {
         format!(
             "{}: {} — {} [{}]",
@@ -479,6 +497,21 @@ pub fn build_doctor_report(
     paths: &ServicePaths,
     external: DoctorExternal,
     now: i64,
+) -> Result<DoctorReport, AppError> {
+    let policy = load_existing_policy(&paths.policy_load_input(
+        vec![project.root_path.clone()],
+        paths.release_binary.clone(),
+    ));
+    build_doctor_report_with_policy(db, project, paths, external, now, &policy)
+}
+
+pub fn build_doctor_report_with_policy(
+    db: &Db,
+    project: &Project,
+    paths: &ServicePaths,
+    external: DoctorExternal,
+    now: i64,
+    policy: &Result<ResolvedExecutionPolicy, PolicyViolation>,
 ) -> Result<DoctorReport, AppError> {
     let connection = db.connect()?;
     let mut checks = Vec::new();
@@ -787,6 +820,7 @@ pub fn build_doctor_report(
             "repair .pueue-agent/config.toml and validate it before retrying",
         ),
     });
+    checks.extend(execution_doctor_checks(db, project, policy));
     checks.push(match &external.pueue {
         Ok(tasks) if tasks.iter().any(|task| task.group == project.pueue_group) => doctor_ok(
             "pueue.status",
@@ -993,6 +1027,53 @@ pub fn build_doctor_report(
         )
     });
 
+    let policy_blocked = EventRepository::new(db).policy_blocked_counts(&project.project_id)?;
+    let policy_stages = AgentRunRepository::new(db).policy_failure_stage_counts(&project.project_id)?;
+    checks.push(if policy_blocked.is_empty() && policy_stages.is_empty() {
+        doctor_ok(
+            "execution.policy_blocked",
+            "no policy-blocked events or run failures are present",
+            "none",
+        )
+    } else {
+        let event_summary = policy_blocked
+            .iter()
+            .map(|(code, count)| format!("{code}/pre_binding={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let stage_summary = policy_stages
+            .iter()
+            .map(|((code, stage), count)| format!("{code}/{stage}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let summary = [event_summary, stage_summary]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        doctor_warning(
+            "execution.policy_blocked",
+            &format!("policy-blocked events: {summary}"),
+            "inspect bounded policy code and stage diagnostics; doctor does not retry or repair events",
+        )
+    });
+
+    checks.push(if unlinked_ack_events == 0 {
+        doctor_ok(
+            "execution.ack_consistency",
+            "all in-flight and dispatched events have a same-project agent run link",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "execution.ack_consistency",
+            &format!(
+                "{unlinked_ack_events} in-flight or dispatched event(s) have no same-project agent run link"
+            ),
+            "inspect the affected event and agent-run records without repairing them from doctor",
+        )
+    });
+
     let restart_uncertain_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM events
@@ -1073,9 +1154,173 @@ pub fn build_doctor_report(
     };
     Ok(DoctorReport {
         schema_version: JSON_SCHEMA_VERSION,
+        project_id: project.project_id.clone(),
+        root_path: bounded_execution_path(&project.root_path.to_string_lossy())
+            .unwrap_or_else(|| "[invalid]".to_owned()),
         status,
         checks,
     })
+}
+
+/// Check the immutable execution boundary without creating policy files,
+/// enrolling executables, repairing logs, or changing database state.
+fn execution_doctor_checks(
+    db: &Db,
+    project: &Project,
+    policy: &Result<ResolvedExecutionPolicy, PolicyViolation>,
+) -> Vec<DoctorCheck> {
+    let (policy, mut checks) = match policy {
+        Ok(policy) => {
+            let mut checks = vec![doctor_ok(
+                "execution.policy",
+                "immutable execution policy is readable",
+                "none",
+            )];
+            let anchors = [
+                policy.codex_anchor.verify_identity(),
+                policy.launcher_anchor.verify_identity(),
+            ];
+            checks.push(if anchors.iter().all(Result::is_ok) {
+                doctor_ok(
+                    "execution.anchors",
+                    "execution anchors retain their pinned identity",
+                    "none",
+                )
+            } else {
+                doctor_error(
+                    "execution.anchors",
+                    "an execution anchor is missing or replaced",
+                    "restore the pinned executable and restart the daemon; doctor does not enroll replacements",
+                )
+            });
+            (Some(policy), checks)
+        }
+        Err(violation) => {
+            (None, vec![
+                doctor_error(
+                    "execution.policy",
+                    &format!("immutable execution policy is unavailable ({})", violation.code.as_str()),
+                    "restore the service-owned policy; doctor does not create or repair policy files",
+                ),
+                doctor_warning(
+                    "execution.anchors",
+                    "execution anchors were not inspected because policy is unavailable",
+                    "restore the immutable execution policy before inspecting anchors",
+                ),
+                doctor_warning(
+                    "execution.project_root",
+                    "project root anchor was not inspected because policy is unavailable",
+                    "restore the immutable execution policy before inspecting the project root",
+                ),
+                doctor_warning(
+                    "execution.log_contract",
+                    "agent log contract was not inspected because policy is unavailable",
+                    "restore the immutable execution policy before inspecting agent logs",
+                ),
+            ])
+        }
+    };
+    let root = if let Some(policy) = policy.as_ref() {
+        match config::load(&project.config_path)
+            .and_then(|config| resolve_project_policy(policy, project, &config).map_err(AppError::from))
+            .and_then(|project_policy| project_policy.root_anchor.verify_identity().map_err(AppError::from))
+        {
+            Ok(root) => {
+                checks.push(doctor_ok(
+                    "execution.project_root",
+                    "project root retains its pinned identity",
+                    "none",
+                ));
+                Some(root)
+            }
+            Err(_) => {
+                checks.push(doctor_error(
+                    "execution.project_root",
+                    "project root is missing, replaced, or not admitted by execution policy",
+                    "restore the registered root and policy configuration; doctor does not re-enroll it",
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let recent_runs = AgentRunRepository::new(db).list_by_project(
+        &project.project_id,
+        DEFAULT_SUMMARY_LIMIT,
+    );
+    checks.push(match &recent_runs {
+        Ok(runs) => {
+            let summaries = runs
+                .iter()
+                .filter_map(|run| {
+                    let (Some(kind), Some(path), Some(code), Some(stage)) = (
+                        run.execution_kind.as_deref(),
+                        run.executable_path.as_deref(),
+                        run.policy_code.as_deref(),
+                        run.failure_stage.as_deref(),
+                    ) else {
+                        return None;
+                    };
+                    Some(format!(
+                        "run={} kind={} path={} policy={}/{}",
+                        run.run_id,
+                        bounded_summary(kind),
+                        bounded_execution_path(path).unwrap_or_else(|| "[invalid]".to_owned()),
+                        bounded_summary(code),
+                        bounded_summary(stage),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if summaries.is_empty() {
+                doctor_ok(
+                    "execution.recent",
+                    "no recent run carries policy failure execution evidence",
+                    "none",
+                )
+            } else {
+                doctor_warning(
+                    "execution.recent",
+                    &format!("recent bounded execution evidence: {}", summaries.join("; ")),
+                    "inspect the associated run without exposing command inputs or log output",
+                )
+            }
+        }
+        Err(_) => doctor_warning(
+            "execution.recent",
+            "recent execution evidence could not be queried",
+            "restore database access before inspecting bounded execution diagnostics",
+        ),
+    });
+    if policy.is_some() {
+        checks.push(match root {
+        Some(root) => match inspect_agent_log_dir(&ProjectRootLogReader::from_verified(root)) {
+            Ok(_) => doctor_ok(
+                "execution.log_contract",
+                "agent log directory satisfies the read-only secure log contract",
+                "none",
+            ),
+            Err(AppError::PolicyViolation { violation })
+                if violation.code == PolicyViolationCode::LogUnsafe
+                    && violation.detail == PolicyViolationDetail::LogUnsafe(LogUnsafeReason::Missing) => doctor_warning(
+                "execution.log_contract",
+                "agent log directory is not present yet",
+                "the first verified agent run creates .pueue-agent/logs; doctor does not create it",
+            ),
+            Err(_) => doctor_error(
+                "execution.log_contract",
+                "agent log directory violates the secure log contract",
+                "restore secure .pueue-agent/logs ownership and permissions without doctor repair",
+            ),
+        },
+        None => doctor_warning(
+            "execution.log_contract",
+            "agent log contract could not be inspected",
+            "restore the project root before inspecting agent logs",
+        ),
+        });
+    }
+    checks
 }
 
 fn doctor_ok(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
@@ -1198,7 +1443,8 @@ impl From<&Project> for ProjectSummary {
     fn from(project: &Project) -> Self {
         Self {
             project_id: project.project_id.clone(),
-            root_path: project.root_path.to_string_lossy().into_owned(),
+            root_path: bounded_execution_path(&project.root_path.to_string_lossy())
+                .unwrap_or_else(|| "[invalid]".to_owned()),
             pueue_group: project.pueue_group.clone(),
             enabled: project.enabled,
             paused: project.paused,
@@ -1272,6 +1518,16 @@ struct EventSummary {
     error_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_stage: Option<String>,
 }
 
 impl From<&Event> for EventSummary {
@@ -1281,14 +1537,14 @@ impl From<&Event> for EventSummary {
 }
 
 impl EventSummary {
-    fn from_event(event: &Event, run_id: Option<i64>) -> Self {
+    fn from_event(event: &Event, execution: Option<&EventExecutionProjection>) -> Self {
         Self {
             event_id: event.event_id,
             kind: event.kind,
             status: event.status,
             attempts: event.attempts,
             not_before: event.not_before,
-            run_id,
+            run_id: execution.map(|projection| projection.run_id),
             lease_until: event.lease_until,
             created_at: event.created_at,
             completed_at: event.completed_at,
@@ -1298,6 +1554,26 @@ impl EventSummary {
                 .as_ref()
                 .map(|_| safe_error_summary("event_processing")),
             last_error: event.last_error.as_deref().map(bounded_summary),
+            execution_kind: execution
+                .and_then(|projection| projection.execution_kind.as_deref())
+                .map(bounded_summary),
+            executable_path: execution
+                .and_then(|projection| projection.executable_path.as_deref())
+                .and_then(bounded_execution_path),
+            executable_identity: execution
+                .and_then(|projection| projection.executable_identity.as_deref())
+                .map(bounded_summary),
+            policy_code: execution
+                .and_then(|projection| projection.policy_code.as_deref())
+                .map(bounded_summary)
+                .or_else(|| inferred_pre_binding_policy_code(event, execution.is_some())),
+            failure_stage: execution
+                .and_then(|projection| projection.failure_stage.as_deref())
+                .map(bounded_summary)
+                .or_else(|| {
+                    inferred_pre_binding_policy_code(event, execution.is_some())
+                        .map(|_| "pre_binding".to_owned())
+                }),
         }
     }
 }
@@ -1452,11 +1728,11 @@ impl From<&AgentRun> for AgentRunSummary {
                 .last_error
                 .as_ref()
                 .map(|_| safe_error_summary("agent_run")),
-            execution_kind: run.execution_kind.clone(),
-            executable_path: run.executable_path.clone(),
-            executable_identity: run.executable_identity.clone(),
-            policy_code: run.policy_code.clone(),
-            failure_stage: run.failure_stage.clone(),
+            execution_kind: run.execution_kind.as_deref().map(bounded_summary),
+            executable_path: run.executable_path.as_deref().and_then(bounded_execution_path),
+            executable_identity: run.executable_identity.as_deref().map(bounded_summary),
+            policy_code: run.policy_code.as_deref().map(bounded_summary),
+            failure_stage: run.failure_stage.as_deref().map(bounded_summary),
         }
     }
 }
@@ -1572,11 +1848,11 @@ fn event_summaries(
 ) -> Result<Vec<EventSummary>, AppError> {
     let repository = EventRepository::new(db);
     let event_ids = events.iter().map(|event| event.event_id).collect::<Vec<_>>();
-    let latest_run_ids = repository.latest_run_ids(project_id, &event_ids)?;
+    let execution = repository.latest_execution_projections(project_id, &event_ids)?;
     Ok(events
         .iter()
         .map(|event| {
-            EventSummary::from_event(event, latest_run_ids.get(&event.event_id).copied())
+            EventSummary::from_event(event, execution.get(&event.event_id))
         })
         .collect())
 }

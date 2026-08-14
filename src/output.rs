@@ -1,6 +1,7 @@
-use std::io::IsTerminal;
+use std::{io::IsTerminal, path::Path};
 
 const MAX_OUTPUT_TEXT_BYTES: usize = 240;
+const MAX_EXECUTION_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -272,6 +273,22 @@ pub fn bounded_redacted_text(value: &str) -> String {
         prefix.push(character);
     }
     format!("{prefix}...")
+}
+
+/// Render only a persisted executable or registered-root path, never a command argument.
+///
+/// Unlike generic redaction this preserves a verified absolute executable
+/// path. Callers must use it only for a typed persisted path projection;
+/// malformed or oversized database text is omitted rather than rendered.
+pub fn bounded_execution_path(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > MAX_EXECUTION_PATH_BYTES
+        || value.chars().any(char::is_control)
+        || !Path::new(value).is_absolute()
+    {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn is_sensitive_flag(value: &str) -> bool {

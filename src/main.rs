@@ -98,7 +98,7 @@ mod commands {
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
         diagnostics::{
-            build_doctor_report, render_doctor_report_value, render_events,
+            build_doctor_report_with_policy, render_doctor_report_value, render_events,
             render_incident_explanation, render_project_status_json, render_task_inspection,
             DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
         },
@@ -300,17 +300,33 @@ mod commands {
     }
 
     pub async fn doctor(args: DoctorArgs) -> Result<(), AppError> {
-        let (db, project, service_paths, policy) =
-            resolve_project_read_only(args.project_root, args.pueue_config)?;
-        let pueue = configured_pueue(policy)?;
+        let (db, project, service_paths, project_roots) =
+            resolve_project_doctor_read_only(args.project_root, args.pueue_config)?;
+        let policy = load_existing_policy(&service_paths.policy_load_input(
+            project_roots,
+            current_launcher_path()?,
+        ));
+        let pueue_status = match &policy {
+            Ok(policy) => match configured_pueue(Arc::new(policy.clone())) {
+                Ok(pueue) => pueue.status_json().await.map_err(|error| error.render()),
+                Err(error) => Err(error.render()),
+            },
+            Err(violation) => Err(format!("execution policy unavailable ({})", violation.code.as_str())),
+        };
         let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
         let external = DoctorExternal {
-            pueue: pueue.status_json().await.map_err(|error| error.render()),
+            pueue: pueue_status,
             service: ServiceManager.status().map_err(|error| error.render()),
             callback: callbacks.current_callback().map_err(|error| error.render()),
         };
-        let report =
-            build_doctor_report(&db, &project, &service_paths, external, unix_timestamp()?)?;
+        let report = build_doctor_report_with_policy(
+            &db,
+            &project,
+            &service_paths,
+            external,
+            unix_timestamp()?,
+            &policy,
+        )?;
         println!("{}", render_doctor_report_value(&report, args.json)?);
         if report.has_errors() {
             return Err(AppError::Message {
@@ -731,6 +747,36 @@ mod commands {
         ))?);
         let service_paths = service_paths.pin_to_policy(&policy)?;
         Ok((db, project, service_paths, policy))
+    }
+
+    /// Doctor must report an unavailable policy rather than failing before
+    /// diagnostics are assembled. This resolver opens only existing database
+    /// state and does not pin service paths to a policy generation.
+    fn resolve_project_doctor_read_only(
+        project_root: Option<std::path::PathBuf>,
+        pueue_config: Option<std::path::PathBuf>,
+    ) -> Result<(Db, Project, ServicePaths, Vec<PathBuf>), AppError> {
+        let current_dir = env::current_dir().map_err(|source| AppError::Io {
+            operation: "read current directory",
+            source,
+        })?;
+        let project_root = match project_root {
+            Some(path) => project::find_root(&path)?,
+            None => project::find_root(&current_dir)?,
+        };
+        let service_paths = ServicePaths::from_environment(&project_root, pueue_config)?;
+        let db = Db::open_read_only(&paths::state_db_path()?)?;
+        let project = ProjectRepository::new(&db)
+            .find_by_root(&project_root)?
+            .ok_or(AppError::Runtime {
+                operation: "find registered project",
+            })?;
+        let project_roots = ProjectRepository::new(&db)
+            .list_all()?
+            .into_iter()
+            .map(|registered| registered.root_path)
+            .collect();
+        Ok((db, project, service_paths, project_roots))
     }
 
     fn registered_roots_if_present(state_db: &std::path::Path) -> Result<Vec<PathBuf>, AppError> {
