@@ -142,6 +142,16 @@ where
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(&reconciliation.observed_tasks)?;
 
+        let cleanup_blocked_projects = self
+            .active_agents
+            .iter()
+            .filter_map(|agent| agent.cleanup_blocked_project().map(str::to_owned))
+            .chain(
+                self.active_cleanups
+                    .iter()
+                    .filter_map(|cleanup| cleanup.cleanup_blocked_project().map(str::to_owned)),
+            )
+            .collect::<BTreeSet<_>>();
         let mut scheduler = Scheduler::new(
             self.db.clone(),
             self.runner.take().ok_or(AppError::Runtime {
@@ -152,7 +162,8 @@ where
                 lease_seconds: self.config.lease_seconds,
                 claim_limit: self.config.claim_limit,
             },
-        );
+        )
+        .with_cleanup_blocked_projects(cleanup_blocked_projects);
         let scheduler_result = scheduler.tick().await;
         self.runner = Some(scheduler.into_runner());
         let mut scheduler_report = match scheduler_result {
@@ -368,6 +379,9 @@ where
                 Ok(()) => {
                     self.active_cleanups.swap_remove(index);
                     finished += 1;
+                }
+                Err(_error) if self.active_cleanups[index].cleanup_pending() => {
+                    index += 1;
                 }
                 Err(error) => {
                     if first_error.is_none() {

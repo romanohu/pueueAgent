@@ -889,6 +889,16 @@ impl<'db> EventRepository<'db> {
         lease_until: i64,
         limit: usize,
     ) -> Result<Vec<Event>, AppError> {
+        self.claim_batch_excluding_projects(now, lease_until, limit, &BTreeSet::new())
+    }
+
+    pub fn claim_batch_excluding_projects(
+        &self,
+        now: i64,
+        lease_until: i64,
+        limit: usize,
+        blocked_project_ids: &BTreeSet<String>,
+    ) -> Result<Vec<Event>, AppError> {
         if lease_until <= now {
             return Err(AppError::Configuration {
                 field: "event_lease",
@@ -909,9 +919,17 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin immediate event claim"))?;
+        let blocked_filter = if blocked_project_ids.is_empty() {
+            ""
+        } else {
+            "AND NOT EXISTS (
+                           SELECT 1 FROM json_each(?3) AS blocked_projects
+                           WHERE blocked_projects.value = events.project_id
+                       )"
+        };
         let event_ids = {
             let mut statement = transaction
-                .prepare(
+                .prepare(&format!(
                     "SELECT event_id FROM events
                      WHERE status IN ('pending', 'retry_wait') AND not_before <= ?1
                        AND EXISTS (
@@ -926,12 +944,26 @@ impl<'db> EventRepository<'db> {
                            WHERE agent_runs.project_id = events.project_id
                              AND status IN ('starting', 'running')
                        )
+                       {blocked_filter}
                      ORDER BY created_at, event_id
-                     LIMIT ?2",
-                )
+                     LIMIT ?2"
+                ))
                 .map_err(database_error("prepare event claim"))?;
+            let blocked_json = if blocked_project_ids.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(blocked_project_ids).map_err(|_| {
+                    AppError::Runtime {
+                        operation: "serialize blocked project filter",
+                    }
+                })?)
+            };
+            let mut query_params = vec![Value::Integer(now), Value::Integer(limit)];
+            if let Some(blocked_json) = blocked_json {
+                query_params.push(Value::Text(blocked_json));
+            }
             let rows = statement
-                .query_map(params![now, limit], |row| row.get::<_, i64>(0))
+                .query_map(params_from_iter(query_params), |row| row.get::<_, i64>(0))
                 .map_err(database_error("query claimable events"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(database_error("read claimable events"))?;

@@ -1,4 +1,4 @@
-use std::{fs, fs::OpenOptions, path::PathBuf, process::Command, sync::Arc};
+use std::{collections::BTreeSet, fs, fs::OpenOptions, path::PathBuf, process::Command, sync::Arc};
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -256,6 +256,10 @@ max_agent_runs = 10
     }
 
     fn scheduler(&self) -> Scheduler {
+        self.scheduler_with_claim_limit(100)
+    }
+
+    fn scheduler_with_claim_limit(&self, claim_limit: usize) -> Scheduler {
         let projects = ProjectRepository::new(&self.db).list_all().unwrap();
         let owned = projects
             .iter()
@@ -286,7 +290,7 @@ max_agent_runs = 10
             SchedulerConfig {
                 now: self.now,
                 lease_seconds: 60,
-                claim_limit: 100,
+                claim_limit,
             },
         )
     }
@@ -444,6 +448,48 @@ max_agent_runs = 10
             )
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn cleanup_blocked_scheduler_builder_defers_claimed_events_before_project_work() {
+    let harness = SchedulerHarness::new();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "cleanup-blocked-order");
+    let intervention_id = harness.queue_intervention("must remain pending");
+
+    let mut scheduler = harness
+        .scheduler()
+        .with_cleanup_blocked_projects(BTreeSet::from(["project-a".to_owned()]));
+    let report = scheduler.tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    assert_eq!(harness.event(event_id).attempts, 0);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(harness.pending_intervention_count(), 1);
+    assert_eq!(harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending);
+}
+
+#[tokio::test]
+async fn blocked_projects_do_not_starve_unblocked_events_at_claim_limit() {
+    let harness = SchedulerHarness::new();
+    harness.register_project("project-b", "pb-project-b", "/bin/echo", "");
+    let blocked_first = harness.enqueue(EventKind::TaskFailed, "project-a", "claim-fairness-a-first");
+    let blocked_second = harness.enqueue(EventKind::TaskFailed, "project-a", "claim-fairness-a-second");
+    let other_event = harness.enqueue(EventKind::TaskFailed, "project-b", "claim-fairness-b");
+
+    let mut scheduler = harness
+        .scheduler_with_claim_limit(2)
+        .with_cleanup_blocked_projects(BTreeSet::from(["project-a".to_owned()]));
+    let report = scheduler.tick().await.unwrap();
+
+    assert_eq!(harness.event_status(blocked_first), EventStatus::Pending);
+    assert_eq!(harness.event(blocked_first).attempts, 0);
+    assert_eq!(harness.event_status(blocked_second), EventStatus::Pending);
+    assert_eq!(harness.event(blocked_second).attempts, 0);
+    assert_eq!(harness.event_status(other_event), EventStatus::Dispatched);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(report.started.len(), 1);
 }
 
 #[cfg(unix)]

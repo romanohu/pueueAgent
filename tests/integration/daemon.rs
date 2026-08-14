@@ -515,6 +515,459 @@ fn process_exists(pid: i32) -> bool {
     unsafe { kill(pid, 0) == 0 }
 }
 
+#[cfg(unix)]
+fn create_cleanup_depth_overflow(run_temp: &PathBuf) -> PathBuf {
+    let mut nested = run_temp.clone();
+    for index in 0..=pueue_agent::environment::MAX_PRIVATE_TEMP_CLEANUP_DEPTH + 1 {
+        nested.push(format!("cleanup-level-{index}"));
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(nested.join("retained-leaf"), b"owned").unwrap();
+    nested.parent().unwrap().to_path_buf()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_pending_project_defers_without_attempt_while_other_project_dispatches() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let first_event = harness.enqueue(EventKind::TaskFinished, "project-a", "cleanup-blocked-first");
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+
+    let run_id = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM agent_runs WHERE project_id = 'project-a' ORDER BY run_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(run_id.to_string());
+    let overflow_subtree = create_cleanup_depth_overflow(&run_temp);
+
+    let terminal_deadline = Instant::now() + Duration::from_secs(10);
+    while harness.event_status(first_event) != EventStatus::Completed {
+        assert!(Instant::now() < terminal_deadline, "project-a did not reach terminal persistence");
+        daemon.run_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(overflow_subtree.is_dir());
+
+    let blocked_event = harness.enqueue(EventKind::TaskFailed, "project-a", "cleanup-blocked-new");
+    let other_event = harness.enqueue(EventKind::TaskFailed, "project-b", "cleanup-blocked-other");
+    let intervention_id = InterventionRepository::new(&harness.db)
+        .insert_pending("project-a", "must remain pending", harness.now)
+        .unwrap();
+
+    daemon.run_once().await.unwrap();
+    let blocked = EventRepository::new(&harness.db)
+        .find_by_id(blocked_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.status, EventStatus::Pending);
+    assert_eq!(blocked.attempts, 0);
+    assert_eq!(harness.event_status(other_event), EventStatus::Dispatched);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE project_id = 'project-a' AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let intervention = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id, attempts FROM interventions WHERE intervention_id = ?1",
+            [intervention_id.intervention_id.as_str()],
+            |row| Ok((
+                row.get::<_, pueue_agent::interventions::InterventionStatus>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+            )),
+        )
+        .unwrap();
+    assert_eq!(
+        intervention,
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            0,
+        )
+    );
+
+    fs::remove_dir_all(overflow_subtree).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_retry_is_fair_across_projects_and_finishes_after_fault_removal() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
+    let event_a = harness.enqueue(EventKind::TaskFinished, "project-a", "cleanup-fair-a");
+    let event_b = harness.enqueue(EventKind::TaskFinished, "project-b", "cleanup-fair-b");
+    let mut daemon = harness.daemon();
+    daemon.run_once().await.unwrap();
+
+    let run_id = |project_id: &str| {
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT run_id FROM agent_runs WHERE project_id = ?1 ORDER BY run_id DESC LIMIT 1",
+                [project_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let run_a = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(run_id("project-a").to_string());
+    let run_b = harness
+        .root("project-b")
+        .join(".pueue-agent/tmp")
+        .join(run_id("project-b").to_string());
+    let overflow_a = create_cleanup_depth_overflow(&run_a);
+    let overflow_b = create_cleanup_depth_overflow(&run_b);
+
+    let terminal_deadline = Instant::now() + Duration::from_secs(10);
+    while harness.event_status(event_a) != EventStatus::Completed
+        || harness.event_status(event_b) != EventStatus::Completed
+    {
+        assert!(Instant::now() < terminal_deadline, "agents did not reach terminal persistence");
+        daemon.run_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(overflow_a.is_dir());
+    assert!(overflow_b.is_dir());
+
+    for project_id in ["project-a", "project-b"] {
+        let config_path = harness.root(project_id).join(".pueue-agent/config.toml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(config_path, config.replace("sleep 1", "sleep 30")).unwrap();
+    }
+
+    let retry_event_a = harness.enqueue(EventKind::TaskFailed, "project-a", "cleanup-fair-retry-a");
+    let retry_event_b = harness.enqueue(EventKind::TaskFailed, "project-b", "cleanup-fair-retry-b");
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(retry_event_a), EventStatus::Pending);
+    assert_eq!(harness.event_status(retry_event_b), EventStatus::Pending);
+
+    fs::remove_dir_all(overflow_a).unwrap();
+    daemon.run_once().await.unwrap();
+    assert!(!run_a.join("cleanup-level-0").exists());
+    assert!(run_b.join("cleanup-level-0").is_dir());
+
+    fs::remove_dir_all(overflow_b).unwrap();
+    daemon.run_once().await.unwrap();
+    assert!(!run_b.join("cleanup-level-0").exists());
+    daemon.run_once().await.unwrap();
+    assert_eq!(harness.event_status(retry_event_a), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(retry_event_b), EventStatus::Dispatched);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE project_id IN ('project-a', 'project-b')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        4
+    );
+    for project_id in ["project-a", "project-b"] {
+        assert_eq!(
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_runs WHERE project_id = ?1",
+                    [project_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "each project retains its original terminal run and one retry run",
+        );
+    }
+    let retry_bindings = harness
+        .db
+        .connect()
+        .unwrap()
+        .prepare(
+            "SELECT events.project_id, MAX(agent_run_events.run_id)
+             FROM events
+             JOIN agent_run_events
+               ON agent_run_events.project_id = events.project_id
+              AND agent_run_events.event_id = events.event_id
+             WHERE events.event_id IN (?1, ?2)
+             GROUP BY events.event_id
+             ORDER BY events.event_id",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![retry_event_a, retry_event_b], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(retry_bindings.len(), 2);
+    assert_eq!(retry_bindings[0].0, "project-a");
+    assert_eq!(retry_bindings[1].0, "project-b");
+    assert!(retry_bindings.iter().all(|(_, run_id)| run_id.is_some()));
+    assert_ne!(retry_bindings[0].1, retry_bindings[1].1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_retains_temp_cleanup_when_deadline_expires() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
+    let event_id = harness.enqueue(EventKind::TaskFinished, "project-a", "cleanup-shutdown-deadline");
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        harness.runner(),
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(harness.now),
+            shutdown_grace_period: Duration::from_millis(150),
+        },
+    );
+    daemon.run_once().await.unwrap();
+
+    let run_id = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM agent_runs WHERE project_id = 'project-a' ORDER BY run_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(run_id.to_string());
+    let overflow_subtree = create_cleanup_depth_overflow(&run_temp);
+    let terminal_deadline = Instant::now() + Duration::from_secs(10);
+    while harness.event_status(event_id) != EventStatus::Completed {
+        assert!(Instant::now() < terminal_deadline, "agent did not reach terminal persistence");
+        daemon.run_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(overflow_subtree.is_dir());
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(3), daemon.run(shutdown))
+        .await
+        .expect("shutdown cleanup must remain bounded");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(result.is_err());
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE project_id = 'project-a' AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+
+    fs::remove_dir_all(overflow_subtree).unwrap();
+    daemon.run_once().await.unwrap();
+    assert!(!run_temp.join("cleanup-level-0").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bound_cleanup_pending_project_defers_without_attempt_while_other_project_dispatches() {
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 30"],
+        1,
+    );
+    let initial_event = harness.enqueue(EventKind::TaskFailed, "project-a", "bound-cleanup-pending-first");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_bound_cleanup_pending_dispatch_ack
+             BEFORE UPDATE OF launch_gate_state ON agent_runs
+             WHEN NEW.project_id = 'project-a' AND NEW.launch_gate_state = 'released'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected bound cleanup pending dispatch acknowledgement failure');
+             END;
+             CREATE TRIGGER reject_bound_cleanup_pending_finalizer
+             BEFORE UPDATE OF status ON events
+             WHEN NEW.project_id = 'project-a'
+                  AND NEW.status IN ('completed', 'retry_wait', 'dead_letter')
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected bound cleanup pending finalizer failure');
+             END;",
+        )
+        .unwrap();
+
+    let mut daemon = harness.daemon();
+    assert!(daemon.run_once().await.is_err());
+    assert_eq!(harness.event_status(initial_event), EventStatus::InFlight);
+
+    let run_id = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM agent_runs WHERE project_id = 'project-a' ORDER BY run_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(run_id.to_string());
+    let overflow_subtree = create_cleanup_depth_overflow(&run_temp);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER reject_bound_cleanup_pending_dispatch_ack;
+             DROP TRIGGER reject_bound_cleanup_pending_finalizer;",
+        )
+        .unwrap();
+
+    let blocked_event = harness.enqueue(EventKind::TaskFailed, "project-a", "bound-cleanup-pending-new");
+    let other_event = harness.enqueue(EventKind::TaskFailed, "project-b", "bound-cleanup-pending-other");
+    let intervention_id = InterventionRepository::new(&harness.db)
+        .insert_pending("project-a", "must remain pending", harness.now)
+        .unwrap();
+
+    assert!(daemon.run_once().await.is_ok());
+    let blocked = EventRepository::new(&harness.db)
+        .find_by_id(blocked_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.status, EventStatus::Pending);
+    assert_eq!(blocked.attempts, 0);
+    assert_eq!(harness.event_status(other_event), EventStatus::Dispatched);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE project_id = 'project-a' AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let intervention = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, agent_run_id, attempts FROM interventions WHERE intervention_id = ?1",
+            [intervention_id.intervention_id.as_str()],
+            |row| Ok((
+                row.get::<_, pueue_agent::interventions::InterventionStatus>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+            )),
+        )
+        .unwrap();
+    assert_eq!(
+        intervention,
+        (
+            pueue_agent::interventions::InterventionStatus::Pending,
+            None,
+            0,
+        )
+    );
+
+    fs::remove_dir_all(overflow_subtree).unwrap();
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), daemon.run(shutdown))
+        .await
+        .expect("bound cleanup owner shutdown must remain bounded")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn daemon_run_once_invokes_reconciliation_detection_termination_and_scheduler() {
     let harness = DaemonHarness::new();

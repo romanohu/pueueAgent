@@ -234,6 +234,21 @@ impl BoundCleanupHandle {
         self.run_id
     }
 
+    pub(crate) fn cleanup_pending(&self) -> bool {
+        matches!(
+            &self.kind,
+            BoundCleanupKind::LiveChild {
+                finalized: true,
+                retained_authority: RetainedLaunchAuthority::Retained { .. },
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn cleanup_blocked_project(&self) -> Option<&str> {
+        self.cleanup_pending().then_some(self.project_id.as_str())
+    }
+
     pub async fn retry(
         &mut self,
         db: &crate::db::Db,

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt};
+use std::{collections::{BTreeMap, BTreeSet}, fmt};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -33,6 +33,7 @@ pub struct Scheduler {
     db: crate::db::Db,
     runner: AgentRunner,
     config: SchedulerConfig,
+    cleanup_blocked_projects: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -100,7 +101,17 @@ pub struct StartedAgent {
 
 impl Scheduler {
     pub fn new(db: crate::db::Db, runner: AgentRunner, config: SchedulerConfig) -> Self {
-        Self { db, runner, config }
+        Self {
+            db,
+            runner,
+            config,
+            cleanup_blocked_projects: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_cleanup_blocked_projects(mut self, project_ids: BTreeSet<String>) -> Self {
+        self.cleanup_blocked_projects = project_ids;
+        self
     }
 
     pub fn into_runner(self) -> AgentRunner {
@@ -181,10 +192,11 @@ impl Scheduler {
             .recover_expired_leases()
             .map_err(SchedulerTickError::from_source)?;
         let claimed = EventRepository::new(&self.db)
-            .claim_batch(
+            .claim_batch_excluding_projects(
                 self.config.now,
                 self.config.now + self.config.lease_seconds,
                 self.config.claim_limit,
+                &self.cleanup_blocked_projects,
             )
             .map_err(SchedulerTickError::from_source)?;
         let mut report = SchedulerReport {
@@ -202,6 +214,14 @@ impl Scheduler {
         }
 
         for (project_id, mut events) in group_by_project(claimed) {
+            if self.cleanup_blocked_projects.contains(&project_id) {
+                let event_ids = events
+                    .iter()
+                    .map(|event| event.event_id)
+                    .collect::<Vec<_>>();
+                return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                continue;
+            }
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
             let event_ids = events
                 .iter()
