@@ -8,6 +8,7 @@ use pueue_agent::{
     execution_policy::NetworkMode,
     models::AgentContextMode,
     paths, project,
+    AppError,
 };
 use tempfile::TempDir;
 
@@ -246,7 +247,48 @@ fn empty_pueue_group_is_rejected() {
 
     let error = load_config(config).unwrap_err();
 
-    assert!(error.to_string().contains("pueue_group"));
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "pueue_group",
+            message: "has invalid characters or length"
+        }
+    ));
+}
+
+#[test]
+fn pueue_group_rejects_invalid_values_with_the_bounded_validation_error() {
+    for value in ["", " ", "-bad", "pa project", "pa/project", "pa;touch-x"] {
+        let config = valid_config().replace(
+            "pueue_group = \"pa-training-abcdef\"",
+            &format!("pueue_group = \"{value}\""),
+        );
+        let error = load_config(config).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::Validation {
+                    field: "pueue_group",
+                    message: "has invalid characters or length"
+                }
+            ),
+            "unexpected error for {value:?}: {error:?}"
+        );
+    }
+
+    let overlong = "a".repeat(129);
+    let config = valid_config().replace(
+        "pueue_group = \"pa-training-abcdef\"",
+        &format!("pueue_group = \"{overlong}\""),
+    );
+    let error = load_config(config).unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "pueue_group",
+            message: "has invalid characters or length"
+        }
+    ));
 }
 
 #[test]

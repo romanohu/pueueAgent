@@ -149,7 +149,7 @@ struct RawProjectConfig {
 impl RawProjectConfig {
     fn validate(self) -> Result<ProjectConfig, AppError> {
         required(&self.project_id, "project_id")?;
-        required(&self.pueue_group, "pueue_group")?;
+        crate::pueue_security::validate_group(&self.pueue_group)?;
 
         Ok(ProjectConfig {
             project_id: self.project_id,

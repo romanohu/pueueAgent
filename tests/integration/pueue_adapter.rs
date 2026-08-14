@@ -3,6 +3,9 @@ mod fake_pueue;
 
 use std::{ffi::OsString, fs, path::PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use fake_pueue::{FakePueue, FakePueueCommand};
 use pueue_agent::{
     batches::BatchJobResult,
@@ -12,7 +15,13 @@ use pueue_agent::{
         Submission, SubmissionKind, SubmissionStatus,
     },
     pueue::{CommandPueue, PueueApi, PueueError, PueueTask},
+    pueue_security::validate_group,
     submit, AppError,
+};
+#[cfg(unix)]
+use pueue_agent::execution_policy::{
+    load_or_create_policy, PolicyLoadInput, PolicyViolation, PolicyViolationCode,
+    PolicyViolationStage, StartupEnvironment,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -34,6 +43,111 @@ const STATUS_JSON: &str = r#"{
     }
   }
 }"#;
+
+#[cfg(unix)]
+struct CorePolicyHarness {
+    _temp: TempDir,
+    state_dir: PathBuf,
+    project_root: PathBuf,
+    trusted_dir: PathBuf,
+    codex_home: PathBuf,
+    launcher: PathBuf,
+    config_path: PathBuf,
+    replacement_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl CorePolicyHarness {
+    fn new(config_under_project_root: bool, weak_config: bool) -> Self {
+        let temp = TempDir::new().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let state_dir = base.join("state");
+        let project_root = base.join("project");
+        let trusted_dir = base.join("trusted");
+        let codex_home = base.join("codex-home");
+        for directory in [&state_dir, &project_root, &trusted_dir, &codex_home] {
+            fs::create_dir(directory).unwrap();
+            secure_directory(directory);
+        }
+
+        let codex = trusted_dir.join("codex");
+        let pueue = trusted_dir.join("pueue");
+        let launcher = trusted_dir.join("launcher");
+        for executable in [&codex, &pueue, &launcher] {
+            fs::write(executable, b"generated fixture").unwrap();
+            secure_executable(executable);
+        }
+
+        let config_path = if config_under_project_root {
+            project_root.join("pueue.yml")
+        } else {
+            base.join("pueue.yml")
+        };
+        fs::write(&config_path, b"fixture: true\n").unwrap();
+        if weak_config {
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o666)).unwrap();
+        } else {
+            secure_file(&config_path);
+        }
+
+        let policy_path = state_dir.join("execution-policy.toml");
+        fs::write(
+            &policy_path,
+            format!(
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+                trusted_dir.display().to_string(),
+                codex.display().to_string(),
+                pueue.display().to_string(),
+            ),
+        )
+        .unwrap();
+        secure_file(&policy_path);
+
+        Self {
+            _temp: temp,
+            state_dir,
+            project_root,
+            trusted_dir,
+            codex_home,
+            launcher,
+            config_path,
+            replacement_path: base.join("replacement.yml"),
+        }
+    }
+
+    fn input(&self) -> PolicyLoadInput {
+        PolicyLoadInput {
+            state_dir: self.state_dir.clone(),
+            project_roots: vec![self.project_root.clone()],
+            inherited_path: self.trusted_dir.clone().into_os_string(),
+            startup_environment: StartupEnvironment::from_pairs([("FIXTURE", "true")]),
+            codex_home: self.codex_home.clone(),
+            pueue_config: self.config_path.clone(),
+            launcher_path: self.launcher.clone(),
+        }
+    }
+
+    fn load_core_policy(
+        &self,
+    ) -> Result<pueue_agent::execution_policy::ResolvedExecutionPolicy, PolicyViolation> {
+        load_or_create_policy(&self.input())
+    }
+}
+
+#[cfg(unix)]
+fn secure_directory(path: &std::path::Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+fn secure_file(path: &std::path::Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(unix)]
+fn secure_executable(path: &std::path::Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
 
 struct SubmitHarness {
     _temp: TempDir,
@@ -96,6 +210,67 @@ max_experiments = 20
 
 fn expected_provisional_signature(group: &str, task_id: i64, submission_id: &str) -> String {
     format!("provisional-submit:v1:group={group}:task-id={task_id}:intent={submission_id}")
+}
+
+#[test]
+fn pueue_group_accepts_bounded_grammar_and_rejects_shell_text() {
+    for value in ["pa-project", "A9._-x"] {
+        validate_group(value).unwrap();
+    }
+    for value in ["", "-bad", "pa project", "pa/project", "pa;touch-x", &"a".repeat(129)] {
+        assert!(validate_group(value).is_err(), "accepted {value:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pueue_config_anchor_rejects_replacement_before_each_command() {
+    let harness = CorePolicyHarness::new(false, false);
+    let policy = harness.load_core_policy().unwrap();
+
+    fs::rename(&harness.config_path, &harness.replacement_path).unwrap();
+    fs::write(&harness.config_path, b"replacement\n").unwrap();
+    secure_file(&harness.config_path);
+
+    let error = match policy
+        .pueue_config_anchor
+        .verify_identity(&policy.project_roots)
+    {
+        Ok(_) => panic!("replaced Pueue config was accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        AppError::PolicyViolation {
+            violation: PolicyViolation {
+                code: PolicyViolationCode::AnchorReplaced,
+                stage: PolicyViolationStage::RunBoundPreMarker,
+                ..
+            }
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn pueue_config_anchor_rejects_weak_mode_and_project_root_config() {
+    let weak = CorePolicyHarness::new(false, true);
+    let weak_result = weak.load_core_policy();
+    match &weak_result {
+        Err(error)
+            if error.code == PolicyViolationCode::AnchorMissing
+                && error.stage == PolicyViolationStage::Startup => {}
+        result => panic!("weak config result: {result:?}"),
+    }
+
+    let under_root = CorePolicyHarness::new(true, false);
+    let under_root_result = under_root.load_core_policy();
+    match &under_root_result {
+        Err(error)
+            if error.code == PolicyViolationCode::TrustedPathUnsafe
+                && error.stage == PolicyViolationStage::Startup => {}
+        result => panic!("project-root config result: {result:?}"),
+    }
 }
 
 #[tokio::test]
