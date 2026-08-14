@@ -492,6 +492,314 @@ async fn blocked_projects_do_not_starve_unblocked_events_at_claim_limit() {
     assert_eq!(report.started.len(), 1);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn nonempty_max_generation_blocks_only_its_project_without_advancing_sequence() {
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let retained = tmp.join(pueue_agent::environment::MAX_PRIVATE_TEMP_RUN_ID.to_string());
+    fs::create_dir(&retained).unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(retained.join("preserved"), b"crash-retained").unwrap();
+
+    harness.register_project("project-b", "pb-project-b", "/bin/echo", "");
+    let blocked_event = harness.enqueue(EventKind::TaskFailed, "project-a", "floor-a");
+    let unrelated_event = harness.enqueue(EventKind::TaskFailed, "project-b", "floor-b");
+    let intervention_id = harness.queue_intervention("must remain pending");
+
+    let mut scheduler = harness.scheduler();
+    let mut report = scheduler.tick().await.unwrap();
+
+    assert_eq!(harness.event_status(blocked_event), EventStatus::DeadLetter);
+    assert_eq!(harness.event(blocked_event).attempts, 1);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Dispatched);
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].run_id, 1);
+    let sequence: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence, 1);
+    assert_eq!(harness.pending_intervention_count(), 1);
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending
+    );
+    let mut unrelated = report.started.pop().unwrap();
+    unrelated.handle.wait(&harness.db, harness.now).await.unwrap();
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Completed);
+    assert_eq!(fs::read(retained.join("preserved")).unwrap(), b"crash-retained");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn empty_max_generation_without_event_does_not_poison_unrelated_project() {
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let retained = tmp.join(pueue_agent::environment::MAX_PRIVATE_TEMP_RUN_ID.to_string());
+    fs::create_dir(&retained).unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o700)).unwrap();
+
+    harness.register_project("project-b", "pb-project-b", "/bin/echo", "");
+    let unrelated_event = harness.enqueue(EventKind::TaskFailed, "project-b", "floor-only-b");
+
+    let mut scheduler = harness.scheduler();
+    let mut report = scheduler.tick().await.unwrap();
+
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Dispatched);
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].run_id, 1);
+    let sequence: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence, 1);
+    let mut unrelated = report.started.pop().unwrap();
+    unrelated.handle.wait(&harness.db, harness.now).await.unwrap();
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Completed);
+    assert!(retained.is_dir());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn future_generation_blocks_before_reservation_or_run_id_allocation() {
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let future = tmp.join("1");
+    fs::create_dir(&future).unwrap();
+    fs::set_permissions(&future, fs::Permissions::from_mode(0o700)).unwrap();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "future-generation");
+    let intervention_id = harness.queue_intervention("must remain pending");
+
+    let report = harness.scheduler().tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(harness.event(event_id).attempts, 1);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(harness.pending_intervention_count(), 1);
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending
+    );
+    let sequence: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence, 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn invalid_numeric_symlink_does_not_poison_global_floor() {
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = harness.temp.path().join("outside-floor");
+    fs::create_dir(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    let poisoned = tmp
+        .join(pueue_agent::environment::MAX_PRIVATE_TEMP_RUN_ID.to_string());
+    symlink(&outside, &poisoned).unwrap();
+
+    harness.register_project("project-b", "pb-project-b", "/bin/echo", "");
+    let blocked_event = harness.enqueue(EventKind::TaskFailed, "project-a", "symlink-floor-a");
+    let unrelated_event = harness.enqueue(EventKind::TaskFailed, "project-b", "symlink-floor-b");
+    let mut scheduler = harness.scheduler();
+    let mut report = scheduler.tick().await.unwrap();
+
+    assert_eq!(harness.event_status(blocked_event), EventStatus::DeadLetter);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Dispatched);
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].run_id, 1);
+    let mut unrelated = report.started.pop().unwrap();
+    unrelated.handle.wait(&harness.db, harness.now).await.unwrap();
+    assert!(poisoned.is_symlink());
+    assert!(outside.is_dir());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn crash_retained_temp_dead_letters_before_reservation_or_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let retained = tmp.join("41");
+    fs::create_dir(&retained).unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(retained.join("preserved"), b"crash-retained").unwrap();
+
+    harness.register_project("project-b", "pb-project-b", "/bin/echo", "");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "crash-retained");
+    let unrelated_event =
+        harness.enqueue(EventKind::TaskFailed, "project-b", "crash-retained-b");
+    let intervention_id = harness.queue_intervention("must remain pending");
+
+    let mut scheduler = harness.scheduler();
+    let mut report = scheduler.tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(harness.event(event_id).attempts, 1);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Dispatched);
+    let mut unrelated = report.started.pop().unwrap();
+    unrelated.handle.wait(&harness.db, harness.now).await.unwrap();
+    assert_eq!(harness.event_status(unrelated_event), EventStatus::Completed);
+    assert_eq!(harness.pending_intervention_count(), 1);
+    assert_eq!(
+        harness.intervention_state(&intervention_id).0,
+        pueue_agent::interventions::InterventionStatus::Pending
+    );
+    assert_eq!(
+        fs::read(retained.join("preserved")).unwrap(),
+        b"crash-retained"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn empty_retained_generations_allow_the_next_agent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let seed_event = harness.enqueue(EventKind::TaskFinished, "project-a", "durable-seed");
+    let seed_run = AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            seed_event,
+            None,
+            AgentRunStatus::Starting,
+            harness.now - 1,
+            harness.root("project-a").join(".pueue-agent/logs/seed.log"),
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'completed', finished_at = ?1 WHERE run_id = ?2",
+            params![harness.now, seed_run.run_id],
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'completed', completed_at = ?1 WHERE event_id = ?2",
+            params![harness.now, seed_event],
+        )
+        .unwrap();
+    let retained = tmp.join(seed_run.run_id.to_string());
+    fs::create_dir(&retained).unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "empty-retained");
+    let runner = harness.scheduler().into_runner();
+    let project = harness.project();
+    let project_config = pueue_agent::config::load(&project.config_path).unwrap();
+    let project_policy = runner.resolve_project_policy(&project, &project_config).unwrap();
+    let inventory = runner
+        .preflight_private_temp_capacity(&project_policy, seed_run.run_id)
+        .unwrap();
+    assert_eq!(inventory.generations, 1);
+    assert_eq!(inventory.retained_nonempty_generations, 0);
+    assert_eq!(inventory.retained_allocated_bytes, 0);
+
+    let mut scheduler = harness.scheduler();
+    let mut report = scheduler.tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+    assert_eq!(harness.event(event_id).attempts, 1);
+    assert_eq!(report.started[0].run_id, seed_run.run_id + 1);
+    let mut started = report.started.pop().unwrap();
+    started.handle.wait(&harness.db, harness.now).await.unwrap();
+    assert!(retained.is_dir());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn active_agent_temp_is_deferred_not_classified_as_crash_retained() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = SchedulerHarness::new();
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let active_event = harness.enqueue(EventKind::TaskFailed, "project-a", "active-run");
+    let active_run = AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::with_context(
+            "project-a",
+            active_event,
+            Some(42_424),
+            AgentRunStatus::Running,
+            harness.now - 10,
+            harness
+                .root("project-a")
+                .join(".pueue-agent/logs/active.log"),
+            AgentContextMode::Fresh,
+            None,
+            vec![active_event.to_string()],
+        ))
+        .unwrap();
+    let retained = tmp.join(active_run.run_id.to_string());
+    fs::create_dir(&retained).unwrap();
+    fs::set_permissions(&retained, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(retained.join("live-agent-data"), b"must not inventory").unwrap();
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "defer-active");
+
+    let mut scheduler = harness.scheduler();
+    let result = scheduler.tick().await;
+
+    assert!(result.is_ok(), "active project should be deferred, not failed");
+    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    assert_eq!(harness.event(event_id).attempts, 0);
+    assert!(harness.agent_run_states().iter().all(|(status, _, _)| {
+        *status == AgentRunStatus::Running
+    }));
+    assert_eq!(
+        fs::read(retained.join("live-agent-data")).unwrap(),
+        b"must not inventory"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn spawn_is_dispatched_but_not_completed_until_native_exit() {

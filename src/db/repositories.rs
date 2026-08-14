@@ -19,7 +19,10 @@ use crate::{
         BatchJobResult, MAX_BATCH_ARGV_JSON_BYTES, MAX_BATCH_METADATA_JSON_BYTES,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
-    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
+    environment::{
+        MAX_PRIVATE_TEMP_RUN_ID, PrivateRunTemp, ProjectAdmissionLock, RunIdAdmissionGuard,
+    },
+    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage, ProjectRootAnchor},
     interventions::{
         validate_message, Intervention, InterventionCounts, InterventionReservation,
         MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
@@ -44,17 +47,41 @@ pub struct ProjectRepository<'db> {
     db: &'db Db,
 }
 
+fn acquire_run_id_admission_guard(db: &Db) -> Result<RunIdAdmissionGuard, AppError> {
+    match RunIdAdmissionGuard::try_acquire(db.run_id_lock_parent())? {
+        Some(guard) => Ok(guard),
+        None => Err(AppError::Runtime {
+            operation: "acquire agent run ID admission guard",
+        }),
+    }
+}
+
 impl<'db> ProjectRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
         Self { db }
     }
 
     pub fn register(&self, project: &NewProject) -> Result<Project, AppError> {
+        let run_id_guard = acquire_run_id_admission_guard(self.db)?;
         let canonical_root =
             fs::canonicalize(&project.root_path).map_err(|source| AppError::Io {
                 operation: "canonicalize project root",
                 source,
             })?;
+        let root_anchor = ProjectRootAnchor::resolve(&canonical_root).map_err(AppError::from)?;
+        let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+        let project_lock = match ProjectAdmissionLock::try_acquire(&verified_root)? {
+            Some(lock) => lock,
+            None => {
+                return Err(AppError::Runtime {
+                    operation: "acquire project registration admission lock",
+                });
+            }
+        };
+        let retained_generations = PrivateRunTemp::inspect_generation_floor(&verified_root)?;
+        let durable_run_id_high_water =
+            AgentRunRepository::new(self.db).durable_run_id_high_water(&run_id_guard)?;
+        retained_generations.validate_durable_high_water(durable_run_id_high_water)?;
         let root_path = path_text(&canonical_root, "root_path")?;
         let config_path = path_text(&project.config_path, "config_path")?;
         let mut connection = self.db.connect()?;
@@ -114,9 +141,14 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read registered project"))?;
+        #[cfg(test)]
+        invoke_register_before_commit_hook(&canonical_root);
+        root_anchor.verify_identity().map_err(AppError::from)?;
         transaction
             .commit()
             .map_err(database_error("commit project registration"))?;
+        drop(project_lock);
+        drop(run_id_guard);
         Ok(registered)
     }
 
@@ -371,11 +403,29 @@ impl<'db> ProjectRepository<'db> {
         now: i64,
         unresolved_task_ids: &[i64],
     ) -> Result<Project, AppError> {
+        let _run_id_guard = acquire_run_id_admission_guard(self.db)?;
+        let project = self.find_by_id(project_id)?.ok_or(AppError::Runtime {
+            operation: "read project before removal",
+        })?;
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).map_err(AppError::from)?;
+        let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+        let _project_lock = match ProjectAdmissionLock::try_acquire(&verified_root)? {
+            Some(lock) => lock,
+            None => {
+                return Err(AppError::Runtime {
+                    operation: "acquire project removal admission lock",
+                });
+            }
+        };
+        let retained_generations = PrivateRunTemp::inspect_generation_floor(&verified_root)?;
+        let durable_run_id_high_water =
+            AgentRunRepository::new(self.db).durable_run_id_high_water(&_run_id_guard)?;
+        retained_generations.validate_durable_high_water(durable_run_id_high_water)?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin project removal"))?;
-        let project = transaction
+        let transaction_project = transaction
             .query_row(
                 "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
                         halted_reason, created_at, updated_at
@@ -384,9 +434,14 @@ impl<'db> ProjectRepository<'db> {
                 project_from_row,
             )
             .map_err(database_error("read project before removal"))?;
+        if transaction_project.root_path != project.root_path {
+            return Err(AppError::Runtime {
+                operation: "verify project root before removal",
+            });
+        }
         insert_operator_log(
             &transaction,
-            &project,
+            &transaction_project,
             "remove",
             &json!({
                 "group_released": true,
@@ -399,10 +454,13 @@ impl<'db> ProjectRepository<'db> {
         transaction
             .execute("DELETE FROM projects WHERE project_id = ?1", [project_id])
             .map_err(database_error("remove project"))?;
+        #[cfg(test)]
+        invoke_remove_before_commit_hook(&project.root_path);
+        root_anchor.verify_identity().map_err(AppError::from)?;
         transaction
             .commit()
             .map_err(database_error("commit project removal"))?;
-        Ok(project)
+        Ok(transaction_project)
     }
 
     pub fn record_task_cancellation(
@@ -3208,51 +3266,29 @@ impl<'db> AgentRunRepository<'db> {
         Self { db }
     }
 
-    pub fn insert(&self, run: &NewAgentRun) -> Result<AgentRun, AppError> {
-        let log_path = path_text(&run.log_path, "log_path")?;
-        let context_lineage_json =
-            serde_json::to_string(&run.context_lineage).map_err(|source| {
-                AppError::Serialization {
-                    operation: "serialize agent context lineage",
-                    source,
-                }
-            })?;
-        let launch_gate_state = if run.status == AgentRunStatus::Starting {
-            "pending"
-        } else {
-            "released"
-        };
-        let execution = run.execution.as_ref();
+    pub(crate) fn durable_run_id_high_water(
+        &self,
+        _run_id_guard: &RunIdAdmissionGuard,
+    ) -> Result<i64, AppError> {
         let connection = self.db.connect()?;
-        connection
-            .execute(
-                "INSERT INTO agent_runs (
-                    project_id, primary_event_id, pid, status, started_at,
-                    finished_at, exit_code, log_path, last_error, launch_gate_state,
-                    context_mode,
-                    context_session_id, context_lineage_json,
-                    execution_kind, executable_path, executable_identity,
-                    policy_code, failure_stage
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10,
-                           ?11, ?12, ?13, NULL, NULL)",
-                params![
-                    run.project_id,
-                    run.primary_event_id,
-                    run.pid,
-                    run.status,
-                    run.started_at,
-                    log_path,
-                    launch_gate_state,
-                    run.context_mode.as_str(),
-                    run.context_session_id.as_deref(),
-                    context_lineage_json,
-                    execution.map(ExecutionProjection::execution_kind),
-                    execution.map(ExecutionProjection::executable_path),
-                    execution.map(ExecutionProjection::executable_identity),
-                ],
-            )
-            .map_err(database_error("insert agent run"))?;
-        read_agent_run(&connection, connection.last_insert_rowid())
+        read_durable_agent_run_id_high_water(&connection)
+    }
+
+    fn acquire_run_id_guard(&self) -> Result<RunIdAdmissionGuard, AppError> {
+        acquire_run_id_admission_guard(self.db)
+    }
+
+    pub fn insert(&self, run: &NewAgentRun) -> Result<AgentRun, AppError> {
+        let run_id_guard = self.acquire_run_id_guard()?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin agent run insertion"))?;
+        let run_id = insert_agent_run(&transaction, run, &run_id_guard)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit agent run insertion"))?;
+        read_agent_run(&connection, run_id)
     }
 
     pub fn insert_with_events(
@@ -3268,6 +3304,22 @@ impl<'db> AgentRunRepository<'db> {
         run: &NewAgentRun,
         event_ids: &[i64],
         reservation_token: Option<&str>,
+    ) -> Result<AgentRun, AppError> {
+        let run_id_guard = self.acquire_run_id_guard()?;
+        self.insert_with_events_and_reservation_with_guard(
+            run,
+            event_ids,
+            reservation_token,
+            &run_id_guard,
+        )
+    }
+
+    pub(crate) fn insert_with_events_and_reservation_with_guard(
+        &self,
+        run: &NewAgentRun,
+        event_ids: &[i64],
+        reservation_token: Option<&str>,
+        _run_id_guard: &RunIdAdmissionGuard,
     ) -> Result<AgentRun, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -3304,7 +3356,7 @@ impl<'db> AgentRunRepository<'db> {
         } else {
             0
         };
-        let run_id = insert_agent_run(&transaction, run)?;
+        let run_id = insert_agent_run(&transaction, run, _run_id_guard)?;
         for event_id in event_ids {
             let status = transaction
                 .query_row(
@@ -5918,7 +5970,72 @@ fn agent_run_from_row(row: &Row<'_>) -> rusqlite::Result<AgentRun> {
     })
 }
 
-fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<i64, AppError> {
+fn reserve_next_agent_run_id(transaction: &Transaction<'_>) -> Result<i64, AppError> {
+    let stored_floor: i64 = transaction
+        .query_row(
+            "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read agent run ID sequence"))?;
+    let existing_floor: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(run_id), 0) FROM agent_runs",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read maximum agent run ID"))?;
+    let floor = stored_floor.max(existing_floor);
+    if floor >= MAX_PRIVATE_TEMP_RUN_ID {
+        return Err(AppError::Runtime {
+            operation: "allocate agent run ID",
+        });
+    }
+    let next_run_id = floor + 1;
+    transaction
+        .execute(
+            "UPDATE agent_run_id_sequence
+             SET last_run_id = ?1
+             WHERE sequence_id = 1",
+            [next_run_id],
+        )
+        .map_err(database_error("advance agent run ID sequence"))?;
+    Ok(next_run_id)
+}
+
+fn read_durable_agent_run_id_high_water(connection: &Connection) -> Result<i64, AppError> {
+    let stored_floor: i64 = connection
+        .query_row(
+            "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read agent run ID sequence floor"))?;
+    let existing_floor: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(run_id), 0) FROM agent_runs",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read maximum agent run ID for floor"))?;
+    if stored_floor < 0
+        || stored_floor > MAX_PRIVATE_TEMP_RUN_ID
+        || existing_floor > MAX_PRIVATE_TEMP_RUN_ID
+        || stored_floor < existing_floor
+    {
+        return Err(AppError::Runtime {
+            operation: "validate agent run ID sequence floor",
+        });
+    }
+    Ok(stored_floor)
+}
+
+fn insert_agent_run(
+    transaction: &Transaction<'_>,
+    run: &NewAgentRun,
+    _run_id_guard: &RunIdAdmissionGuard,
+) -> Result<i64, AppError> {
+    let run_id = reserve_next_agent_run_id(transaction)?;
     let log_path = path_text(&run.log_path, "log_path")?;
     let context_lineage_json =
         serde_json::to_string(&run.context_lineage).map_err(|source| AppError::Serialization {
@@ -5934,15 +6051,16 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
     transaction
         .execute(
             "INSERT INTO agent_runs (
-                project_id, primary_event_id, pid, status, started_at,
+                run_id, project_id, primary_event_id, pid, status, started_at,
                 finished_at, exit_code, log_path, last_error, launch_gate_state,
                 context_mode,
                 context_session_id, context_lineage_json,
                 execution_kind, executable_path, executable_identity,
                 policy_code, failure_stage
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, ?7, ?8, ?9, ?10,
-                       ?11, ?12, ?13, NULL, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11,
+                       ?12, ?13, ?14, NULL, NULL)",
             params![
+                run_id,
                 run.project_id,
                 run.primary_event_id,
                 run.pid,
@@ -5959,7 +6077,7 @@ fn insert_agent_run(transaction: &Transaction<'_>, run: &NewAgentRun) -> Result<
             ],
         )
         .map_err(database_error("insert agent run"))?;
-    Ok(transaction.last_insert_rowid())
+    Ok(run_id)
 }
 
 fn attach_event_to_agent_run(
@@ -5992,11 +6110,51 @@ fn read_agent_run(connection: &Connection, run_id: i64) -> Result<AgentRun, AppE
 #[cfg(test)]
 std::thread_local! {
     static FAIL_FINALIZER_RESULT_READ_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLACE_REGISTERED_ROOT_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPLACE_REMOVED_ROOT_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 fn inject_finalizer_result_read_failure_once() {
     FAIL_FINALIZER_RESULT_READ_ONCE.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn inject_registered_root_replacement_before_commit_once() {
+    REPLACE_REGISTERED_ROOT_BEFORE_COMMIT.with(|replace| replace.set(true));
+}
+
+#[cfg(test)]
+fn inject_removed_root_replacement_before_commit_once() {
+    REPLACE_REMOVED_ROOT_BEFORE_COMMIT.with(|replace| replace.set(true));
+}
+
+#[cfg(test)]
+fn invoke_register_before_commit_hook(root: &std::path::Path) {
+    if REPLACE_REGISTERED_ROOT_BEFORE_COMMIT.with(|replace| replace.replace(false)) {
+        let retired = root.with_file_name(format!(
+            "{}-retired",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+        ));
+        std::fs::rename(root, &retired).expect("retire registered root in test hook");
+        std::fs::create_dir(root).expect("replace registered root in test hook");
+    }
+}
+
+#[cfg(test)]
+fn invoke_remove_before_commit_hook(root: &std::path::Path) {
+    if REPLACE_REMOVED_ROOT_BEFORE_COMMIT.with(|replace| replace.replace(false)) {
+        let retired = root.with_file_name(format!(
+            "{}-removal-retired",
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+        ));
+        std::fs::rename(root, &retired).expect("retire removed root in test hook");
+        std::fs::create_dir(root).expect("replace removed root in test hook");
+    }
 }
 
 fn read_agent_run_in_transaction(
@@ -6280,5 +6438,686 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count_after_rejection, 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn durable_run_id_high_water_survives_project_removal_and_reenrollment() {
+        let temp = TempDir::new().unwrap();
+        let first_root = temp.path().join("first-project");
+        fs::create_dir_all(&first_root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &first_root,
+                "pa-run-id-floor",
+                first_root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let first_event = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFinished,
+                "first-run-id",
+                json!({"task_id": 41}),
+                100,
+                100,
+            ))
+            .unwrap()
+            .event_id;
+        EventRepository::new(&db).claim_batch(100, 200, 1).unwrap();
+        let first_run = AgentRunRepository::new(&db)
+            .insert_with_events(
+                &NewAgentRun::new(
+                    "project-a",
+                    first_event,
+                    None,
+                    AgentRunStatus::Starting,
+                    110,
+                    "/tmp/first-run-id.log",
+                ),
+                &[first_event],
+            )
+            .unwrap();
+        assert_eq!(first_run.run_id, 1);
+        let first_anchor = crate::execution_policy::ProjectRootAnchor::resolve(
+            &fs::canonicalize(&first_root).unwrap(),
+        )
+        .unwrap();
+        let retained = crate::environment::PrivateRunTemp::create(
+            &first_anchor.verify_identity().unwrap(),
+            first_run.run_id,
+        )
+        .unwrap();
+        let retained_path = retained.path().to_path_buf();
+        drop(retained);
+        ProjectRepository::new(&db)
+            .remove("project-a", 120, &[])
+            .unwrap();
+        assert!(retained_path.is_dir());
+
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &first_root,
+                "pa-run-id-reenrolled",
+                first_root.join(".pueue-agent/config.toml"),
+                130,
+            ))
+            .unwrap();
+        let second_event = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFinished,
+                "second-run-id",
+                json!({"task_id": 42}),
+                130,
+                130,
+            ))
+            .unwrap()
+            .event_id;
+        EventRepository::new(&db).claim_batch(130, 230, 1).unwrap();
+        let second_run = AgentRunRepository::new(&db)
+            .insert_with_events(
+                &NewAgentRun::new(
+                    "project-a",
+                    second_event,
+                    None,
+                    AgentRunStatus::Starting,
+                    140,
+                    "/tmp/second-run-id.log",
+                ),
+                &[second_event],
+            )
+            .unwrap();
+        assert_eq!(second_run.run_id, first_run.run_id + 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn committed_run_id_before_temp_create_failure_is_not_reused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let first_root = temp.path().join("first-project");
+        let second_root = temp.path().join("second-project");
+        fs::create_dir(&first_root).unwrap();
+        fs::create_dir(&second_root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        for (project_id, root, group) in [
+            ("project-a", &first_root, "pa-temp-gap"),
+            ("project-b", &second_root, "pb-temp-gap"),
+        ] {
+            ProjectRepository::new(&db)
+                .register(&NewProject::new(
+                    project_id,
+                    root,
+                    group,
+                    root.join(".pueue-agent/config.toml"),
+                    100,
+                ))
+                .unwrap();
+        }
+        let first_event = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFinished,
+                "temp-gap-first",
+                json!({}),
+                100,
+                100,
+            ))
+            .unwrap()
+            .event_id;
+        let first_run = AgentRunRepository::new(&db)
+            .insert(&NewAgentRun::new(
+                "project-a",
+                first_event,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                "/tmp/temp-gap-first.log",
+            ))
+            .unwrap();
+        assert_eq!(first_run.run_id, 1);
+
+        let tmp = first_root.join(".pueue-agent/tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        let occupied = tmp.join(first_run.run_id.to_string());
+        fs::create_dir(&occupied).unwrap();
+        fs::set_permissions(&occupied, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = ProjectRootAnchor::resolve(&fs::canonicalize(&first_root).unwrap()).unwrap();
+        assert!(PrivateRunTemp::create(&anchor.verify_identity().unwrap(), first_run.run_id)
+            .is_err());
+
+        let second_event = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-b",
+                EventKind::TaskFinished,
+                "temp-gap-second",
+                json!({}),
+                120,
+                120,
+            ))
+            .unwrap()
+            .event_id;
+        let second_run = AgentRunRepository::new(&db)
+            .insert(&NewAgentRun::new(
+                "project-b",
+                second_event,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/temp-gap-second.log",
+            ))
+            .unwrap();
+        assert_eq!(second_run.run_id, 2);
+        let sequence: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn project_removal_rejects_future_generation_without_advancing_sequence() {
+        let temp = TempDir::new().unwrap();
+        let first_root = temp.path().join("first-project");
+        fs::create_dir(&first_root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &first_root,
+                "pa-removal-floor",
+                first_root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let first_anchor = ProjectRootAnchor::resolve(&fs::canonicalize(&first_root).unwrap())
+            .unwrap();
+        let retained = PrivateRunTemp::create(&first_anchor.verify_identity().unwrap(), 41)
+            .unwrap();
+        fs::write(retained.path().join("preserved"), b"retained evidence").unwrap();
+        let retained_path = retained.path().to_path_buf();
+        drop(retained);
+
+        let result = ProjectRepository::new(&db).remove("project-a", 110, &[]);
+
+        let sequence: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 0);
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyViolation { violation })
+                if violation.code == PolicyViolationCode::TempUnsafe
+        ));
+        assert!(ProjectRepository::new(&db)
+            .find_by_id("project-a")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            fs::read(retained_path.join("preserved")).unwrap(),
+            b"retained evidence"
+        );
+
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn project_removal_inventory_failure_preserves_row_and_sequence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &root,
+                "pa-removal-unsafe",
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let anchor = ProjectRootAnchor::resolve(&fs::canonicalize(&root).unwrap()).unwrap();
+        let retained = PrivateRunTemp::create(&anchor.verify_identity().unwrap(), 17).unwrap();
+        let tmp = retained.path().parent().unwrap().to_path_buf();
+        drop(retained);
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let result = ProjectRepository::new(&db).remove("project-a", 110, &[]);
+
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyViolation { violation })
+                if violation.code == PolicyViolationCode::TempUnsafe
+        ));
+        assert!(ProjectRepository::new(&db)
+            .find_by_id("project-a")
+            .unwrap()
+            .is_some());
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operator_logs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn project_removal_lock_contention_preserves_row_and_sequence() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &root,
+                "pa-removal-lock",
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let anchor = ProjectRootAnchor::resolve(&fs::canonicalize(&root).unwrap()).unwrap();
+        let verified = anchor.verify_identity().unwrap();
+        let lock = ProjectAdmissionLock::try_acquire(&verified)
+            .unwrap()
+            .expect("project lock");
+
+        let result = ProjectRepository::new(&db).remove("project-a", 110, &[]);
+
+        assert!(matches!(
+            result,
+            Err(AppError::Runtime {
+                operation: "acquire project removal admission lock"
+            })
+        ));
+        assert!(ProjectRepository::new(&db)
+            .find_by_id("project-a")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(lock);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn project_removal_root_replacement_rolls_back_floor_and_row() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &root,
+                "pa-removal-replaced",
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        inject_removed_root_replacement_before_commit_once();
+        let result = ProjectRepository::new(&db).remove("project-a", 110, &[]);
+
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyViolation { violation })
+                if violation.code == PolicyViolationCode::RootChanged
+        ));
+        assert!(ProjectRepository::new(&db)
+            .find_by_id("project-a")
+            .unwrap()
+            .is_some());
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operator_logs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(root.with_file_name("project-removal-retired").is_dir());
+    }
+
+    #[test]
+    fn project_admission_lock_is_scoped_and_nonblocking() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let temp = TempDir::new().unwrap();
+        let first_root = temp.path().join("first-project");
+        let second_root = temp.path().join("second-project");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &first_root,
+                "pa-lock-test",
+                first_root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-b",
+                &second_root,
+                "pb-lock-test",
+                second_root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let unrelated_event = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-b",
+                EventKind::TaskFinished,
+                "unrelated-lock-write",
+                json!({"task_id": 43}),
+                100,
+                100,
+            ))
+            .unwrap()
+            .event_id;
+        let first_anchor = crate::execution_policy::ProjectRootAnchor::resolve(
+            &fs::canonicalize(&first_root).unwrap(),
+        )
+        .unwrap();
+        let first_root = first_anchor.verify_identity().unwrap();
+        let first_lock = crate::environment::ProjectAdmissionLock::try_acquire(&first_root)
+            .unwrap()
+            .expect("first project lock");
+
+        let (same_result_tx, same_result_rx) = mpsc::channel();
+        let same_anchor = first_anchor.clone();
+        thread::spawn(move || {
+            let root = same_anchor.verify_identity().unwrap();
+            let result = crate::environment::ProjectAdmissionLock::try_acquire(&root)
+                .unwrap()
+                .is_none();
+            same_result_tx.send(result).unwrap();
+        });
+        assert!(same_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-project contention result"));
+
+        let (other_result_tx, other_result_rx) = mpsc::channel();
+        let unrelated_db = db.clone();
+        thread::spawn(move || {
+            let result = AgentRunRepository::new(&unrelated_db)
+                .insert(&NewAgentRun::new(
+                    "project-b",
+                    unrelated_event,
+                    None,
+                    AgentRunStatus::Starting,
+                    110,
+                    "/tmp/unrelated-lock-write.log",
+                ))
+                .map(|_| ());
+            other_result_tx.send(result).unwrap();
+        });
+        assert!(other_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unrelated-project bind result")
+            .is_ok());
+        drop(first_lock);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn registration_rejects_future_generation_without_advancing_run_id_sequence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("registered-project");
+        let tmp = root.join(".pueue-agent/tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        let future = tmp.join(MAX_PRIVATE_TEMP_RUN_ID.to_string());
+        fs::create_dir(&future).unwrap();
+        fs::set_permissions(&future, fs::Permissions::from_mode(0o700)).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+
+        let result = ProjectRepository::new(&db).register(&NewProject::new(
+            "project-future",
+            &root,
+            "group-future",
+            root.join(".pueue-agent/config.toml"),
+            100,
+        ));
+
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyViolation { violation })
+                if violation.code == PolicyViolationCode::TempUnsafe
+        ));
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE project_id = 'project-future'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn registration_rejects_root_replacement_before_commit() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("registered-project");
+        fs::create_dir(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+
+        inject_registered_root_replacement_before_commit_once();
+        let result = ProjectRepository::new(&db).register(&NewProject::new(
+            "project-replaced",
+            &root,
+            "group-replaced",
+            root.join(".pueue-agent/config.toml"),
+            100,
+        ));
+
+        assert!(matches!(
+            result,
+            Err(AppError::PolicyViolation { violation })
+                if violation.code == PolicyViolationCode::RootChanged
+        ));
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE project_id = 'project-replaced'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn run_id_guard_survives_visible_database_parent_swap() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        let db = Db::open(&parent.join("state.sqlite3")).unwrap();
+        let first = RunIdAdmissionGuard::try_acquire(db.run_id_lock_parent())
+            .unwrap()
+            .expect("first global run-ID guard");
+
+        let moved = temp.path().join("state-moved");
+        fs::rename(&parent, &moved).unwrap();
+        fs::create_dir(&parent).unwrap();
+
+        let second = RunIdAdmissionGuard::try_acquire(db.run_id_lock_parent()).unwrap();
+        assert!(second.is_none(), "visible parent replacement bypassed guard");
+        drop(first);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn global_run_id_guard_serializes_durable_allocation() {
+        use std::sync::mpsc;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-a",
+                &root,
+                "pa-bootstrap-race",
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let event_id = EventRepository::new(&db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFailed,
+                "bootstrap-race-event",
+                json!({}),
+                100,
+                100,
+            ))
+            .unwrap()
+            .event_id;
+        let first = RunIdAdmissionGuard::try_acquire(db.run_id_lock_parent())
+            .unwrap()
+            .expect("allocator guard");
+
+        let (sender, receiver) = mpsc::channel();
+        let competing_db = db.clone();
+        std::thread::spawn(move || {
+            let result = AgentRunRepository::new(&competing_db).insert(&NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                110,
+                "/tmp/bootstrap-race.log",
+            ));
+            sender.send(result.is_err()).unwrap();
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("competing allocator result"));
+        assert_eq!(AgentRunRepository::new(&db).count_by_project("project-a").unwrap(), 0);
+        drop(first);
+
+        let run = AgentRunRepository::new(&db)
+            .insert(&NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                120,
+                "/tmp/bootstrap-race-second.log",
+            ))
+            .unwrap();
+        assert_eq!(run.run_id, 1);
+    }
+
+    #[test]
+    fn run_id_allocator_rejects_a_floor_that_would_emit_maximum_generation_id() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE agent_run_id_sequence SET last_run_id = ?1 WHERE sequence_id = 1",
+                [i64::MAX - 1],
+            )
+            .unwrap();
+        drop(connection);
+        let mut connection = db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(reserve_next_agent_run_id(&transaction).is_err());
+        transaction.rollback().unwrap();
+        let floor: i64 = connection
+            .query_row(
+                "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, i64::MAX - 1);
     }
 }

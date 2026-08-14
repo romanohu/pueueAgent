@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::BTreeMap};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::{
@@ -10,6 +10,7 @@ use crate::{
         SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
+    environment::MAX_PRIVATE_TEMP_RUN_ID,
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
@@ -586,13 +587,14 @@ pub fn build_doctor_report(
         "task_observations",
         "operator_logs",
         "interventions",
+        "agent_run_id_sequence",
     ];
     let table_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
                  'projects','events','integration_events','incidents','agent_runs',
                  'agent_run_events','submissions','termination_requests','task_observations',
-                 'operator_logs','interventions'
+                 'operator_logs','interventions','agent_run_id_sequence'
              )",
             [],
             |row| row.get(0),
@@ -611,6 +613,48 @@ pub fn build_doctor_report(
         doctor_error(
             "schema.tables",
             "one or more required SQLite tables are missing",
+            "reopen the database with the matching pueue-agent release",
+        )
+    });
+    let sequence_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_run_id_sequence",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+    let sequence_row = connection
+        .query_row(
+            "SELECT sequence_id, last_run_id FROM agent_run_id_sequence
+             WHERE sequence_id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional();
+    let sequence_valid = match (sequence_count, sequence_row) {
+        (Some(1), Ok(Some((1, last_run_id))))
+            if (0..=MAX_PRIVATE_TEMP_RUN_ID).contains(&last_run_id) => connection
+            .query_row(
+                "SELECT COALESCE(MAX(run_id), 0) FROM agent_runs",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|max_run_id| {
+                max_run_id <= MAX_PRIVATE_TEMP_RUN_ID && last_run_id >= max_run_id
+            })
+            .unwrap_or(false),
+        _ => false,
+    };
+    checks.push(if sequence_valid {
+        doctor_ok(
+            "schema.agent_run_id_sequence",
+            "agent run ID sequence singleton is valid",
+            "none",
+        )
+    } else {
+        doctor_error(
+            "schema.agent_run_id_sequence",
+            "agent run ID sequence singleton is missing or invalid",
             "reopen the database with the matching pueue-agent release",
         )
     });

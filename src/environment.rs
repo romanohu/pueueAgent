@@ -33,6 +33,7 @@ pub const MAX_PRIVATE_TEMP_CLEANUP_DEPTH: usize = 32;
 pub const MAX_PRIVATE_TEMP_CLEANUP_ENTRIES: usize = 4096;
 pub const MAX_PRIVATE_TEMP_ALLOCATED_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_PRIVATE_TEMP_GENERATIONS: usize = 4096;
+pub const MAX_PRIVATE_TEMP_RUN_ID: i64 = i64::MAX - 1;
 
 const BASELINE_NAMES: &[&str] = &[
     "HOME",
@@ -395,7 +396,7 @@ fn join_trusted_path(paths: &[PathBuf]) -> Result<OsString, PolicyViolation> {
 
 fn validate_run_id(run_id: i64) -> Result<(), PolicyViolation> {
     let text = run_id.to_string();
-    if run_id <= 0 || text.len() > MAX_RUN_ID_BYTES {
+    if run_id <= 0 || run_id > MAX_PRIVATE_TEMP_RUN_ID || text.len() > MAX_RUN_ID_BYTES {
         Err(PolicyViolation::new(
             PolicyViolationCode::TempUnsafe,
             PolicyViolationStage::RunBoundPreMarker,
@@ -419,6 +420,138 @@ fn temp_error() -> PolicyViolation {
     )
 }
 
+pub(crate) struct ProjectAdmissionLock {
+    directory: File,
+}
+
+/// Cross-process serialization for the durable run-ID floor and allocator.
+/// The guard flocks a fresh descriptor opened relative to the retained
+/// database-parent capability, so no replaceable lock-file leaf is trusted.
+/// The descriptor is close-on-exec and never held across native launch.
+pub(crate) struct RunIdAdmissionGuard {
+    file: File,
+}
+
+impl RunIdAdmissionGuard {
+    pub(crate) fn try_acquire(
+        parent: &File,
+    ) -> Result<Option<Self>, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = parent;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = std::ffi::CString::new(".").expect("literal contains no NUL");
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::PreBinding,
+                ));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Some(Self { file }));
+            }
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            Err(PolicyViolation::new(PolicyViolationCode::TempUnsafe, PolicyViolationStage::PreBinding))
+        }
+    }
+}
+
+impl Drop for RunIdAdmissionGuard {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+impl ProjectAdmissionLock {
+    pub(crate) fn try_acquire(
+        root: &VerifiedProjectRoot,
+    ) -> Result<Option<Self>, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = root;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let name = std::ffi::CString::new(".").expect("literal contains no NUL");
+            let fd = unsafe {
+                libc::openat(
+                    root.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::PreBinding,
+                ));
+            }
+            let directory = unsafe { File::from_raw_fd(fd) };
+            let result = unsafe {
+                libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+            };
+            if result == 0 {
+                return Ok(Some(Self { directory }));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            Err(PolicyViolation::new(
+                PolicyViolationCode::TempUnsafe,
+                PolicyViolationStage::PreBinding,
+            ))
+        }
+    }
+}
+
+impl Drop for ProjectAdmissionLock {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.directory.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 /// An exclusive, owner-only per-run directory.
 pub struct PrivateRunTemp {
     name: OsString,
@@ -439,6 +572,30 @@ pub struct TempInventoryReport {
     pub generations: usize,
     pub retained_nonempty_generations: usize,
     pub retained_allocated_bytes: u64,
+    pub max_generation_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TempGenerationFloorReport {
+    pub max_generation_id: Option<i64>,
+}
+
+impl TempInventoryReport {
+    pub(crate) fn validate_durable_high_water(
+        &self,
+        durable_run_id_high_water: i64,
+    ) -> Result<(), PolicyViolation> {
+        validate_generation_high_water(self.max_generation_id, durable_run_id_high_water)
+    }
+}
+
+impl TempGenerationFloorReport {
+    pub(crate) fn validate_durable_high_water(
+        &self,
+        durable_run_id_high_water: i64,
+    ) -> Result<(), PolicyViolation> {
+        validate_generation_high_water(self.max_generation_id, durable_run_id_high_water)
+    }
 }
 
 impl fmt::Debug for PrivateRunTemp {
@@ -452,8 +609,126 @@ impl fmt::Debug for PrivateRunTemp {
 }
 
 impl PrivateRunTemp {
+    /// Inspect top-level generation IDs for validation against the durable run
+    /// ID high-water. Filesystem entries are never allocator authority and
+    /// this observation never mutates global state.
+    pub(crate) fn inspect_generation_floor(
+        root: &VerifiedProjectRoot,
+    ) -> Result<TempGenerationFloorReport, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = root;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let root_mount = directory_mount_identity_at(
+                &root.directory,
+                PolicyViolationStage::PreBinding,
+            )?;
+            let service = match open_optional_directory_on_mount(
+                &root.directory,
+                OsStr::new(PRIVATE_TEMP_ROOT),
+                root_mount,
+                PolicyViolationStage::PreBinding,
+            )? {
+                Some(directory) => {
+                    validate_private_temp_container_at(
+                        &directory,
+                        PolicyViolationStage::PreBinding,
+                    )?;
+                    directory
+                }
+                None => {
+                    return Ok(TempGenerationFloorReport::default());
+                }
+            };
+            let tmp = match open_optional_directory_on_mount(
+                &service,
+                OsStr::new(PRIVATE_TEMP_DIR),
+                root_mount,
+                PolicyViolationStage::PreBinding,
+            )? {
+                Some(directory) => {
+                    validate_private_directory_at(&directory, PolicyViolationStage::PreBinding)?;
+                    directory
+                }
+                None => {
+                    return Ok(TempGenerationFloorReport::default());
+                }
+            };
+            let entries = directory_entries(
+                &tmp,
+                MAX_PRIVATE_TEMP_GENERATIONS,
+                TempUnsafeReason::GenerationLimit,
+                PolicyViolationStage::PreBinding,
+                None,
+                None,
+                #[cfg(all(test, unix))]
+                None,
+            )?;
+            let mut report = TempGenerationFloorReport::default();
+            for entry in entries {
+                if entry.mount_identity != root_mount {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::MountBoundary,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+                let name = entry.name.to_str().ok_or_else(|| {
+                    temp_violation_at(
+                        TempUnsafeReason::InvalidEntry,
+                        PolicyViolationStage::PreBinding,
+                    )
+                })?;
+                let generation_id = name
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value > 0 && *value <= MAX_PRIVATE_TEMP_RUN_ID)
+                    .filter(|value| name == value.to_string())
+                    .ok_or_else(|| {
+                        temp_violation_at(
+                            TempUnsafeReason::InvalidEntry,
+                            PolicyViolationStage::PreBinding,
+                        )
+                    })?;
+                if !matches!(entry.kind, AuditedEntryKind::Directory) {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::InvalidEntry,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+                let generation = open_directory_on_mount(
+                    &tmp,
+                    &entry.name,
+                    root_mount,
+                    PolicyViolationStage::PreBinding,
+                )?;
+                validate_private_directory_at(&generation, PolicyViolationStage::PreBinding)?;
+                if directory_identity_at(&generation, PolicyViolationStage::PreBinding)?
+                    != entry.identity
+                {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::IdentityChanged,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
+                report.max_generation_id = Some(
+                    report
+                        .max_generation_id
+                        .unwrap_or_default()
+                        .max(generation_id),
+                );
+            }
+            Ok(report)
+        }
+    }
+
     pub fn create(root: &VerifiedProjectRoot, run_id: i64) -> Result<Self, PolicyViolation> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (root, run_id);
             return Err(PolicyViolation::new(
@@ -461,11 +736,12 @@ impl PrivateRunTemp {
                 PolicyViolationStage::RunBoundPreMarker,
             ));
         }
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             validate_run_id(run_id)?;
             let owner = root.directory.try_clone().map_err(|_| temp_error())?;
-            let service = open_or_create_directory(&owner, OsStr::new(PRIVATE_TEMP_ROOT))?;
+            let service =
+                open_or_create_private_temp_container(&owner, OsStr::new(PRIVATE_TEMP_ROOT))?;
             let tmp = open_or_create_directory(&service, OsStr::new(PRIVATE_TEMP_DIR))?;
             let name = OsString::from(run_id.to_string());
             mkdirat_private(&tmp, &name)?;
@@ -498,7 +774,7 @@ impl PrivateRunTemp {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<TempCleanupReport, PolicyViolation> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = deadline;
             return Err(PolicyViolation::new(
@@ -506,13 +782,17 @@ impl PrivateRunTemp {
                 PolicyViolationStage::RunBoundPreMarker,
             ));
         }
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             check_cleanup_deadline(deadline)?;
             validate_private_directory(&self.directory)?;
             if directory_identity(&self.directory)? != self.identity {
                 return Err(temp_violation(TempUnsafeReason::IdentityChanged));
             }
+            let root_mount = directory_mount_identity_at(
+                &self.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
             let mut state = AuditState::default();
             let entries = audit_directory(
                 &self.directory,
@@ -520,12 +800,21 @@ impl PrivateRunTemp {
                 &mut state,
                 deadline,
                 PolicyViolationStage::RunBoundPreMarker,
+                root_mount,
+                #[cfg(all(test, unix))]
+                None,
             )?;
             let mut report = TempCleanupReport {
                 entries_removed: 0,
                 allocated_bytes_reclaimed: 0,
             };
-            remove_audited_entries(&self.directory, &entries, &mut report, deadline)?;
+            remove_audited_entries(
+                &self.directory,
+                &entries,
+                &mut report,
+                deadline,
+                root_mount,
+            )?;
             finish_cleanup_before_success(
                 &self.directory,
                 deadline,
@@ -546,6 +835,10 @@ impl PrivateRunTemp {
         if directory_identity(&self.directory)? != self.identity {
             return Err(temp_violation(TempUnsafeReason::IdentityChanged));
         }
+        let root_mount = directory_mount_identity_at(
+            &self.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
         let mut state = AuditState::default();
         let entries = audit_directory(
             &self.directory,
@@ -553,6 +846,8 @@ impl PrivateRunTemp {
             &mut state,
             deadline,
             PolicyViolationStage::RunBoundPreMarker,
+            root_mount,
+            None,
         )?;
         audit_hook();
         let mut report = TempCleanupReport {
@@ -565,7 +860,9 @@ impl PrivateRunTemp {
             &entries,
             &mut report,
             deadline,
+            root_mount,
             Some(&mut test_state),
+            None,
         )?;
         finish_cleanup_before_success(
             &self.directory,
@@ -585,6 +882,10 @@ impl PrivateRunTemp {
         if directory_identity(&self.directory)? != self.identity {
             return Err(temp_violation(TempUnsafeReason::IdentityChanged));
         }
+        let root_mount = directory_mount_identity_at(
+            &self.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
         let mut state = AuditState::default();
         let entries = audit_directory(
             &self.directory,
@@ -592,6 +893,8 @@ impl PrivateRunTemp {
             &mut state,
             deadline,
             PolicyViolationStage::RunBoundPreMarker,
+            root_mount,
+            None,
         )?;
         let mut report = TempCleanupReport {
             entries_removed: 0,
@@ -602,7 +905,9 @@ impl PrivateRunTemp {
             &entries,
             &mut report,
             deadline,
+            root_mount,
             Some(&mut *test_state),
+            None,
         )?;
         finish_cleanup_before_success(
             &self.directory,
@@ -612,10 +917,56 @@ impl PrivateRunTemp {
         Ok(report)
     }
 
+    #[cfg(all(test, unix))]
+    fn cleanup_contents_before_with_mount_test_state(
+        &mut self,
+        deadline: Option<Instant>,
+        mount_test_state: &mut MountBoundaryTestState,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        validate_private_directory(&self.directory)?;
+        if directory_identity(&self.directory)? != self.identity {
+            return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+        }
+        let root_mount = directory_mount_identity_at(
+            &self.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let mut state = AuditState::default();
+        let entries = audit_directory(
+            &self.directory,
+            0,
+            &mut state,
+            deadline,
+            PolicyViolationStage::RunBoundPreMarker,
+            root_mount,
+            Some(&mut *mount_test_state),
+        )?;
+        let mut report = TempCleanupReport {
+            entries_removed: 0,
+            allocated_bytes_reclaimed: 0,
+        };
+        let mut cleanup_test_state = CleanupTestState::default();
+        remove_audited_entries_impl(
+            &self.directory,
+            &entries,
+            &mut report,
+            deadline,
+            root_mount,
+            Some(&mut cleanup_test_state),
+            Some(&mut *mount_test_state),
+        )?;
+        finish_cleanup_before_success(
+            &self.directory,
+            deadline,
+            Some(&mut cleanup_test_state),
+        )?;
+        Ok(report)
+    }
+
     pub fn inspect_capacity(
         root: &VerifiedProjectRoot,
     ) -> Result<TempInventoryReport, PolicyViolation> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = root;
             return Err(PolicyViolation::new(
@@ -623,38 +974,51 @@ impl PrivateRunTemp {
                 PolicyViolationStage::PreBinding,
             ));
         }
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let service = match open_directory_nofollow(&root.directory, OsStr::new(PRIVATE_TEMP_ROOT)) {
-                Ok(directory) => {
-                    validate_private_directory_at(&directory, PolicyViolationStage::PreBinding)?;
+            let root_mount = directory_mount_identity_at(
+                &root.directory,
+                PolicyViolationStage::PreBinding,
+            )?;
+            let service = match open_optional_directory_on_mount(
+                &root.directory,
+                OsStr::new(PRIVATE_TEMP_ROOT),
+                root_mount,
+                PolicyViolationStage::PreBinding,
+            )? {
+                Some(directory) => {
+                    validate_private_temp_container_at(
+                        &directory,
+                        PolicyViolationStage::PreBinding,
+                    )?;
                     directory
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                None => {
                     return Ok(TempInventoryReport {
                         generations: 0,
                         retained_nonempty_generations: 0,
                         retained_allocated_bytes: 0,
+                        max_generation_id: None,
                     });
-                }
-                Err(error) => {
-                    return Err(map_temp_io_at(error, PolicyViolationStage::PreBinding));
                 }
             };
-            let tmp = match open_directory_nofollow(&service, OsStr::new(PRIVATE_TEMP_DIR)) {
-                Ok(directory) => {
+            let tmp = match open_optional_directory_on_mount(
+                &service,
+                OsStr::new(PRIVATE_TEMP_DIR),
+                root_mount,
+                PolicyViolationStage::PreBinding,
+            )? {
+                Some(directory) => {
                     validate_private_directory_at(&directory, PolicyViolationStage::PreBinding)?;
                     directory
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                None => {
                     return Ok(TempInventoryReport {
                         generations: 0,
                         retained_nonempty_generations: 0,
                         retained_allocated_bytes: 0,
+                        max_generation_id: None,
                     });
-                }
-                Err(error) => {
-                    return Err(map_temp_io_at(error, PolicyViolationStage::PreBinding));
                 }
             };
             let entries = directory_entries(
@@ -672,12 +1036,24 @@ impl PrivateRunTemp {
                 generations: 0,
                 retained_nonempty_generations: 0,
                 retained_allocated_bytes: 0,
+                max_generation_id: None,
             };
             for entry in entries {
+                if entry.mount_identity != root_mount {
+                    return Err(temp_violation_at(
+                        TempUnsafeReason::MountBoundary,
+                        PolicyViolationStage::PreBinding,
+                    ));
+                }
                 let name = entry.name.to_str().ok_or_else(|| {
                     temp_violation_at(TempUnsafeReason::InvalidEntry, PolicyViolationStage::PreBinding)
                 })?;
-                if name.starts_with('0') || name.parse::<u64>().ok().filter(|value| *value > 0).is_none() {
+                let generation_id = name
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value > 0 && *value <= MAX_PRIVATE_TEMP_RUN_ID)
+                    .filter(|value| name == value.to_string());
+                if generation_id.is_none() {
                     return Err(temp_violation_at(
                         TempUnsafeReason::InvalidEntry,
                         PolicyViolationStage::PreBinding,
@@ -689,8 +1065,12 @@ impl PrivateRunTemp {
                         PolicyViolationStage::PreBinding,
                     ));
                 }
-                let generation = open_directory_nofollow(&tmp, &entry.name)
-                    .map_err(|error| map_temp_io_at(error, PolicyViolationStage::PreBinding))?;
+                let generation = open_directory_on_mount(
+                    &tmp,
+                    &entry.name,
+                    root_mount,
+                    PolicyViolationStage::PreBinding,
+                )?;
                 validate_private_directory_at(&generation, PolicyViolationStage::PreBinding)?;
                 if directory_identity_at(&generation, PolicyViolationStage::PreBinding)?
                     != entry.identity
@@ -706,9 +1086,18 @@ impl PrivateRunTemp {
                     &mut state,
                     None,
                     PolicyViolationStage::PreBinding,
+                    root_mount,
+                    #[cfg(all(test, unix))]
+                    None,
                 )
                 .map_err(|error| stage_violation(error, PolicyViolationStage::PreBinding))?;
                 report.generations += 1;
+                report.max_generation_id = Some(
+                    report
+                        .max_generation_id
+                        .unwrap_or_default()
+                        .max(generation_id.expect("validated generation ID")),
+                );
                 let allocated = children
                     .iter()
                     .try_fold(0_u64, |total, child| {
@@ -746,14 +1135,14 @@ impl PrivateRunTemp {
     /// Prove that the retained descriptor still names the exact owner-only
     /// generation visible under the fixed private-temp parent.
     pub fn revalidate_current(&self) -> Result<(), PolicyViolation> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Err(PolicyViolation::new(
                 PolicyViolationCode::UnsupportedPlatform,
                 PolicyViolationStage::RunBoundPreMarker,
             ))
         }
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             validate_private_directory(&self.directory)?;
             if directory_identity(&self.directory)? != self.identity {
@@ -774,14 +1163,14 @@ impl PrivateRunTemp {
     /// bounded policy error while the original generation remains available as
     /// a diagnostic/runtime artifact.
     pub fn cleanup(&mut self) -> Result<(), PolicyViolation> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::UnsupportedPlatform,
                 PolicyViolationStage::RunBoundPreMarker,
             ));
         }
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let _ = self;
             Err(temp_error())
@@ -798,6 +1187,7 @@ impl Drop for PrivateRunTemp {
 struct AuditedEntry {
     name: OsString,
     identity: (u64, u64),
+    mount_identity: MountIdentity,
     kind: AuditedEntryKind,
     allocated_bytes: u64,
     children: Vec<AuditedEntry>,
@@ -808,6 +1198,77 @@ struct AuditedEntry {
 enum AuditedEntryKind {
     Directory,
     Leaf,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountIdentity([u64; 2]);
+
+#[cfg(target_os = "linux")]
+const LINUX_STATX_BASIC_STATS: u32 = 0x0000_07ff;
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+const LINUX_STATX_MNT_ID: u32 = 0x0000_1000;
+
+/// The stable 256-byte Linux kernel `struct statx` ABI subset used here.
+/// Keeping this local avoids the libc wrapper/type availability boundary on
+/// older glibc and on libc crate musl/uClibc configurations.
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+#[repr(C, align(8))]
+struct LinuxStatxBuffer {
+    stx_mask: u32,
+    before_mnt_id: [u8; 140],
+    stx_mnt_id: u64,
+    remaining: [u8; 104],
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+const _: () = {
+    assert!(std::mem::size_of::<LinuxStatxBuffer>() == 256);
+    assert!(std::mem::align_of::<LinuxStatxBuffer>() == 8);
+    assert!(std::mem::offset_of!(LinuxStatxBuffer, stx_mask) == 0);
+    assert!(std::mem::offset_of!(LinuxStatxBuffer, stx_mnt_id) == 144);
+};
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxSyscallFailure {
+    Retry,
+    Missing,
+    MountBoundary,
+    UnsupportedPlatform,
+    IoFailure,
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn classify_linux_openat2_errno(errno: libc::c_int) -> LinuxSyscallFailure {
+    match errno {
+        libc::EINTR => LinuxSyscallFailure::Retry,
+        libc::ENOENT => LinuxSyscallFailure::Missing,
+        libc::EXDEV | libc::ELOOP => LinuxSyscallFailure::MountBoundary,
+        libc::ENOSYS | libc::EINVAL | libc::E2BIG => {
+            LinuxSyscallFailure::UnsupportedPlatform
+        }
+        _ => LinuxSyscallFailure::IoFailure,
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn classify_linux_statx_errno(errno: libc::c_int) -> LinuxSyscallFailure {
+    match errno {
+        libc::EINTR => LinuxSyscallFailure::Retry,
+        libc::ENOSYS => LinuxSyscallFailure::UnsupportedPlatform,
+        _ => LinuxSyscallFailure::IoFailure,
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn parse_linux_statx_mount_identity(
+    statx: &LinuxStatxBuffer,
+) -> Result<MountIdentity, LinuxSyscallFailure> {
+    if statx.stx_mask & LINUX_STATX_MNT_ID == 0 {
+        return Err(LinuxSyscallFailure::UnsupportedPlatform);
+    }
+    Ok(MountIdentity([statx.stx_mnt_id, 0]))
 }
 
 #[cfg(unix)]
@@ -874,6 +1335,27 @@ struct CleanupTestState {
 }
 
 #[cfg(all(unix, test))]
+#[derive(Default)]
+struct MountBoundaryTestState {
+    mismatch_at_directory_open: bool,
+    mismatch_before_unlink: bool,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionalOpenStep {
+    EntryMountPrecheck,
+    SecureOpen,
+    DescriptorMountRecheck,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Default)]
+struct OptionalOpenTestState {
+    steps: Vec<OptionalOpenStep>,
+}
+
+#[cfg(all(unix, test))]
 struct DirectoryEntriesTestState {
     fail_after_metadata: Option<usize>,
     close_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -908,6 +1390,8 @@ fn audit_directory(
     state: &mut AuditState,
     deadline: Option<Instant>,
     stage: PolicyViolationStage,
+    root_mount: MountIdentity,
+    #[cfg(all(test, unix))] mut mount_test_state: Option<&mut MountBoundaryTestState>,
 ) -> Result<Vec<AuditedEntry>, PolicyViolation> {
     check_audit_deadline(deadline, Some(state), stage)?;
     if depth > state.max_depth {
@@ -926,23 +1410,44 @@ fn audit_directory(
         None,
     )? {
         check_audit_deadline(deadline, Some(state), stage)?;
+        if listed.mount_identity != root_mount {
+            return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+        }
         let children = if listed.kind == AuditedEntryKind::Directory {
             if depth == state.max_depth {
                 return Err(temp_violation_at(TempUnsafeReason::DepthLimit, stage));
             }
-            let child = open_directory_nofollow(directory, &listed.name)
-                .map_err(|error| map_temp_io_at(error, stage))?;
+            #[cfg(all(test, unix))]
+            if mount_test_state.as_ref().is_some_and(|test_state| {
+                test_state.mismatch_at_directory_open
+            }) {
+                if let Some(test_state) = mount_test_state.as_deref_mut() {
+                    test_state.mismatch_at_directory_open = false;
+                }
+                return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+            }
+            let child = open_directory_on_mount(directory, &listed.name, root_mount, stage)?;
             validate_private_directory_at(&child, stage)?;
             if directory_identity_at(&child, stage)? != listed.identity {
                 return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
             }
-            audit_directory(&child, depth + 1, state, deadline, stage)?
+            audit_directory(
+                &child,
+                depth + 1,
+                state,
+                deadline,
+                stage,
+                root_mount,
+                #[cfg(all(test, unix))]
+                mount_test_state.as_deref_mut(),
+            )?
         } else {
             Vec::new()
         };
         entries.push(AuditedEntry {
             name: listed.name,
             identity: listed.identity,
+            mount_identity: listed.mount_identity,
             kind: listed.kind,
             allocated_bytes: listed.allocated_bytes,
             children,
@@ -957,6 +1462,7 @@ fn remove_audited_entries(
     entries: &[AuditedEntry],
     report: &mut TempCleanupReport,
     deadline: Option<Instant>,
+    root_mount: MountIdentity,
 ) -> Result<(), PolicyViolation> {
     #[cfg(all(test, unix))]
     let mut test_state = CleanupTestState::default();
@@ -965,8 +1471,11 @@ fn remove_audited_entries(
         entries,
         report,
         deadline,
+        root_mount,
         #[cfg(all(test, unix))]
         Some(&mut test_state),
+        #[cfg(all(test, unix))]
+        None,
     )
 }
 
@@ -976,7 +1485,9 @@ fn remove_audited_entries_impl(
     entries: &[AuditedEntry],
     report: &mut TempCleanupReport,
     deadline: Option<Instant>,
+    root_mount: MountIdentity,
     #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
+    #[cfg(all(test, unix))] mut mount_test_state: Option<&mut MountBoundaryTestState>,
 ) -> Result<(), PolicyViolation> {
     let mut modified = false;
     for entry in entries {
@@ -986,8 +1497,11 @@ fn remove_audited_entries_impl(
             report,
             deadline,
             &mut modified,
+            root_mount,
             #[cfg(all(test, unix))]
             test_state.as_deref_mut(),
+            #[cfg(all(test, unix))]
+            mount_test_state.as_deref_mut(),
         ) {
             if modified {
                 if let Err(sync_error) = sync_directory(
@@ -1042,17 +1556,29 @@ fn remove_audited_entry(
     report: &mut TempCleanupReport,
     deadline: Option<Instant>,
     modified: &mut bool,
+    root_mount: MountIdentity,
     #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
+    #[cfg(all(test, unix))] mut mount_test_state: Option<&mut MountBoundaryTestState>,
 ) -> Result<(), PolicyViolation> {
     check_cleanup_deadline(deadline)?;
     let current = entry_metadata(directory, &entry.name)?;
-    if current.identity != entry.identity || current.kind != entry.kind {
+    if entry.mount_identity != root_mount || current.mount_identity != root_mount {
+        return Err(temp_violation(TempUnsafeReason::MountBoundary));
+    }
+    if current.identity != entry.identity
+        || current.kind != entry.kind
+        || current.mount_identity != entry.mount_identity
+    {
         return Err(temp_violation(TempUnsafeReason::IdentityChanged));
     }
     if entry.kind == AuditedEntryKind::Directory {
         check_cleanup_deadline(deadline)?;
-        let child = open_directory_nofollow(directory, &entry.name)
-            .map_err(map_temp_io)?;
+        let child = open_directory_on_mount(
+            directory,
+            &entry.name,
+            root_mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
         validate_private_directory(&child)?;
         if directory_identity(&child)? != entry.identity {
             return Err(temp_violation(TempUnsafeReason::IdentityChanged));
@@ -1062,8 +1588,11 @@ fn remove_audited_entry(
             &entry.children,
             report,
             deadline,
+            root_mount,
             #[cfg(all(test, unix))]
             test_state.as_deref_mut(),
+            #[cfg(all(test, unix))]
+            mount_test_state.as_deref_mut(),
         )?;
         check_cleanup_deadline_after_recursion(
             deadline,
@@ -1072,12 +1601,36 @@ fn remove_audited_entry(
         )?;
         check_cleanup_deadline(deadline)?;
         let current = entry_metadata(directory, &entry.name)?;
-        if current.identity != entry.identity || current.kind != AuditedEntryKind::Directory {
+        if entry.mount_identity != root_mount || current.mount_identity != root_mount {
+            return Err(temp_violation(TempUnsafeReason::MountBoundary));
+        }
+        if current.identity != entry.identity
+            || current.kind != AuditedEntryKind::Directory
+            || current.mount_identity != entry.mount_identity
+        {
             return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+        }
+        #[cfg(all(test, unix))]
+        if mount_test_state.as_ref().is_some_and(|test_state| {
+            test_state.mismatch_before_unlink
+        }) {
+            if let Some(test_state) = mount_test_state.as_deref_mut() {
+                test_state.mismatch_before_unlink = false;
+            }
+            return Err(temp_violation(TempUnsafeReason::MountBoundary));
         }
         check_cleanup_deadline(deadline)?;
         unlinkat(directory, &entry.name, true)?;
     } else {
+        #[cfg(all(test, unix))]
+        if mount_test_state.as_ref().is_some_and(|test_state| {
+            test_state.mismatch_before_unlink
+        }) {
+            if let Some(test_state) = mount_test_state.as_deref_mut() {
+                test_state.mismatch_before_unlink = false;
+            }
+            return Err(temp_violation(TempUnsafeReason::MountBoundary));
+        }
         check_cleanup_deadline(deadline)?;
         unlinkat(directory, &entry.name, false)?;
     }
@@ -1172,6 +1725,7 @@ fn check_cleanup_deadline_after_sync(
 struct ListedEntry {
     name: OsString,
     identity: (u64, u64),
+    mount_identity: MountIdentity,
     kind: AuditedEntryKind,
     allocated_bytes: u64,
 }
@@ -1269,10 +1823,10 @@ fn directory_entries(
         ) {
             return Err(error);
         }
-        clear_errno();
+        clear_errno(stage)?;
         let entry = unsafe { libc::readdir(stream.as_ptr()) };
         if entry.is_null() {
-            let errno = last_errno();
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if errno != 0 {
                 return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
             }
@@ -1333,6 +1887,7 @@ fn directory_entries(
         result.push(ListedEntry {
             name,
             identity: listed.identity,
+            mount_identity: listed.mount_identity,
             kind: listed.kind,
             allocated_bytes: listed.allocated_bytes,
         });
@@ -1355,24 +1910,228 @@ fn duplicate_directory_fd(
 }
 
 #[cfg(unix)]
-fn clear_errno() {
+fn clear_errno(stage: PolicyViolationStage) -> Result<(), PolicyViolation> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _ = stage;
     #[cfg(target_os = "linux")]
-    unsafe { *libc::__errno_location() = 0; }
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    unsafe { *libc::__error() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+        return Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error() = 0;
+        return Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            stage,
+        ))
+    }
 }
 
-#[cfg(unix)]
-fn last_errno() -> i32 {
-    #[cfg(target_os = "linux")]
-    unsafe { *libc::__errno_location() }
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    unsafe { *libc::__error() }
+#[cfg(target_os = "linux")]
+fn directory_mount_identity_at(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    use std::os::fd::AsRawFd;
+    linux_mount_identity_at(directory.as_raw_fd(), OsStr::new(""), libc::AT_EMPTY_PATH, stage)
+}
+
+#[cfg(target_os = "linux")]
+fn entry_mount_identity_at(
+    directory: &File,
+    name: &OsStr,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    use std::os::fd::AsRawFd;
+    linux_mount_identity_at(
+        directory.as_raw_fd(),
+        name,
+        libc::AT_SYMLINK_NOFOLLOW,
+        stage,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_identity_at(
+    directory_fd: libc::c_int,
+    name: &OsStr,
+    flags: libc::c_int,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| temp_violation_at(TempUnsafeReason::InvalidEntry, stage))?;
+    let mut statx = std::mem::MaybeUninit::<LinuxStatxBuffer>::zeroed();
+    loop {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                directory_fd,
+                name.as_ptr(),
+                flags,
+                LINUX_STATX_BASIC_STATS | LINUX_STATX_MNT_ID,
+                statx.as_mut_ptr(),
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let errno = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        match classify_linux_statx_errno(errno) {
+            LinuxSyscallFailure::Retry => continue,
+            LinuxSyscallFailure::UnsupportedPlatform => {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::UnsupportedPlatform,
+                    stage,
+                ));
+            }
+            LinuxSyscallFailure::Missing
+            | LinuxSyscallFailure::MountBoundary
+            | LinuxSyscallFailure::IoFailure => {
+                return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+            }
+        }
+    }
+    let statx = unsafe { statx.assume_init() };
+    match parse_linux_statx_mount_identity(&statx) {
+        Ok(identity) => Ok(identity),
+        Err(LinuxSyscallFailure::UnsupportedPlatform) => Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            stage,
+        )),
+        Err(_) => Err(temp_violation_at(TempUnsafeReason::IoFailure, stage)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn directory_mount_identity_at(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(macos_mount_identity(&stat.f_fsid))
+}
+
+#[cfg(target_os = "macos")]
+fn entry_mount_identity_at(
+    directory: &File,
+    name: &OsStr,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    match macos_entry_mount_identity_io(directory, name) {
+        Ok(identity) => Ok(identity),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::ENOTSUP)
+            ) => Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                stage,
+            )),
+        Err(_) => Err(temp_violation_at(TempUnsafeReason::IoFailure, stage)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_entry_mount_identity_io(
+    directory: &File,
+    name: &OsStr,
+) -> io::Result<MountIdentity> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    #[repr(C)]
+    struct FsidAttributeBuffer {
+        length: u32,
+        fsid: [i32; 2],
+    }
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_FSID,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = FsidAttributeBuffer {
+        length: 0,
+        fsid: [0; 2],
+    };
+    loop {
+        let result = unsafe {
+            libc::getattrlistat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                &mut attributes as *mut _ as *mut libc::c_void,
+                &mut buffer as *mut _ as *mut libc::c_void,
+                std::mem::size_of::<FsidAttributeBuffer>(),
+                libc::FSOPT_NOFOLLOW as libc::c_ulong,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(error);
+    }
+    if buffer.length < std::mem::size_of::<FsidAttributeBuffer>() as u32 {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    Ok(MountIdentity([
+        buffer.fsid[0] as u32 as u64,
+        buffer.fsid[1] as u32 as u64,
+    ]))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_identity(fsid: &libc::fsid_t) -> MountIdentity {
+    let values = unsafe { std::mem::transmute_copy::<libc::fsid_t, [i32; 2]>(fsid) };
+    MountIdentity([values[0] as u32 as u64, values[1] as u32 as u64])
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn directory_mount_identity_at(
+    _directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    Err(PolicyViolation::new(
+        PolicyViolationCode::UnsupportedPlatform,
+        stage,
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn entry_mount_identity_at(
+    _directory: &File,
+    _name: &OsStr,
+    stage: PolicyViolationStage,
+) -> Result<MountIdentity, PolicyViolation> {
+    Err(PolicyViolation::new(
+        PolicyViolationCode::UnsupportedPlatform,
+        stage,
+    ))
 }
 
 #[cfg(unix)]
 struct EntryMetadata {
     identity: (u64, u64),
+    mount_identity: MountIdentity,
     kind: AuditedEntryKind,
     allocated_bytes: u64,
 }
@@ -1393,6 +2152,7 @@ fn entry_metadata_at(
     stage: PolicyViolationStage,
 ) -> Result<EntryMetadata, PolicyViolation> {
     use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let mount_identity = entry_mount_identity_at(directory, name, stage)?;
     let name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| temp_violation_at(TempUnsafeReason::InvalidEntry, stage))?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -1410,6 +2170,7 @@ fn entry_metadata_at(
         .ok_or_else(|| temp_violation_at(TempUnsafeReason::ByteLimit, stage))?;
     Ok(EntryMetadata {
         identity: (stat.st_dev as u64, stat.st_ino as u64),
+        mount_identity,
         kind,
         allocated_bytes,
     })
@@ -1431,6 +2192,51 @@ fn temp_violation(reason: TempUnsafeReason) -> PolicyViolation {
     temp_violation_at(reason, PolicyViolationStage::RunBoundPreMarker)
 }
 
+fn validate_generation_high_water(
+    max_generation_id: Option<i64>,
+    durable_run_id_high_water: i64,
+) -> Result<(), PolicyViolation> {
+    if !(0..=MAX_PRIVATE_TEMP_RUN_ID).contains(&durable_run_id_high_water)
+        || max_generation_id.is_some_and(|generation_id| {
+            generation_id <= 0
+                || generation_id > MAX_PRIVATE_TEMP_RUN_ID
+                || generation_id > durable_run_id_high_water
+        })
+    {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_or_create_private_temp_container(
+    parent: &File,
+    name: &OsStr,
+) -> Result<File, PolicyViolation> {
+    match open_directory_nofollow(parent, name) {
+        Ok(directory) => {
+            validate_private_temp_container_at(
+                &directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            Ok(directory)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            mkdirat_private(parent, name)?;
+            let directory = open_directory_nofollow(parent, name).map_err(map_temp_io)?;
+            validate_private_temp_container_at(
+                &directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            Ok(directory)
+        }
+        Err(error) => Err(map_temp_io(error)),
+    }
+}
+
 #[cfg(unix)]
 fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, PolicyViolation> {
     match open_directory_nofollow(parent, name) {
@@ -1446,6 +2252,24 @@ fn open_or_create_directory(parent: &File, name: &OsStr) -> Result<File, PolicyV
         }
         Err(error) => Err(map_temp_io(error)),
     }
+}
+
+#[cfg(unix)]
+fn validate_private_temp_container_at(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() as u32 }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1531,6 +2355,236 @@ fn open_directory_nofollow(parent: &File, name: &OsStr) -> io::Result<File> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_optional_directory_on_mount(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<Option<File>, PolicyViolation> {
+    open_optional_directory_on_mount_impl(
+        parent,
+        name,
+        expected_mount,
+        stage,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn open_optional_directory_on_mount_with_test_state(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+    test_state: &mut OptionalOpenTestState,
+) -> Result<Option<File>, PolicyViolation> {
+    open_optional_directory_on_mount_impl(
+        parent,
+        name,
+        expected_mount,
+        stage,
+        Some(test_state),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_RESOLVE_NO_XDEV: u64 = 0x01;
+
+#[cfg(target_os = "linux")]
+fn linux_open_directory_no_xdev(
+    parent: &File,
+    name: &OsStr,
+) -> Result<File, LinuxSyscallFailure> {
+    use std::{os::fd::{AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt};
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| LinuxSyscallFailure::IoFailure)?;
+    let how = LinuxOpenHow {
+        flags: (libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK) as u64,
+        mode: 0,
+        resolve: LINUX_RESOLVE_NO_XDEV,
+    };
+    loop {
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &how as *const LinuxOpenHow,
+                std::mem::size_of::<LinuxOpenHow>(),
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { File::from_raw_fd(fd as libc::c_int) });
+        }
+        let errno = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        match classify_linux_openat2_errno(errno) {
+            LinuxSyscallFailure::Retry => continue,
+            failure => return Err(failure),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_syscall_violation(
+    failure: LinuxSyscallFailure,
+    stage: PolicyViolationStage,
+) -> PolicyViolation {
+    match failure {
+        LinuxSyscallFailure::MountBoundary => {
+            temp_violation_at(TempUnsafeReason::MountBoundary, stage)
+        }
+        LinuxSyscallFailure::UnsupportedPlatform => {
+            PolicyViolation::new(PolicyViolationCode::UnsupportedPlatform, stage)
+        }
+        LinuxSyscallFailure::Retry
+        | LinuxSyscallFailure::Missing
+        | LinuxSyscallFailure::IoFailure => {
+            temp_violation_at(TempUnsafeReason::IoFailure, stage)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_optional_directory_on_mount_impl(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+    #[cfg(test)] mut test_state: Option<&mut OptionalOpenTestState>,
+) -> Result<Option<File>, PolicyViolation> {
+    #[cfg(test)]
+    if let Some(state) = test_state.as_deref_mut() {
+        state.steps.push(OptionalOpenStep::SecureOpen);
+    }
+    let directory = match linux_open_directory_no_xdev(parent, name) {
+        Ok(directory) => directory,
+        Err(LinuxSyscallFailure::Missing) => return Ok(None),
+        Err(failure) => return Err(linux_syscall_violation(failure, stage)),
+    };
+    #[cfg(test)]
+    if let Some(state) = test_state.as_deref_mut() {
+        state.steps.push(OptionalOpenStep::DescriptorMountRecheck);
+    }
+    if directory_mount_identity_at(&directory, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(Some(directory))
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_on_mount(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<File, PolicyViolation> {
+    let directory = linux_open_directory_no_xdev(parent, name)
+        .map_err(|failure| linux_syscall_violation(failure, stage))?;
+    if directory_mount_identity_at(&directory, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_identity_violation(
+    error: io::Error,
+    stage: PolicyViolationStage,
+) -> PolicyViolation {
+    match error.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
+            PolicyViolation::new(PolicyViolationCode::UnsupportedPlatform, stage)
+        }
+        Some(libc::ELOOP) => temp_violation_at(TempUnsafeReason::MountBoundary, stage),
+        _ => temp_violation_at(TempUnsafeReason::IoFailure, stage),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_optional_directory_on_mount_impl(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+    #[cfg(test)] mut test_state: Option<&mut OptionalOpenTestState>,
+) -> Result<Option<File>, PolicyViolation> {
+    #[cfg(test)]
+    if let Some(state) = test_state.as_deref_mut() {
+        state.steps.push(OptionalOpenStep::EntryMountPrecheck);
+    }
+    let entry_mount = match macos_entry_mount_identity_io(parent, name) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(macos_mount_identity_violation(error, stage)),
+    };
+    if entry_mount != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    #[cfg(test)]
+    if let Some(state) = test_state.as_deref_mut() {
+        state.steps.push(OptionalOpenStep::SecureOpen);
+    }
+    let directory = open_directory_nofollow(parent, name)
+        .map_err(|error| macos_mount_identity_violation(error, stage))?;
+    #[cfg(test)]
+    if let Some(state) = test_state.as_deref_mut() {
+        state.steps.push(OptionalOpenStep::DescriptorMountRecheck);
+    }
+    if directory_mount_identity_at(&directory, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(Some(directory))
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory_on_mount(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<File, PolicyViolation> {
+    let entry_mount = macos_entry_mount_identity_io(parent, name)
+        .map_err(|error| macos_mount_identity_violation(error, stage))?;
+    if entry_mount != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    let directory = open_directory_nofollow(parent, name)
+        .map_err(|error| macos_mount_identity_violation(error, stage))?;
+    if directory_mount_identity_at(&directory, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(directory)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn open_directory_on_mount(
+    _parent: &File,
+    _name: &OsStr,
+    _expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<File, PolicyViolation> {
+    Err(PolicyViolation::new(
+        PolicyViolationCode::UnsupportedPlatform,
+        stage,
+    ))
+}
+
 #[cfg(unix)]
 fn map_temp_io(error: io::Error) -> PolicyViolation {
     map_temp_io_at(error, PolicyViolationStage::RunBoundPreMarker)
@@ -1541,7 +2595,7 @@ fn map_temp_io_at(error: io::Error, stage: PolicyViolationStage) -> PolicyViolat
     temp_violation_at(TempUnsafeReason::IoFailure, stage)
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::{
@@ -1573,6 +2627,45 @@ mod tests {
         let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFD) };
         unsafe { libc::close(duplicate) };
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn inspect_capacity_rejects_maximum_sqlite_generation_id() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let retained = PrivateRunTemp::create(&root, MAX_PRIVATE_TEMP_RUN_ID).unwrap();
+        let impossible = retained
+            .path()
+            .parent()
+            .unwrap()
+            .join(i64::MAX.to_string());
+        fs::create_dir(&impossible).unwrap();
+        fs::set_permissions(&impossible, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = PrivateRunTemp::inspect_capacity(&root).unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry)
+        );
+    }
+
+    #[test]
+    fn inspect_capacity_accepts_highest_allocatable_generation_id() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        PrivateRunTemp::create(&root, i64::MAX - 1).unwrap();
+        let report = PrivateRunTemp::inspect_capacity(&root).unwrap();
+        assert_eq!(report.max_generation_id, Some(i64::MAX - 1));
     }
 
     #[test]
@@ -1611,6 +2704,12 @@ mod tests {
             &mut state,
             None,
             PolicyViolationStage::RunBoundPreMarker,
+            directory_mount_identity_at(
+                &temp.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )
+            .unwrap(),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ByteLimit));
@@ -1622,11 +2721,13 @@ mod tests {
         let entry = AuditedEntry {
             name: OsString::from("parent"),
             identity: (1, 1),
+            mount_identity: MountIdentity([1, 0]),
             kind: AuditedEntryKind::Directory,
             allocated_bytes: u64::MAX,
             children: vec![AuditedEntry {
                 name: OsString::from("child"),
                 identity: (1, 2),
+                mount_identity: MountIdentity([1, 0]),
                 kind: AuditedEntryKind::Leaf,
                 allocated_bytes: 1,
                 children: Vec::new(),
@@ -1660,6 +2761,186 @@ mod tests {
     }
 
     #[test]
+    fn mount_identity_mismatch_at_directory_open_preserves_tree_and_retry_authority() {
+        let (_holder, mut temp) = test_temp(713);
+        let nested = temp.path.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(nested.join("payload"), b"preserved").unwrap();
+        let mut state = MountBoundaryTestState {
+            mismatch_at_directory_open: true,
+            ..MountBoundaryTestState::default()
+        };
+
+        let error = temp
+            .cleanup_contents_before_with_mount_test_state(None, &mut state)
+            .unwrap_err();
+
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::MountBoundary)
+        );
+        assert_eq!(fs::read(nested.join("payload")).unwrap(), b"preserved");
+        temp.cleanup_contents_before(None).unwrap();
+        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn mount_identity_mismatch_before_unlink_deletes_nothing_and_remains_retryable() {
+        let (_holder, mut temp) = test_temp(714);
+        fs::write(temp.path.join("first"), b"first").unwrap();
+        fs::write(temp.path.join("second"), b"second").unwrap();
+        let mut state = MountBoundaryTestState {
+            mismatch_before_unlink: true,
+            ..MountBoundaryTestState::default()
+        };
+
+        let error = temp
+            .cleanup_contents_before_with_mount_test_state(None, &mut state)
+            .unwrap_err();
+
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::MountBoundary)
+        );
+        assert_eq!(fs::read(temp.path.join("first")).unwrap(), b"first");
+        assert_eq!(fs::read(temp.path.join("second")).unwrap(), b"second");
+        temp.cleanup_contents_before(None).unwrap();
+        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn optional_mount_open_checks_entry_before_descriptor_and_missing_is_empty() {
+        let holder = tempfile::tempdir().unwrap();
+        let parent = File::open(holder.path()).unwrap();
+        let expected_mount = directory_mount_identity_at(
+            &parent,
+            PolicyViolationStage::PreBinding,
+        )
+        .unwrap();
+        let mut missing_state = OptionalOpenTestState::default();
+
+        let missing = open_optional_directory_on_mount_with_test_state(
+            &parent,
+            OsStr::new("missing"),
+            expected_mount,
+            PolicyViolationStage::PreBinding,
+            &mut missing_state,
+        )
+        .unwrap();
+
+        assert!(missing.is_none());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            missing_state.steps,
+            vec![OptionalOpenStep::EntryMountPrecheck]
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(missing_state.steps, vec![OptionalOpenStep::SecureOpen]);
+
+        let present = holder.path().join("present");
+        fs::create_dir(&present).unwrap();
+        fs::set_permissions(&present, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut present_state = OptionalOpenTestState::default();
+        let opened = open_optional_directory_on_mount_with_test_state(
+            &parent,
+            OsStr::new("present"),
+            expected_mount,
+            PolicyViolationStage::PreBinding,
+            &mut present_state,
+        )
+        .unwrap();
+
+        assert!(opened.is_some());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            present_state.steps,
+            vec![
+                OptionalOpenStep::EntryMountPrecheck,
+                OptionalOpenStep::SecureOpen,
+                OptionalOpenStep::DescriptorMountRecheck,
+            ]
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            present_state.steps,
+            vec![
+                OptionalOpenStep::SecureOpen,
+                OptionalOpenStep::DescriptorMountRecheck,
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_statx_buffer_parser_requires_mount_id_and_reads_kernel_offsets() {
+        let with_mount_id = LinuxStatxBuffer {
+            stx_mask: LINUX_STATX_MNT_ID,
+            before_mnt_id: [0; 140],
+            stx_mnt_id: 73,
+            remaining: [0; 104],
+        };
+        assert_eq!(
+            parse_linux_statx_mount_identity(&with_mount_id),
+            Ok(MountIdentity([73, 0]))
+        );
+
+        let without_mount_id = LinuxStatxBuffer {
+            stx_mask: 0,
+            before_mnt_id: [0; 140],
+            stx_mnt_id: 91,
+            remaining: [0; 104],
+        };
+        assert_eq!(
+            parse_linux_statx_mount_identity(&without_mount_id),
+            Err(LinuxSyscallFailure::UnsupportedPlatform)
+        );
+    }
+
+    #[test]
+    fn linux_openat2_errno_classifier_preserves_security_and_capability_meaning() {
+        for errno in [libc::EXDEV, libc::ELOOP] {
+            assert_eq!(
+                classify_linux_openat2_errno(errno),
+                LinuxSyscallFailure::MountBoundary
+            );
+        }
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::E2BIG] {
+            assert_eq!(
+                classify_linux_openat2_errno(errno),
+                LinuxSyscallFailure::UnsupportedPlatform
+            );
+        }
+        assert_eq!(
+            classify_linux_openat2_errno(libc::ENOENT),
+            LinuxSyscallFailure::Missing
+        );
+        assert_eq!(
+            classify_linux_openat2_errno(libc::EINTR),
+            LinuxSyscallFailure::Retry
+        );
+        assert_eq!(
+            classify_linux_openat2_errno(libc::EACCES),
+            LinuxSyscallFailure::IoFailure
+        );
+    }
+
+    #[test]
+    fn linux_statx_errno_classifier_retries_and_reports_capability() {
+        assert_eq!(
+            classify_linux_statx_errno(libc::EINTR),
+            LinuxSyscallFailure::Retry
+        );
+        assert_eq!(
+            classify_linux_statx_errno(libc::ENOSYS),
+            LinuxSyscallFailure::UnsupportedPlatform
+        );
+        assert_eq!(
+            classify_linux_statx_errno(libc::EACCES),
+            LinuxSyscallFailure::IoFailure
+        );
+    }
+
+    #[test]
     fn expired_deadline_performs_no_mutation() {
         let (_holder, mut temp) = test_temp(705);
         let file = temp.path.join("payload");
@@ -1690,6 +2971,12 @@ mod tests {
             &mut state,
             None,
             PolicyViolationStage::RunBoundPreMarker,
+            directory_mount_identity_at(
+                &temp.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )
+            .unwrap(),
+            None,
         )
         .unwrap_err();
 
@@ -1711,6 +2998,12 @@ mod tests {
             &mut state,
             Some(Instant::now() + Duration::from_secs(60)),
             PolicyViolationStage::RunBoundPreMarker,
+            directory_mount_identity_at(
+                &temp.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )
+            .unwrap(),
+            None,
         )
         .unwrap_err();
 

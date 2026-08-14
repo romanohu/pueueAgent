@@ -12,7 +12,10 @@ use crate::{
     codex_command::{CodexArgvBuilder, CodexCapabilities},
     config::{AgentConfig, ProjectConfig},
     db::{AgentRunRepository, GateFailurePolicy},
-    environment::{PrivateRunTemp, SanitizedEnvironment},
+    environment::{
+        PrivateRunTemp, ProjectAdmissionLock, RunIdAdmissionGuard, SanitizedEnvironment,
+        TempInventoryReport,
+    },
     execution_policy::{
         resolve_project_policy, AgentKind, PolicyViolation, PolicyViolationCode,
         PolicyViolationStage, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
@@ -350,12 +353,50 @@ impl AgentRunner {
         Self { config, policy }
     }
 
+    pub(crate) fn try_acquire_run_id_admission_guard(
+        &self,
+        db: &crate::db::Db,
+    ) -> Result<Option<RunIdAdmissionGuard>, PolicyViolation> {
+        RunIdAdmissionGuard::try_acquire(db.run_id_lock_parent())
+    }
+
     pub fn resolve_project_policy(
         &self,
         project: &Project,
         config: &ProjectConfig,
     ) -> Result<ResolvedProjectExecutionPolicy, PolicyViolation> {
         resolve_project_policy(&self.policy, project, config)
+    }
+
+    pub fn preflight_private_temp_capacity(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+        durable_run_id_high_water: i64,
+    ) -> Result<TempInventoryReport, PolicyViolation> {
+        let verified_root = policy
+            .root_anchor
+            .verify_identity()
+            .map_err(|mut violation| {
+                violation.stage = PolicyViolationStage::PreBinding;
+                violation
+            })?;
+        let report = PrivateRunTemp::inspect_capacity(&verified_root)?;
+        report.validate_durable_high_water(durable_run_id_high_water)?;
+        Ok(report)
+    }
+
+    pub(crate) fn try_acquire_project_admission_lock(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+    ) -> Result<Option<ProjectAdmissionLock>, PolicyViolation> {
+        let verified_root = policy
+            .root_anchor
+            .verify_identity()
+            .map_err(|mut violation| {
+                violation.stage = PolicyViolationStage::PreBinding;
+                violation
+            })?;
+        ProjectAdmissionLock::try_acquire(&verified_root)
     }
 
     /// Resolve startup marker evidence through the immutable project-root
@@ -497,7 +538,7 @@ impl AgentRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn(
+    pub(crate) async fn spawn(
         &self,
         db: &crate::db::Db,
         project: &Project,
@@ -509,6 +550,8 @@ impl AgentRunner {
         reservation: Option<&InterventionReservation>,
         prompt: &str,
         now: i64,
+        run_id_guard: RunIdAdmissionGuard,
+        project_lock: ProjectAdmissionLock,
     ) -> Result<AgentHandle, AgentSpawnError> {
         let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
         self.preflight_project_launch(project_policy, config, prompt)
@@ -522,7 +565,7 @@ impl AgentRunner {
         let execution = Self::execution_projection(project_policy).map_err(pre_binding_error)?;
         let repository = AgentRunRepository::new(db);
         let run = repository
-            .insert_with_events_and_reservation(
+            .insert_with_events_and_reservation_with_guard(
                 &NewAgentRun::with_context(
                     &project.project_id,
                     primary_event_id,
@@ -537,6 +580,7 @@ impl AgentRunner {
                 .with_execution(execution.clone()),
                 event_ids,
                 reservation.map(|reservation| reservation.token.as_str()),
+                &run_id_guard,
             )
             .map_err(pre_binding_error)?;
         drop(agent_start_guard);
@@ -564,6 +608,8 @@ impl AgentRunner {
                     error.into(),
                 )
             })?;
+        drop(run_id_guard);
+        drop(project_lock);
         let command = self
             .command_for(project_policy, config, prompt, temp.path())
             .map_err(|error| {

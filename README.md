@@ -28,6 +28,11 @@ SQLite が、プロジェクト登録、callback、再照合したタスク、in
 - Rust stable と Cargo
 - `pueue` と `pueued`
 - Linux では systemd user service、macOS では launchd
+- Linux の private temp inventory/cleanup には kernel 5.8 以降が必要です。
+  `openat2(RESOLVE_NO_XDEV)`（5.6 以降）と `statx` mount ID（5.8 以降）の
+  どちらかを厳密に確認できない場合、agent は安全側に
+  `unsupported_platform` として起動・cleanup を拒否し、古い syscall や
+  device ID だけの判定へ fallback しません。
 
 ```bash
 git clone <repo>

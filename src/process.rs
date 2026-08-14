@@ -1008,6 +1008,10 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
             return Err(BootstrapError::TargetCreate);
         }
     }
+    // The helper is the isolated process boundary for target creation. Keep
+    // the supervisor's umask untouched while ensuring target-created private
+    // run directories cannot inherit a weaker ambient mask.
+    unsafe { libc::umask(0o077); }
     let mut target = PlatformTarget::prepare(&frame)?;
     #[cfg(test)]
     TEST_PREPARED_TARGET_PID.store(target.pid(), Ordering::SeqCst);

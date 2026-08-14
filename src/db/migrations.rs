@@ -1,10 +1,10 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-use crate::AppError;
+use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 14;
+pub const LATEST_SCHEMA_VERSION: i64 = 15;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -41,6 +41,14 @@ const AGENT_RUN_V14_EXECUTION_COLUMNS: [(&str, &str); 5] = [
         "ALTER TABLE agent_runs ADD COLUMN failure_stage TEXT",
     ),
 ];
+const AGENT_RUN_ID_SEQUENCE_TABLE_SQL: &str = r#"
+    CREATE TABLE agent_run_id_sequence (
+        sequence_id INTEGER PRIMARY KEY CHECK (sequence_id = 1),
+        last_run_id INTEGER NOT NULL CHECK (
+            last_run_id >= 0 AND last_run_id <= 9223372036854775806
+        )
+    );
+"#;
 const OPERATOR_LOGS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS operator_logs (
         log_id INTEGER PRIMARY KEY,
@@ -71,6 +79,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
         && missing_execution_projection_columns(connection)?.is_empty();
     if version == LATEST_SCHEMA_VERSION {
+        validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
         // integrity, and the new required event index.
@@ -459,6 +468,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             &missing_execution_projection_columns,
         )?;
     }
+    ensure_agent_run_id_sequence(&transaction)?;
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -535,6 +545,110 @@ fn missing_execution_projection_columns(
         }
     }
     Ok(missing)
+}
+
+fn validate_agent_run_id_sequence(connection: &Connection) -> Result<(), AppError> {
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_run_id_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| invalid_agent_run_id_sequence())?;
+    if !table_sql.as_deref().is_some_and(|sql| {
+        compact_sql(sql) == compact_sql(AGENT_RUN_ID_SEQUENCE_TABLE_SQL)
+    }) {
+        return Err(AppError::Runtime {
+            operation: "validate SQLite agent run ID sequence schema",
+        });
+    }
+    let row_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_run_id_sequence",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| invalid_agent_run_id_sequence())?;
+    if row_count != 1 {
+        return Err(invalid_agent_run_id_sequence());
+    }
+    let (sequence_id, last_run_id): (i64, i64) = connection
+        .query_row(
+            "SELECT sequence_id, last_run_id FROM agent_run_id_sequence",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| invalid_agent_run_id_sequence())?;
+    let max_run_id: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(run_id), 0) FROM agent_runs",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| invalid_agent_run_id_sequence())?;
+    if sequence_id != 1
+        || last_run_id < 0
+        || last_run_id > MAX_PRIVATE_TEMP_RUN_ID
+        || max_run_id > MAX_PRIVATE_TEMP_RUN_ID
+        || last_run_id < max_run_id
+    {
+        return Err(invalid_agent_run_id_sequence());
+    }
+    Ok(())
+}
+
+fn invalid_agent_run_id_sequence() -> AppError {
+    AppError::Runtime {
+        operation: "validate SQLite agent run ID sequence",
+    }
+}
+
+fn ensure_agent_run_id_sequence(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let table_sql: Option<String> = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_run_id_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("check agent run ID sequence table"))?;
+    if let Some(sql) = table_sql {
+        if compact_sql(&sql) != compact_sql(AGENT_RUN_ID_SEQUENCE_TABLE_SQL) {
+            return Err(AppError::Runtime {
+                operation: "validate SQLite agent run ID sequence schema",
+            });
+        }
+    } else {
+        transaction
+            .execute_batch(AGENT_RUN_ID_SEQUENCE_TABLE_SQL)
+            .map_err(database_error("create agent run ID sequence table"))?;
+        let max_run_id: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(run_id), 0) FROM agent_runs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error("backfill maximum agent run ID"))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_run_id_sequence (sequence_id, last_run_id)
+                 VALUES (1, ?1)",
+                [max_run_id],
+            )
+            .map_err(database_error("initialize agent run ID sequence"))?;
+    }
+    validate_agent_run_id_sequence(transaction)
+        .map_err(|_| AppError::Runtime {
+            operation: "validate SQLite agent run ID sequence after migration",
+        })?;
+    transaction
+        .execute_batch("PRAGMA user_version = 15;")
+        .map_err(database_error("set SQLite v15 schema version"))
 }
 
 fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {

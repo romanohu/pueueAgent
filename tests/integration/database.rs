@@ -379,7 +379,7 @@ fn assert_malformed_execution_projection_rejected(path: &Path) {
         Ok(_) => panic!("malformed execution projection schema was accepted"),
     };
     assert!(matches!(
-        error,
+        &error,
         AppError::Runtime {
             operation: "verify SQLite v14 agent run execution projection schema"
         }
@@ -472,6 +472,7 @@ fn open_configures_sqlite_and_installs_all_tables() {
         "integration_events",
         "incidents",
         "agent_runs",
+        "agent_run_id_sequence",
         "agent_run_events",
         "submissions",
         "termination_requests",
@@ -510,6 +511,70 @@ fn open_configures_sqlite_and_installs_all_tables() {
     drop(statement);
     drop(connection);
     Db::open(&test.path).unwrap();
+}
+
+#[test]
+fn latest_schema_rejects_agent_run_sequence_below_existing_runs() {
+    let test = TestDatabase::new();
+    let (run_id, _) = bind_starting_run(&test, "invalid-run-id-sequence");
+    assert!(run_id > 0);
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_run_id_sequence SET last_run_id = 0 WHERE sequence_id = 1",
+            [],
+        )
+        .unwrap();
+    let error = Db::open(&test.path).unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Runtime {
+            operation: "validate SQLite agent run ID sequence"
+        }
+    ), "unexpected error: {error:?}");
+}
+
+#[test]
+fn v14_to_v15_seeds_committed_run_high_water_and_allocates_the_next_id() {
+    let test = TestDatabase::new();
+    let (first_run_id, first_event_id) = bind_starting_run(&test, "v15-sequence-seed");
+    assert_eq!(first_run_id, 1);
+    test.db
+        .connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "UPDATE agent_runs SET status = 'completed', finished_at = 120 WHERE run_id = {first_run_id};
+             UPDATE events SET status = 'completed', completed_at = 120 WHERE event_id = {first_event_id};
+             DROP TABLE agent_run_id_sequence;
+             PRAGMA user_version = 14;"
+        ))
+        .unwrap();
+
+    let migrated = Db::open(&test.path).unwrap();
+    let seeded: i64 = migrated
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(seeded, first_run_id);
+
+    let second_event_id = insert_event(&migrated, "project-a", "v15-next-run", 130);
+    let second_run = AgentRunRepository::new(&migrated)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            second_event_id,
+            None,
+            AgentRunStatus::Starting,
+            140,
+            "/tmp/v15-next-run.log",
+        ))
+        .unwrap();
+    assert_eq!(second_run.run_id, first_run_id + 1);
 }
 
 #[test]
@@ -745,7 +810,7 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let event_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
@@ -874,7 +939,7 @@ fn v14_adds_projection_and_preserves_v13_rows() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let columns = connection
         .prepare("PRAGMA table_info(agent_runs)")
         .unwrap()

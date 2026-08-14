@@ -527,6 +527,140 @@ fn create_cleanup_depth_overflow(run_temp: &PathBuf) -> PathBuf {
     nested.parent().unwrap().to_path_buf()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn startup_temp_inventory_rejects_symlink_weak_and_over_limit_without_mutation() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    {
+        let harness = DaemonHarness::new();
+        harness.register_project_with_agent(
+            "project-b",
+            "pb-project",
+            "/bin/sh",
+            &["-c", "sleep 1"],
+            1,
+        );
+        let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = harness.temp.path().join("outside-retained");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let symlinked = tmp.join("999");
+        symlink(&outside, &symlinked).unwrap();
+        let symlink_event =
+            harness.enqueue(EventKind::TaskFailed, "project-a", "startup-symlink");
+        let unrelated_event =
+            harness.enqueue(EventKind::TaskFailed, "project-b", "startup-unrelated");
+
+        let mut daemon = harness.daemon_at(harness.now);
+        daemon.run_once().await.unwrap();
+        assert_eq!(harness.event_status(symlink_event), EventStatus::DeadLetter);
+        assert_eq!(harness.event_status(unrelated_event), EventStatus::Dispatched);
+        assert!(symlinked.is_symlink());
+        assert!(outside.is_dir());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while harness.event_status(unrelated_event) != EventStatus::Completed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "unrelated project did not drain"
+            );
+            daemon.run_once().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    {
+        let harness = DaemonHarness::new();
+        let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        let weak = tmp.join("999");
+        fs::create_dir(&weak).unwrap();
+        fs::set_permissions(&weak, fs::Permissions::from_mode(0o755)).unwrap();
+        let weak_event = harness.enqueue(EventKind::TaskFailed, "project-a", "startup-weak");
+        let mut daemon = harness.daemon_at(harness.now);
+        daemon.run_once().await.unwrap();
+        assert_eq!(harness.event_status(weak_event), EventStatus::DeadLetter);
+        assert_eq!(
+            fs::metadata(&weak).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(weak.is_dir());
+    }
+
+    {
+        let harness = DaemonHarness::new();
+        let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        for run_id in 1..=pueue_agent::environment::MAX_PRIVATE_TEMP_GENERATIONS + 1 {
+            let generation = tmp.join(run_id.to_string());
+            fs::create_dir(&generation).unwrap();
+            fs::set_permissions(&generation, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let over_limit_count = fs::read_dir(&tmp).unwrap().count();
+        let over_limit_event =
+            harness.enqueue(EventKind::TaskFailed, "project-a", "startup-over-limit");
+        let mut daemon = harness.daemon_at(harness.now);
+        daemon.run_once().await.unwrap();
+        assert_eq!(harness.event_status(over_limit_event), EventStatus::DeadLetter);
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), over_limit_count);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn daemon_keeps_running_after_temp_inventory_violation_until_cancel() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-b",
+        "pb-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
+    let tmp = harness.root("project-a").join(".pueue-agent/tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = harness.temp.path().join("outside-daemon-run");
+    fs::create_dir(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    let retained = tmp.join("999");
+    symlink(&outside, &retained).unwrap();
+    let unsafe_event = harness.enqueue(EventKind::TaskFailed, "project-a", "daemon-unsafe");
+    let unrelated_event = harness.enqueue(EventKind::TaskFailed, "project-b", "daemon-unrelated");
+
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut daemon = harness.daemon_at(harness.now);
+    let task = tokio::spawn(async move { daemon.run(task_shutdown).await });
+    // Native lifecycle setup includes compiling the generated fixture agent;
+    // use the same production-bounded readiness contract as the other daemon
+    // lifecycle tests instead of a short wall-clock bound around setup.
+    harness.wait_for_native_dispatch(unrelated_event).await;
+    let completion = tokio::time::timeout(Duration::from_secs(35), async {
+        while harness.event_status(unrelated_event) != EventStatus::Completed {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    completion.expect("unrelated project should complete while daemon remains running");
+    assert_eq!(harness.event_status(unsafe_event), EventStatus::DeadLetter);
+    assert!(!task.is_finished());
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("daemon should stop after explicit cancellation")
+        .unwrap()
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn cleanup_pending_project_defers_without_attempt_while_other_project_dispatches() {

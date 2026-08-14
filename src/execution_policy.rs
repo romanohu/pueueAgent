@@ -321,6 +321,7 @@ pub enum TempUnsafeReason {
     ByteLimit,
     GenerationLimit,
     IdentityChanged,
+    MountBoundary,
     InvalidEntry,
     IoFailure,
 }

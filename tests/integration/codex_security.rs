@@ -14,16 +14,21 @@ use pueue_agent::{
     },
     execution_policy::{
         load_or_create_policy, AgentKind, ExecutableAnchor, ExecutableIdentity, NetworkMode,
-        PolicyLoadInput, PolicyViolationCode, PolicyViolationDetail, ProjectRootAnchor,
-        ResolvedProjectExecutionPolicy, StartupEnvironment, TempUnsafeReason,
+        PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor, ResolvedProjectExecutionPolicy,
+        StartupEnvironment,
     },
-    environment::{PrivateRunTemp, SanitizedEnvironment},
+    environment::SanitizedEnvironment,
     models::AgentContextMode,
 };
 use tempfile::TempDir;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use pueue_agent::{
+    environment::PrivateRunTemp,
+    execution_policy::{PolicyViolationDetail, TempUnsafeReason},
+};
 
 #[test]
 fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
@@ -343,7 +348,7 @@ fn codex_shell_filters_always_have_a_nonsecret_baseline() {
     assert!(!filters.contains("OPENAI_API_KEY"));
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_is_0700_and_retained_after_cleanup_and_drop() {
     use std::os::unix::fs::PermissionsExt;
@@ -364,7 +369,7 @@ fn private_temp_is_0700_and_retained_after_cleanup_and_drop() {
     assert_eq!(fs::read(path.join("original-generation")).unwrap(), b"original");
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_rejects_collision_and_unsafe_fixed_parents() {
     use std::os::unix::fs::PermissionsExt;
@@ -379,12 +384,13 @@ fn private_temp_rejects_collision_and_unsafe_fixed_parents() {
     let weak_harness = Harness::new();
     fs::set_permissions(
         weak_harness.root.join(".pueue-agent"),
-        fs::Permissions::from_mode(0o755),
+        fs::Permissions::from_mode(0o775),
     )
     .unwrap();
     let weak_anchor = ProjectRootAnchor::resolve(&weak_harness.root).unwrap();
     let weak_root = weak_anchor.verify_identity().unwrap();
     assert!(PrivateRunTemp::create(&weak_root, 42).is_err());
+    assert!(PrivateRunTemp::inspect_capacity(&weak_root).is_err());
 
     let symlink_harness = Harness::new();
     let outside = symlink_harness._temp.path().join("outside");
@@ -396,7 +402,7 @@ fn private_temp_rejects_collision_and_unsafe_fixed_parents() {
     assert!(PrivateRunTemp::create(&symlink_root, 42).is_err());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_does_not_follow_nested_symlinks_or_delete_replacement() {
     use std::os::unix::fs::symlink;
@@ -429,7 +435,7 @@ fn private_temp_does_not_follow_nested_symlinks_or_delete_replacement() {
     assert!(!moved.join("keep").exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_revalidation_rejects_replaced_generation_before_authorization() {
     use std::os::unix::fs::PermissionsExt;
@@ -448,7 +454,7 @@ fn private_temp_revalidation_rejects_replaced_generation_before_authorization() 
     assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_retains_tree_without_traversal() {
     let harness = Harness::new();
@@ -465,7 +471,7 @@ fn private_temp_retains_tree_without_traversal() {
     assert_eq!(fs::read(path.join("entry-4096")).unwrap(), b"x");
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_cleanup_removes_bounded_contents_but_retains_run_directory() {
     use std::os::unix::fs::PermissionsExt;
@@ -488,10 +494,11 @@ fn private_temp_cleanup_removes_bounded_contents_but_retains_run_directory() {
     assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn private_temp_cleanup_does_not_follow_symlink_or_fifo_targets() {
+fn private_temp_cleanup_does_not_follow_symlink_fifo_or_socket_targets() {
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
 
     let harness = Harness::new();
     let root = ProjectRootAnchor::resolve(&harness.root)
@@ -504,15 +511,18 @@ fn private_temp_cleanup_does_not_follow_symlink_or_fifo_targets() {
     symlink(&outside, temp.path().join("link")).unwrap();
     let fifo = temp.path().join("fifo");
     assert_eq!(unsafe { libc::mkfifo(std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap().as_ptr(), 0o600) }, 0);
+    let socket = temp.path().join("socket");
+    let listener = UnixListener::bind(&socket).unwrap();
     let report = temp.cleanup_contents_before(None).unwrap();
 
-    assert_eq!(report.entries_removed, 2);
+    assert_eq!(report.entries_removed, 3);
     assert_eq!(fs::read(&outside).unwrap(), b"keep");
     assert!(temp.path().is_dir());
     assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+    drop(listener);
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_cleanup_rejects_depth_entry_and_allocated_byte_overflow_before_mutation() {
     use std::os::unix::fs::PermissionsExt;
@@ -545,7 +555,7 @@ fn private_temp_cleanup_rejects_depth_entry_and_allocated_byte_overflow_before_m
 
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_cleanup_expired_deadline_does_not_mutate() {
     let harness = Harness::new();
@@ -562,7 +572,7 @@ fn private_temp_cleanup_expired_deadline_does_not_mutate() {
     assert_eq!(fs::read(temp.path().join("small")).unwrap(), b"small");
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_cleanup_never_touches_a_replacement_run_generation() {
     let harness = Harness::new();
@@ -586,7 +596,7 @@ fn private_temp_cleanup_never_touches_a_replacement_run_generation() {
     assert!(visible.is_dir());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_inventory_allows_empty_generations_and_rejects_nonempty_or_unsafe_generations() {
     use std::os::unix::fs::PermissionsExt;
@@ -621,7 +631,7 @@ fn private_temp_inventory_allows_empty_generations_and_rejects_nonempty_or_unsaf
     assert_eq!(error.stage, pueue_agent::execution_policy::PolicyViolationStage::PreBinding);
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_inventory_rejects_weak_fixed_components_at_prebinding() {
     use std::os::unix::fs::PermissionsExt;
@@ -642,7 +652,7 @@ fn private_temp_inventory_rejects_weak_fixed_components_at_prebinding() {
     assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry));
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_temp_inventory_rejects_generation_overflow_without_mutation() {
     use std::os::unix::fs::PermissionsExt;
@@ -664,6 +674,34 @@ fn private_temp_inventory_rejects_generation_overflow_without_mutation() {
 
     assert_eq!(error.detail, PolicyViolationDetail::TempUnsafe(TempUnsafeReason::GenerationLimit));
     assert_eq!(fs::read_dir(tmp).unwrap().count(), pueue_agent::environment::MAX_PRIVATE_TEMP_GENERATIONS + 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn private_temp_inventory_rejects_noncanonical_decimal_generation_names() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for name in ["+1", "+01"] {
+        let harness = Harness::new();
+        let tmp = harness.root.join(".pueue-agent/tmp");
+        fs::remove_dir_all(tmp.join("run")).unwrap();
+        let generation = tmp.join(name);
+        fs::create_dir(&generation).unwrap();
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = ProjectRootAnchor::resolve(&harness.root)
+            .unwrap()
+            .verify_identity()
+            .unwrap();
+
+        let error = PrivateRunTemp::inspect_capacity(&root).unwrap_err();
+
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry),
+            "name={name}"
+        );
+        assert!(generation.is_dir());
+    }
 }
 
 #[test]

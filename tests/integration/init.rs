@@ -1,10 +1,17 @@
 use std::fs;
 
-use assert_cmd::Command;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+use assert_cmd::{cargo::CommandCargoExt, Command};
 use pueue_agent::{
     config,
-    db::{Db, ProjectRepository},
-    models::{AgentContextMode, NewProject},
+    db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
+    environment::PrivateRunTemp,
+    execution_policy::ProjectRootAnchor,
+    models::{
+        AgentContextMode, AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject,
+    },
 };
 use tempfile::TempDir;
 
@@ -33,6 +40,103 @@ fn init_creates_toml_state_and_instructions() {
     assert!(state.join("logs").is_dir());
     let loaded = config::load(&state.join("config.toml")).unwrap();
     assert_eq!(loaded.agent.context, AgentContextMode::Fresh);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ordinary_init_container_allows_private_temp_inventory_create_and_removal() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    fs::create_dir(&root).unwrap();
+    let mut command = std::process::Command::cargo_bin("pueue-agent").unwrap();
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+
+    let output = command.arg("init").arg(&root).output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::metadata(root.join(".pueue-agent"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+    ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            "project-a",
+            &root,
+            "pa-init-private-temp",
+            root.join(".pueue-agent/config.toml"),
+            100,
+        ))
+        .unwrap();
+    let anchor = ProjectRootAnchor::resolve(&fs::canonicalize(&root).unwrap()).unwrap();
+    let verified_root = anchor.verify_identity().unwrap();
+    let inventory = PrivateRunTemp::inspect_capacity(&verified_root).unwrap();
+    assert_eq!(inventory.generations, 0);
+
+    let event_id = EventRepository::new(&db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            "init-private-temp-run",
+            serde_json::json!({}),
+            101,
+            101,
+        ))
+        .unwrap()
+        .event_id;
+    let run = AgentRunRepository::new(&db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            102,
+            root.join(".pueue-agent/logs/init-private-temp.log"),
+        ))
+        .unwrap();
+    let generation = PrivateRunTemp::create(&verified_root, run.run_id).unwrap();
+
+    assert_eq!(
+        fs::metadata(root.join(".pueue-agent/tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(generation.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    drop(generation);
+
+    ProjectRepository::new(&db)
+        .remove("project-a", 110, &[])
+        .unwrap();
+    assert_eq!(
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT last_run_id FROM agent_run_id_sequence WHERE sequence_id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        run.run_id
+    );
 }
 
 #[test]

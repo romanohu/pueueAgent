@@ -78,18 +78,26 @@ performed by the daemon while it still owns the cleanup handle.
 
 ## Descriptor traversal and limits
 
-The cleanup API is Unix-only and fails closed as `UnsupportedPlatform`
-elsewhere. It uses only descriptor-relative operations:
+The cleanup API supports Linux and macOS and fails closed as
+`UnsupportedPlatform` elsewhere. Linux cleanup and inventory require kernel
+5.8 or newer: the implementation requires `openat2(RESOLVE_NO_XDEV)` (kernel
+5.6) and `statx` mount IDs (kernel 5.8), and reports `UnsupportedPlatform`
+without a weaker fallback when either exact capability is unavailable. It uses
+only descriptor-relative operations:
 
 - duplicate a directory FD and enumerate it through `fdopendir`/`readdir`;
 - skip only `.` and `..`, reject invalid/NUL names, and never create a path;
-- inspect entries with `fstatat(..., AT_SYMLINK_NOFOLLOW)`;
-- open child directories with `openat(O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` and
-  verify owner, `0700` mode, type, and device/inode;
+- inspect entries with `fstatat(..., AT_SYMLINK_NOFOLLOW)` plus an exact mount
+  identity (`statx` mount ID on Linux, no-follow FSID on macOS);
+- on Linux, open child directories directly with
+  `openat2(O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC, RESOLVE_NO_XDEV)`; on macOS,
+  compare the no-follow entry FSID before descriptor open and recheck the
+  descriptor FSID after open; then verify owner, `0700` mode, type, and
+  device/inode;
 - treat regular files, symlinks, sockets, FIFOs, and device entries as leaves;
   no leaf is opened or read;
-- revalidate identity/type immediately before `unlinkat`; unlink symlinks as
-  links and never follow their targets;
+- revalidate mount identity, entry identity, and type immediately before
+  `unlinkat`; unlink symlinks as links and never follow their targets;
 - remove audited children bottom-up and `fsync` each modified directory;
 - never call `unlinkat(..., AT_REMOVEDIR)` for the retained run root.
 

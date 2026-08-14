@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::{
     agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle},
     config,
-    db::{EventRepository, InterventionRepository, ProjectRepository},
+    db::{AgentRunRepository, EventRepository, InterventionRepository, ProjectRepository},
     guardrails::{DispatchDecision, Guardrails},
     interventions::{
         Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
@@ -227,6 +227,14 @@ impl Scheduler {
                 .iter()
                 .map(|event| event.event_id)
                 .collect::<Vec<_>>();
+            if return_scheduler_error!(
+                AgentRunRepository::new(&self.db).find_active_by_project(&project_id)
+            )
+            .is_some()
+            {
+                return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                continue;
+            }
             let Some(primary) = events.first().cloned() else {
                 continue;
             };
@@ -351,6 +359,83 @@ impl Scheduler {
                 }
             }
 
+            let run_id_guard = match self.runner.try_acquire_run_id_admission_guard(&self.db) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                    continue;
+                }
+                Err(violation) => {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                            &project.project_id,
+                            &event_ids,
+                            self.config.now,
+                            &violation,
+                        )
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(violation.into());
+                    }
+                    continue;
+                }
+            };
+            let project_lock = match self.runner.try_acquire_project_admission_lock(&project_policy) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                    continue;
+                }
+                Err(violation) => {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                            &project.project_id,
+                            &event_ids,
+                            self.config.now,
+                            &violation,
+                        )
+                    );
+                    if violation.code != crate::execution_policy::PolicyViolationCode::TempUnsafe
+                        && first_error.is_none()
+                    {
+                        first_error = Some(violation.into());
+                    }
+                    continue;
+                }
+            };
+            if return_scheduler_error!(
+                AgentRunRepository::new(&self.db).find_active_by_project(&project_id)
+            )
+            .is_some()
+            {
+                return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                continue;
+            }
+            let durable_run_id_high_water = return_scheduler_error!(
+                AgentRunRepository::new(&self.db).durable_run_id_high_water(&run_id_guard)
+            );
+            let _temp_inventory = match self.runner.preflight_private_temp_capacity(
+                &project_policy,
+                durable_run_id_high_water,
+            ) {
+                Ok(report) => report,
+                Err(violation) => {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                            &project.project_id,
+                            &event_ids,
+                            self.config.now,
+                            &violation,
+                        )
+                    );
+                    if violation.code != crate::execution_policy::PolicyViolationCode::TempUnsafe
+                        && first_error.is_none()
+                    {
+                        first_error = Some(violation.into());
+                    }
+                    continue;
+                }
+            };
             let mode = dispatch_mode(primary.kind).to_owned();
             let (reservation, prompt) =
                 match self.reserve_interventions_for_prompt(&project, &mode, &events) {
@@ -408,6 +493,8 @@ impl Scheduler {
                     reservation.as_ref(),
                     &prompt,
                     self.config.now,
+                    run_id_guard,
+                    project_lock,
                 )
                 .await
             {

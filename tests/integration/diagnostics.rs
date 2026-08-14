@@ -447,6 +447,159 @@ fn canonical_state_doctor_reports_actual_sqlite_schema_version_in_json_and_text(
 }
 
 #[test]
+fn doctor_reports_healthy_agent_run_id_sequence_without_exposing_values() {
+    let harness = DiagnosticsHarness::new();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+    let check = state_check(&value, "schema.agent_run_id_sequence");
+    assert_eq!(check["status"], "ok");
+    assert!(!check["summary"].as_str().unwrap().contains("last_run_id"));
+    assert!(!check["summary"].as_str().unwrap().contains("0"));
+}
+
+#[test]
+fn doctor_reports_missing_agent_run_id_sequence_row_without_aborting() {
+    let harness = DiagnosticsHarness::new();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM agent_run_id_sequence", [])
+        .unwrap();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+    assert_eq!(
+        state_check(&value, "schema.agent_run_id_sequence")["status"],
+        "error"
+    );
+    assert_eq!(state_check(&value, "schema.tables")["status"], "ok");
+}
+
+#[test]
+fn doctor_reports_missing_agent_run_id_sequence_table_without_aborting() {
+    let harness = DiagnosticsHarness::new();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DROP TABLE agent_run_id_sequence", [])
+        .unwrap();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+    assert_eq!(state_check(&value, "schema.tables")["status"], "error");
+    assert_eq!(
+        state_check(&value, "schema.agent_run_id_sequence")["status"],
+        "error"
+    );
+}
+
+#[test]
+fn doctor_reports_agent_run_id_sequence_floor_below_existing_run() {
+    let harness = DiagnosticsHarness::new();
+    let event_id = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            "doctor-sequence-floor",
+            json!({"task_id": 44}),
+            100,
+            100,
+        ))
+        .unwrap()
+        .event_id;
+    AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            110,
+            "/tmp/doctor-sequence-floor.log",
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_run_id_sequence SET last_run_id = 0 WHERE sequence_id = 1",
+            [],
+        )
+        .unwrap();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+    assert_eq!(
+        state_check(&value, "schema.agent_run_id_sequence")["status"],
+        "error"
+    );
+}
+
+#[test]
+fn doctor_reports_agent_run_id_sequence_above_allocatable_limit() {
+    let harness = DiagnosticsHarness::new();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_run_id_sequence SET last_run_id = ?1 WHERE sequence_id = 1",
+            [i64::MAX],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = OFF")
+        .unwrap();
+    drop(connection);
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+    let value: Value =
+        serde_json::from_str(&render_doctor_report_value(&report, true).unwrap()).unwrap();
+    assert_eq!(
+        state_check(&value, "schema.agent_run_id_sequence")["status"],
+        "error"
+    );
+}
+
+#[test]
 fn cli_output_contract_status_has_header_ids_states_summary_and_pure_json() {
     let harness = DiagnosticsHarness::new();
     let event = EventRepository::new(&harness.db)

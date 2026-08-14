@@ -3,7 +3,7 @@ mod repositories;
 
 pub use migrations::LATEST_SCHEMA_VERSION;
 
-use std::{fs, path::Path, path::PathBuf, sync::Mutex, time::Duration};
+use std::{fs, path::Path, path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -16,13 +16,13 @@ pub use repositories::{
     SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
     MAX_FOLLOW_LINEAGE_SUBMISSIONS,
 };
-
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 static OPEN_INITIALIZATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct Db {
     path: PathBuf,
+    lock_parent: Arc<fs::File>,
     read_only: bool,
     busy_timeout: Duration,
 }
@@ -42,21 +42,25 @@ impl Db {
             })?;
         }
 
+        let lock_parent = Arc::new(open_lock_parent(path)?);
         let mut connection = open_connection(path, BUSY_TIMEOUT)?;
         migrations::migrate(&mut connection)?;
 
         Ok(Self {
             path: path.to_path_buf(),
+            lock_parent,
             read_only: false,
             busy_timeout: BUSY_TIMEOUT,
         })
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, AppError> {
+        let lock_parent = Arc::new(open_lock_parent(path)?);
         let connection = open_read_only_connection(path)?;
         drop(connection);
         Ok(Self {
             path: path.to_path_buf(),
+            lock_parent,
             read_only: true,
             busy_timeout: BUSY_TIMEOUT,
         })
@@ -73,6 +77,7 @@ impl Db {
     pub(crate) fn with_busy_timeout(&self, busy_timeout: Duration) -> Self {
         Self {
             path: self.path.clone(),
+            lock_parent: Arc::clone(&self.lock_parent),
             read_only: self.read_only,
             busy_timeout,
         }
@@ -80,6 +85,39 @@ impl Db {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn run_id_lock_parent(&self) -> &fs::File {
+        &self.lock_parent
+    }
+}
+
+fn open_lock_parent(path: &Path) -> Result<fs::File, AppError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::FromRawFd;
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).map_err(|_| AppError::Configuration { field: "state_db_path" })?;
+        let fd = unsafe {
+            libc::open(
+                parent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(AppError::Io {
+                operation: "open database parent descriptor",
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        return Ok(unsafe { fs::File::from_raw_fd(fd) });
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        fs::File::open(path.parent().unwrap_or_else(|| Path::new("."))).map_err(|source| AppError::Io {
+            operation: "open database parent descriptor",
+            source,
+        })
     }
 }
 

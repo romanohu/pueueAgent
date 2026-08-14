@@ -89,6 +89,50 @@ fn main() {
         ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
     }
 
+    fn compile_generated_private_temp_fixture(directory: &Path) -> ExecutableAnchor {
+        let source = directory.join("generated-private-temp-target.rs");
+        let executable = directory.join("generated-private-temp-target");
+        fs::write(
+            &source,
+            r#"use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+extern "C" { fn umask(mask: u32) -> u32; }
+
+fn main() {
+    let private_temp = PathBuf::from(env::args_os().nth(1).expect("private temp argument"));
+    let created = private_temp.join("target-created");
+    fs::create_dir(&created).expect("create private temp directory");
+    let mode = fs::metadata(&created)
+        .expect("stat private temp directory")
+        .permissions()
+        .mode()
+        & 0o777;
+    let inherited_umask = unsafe {
+        let current = umask(0);
+        umask(current);
+        current
+    };
+    fs::write(
+        private_temp.join("target-report"),
+        format!("{mode:o},{inherited_umask:o}"),
+    )
+    .expect("write private temp report");
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated private-temp fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
+    }
+
     fn compile_generated_pueue_fixture(directory: &Path) -> ExecutableAnchor {
         let source = directory.join("generated-pueue-target.rs");
         let executable = directory.join("generated-pueue-target");
@@ -455,6 +499,52 @@ fn main() {
         let status = child.wait().await.unwrap();
         assert!(status.success());
         assert_eq!(fs::read(&started).unwrap(), b"started");
+    }
+
+    #[tokio::test]
+    async fn verified_target_private_temp_creation_inherits_private_umask() {
+        let temporary = tempdir().unwrap();
+        let (launcher, _) = copy_launcher(temporary.path());
+        let target = compile_generated_private_temp_fixture(temporary.path());
+        let private_temp = temporary.path().join("private-run-temp");
+        fs::create_dir(&private_temp).unwrap();
+        fs::set_permissions(&private_temp, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(
+            &fs::canonicalize(temporary.path()).unwrap(),
+        )
+        .unwrap();
+
+        let mut child = spawn_verified_command(VerifiedCommandSpec {
+            launcher,
+            executable: target,
+            argv: vec![
+                OsString::from("generated-private-temp-target"),
+                private_temp.as_os_str().to_os_string(),
+            ],
+            cwd: Some(root_anchor.canonical_path.clone()),
+            environment: SanitizedEnvironment::default(),
+            process_group: ProcessGroupRequirement::Required,
+            start_suspended: true,
+            project_root: Some(root_anchor.verify_identity().unwrap()),
+            pueue_config: None,
+            child_io: VerifiedChildIo::Capture,
+        })
+        .unwrap();
+
+        child.release().unwrap();
+        child.confirm_exec().await.unwrap();
+        child.wait_for_release_ack().await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        let created = private_temp.join("target-created");
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o700,
+        );
+        assert_eq!(
+            fs::read_to_string(private_temp.join("target-report")).unwrap(),
+            "700,77",
+        );
     }
 
     #[tokio::test]
