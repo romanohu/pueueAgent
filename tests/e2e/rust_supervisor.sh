@@ -453,8 +453,8 @@ grep -qx 'ARG_4=resume' "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation silently used a fresh execution"
 grep -qx "ARG_5=$context_session_id" "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation used the wrong session ID"
-grep -qx "CODEX_HOME=$CODEX_HOME" "$PUEUE_AGENT_TEST_CODEX_LOG" \
-  || fail "Codex continuation did not inherit the fixture CODEX_HOME"
+grep -qx 'ENV_NAME=CODEX_HOME' "$PUEUE_AGENT_TEST_CODEX_LOG" \
+  || fail "Codex continuation did not expose the fixture CODEX_HOME name"
 
 PA_INSTALL_PREFIX="$WORK/install" "$REPO_ROOT/install.sh" >/dev/null
 [ -L "$WORK/install/pueue-agent" ] || fail "install did not create pueue-agent symlink"

@@ -106,6 +106,17 @@ pub struct LogFileIdentity {
 /// callers even though the kernel fields we compare are identical.
 pub type GateMarkerIdentity = LogFileIdentity;
 
+/// Startup recovery distinguishes an absent marker from a marker final-entry
+/// that cannot be trusted after its secure parent has been pinned. Callers
+/// must treat `Indeterminate` conservatively; it never asserts that a marker
+/// was valid or that execution began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupGateMarkerInspection {
+    Absent,
+    Valid,
+    Indeterminate,
+}
+
 #[derive(Debug)]
 pub struct AgentLogFile {
     file: File,
@@ -735,6 +746,55 @@ pub fn inspect_gate_marker(
             return Err(log_unsafe(LogUnsafeReason::InvalidContents));
         }
         Ok(Some(identity))
+    }
+}
+
+/// Inspect a startup-recovery marker through the fixed agent-log directory.
+/// The log parent is opened and identity-checked before and after inspecting
+/// only the final marker entry. Parent/root failures are returned to preserve
+/// fail-closed, no-mutation recovery; final-entry failures are explicitly
+/// represented as indeterminate evidence for conservative recovery handling.
+pub fn inspect_startup_gate_marker(
+    root: &ProjectRootLogReader,
+    relative: &Path,
+) -> Result<StartupGateMarkerInspection, AppError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (root, relative);
+        return Err(unsupported_platform(PolicyViolationStage::Startup));
+    }
+    #[cfg(unix)]
+    {
+        let (parent_components, _) = split_relative_parent(relative)?;
+        if parent_components.as_slice() != [OsStr::new(".pueue-agent"), OsStr::new("logs")] {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+
+        root.revalidate_root_path_identity()?;
+        let pinned_parent = inspect_agent_log_dir(root)?;
+        let (parent, name) = root.open_parent_for(relative)?;
+        validate_directory(&parent)?;
+        let opened_parent = LogFileIdentity::from_open_descriptor(&parent).map_err(|source| {
+            AppError::Io {
+                operation: "read startup marker parent metadata",
+                source,
+            }
+        })?;
+        if opened_parent != pinned_parent {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+
+        let final_entry = inspect_gate_marker_in_parent(&parent, &name);
+        let current_parent = inspect_agent_log_dir(root)?;
+        if current_parent != pinned_parent || current_parent != opened_parent {
+            return Err(log_unsafe(LogUnsafeReason::RootChanged));
+        }
+        root.revalidate_root_path_identity()?;
+        match final_entry {
+            Ok(Some(_)) => Ok(StartupGateMarkerInspection::Valid),
+            Ok(None) => Ok(StartupGateMarkerInspection::Absent),
+            Err(_) => Ok(StartupGateMarkerInspection::Indeterminate),
+        }
     }
 }
 

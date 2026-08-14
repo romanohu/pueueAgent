@@ -3716,6 +3716,30 @@ impl<'db> AgentRunRepository<'db> {
         confirmed_pending_marker_ids: &BTreeSet<i64>,
         confirmed_release_requested_ids: &BTreeSet<i64>,
     ) -> Result<AgentRunRecovery, AppError> {
+        self.recover_interrupted_with_marker_evidence(
+            finished_at,
+            reason,
+            policies,
+            confirmed_pending_marker_ids,
+            confirmed_release_requested_ids,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+    }
+
+    /// Recover durable startup gate evidence. Confirmed marker evidence and
+    /// final-entry indeterminate evidence are deliberately distinct: the
+    /// latter has a pinned secure parent but cannot establish marker validity.
+    pub fn recover_interrupted_with_marker_evidence(
+        &self,
+        finished_at: i64,
+        reason: &str,
+        policies: &BTreeMap<String, RetryPolicy>,
+        confirmed_pending_marker_ids: &BTreeSet<i64>,
+        confirmed_release_requested_ids: &BTreeSet<i64>,
+        indeterminate_pending_marker_ids: &BTreeSet<i64>,
+        indeterminate_release_requested_ids: &BTreeSet<i64>,
+    ) -> Result<AgentRunRecovery, AppError> {
         if confirmed_pending_marker_ids
             .iter()
             .any(|run_id| confirmed_release_requested_ids.contains(run_id))
@@ -3727,11 +3751,18 @@ impl<'db> AgentRunRepository<'db> {
         }
         {
             let connection = self.db.connect()?;
-            for (run_id, expected_status, expected_gate) in confirmed_pending_marker_ids
+            for (run_id, expected_status, expected_gate, allow_running_pending) in
+                confirmed_pending_marker_ids
                 .iter()
-                .map(|run_id| (*run_id, AgentRunStatus::Starting, "pending"))
+                .map(|run_id| (*run_id, AgentRunStatus::Starting, "pending", false))
+                .chain(indeterminate_pending_marker_ids.iter().map(|run_id| {
+                    (*run_id, AgentRunStatus::Starting, "pending", true)
+                }))
                 .chain(confirmed_release_requested_ids.iter().map(|run_id| {
-                    (*run_id, AgentRunStatus::Running, "release_requested")
+                    (*run_id, AgentRunStatus::Running, "release_requested", false)
+                }))
+                .chain(indeterminate_release_requested_ids.iter().map(|run_id| {
+                    (*run_id, AgentRunStatus::Running, "release_requested", false)
                 }))
             {
                 let Some((status, gate_state)) = connection
@@ -3754,6 +3785,8 @@ impl<'db> AgentRunRepository<'db> {
                     });
                 };
                 let status_matches = if expected_gate == "release_requested" {
+                    matches!(status, AgentRunStatus::Starting | AgentRunStatus::Running)
+                } else if allow_running_pending {
                     matches!(status, AgentRunStatus::Starting | AgentRunStatus::Running)
                 } else {
                     status == expected_status
@@ -3830,7 +3863,17 @@ impl<'db> AgentRunRepository<'db> {
                         message: "pending marker evidence changed phase during recovery",
                     });
                 }
-                if confirmed_release_requested_ids.contains(&run_id)
+                if indeterminate_pending_marker_ids.contains(&run_id)
+                    && !(matches!(run_status, AgentRunStatus::Starting | AgentRunStatus::Running)
+                        && gate_state == "pending")
+                {
+                    return Err(AppError::Validation {
+                        field: "launch_gate_state",
+                        message: "indeterminate pending marker evidence changed phase during recovery",
+                    });
+                }
+                if (confirmed_release_requested_ids.contains(&run_id)
+                    || indeterminate_release_requested_ids.contains(&run_id))
                     && gate_state != "release_requested"
                 {
                     return Err(AppError::Validation {
@@ -3877,14 +3920,17 @@ impl<'db> AgentRunRepository<'db> {
                         .map_err(database_error("read project recovery events"))?;
                     rows
                 };
-                let pending_marker_policy_evidence = run_status == AgentRunStatus::Starting
-                    && gate_state == "pending"
-                    && (confirmed_pending_marker_ids.contains(&run_id)
-                        || (policy_code.as_deref()
+                let pending_marker_policy_evidence = gate_state == "pending"
+                    && ((run_status == AgentRunStatus::Starting
+                        && confirmed_pending_marker_ids.contains(&run_id))
+                        || (matches!(run_status, AgentRunStatus::Starting | AgentRunStatus::Running)
+                            && indeterminate_pending_marker_ids.contains(&run_id))
+                        || (run_status == AgentRunStatus::Starting
+                            && policy_code.as_deref()
                             == Some(PolicyViolationCode::NativeGateFailed.as_str())
                             && failure_stage.as_deref()
                                 == Some(PolicyViolationStage::PostMarker.as_str())));
-                if pending_marker_policy_evidence {
+                if pending_marker_policy_evidence && run_status == AgentRunStatus::Starting {
                     let invalid_interventions = transaction
                         .query_row(
                             "SELECT COUNT(*) FROM interventions
@@ -3904,7 +3950,11 @@ impl<'db> AgentRunRepository<'db> {
                     }
                 }
                 let execution_unknown = (gate_state == "release_requested"
-                    && confirmed_release_requested_ids.contains(&run_id))
+                    && (confirmed_release_requested_ids.contains(&run_id)
+                        || indeterminate_release_requested_ids.contains(&run_id)))
+                    || (run_status == AgentRunStatus::Running
+                        && gate_state == "pending"
+                        && indeterminate_pending_marker_ids.contains(&run_id))
                     || gate_state == "released"
                     || linked_events
                         .iter()

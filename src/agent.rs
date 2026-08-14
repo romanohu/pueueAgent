@@ -28,7 +28,9 @@ use crate::{
     native_launcher::{NativeAgentChild, NativeLaunchSpec, NativeLauncher},
     output::bounded_redacted_text,
     process::TerminalObservation,
-    project_logs::{inspect_gate_marker, ProjectRootLogReader},
+    project_logs::{
+        inspect_startup_gate_marker, ProjectRootLogReader, StartupGateMarkerInspection,
+    },
     retry::{EventResolution, RetryPolicy},
     upgrade::AgentStartUpgradeGuard,
     AppError,
@@ -408,23 +410,29 @@ impl AgentRunner {
         project: &Project,
         config: &ProjectConfig,
         candidates: &[(i64, String, PathBuf)],
-    ) -> Result<BTreeSet<i64>, AppError> {
+    ) -> Result<StartupGateMarkerEvidence, AppError> {
         let policy = self
             .resolve_project_policy(project, config)
             .map_err(AppError::from)?;
         let verified_root = policy.root_anchor.verify_identity().map_err(AppError::from)?;
         let reader = ProjectRootLogReader::from_verified(verified_root);
         reader.revalidate_root_path_identity()?;
-        let mut confirmed = BTreeSet::new();
+        let mut evidence = StartupGateMarkerEvidence::default();
         for (run_id, _gate_state, stored_log_path) in candidates {
             let relative_log = recovery_relative_log_path(&policy, stored_log_path)?;
             let relative_marker = launch_gate_marker_path(&relative_log);
-            if inspect_gate_marker(&reader, &relative_marker)?.is_some() {
-                confirmed.insert(*run_id);
+            match inspect_startup_gate_marker(&reader, &relative_marker)? {
+                StartupGateMarkerInspection::Absent => {}
+                StartupGateMarkerInspection::Valid => {
+                    evidence.confirmed.insert(*run_id);
+                }
+                StartupGateMarkerInspection::Indeterminate => {
+                    evidence.indeterminate.insert(*run_id);
+                }
             }
         }
         reader.revalidate_root_path_identity()?;
-        Ok(confirmed)
+        Ok(evidence)
     }
 
     pub fn preflight_project_launch(
@@ -770,6 +778,12 @@ impl AgentRunner {
             process_proof: ProcessProof::Owned,
         })
     }
+}
+
+#[derive(Default)]
+pub(crate) struct StartupGateMarkerEvidence {
+    pub(crate) confirmed: BTreeSet<i64>,
+    pub(crate) indeterminate: BTreeSet<i64>,
 }
 
 fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {

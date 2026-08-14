@@ -2247,6 +2247,243 @@ async fn startup_recovery_closes_pending_marker_evidence_crash_window() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn recovery_retries_pre_marker_and_dead_letters_post_marker() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+
+    let pre_event = harness.enqueue(EventKind::TaskFailed, "project-a", "pre-marker-recovery");
+    let post_event = harness.enqueue(EventKind::TaskFailed, "project-a", "post-marker-recovery");
+    for event_id in [pre_event, post_event] {
+        harness.claim_with_lease(event_id, harness.now + 600);
+    }
+
+    let runs = AgentRunRepository::new(&harness.db);
+    runs.insert_with_events(
+        &NewAgentRun::new(
+            "project-a",
+            pre_event,
+            None,
+            AgentRunStatus::Starting,
+            harness.now - 10,
+            harness.registered_root("project-a").join(format!(
+                ".pueue-agent/logs/agent-190-{pre_event}.log"
+            )),
+        ),
+        &[pre_event],
+    )
+    .unwrap();
+
+    let intervention_id =
+        harness.reserve_intervention("already delivered", "post-marker-token", harness.now + 600);
+    let post_log = harness
+        .registered_root("project-a")
+        .join(format!(".pueue-agent/logs/agent-190-{post_event}.log"));
+    let post_run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                post_event,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &post_log,
+            ),
+            &[post_event],
+            Some("post-marker-token"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions(
+        "project-a",
+        post_run.run_id,
+        42_424,
+        harness.now - 5,
+    )
+    .unwrap();
+    runs.mark_gate_release_requested("project-a", post_run.run_id)
+        .unwrap();
+    let marker_path = PathBuf::from(format!("{}.gate-started", post_log.display()));
+    fs::write(&marker_path, b"authorized\n").unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.requeued_agent_events, 1);
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(harness.event_status(pre_event), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(post_event), EventStatus::DeadLetter);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Applied, Some(post_run.run_id))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_dead_letters_indeterminate_relative_marker_without_releasing_intervention() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "indeterminate-marker");
+    harness.claim_with_lease(event_id, harness.now + 600);
+
+    let intervention_id =
+        harness.reserve_intervention("already delivered", "indeterminate-token", harness.now + 600);
+    let log_path = harness
+        .registered_root("project-a")
+        .join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let runs = AgentRunRepository::new(&harness.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+            Some("indeterminate-token"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 42_424, harness.now - 5)
+        .unwrap();
+    runs.mark_gate_release_requested("project-a", run.run_id)
+        .unwrap();
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    fs::write(&marker_path, b"not an authorization marker\n").unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(report.requeued_agent_events, 0);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Applied, Some(run.run_id))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_dead_letters_indeterminate_pending_marker_as_post_marker_policy() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "pending-indeterminate");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let log_path = harness
+        .registered_root("project-a")
+        .join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    fs::write(&marker_path, b"not an authorization marker\n").unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    let state: (String, Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT launch_gate_state, policy_code, failure_stage
+             FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            "failed".to_owned(),
+            Some("native_gate_failed".to_owned()),
+            Some("post_marker".to_owned()),
+        )
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_dead_letters_running_pending_indeterminate_marker_and_retains_applied_intervention() {
+    let harness = DaemonHarness::new();
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "running-pending-marker");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let intervention_id = harness.reserve_intervention(
+        "already delivered",
+        "running-pending-token",
+        harness.now + 600,
+    );
+    let log_path = harness
+        .registered_root("project-a")
+        .join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let runs = AgentRunRepository::new(&harness.db);
+    let run = runs
+        .insert_with_events_and_reservation(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+            Some("running-pending-token"),
+        )
+        .unwrap();
+    runs.mark_running_and_apply_interventions("project-a", run.run_id, 42_424, harness.now - 5)
+        .unwrap();
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    fs::write(&marker_path, b"not an authorization marker\n").unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.dead_lettered_agent_events, 1);
+    assert_eq!(report.requeued_agent_events, 0);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(
+        harness.intervention_state(&intervention_id),
+        (InterventionStatus::Applied, Some(run.run_id))
+    );
+    let state: (String, Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT launch_gate_state, policy_code, failure_stage
+             FROM agent_runs WHERE run_id = ?1",
+            [run.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        (
+            "released".to_owned(),
+            Some("native_gate_failed".to_owned()),
+            Some("post_marker".to_owned()),
+        )
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn startup_recovery_rejects_symlinked_log_directory_without_database_mutation() {
     let harness = DaemonHarness::new();
     harness.pause_project("project-a");

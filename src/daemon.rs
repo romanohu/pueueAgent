@@ -126,15 +126,22 @@ where
         let mut report = DaemonReport::default();
 
         if self.startup_recovery_pending {
-            let (policies, confirmed_pending_marker_ids, confirmed_release_requested_ids) =
-                self.load_startup_recovery_inputs()?;
+            let (
+                policies,
+                confirmed_pending_marker_ids,
+                confirmed_release_requested_ids,
+                indeterminate_pending_marker_ids,
+                indeterminate_release_requested_ids,
+            ) = self.load_startup_recovery_inputs()?;
             let recovery = AgentRunRepository::new(&self.db)
-                .recover_interrupted(
+                .recover_interrupted_with_marker_evidence(
                     now,
                     DAEMON_RESTART_REASON,
                     &policies,
                     &confirmed_pending_marker_ids,
                     &confirmed_release_requested_ids,
+                    &indeterminate_pending_marker_ids,
+                    &indeterminate_release_requested_ids,
                 )?;
             self.startup_recovery_pending = false;
             report.recovered_agent_runs = recovery.failed_runs;
@@ -244,6 +251,8 @@ where
             BTreeMap<String, RetryPolicy>,
             BTreeSet<i64>,
             BTreeSet<i64>,
+            BTreeSet<i64>,
+            BTreeSet<i64>,
         ),
         AppError,
     > {
@@ -254,6 +263,8 @@ where
         let mut policies = BTreeMap::new();
         let mut confirmed_pending_marker_ids = BTreeSet::new();
         let mut confirmed_release_requested_ids = BTreeSet::new();
+        let mut indeterminate_pending_marker_ids = BTreeSet::new();
+        let mut indeterminate_release_requested_ids = BTreeSet::new();
         for project in projects {
             let project_config = config::load(&project.config_path)?;
             if project_config.project_id != project.project_id {
@@ -277,21 +288,31 @@ where
             let candidates = AgentRunRepository::new(&self.db)
                 .list_startup_marker_candidates(&project.project_id)?;
             if !candidates.is_empty() {
-                let confirmed = runner.inspect_startup_gate_markers(
+                let marker_evidence = runner.inspect_startup_gate_markers(
                     &project,
                     &project_config,
                     &candidates,
                 )?;
                 for (run_id, gate_state, _) in candidates {
-                    if !confirmed.contains(&run_id) {
+                    let confirmed = marker_evidence.confirmed.contains(&run_id);
+                    let indeterminate = marker_evidence.indeterminate.contains(&run_id);
+                    if !confirmed && !indeterminate {
                         continue;
                     }
                     match gate_state.as_str() {
                         "pending" => {
-                            confirmed_pending_marker_ids.insert(run_id);
+                            if confirmed {
+                                confirmed_pending_marker_ids.insert(run_id);
+                            } else {
+                                indeterminate_pending_marker_ids.insert(run_id);
+                            }
                         }
                         "release_requested" => {
-                            confirmed_release_requested_ids.insert(run_id);
+                            if confirmed {
+                                confirmed_release_requested_ids.insert(run_id);
+                            } else {
+                                indeterminate_release_requested_ids.insert(run_id);
+                            }
                         }
                         _ => {
                             return Err(AppError::Validation {
@@ -307,6 +328,8 @@ where
             policies,
             confirmed_pending_marker_ids,
             confirmed_release_requested_ids,
+            indeterminate_pending_marker_ids,
+            indeterminate_release_requested_ids,
         ))
     }
 

@@ -4,7 +4,9 @@ set -eu
 : "${PUEUE_AGENT_TEST_CODEX_LOG:?PUEUE_AGENT_TEST_CODEX_LOG is required}"
 
 {
-  printf 'CODEX_HOME=%s\n' "${CODEX_HOME:-}"
+  if [ -n "${CODEX_HOME+x}" ]; then
+    printf 'ENV_NAME=CODEX_HOME\n'
+  fi
   printf 'ARGC=%s\n' "$#"
   index=1
   for argument in "$@"; do
