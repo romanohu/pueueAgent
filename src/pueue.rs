@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, ffi::OsString, io, path::PathBuf, process::Output};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fmt,
+    io,
+    path::PathBuf,
+    process::Output,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -8,13 +16,29 @@ use tokio::process::Command;
 
 use crate::AppError;
 
-#[derive(Debug, Error)]
+pub const PUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Error)]
 pub enum PueueError {
-    #[error("failed to start Pueue `{operation}`: {source}")]
+    #[error("failed to start Pueue `{operation}`")]
     Spawn {
         operation: &'static str,
-        #[source]
-        source: io::Error,
+        source_kind: io::ErrorKind,
+    },
+
+    #[error("Pueue `{operation}` timed out")]
+    Timeout { operation: &'static str },
+
+    #[error("Pueue `{operation}` exceeded the {stream} output limit")]
+    OutputLimit {
+        operation: &'static str,
+        stream: &'static str,
+    },
+
+    #[error("Pueue `{operation}` cleanup failed during {stage}")]
+    Cleanup {
+        operation: &'static str,
+        stage: &'static str,
     },
 
     #[error("Pueue `{operation}` failed with exit code {exit_code:?}; inspect captured output")]
@@ -42,6 +66,61 @@ pub enum PueueError {
 
     #[error("Pueue add returned an invalid task ID; inspect captured output")]
     InvalidTaskId { stdout: Vec<u8> },
+}
+
+impl fmt::Debug for PueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn {
+                operation,
+                source_kind,
+            } => formatter
+                .debug_struct("Spawn")
+                .field("operation", operation)
+                .field("source_kind", source_kind)
+                .finish(),
+            Self::Timeout { operation } => formatter
+                .debug_struct("Timeout")
+                .field("operation", operation)
+                .finish(),
+            Self::OutputLimit { operation, stream } => formatter
+                .debug_struct("OutputLimit")
+                .field("operation", operation)
+                .field("stream", stream)
+                .finish(),
+            Self::Cleanup { operation, stage } => formatter
+                .debug_struct("Cleanup")
+                .field("operation", operation)
+                .field("stage", stage)
+                .finish(),
+            Self::CommandFailed {
+                operation,
+                exit_code,
+                stdout,
+                stderr,
+            } => formatter
+                .debug_struct("CommandFailed")
+                .field("operation", operation)
+                .field("exit_code", exit_code)
+                .field("stdout_len", &stdout.len())
+                .field("stderr_len", &stderr.len())
+                .finish(),
+            Self::InvalidStatusJson { .. } => {
+                formatter.write_str("InvalidStatusJson { source: <redacted> }")
+            }
+            Self::InvalidGroupJson { .. } => {
+                formatter.write_str("InvalidGroupJson { source: <redacted> }")
+            }
+            Self::InvalidStatusTask { reason } => formatter
+                .debug_struct("InvalidStatusTask")
+                .field("reason", reason)
+                .finish(),
+            Self::InvalidTaskId { stdout } => formatter
+                .debug_struct("InvalidTaskId")
+                .field("stdout_len", &stdout.len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,7 +199,10 @@ impl CommandPueue {
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|source| PueueError::Spawn { operation, source })?;
+            .map_err(|source| PueueError::Spawn {
+                operation,
+                source_kind: source.kind(),
+            })?;
 
         if !output.status.success() {
             return Err(PueueError::CommandFailed {

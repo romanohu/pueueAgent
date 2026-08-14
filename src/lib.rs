@@ -27,6 +27,7 @@ pub mod process;
 pub mod project;
 pub mod project_logs;
 pub mod pueue;
+pub mod pueue_process;
 pub mod pueue_security;
 pub mod reconcile;
 pub mod retry;

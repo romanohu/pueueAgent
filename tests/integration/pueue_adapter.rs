@@ -1,5 +1,8 @@
 #[path = "../support/fake_pueue.rs"]
 mod fake_pueue;
+#[cfg(all(unix, debug_assertions))]
+#[path = "../support/native_process_fixture.rs"]
+mod native_process_fixture;
 
 use std::{ffi::OsString, fs, path::PathBuf};
 
@@ -7,6 +10,8 @@ use std::{ffi::OsString, fs, path::PathBuf};
 use std::os::unix::fs::PermissionsExt;
 
 use fake_pueue::{FakePueue, FakePueueCommand};
+#[cfg(all(unix, debug_assertions))]
+use native_process_fixture::{NativeBehavior, NativeFakePueue};
 use pueue_agent::{
     batches::BatchJobResult,
     db::{BatchRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
@@ -18,6 +23,11 @@ use pueue_agent::{
     pueue_security::validate_group,
     submit, AppError,
 };
+#[cfg(all(unix, debug_assertions))]
+use pueue_agent::{
+    pueue_process::PueueProcessRunner,
+    pueue_security::MAX_PUEUE_OUTPUT_BYTES,
+};
 #[cfg(unix)]
 use pueue_agent::execution_policy::{
     load_or_create_policy, PolicyLoadInput, PolicyViolation, PolicyViolationCode,
@@ -25,6 +35,10 @@ use pueue_agent::execution_policy::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+
+#[cfg(all(unix, debug_assertions))]
+static NATIVE_PROCESS_FIXTURE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 const STATUS_JSON: &str = r#"{
   "tasks": {
@@ -43,6 +57,287 @@ const STATUS_JSON: &str = r#"{
     }
   }
 }"#;
+
+#[cfg(all(unix, debug_assertions))]
+async fn run_native_failure(
+    behavior: NativeBehavior,
+    timeout: std::time::Duration,
+) -> (NativeFakePueue, AppError) {
+    let fixture = NativeFakePueue::new(behavior);
+    let policy = fixture.policy();
+    let runner = PueueProcessRunner::with_limits(timeout, MAX_PUEUE_OUTPUT_BYTES);
+    let run = tokio::spawn(async move {
+        runner
+            .run(
+                policy.as_ref(),
+                &[
+                    OsString::from("status"),
+                    OsString::from("--json"),
+                ],
+            )
+            .await
+    });
+    fixture.wait_until_ready().await;
+    fixture.assert_started_processes_alive().await;
+    let error = tokio::time::timeout(std::time::Duration::from_secs(8), run)
+        .await
+        .expect("native Pueue runner exceeded outer test bound")
+        .expect("native Pueue runner task panicked")
+        .expect_err("native Pueue failure fixture unexpectedly succeeded");
+    (fixture, error)
+}
+
+#[cfg(all(unix, debug_assertions))]
+async fn assert_native_cleanup_contract(fixture: &NativeFakePueue) {
+    assert_native_launch_contract(fixture).await;
+    assert_eq!(fixture.term_observation().await, b"pipe-open");
+    fixture.wait_for_processes_gone().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+async fn assert_native_launch_contract(fixture: &NativeFakePueue) {
+    assert_eq!(
+        fixture.captured_argv().await,
+        vec![
+            b"--config".to_vec(),
+            b"/dev/fd/9".to_vec(),
+            b"status".to_vec(),
+            b"--json".to_vec(),
+        ]
+    );
+    assert_eq!(fixture.captured_config().await, b"fixture-config-fd9\n");
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn pueue_timeout_terminates_the_process_group() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let (fixture, error) = run_native_failure(
+        NativeBehavior::Hold,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(matches!(
+        error,
+        AppError::Pueue(PueueError::Timeout {
+            operation: "status"
+        })
+    ));
+    assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn stdout_overflow_terminates_and_reaps_the_process_group() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let (fixture, error) = run_native_failure(
+        NativeBehavior::StdoutOverflow,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(matches!(
+        error,
+        AppError::Pueue(PueueError::OutputLimit {
+            operation: "status",
+            stream: "stdout"
+        })
+    ));
+    assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn stderr_overflow_terminates_and_reaps_the_process_group() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let (fixture, error) = run_native_failure(
+        NativeBehavior::StderrOverflow,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(matches!(
+        error,
+        AppError::Pueue(PueueError::OutputLimit {
+            operation: "status",
+            stream: "stderr"
+        })
+    ));
+    assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn cancelling_the_caller_still_terminates_and_reaps_the_process_group() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::new(NativeBehavior::Hold);
+    let policy = fixture.policy();
+    let runner = PueueProcessRunner::with_limits(
+        std::time::Duration::from_secs(8),
+        MAX_PUEUE_OUTPUT_BYTES,
+    );
+    let caller = tokio::spawn(async move {
+        runner
+            .run(
+                policy.as_ref(),
+                &[
+                    OsString::from("status"),
+                    OsString::from("--json"),
+                ],
+            )
+            .await
+    });
+    fixture.wait_until_ready().await;
+    fixture.assert_started_processes_alive().await;
+
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("caller abort unexpectedly completed")
+            .is_cancelled()
+    );
+
+    assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn dual_stream_overflow_preserves_the_primary_failure_after_cleanup() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let (fixture, error) = run_native_failure(
+        NativeBehavior::BothStreamsOverflow,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(matches!(
+        error,
+        AppError::Pueue(PueueError::OutputLimit {
+            operation: "status",
+            stream: "stdout" | "stderr"
+        })
+    ));
+    assert_native_launch_contract(&fixture).await;
+    assert!(matches!(
+        fixture.term_observation().await.as_slice(),
+        b"pipe-open" | b"pipe-closed"
+    ));
+    fixture.wait_for_processes_gone().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn verified_runner_accepts_both_streams_at_the_exact_limit() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::new(NativeBehavior::ExactLimitSuccess);
+    let policy = fixture.policy();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        PueueProcessRunner::with_limits(
+            std::time::Duration::from_secs(2),
+            MAX_PUEUE_OUTPUT_BYTES,
+        )
+        .run(
+            policy.as_ref(),
+            &[OsString::from("status"), OsString::from("--json")],
+        ),
+    )
+    .await
+    .expect("exact-limit runner exceeded outer test bound")
+    .expect("exact-limit runner failed");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, vec![b'x'; 64 * 1024]);
+    assert_eq!(output.stderr, vec![b'x'; 64 * 1024]);
+    assert_native_launch_contract(&fixture).await;
+    fixture.wait_for_processes_gone().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn verified_runner_returns_bounded_output_for_nonzero_status() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::new(NativeBehavior::NonzeroExit);
+    let policy = fixture.policy();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        PueueProcessRunner::with_limits(
+            std::time::Duration::from_secs(2),
+            MAX_PUEUE_OUTPUT_BYTES,
+        )
+        .run(
+            policy.as_ref(),
+            &[OsString::from("status"), OsString::from("--json")],
+        ),
+    )
+    .await
+    .expect("nonzero runner exceeded outer test bound")
+    .expect_err("nonzero runner unexpectedly succeeded");
+
+    match error {
+        AppError::Pueue(PueueError::CommandFailed {
+            operation,
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            assert_eq!(operation, "status");
+            assert_eq!(exit_code, Some(7));
+            assert_eq!(stdout, vec![b'x'; 17]);
+            assert_eq!(stderr, vec![b'x'; 17]);
+        }
+        other => panic!("unexpected runner error: {other:?}"),
+    }
+    assert_native_launch_contract(&fixture).await;
+    fixture.wait_for_processes_gone().await;
+}
+
+#[test]
+fn pueue_error_display_and_debug_redact_captured_bytes_and_spawn_sources() {
+    const SENTINEL: &str = "/secret/pueue-config-SENTINEL";
+    let spawn = PueueError::Spawn {
+        operation: "status",
+        source_kind: std::io::ErrorKind::NotFound,
+    };
+    let command_failed = PueueError::CommandFailed {
+        operation: "status",
+        exit_code: Some(7),
+        stdout: SENTINEL.as_bytes().to_vec(),
+        stderr: SENTINEL.as_bytes().to_vec(),
+    };
+    let invalid_task_id = PueueError::InvalidTaskId {
+        stdout: SENTINEL.as_bytes().to_vec(),
+    };
+
+    let spawn_debug = format!("{spawn:?}");
+    let command_debug = format!("{command_failed:?}");
+    let task_id_debug = format!("{invalid_task_id:?}");
+    assert!(spawn_debug.contains("source_kind: NotFound"));
+    assert!(command_debug.contains(&format!("stdout_len: {}", SENTINEL.len())));
+    assert!(command_debug.contains(&format!("stderr_len: {}", SENTINEL.len())));
+    assert!(task_id_debug.contains(&format!("stdout_len: {}", SENTINEL.len())));
+
+    let mut source_chain = String::new();
+    let mut source = std::error::Error::source(&spawn);
+    while let Some(error) = source {
+        source_chain.push_str(&format!("{error} {error:?}"));
+        source = error.source();
+    }
+    assert!(source_chain.is_empty(), "unexpected source chain: {source_chain}");
+    assert!(
+        !source_chain.contains(SENTINEL),
+        "Error::source leaked: {source_chain}"
+    );
+
+    for error in [spawn, command_failed, invalid_task_id] {
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains(SENTINEL), "Display leaked: {display}");
+        assert!(!debug.contains(SENTINEL), "Debug leaked: {debug}");
+    }
+}
 
 #[cfg(unix)]
 struct CorePolicyHarness {
