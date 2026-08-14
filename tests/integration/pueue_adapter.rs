@@ -25,15 +25,12 @@ use pueue_agent::{
         AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
         Submission, SubmissionKind, SubmissionStatus,
     },
-    pueue::{configured_pueue, PueueApi, PueueError, PueueTask},
-    pueue_security::validate_group,
+    pueue::{configured_pueue, PueueApi, PueueError, PueueTask, PUEUE_TIMEOUT},
+    pueue_security::{validate_group, MAX_PUEUE_OUTPUT_BYTES},
     submit, AppError,
 };
 #[cfg(all(unix, debug_assertions))]
-use pueue_agent::{
-    pueue_process::PueueProcessRunner,
-    pueue_security::MAX_PUEUE_OUTPUT_BYTES,
-};
+use pueue_agent::pueue_process::PueueProcessRunner;
 #[cfg(unix)]
 use pueue_agent::execution_policy::{
     load_or_create_policy, PolicyLoadInput, PolicyViolation, PolicyViolationCode,
@@ -54,6 +51,108 @@ fn pueue_process_runner_has_a_fail_closed_non_unix_contract() {
     let source = include_str!("../../src/pueue_process.rs");
     assert!(source.contains("#[cfg(not(unix))]\n    pub(crate) async fn run_with_environment"));
     assert!(source.contains("operation: \"run verified Pueue on this platform\""));
+}
+
+#[test]
+fn production_pueue_limits_are_exact() {
+    assert_eq!(PUEUE_TIMEOUT, std::time::Duration::from_secs(30));
+    assert_eq!(MAX_PUEUE_OUTPUT_BYTES, 65_536);
+}
+
+fn source_before_test_module(source: &str) -> &str {
+    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+}
+
+#[test]
+fn pueue_control_sources_forbid_bare_and_shell_execution() {
+    let adapter_source = include_str!("../../src/pueue.rs");
+    let factory_and_backend = adapter_source
+        .split("\n#[cfg(test)]\nimpl CommandPueue {")
+        .next()
+        .expect("adapter source must include the canonical factory and backend");
+    let api_impl_start = adapter_source
+        .find("\n#[async_trait]\nimpl PueueApi for CommandPueue {")
+        .expect("adapter source must include its PueueApi implementation");
+    let api_impl = &adapter_source[api_impl_start..];
+    assert!(factory_and_backend.contains("pub fn configured_pueue"));
+    assert!(factory_and_backend.contains("async fn execute"));
+    assert!(api_impl.contains("async fn status_json"));
+    assert!(api_impl.contains("async fn ensure_group"));
+    let sources = [
+        ("pueue factory/backend", factory_and_backend),
+        ("pueue API", api_impl),
+        (
+            "pueue_process",
+            source_before_test_module(include_str!("../../src/pueue_process.rs")),
+        ),
+        (
+            "pueue_security",
+            source_before_test_module(include_str!("../../src/pueue_security.rs")),
+        ),
+        ("main", source_before_test_module(include_str!("../../src/main.rs"))),
+        ("submit", source_before_test_module(include_str!("../../src/submit.rs"))),
+        ("batches", source_before_test_module(include_str!("../../src/batches.rs"))),
+        ("cancel", source_before_test_module(include_str!("../../src/cancel.rs"))),
+        (
+            "reconcile",
+            source_before_test_module(include_str!("../../src/reconcile.rs")),
+        ),
+        (
+            "termination",
+            source_before_test_module(include_str!("../../src/termination.rs")),
+        ),
+        (
+            "diagnostics",
+            source_before_test_module(include_str!("../../src/diagnostics.rs")),
+        ),
+        (
+            "service",
+            source_before_test_module(include_str!("../../src/service.rs")),
+        ),
+    ];
+    let forbidden = [
+        "Command::new(\"pueue\")",
+        "Command::new(\"/bin/sh\")",
+        "/bin/sh",
+        "sh -c",
+        "command -v",
+    ];
+
+    for (name, source) in &sources {
+        for pattern in forbidden {
+            assert!(
+                !source.contains(pattern),
+                "production Pueue control source {name} contains forbidden {pattern:?}"
+            );
+        }
+        assert!(
+            !source
+                .split(|character: char| !character.is_ascii_alphabetic())
+                .any(|word| word == "eval"),
+            "production Pueue control source {name} contains a shell eval token"
+        );
+    }
+    for (name, source) in sources
+        .iter()
+        .filter(|(name, _)| !name.starts_with("pueue "))
+    {
+        assert!(
+            !source.contains("CommandPueue"),
+            "production Pueue control source {name} bypasses configured_pueue"
+        );
+    }
+    assert_eq!(
+        factory_and_backend
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                line.contains("CommandPueue {") && !line.starts_with("pub struct ")
+            })
+            .count(),
+        1,
+        "only configured_pueue may construct CommandPueue"
+    );
+    assert!(factory_and_backend.contains("Ok(CommandPueue {"));
 }
 
 #[cfg(all(unix, debug_assertions))]
@@ -117,6 +216,29 @@ async fn ambient_path_replacement_cannot_override_the_pinned_pueue_executable() 
         Some(&b"--config".to_vec())
     );
     fixture.wait_for_processes_gone().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn adapter_rejects_replaced_pinned_config_before_native_execution() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::new(NativeBehavior::ExactLimitSuccess);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+    fixture.replace_pinned_config();
+
+    let error = adapter.status_json().await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::PolicyViolation {
+            violation: PolicyViolation {
+                code: PolicyViolationCode::AnchorReplaced,
+                stage: PolicyViolationStage::RunBoundPreMarker,
+                ..
+            }
+        }
+    ));
+    fixture.assert_no_execution_artifacts();
 }
 
 const STATUS_JSON: &str = r#"{
@@ -475,7 +597,6 @@ struct CorePolicyHarness {
     codex_home: PathBuf,
     launcher: PathBuf,
     config_path: PathBuf,
-    replacement_path: PathBuf,
 }
 
 #[cfg(unix)]
@@ -533,7 +654,6 @@ impl CorePolicyHarness {
             codex_home,
             launcher,
             config_path,
-            replacement_path: base.join("replacement.yml"),
         }
     }
 
@@ -642,35 +762,6 @@ fn pueue_group_accepts_bounded_grammar_and_rejects_shell_text() {
     for value in ["", "-bad", "pa project", "pa/project", "pa;touch-x", &"a".repeat(129)] {
         assert!(validate_group(value).is_err(), "accepted {value:?}");
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn pueue_config_anchor_rejects_replacement_before_each_command() {
-    let harness = CorePolicyHarness::new(false, false);
-    let policy = harness.load_core_policy().unwrap();
-
-    fs::rename(&harness.config_path, &harness.replacement_path).unwrap();
-    fs::write(&harness.config_path, b"replacement\n").unwrap();
-    secure_file(&harness.config_path);
-
-    let error = match policy
-        .pueue_config_anchor
-        .verify_identity(&policy.project_roots)
-    {
-        Ok(_) => panic!("replaced Pueue config was accepted"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        error,
-        AppError::PolicyViolation {
-            violation: PolicyViolation {
-                code: PolicyViolationCode::AnchorReplaced,
-                stage: PolicyViolationStage::RunBoundPreMarker,
-                ..
-            }
-        }
-    ));
 }
 
 #[cfg(unix)]

@@ -106,9 +106,37 @@ fn doctor_reports_fixed_pueue_bounds_without_output() {
         .find(|check| check.name == "pueue.bounds")
         .expect("doctor must report fixed Pueue process bounds");
     assert_eq!(check.status, DoctorCheckStatus::Ok);
-    assert!(check.summary.contains("30"));
-    assert!(check.summary.contains("65536"));
+    assert_eq!(
+        check.summary,
+        "Pueue commands use timeout=30s and independent stdout/stderr caps=65536 bytes"
+    );
     assert!(!check.summary.contains("credential"));
+    assert!(!check.summary.contains("fixture-output"));
+
+    let rendered = render_doctor_report_value(&report, false).unwrap();
+    assert!(rendered.contains(
+        "Pueue commands use timeout=30s and independent stdout/stderr caps=65536 bytes"
+    ));
+    assert!(!rendered.contains("fixture-output"));
+}
+
+#[test]
+fn doctor_pueue_bounds_source_derives_its_summary_from_production_constants() {
+    let source = include_str!("../../src/diagnostics.rs");
+    let summary_start = source
+        .find("let pueue_bounds_summary = format!(")
+        .expect("doctor must construct the Pueue bounds summary");
+    let bounds_end = source[summary_start..]
+        .find("checks.extend(execution_doctor_checks")
+        .map(|offset| summary_start + offset)
+        .expect("Pueue bounds check must precede execution policy diagnostics");
+    let bounds = &source[summary_start..bounds_end];
+
+    assert!(bounds.contains("PUEUE_TIMEOUT.as_secs()"));
+    assert!(bounds.contains("MAX_PUEUE_OUTPUT_BYTES"));
+    assert!(bounds.contains("doctor_ok(\"pueue.bounds\", &pueue_bounds_summary, \"none\")"));
+    assert!(!bounds.contains("timeout=30s"));
+    assert!(!bounds.contains("caps=65536 bytes"));
 }
 
 fn state_check<'a>(value: &'a Value, name: &str) -> &'a Value {

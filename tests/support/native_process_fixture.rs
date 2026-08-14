@@ -157,6 +157,7 @@ pub const OVERFLOW_SENTINEL_REPETITIONS: usize = 4096;
 pub struct NativeFakePueue {
     _temp: TempDir,
     policy: Arc<ResolvedExecutionPolicy>,
+    config_path: PathBuf,
     ready_path: PathBuf,
     leader_pid_path: PathBuf,
     descendant_pid_path: PathBuf,
@@ -271,7 +272,7 @@ impl NativeFakePueue {
             inherited_path: trusted_dir.clone().into_os_string(),
             startup_environment,
             codex_home,
-            pueue_config: config_path,
+            pueue_config: config_path.clone(),
             launcher_path,
         })
         .expect("load generated native Pueue policy");
@@ -279,6 +280,7 @@ impl NativeFakePueue {
         Self {
             _temp: temp,
             policy: Arc::new(policy),
+            config_path,
             ready_path,
             leader_pid_path,
             descendant_pid_path,
@@ -290,6 +292,29 @@ impl NativeFakePueue {
 
     pub fn policy(&self) -> Arc<ResolvedExecutionPolicy> {
         Arc::clone(&self.policy)
+    }
+
+    pub fn replace_pinned_config(&self) {
+        let replacement = self.config_path.with_extension("replacement.yml");
+        fs::rename(&self.config_path, replacement).expect("replace pinned Pueue config inode");
+        fs::write(&self.config_path, b"replacement-config\n")
+            .expect("write replacement Pueue config");
+        secure_file(&self.config_path);
+    }
+
+    pub fn assert_no_execution_artifacts(&self) {
+        assert!(
+            !self.ready_path.exists(),
+            "native fake Pueue started after config anchor rejection"
+        );
+        assert!(
+            !self.argv_capture_path.exists(),
+            "native fake Pueue captured argv after config anchor rejection"
+        );
+        assert!(
+            !self.config_capture_path.exists(),
+            "native fake Pueue read the config after config anchor rejection"
+        );
     }
 
     pub async fn wait_until_ready(&self) {

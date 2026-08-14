@@ -19,7 +19,8 @@ use crate::{
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
     output::{bounded_execution_path, bounded_redacted_text, format_state, human_header, human_summary, render_id},
-    pueue::PueueTask,
+    pueue::{PueueTask, PUEUE_TIMEOUT},
+    pueue_security::MAX_PUEUE_OUTPUT_BYTES,
     project_logs::{inspect_agent_log_dir, ProjectRootLogReader},
     service::{callback_command, ServicePaths, ServiceStatus},
     state,
@@ -820,11 +821,12 @@ pub fn build_doctor_report_with_policy(
             "repair .pueue-agent/config.toml and validate it before retrying",
         ),
     });
-    checks.push(doctor_ok(
-        "pueue.bounds",
-        "Pueue commands use timeout=30s and independent stdout/stderr caps=65536 bytes",
-        "none",
-    ));
+    let pueue_bounds_summary = format!(
+        "Pueue commands use timeout={}s and independent stdout/stderr caps={} bytes",
+        PUEUE_TIMEOUT.as_secs(),
+        MAX_PUEUE_OUTPUT_BYTES,
+    );
+    checks.push(doctor_ok("pueue.bounds", &pueue_bounds_summary, "none"));
     checks.extend(execution_doctor_checks(db, project, policy));
     checks.push(match &external.pueue {
         Ok(tasks) if tasks.iter().any(|task| task.group == project.pueue_group) => doctor_ok(
