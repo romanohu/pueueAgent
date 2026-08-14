@@ -3,13 +3,14 @@ use std::{
     ffi::OsString,
     fs,
     path::PathBuf,
+    sync::Arc,
     sync::Mutex,
 };
 
 use async_trait::async_trait;
 use pueue_agent::{
-    db::{Db, ProjectRepository},
-    execution_policy::StartupEnvironment,
+    db::{Db, EventRepository, ProjectRepository},
+    execution_policy::{ResolvedExecutionPolicy, StartupEnvironment},
     pueue::{PueueApi, PueueTask},
     service::{
         callback_command, enable_with, install_callback_once,
@@ -735,6 +736,7 @@ fn conflicting_existing_callback_is_rejected() {
     assert_eq!(registry.writes.get(), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn partial_enable_failure_leaves_project_and_callback_recoverable() {
     let harness = EnableHarness::new();
@@ -742,7 +744,7 @@ async fn partial_enable_failure_leaves_project_and_callback_recoverable() {
     let registry = FakeCallbackRegistry::default();
     let pueue = FakePueueControl::default();
 
-    let error = enable_with(&harness.db, &harness.options, &service, &registry, &pueue)
+    let error = enable_with(&harness.db, &harness.options, &harness.policy, &service, &registry, &pueue)
         .await
         .expect_err("service install failure should make enable fail visibly");
 
@@ -759,6 +761,7 @@ async fn partial_enable_failure_leaves_project_and_callback_recoverable() {
     assert_eq!(service.status_checks.get(), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn enable_provisions_configured_pueue_group_before_callback_and_service_install() {
     let harness = EnableHarness::new();
@@ -766,7 +769,7 @@ async fn enable_provisions_configured_pueue_group_before_callback_and_service_in
     let registry = FakeCallbackRegistry::default();
     let pueue = FakePueueControl::default();
 
-    enable_with(&harness.db, &harness.options, &service, &registry, &pueue)
+    enable_with(&harness.db, &harness.options, &harness.policy, &service, &registry, &pueue)
         .await
         .unwrap();
 
@@ -778,6 +781,7 @@ async fn enable_provisions_configured_pueue_group_before_callback_and_service_in
     assert_eq!(service.installed.get(), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn enable_verifies_daemon_health_before_success() {
     let harness = EnableHarness::new();
@@ -785,7 +789,7 @@ async fn enable_verifies_daemon_health_before_success() {
     let registry = FakeCallbackRegistry::default();
     let pueue = FakePueueControl::default();
 
-    let error = enable_with(&harness.db, &harness.options, &service, &registry, &pueue)
+    let error = enable_with(&harness.db, &harness.options, &harness.policy, &service, &registry, &pueue)
         .await
         .expect_err("enable should fail when service is not healthy");
 
@@ -795,6 +799,7 @@ async fn enable_verifies_daemon_health_before_success() {
     assert!(registry.current_value().is_some());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn invalid_group_fails_before_registration_or_external_side_effects() {
     let harness = EnableHarness::with_group("pa project");
@@ -802,7 +807,7 @@ async fn invalid_group_fails_before_registration_or_external_side_effects() {
     let registry = FakeCallbackRegistry::default();
     let pueue = FakePueueControl::default();
 
-    let error = enable_with(&harness.db, &harness.options, &service, &registry, &pueue)
+    let error = enable_with(&harness.db, &harness.options, &harness.policy, &service, &registry, &pueue)
         .await
         .expect_err("invalid group must fail at the enable boundary");
 
@@ -817,6 +822,46 @@ async fn invalid_group_fails_before_registration_or_external_side_effects() {
         .find_by_root(&harness.project_root)
         .unwrap()
         .is_none());
+    assert!(pueue.groups.lock().unwrap().is_empty());
+    assert_eq!(registry.writes.get(), 0);
+    assert_eq!(service.installed.get(), 0);
+    assert_eq!(service.status_checks.get(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replaced_pinned_pueue_config_fails_before_registration_or_external_side_effects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = EnableHarness::new();
+    let pinned_config = harness.policy.pueue_config_anchor.canonical_path.clone();
+    let replacement = pinned_config.with_extension("replacement");
+    fs::write(&replacement, "fixture: replacement\n").unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::rename(replacement, &pinned_config).unwrap();
+    let service = FakeService::running();
+    let registry = FakeCallbackRegistry::default();
+    let pueue = FakePueueControl::default();
+
+    let error = enable_with(&harness.db, &harness.options, &harness.policy, &service, &registry, &pueue)
+        .await
+        .expect_err("the pinned Pueue config identity must be verified before enable mutates state");
+
+    assert!(matches!(
+        &error,
+        AppError::Configuration {
+            field: "pueue_config"
+        }
+    ));
+    assert!(!error.to_string().contains("policy_blocked"));
+    assert!(ProjectRepository::new(&harness.db)
+        .find_by_root(&harness.project_root)
+        .unwrap()
+        .is_none());
+    assert!(EventRepository::new(&harness.db)
+        .recent_events("project-a", 10)
+        .unwrap()
+        .is_empty());
     assert!(pueue.groups.lock().unwrap().is_empty());
     assert_eq!(registry.writes.get(), 0);
     assert_eq!(service.installed.get(), 0);
@@ -891,13 +936,16 @@ fn pueue_config_callback_registry_rejects_non_daemon_callback_conflicts() {
     );
 }
 
+#[cfg(unix)]
 struct EnableHarness {
     _temp: TempDir,
     db: Db,
     project_root: PathBuf,
     options: EnableOptions,
+    policy: Arc<ResolvedExecutionPolicy>,
 }
 
+#[cfg(unix)]
 impl EnableHarness {
     fn new() -> Self {
         Self::with_group("pa-project")
@@ -939,9 +987,15 @@ max_agent_runs = 10
         )
         .unwrap();
 
+        let policy = execution_policy_fixture::resolved_policy(
+            temp.path(),
+            &[("project-a", project_root.as_path(), std::path::Path::new("codex"))],
+        );
+        let mut service_paths = service_paths();
+        service_paths.pueue_config = policy.pueue_config_anchor.canonical_path.clone();
         let options = EnableOptions {
             project_root: project_root.clone(),
-            service_paths: service_paths(),
+            service_paths,
             now: 200,
         };
 
@@ -950,6 +1004,7 @@ max_agent_runs = 10
             db,
             project_root,
             options,
+            policy,
         }
     }
 }

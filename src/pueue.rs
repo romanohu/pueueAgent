@@ -30,10 +30,10 @@ pub enum PueueError {
         source_kind: io::ErrorKind,
     },
 
-    #[error("Pueue `{operation}` timed out")]
+    #[error("Pueue {operation} timed out")]
     Timeout { operation: &'static str },
 
-    #[error("Pueue `{operation}` exceeded the {stream} output limit")]
+    #[error("Pueue {operation} output limit exceeded for {stream}")]
     OutputLimit {
         operation: &'static str,
         stream: &'static str,
@@ -45,7 +45,7 @@ pub enum PueueError {
         stage: &'static str,
     },
 
-    #[error("Pueue `{operation}` failed with exit code {exit_code:?}; inspect captured output")]
+    #[error("Pueue {operation} failed with exit code {exit_code:?}")]
     CommandFailed {
         operation: &'static str,
         exit_code: Option<i32>,
@@ -68,7 +68,7 @@ pub enum PueueError {
     #[error("Pueue status JSON has an invalid task shape: {reason}")]
     InvalidStatusTask { reason: &'static str },
 
-    #[error("Pueue add returned an invalid task ID; inspect captured output")]
+    #[error("Pueue add returned an invalid task ID")]
     InvalidTaskId { stdout: Vec<u8> },
 }
 

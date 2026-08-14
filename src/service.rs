@@ -13,7 +13,7 @@ use crate::{
     output::bounded_redacted_text,
     paths,
     pueue::PueueApi,
-    pueue_security::validate_group,
+    pueue_security::{validate_group, validate_pinned_config},
     AppError,
 };
 
@@ -541,6 +541,7 @@ pub fn install_callback_once(
 pub async fn enable_with(
     db: &Db,
     options: &EnableOptions,
+    policy: &ResolvedExecutionPolicy,
     service: &impl ServiceControl,
     callbacks: &impl CallbackRegistry,
     pueue: &impl PueueApi,
@@ -548,6 +549,7 @@ pub async fn enable_with(
     let config_path = options.project_root.join(".pueue-agent/config.toml");
     let project_config = config::load(&config_path)?;
     validate_group(&project_config.pueue_group)?;
+    validate_pinned_config(policy, &options.service_paths.pueue_config)?;
     register_project_if_needed(db, options, &config_path, &project_config)?;
 
     pueue.ensure_group(&project_config.pueue_group).await?;

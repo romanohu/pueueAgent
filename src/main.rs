@@ -169,7 +169,15 @@ mod commands {
             now: unix_timestamp()?,
         };
         let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
-        enable_with(&db, &options, &ServiceManager, &callbacks, &pueue).await
+        enable_with(
+            &db,
+            &options,
+            policy.as_ref(),
+            &ServiceManager,
+            &callbacks,
+            &pueue,
+        )
+        .await
     }
 
     pub async fn disable(args: DisableArgs) -> Result<(), AppError> {

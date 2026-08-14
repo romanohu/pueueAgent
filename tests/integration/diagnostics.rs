@@ -13,7 +13,7 @@ use pueue_agent::{
     diagnostics::{
         build_doctor_report, render_doctor_report, render_doctor_report_value, render_events,
         render_incident_explanation, render_project_status_json, render_task_inspection,
-        DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
+        DoctorCheckStatus, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
     },
     execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage, StartupEnvironment},
     models::{
@@ -85,6 +85,30 @@ fn doctor_external() -> DoctorExternal {
         service: Ok(ServiceStatus::Stopped),
         callback: Ok(None),
     }
+}
+
+#[test]
+fn doctor_reports_fixed_pueue_bounds_without_output() {
+    let harness = DiagnosticsHarness::new();
+    let paths = doctor_paths(&harness);
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &paths,
+        doctor_external(),
+        100,
+    )
+    .unwrap();
+
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "pueue.bounds")
+        .expect("doctor must report fixed Pueue process bounds");
+    assert_eq!(check.status, DoctorCheckStatus::Ok);
+    assert!(check.summary.contains("30"));
+    assert!(check.summary.contains("65536"));
+    assert!(!check.summary.contains("credential"));
 }
 
 fn state_check<'a>(value: &'a Value, name: &str) -> &'a Value {

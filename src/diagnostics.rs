@@ -820,6 +820,11 @@ pub fn build_doctor_report_with_policy(
             "repair .pueue-agent/config.toml and validate it before retrying",
         ),
     });
+    checks.push(doctor_ok(
+        "pueue.bounds",
+        "Pueue commands use timeout=30s and independent stdout/stderr caps=65536 bytes",
+        "none",
+    ));
     checks.extend(execution_doctor_checks(db, project, policy));
     checks.push(match &external.pueue {
         Ok(tasks) if tasks.iter().any(|task| task.group == project.pueue_group) => doctor_ok(

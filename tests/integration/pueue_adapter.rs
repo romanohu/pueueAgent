@@ -14,7 +14,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use fake_pueue::{FakePueue, FakePueueCommand};
 #[cfg(all(unix, debug_assertions))]
-use native_process_fixture::{NativeBehavior, NativeFakePueue};
+use native_process_fixture::{
+    NativeBehavior, NativeFakePueue, OUTPUT_SENTINEL, OVERFLOW_SENTINEL_REPETITIONS,
+    TIMEOUT_SENTINEL_REPETITIONS,
+};
 use pueue_agent::{
     batches::BatchJobResult,
     db::{BatchRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
@@ -189,17 +192,22 @@ async fn assert_native_launch_contract(fixture: &NativeFakePueue) {
 async fn pueue_timeout_terminates_the_process_group() {
     let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let (fixture, error) = run_native_failure(
-        NativeBehavior::Hold,
+        NativeBehavior::HoldWithSentinel,
         std::time::Duration::from_secs(2),
     )
     .await;
 
     assert!(matches!(
-        error,
+        &error,
         AppError::Pueue(PueueError::Timeout {
             operation: "status"
         })
     ));
+    assert_native_error_does_not_render_fixture_output(
+        &error,
+        "Pueue status timed out",
+        TIMEOUT_SENTINEL_REPETITIONS,
+    );
     assert_native_cleanup_contract(&fixture).await;
 }
 
@@ -208,18 +216,23 @@ async fn pueue_timeout_terminates_the_process_group() {
 async fn stdout_overflow_terminates_and_reaps_the_process_group() {
     let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let (fixture, error) = run_native_failure(
-        NativeBehavior::StdoutOverflow,
+        NativeBehavior::StdoutOverflowWithSentinel,
         std::time::Duration::from_secs(2),
     )
     .await;
 
     assert!(matches!(
-        error,
+        &error,
         AppError::Pueue(PueueError::OutputLimit {
             operation: "status",
             stream: "stdout"
         })
     ));
+    assert_native_error_does_not_render_fixture_output(
+        &error,
+        "Pueue status output limit exceeded for stdout",
+        OVERFLOW_SENTINEL_REPETITIONS,
+    );
     assert_native_cleanup_contract(&fixture).await;
 }
 
@@ -228,19 +241,42 @@ async fn stdout_overflow_terminates_and_reaps_the_process_group() {
 async fn stderr_overflow_terminates_and_reaps_the_process_group() {
     let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let (fixture, error) = run_native_failure(
-        NativeBehavior::StderrOverflow,
+        NativeBehavior::StderrOverflowWithSentinel,
         std::time::Duration::from_secs(2),
     )
     .await;
 
     assert!(matches!(
-        error,
+        &error,
         AppError::Pueue(PueueError::OutputLimit {
             operation: "status",
             stream: "stderr"
         })
     ));
+    assert_native_error_does_not_render_fixture_output(
+        &error,
+        "Pueue status output limit exceeded for stderr",
+        OVERFLOW_SENTINEL_REPETITIONS,
+    );
     assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn assert_native_error_does_not_render_fixture_output(
+    error: &AppError,
+    expected: &str,
+    fixture_repetitions: usize,
+) {
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    let fixture_output = OUTPUT_SENTINEL.repeat(fixture_repetitions);
+
+    assert!(fixture_output.len() > 256);
+    assert!(display.contains(expected), "unexpected display: {display}");
+    assert!(!display.contains(OUTPUT_SENTINEL), "display leaked fixture marker: {display}");
+    assert!(!debug.contains(OUTPUT_SENTINEL), "debug leaked fixture marker: {debug}");
+    assert!(!display.contains(&fixture_output), "display leaked fixture output");
+    assert!(!debug.contains(&fixture_output), "debug leaked fixture output");
 }
 
 #[cfg(all(unix, debug_assertions))]
@@ -413,6 +449,21 @@ fn pueue_error_display_and_debug_redact_captured_bytes_and_spawn_sources() {
         assert!(!display.contains(SENTINEL), "Display leaked: {display}");
         assert!(!debug.contains(SENTINEL), "Debug leaked: {debug}");
     }
+}
+
+#[test]
+fn pueue_timeout_error_renders_a_bounded_status_without_fixture_output() {
+    let credential_marker = "credential-marker-should-not-render";
+    let fixture_output = format!("{credential_marker}{}", "x".repeat(512));
+    let error = PueueError::Timeout {
+        operation: "status",
+    };
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("Pueue status timed out"));
+    assert!(!rendered.contains(&fixture_output));
+    assert!(!rendered.contains(credential_marker));
+    assert!(rendered.len() <= 256);
 }
 
 #[cfg(unix)]

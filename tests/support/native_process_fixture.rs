@@ -85,7 +85,7 @@ fn main() {
     }
     fs::write(__READY__, b"ready").expect("write fixture readiness");
 
-    let output = vec![b'x'; __OUTPUT_BYTES__];
+    let output = __OUTPUT_PAYLOAD__.as_bytes().repeat(__OUTPUT_REPETITIONS__);
     if __OUTPUT_STREAM__ == "stdout" {
         let mut stream = std::io::stdout();
         let _ = stream.write_all(&output);
@@ -142,12 +142,17 @@ fn main() {
 #[derive(Clone, Copy, Debug)]
 pub enum NativeBehavior {
     Hold,
-    StdoutOverflow,
-    StderrOverflow,
+    HoldWithSentinel,
+    StdoutOverflowWithSentinel,
+    StderrOverflowWithSentinel,
     BothStreamsOverflow,
     ExactLimitSuccess,
     NonzeroExit,
 }
+
+pub const OUTPUT_SENTINEL: &str = "fixture-output-credential-marker";
+pub const TIMEOUT_SENTINEL_REPETITIONS: usize = 16;
+pub const OVERFLOW_SENTINEL_REPETITIONS: usize = 4096;
 
 pub struct NativeFakePueue {
     _temp: TempDir,
@@ -187,15 +192,16 @@ impl NativeFakePueue {
         let argv_capture_path = base.join("argv-capture");
         let config_capture_path = base.join("config-fd9-capture");
 
-        let (output_stream, output_bytes, term_stream, exit_code) = match behavior {
-            NativeBehavior::Hold => ("none", 0, "stdout", -1),
-            NativeBehavior::StdoutOverflow => ("stdout", 64 * 1024 + 1, "stderr", -1),
-            NativeBehavior::StderrOverflow => ("stderr", 64 * 1024 + 1, "stdout", -1),
+        let (output_stream, output_payload, output_repetitions, term_stream, exit_code) = match behavior {
+            NativeBehavior::Hold => ("none", "", 0, "stdout", -1),
+            NativeBehavior::HoldWithSentinel => ("stdout", OUTPUT_SENTINEL, TIMEOUT_SENTINEL_REPETITIONS, "stderr", -1),
+            NativeBehavior::StdoutOverflowWithSentinel => ("stdout", OUTPUT_SENTINEL, OVERFLOW_SENTINEL_REPETITIONS, "stderr", -1),
+            NativeBehavior::StderrOverflowWithSentinel => ("stderr", OUTPUT_SENTINEL, OVERFLOW_SENTINEL_REPETITIONS, "stdout", -1),
             NativeBehavior::BothStreamsOverflow => {
-                ("both", 64 * 1024 + 1, "stdout", -1)
+                ("both", "x", 64 * 1024 + 1, "stdout", -1)
             }
-            NativeBehavior::ExactLimitSuccess => ("both", 64 * 1024, "stdout", 0),
-            NativeBehavior::NonzeroExit => ("both", 17, "stdout", 7),
+            NativeBehavior::ExactLimitSuccess => ("both", "x", 64 * 1024, "stdout", 0),
+            NativeBehavior::NonzeroExit => ("both", "x", 17, "stdout", 7),
         };
         let source_path = base.join("native-process-fixture.rs");
         let target_path = trusted_dir.join("pueue");
@@ -207,7 +213,8 @@ impl NativeFakePueue {
             .replace("__ARGV_CAPTURE__", &rust_string(&argv_capture_path))
             .replace("__CONFIG_CAPTURE__", &rust_string(&config_capture_path))
             .replace("__OUTPUT_STREAM__", &format!("{output_stream:?}"))
-            .replace("__OUTPUT_BYTES__", &output_bytes.to_string())
+            .replace("__OUTPUT_PAYLOAD__", &format!("{output_payload:?}"))
+            .replace("__OUTPUT_REPETITIONS__", &output_repetitions.to_string())
             .replace("__TERM_STREAM__", &format!("{term_stream:?}"))
             .replace("__EXIT_CODE__", &exit_code.to_string());
         fs::write(&source_path, source).expect("write generated native Pueue source");
