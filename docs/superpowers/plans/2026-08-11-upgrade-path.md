@@ -4,7 +4,7 @@
 
 **Goal:** `pueue-agent upgrade` で local `main` checkout の更新、テスト、release build、binary install、service restart、health check、rollback を安全に実行できるようにする。
 
-**Architecture:** version/build metadata、source/git orchestration、binary installation、service lifecycle を分離する。upgrade は clean な main の fast-forward だけを許可し、既存の install layout を維持したまま新 binary を atomic に反映する。service restart は停止・ライフサイクル計画の `ServiceControl` API を利用する。
+**Architecture:** version/build metadata、source/git orchestration、binary installation、service lifecycle を分離する。upgrade は clean な main の fast-forward だけを許可し、既存の install layout を維持したまま新 binary を atomic に反映する。service restart は停止・ライフサイクル計画の `ServiceControl` API を利用する。更新前の policy-backed Pueue adapter は mutation 前の preflight にだけ使い、binary replacement 後の health check は policy を read-only で再読込して新 launcher identity に固定した adapter を使う。
 
 **Tech Stack:** Rust 2021、Clap、std::process::Command の argument vector、Tokio、既存 ServiceControl/ServiceManager、Git/Cargo、SQLite active-agent query、Rust integration tests。
 

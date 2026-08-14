@@ -20,10 +20,11 @@ use std::os::fd::{AsRawFd, FromRawFd};
 
 use serde::Deserialize;
 
-use crate::{config::ProjectConfig, models::Project, AppError};
+use crate::{config::ProjectConfig, models::Project, paths, AppError};
 
 const POLICY_FILENAME: &str = "execution-policy.toml";
 const POLICY_VERSION: u32 = 1;
+const MAX_STATE_DIRECTORY_CREATIONS: usize = 4;
 const DEFAULT_POLICY: &str = r#"version = 1
 
 [defaults]
@@ -539,6 +540,26 @@ fn open_child_path_nofollow(parent: &OpenedPath, name: &OsStr) -> io::Result<Ope
 }
 
 #[cfg(unix)]
+fn mkdirat(directory: &File, name: &OsStr, mode: u32) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path component"))?;
+    // SAFETY: directory is an owned descriptor and name is NUL terminated.
+    let result = unsafe {
+        libc::mkdirat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn unlinkat(directory: &File, name: &OsStr) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let name = std::ffi::CString::new(name.as_bytes())
@@ -1022,7 +1043,12 @@ fn load_policy(
         .iter()
         .map(|anchor| anchor.canonical_path.clone())
         .collect::<Vec<_>>();
-    let state_dir = validate_service_directory(&input.state_dir, &project_roots)?;
+    let state_dir = open_service_directory(
+        &input.state_dir,
+        &project_roots,
+        create_missing,
+        &input.startup_environment,
+    )?;
     let codex_home = validate_service_directory(&input.codex_home, &project_roots)?.canonical_path;
     let policy_name = OsStr::new(POLICY_FILENAME);
     let policy_file = match openat_nofollow(&state_dir.file, policy_name, libc::O_RDONLY, 0) {
@@ -1280,6 +1306,226 @@ fn validate_service_directory(
             PolicyViolationStage::Startup,
         )
     })?;
+    validate_opened_service_directory(&opened, roots)?;
+    Ok(opened)
+}
+
+#[cfg(unix)]
+fn open_service_directory(
+    path: &Path,
+    roots: &[PathBuf],
+    create_missing: bool,
+    startup_environment: &StartupEnvironment,
+) -> Result<OpenedPath, PolicyViolation> {
+    match open_path_nofollow(path) {
+        Ok(opened) => {
+            validate_opened_service_directory(&opened, roots)?;
+            Ok(opened)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create_missing => {
+            create_service_directory(path, roots, startup_environment)
+        }
+        Err(_) => Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_service_directory(
+    _path: &Path,
+    _roots: &[PathBuf],
+    _create_missing: bool,
+    _startup_environment: &StartupEnvironment,
+) -> Result<OpenedPath, PolicyViolation> {
+    Err(unsupported_platform())
+}
+
+#[cfg(unix)]
+fn create_service_directory(
+    path: &Path,
+    roots: &[PathBuf],
+    startup_environment: &StartupEnvironment,
+) -> Result<OpenedPath, PolicyViolation> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        ));
+    }
+    let parent_path = path.parent().ok_or_else(|| {
+        PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        )
+    })?;
+    match open_path_nofollow(parent_path) {
+        Ok(parent) => {
+            validate_opened_service_directory(&parent, roots)?;
+            validate_configured_state_directory(path, roots, startup_environment)?;
+            create_service_directory_component(&parent, name, roots)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_configured_service_directory_chain(
+                path,
+                roots,
+                startup_environment,
+            )
+        }
+        Err(_) => Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn create_configured_service_directory_chain(
+    path: &Path,
+    roots: &[PathBuf],
+    startup_environment: &StartupEnvironment,
+) -> Result<OpenedPath, PolicyViolation> {
+    validate_configured_state_directory(path, roots, startup_environment)?;
+
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    let ancestor = loop {
+        match open_path_nofollow(cursor) {
+            Ok(opened) => break opened,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor.file_name().ok_or_else(policy_unreadable)?;
+                missing.push(name.to_os_string());
+                if missing.len() > MAX_STATE_DIRECTORY_CREATIONS {
+                    return Err(policy_unreadable());
+                }
+                cursor = cursor.parent().ok_or_else(policy_unreadable)?;
+            }
+            Err(_) => return Err(policy_unreadable()),
+        }
+    };
+    validate_opened_service_directory(&ancestor, roots)?;
+    missing.reverse();
+
+    let candidate_path = missing
+        .iter()
+        .fold(ancestor.canonical_path.clone(), |path, name| path.join(name));
+    if inside_any_root(&candidate_path, roots) {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::TrustedPathUnsafe,
+            PolicyViolationStage::Startup,
+        ));
+    }
+
+    let mut opened = ancestor;
+    for name in missing {
+        opened = create_service_directory_component(&opened, &name, roots)?;
+    }
+    if opened.canonical_path != candidate_path {
+        return Err(policy_unreadable());
+    }
+    validate_opened_service_directory(&opened, roots)?;
+    Ok(opened)
+}
+
+#[cfg(unix)]
+fn validate_configured_state_directory(
+    path: &Path,
+    roots: &[PathBuf],
+    startup_environment: &StartupEnvironment,
+) -> Result<(), PolicyViolation> {
+    let home = startup_environment
+        .get("HOME")
+        .filter(|home| !home.is_empty())
+        .map(Path::new)
+        .filter(|home| home.is_absolute())
+        .ok_or_else(policy_unreadable)?;
+    validate_service_directory(home, roots)?;
+
+    let explicit_state_dir = startup_environment
+        .get("PUEUE_AGENT_STATE_DIR")
+        .map(Path::new);
+    let xdg_state_home = startup_environment.get("XDG_STATE_HOME").map(Path::new);
+    let configured_database = paths::state_db_path_with_override(
+        explicit_state_dir,
+        xdg_state_home,
+        Some(home),
+    )
+    .map_err(|_| policy_unreadable())?;
+    let configured_state_dir = configured_database
+        .parent()
+        .ok_or_else(policy_unreadable)?;
+    if path != configured_state_dir {
+        return Err(policy_unreadable());
+    }
+    Ok(())
+}
+
+const fn policy_unreadable() -> PolicyViolation {
+    PolicyViolation::new(
+        PolicyViolationCode::PolicyUnreadable,
+        PolicyViolationStage::Startup,
+    )
+}
+
+#[cfg(unix)]
+fn create_service_directory_component(
+    parent: &OpenedPath,
+    name: &OsStr,
+    roots: &[PathBuf],
+) -> Result<OpenedPath, PolicyViolation> {
+    let candidate_path = parent.canonical_path.join(name);
+    if inside_any_root(&candidate_path, roots) {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::TrustedPathUnsafe,
+            PolicyViolationStage::Startup,
+        ));
+    }
+    match mkdirat(&parent.file, name, 0o700) {
+        Ok(()) => parent.file.sync_all().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::PolicyUnreadable,
+                PolicyViolationStage::Startup,
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::PolicyUnreadable,
+                PolicyViolationStage::Startup,
+            ))
+        }
+    }
+    let opened = open_child_path_nofollow(&parent, name).map_err(|_| {
+        PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        )
+    })?;
+    if opened.canonical_path != candidate_path {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyUnreadable,
+            PolicyViolationStage::Startup,
+        ));
+    }
+    validate_opened_service_directory(&opened, roots)?;
+    Ok(opened)
+}
+
+fn validate_opened_service_directory(
+    opened: &OpenedPath,
+    roots: &[PathBuf],
+) -> Result<(), PolicyViolation> {
     if inside_any_root(&opened.canonical_path, roots) {
         return Err(PolicyViolation::new(
             PolicyViolationCode::TrustedPathUnsafe,
@@ -1298,7 +1544,7 @@ fn validate_service_directory(
             PolicyViolationStage::Startup,
         ));
     }
-    Ok(opened)
+    Ok(())
 }
 
 fn validate_opened_trusted_directory(
@@ -1602,10 +1848,13 @@ mod fix_round_tests {
         (
             temporary,
             PolicyLoadInput {
-                state_dir,
+                state_dir: state_dir.clone(),
                 project_roots: vec![project_root],
                 inherited_path: trusted_bin.into_os_string(),
-                startup_environment: StartupEnvironment::default(),
+                startup_environment: StartupEnvironment::from_pairs([
+                    ("HOME", base.as_os_str()),
+                    ("PUEUE_AGENT_STATE_DIR", state_dir.as_os_str()),
+                ]),
                 codex_home,
                 pueue_config,
                 launcher_path: base.join("trusted-bin/launcher"),
@@ -1632,5 +1881,139 @@ mod fix_round_tests {
         *POLICY_OPEN_HOOK.lock().unwrap() = None;
         assert!(result.is_ok());
         assert_eq!(mode(&fs::metadata(input.state_dir.join(POLICY_FILENAME)).unwrap()), 0o644);
+    }
+
+    #[test]
+    fn create_capable_load_securely_creates_a_missing_final_state_directory() {
+        let (_temporary, input) = startup_fixture();
+        fs::remove_file(input.state_dir.join(POLICY_FILENAME)).unwrap();
+        fs::remove_dir(&input.state_dir).unwrap();
+
+        let policy = load_or_create_policy(&input).unwrap();
+
+        assert_eq!(policy.launcher_anchor.canonical_path, input.launcher_path);
+        assert_eq!(mode(&fs::metadata(&input.state_dir).unwrap()), 0o700);
+        assert_eq!(
+            mode(&fs::metadata(input.state_dir.join(POLICY_FILENAME)).unwrap()),
+            0o600
+        );
+    }
+
+    #[test]
+    fn create_capable_load_with_missing_home_does_not_create_a_final_leaf() {
+        let (_temporary, mut input) = startup_fixture();
+        fs::remove_file(input.state_dir.join(POLICY_FILENAME)).unwrap();
+        fs::remove_dir(&input.state_dir).unwrap();
+        input.startup_environment = StartupEnvironment::default();
+
+        assert!(load_or_create_policy(&input).is_err());
+        assert!(!input.state_dir.exists());
+    }
+
+    #[test]
+    fn create_capable_load_does_not_create_state_inside_a_project_root() {
+        let (_temporary, mut input) = startup_fixture();
+        let rejected_state = input.project_roots[0].join("state");
+        input.state_dir = rejected_state.clone();
+
+        let error = load_or_create_policy(&input).unwrap_err();
+
+        assert_eq!(error.code, PolicyViolationCode::TrustedPathUnsafe);
+        assert!(!rejected_state.exists());
+    }
+
+    #[test]
+    fn create_capable_load_does_not_create_state_below_an_unsafe_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temporary, mut input) = startup_fixture();
+        let unsafe_parent = input.state_dir.parent().unwrap().join("unsafe-parent");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let rejected_state = unsafe_parent.join("state");
+        input.state_dir = rejected_state.clone();
+
+        assert!(load_or_create_policy(&input).is_err());
+        assert!(!rejected_state.exists());
+    }
+
+    #[test]
+    fn create_capable_load_does_not_follow_a_state_directory_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (_temporary, mut input) = startup_fixture();
+        let base = input.state_dir.parent().unwrap().to_path_buf();
+        let target = base.join("state-target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let linked_state = base.join("linked-state");
+        symlink(&target, &linked_state).unwrap();
+        input.state_dir = linked_state;
+
+        assert!(load_or_create_policy(&input).is_err());
+        assert!(!target.join(POLICY_FILENAME).exists());
+    }
+
+    #[test]
+    fn create_capable_load_creates_an_absolute_xdg_state_home_and_app_chain() {
+        let (_temporary, mut input) = startup_fixture();
+        let base = input.state_dir.parent().unwrap().to_path_buf();
+        let xdg_state_home = base.join("fresh-xdg-state-home");
+        let state_dir = xdg_state_home.join("pueue-agent");
+        input.state_dir = state_dir.clone();
+        input.startup_environment = StartupEnvironment::from_pairs([
+            ("HOME", base.as_os_str()),
+            ("XDG_STATE_HOME", xdg_state_home.as_os_str()),
+        ]);
+
+        let policy = load_or_create_policy(&input).unwrap();
+
+        assert_eq!(policy.launcher_anchor.canonical_path, input.launcher_path);
+        assert_eq!(mode(&fs::metadata(&xdg_state_home).unwrap()), 0o700);
+        assert_eq!(mode(&fs::metadata(&state_dir).unwrap()), 0o700);
+        assert_eq!(
+            mode(&fs::metadata(state_dir.join(POLICY_FILENAME)).unwrap()),
+            0o600
+        );
+    }
+
+    #[test]
+    fn create_capable_load_rejects_an_unrecognized_missing_parent_chain() {
+        let (_temporary, mut input) = startup_fixture();
+        let missing_parent = input.state_dir.parent().unwrap().join("missing-parent");
+        let rejected_state = missing_parent.join("state");
+        input.state_dir = rejected_state.clone();
+
+        assert!(load_or_create_policy(&input).is_err());
+        assert!(!missing_parent.exists());
+        assert!(!rejected_state.exists());
+    }
+
+    #[test]
+    fn create_capable_load_with_missing_home_creates_no_xdg_state_chain() {
+        let (_temporary, mut input) = startup_fixture();
+        let base = input.state_dir.parent().unwrap();
+        let xdg_state_home = base.join("xdg-without-home");
+        let rejected_state = xdg_state_home.join("pueue-agent");
+        input.state_dir = rejected_state.clone();
+        input.startup_environment =
+            StartupEnvironment::from_pairs([("XDG_STATE_HOME", xdg_state_home.as_os_str())]);
+
+        assert!(load_or_create_policy(&input).is_err());
+        assert!(!xdg_state_home.exists());
+        assert!(!rejected_state.exists());
+    }
+
+    #[test]
+    fn create_capable_load_rejects_relative_state_without_side_effects() {
+        let (_temporary, mut input) = startup_fixture();
+        let relative = PathBuf::from(format!(
+            "relative-policy-state-{}/pueue-agent",
+            std::process::id()
+        ));
+        input.state_dir = relative.clone();
+
+        assert!(load_or_create_policy(&input).is_err());
+        assert!(!relative.exists());
     }
 }

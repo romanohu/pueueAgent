@@ -3,8 +3,7 @@ use std::{
     ffi::OsString,
     fmt,
     io,
-    path::PathBuf,
-    process::Output,
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,9 +11,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::process::Command;
 
-use crate::AppError;
+use crate::{
+    environment::SanitizedEnvironment,
+    execution_policy::ResolvedExecutionPolicy,
+    pueue_process::{BoundedOutput, PueueProcessRunner},
+    pueue_security::validate_group,
+    AppError,
+};
 
 pub const PUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -163,64 +167,94 @@ pub trait PueueApi: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct CommandPueue {
-    executable: PathBuf,
-    fixed_args: Vec<OsString>,
+    backend: CommandPueueBackend,
+}
+
+#[derive(Debug, Clone)]
+enum CommandPueueBackend {
+    Verified {
+        policy: Arc<ResolvedExecutionPolicy>,
+        environment: SanitizedEnvironment,
+        runner: PueueProcessRunner,
+    },
+    #[cfg(test)]
+    Unconfigured,
+}
+
+pub fn configured_pueue(
+    policy: Arc<ResolvedExecutionPolicy>,
+) -> Result<CommandPueue, AppError> {
+    let environment = SanitizedEnvironment::for_pueue(&policy)?;
+    let _ = policy.pueue_anchor.verify_identity()?;
+    let _ = policy.launcher_anchor.verify_identity()?;
+    let _ = policy
+        .pueue_config_anchor
+        .verify_identity(&policy.project_roots)?;
+    Ok(CommandPueue {
+        backend: CommandPueueBackend::Verified {
+            policy,
+            environment,
+            runner: PueueProcessRunner::new(),
+        },
+    })
 }
 
 impl CommandPueue {
-    pub fn new<I, S>(executable: impl Into<PathBuf>, fixed_args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<OsString>,
-    {
-        Self {
-            executable: executable.into(),
-            fixed_args: fixed_args.into_iter().map(Into::into).collect(),
-        }
-    }
-
-    pub fn executable(&self) -> &std::path::Path {
-        &self.executable
-    }
-
-    pub fn fixed_args(&self) -> &[OsString] {
-        &self.fixed_args
-    }
-
     async fn execute(
         &self,
         operation: &'static str,
         operation_args: &[OsString],
-    ) -> Result<Output, AppError> {
-        let output = Command::new(&self.executable)
-            .args(&self.fixed_args)
-            .arg(operation)
-            .args(operation_args)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|source| PueueError::Spawn {
-                operation,
-                source_kind: source.kind(),
-            })?;
-
-        if !output.status.success() {
-            return Err(PueueError::CommandFailed {
-                operation,
-                exit_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
+    ) -> Result<BoundedOutput, AppError> {
+        match &self.backend {
+            CommandPueueBackend::Verified {
+                policy,
+                environment,
+                runner,
+            } => {
+                let mut argv = Vec::with_capacity(operation_args.len() + 1);
+                argv.push(OsString::from(operation));
+                argv.extend_from_slice(operation_args);
+                runner
+                    .run_with_environment(policy, environment, &argv)
+                    .await
             }
-            .into());
+            #[cfg(test)]
+            CommandPueueBackend::Unconfigured => Err(AppError::Configuration {
+                field: "pueue_test_policy",
+            }),
         }
-
-        Ok(output)
     }
 }
 
+#[cfg(test)]
+impl CommandPueue {
+    pub fn new(policy: Arc<ResolvedExecutionPolicy>) -> Result<Self, AppError> {
+        configured_pueue(policy)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn with_test_limits(
+        policy: Arc<ResolvedExecutionPolicy>,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<Self, AppError> {
+        let environment = SanitizedEnvironment::for_pueue(&policy)?;
+        Ok(Self {
+            backend: CommandPueueBackend::Verified {
+                policy,
+                environment,
+                runner: PueueProcessRunner::with_limits(timeout, output_limit),
+            },
+        })
+    }
+}
+
+#[cfg(test)]
 impl Default for CommandPueue {
     fn default() -> Self {
-        Self::new("pueue", Vec::<OsString>::new())
+        Self {
+            backend: CommandPueueBackend::Unconfigured,
+        }
     }
 }
 
@@ -274,6 +308,7 @@ impl PueueApi for CommandPueue {
     }
 
     async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
+        validate_group(group)?;
         if self.group_exists(group).await? {
             return Ok(());
         }

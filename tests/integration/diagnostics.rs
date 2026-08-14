@@ -15,6 +15,7 @@ use pueue_agent::{
         render_incident_explanation, render_project_status_json, render_task_inspection,
         DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
     },
+    execution_policy::StartupEnvironment,
     models::{
         AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewIncident, NewProject,
         NewTaskObservation, NewTerminationRequest, TerminationRequestStatus,
@@ -67,8 +68,12 @@ fn doctor_paths(harness: &DiagnosticsHarness) -> ServicePaths {
         release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
         pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
         state_dir: std::path::PathBuf::from("/state"),
+        execution_policy: std::path::PathBuf::from("/state/execution-policy.toml"),
         working_dir: harness.project().root_path,
+        home: std::path::PathBuf::from("/home/fixture"),
+        codex_home: std::path::PathBuf::from("/home/fixture/.codex"),
         path_env: "/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::default(),
     }
 }
 
@@ -2159,8 +2164,12 @@ fn doctor_projection_reports_unavailable_integrations_as_errors_without_repairin
         release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
         pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
         state_dir: std::path::PathBuf::from("/state"),
+        execution_policy: std::path::PathBuf::from("/state/execution-policy.toml"),
         working_dir: harness.project().root_path,
+        home: std::path::PathBuf::from("/home/fixture"),
+        codex_home: std::path::PathBuf::from("/home/fixture/.codex"),
         path_env: "/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::default(),
     };
     let rendered = render_doctor_report(
         &harness.db,
@@ -2334,8 +2343,12 @@ fn doctor_reports_missing_submission_kind_or_origin_indexes() {
         release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
         pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
         state_dir: std::path::PathBuf::from("/state"),
+        execution_policy: std::path::PathBuf::from("/state/execution-policy.toml"),
         working_dir: harness.project().root_path,
+        home: std::path::PathBuf::from("/home/fixture"),
+        codex_home: std::path::PathBuf::from("/home/fixture/.codex"),
         path_env: "/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::default(),
     };
 
     let rendered = render_doctor_report(
@@ -2480,8 +2493,12 @@ fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
         release_binary: std::path::PathBuf::from("/missing/pueue-agent"),
         pueue_config: std::path::PathBuf::from("/missing/pueue.yml"),
         state_dir: std::path::PathBuf::from("/state"),
+        execution_policy: std::path::PathBuf::from("/state/execution-policy.toml"),
         working_dir: harness.project().root_path,
+        home: std::path::PathBuf::from("/home/fixture"),
+        codex_home: std::path::PathBuf::from("/home/fixture/.codex"),
         path_env: "/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::default(),
     };
     let rendered = render_doctor_report(
         &harness.db,

@@ -90,6 +90,29 @@ impl PueueProcessRunner {
         policy: &ResolvedExecutionPolicy,
         operation_argv: &[OsString],
     ) -> Result<BoundedOutput, AppError> {
+        let environment = SanitizedEnvironment::for_pueue(policy)?;
+        self.run_with_environment(policy, &environment, operation_argv)
+            .await
+    }
+
+    #[cfg(not(unix))]
+    pub async fn run(
+        &self,
+        policy: &ResolvedExecutionPolicy,
+        operation_argv: &[OsString],
+    ) -> Result<BoundedOutput, AppError> {
+        let environment = SanitizedEnvironment::for_pueue(policy)?;
+        self.run_with_environment(policy, &environment, operation_argv)
+            .await
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn run_with_environment(
+        &self,
+        policy: &ResolvedExecutionPolicy,
+        environment: &SanitizedEnvironment,
+        operation_argv: &[OsString],
+    ) -> Result<BoundedOutput, AppError> {
         let operation_arg = operation_argv.first().ok_or(AppError::Validation {
             field: "pueue_operation",
             message: "must not be empty",
@@ -100,11 +123,16 @@ impl PueueProcessRunner {
         })?;
         let runner = *self;
         let policy = policy.clone();
+        let environment = environment.clone();
         let operation_argv = operation_argv.to_vec();
         // Tokio retains ownership of a spawned task when its JoinHandle is
         // dropped. Keep every destructive process resource in this task so
         // cancelling the caller cannot bypass the bounded cleanup path.
-        tokio::spawn(async move { runner.run_owned(&policy, &operation_argv).await })
+        tokio::spawn(async move {
+            runner
+                .run_owned(&policy, &environment, &operation_argv)
+                .await
+        })
             .await
             .map_err(|_| {
                 AppError::Pueue(PueueError::Cleanup {
@@ -114,10 +142,23 @@ impl PueueProcessRunner {
             })?
     }
 
+    #[cfg(not(unix))]
+    pub(crate) async fn run_with_environment(
+        &self,
+        _policy: &ResolvedExecutionPolicy,
+        _environment: &SanitizedEnvironment,
+        _operation_argv: &[OsString],
+    ) -> Result<BoundedOutput, AppError> {
+        Err(AppError::Runtime {
+            operation: "run verified Pueue on this platform",
+        })
+    }
+
     #[cfg(unix)]
     async fn run_owned(
         &self,
         policy: &ResolvedExecutionPolicy,
+        environment: &SanitizedEnvironment,
         operation_argv: &[OsString],
     ) -> Result<BoundedOutput, AppError> {
         use crate::process::{
@@ -141,9 +182,11 @@ impl PueueProcessRunner {
         let verified_config = policy
             .pueue_config_anchor
             .verify_identity(&policy.project_roots)?;
-        let environment = SanitizedEnvironment::for_pueue(policy)?;
-
-        let mut argv = Vec::with_capacity(operation_args.len() + 3);
+        let mut argv = Vec::with_capacity(operation_args.len() + 4);
+        // execveat receives argv verbatim. Keep argv[0] a stable display name
+        // for the already-verified executable so Pueue sees --config as its
+        // first user-visible argument.
+        argv.push(OsString::from("pueue"));
         argv.push(OsString::from("--config"));
         argv.push(OsString::from("/dev/fd/9"));
         argv.push(OsString::from(operation));
@@ -153,7 +196,7 @@ impl PueueProcessRunner {
             launcher: policy.launcher_anchor.clone(),
             executable: policy.pueue_anchor.clone(),
             argv,
-            environment,
+            environment: environment.clone(),
             cwd: None,
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
@@ -227,25 +270,6 @@ impl PueueProcessRunner {
         }
     }
 
-    #[cfg(not(unix))]
-    pub async fn run(
-        &self,
-        _policy: &ResolvedExecutionPolicy,
-        operation_argv: &[OsString],
-    ) -> Result<BoundedOutput, AppError> {
-        let operation_arg = operation_argv.first().ok_or(AppError::Validation {
-            field: "pueue_operation",
-            message: "must not be empty",
-        })?;
-        let operation = operation_name(operation_arg).ok_or(AppError::Validation {
-            field: "pueue_operation",
-            message: "is not supported",
-        })?;
-        Err(AppError::Pueue(PueueError::Spawn {
-            operation,
-            source_kind: io::ErrorKind::Unsupported,
-        }))
-    }
 }
 
 fn operation_name(value: &OsString) -> Option<&'static str> {

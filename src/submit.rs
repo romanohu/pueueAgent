@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::Read,
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,10 +13,12 @@ use uuid::Uuid;
 use crate::{
     config,
     db::{AgentRunRepository, Db, ProjectRepository, SubmissionRepository},
+    execution_policy::load_existing_policy,
     models::{NewSubmission, Submission, SubmissionKind},
     output::{bounded_redacted_text, format_state, human_header, human_summary},
     paths, project,
-    pueue::{CommandPueue, PueueApi},
+    pueue::{configured_pueue, PueueApi},
+    service::ServicePaths,
     AppError,
 };
 
@@ -56,19 +59,37 @@ impl Default for SubmitOptions {
 }
 
 pub async fn run(project_root: &Path, args: &[OsString]) -> Result<Submission, AppError> {
-    let db = Db::open(&paths::state_db_path()?)?;
     let root = project::find_root(project_root)?;
-    let registered = ProjectRepository::new(&db)
+    let service_paths = ServicePaths::from_environment(&root, None)?;
+    let state_db = paths::state_db_path()?;
+    let read_db = Db::open_read_only(&state_db)?;
+    let registered = ProjectRepository::new(&read_db)
         .find_by_root(&root)?
         .ok_or(AppError::Runtime {
             operation: "submit for an unregistered project",
         })?;
+    let project_roots = ProjectRepository::new(&read_db)
+        .list_all()?
+        .into_iter()
+        .map(|project| project.root_path)
+        .collect();
+    let launcher_path = env::current_exe().map_err(|source| AppError::Io {
+        operation: "resolve submit launcher",
+        source,
+    })?;
+    let policy = Arc::new(load_existing_policy(&service_paths.policy_load_input(
+        project_roots,
+        launcher_path,
+    ))?);
+    let pueue = configured_pueue(policy)?;
+    drop(read_db);
+    let db = Db::open(&state_db)?;
     let options = SubmitOptions::new(
         SubmissionKind::Experiment,
         Value::Object(Default::default()),
         origin_from_environment(&registered.project_id)?,
     );
-    run_with_options(&db, project_root, args, &options, &CommandPueue::default()).await
+    run_with_options(&db, project_root, args, &options, &pueue).await
 }
 
 pub async fn run_with<P: PueueApi + ?Sized>(

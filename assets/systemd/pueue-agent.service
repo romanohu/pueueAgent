@@ -7,6 +7,9 @@ Type=simple
 ExecStart=${PUEUE_AGENT_BIN} daemon --foreground --pueue-config ${PUEUE_CONFIG}
 Environment=PATH=${PUEUE_AGENT_PATH}
 Environment=PUEUE_AGENT_STATE_DIR=${PUEUE_AGENT_STATE_DIR}
+Environment=HOME=${HOME}
+Environment=CODEX_HOME=${CODEX_HOME}
+Environment=PUEUE_AGENT_EXECUTION_POLICY=${PUEUE_AGENT_EXECUTION_POLICY}
 WorkingDirectory=${PUEUE_AGENT_WORKING_DIR}
 Restart=on-failure
 RestartSec=5

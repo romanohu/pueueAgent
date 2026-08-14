@@ -55,7 +55,8 @@ fn main() {
     }
 
     let mut captured_args = Vec::new();
-    for argument in env::args_os() {
+    // Capture the arguments Pueue parses, excluding the exec-supplied argv[0].
+    for argument in env::args_os().skip(1) {
         captured_args.extend_from_slice(argument.as_bytes());
         captured_args.push(0);
     }
@@ -161,6 +162,13 @@ pub struct NativeFakePueue {
 
 impl NativeFakePueue {
     pub fn new(behavior: NativeBehavior) -> Self {
+        Self::new_with_ambient_path(behavior, None)
+    }
+
+    pub fn new_with_ambient_path(
+        behavior: NativeBehavior,
+        ambient_path: Option<&Path>,
+    ) -> Self {
         let temp = TempDir::new().expect("create native Pueue fixture root");
         let base = fs::canonicalize(temp.path()).expect("canonicalize fixture root");
         let state_dir = base.join("state");
@@ -240,11 +248,21 @@ impl NativeFakePueue {
         .expect("write generated core policy");
         secure_file(&policy_path);
 
+        let startup_environment = match ambient_path {
+            Some(path) => StartupEnvironment::from_pairs([
+                ("FIXTURE", std::ffi::OsStr::new("native-pueue")),
+                ("PATH", path.as_os_str()),
+            ]),
+            None => StartupEnvironment::from_pairs([(
+                "FIXTURE",
+                std::ffi::OsStr::new("native-pueue"),
+            )]),
+        };
         let policy = load_or_create_policy(&PolicyLoadInput {
             state_dir,
             project_roots: vec![project_root],
             inherited_path: trusted_dir.clone().into_os_string(),
-            startup_environment: StartupEnvironment::from_pairs([("FIXTURE", "native-pueue")]),
+            startup_environment,
             codex_home,
             pueue_config: config_path,
             launcher_path,

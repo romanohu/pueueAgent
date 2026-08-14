@@ -91,6 +91,13 @@ impl PueueApi for FakePueue {
     }
 }
 
+fn accepts_api<P: PueueApi>(_api: &P) {}
+
+#[test]
+fn daemon_fake_preserves_the_pueue_api_contract() {
+    accepts_api(&FakePueue::with_tasks(Vec::new()));
+}
+
 struct DaemonHarness {
     temp: TempDir,
     db: Db,
@@ -210,6 +217,14 @@ max_agent_runs = 10
     }
 
     fn runner(&self) -> AgentRunner {
+        AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            self.policy(),
+        )
+    }
+
+    fn policy(&self) -> Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy> {
         let projects = ProjectRepository::new(&self.db).list_all().unwrap();
         let owned = projects
             .iter()
@@ -229,17 +244,14 @@ max_agent_runs = 10
             .iter()
             .map(|(project_id, root, program)| (project_id.as_str(), root.as_path(), program.as_path()))
             .collect::<Vec<_>>();
-        AgentRunner::new(
-            AgentRunnerConfig::production()
-                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
-            execution_policy_fixture::resolved_policy(self.temp.path(), &borrowed),
-        )
+        execution_policy_fixture::resolved_policy(self.temp.path(), &borrowed)
     }
 
     fn daemon_at(&self, now: i64) -> Daemon<FakePueue> {
         Daemon::new(
             self.db.clone(),
             self.fake_pueue.clone(),
+            self.policy(),
             self.runner(),
             DaemonConfig {
                 interval: Duration::from_millis(10),
@@ -912,6 +924,7 @@ async fn shutdown_retains_temp_cleanup_when_deadline_expires() {
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
@@ -1213,6 +1226,7 @@ async fn daemon_shutdown_bounds_long_running_child_agent_and_marks_it_terminal()
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
@@ -1270,6 +1284,7 @@ async fn daemon_shutdown_retains_handle_when_finalizer_exhausts_grace() {
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
@@ -1323,6 +1338,7 @@ async fn daemon_shutdown_database_lock_respects_global_deadline_and_retains_term
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_secs(60),
@@ -1396,6 +1412,7 @@ async fn daemon_shutdown_attempts_later_agent_after_first_finalizer_persists() {
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
@@ -1463,6 +1480,7 @@ async fn daemon_shutdown_retries_transient_finalizer_failure_with_same_handle() 
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
@@ -1614,6 +1632,7 @@ async fn daemon_shutdown_keeps_bound_cleanup_after_repeated_finalizer_failure() 
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),
@@ -1698,6 +1717,7 @@ async fn daemon_error_drain_preserves_started_and_bound_cleanup_owners_together(
     let mut daemon = Daemon::new(
         harness.db.clone(),
         harness.fake_pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),

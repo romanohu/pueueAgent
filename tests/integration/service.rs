@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use pueue_agent::{
     db::{Db, ProjectRepository},
+    execution_policy::StartupEnvironment,
     pueue::{PueueApi, PueueTask},
     service::{
         callback_command, enable_with, install_callback_once,
@@ -21,6 +22,10 @@ use pueue_agent::{
     AppError,
 };
 use tempfile::TempDir;
+
+#[cfg(unix)]
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
 
 #[derive(Default)]
 struct FakeCallbackRegistry {
@@ -88,6 +93,13 @@ impl PueueApi for FakePueueControl {
         self.groups.lock().unwrap().push(group.to_owned());
         Ok(())
     }
+}
+
+fn accepts_api<P: PueueApi>(_api: &P) {}
+
+#[test]
+fn service_fake_preserves_the_pueue_api_contract() {
+    accepts_api(&FakePueueControl::default());
 }
 
 impl FakeService {
@@ -424,6 +436,136 @@ fn service_definitions_include_explicit_paths_environment_and_restart_policy() {
 }
 
 #[test]
+fn definitions_pin_policy_and_codex_paths_without_secrets() {
+    let paths = service_paths();
+
+    let systemd = ServiceDefinition::systemd(&paths).render();
+    assert!(systemd.contains("Environment=\"HOME=/Users/alice\""));
+    assert!(systemd.contains("Environment=\"CODEX_HOME=/Users/alice/.codex\""));
+    assert!(systemd.contains(
+        "Environment=\"PUEUE_AGENT_EXECUTION_POLICY=/Users/alice/.local/state/pueue-agent/execution-policy.toml\""
+    ));
+
+    let launchd = ServiceDefinition::launchd(&paths).render();
+    assert!(launchd.contains("<key>HOME</key>\n    <string>/Users/alice</string>"));
+    assert!(launchd.contains("<key>CODEX_HOME</key>\n    <string>/Users/alice/.codex</string>"));
+    assert!(launchd.contains(
+        "<key>PUEUE_AGENT_EXECUTION_POLICY</key>\n    <string>/Users/alice/.local/state/pueue-agent/execution-policy.toml</string>"
+    ));
+
+    for rendered in [systemd, launchd] {
+        assert!(rendered.contains("/Users/alice/.local/state/pueue-agent/execution-policy.toml"));
+        assert!(rendered.contains("/Users/alice/.codex"));
+        assert!(rendered.contains("/Users/alice"));
+        assert!(!rendered.contains("OPENAI_API_KEY"));
+        assert!(!rendered.contains("service-definition-secret"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_pinning_binds_service_and_callback_to_the_verified_launcher() {
+    let temp = TempDir::new().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(&base, &[]);
+    let unverified = base.join("unverified-release-binary");
+    let paths = ServicePaths {
+        release_binary: unverified.clone(),
+        pueue_config: base.join("execution-policy-pueue.yml"),
+        state_dir: base.join("execution-policy-state"),
+        execution_policy: base.join("execution-policy-state/execution-policy.toml"),
+        working_dir: base.clone(),
+        home: base.clone(),
+        codex_home: base.join("execution-policy-codex-home"),
+        path_env: base.join("execution-policy-bin").display().to_string(),
+        startup_environment: StartupEnvironment::default(),
+    };
+
+    let pinned = paths.pin_to_policy(&policy).unwrap();
+
+    assert_eq!(
+        pinned.release_binary,
+        policy.launcher_anchor.canonical_path
+    );
+    let callback = callback_command(&pinned);
+    let systemd = ServiceDefinition::systemd(&pinned).render();
+    assert!(callback.contains(policy.launcher_anchor.canonical_path.to_str().unwrap()));
+    assert!(systemd.contains(policy.launcher_anchor.canonical_path.to_str().unwrap()));
+    assert!(!callback.contains(unverified.to_str().unwrap()));
+    assert!(!systemd.contains(unverified.to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_pinning_rejects_a_replaced_service_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(&base, &[]);
+    let launcher = policy.launcher_anchor.canonical_path.clone();
+    fs::rename(&launcher, launcher.with_extension("old")).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher).unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let paths = ServicePaths {
+        release_binary: base.join("unverified-release-binary"),
+        pueue_config: base.join("execution-policy-pueue.yml"),
+        state_dir: base.join("execution-policy-state"),
+        execution_policy: base.join("execution-policy-state/execution-policy.toml"),
+        working_dir: base.clone(),
+        home: base.clone(),
+        codex_home: base.join("execution-policy-codex-home"),
+        path_env: base.join("execution-policy-bin").display().to_string(),
+        startup_environment: StartupEnvironment::default(),
+    };
+
+    let error = paths.pin_to_policy(&policy).unwrap_err();
+
+    assert!(matches!(error, AppError::PolicyViolation { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn enable_policy_failure_creates_no_project_state_callback_or_service_definition() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    pueue_agent::init::run(&project).unwrap();
+    let rejected_state = project.join(".pueue-agent/state");
+    let codex_home = temp.path().join("codex-home");
+    fs::create_dir(&codex_home).unwrap();
+    let pueue_config = temp.path().join("pueue.yml");
+    let original_config = "fixture: unchanged\n";
+    fs::write(&pueue_config, original_config).unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .env("HOME", temp.path())
+        .env("CODEX_HOME", &codex_home)
+        .env("PUEUE_AGENT_STATE_DIR", &rejected_state)
+        .args([
+            "enable",
+            "--pueue-config",
+            pueue_config.to_str().unwrap(),
+            project.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!rejected_state.exists());
+    assert_eq!(fs::read_to_string(&pueue_config).unwrap(), original_config);
+    assert!(!temp
+        .path()
+        .join("Library/LaunchAgents/com.pueue-agent.plist")
+        .exists());
+    assert!(!temp
+        .path()
+        .join(".config/systemd/user/pueue-agent.service")
+        .exists());
+}
+
+#[test]
 fn systemd_definition_quotes_paths_with_spaces_without_changing_launchd_argument_boundaries() {
     let paths = service_paths_with_spaces();
 
@@ -450,8 +592,17 @@ fn systemd_definition_escapes_quotes_backslashes_and_percent_specifiers() {
         release_binary: PathBuf::from("/opt/Pueue Agent 100%/bin/pueue\"agent"),
         pueue_config: PathBuf::from("/Users/alice/pueue\\profiles/pueue.yml"),
         state_dir: PathBuf::from("/Users/alice/state 100%/pueue-agent"),
+        execution_policy: PathBuf::from(
+            "/Users/alice/state 100%/pueue-agent/execution-policy.toml",
+        ),
         working_dir: PathBuf::from("/Users/alice/project \"quoted\""),
+        home: PathBuf::from("/Users/alice"),
+        codex_home: PathBuf::from("/Users/alice/.codex"),
         path_env: "/tmp/tool 100%/bin:/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::from_pairs([(
+            "OPENAI_API_KEY",
+            "service-definition-secret",
+        )]),
     };
 
     let systemd = ServiceDefinition::systemd(&paths).render();
@@ -644,6 +795,34 @@ async fn enable_verifies_daemon_health_before_success() {
     assert!(registry.current_value().is_some());
 }
 
+#[tokio::test]
+async fn invalid_group_fails_before_registration_or_external_side_effects() {
+    let harness = EnableHarness::with_group("pa project");
+    let service = FakeService::running();
+    let registry = FakeCallbackRegistry::default();
+    let pueue = FakePueueControl::default();
+
+    let error = enable_with(&harness.db, &harness.options, &service, &registry, &pueue)
+        .await
+        .expect_err("invalid group must fail at the enable boundary");
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "pueue_group",
+            ..
+        }
+    ));
+    assert!(ProjectRepository::new(&harness.db)
+        .find_by_root(&harness.project_root)
+        .unwrap()
+        .is_none());
+    assert!(pueue.groups.lock().unwrap().is_empty());
+    assert_eq!(registry.writes.get(), 0);
+    assert_eq!(service.installed.get(), 0);
+    assert_eq!(service.status_checks.get(), 0);
+}
+
 #[test]
 fn pueue_config_callback_registry_updates_daemon_scoped_callback_only() {
     let temp = TempDir::new().unwrap();
@@ -721,19 +900,23 @@ struct EnableHarness {
 
 impl EnableHarness {
     fn new() -> Self {
+        Self::with_group("pa-project")
+    }
+
+    fn with_group(group: &str) -> Self {
         let temp = TempDir::new().unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         let project_root = temp.path().join("project");
         fs::create_dir_all(project_root.join(".pueue-agent")).unwrap();
         fs::write(
             project_root.join(".pueue-agent/config.toml"),
-            r#"
+            format!(r#"
 project_id = "project-a"
-pueue_group = "pa-project"
+pueue_group = {group:?}
 
 [agent]
 program = "/bin/echo"
-args = ["{prompt}"]
+args = ["{{prompt}}"]
 timeout_minutes = 1
 max_retries = 1
 
@@ -752,7 +935,7 @@ kill_after_minutes = 0
 max_consecutive_failures = 3
 max_experiments = 20
 max_agent_runs = 10
-"#,
+"#),
         )
         .unwrap();
 
@@ -776,8 +959,17 @@ fn service_paths() -> ServicePaths {
         release_binary: PathBuf::from("/opt/pueue-agent/target/release/pueue-agent"),
         pueue_config: PathBuf::from("/Users/alice/.config/pueue/pueue.yml"),
         state_dir: PathBuf::from("/Users/alice/.local/state/pueue-agent"),
+        execution_policy: PathBuf::from(
+            "/Users/alice/.local/state/pueue-agent/execution-policy.toml",
+        ),
         working_dir: PathBuf::from("/Users/alice/project"),
+        home: PathBuf::from("/Users/alice"),
+        codex_home: PathBuf::from("/Users/alice/.codex"),
         path_env: "/private/tmp/pueue-agent-rustup/toolchains/stable-aarch64-apple-darwin/bin:/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::from_pairs([(
+            "OPENAI_API_KEY",
+            "service-definition-secret",
+        )]),
     }
 }
 
@@ -786,7 +978,16 @@ fn service_paths_with_spaces() -> ServicePaths {
         release_binary: PathBuf::from("/opt/Pueue Agent/target/release/pueue-agent"),
         pueue_config: PathBuf::from("/Users/alice/Library/Application Support/pueue/pueue.yml"),
         state_dir: PathBuf::from("/Users/alice/Library/Application Support/pueue-agent"),
+        execution_policy: PathBuf::from(
+            "/Users/alice/Library/Application Support/pueue-agent/execution-policy.toml",
+        ),
         working_dir: PathBuf::from("/Users/alice/project with spaces"),
+        home: PathBuf::from("/Users/alice"),
+        codex_home: PathBuf::from("/Users/alice/.codex"),
         path_env: "/tmp/tool dir/bin:/usr/bin:/bin".to_owned(),
+        startup_environment: StartupEnvironment::from_pairs([(
+            "OPENAI_API_KEY",
+            "service-definition-secret",
+        )]),
     }
 }

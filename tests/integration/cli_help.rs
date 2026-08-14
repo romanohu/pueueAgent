@@ -51,6 +51,37 @@ fn upgrade_pre_run_errors_include_a_safe_diagnostic_command() {
 }
 
 #[test]
+fn upgrade_without_an_existing_policy_creates_no_database_or_upgrade_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state_dir = temporary.path().join("state");
+    let codex_home = temporary.path().join("codex-home");
+    std::fs::create_dir(&state_dir).unwrap();
+    std::fs::create_dir(&codex_home).unwrap();
+    let pueue_config = temporary.path().join("pueue.yml");
+    std::fs::write(&pueue_config, "fixture: true\n").unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .env("HOME", temporary.path())
+        .env("CODEX_HOME", &codex_home)
+        .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+        .args([
+            "upgrade",
+            "--source",
+            temporary.path().to_str().unwrap(),
+            "--pueue-config",
+            pueue_config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!state_dir.join("state.sqlite3").exists());
+    assert!(!state_dir.join("upgrade.lock").exists());
+    assert!(!state_dir.join("upgrade.pending").exists());
+}
+
+#[test]
 fn help_lists_diagnostics_commands_and_status_options() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
@@ -339,10 +370,19 @@ fn events_cli_renders_the_project_scoped_event_projection() {
             100,
         ))
         .unwrap();
+    let trusted_dir = temp.path().join("trusted-bin");
+    fs::create_dir_all(&trusted_dir).unwrap();
+    let pueue = trusted_dir.join("pueue");
+    fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &pueue).unwrap();
+    make_executable(&pueue);
+    let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
 
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()
-        .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+        .env("PUEUE_AGENT_STATE_DIR", &policy_paths.state_dir)
+        .env("HOME", &policy_paths.home)
+        .env("CODEX_HOME", &policy_paths.codex_home)
+        .env("PATH", &policy_paths.trusted_dir)
         .current_dir(&root)
         .args(["events", "--json", "--limit", "1"])
         .output()
@@ -682,7 +722,7 @@ fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
         .status
         .success());
 }
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, process::Command};
 
 use pueue_agent::{
     config,
@@ -698,12 +738,190 @@ use pueue_agent::{
 use serde_json::Value;
 use tempfile::TempDir;
 
+struct CliPolicyPaths {
+    state_dir: PathBuf,
+    home: PathBuf,
+    codex_home: PathBuf,
+    trusted_dir: PathBuf,
+}
+
+#[cfg(unix)]
+fn install_cli_policy(
+    base: &std::path::Path,
+    state_dir: &std::path::Path,
+    trusted_dir: &std::path::Path,
+    pueue_bin: &std::path::Path,
+) -> CliPolicyPaths {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = fs::canonicalize(base).unwrap();
+    let state_dir = fs::canonicalize(state_dir).unwrap();
+    fs::create_dir_all(trusted_dir).unwrap();
+    fs::set_permissions(trusted_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let trusted_dir = fs::canonicalize(trusted_dir).unwrap();
+    let pueue_bin = fs::canonicalize(pueue_bin).unwrap();
+    let codex = trusted_dir.join("codex");
+    fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &codex).unwrap();
+    make_executable(&codex);
+    let home = base.join("home");
+    let codex_home = base.join("codex-home");
+    let pueue_config = home.join(".config/pueue/pueue.yml");
+    fs::create_dir_all(pueue_config.parent().unwrap()).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&pueue_config, "fixture: true\n").unwrap();
+    fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        state_dir.join("execution-policy.toml"),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+            trusted_dir.display().to_string(),
+            codex.display().to_string(),
+            pueue_bin.display().to_string(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        state_dir.join("execution-policy.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    CliPolicyPaths {
+        state_dir,
+        home,
+        codex_home,
+        trusted_dir,
+    }
+}
+
+#[cfg(unix)]
+fn compile_marker_pueue(target: &std::path::Path, marker: &std::path::Path) {
+    let source_path = target.with_extension("rs");
+    fs::write(
+        &source_path,
+        format!(
+            "fn main() {{ std::fs::write({:?}, b\"invoked\").unwrap(); }}\n",
+            marker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-O", "-o"])
+        .arg(target)
+        .arg(&source_path)
+        .output()
+        .expect("compile marker Pueue fixture");
+    assert!(
+        output.status.success(),
+        "marker Pueue fixture failed to compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    make_executable(target);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_missing_policy_is_existing_only_and_never_invokes_pueue() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    pueue_agent::init::run(&root).unwrap();
+    let state_dir = temp.path().join("state");
+    let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+    let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+    ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            &project_config.project_id,
+            &root,
+            &project_config.pueue_group,
+            root.join(".pueue-agent/config.toml"),
+            100,
+        ))
+        .unwrap();
+    let trusted_dir = temp.path().join("trusted-bin");
+    fs::create_dir_all(&trusted_dir).unwrap();
+    let marker = temp.path().join("pueue-invoked");
+    let pueue = trusted_dir.join("pueue");
+    compile_marker_pueue(&pueue, &marker);
+    let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
+    let policy_path = state_dir.join("execution-policy.toml");
+    fs::remove_file(&policy_path).unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .env("PUEUE_AGENT_STATE_DIR", &policy_paths.state_dir)
+        .env("HOME", &policy_paths.home)
+        .env("CODEX_HOME", &policy_paths.codex_home)
+        .env("PATH", &policy_paths.trusted_dir)
+        .current_dir(&root)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!policy_path.exists());
+    assert!(!marker.exists());
+    assert!(ProjectRepository::new(&db)
+        .find_by_root(&root)
+        .unwrap()
+        .is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn enable_policy_failure_has_zero_downstream_side_effects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    pueue_agent::init::run(&root).unwrap();
+    let state_dir = temp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let trusted_dir = temp.path().join("trusted-bin");
+    fs::create_dir_all(&trusted_dir).unwrap();
+    let marker = temp.path().join("pueue-invoked");
+    let pueue = trusted_dir.join("pueue");
+    compile_marker_pueue(&pueue, &marker);
+    let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
+    let policy_path = state_dir.join("execution-policy.toml");
+    fs::write(&policy_path, "version = 2\n").unwrap();
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let pueue_config = policy_paths.home.join(".config/pueue/pueue.yml");
+    let config_before = fs::read(&pueue_config).unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .env("PUEUE_AGENT_STATE_DIR", &policy_paths.state_dir)
+        .env("HOME", &policy_paths.home)
+        .env("CODEX_HOME", &policy_paths.codex_home)
+        .env("PATH", &policy_paths.trusted_dir)
+        .args(["enable", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!state_dir.join("state.sqlite3").exists());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&pueue_config).unwrap(), config_before);
+    assert!(!policy_paths
+        .home
+        .join(".config/systemd/user/pueue-agent.service")
+        .exists());
+    assert!(!policy_paths
+        .home
+        .join("Library/LaunchAgents/com.pueue-agent.plist")
+        .exists());
+}
+
 struct DiagnosticsCliHarness {
     _temp: TempDir,
     root: std::path::PathBuf,
-    state_dir: std::path::PathBuf,
     db: Db,
     project_id: String,
+    policy_paths: CliPolicyPaths,
 }
 
 impl DiagnosticsCliHarness {
@@ -724,19 +942,28 @@ impl DiagnosticsCliHarness {
                 100,
             ))
             .unwrap();
+        let trusted_dir = temp.path().join("trusted-bin");
+        fs::create_dir_all(&trusted_dir).unwrap();
+        let pueue = trusted_dir.join("pueue");
+        fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &pueue).unwrap();
+        make_executable(&pueue);
+        let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
         Self {
             _temp: temp,
             root,
-            state_dir,
             db,
             project_id: project_config.project_id,
+            policy_paths,
         }
     }
 
     fn command(&self) -> assert_cmd::Command {
         let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
         command
-            .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
+            .env("PUEUE_AGENT_STATE_DIR", &self.policy_paths.state_dir)
+            .env("HOME", &self.policy_paths.home)
+            .env("CODEX_HOME", &self.policy_paths.codex_home)
+            .env("PATH", &self.policy_paths.trusted_dir)
             .current_dir(&self.root);
         command
     }
@@ -850,14 +1077,38 @@ fn cli_output_contract_runs_emits_bounded_json_and_human_lineage_without_sensiti
     }
 }
 
+const SUBMIT_BATCH_PUEUE_SOURCE: &str = r#"
+use std::{env, fs, io::Write};
+
+fn main() {
+    let is_add = env::args_os().any(|argument| argument == "add");
+    if !is_add {
+        return;
+    }
+    let count = fs::read_to_string(__ADD_COUNT__)
+        .expect("read add count")
+        .parse::<usize>()
+        .expect("parse add count") + 1;
+    fs::write(__ADD_COUNT__, count.to_string()).expect("write add count");
+    let fail = fs::read_to_string(__FAIL_ON_ADD__)
+        .expect("read failure ordinal")
+        .parse::<usize>()
+        .expect("parse failure ordinal");
+    if fail > 0 && count == fail {
+        std::io::stderr().write_all(b"fake pueue failure secret").expect("write failure");
+        std::process::exit(7);
+    }
+    println!("{}", 700 + count);
+}
+"#;
+
 struct SubmitBatchCliHarness {
     _temp: TempDir,
     root: PathBuf,
-    state_dir: PathBuf,
     manifest: PathBuf,
-    pueue_bin: PathBuf,
     add_count: PathBuf,
     fail_on_add: PathBuf,
+    policy_paths: CliPolicyPaths,
 }
 
 impl SubmitBatchCliHarness {
@@ -889,33 +1140,42 @@ impl SubmitBatchCliHarness {
         let fail_on_add = temp.path().join("fail-on-add");
         fs::write(&add_count, "0").unwrap();
         fs::write(&fail_on_add, "0").unwrap();
-        fs::write(
-            &pueue_bin,
-            format!(
-                "#!/bin/sh\nset -eu\noperation=\"\"\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    add) operation=add; break ;;\n  esac\ndone\nif [ \"$operation\" = add ]; then\n  count=$(/bin/cat '{add_count}')\n  count=$((count + 1))\n  printf '%s' \"$count\" > '{add_count}'\n  fail=$(/bin/cat '{fail_on_add}')\n  if [ \"$fail\" -gt 0 ] && [ \"$count\" -eq \"$fail\" ]; then\n    printf 'fake pueue failure secret' >&2\n    exit 7\n  fi\n  printf '%s\\n' $((700 + count))\n  exit 0\nfi\nexit 0\n",
-                add_count = add_count.display(),
-                fail_on_add = fail_on_add.display(),
-            ),
-        )
-        .unwrap();
+        let source_path = temp.path().join("submit-batch-pueue.rs");
+        let source = SUBMIT_BATCH_PUEUE_SOURCE
+            .replace("__ADD_COUNT__", &rust_string(&add_count))
+            .replace("__FAIL_ON_ADD__", &rust_string(&fail_on_add));
+        fs::write(&source_path, source).unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-O", "-o"])
+            .arg(&pueue_bin)
+            .arg(&source_path)
+            .output()
+            .expect("compile generated submit-batch Pueue fixture");
+        assert!(
+            output.status.success(),
+            "generated submit-batch Pueue fixture failed to compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         make_executable(&pueue_bin);
+        let policy_paths = install_cli_policy(temp.path(), &state_dir, &pueue_dir, &pueue_bin);
 
         Self {
             _temp: temp,
             root,
-            state_dir,
             manifest: manifest_path,
-            pueue_bin,
             add_count,
             fail_on_add,
+            policy_paths,
         }
     }
 
     fn command(&self) -> assert_cmd::Command {
         let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
         command
-            .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
-            .env("PATH", self.pueue_bin.parent().unwrap())
+            .env("PUEUE_AGENT_STATE_DIR", &self.policy_paths.state_dir)
+            .env("HOME", &self.policy_paths.home)
+            .env("CODEX_HOME", &self.policy_paths.codex_home)
+            .env("PATH", &self.policy_paths.trusted_dir)
             .current_dir(&self.root);
         command
     }
@@ -954,6 +1214,10 @@ fn make_executable(path: &std::path::Path) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn rust_string(path: &std::path::Path) -> String {
+    format!("{:?}", path.to_string_lossy())
 }
 
 const BATCH_REQUEST_ID: &str = "11111111-1111-4111-8111-111111111111";

@@ -72,6 +72,13 @@ impl PueueApi for FakePueue {
     }
 }
 
+fn accepts_api<P: PueueApi>(_api: &P) {}
+
+#[test]
+fn reconciliation_fake_preserves_the_pueue_api_contract() {
+    accepts_api(&FakePueue::with_tasks(Vec::new()));
+}
+
 struct Harness {
     _temp: TempDir,
     db: Db,

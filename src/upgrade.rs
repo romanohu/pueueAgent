@@ -5,20 +5,55 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     thread,
 };
+
+use async_trait::async_trait;
 
 use crate::{
     cli::UpgradeArgs,
     db::{AgentRunRepository, Db, ProjectRepository},
+    execution_policy::{load_existing_policy, PolicyLoadInput, ResolvedExecutionPolicy},
     output::{bounded_redacted_text, human_summary},
-    service::{installed_pueue_config, ServiceControl, ServiceStatus},
+    pueue::{configured_pueue, PueueApi},
+    service::{ServiceControl, ServiceStatus},
     AppError,
 };
 
 pub const SOURCE_ROOT_ENV: &str = "PUEUE_AGENT_SOURCE_ROOT";
 const PACKAGE_BINARY_NAME: &str = "pueue-agent";
+
+#[async_trait]
+pub trait UpgradePueueHealth: Send + Sync {
+    async fn check_status(&self) -> Result<(), AppError>;
+}
+
+#[derive(Clone)]
+pub struct ReloadingPueueHealth {
+    input: PolicyLoadInput,
+}
+
+impl ReloadingPueueHealth {
+    pub fn new(input: PolicyLoadInput) -> Self {
+        Self { input }
+    }
+
+    fn resolve_policy(&self) -> Result<Arc<ResolvedExecutionPolicy>, AppError> {
+        Ok(Arc::new(load_existing_policy(&self.input)?))
+    }
+}
+
+#[async_trait]
+impl UpgradePueueHealth for ReloadingPueueHealth {
+    async fn check_status(&self) -> Result<(), AppError> {
+        let policy = self.resolve_policy()?;
+        configured_pueue(policy)?.status_json().await.map(|_| ())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeOptions {
@@ -27,34 +62,18 @@ pub struct UpgradeOptions {
     pub branch: String,
     pub remote: String,
     pub release_binary: PathBuf,
-    pub pueue_binary: PathBuf,
-    pub pueue_config: Option<PathBuf>,
     pub installed_revision: String,
 }
 
 impl UpgradeOptions {
     pub fn from_args(args: UpgradeArgs) -> Self {
-        let env_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
-        let home = env::var_os("HOME").map(PathBuf::from);
-        let installed_service_pueue_config = home
-            .as_deref()
-            .and_then(installed_pueue_config);
         Self {
             source: args.source,
             json: args.json,
             branch: "main".to_owned(),
             remote: "origin".to_owned(),
-            release_binary: std::env::current_exe()
+            release_binary: env::current_exe()
                 .unwrap_or_else(|_| PathBuf::from("pueue-agent")),
-            pueue_binary: std::env::var_os("PUEUE_BINARY")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("pueue")),
-            pueue_config: resolve_pueue_config_with_service(
-                args.pueue_config.as_deref(),
-                env_pueue_config.as_deref(),
-                installed_service_pueue_config.as_deref(),
-                home.as_deref(),
-            ),
             installed_revision: option_env!("PUEUE_AGENT_GIT_REVISION")
                 .unwrap_or("unknown")
                 .to_owned(),
@@ -506,31 +525,42 @@ pub fn validate_checkout_with<R: GitCommandRunner>(
     })
 }
 
-pub struct UpgradeRunner<'a, S, R> {
+pub struct UpgradeRunner<'a, S, R, P> {
     options: UpgradeOptions,
-    db: &'a Db,
+    database_path: PathBuf,
     service: &'a S,
     commands: &'a R,
+    pueue: &'a P,
 }
 
-impl<'a, S, R> UpgradeRunner<'a, S, R>
+impl<'a, S, R, P> UpgradeRunner<'a, S, R, P>
 where
     S: ServiceControl,
     R: UpgradeCommandRunner,
+    P: UpgradePueueHealth,
 {
-    pub fn new(options: UpgradeOptions, db: &'a Db, service: &'a S, commands: &'a R) -> Self {
+    pub fn new(
+        options: UpgradeOptions,
+        database_path: PathBuf,
+        service: &'a S,
+        commands: &'a R,
+        pueue: &'a P,
+    ) -> Self {
         Self {
             options,
-            db,
+            database_path,
             service,
             commands,
+            pueue,
         }
     }
 
     pub async fn run(&self) -> Result<UpgradeReport, UpgradeFailure> {
+        self.check_pueue_health("preflight").await?;
         let state_dir = self.state_dir()?;
         let _lock = UpgradeLock::acquire(&state_dir)?;
-        self.reject_active_agent_runs()?;
+        let db = Db::open(&self.database_path)?;
+        self.reject_active_agent_runs(&db)?;
         let source = self
             .options
             .source
@@ -548,7 +578,7 @@ where
         )?;
         // The lock serializes upgrades. These two checks close the observable windows before
         // source mutation and before binary replacement without stopping Pueue experiment tasks.
-        self.reject_active_agent_runs()?;
+        self.reject_active_agent_runs(&db)?;
         let upstream = format!("{}/{}", self.options.remote, self.options.branch);
         run_git(
             self.commands,
@@ -668,7 +698,7 @@ where
                 ),
             ));
         }
-        if let Err(error) = self.reject_active_agent_runs() {
+        if let Err(error) = self.reject_active_agent_runs(&db) {
             return Err(UpgradeFailure::with_report(
                 report,
                 with_cleanup_failure(
@@ -686,7 +716,7 @@ where
                 ),
             ));
         }
-        if let Err(error) = self.snapshot_database(&database_backup) {
+        if let Err(error) = self.snapshot_database(&db, &database_backup) {
             return Err(self.recover_after_pre_install_failure(
                 &[&install_candidate, &backup, &database_backup],
                 report,
@@ -708,6 +738,7 @@ where
 
         if let Err(error) = self.service.restart() {
             return Err(self.rollback_after_post_install_failure(
+                &db,
                 &backup,
                 &database_backup,
                 &install_target,
@@ -718,8 +749,19 @@ where
         report.restart = UpgradeStep::succeeded();
 
         report.health = UpgradeStep::attempted();
-        if let Err(error) = self.check_health(&source) {
+        if let Err(error) = self.check_service_and_database_health(&db) {
             return Err(self.rollback_after_post_install_failure(
+                &db,
+                &backup,
+                &database_backup,
+                &install_target,
+                report,
+                error,
+            ));
+        }
+        if let Err(error) = self.check_pueue_health("post-restart").await {
+            return Err(self.rollback_after_post_install_failure(
+                &db,
                 &backup,
                 &database_backup,
                 &install_target,
@@ -737,9 +779,9 @@ where
         Ok(report)
     }
 
-    fn reject_active_agent_runs(&self) -> Result<(), AppError> {
-        let projects = ProjectRepository::new(self.db).list_enabled()?;
-        let agent_runs = AgentRunRepository::new(self.db);
+    fn reject_active_agent_runs(&self, db: &Db) -> Result<(), AppError> {
+        let projects = ProjectRepository::new(db).list_enabled()?;
+        let agent_runs = AgentRunRepository::new(db);
         for project in projects {
             if let Some(run) = agent_runs.find_active_by_project(&project.project_id)? {
                 return Err(AppError::Message {
@@ -754,8 +796,7 @@ where
     }
 
     fn state_dir(&self) -> Result<PathBuf, AppError> {
-        self.db
-            .path()
+        self.database_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
@@ -792,42 +833,29 @@ where
         }
     }
 
-    fn check_health(&self, source: &Path) -> Result<(), AppError> {
+    async fn check_pueue_health(&self, phase: &'static str) -> Result<(), AppError> {
+        self.pueue.check_status().await.map_err(|error| {
+            AppError::Message {
+                message: format!(
+                    "upgrade Pueue {phase} failed: {}",
+                    bounded_redacted_text(&error.to_string())
+                ),
+            }
+        })
+    }
+
+    fn check_service_and_database_health(&self, db: &Db) -> Result<(), AppError> {
         if self.service.status()? != ServiceStatus::Running {
             return Err(AppError::Message {
                 message: "upgrade service health check failed: service is not running".to_owned(),
             });
         }
-        self.db.connect()?;
-
-        let mut args = Vec::new();
-        if let Some(config) = &self.options.pueue_config {
-            args.push(OsString::from("--config"));
-            args.push(config.as_os_str().to_os_string());
-        }
-        args.push(OsString::from("status"));
-        args.push(OsString::from("--json"));
-        let pueue_status = self.run_checked_command(
-            source,
-            self.options.pueue_binary.as_os_str(),
-            &args,
-            "Pueue health check",
-        )?;
-        if pueue_status.stdout_limited {
-            return Err(AppError::Message {
-                message: "upgrade Pueue health check output exceeded the safe limit".to_owned(),
-            });
-        }
-        let status = serde_json::from_str::<serde_json::Value>(&pueue_status.stdout).map_err(
-            |_| AppError::Message {
-                message: "upgrade Pueue health check returned invalid status JSON".to_owned(),
-            },
-        )?;
-        validate_pueue_status_shape(&status)
+        db.connect()?;
+        Ok(())
     }
 
-    fn snapshot_database(&self, destination: &Path) -> Result<(), AppError> {
-        let connection = self.db.connect()?;
+    fn snapshot_database(&self, db: &Db, destination: &Path) -> Result<(), AppError> {
+        let connection = db.connect()?;
         let destination = destination.to_string_lossy().into_owned();
         connection
             .execute("VACUUM INTO ?1", [&destination])
@@ -840,6 +868,7 @@ where
 
     fn rollback_after_post_install_failure(
         &self,
+        db: &Db,
         backup: &Path,
         database_backup: &Path,
         install_target: &Path,
@@ -849,7 +878,7 @@ where
         let stop = self.service.stop();
         let service_stopped = stop.is_ok();
         let database_restore = if service_stopped {
-            self.restore_database_snapshot(database_backup)
+            self.restore_database_snapshot(db, database_backup)
         } else {
             Err(AppError::Message {
                 message: "database restore skipped because service stop failed".to_owned(),
@@ -974,8 +1003,8 @@ where
         }
     }
 
-    fn restore_database_snapshot(&self, backup: &Path) -> Result<(), AppError> {
-        let database_path = self.db.path();
+    fn restore_database_snapshot(&self, db: &Db, backup: &Path) -> Result<(), AppError> {
+        let database_path = db.path();
         let state_dir = database_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1625,50 +1654,6 @@ fn sanitize_timestamp_shape(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn validate_pueue_status_shape(status: &serde_json::Value) -> Result<(), AppError> {
-    let tasks = status
-        .as_object()
-        .and_then(|status| status.get("tasks"))
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(invalid_pueue_status_shape)?;
-    for task in tasks.values() {
-        let task = task.as_object().ok_or_else(invalid_pueue_status_shape)?;
-        let valid_id = match task.get("id") {
-            Some(serde_json::Value::Number(value)) => value.as_i64().is_some_and(|id| id >= 0),
-            Some(serde_json::Value::String(value)) => {
-                value.parse::<i64>().is_ok_and(|id| id >= 0)
-            }
-            _ => false,
-        };
-        let valid_strings = ["group", "command"]
-            .into_iter()
-            .all(|field| task.get(field).is_some_and(serde_json::Value::is_string));
-        let status = task
-            .get("status")
-            .and_then(serde_json::Value::as_object)
-            .filter(|status| status.len() == 1)
-            .and_then(|status| status.values().next())
-            .and_then(serde_json::Value::as_object);
-        let valid_timestamps = status.is_some_and(|details| {
-            ["enqueued_at", "start", "end"].into_iter().all(|field| {
-                details
-                    .get(field)
-                    .is_none_or(|value| value.is_null() || value.is_string())
-            })
-        });
-        if !valid_id || !valid_strings || !valid_timestamps {
-            return Err(invalid_pueue_status_shape());
-        }
-    }
-    Ok(())
-}
-
-fn invalid_pueue_status_shape() -> AppError {
-    AppError::Message {
-        message: "upgrade Pueue health check returned an invalid status schema".to_owned(),
-    }
-}
-
 fn temporary_path(parent: &Path, prefix: &str) -> Result<PathBuf, AppError> {
     for _ in 0..32 {
         let sequence = TEMPORARY_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1866,10 +1851,14 @@ mod tests {
 
     use super::{
         cleanup_failure_suffix, lock_file, read_capped, run_git, AgentStartUpgradeGuard,
-        GitCommandOutput, GitCommandRunner, UpgradeLock, MAX_RAW_PROCESS_OUTPUT_BYTES,
+        GitCommandOutput, GitCommandRunner, ReloadingPueueHealth, UpgradeLock,
+        MAX_RAW_PROCESS_OUTPUT_BYTES,
     };
     use crate::{
         db::Db,
+        execution_policy::{
+            load_or_create_policy, PolicyLoadInput, StartupEnvironment,
+        },
         AppError,
     };
 
@@ -1969,5 +1958,54 @@ mod tests {
 
         assert!(suffix.contains("upgrade cleanup failed"));
         assert!(suffix.len() < 600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reloading_health_resolves_a_replaced_launcher_as_a_new_anchor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = TempDir::new().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let state_dir = base.join("state");
+        let trusted_bin = base.join("trusted-bin");
+        let codex_home = base.join("codex-home");
+        for directory in [&state_dir, &trusted_bin, &codex_home] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for name in ["codex", "pueue", "launcher"] {
+            let executable = trusted_bin.join(name);
+            fs::write(&executable, b"fixture executable").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let pueue_config = base.join("pueue.yml");
+        fs::write(&pueue_config, b"fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        let launcher_path = trusted_bin.join("launcher");
+        let input = PolicyLoadInput {
+            state_dir: state_dir.clone(),
+            project_roots: Vec::new(),
+            inherited_path: trusted_bin.into_os_string(),
+            startup_environment: StartupEnvironment::from_pairs([
+                ("HOME", base.as_os_str()),
+                ("PUEUE_AGENT_STATE_DIR", state_dir.as_os_str()),
+            ]),
+            codex_home,
+            pueue_config,
+            launcher_path: launcher_path.clone(),
+        };
+        load_or_create_policy(&input).unwrap();
+        let provider = ReloadingPueueHealth::new(input);
+        let before = provider.resolve_policy().unwrap();
+        fs::rename(&launcher_path, launcher_path.with_extension("old")).unwrap();
+        fs::write(&launcher_path, b"replacement executable").unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let after = provider.resolve_policy().unwrap();
+
+        assert_eq!(before.launcher_anchor.canonical_path, launcher_path);
+        assert_eq!(after.launcher_anchor.canonical_path, launcher_path);
+        assert_ne!(before.launcher_anchor.identity, after.launcher_anchor.identity);
     }
 }

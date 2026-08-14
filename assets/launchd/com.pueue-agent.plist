@@ -19,6 +19,12 @@
     <string>${PUEUE_AGENT_PATH}</string>
     <key>PUEUE_AGENT_STATE_DIR</key>
     <string>${PUEUE_AGENT_STATE_DIR}</string>
+    <key>HOME</key>
+    <string>${HOME}</string>
+    <key>CODEX_HOME</key>
+    <string>${CODEX_HOME}</string>
+    <key>PUEUE_AGENT_EXECUTION_POLICY</key>
+    <string>${PUEUE_AGENT_EXECUTION_POLICY}</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>${PUEUE_AGENT_WORKING_DIR}</string>

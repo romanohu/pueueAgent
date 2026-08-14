@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::{poll_fn, Future},
     pin::Pin,
+    sync::Arc,
     task::Poll,
     time::Duration,
 };
@@ -14,6 +15,7 @@ use crate::{
     config,
     db::{AgentRunRepository, Db, ProjectRepository, TerminationRequestRepository},
     detect::Detector,
+    execution_policy::ResolvedExecutionPolicy,
     incidents::IncidentStore,
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
@@ -63,6 +65,7 @@ pub struct DaemonReport {
 pub struct Daemon<P> {
     db: Db,
     pueue: P,
+    _policy: Arc<ResolvedExecutionPolicy>,
     runner: Option<AgentRunner>,
     config: DaemonConfig,
     active_agents: Vec<AgentHandle>,
@@ -74,10 +77,17 @@ impl<P> Daemon<P>
 where
     P: PueueApi + Clone,
 {
-    pub fn new(db: Db, pueue: P, runner: AgentRunner, config: DaemonConfig) -> Self {
+    pub fn new(
+        db: Db,
+        pueue: P,
+        policy: Arc<ResolvedExecutionPolicy>,
+        runner: AgentRunner,
+        config: DaemonConfig,
+    ) -> Self {
         Self {
             db,
             pueue,
+            _policy: policy,
             runner: Some(runner),
             config,
             active_agents: Vec::new(),

@@ -340,6 +340,13 @@ fn unix_timestamp() -> i64 {
         .unwrap()
 }
 
+fn accepts_api<P: PueueApi>(_api: &P) {}
+
+#[test]
+fn termination_fake_preserves_the_pueue_api_contract() {
+    accepts_api(&FakePueue::with_tasks(Vec::new()));
+}
+
 #[test]
 fn policy_maps_only_explicit_kill_observations_to_termination() {
     assert!(!TerminationPolicy.should_kill(&Observation::pattern(

@@ -5,12 +5,15 @@ use std::{
 };
 
 use crate::{
+    codex_session,
     config,
     db::{Db, ProjectRepository},
+    execution_policy::{PolicyLoadInput, ResolvedExecutionPolicy, StartupEnvironment},
     models::NewProject,
     output::bounded_redacted_text,
     paths,
     pueue::PueueApi,
+    pueue_security::validate_group,
     AppError,
 };
 
@@ -19,8 +22,12 @@ pub struct ServicePaths {
     pub release_binary: PathBuf,
     pub pueue_config: PathBuf,
     pub state_dir: PathBuf,
+    pub execution_policy: PathBuf,
     pub working_dir: PathBuf,
+    pub home: PathBuf,
+    pub codex_home: PathBuf,
     pub path_env: String,
+    pub startup_environment: StartupEnvironment,
 }
 
 impl ServicePaths {
@@ -45,16 +52,70 @@ impl ServicePaths {
                 home.join(".config/pueue/pueue.yml")
             }
         };
+        let pueue_config = fs::canonicalize(pueue_config).map_err(|source| AppError::Io {
+            operation: "resolve Pueue configuration",
+            source,
+        })?;
+        let home = env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or(AppError::Configuration { field: "HOME" })?;
+        let home = fs::canonicalize(home).map_err(|source| AppError::Io {
+            operation: "resolve service home",
+            source,
+        })?;
+        let codex_home = codex_session::home_from_environment()?;
         let release_binary = release_binary_path()?;
         let path_env = env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned());
+        let execution_policy = state_dir.join("execution-policy.toml");
 
         Ok(Self {
             release_binary,
             pueue_config,
             state_dir,
+            execution_policy,
             working_dir: project_root.to_path_buf(),
+            home,
+            codex_home,
             path_env,
+            startup_environment: StartupEnvironment::capture(),
         })
+    }
+
+    pub fn policy_load_input(
+        &self,
+        project_roots: Vec<PathBuf>,
+        launcher_path: PathBuf,
+    ) -> PolicyLoadInput {
+        PolicyLoadInput {
+            state_dir: self.state_dir.clone(),
+            project_roots,
+            inherited_path: self.path_env.clone().into(),
+            startup_environment: self.startup_environment.clone(),
+            codex_home: self.codex_home.clone(),
+            pueue_config: self.pueue_config.clone(),
+            launcher_path,
+        }
+    }
+
+    pub fn pin_to_policy(
+        mut self,
+        policy: &ResolvedExecutionPolicy,
+    ) -> Result<Self, AppError> {
+        self.state_dir = fs::canonicalize(&self.state_dir).map_err(|source| AppError::Io {
+            operation: "resolve service state directory",
+            source,
+        })?;
+        let verified_launcher = policy.launcher_anchor.verify_identity()?;
+        self.release_binary = verified_launcher.anchor.canonical_path;
+        self.execution_policy = self.state_dir.join("execution-policy.toml");
+        self.pueue_config = policy.pueue_config_anchor.canonical_path.clone();
+        self.codex_home = policy.codex_home.clone();
+        self.path_env = env::join_paths(&policy.trusted_path)
+            .map_err(|_| AppError::Configuration { field: "PATH" })?
+            .into_string()
+            .map_err(|_| AppError::Configuration { field: "PATH" })?;
+        Ok(self)
     }
 }
 
@@ -486,6 +547,7 @@ pub async fn enable_with(
 ) -> Result<(), AppError> {
     let config_path = options.project_root.join(".pueue-agent/config.toml");
     let project_config = config::load(&config_path)?;
+    validate_group(&project_config.pueue_group)?;
     register_project_if_needed(db, options, &config_path, &project_config)?;
 
     pueue.ensure_group(&project_config.pueue_group).await?;
@@ -541,6 +603,9 @@ Type=simple
 ExecStart={} daemon --foreground --pueue-config {}
 Environment={}
 Environment={}
+Environment={}
+Environment={}
+Environment={}
 WorkingDirectory={}
 Restart=on-failure
 RestartSec=5
@@ -554,6 +619,12 @@ WantedBy=default.target
         systemd_quote(&format!(
             "PUEUE_AGENT_STATE_DIR={}",
             paths.state_dir.display()
+        )),
+        systemd_quote(&format!("HOME={}", paths.home.display())),
+        systemd_quote(&format!("CODEX_HOME={}", paths.codex_home.display())),
+        systemd_quote(&format!(
+            "PUEUE_AGENT_EXECUTION_POLICY={}",
+            paths.execution_policy.display()
         )),
         systemd_quote(&paths.working_dir.display().to_string()),
     )
@@ -582,6 +653,12 @@ fn render_launchd(paths: &ServicePaths) -> String {
     <string>{}</string>
     <key>PUEUE_AGENT_STATE_DIR</key>
     <string>{}</string>
+    <key>HOME</key>
+    <string>{}</string>
+    <key>CODEX_HOME</key>
+    <string>{}</string>
+    <key>PUEUE_AGENT_EXECUTION_POLICY</key>
+    <string>{}</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>{}</string>
@@ -599,6 +676,9 @@ fn render_launchd(paths: &ServicePaths) -> String {
         xml_escape(&paths.pueue_config.display().to_string()),
         xml_escape(&paths.path_env),
         xml_escape(&paths.state_dir.display().to_string()),
+        xml_escape(&paths.home.display().to_string()),
+        xml_escape(&paths.codex_home.display().to_string()),
+        xml_escape(&paths.execution_policy.display().to_string()),
         xml_escape(&paths.working_dir.display().to_string()),
     )
 }

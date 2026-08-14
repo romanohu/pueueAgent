@@ -4,21 +4,24 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
+use async_trait::async_trait;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 
 use pueue_agent::{
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
     models::{AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject},
+    pueue::PueueError,
     service::{ServiceControl, ServiceDefinition, ServiceStatus},
     upgrade::{
         render_report, resolve_pueue_config, resolve_pueue_config_with_service,
         resolve_source_root, validate_checkout,
         validate_checkout_with, CheckoutState, GitCommandOutput, GitCommandRunner,
         UpgradeCommandOutput, UpgradeCommandRunner, UpgradeFailure, UpgradeReport, UpgradeRollback,
-        UpgradeRunner, UpgradeStep,
+        UpgradePueueHealth, UpgradeRunner, UpgradeStep,
     },
     AppError,
 };
@@ -109,6 +112,49 @@ fn pueue_config_resolution_uses_the_installed_service_before_the_default() {
     );
 }
 
+#[test]
+fn upgrade_has_no_ambient_pueue_binary_execution_path() {
+    let source = include_str!("../../src/upgrade.rs");
+    assert!(!source.contains("PUEUE_BINARY"));
+    assert!(!source.contains("Command::new(\"pueue\")"));
+}
+
+#[test]
+fn upgrade_command_does_not_open_the_mutable_database_before_the_runner() {
+    let source = include_str!("../../src/main.rs");
+    let upgrade_command = source
+        .split("pub async fn upgrade")
+        .nth(1)
+        .unwrap()
+        .split("fn upgrade_diagnostic_error")
+        .next()
+        .unwrap();
+
+    assert!(!upgrade_command.contains("Db::open("));
+    assert!(upgrade_command.contains("UpgradeRunner::new"));
+    assert!(upgrade_command.contains("state_db"));
+}
+
+fn state_artifacts(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let mut artifacts = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            let contents = if path.is_file() {
+                fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            (path, contents)
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+    artifacts
+}
+
 struct UpgradeFixture {
     temp: TempDir,
     source: PathBuf,
@@ -116,6 +162,7 @@ struct UpgradeFixture {
     db: Db,
     commands: FakeCommandRunner,
     service: FakeServiceRecorder,
+    pueue: FakePueue,
 }
 
 impl UpgradeFixture {
@@ -160,6 +207,7 @@ impl UpgradeFixture {
             db: db.clone(),
             commands: FakeCommandRunner::default(),
             service: FakeServiceRecorder::with_db(db.clone()),
+            pueue: FakePueue::default(),
         }
     }
 
@@ -191,43 +239,51 @@ impl UpgradeFixture {
 
     fn pueue_failure() -> Self {
         let fixture = Self::new();
-        fixture.commands.fail_pueue_status.set(true);
+        fixture
+            .pueue
+            .fail_on_call(1, FakePueueFailure::Unavailable);
+        fixture
+    }
+
+    fn post_restart_pueue_failure() -> Self {
+        let fixture = Self::new();
+        fixture.pueue.fail_on_call(2, FakePueueFailure::Timeout);
         fixture
     }
 
     fn pueue_invalid_status() -> Self {
         let fixture = Self::new();
-        fixture.commands.invalid_pueue_status.set(true);
+        fixture
+            .pueue
+            .fail_on_call(1, FakePueueFailure::InvalidJson);
         fixture
     }
 
     fn pueue_malformed_task_status() -> Self {
         let fixture = Self::new();
-        *fixture.commands.pueue_status_output.borrow_mut() =
-            Some(r#"{"tasks":{"42":null}}"#.to_owned());
+        fixture
+            .pueue
+            .fail_on_call(1, FakePueueFailure::InvalidTask);
         fixture
     }
 
     fn pueue_valid_task_status() -> Self {
-        let fixture = Self::new();
-        *fixture.commands.pueue_status_output.borrow_mut() = Some(
-            r#"{"tasks":{"42":{"id":42,"group":"pa-project","command":"echo ready","status":{"Running":{"enqueued_at":"2026-08-11T00:00:00Z","start":null}}}}}"#.to_owned(),
-        );
-        fixture
+        Self::new()
     }
 
     fn pueue_malformed_timestamp_status() -> Self {
         let fixture = Self::new();
-        *fixture.commands.pueue_status_output.borrow_mut() = Some(
-            r#"{"tasks":{"42":{"id":42,"group":"pa-project","command":"echo ready","status":{"Running":{"start":123}}}}}"#.to_owned(),
-        );
+        fixture
+            .pueue
+            .fail_on_call(1, FakePueueFailure::InvalidTimestamp);
         fixture
     }
 
     fn pueue_oversized_status() -> Self {
         let fixture = Self::new();
-        *fixture.commands.pueue_status_output.borrow_mut() =
-            Some(format!(r#"{{"tasks":{{}}}}{}"#, " ".repeat(1_100_000)));
+        fixture
+            .pueue
+            .fail_on_call(1, FakePueueFailure::OutputLimit);
         fixture
     }
 
@@ -270,8 +326,15 @@ impl UpgradeFixture {
     async fn run_upgrade(
         &self,
     ) -> Result<pueue_agent::upgrade::UpgradeReport, UpgradeFailure> {
-        UpgradeRunner::new(self.options(), &self.db, &self.service, &self.commands).run()
-            .await
+        UpgradeRunner::new(
+            self.options(),
+            self.db.path().to_path_buf(),
+            &self.service,
+            &self.commands,
+            &self.pueue,
+        )
+        .run()
+        .await
     }
 
     fn options(&self) -> pueue_agent::upgrade::UpgradeOptions {
@@ -281,8 +344,6 @@ impl UpgradeFixture {
             branch: "main".to_owned(),
             remote: "origin".to_owned(),
             release_binary: self.installed_binary.clone(),
-            pueue_binary: PathBuf::from("pueue"),
-            pueue_config: None,
             installed_revision: "old-revision".to_owned(),
         }
     }
@@ -293,9 +354,15 @@ impl UpgradeFixture {
     ) -> Result<pueue_agent::upgrade::UpgradeReport, UpgradeFailure> {
         let mut options = self.options();
         options.installed_revision = installed_revision.to_owned();
-        UpgradeRunner::new(options, &self.db, &self.service, &self.commands)
-            .run()
-            .await
+        UpgradeRunner::new(
+            options,
+            self.db.path().to_path_buf(),
+            &self.service,
+            &self.commands,
+            &self.pueue,
+        )
+        .run()
+        .await
     }
 
     fn make_noop(&self) {
@@ -398,6 +465,37 @@ impl UpgradeFixture {
     }
 }
 
+#[tokio::test]
+async fn pueue_preflight_failure_does_not_create_a_missing_database_parent() {
+    let temporary = TempDir::new().unwrap();
+    let database_path = temporary.path().join("missing-state/state.sqlite3");
+    let pueue = FakePueue::default();
+    pueue.fail_on_call(1, FakePueueFailure::Unavailable);
+    let service = FakeServiceRecorder::running();
+    let commands = FakeCommandRunner::default();
+    let options = pueue_agent::upgrade::UpgradeOptions {
+        source: Some(temporary.path().join("unused-source")),
+        json: false,
+        branch: "main".to_owned(),
+        remote: "origin".to_owned(),
+        release_binary: temporary.path().join("unused-binary"),
+        installed_revision: "old-revision".to_owned(),
+    };
+
+    let failure = UpgradeRunner::new(options, database_path.clone(), &service, &commands, &pueue)
+        .run()
+        .await
+        .unwrap_err();
+
+    assert!(failure.to_string().contains("Pueue preflight"));
+    assert_eq!(pueue.status_calls.load(Ordering::SeqCst), 1);
+    assert!(!database_path.exists());
+    assert!(!database_path.parent().unwrap().exists());
+    assert!(service.actions.borrow().is_empty());
+    assert!(commands.invocations.borrow().is_empty());
+    assert!(commands.command_invocations.borrow().is_empty());
+}
+
 struct ActiveRunPlan {
     db: Db,
     project_id: String,
@@ -441,14 +539,91 @@ impl ActiveRunPlan {
 }
 
 #[derive(Default)]
+struct FakePueue {
+    status_calls: AtomicU32,
+    failure_call: AtomicU32,
+    failure_kind: AtomicU32,
+}
+
+#[derive(Clone, Copy)]
+enum FakePueueFailure {
+    Unavailable = 1,
+    Timeout = 2,
+    InvalidJson = 3,
+    InvalidTask = 4,
+    InvalidTimestamp = 5,
+    OutputLimit = 6,
+}
+
+impl FakePueue {
+    fn fail_on_call(&self, call: u32, failure: FakePueueFailure) {
+        self.failure_kind.store(failure as u32, Ordering::SeqCst);
+        self.failure_call.store(call, Ordering::SeqCst);
+    }
+
+    fn clear_failure(&self) {
+        self.failure_call.store(0, Ordering::SeqCst);
+    }
+
+    fn failure(&self) -> AppError {
+        match self.failure_kind.load(Ordering::SeqCst) {
+            value if value == FakePueueFailure::Timeout as u32 => {
+                AppError::Pueue(PueueError::Timeout {
+                    operation: "status",
+                })
+            }
+            value if value == FakePueueFailure::InvalidJson as u32 => {
+                AppError::Pueue(PueueError::InvalidStatusJson {
+                    source: serde_json::from_str::<serde_json::Value>("not-json").unwrap_err(),
+                })
+            }
+            value if value == FakePueueFailure::InvalidTask as u32 => {
+                AppError::Pueue(PueueError::InvalidStatusTask {
+                    reason: "task is not an object",
+                })
+            }
+            value if value == FakePueueFailure::InvalidTimestamp as u32 => {
+                AppError::Pueue(PueueError::InvalidStatusTask {
+                    reason: "task status timestamp is invalid",
+                })
+            }
+            value if value == FakePueueFailure::OutputLimit as u32 => {
+                AppError::Pueue(PueueError::OutputLimit {
+                    operation: "status",
+                    stream: "stdout",
+                })
+            }
+            _ => AppError::Message {
+                message: "fixture Pueue unavailable".to_owned(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl UpgradePueueHealth for FakePueue {
+    async fn check_status(&self) -> Result<(), AppError> {
+        let call = self.status_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.failure_call.load(Ordering::SeqCst) {
+            return Err(self.failure());
+        }
+        Ok(())
+    }
+}
+
+fn accepts_upgrade_health<P: UpgradePueueHealth>(_health: &P) {}
+
+#[test]
+fn upgrade_fake_preserves_the_health_provider_contract() {
+    accepts_upgrade_health(&FakePueue::default());
+}
+
+#[derive(Default)]
 struct FakeCommandRunner {
     invocations: RefCell<Vec<Vec<String>>>,
     command_invocations: RefCell<Vec<(String, Vec<String>)>>,
     fail_tests: Cell<bool>,
     fail_build: Cell<bool>,
-    fail_pueue_status: Cell<bool>,
-    invalid_pueue_status: Cell<bool>,
-    pueue_status_output: RefCell<Option<String>>,
     fail_fetch: Cell<bool>,
     fetch_stderr: RefCell<String>,
     build_stderr: RefCell<String>,
@@ -562,20 +737,6 @@ impl UpgradeCommandRunner for FakeCommandRunner {
                 Ok(UpgradeCommandOutput::success())
             }
             ("cargo", Some("test")) => Ok(UpgradeCommandOutput::success()),
-            ("pueue", Some("status")) if self.fail_pueue_status.get() => {
-                Ok(UpgradeCommandOutput::failure("Pueue unavailable"))
-            }
-            ("pueue", Some("status")) if self.invalid_pueue_status.get() => {
-                Ok(UpgradeCommandOutput::success_with_stdout("not Pueue JSON"))
-            }
-            ("pueue", Some("status")) if self.pueue_status_output.borrow().is_some() => {
-                Ok(UpgradeCommandOutput::success_with_stdout(
-                    self.pueue_status_output.borrow().as_deref().unwrap(),
-                ))
-            }
-            ("pueue", Some("status")) => {
-                Ok(UpgradeCommandOutput::success_with_stdout(r#"{"tasks":{}}"#))
-            }
             _ => panic!("unexpected upgrade command: {program} {arguments:?}"),
         }
     }
@@ -918,6 +1079,7 @@ async fn successful_upgrade_fast_forwards_builds_installs_and_checks_health() {
     assert_eq!(report.rollback, UpgradeRollback::NotRequired);
     assert_eq!(fixture.installed_binary(), UpgradeFixture::new_binary_bytes());
     assert_eq!(fixture.service_calls(), ["stop", "restart"]);
+    assert_eq!(fixture.pueue.status_calls.load(Ordering::SeqCst), 2);
     assert!(fixture.database_backups().is_empty());
     assert!(fixture.commands.invocations.borrow().iter().any(|arguments| {
         arguments == &vec!["merge".to_owned(), "--ff-only".to_owned(), "origin/main".to_owned()]
@@ -952,13 +1114,24 @@ async fn successful_upgrade_fast_forwards_builds_installs_and_checks_health() {
         .filter(|(program, _)| program == "pueue")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(
-        pueue_commands,
-        vec![(
-            "pueue".to_owned(),
-            vec!["status".to_owned(), "--json".to_owned()]
-        )]
-    );
+    assert!(pueue_commands.is_empty());
+}
+
+#[tokio::test]
+async fn pueue_preflight_failure_happens_before_upgrade_mutation_or_install() {
+    let fixture = UpgradeFixture::pueue_failure();
+    let state_before = state_artifacts(fixture.state_dir());
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("Pueue"));
+    assert_eq!(fixture.pueue.status_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+    assert!(fixture.service_calls().is_empty());
+    assert!(fixture.commands.command_invocations.borrow().is_empty());
+    assert!(fixture.commands.invocations.borrow().is_empty());
+    assert!(!fixture.retry_marker().exists());
+    assert_eq!(state_artifacts(fixture.state_dir()), state_before);
 }
 
 #[tokio::test]
@@ -1067,6 +1240,24 @@ async fn service_health_failure_restores_previous_binary() {
 }
 
 #[tokio::test]
+async fn post_restart_pueue_failure_restores_binary_database_and_service() {
+    let fixture = UpgradeFixture::post_restart_pueue_failure();
+    fixture.set_database_marker("old");
+    fixture.service.mutate_database_on_first_restart();
+
+    let failure = fixture.run_upgrade().await.unwrap_err();
+
+    assert!(failure.to_string().contains("Pueue"));
+    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert_eq!(fixture.pueue.status_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
+    assert_eq!(fixture.database_marker(), "old");
+    assert_eq!(fixture.service_calls(), ["stop", "restart", "stop", "restart"]);
+    assert!(fixture.retry_marker().exists());
+    assert!(fixture.database_backups().is_empty());
+}
+
+#[tokio::test]
 async fn snapshot_is_created_after_the_service_is_quiesced_and_rollback_restores_both_states() {
     let fixture = UpgradeFixture::service_failure();
     fixture.set_database_marker("old");
@@ -1134,24 +1325,16 @@ async fn candidate_rename_failure_restarts_the_unchanged_service() {
 }
 
 #[tokio::test]
-async fn pueue_health_failure_restores_previous_binary_without_touching_experiment_tasks() {
+async fn pueue_health_failure_prevents_install_without_touching_experiment_tasks() {
     let fixture = UpgradeFixture::pueue_failure();
 
     let failure = fixture.run_upgrade().await.unwrap_err();
 
-    assert!(failure.to_string().contains("rollback"));
-    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert!(failure.to_string().contains("Pueue"));
+    assert!(failure.report().is_none());
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["stop", "restart", "stop", "restart"]);
-    assert!(fixture
-        .commands
-        .command_invocations
-        .borrow()
-        .iter()
-        .filter(|(program, _)| program == "pueue")
-        .all(|(_, arguments)| {
-            arguments == &vec!["status".to_owned(), "--json".to_owned()]
-        }));
+    assert!(fixture.service_calls().is_empty());
+    assert!(fixture.commands.command_invocations.borrow().is_empty());
 }
 
 #[tokio::test]
@@ -1255,13 +1438,13 @@ async fn failed_post_fast_forward_upgrade_is_retried_for_the_pending_revision() 
 }
 
 #[tokio::test]
-async fn failed_post_install_health_check_is_retried_for_the_pending_revision() {
+async fn failed_pueue_preflight_can_be_retried_without_a_pending_revision() {
     let fixture = UpgradeFixture::pueue_failure();
 
     fixture.run_upgrade().await.unwrap_err();
-    assert!(fixture.retry_marker().exists());
+    assert!(!fixture.retry_marker().exists());
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    fixture.commands.fail_pueue_status.set(false);
+    fixture.pueue.clear_failure();
 
     let report = fixture.run_upgrade().await.unwrap();
 
@@ -1300,25 +1483,25 @@ async fn build_failure_stderr_is_bounded_and_redacted() {
 }
 
 #[tokio::test]
-async fn invalid_pueue_status_json_triggers_rollback() {
+async fn invalid_pueue_status_json_is_rejected_before_install() {
     let fixture = UpgradeFixture::pueue_invalid_status();
 
     let failure = fixture.run_upgrade().await.unwrap_err();
 
     assert!(failure.to_string().contains("Pueue"));
-    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert!(failure.report().is_none());
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
-    assert_eq!(fixture.service_calls(), ["stop", "restart", "stop", "restart"]);
+    assert!(fixture.service_calls().is_empty());
 }
 
 #[tokio::test]
-async fn malformed_pueue_task_entry_triggers_rollback() {
+async fn malformed_pueue_task_entry_is_rejected_before_install() {
     let fixture = UpgradeFixture::pueue_malformed_task_status();
 
     let failure = fixture.run_upgrade().await.unwrap_err();
 
     assert!(failure.to_string().contains("Pueue"));
-    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert!(failure.report().is_none());
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
 }
 
@@ -1333,25 +1516,25 @@ async fn pueue_task_status_shape_used_by_the_adapter_is_healthy() {
 }
 
 #[tokio::test]
-async fn malformed_pueue_timestamp_triggers_rollback() {
+async fn malformed_pueue_timestamp_is_rejected_before_install() {
     let fixture = UpgradeFixture::pueue_malformed_timestamp_status();
 
     let failure = fixture.run_upgrade().await.unwrap_err();
 
     assert!(failure.to_string().contains("Pueue"));
-    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert!(failure.report().is_none());
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
 }
 
 #[tokio::test]
-async fn oversized_pueue_status_triggers_rollback_without_retaining_output() {
+async fn oversized_pueue_status_is_rejected_before_install_without_retaining_output() {
     let fixture = UpgradeFixture::pueue_oversized_status();
 
     let failure = fixture.run_upgrade().await.unwrap_err();
 
     assert!(failure.to_string().contains("Pueue"));
     assert!(failure.to_string().len() < 600);
-    assert_eq!(failure.report().unwrap().rollback, UpgradeRollback::Succeeded);
+    assert!(failure.report().is_none());
     assert_eq!(fixture.installed_binary(), UpgradeFixture::old_binary_bytes());
 }
 

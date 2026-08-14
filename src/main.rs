@@ -84,7 +84,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 }
 
 mod commands {
-    use std::{env, ffi::OsString, path::PathBuf, sync::Arc};
+    use std::{env, path::PathBuf, sync::Arc};
 
     use pueue_agent::{
         agent::{AgentRunner, AgentRunnerConfig},
@@ -103,19 +103,25 @@ mod commands {
             DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
         },
         events::{record_callback, record_operator_wake_with, CallbackMetadata},
-        execution_policy::{load_existing_policy, PolicyLoadInput, StartupEnvironment},
+        execution_policy::{
+            load_existing_policy, load_or_create_policy, ResolvedExecutionPolicy,
+        },
         interventions::{validate_message, InterventionStatus, MAX_INTERVENTIONS_PER_RUN},
         models::Project,
         output::{bounded_redacted_text, format_state, human_header, human_summary},
         paths, project,
-        pueue::{CommandPueue, PueueApi},
+        pueue::{configured_pueue, PueueApi},
         service::{
-            enable_with, CallbackRegistry, EnableOptions, PueueConfigCallbackRegistry,
-            ServiceControl, ServiceManager, ServicePaths, ServiceStatus,
+            enable_with, installed_pueue_config, CallbackRegistry, EnableOptions,
+            PueueConfigCallbackRegistry, ServiceControl, ServiceManager, ServicePaths,
+            ServiceStatus,
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
         submit as submit_command,
-        upgrade::{self, resolve_source_root, ProcessUpgradeCommandRunner, UpgradeRunner},
+        upgrade::{
+            self, resolve_source_root, ProcessUpgradeCommandRunner, ReloadingPueueHealth,
+            UpgradeRunner,
+        },
         version::{self, BuildInfo},
         AppError,
     };
@@ -144,27 +150,32 @@ mod commands {
             None => project::find_root(&current_dir)?,
         };
         let service_paths = ServicePaths::from_environment(&project_root, args.pueue_config)?;
-        let db = Db::open(&paths::state_db_path()?)?;
+        let _ = pueue_agent::config::load(&project_root.join(".pueue-agent/config.toml"))?;
+        let state_db = paths::state_db_path()?;
+        let mut project_roots = registered_roots_if_present(&state_db)?;
+        if !project_roots.iter().any(|root| root == &project_root) {
+            project_roots.push(project_root.clone());
+        }
+        let policy = Arc::new(load_or_create_policy(&service_paths.policy_load_input(
+            project_roots,
+            current_launcher_path()?,
+        ))?);
+        let pueue = configured_pueue(Arc::clone(&policy))?;
+        let service_paths = service_paths.pin_to_policy(&policy)?;
+        let db = Db::open(&state_db)?;
         let options = EnableOptions {
             project_root,
             service_paths: service_paths.clone(),
             now: unix_timestamp()?,
         };
         let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
-        let pueue = CommandPueue::new(
-            "pueue",
-            vec![
-                OsString::from("--config"),
-                OsString::from(service_paths.pueue_config.as_os_str()),
-            ],
-        );
         enable_with(&db, &options, &ServiceManager, &callbacks, &pueue).await
     }
 
     pub async fn disable(args: DisableArgs) -> Result<(), AppError> {
-        let (db, project, service_paths) =
+        let (db, project, _service_paths, policy) =
             resolve_project(args.project_root, args.pueue_config.clone())?;
-        let pueue = configured_pueue(&service_paths);
+        let pueue = configured_pueue(policy)?;
         let tasks = match pueue.status_json().await {
             Ok(tasks) => tasks,
             Err(error) if args.remove => return Err(error),
@@ -208,8 +219,9 @@ mod commands {
             pueue_config,
             project_root,
         } = args;
-        let (db, project, service_paths) = resolve_project(project_root, pueue_config)?;
-        let pueue = configured_pueue(&service_paths);
+        let (db, project, _service_paths, policy) =
+            resolve_project(project_root, pueue_config)?;
+        let pueue = configured_pueue(policy)?;
         let result = cancel_task_with(&db, &project, &pueue, task_id, unix_timestamp()?).await?;
         println!("{}", render_cancel_result(&project, &result, json));
         Ok(())
@@ -222,8 +234,9 @@ mod commands {
             json,
             compact,
         } = args;
-        let (db, project, service_paths) = resolve_project_read_only(project_root, pueue_config)?;
-        let pueue = configured_pueue(&service_paths);
+        let (db, project, _service_paths, policy) =
+            resolve_project_read_only(project_root, pueue_config)?;
+        let pueue = configured_pueue(policy)?;
         let pueue = match pueue.status_json().await {
             Ok(tasks) => PueueSnapshot::Tasks(tasks),
             Err(error) => PueueSnapshot::Error(error.render()),
@@ -245,7 +258,8 @@ mod commands {
 
     pub fn events(args: EventsArgs) -> Result<(), AppError> {
         let limit = validate_event_limit(args.limit)?;
-        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) =
+            resolve_project_read_only(args.project_root, args.pueue_config)?;
         let filter = EventFilter::new(args.kind, args.status, limit);
         println!("{}", render_events(&db, &project, &filter, args.json)?);
         Ok(())
@@ -253,7 +267,8 @@ mod commands {
 
     pub async fn runs(args: RunsArgs) -> Result<(), AppError> {
         let limit = pueue_agent::runs::validate_limit(args.limit)?;
-        let (db, project, _) = resolve_project_read_only(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) =
+            resolve_project_read_only(args.project_root, args.pueue_config)?;
         if args.follow {
             return pueue_agent::runs::follow_runs(db.path(), &project, limit, args.json).await;
         }
@@ -265,7 +280,8 @@ mod commands {
     }
 
     pub fn inspect(args: InspectArgs) -> Result<(), AppError> {
-        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) =
+            resolve_project_read_only(args.project_root, args.pueue_config)?;
         println!(
             "{}",
             render_task_inspection(&db, &project, args.task_id, args.json)?
@@ -274,7 +290,8 @@ mod commands {
     }
 
     pub fn explain(args: ExplainArgs) -> Result<(), AppError> {
-        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) =
+            resolve_project_read_only(args.project_root, args.pueue_config)?;
         println!(
             "{}",
             render_incident_explanation(&db, &project, args.incident_id, args.json)?
@@ -283,9 +300,9 @@ mod commands {
     }
 
     pub async fn doctor(args: DoctorArgs) -> Result<(), AppError> {
-        let (db, project, service_paths) =
+        let (db, project, service_paths, policy) =
             resolve_project_read_only(args.project_root, args.pueue_config)?;
-        let pueue = configured_pueue(&service_paths);
+        let pueue = configured_pueue(policy)?;
         let callbacks = PueueConfigCallbackRegistry::new(&service_paths.pueue_config);
         let external = DoctorExternal {
             pueue: pueue.status_json().await.map_err(|error| error.render()),
@@ -316,12 +333,9 @@ mod commands {
             source,
         })?;
         let project_root = project::find_root(&current_dir)?;
-        let db = Db::open(&paths::state_db_path()?)?;
-        let registered = ProjectRepository::new(&db)
-            .find_by_root(&project_root)?
-            .ok_or(AppError::Runtime {
-                operation: "submit for an unregistered project",
-            })?;
+        let (db, registered, _service_paths, policy) =
+            resolve_project(Some(project_root.clone()), None)?;
+        let pueue = configured_pueue(policy)?;
         let options = submit_command::SubmitOptions::new(
             kind,
             submit_command::load_metadata(metadata.as_deref(), metadata_json.as_deref())?,
@@ -332,7 +346,7 @@ mod commands {
             &project_root,
             &command,
             &options,
-            &CommandPueue::default(),
+            &pueue,
         )
         .await?;
         println!(
@@ -343,8 +357,8 @@ mod commands {
     }
 
     pub async fn submit_batch(args: SubmitBatchArgs) -> Result<(), AppError> {
-        let (db, project, service_paths) = resolve_project(args.project_root, None)?;
-        let pueue = configured_pueue(&service_paths);
+        let (db, project, _service_paths, policy) = resolve_project(args.project_root, None)?;
+        let pueue = configured_pueue(policy)?;
         let batch = pueue_agent::batches::run_with(
             &db,
             &project.root_path,
@@ -384,14 +398,14 @@ mod commands {
     }
 
     pub fn pause(args: ProjectArgs) -> Result<(), AppError> {
-        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
         let project = status_command::pause_project(&db, &project.project_id, unix_timestamp()?)?;
         println!("paused: {}", bounded_redacted_text(&project.project_id));
         Ok(())
     }
 
     pub fn resume(args: ProjectArgs) -> Result<(), AppError> {
-        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
         let project = status_command::resume_project(&db, &project.project_id, unix_timestamp()?)?;
         println!("resumed: {}", bounded_redacted_text(&project.project_id));
         Ok(())
@@ -405,10 +419,10 @@ mod commands {
             pueue_config,
             project_root,
         } = args;
-        let (db, project, _) = resolve_project(project_root, pueue_config)?;
-
         match action {
             Some(SteerAction::List(_)) => {
+                let (db, project, _, _) =
+                    resolve_project_read_only(project_root, pueue_config)?;
                 let interventions = InterventionRepository::new(&db).list(
                     &project.project_id,
                     InterventionStatus::Pending,
@@ -447,6 +461,7 @@ mod commands {
                 }
             }
             None => {
+                let (db, project, _, _) = resolve_project(project_root, pueue_config)?;
                 let message = message.join(" ");
                 validate_message(&message)?;
                 let intervention = InterventionRepository::new(&db).insert_pending(
@@ -474,7 +489,7 @@ mod commands {
     }
 
     pub fn wake(args: WakeArgs) -> Result<(), AppError> {
-        let (db, project, _) = resolve_project(args.project_root, args.pueue_config)?;
+        let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
         let event_id =
             record_operator_wake_with(&db, &project.project_id, &args.reason, unix_timestamp()?)?;
         if args.json {
@@ -500,12 +515,42 @@ mod commands {
 
     pub async fn upgrade(args: UpgradeArgs) -> Result<(), AppError> {
         let json = args.json;
+        let home = env::var_os("HOME").map(PathBuf::from);
+        let environment_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
+        let installed_service_pueue_config = home
+            .as_deref()
+            .and_then(installed_pueue_config);
+        let pueue_config = upgrade::resolve_pueue_config_with_service(
+            args.pueue_config.as_deref(),
+            environment_pueue_config.as_deref(),
+            installed_service_pueue_config.as_deref(),
+            home.as_deref(),
+        );
         let current_exe = env::current_exe()
             .map_err(|source| AppError::Io {
                 operation: "resolve current executable for upgrade",
                 source,
             })
             .map_err(upgrade_diagnostic_error)?;
+        let state_db = paths::state_db_path().map_err(upgrade_diagnostic_error)?;
+        let working_dir = env::current_dir()
+            .map_err(|source| AppError::Io {
+                operation: "read upgrade working directory",
+                source,
+            })
+            .map_err(upgrade_diagnostic_error)?;
+        let service_paths = ServicePaths::from_environment(&working_dir, pueue_config)
+            .map_err(upgrade_diagnostic_error)?;
+        let project_roots = registered_roots_if_present(&state_db)
+            .map_err(upgrade_diagnostic_error)?;
+        let policy_input = service_paths.policy_load_input(project_roots, current_exe.clone());
+        let policy = Arc::new(
+            load_existing_policy(&policy_input).map_err(upgrade_diagnostic_error)?,
+        );
+        let service_paths = service_paths
+            .pin_to_policy(&policy)
+            .map_err(upgrade_diagnostic_error)?;
+        let pueue_health = ReloadingPueueHealth::new(policy_input);
         let env_source = env::var_os(upgrade::SOURCE_ROOT_ENV).map(PathBuf::from);
         let source = resolve_source_root(
             args.source.as_deref(),
@@ -515,11 +560,13 @@ mod commands {
         .map_err(upgrade_diagnostic_error)?;
         let mut options = upgrade::UpgradeOptions::from_args(args);
         options.source = Some(source);
-        let state_db = paths::state_db_path().map_err(upgrade_diagnostic_error)?;
-        let db = Db::open(&state_db).map_err(upgrade_diagnostic_error)?;
+        options.release_binary = service_paths.release_binary;
         let service = ServiceManager;
         let commands = ProcessUpgradeCommandRunner;
-        match UpgradeRunner::new(options, &db, &service, &commands).run().await {
+        match UpgradeRunner::new(options, state_db, &service, &commands, &pueue_health)
+            .run()
+            .await
+        {
             Ok(report) => {
                 println!("{}", upgrade::render_report(&report, json)?);
                 Ok(())
@@ -562,52 +609,24 @@ mod commands {
 
     pub async fn daemon(args: DaemonArgs) -> Result<(), AppError> {
         let state_db = paths::state_db_path()?;
-        let db = Db::open(&state_db)?;
-        let projects = ProjectRepository::new(&db).list_all()?;
-        let project_roots = projects
-            .iter()
-            .map(|project| project.root_path.clone())
-            .collect::<Vec<_>>();
-        let state_dir = state_db
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .ok_or(AppError::Configuration {
-                field: "state_db_path",
-            })?;
-        let pueue_config = match args.pueue_config.clone() {
-            Some(path) => path,
-            None => {
-                let home = env::var_os("HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .ok_or(AppError::Configuration { field: "HOME" })?;
-                home.join(".config/pueue/pueue.yml")
-            }
-        };
-        let policy = Arc::new(load_existing_policy(&PolicyLoadInput {
-            state_dir,
+        let working_dir = env::current_dir().map_err(|source| AppError::Io {
+            operation: "read daemon working directory",
+            source,
+        })?;
+        let service_paths = ServicePaths::from_environment(&working_dir, args.pueue_config)?;
+        let project_roots = registered_roots_if_present(&state_db)?;
+        let policy = Arc::new(load_or_create_policy(&service_paths.policy_load_input(
             project_roots,
-            inherited_path: env::var_os("PATH").ok_or(AppError::Configuration {
-                field: "PATH",
-            })?,
-            startup_environment: StartupEnvironment::capture(),
-            codex_home: pueue_agent::codex_session::home_from_environment()?,
-            pueue_config,
-            launcher_path: env::current_exe().map_err(|source| AppError::Io {
-                operation: "resolve daemon launcher",
-                source,
-            })?,
-        })?);
-        let fixed_args = args
-            .pueue_config
-            .as_ref()
-            .map(|path| vec![OsString::from("--config"), OsString::from(path.as_os_str())])
-            .unwrap_or_default();
-        let pueue = CommandPueue::new("pueue", fixed_args);
+            current_launcher_path()?,
+        ))?);
+        let pueue = configured_pueue(Arc::clone(&policy))?;
+        let db = Db::open(&state_db)?;
+        let runner = AgentRunner::new(AgentRunnerConfig::production(), Arc::clone(&policy));
         let mut daemon = Daemon::new(
             db,
             pueue,
-            AgentRunner::new(AgentRunnerConfig::production(), policy),
+            policy,
+            runner,
             DaemonConfig::default(),
         );
         daemon.run(production_shutdown_token()).await
@@ -650,7 +669,7 @@ mod commands {
     fn resolve_project(
         project_root: Option<std::path::PathBuf>,
         pueue_config: Option<std::path::PathBuf>,
-    ) -> Result<(Db, Project, ServicePaths), AppError> {
+    ) -> Result<(Db, Project, ServicePaths, Arc<ResolvedExecutionPolicy>), AppError> {
         let current_dir = env::current_dir().map_err(|source| AppError::Io {
             operation: "read current directory",
             source,
@@ -660,19 +679,32 @@ mod commands {
             None => project::find_root(&current_dir)?,
         };
         let service_paths = ServicePaths::from_environment(&project_root, pueue_config)?;
-        let db = Db::open(&paths::state_db_path()?)?;
-        let project = ProjectRepository::new(&db)
+        let state_db = paths::state_db_path()?;
+        let read_db = Db::open_read_only(&state_db)?;
+        let project = ProjectRepository::new(&read_db)
             .find_by_root(&project_root)?
             .ok_or(AppError::Runtime {
                 operation: "find registered project",
             })?;
-        Ok((db, project, service_paths))
+        let project_roots = ProjectRepository::new(&read_db)
+            .list_all()?
+            .into_iter()
+            .map(|registered| registered.root_path)
+            .collect();
+        let policy = Arc::new(load_existing_policy(&service_paths.policy_load_input(
+            project_roots,
+            current_launcher_path()?,
+        ))?);
+        let service_paths = service_paths.pin_to_policy(&policy)?;
+        drop(read_db);
+        let db = Db::open(&state_db)?;
+        Ok((db, project, service_paths, policy))
     }
 
     fn resolve_project_read_only(
         project_root: Option<std::path::PathBuf>,
         pueue_config: Option<std::path::PathBuf>,
-    ) -> Result<(Db, Project, ServicePaths), AppError> {
+    ) -> Result<(Db, Project, ServicePaths, Arc<ResolvedExecutionPolicy>), AppError> {
         let current_dir = env::current_dir().map_err(|source| AppError::Io {
             operation: "read current directory",
             source,
@@ -688,17 +720,36 @@ mod commands {
             .ok_or(AppError::Runtime {
                 operation: "find registered project",
             })?;
-        Ok((db, project, service_paths))
+        let project_roots = ProjectRepository::new(&db)
+            .list_all()?
+            .into_iter()
+            .map(|registered| registered.root_path)
+            .collect();
+        let policy = Arc::new(load_existing_policy(&service_paths.policy_load_input(
+            project_roots,
+            current_launcher_path()?,
+        ))?);
+        let service_paths = service_paths.pin_to_policy(&policy)?;
+        Ok((db, project, service_paths, policy))
     }
 
-    fn configured_pueue(service_paths: &ServicePaths) -> CommandPueue {
-        CommandPueue::new(
-            "pueue",
-            vec![
-                OsString::from("--config"),
-                OsString::from(service_paths.pueue_config.as_os_str()),
-            ],
-        )
+    fn registered_roots_if_present(state_db: &std::path::Path) -> Result<Vec<PathBuf>, AppError> {
+        if !state_db.is_file() {
+            return Ok(Vec::new());
+        }
+        let db = Db::open_read_only(state_db)?;
+        Ok(ProjectRepository::new(&db)
+            .list_all()?
+            .into_iter()
+            .map(|project| project.root_path)
+            .collect())
+    }
+
+    fn current_launcher_path() -> Result<PathBuf, AppError> {
+        env::current_exe().map_err(|source| AppError::Io {
+            operation: "resolve command launcher",
+            source,
+        })
     }
 
     fn validate_event_limit(limit: usize) -> Result<usize, AppError> {

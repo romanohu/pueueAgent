@@ -6,6 +6,9 @@ mod native_process_fixture;
 
 use std::{ffi::OsString, fs, path::PathBuf};
 
+#[cfg(all(unix, debug_assertions))]
+use std::process::Command;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -19,7 +22,7 @@ use pueue_agent::{
         AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
         Submission, SubmissionKind, SubmissionStatus,
     },
-    pueue::{CommandPueue, PueueApi, PueueError, PueueTask},
+    pueue::{configured_pueue, PueueApi, PueueError, PueueTask},
     pueue_security::validate_group,
     submit, AppError,
 };
@@ -36,9 +39,82 @@ use pueue_agent::execution_policy::{
 use serde_json::json;
 use tempfile::TempDir;
 
+fn accepts_api<P: PueueApi>(_api: &P) {}
+
+#[test]
+fn shared_fake_preserves_the_pueue_api_contract() {
+    accepts_api(&FakePueue::new());
+}
+
+#[test]
+fn pueue_process_runner_has_a_fail_closed_non_unix_contract() {
+    let source = include_str!("../../src/pueue_process.rs");
+    assert!(source.contains("#[cfg(not(unix))]\n    pub(crate) async fn run_with_environment"));
+    assert!(source.contains("operation: \"run verified Pueue on this platform\""));
+}
+
 #[cfg(all(unix, debug_assertions))]
 static NATIVE_PROCESS_FIXTURE_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn configured_adapter_uses_only_the_startup_pinned_pueue_and_config_descriptor() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::new(NativeBehavior::ExactLimitSuccess);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    adapter.kill(41).await.unwrap();
+
+    assert_eq!(
+        fixture.captured_argv().await,
+        vec![
+            b"--config".to_vec(),
+            b"/dev/fd/9".to_vec(),
+            b"kill".to_vec(),
+            b"41".to_vec(),
+        ]
+    );
+    assert_eq!(fixture.captured_config().await, b"fixture-config-fd9\n");
+    fixture.wait_for_processes_gone().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn ambient_path_replacement_cannot_override_the_pinned_pueue_executable() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let ambient = TempDir::new().unwrap();
+    let marker = ambient.path().join("ambient-pueue-ran");
+    let source = ambient.path().join("replacement.rs");
+    fs::write(
+        &source,
+        format!("fn main() {{ std::fs::write({:?}, b\"ran\").unwrap(); }}", marker),
+    )
+    .unwrap();
+    let replacement = ambient.path().join("pueue");
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-O", "-o"])
+        .arg(&replacement)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = NativeFakePueue::new_with_ambient_path(
+        NativeBehavior::ExactLimitSuccess,
+        Some(ambient.path()),
+    );
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    adapter.kill(41).await.unwrap();
+
+    assert!(!marker.exists());
+    assert_eq!(
+        fixture.captured_argv().await.first(),
+        Some(&b"--config".to_vec())
+    );
+    fixture.wait_for_processes_gone().await;
+}
 
 const STATUS_JSON: &str = r#"{
   "tasks": {
@@ -571,7 +647,7 @@ fn pueue_config_anchor_rejects_weak_mode_and_project_root_config() {
 #[tokio::test]
 async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
     let add_args = [
         OsString::from("-g"),
         OsString::from("pa-project"),
@@ -589,7 +665,7 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
         fixture.captured_args(),
         vec![
             "--config",
-            "profile path.yml",
+            "/dev/fd/9",
             "add",
             "--print-task-id",
             "-g",
@@ -610,13 +686,13 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
 #[tokio::test]
 async fn command_adapter_kills_only_the_requested_task_id() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     adapter.kill(41).await.unwrap();
 
     assert_eq!(
         fixture.captured_args(),
-        vec!["--config", "profile path.yml", "kill", "41"]
+        vec!["--config", "/dev/fd/9", "kill", "41"]
             .into_iter()
             .map(OsString::from)
             .collect::<Vec<_>>()
@@ -626,13 +702,13 @@ async fn command_adapter_kills_only_the_requested_task_id() {
 #[tokio::test]
 async fn command_adapter_removes_only_the_requested_task_id() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     adapter.remove(41).await.unwrap();
 
     assert_eq!(
         fixture.captured_args(),
-        vec!["--config", "profile path.yml", "remove", "41"]
+        vec!["--config", "/dev/fd/9", "remove", "41"]
             .into_iter()
             .map(OsString::from)
             .collect::<Vec<_>>()
@@ -642,10 +718,10 @@ async fn command_adapter_removes_only_the_requested_task_id() {
 #[tokio::test]
 async fn command_adapter_provisions_group_without_shell() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     adapter
-        .ensure_group("pa-project with spaces")
+        .ensure_group("pa-project")
         .await
         .unwrap();
 
@@ -653,10 +729,10 @@ async fn command_adapter_provisions_group_without_shell() {
         fixture.captured_args(),
         vec![
             "--config",
-            "profile path.yml",
+            "/dev/fd/9",
             "group",
             "add",
-            "pa-project with spaces",
+            "pa-project",
         ]
         .into_iter()
         .map(OsString::from)
@@ -665,23 +741,40 @@ async fn command_adapter_provisions_group_without_shell() {
 }
 
 #[tokio::test]
+async fn command_adapter_rejects_invalid_group_before_pueue_execution() {
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    let error = adapter.ensure_group("pa project").await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "pueue_group",
+            ..
+        }
+    ));
+    assert!(fixture.captured_invocations().is_empty());
+}
+
+#[tokio::test]
 async fn command_adapter_skips_group_add_when_group_already_exists() {
     let fixture = FakePueueCommand::new_with_group_lists(
         STATUS_JSON,
         "73\n",
-        &[r#"{"default":{"parallel_tasks":1},"pa-project with spaces":{"parallel_tasks":1}}"#],
+        &[r#"{"default":{"parallel_tasks":1},"pa-project":{"parallel_tasks":1}}"#],
         None,
     );
-    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     adapter
-        .ensure_group("pa-project with spaces")
+        .ensure_group("pa-project")
         .await
         .unwrap();
 
     assert_eq!(
         fixture.captured_invocations(),
-        vec![vec!["--config", "profile path.yml", "group", "-j"]
+        vec![vec!["--config", "/dev/fd/9", "group", "-j"]
             .into_iter()
             .map(OsString::from)
             .collect::<Vec<_>>()]
@@ -696,26 +789,26 @@ async fn command_adapter_adds_missing_group_after_json_list_check() {
         &[r#"{"default":{"parallel_tasks":1}}"#],
         None,
     );
-    let adapter = CommandPueue::new(fixture.executable(), ["--config", "profile path.yml"]);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     adapter
-        .ensure_group("pa-project with spaces")
+        .ensure_group("pa-project")
         .await
         .unwrap();
 
     assert_eq!(
         fixture.captured_invocations(),
         vec![
-            vec!["--config", "profile path.yml", "group", "-j"]
+            vec!["--config", "/dev/fd/9", "group", "-j"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>(),
             vec![
                 "--config",
-                "profile path.yml",
+                "/dev/fd/9",
                 "group",
                 "add",
-                "pa-project with spaces",
+                "pa-project",
             ]
             .into_iter()
             .map(OsString::from)
@@ -735,22 +828,22 @@ async fn command_adapter_treats_racing_group_add_as_success_when_group_appears()
         ],
         Some("group-add"),
     );
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     adapter.ensure_group("pa-project").await.unwrap();
 
     assert_eq!(
         fixture.captured_invocations(),
         vec![
-            vec!["group", "-j"]
+            vec!["--config", "/dev/fd/9", "group", "-j"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>(),
-            vec!["group", "add", "pa-project"]
+            vec!["--config", "/dev/fd/9", "group", "add", "pa-project"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>(),
-            vec!["group", "-j"]
+            vec!["--config", "/dev/fd/9", "group", "-j"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
@@ -766,7 +859,7 @@ async fn command_adapter_preserves_group_add_error_when_group_remains_absent() {
         &[r#"{"default":{"parallel_tasks":1}}"#],
         Some("group-add"),
     );
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let error = adapter.ensure_group("pa-project").await.unwrap_err();
 
@@ -787,15 +880,15 @@ async fn command_adapter_preserves_group_add_error_when_group_remains_absent() {
     assert_eq!(
         fixture.captured_invocations(),
         vec![
-            vec!["group", "-j"]
+            vec!["--config", "/dev/fd/9", "group", "-j"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>(),
-            vec!["group", "add", "pa-project"]
+            vec!["--config", "/dev/fd/9", "group", "add", "pa-project"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>(),
-            vec!["group", "-j"]
+            vec!["--config", "/dev/fd/9", "group", "-j"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
@@ -806,7 +899,7 @@ async fn command_adapter_preserves_group_add_error_when_group_remains_absent() {
 #[tokio::test]
 async fn status_json_preserves_task_identity_timestamps_and_result() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let tasks = adapter.status_json().await.unwrap();
 
@@ -823,7 +916,10 @@ async fn status_json_preserves_task_identity_timestamps_and_result() {
             result: Some(json!({"Failed": 17})),
         }]
     );
-    assert_eq!(fixture.captured_args(), vec!["status", "--json"]);
+    assert_eq!(
+        fixture.captured_args(),
+        vec!["--config", "/dev/fd/9", "status", "--json"]
+    );
 }
 
 #[tokio::test]
@@ -841,7 +937,7 @@ async fn status_json_rejects_state_details_that_are_not_objects() {
       }
     }"#;
     let fixture = FakePueueCommand::new(status_json, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let error = adapter.status_json().await.unwrap_err();
 
@@ -871,7 +967,7 @@ async fn status_json_rejects_wrong_typed_optional_timestamps() {
       }
     }"#;
     let fixture = FakePueueCommand::new(status_json, "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let error = adapter.status_json().await.unwrap_err();
 
@@ -886,7 +982,7 @@ async fn status_json_rejects_wrong_typed_optional_timestamps() {
 #[tokio::test]
 async fn non_zero_exit_is_a_typed_error_with_captured_output() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", Some("kill"));
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let error = adapter.kill(41).await.unwrap_err();
 
@@ -909,7 +1005,7 @@ async fn non_zero_exit_is_a_typed_error_with_captured_output() {
 #[tokio::test]
 async fn remove_non_zero_exit_is_a_typed_error_with_captured_output() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", Some("remove"));
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let error = adapter.remove(41).await.unwrap_err();
 
@@ -924,7 +1020,7 @@ async fn remove_non_zero_exit_is_a_typed_error_with_captured_output() {
 #[tokio::test]
 async fn malformed_status_json_is_a_typed_integration_error() {
     let fixture = FakePueueCommand::new("not-json", "73\n", None);
-    let adapter = CommandPueue::new(fixture.executable(), Vec::<OsString>::new());
+    let adapter = configured_pueue(fixture.policy()).unwrap();
 
     let error = adapter.status_json().await.unwrap_err();
 

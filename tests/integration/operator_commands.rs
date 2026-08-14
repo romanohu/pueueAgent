@@ -6,6 +6,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::path::Path;
+
 use async_trait::async_trait;
 use clap::Parser;
 use pueue_agent::{
@@ -34,6 +37,163 @@ use tempfile::TempDir;
 mod execution_policy_fixture;
 
 const CODEX_SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
+
+#[cfg(unix)]
+#[test]
+fn read_only_cli_actions_do_not_create_missing_database_or_policy_state() {
+    let temporary = TempDir::new().unwrap();
+    let project_root = temporary.path().join("project");
+    fs::create_dir(&project_root).unwrap();
+    pueue_agent::init::run(&project_root).unwrap();
+    let state_dir = temporary.path().join("state");
+    fs::create_dir(&state_dir).unwrap();
+    let codex_home = temporary.path().join("codex-home");
+    fs::create_dir(&codex_home).unwrap();
+    let pueue_config = temporary.path().join("pueue.yml");
+    fs::write(&pueue_config, "fixture: true\n").unwrap();
+
+    let root = project_root.display().to_string();
+    let config = pueue_config.display().to_string();
+    let commands = [
+        vec![
+            "events".to_owned(),
+            root.clone(),
+            "--pueue-config".to_owned(),
+            config.clone(),
+        ],
+        vec![
+            "inspect".to_owned(),
+            "42".to_owned(),
+            root.clone(),
+            "--pueue-config".to_owned(),
+            config.clone(),
+        ],
+        vec![
+            "explain".to_owned(),
+            "42".to_owned(),
+            root.clone(),
+            "--pueue-config".to_owned(),
+            config.clone(),
+        ],
+        vec![
+            "steer".to_owned(),
+            "--project-root".to_owned(),
+            root,
+            "--pueue-config".to_owned(),
+            config,
+            "list".to_owned(),
+        ],
+    ];
+    for arguments in commands {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .env("HOME", temporary.path())
+            .env("CODEX_HOME", &codex_home)
+            .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!state_dir.join("state.sqlite3").exists());
+        assert!(!state_dir.join("execution-policy.toml").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostic_and_steer_list_commands_do_not_migrate_a_legacy_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = TempDir::new().unwrap();
+    let project_root = temporary.path().join("project");
+    fs::create_dir(&project_root).unwrap();
+    pueue_agent::init::run(&project_root).unwrap();
+    let config_path = project_root.join(".pueue-agent/config.toml");
+    let state_dir = temporary.path().join("state");
+    fs::create_dir(&state_dir).unwrap();
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let database_path = state_dir.join("state.sqlite3");
+    let db = Db::open(&database_path).unwrap();
+    ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            "project-a",
+            &project_root,
+            "pa-project-a",
+            &config_path,
+            1,
+        ))
+        .unwrap();
+    drop(db);
+
+    let _policy = execution_policy_fixture::resolved_policy(
+        temporary.path(),
+        &[("project-a", project_root.as_path(), Path::new("codex"))],
+    );
+    let policy_fixture_state = temporary.path().join("execution-policy-state");
+    fs::copy(
+        policy_fixture_state.join("execution-policy.toml"),
+        state_dir.join("execution-policy.toml"),
+    )
+    .unwrap();
+    fs::set_permissions(
+        state_dir.join("execution-policy.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection.execute_batch("PRAGMA user_version = 14;").unwrap();
+    drop(connection);
+
+    let pueue_config = temporary.path().join("execution-policy-pueue.yml");
+    let codex_home = temporary.path().join("execution-policy-codex-home");
+    let config_argument = pueue_config.display().to_string();
+    let commands = [
+        vec![
+            "events".to_owned(),
+            "--pueue-config".to_owned(),
+            config_argument.clone(),
+            project_root.display().to_string(),
+        ],
+        vec![
+            "inspect".to_owned(),
+            "--pueue-config".to_owned(),
+            config_argument.clone(),
+            "42".to_owned(),
+            project_root.display().to_string(),
+        ],
+        vec![
+            "explain".to_owned(),
+            "--pueue-config".to_owned(),
+            config_argument.clone(),
+            "42".to_owned(),
+            project_root.display().to_string(),
+        ],
+        vec![
+            "steer".to_owned(),
+            "--project-root".to_owned(),
+            project_root.display().to_string(),
+            "--pueue-config".to_owned(),
+            config_argument,
+            "list".to_owned(),
+        ],
+    ];
+    for arguments in commands {
+        let _ = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .env("HOME", temporary.path())
+            .env("CODEX_HOME", &codex_home)
+            .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+            .args(arguments)
+            .output()
+            .unwrap();
+        let version: i64 = rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 14);
+        assert!(!database_path.with_extension("sqlite3-wal").exists());
+    }
+}
 
 #[test]
 fn service_lifecycle_commands_parse_without_project_state() {
@@ -292,6 +452,13 @@ impl PueueApi for OperatorPueue {
     async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
         panic!("operator tests must not provision Pueue groups")
     }
+}
+
+fn accepts_api<P: PueueApi>(_api: &P) {}
+
+#[test]
+fn operator_fake_preserves_the_pueue_api_contract() {
+    accepts_api(&OperatorPueue::with_tasks(Vec::new()));
 }
 
 struct CancelHarness {
@@ -848,10 +1015,18 @@ max_agent_runs = 10
         AgentRunner::new(
             AgentRunnerConfig::production()
                 .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
-            execution_policy_fixture::resolved_policy(
-                self.temp.path(),
-                &[("project-a", self.project().root_path.as_path(), std::path::Path::new("codex"))],
-            ),
+            self.policy(),
+        )
+    }
+
+    fn policy(&self) -> Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy> {
+        execution_policy_fixture::resolved_policy(
+            self.temp.path(),
+            &[(
+                "project-a",
+                self.project().root_path.as_path(),
+                std::path::Path::new("codex"),
+            )],
         )
     }
 
@@ -1381,6 +1556,7 @@ async fn pause_prevents_new_agent_claims_and_automatic_termination_until_resume(
     let mut daemon = Daemon::new(
         harness.db.clone(),
         pueue.clone(),
+        harness.policy(),
         harness.runner(),
         DaemonConfig {
             interval: Duration::from_millis(10),

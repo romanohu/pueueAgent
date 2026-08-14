@@ -42,7 +42,11 @@ pueue-agent upgrade --source /path/to/pueueAgent
 7. `cargo build --locked --release` を一時 target directory に対して実行する。
 8. test と build が成功した場合だけ、現行 release binary を backup し、新 binary を install path に atomic に反映する。
 9. systemd user service または launchd user agent を restart する。service 定義と callback の executable path は現在の install layout と一致させる。
-10. service status、SQLite 接続、Pueue status の health check を実行する。
+10. service status、SQLite 接続、Pueue status の health check を実行する。更新前の
+    immutable policy に固定された Pueue adapter は preflight 専用とする。binary
+    replacement 後は policy を read-only で再読込し、新しい launcher identity に
+    固定した adapter を構築して Pueue status を確認する。ambient PATH や未検証の
+    executable/config path へはフォールバックしない。
 11. 成功した場合は revision、service 状態、実行した検証を表示する。
 
 既存の `install.sh` は build と symlink の低レベル経路として残す。`upgrade` はその処理を直接再実装せず、共有可能な install helper を使う。
