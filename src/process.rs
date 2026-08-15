@@ -2037,7 +2037,7 @@ fn spawn_verified_command_with_deadlines(
         .map_err(|_| native_gate_error(PolicyViolationStage::RunBoundPreMarker))?;
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(false);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| map_helper_spawn_error(&error))?;
     let pid = child
@@ -2149,7 +2149,7 @@ pub async fn terminate_process_group(child: &mut VerifiedChild) -> Result<(), Ap
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn cleanup_failed_tokio_helper(child: &mut tokio::process::Child, pid: i64) {
     if let Ok(group) = libc::pid_t::try_from(pid) {
         unsafe { libc::kill(-group, libc::SIGKILL); }
