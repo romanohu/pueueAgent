@@ -64,7 +64,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Cancel(args) => commands::cancel(args).await,
         Command::Submit(args) => commands::submit(args).await,
         Command::SubmitBatch(args) => commands::submit_batch(args).await,
-        Command::Event(args) => commands::event(args),
+        Command::Event(args) => commands::event(args).await,
         Command::Status(args) => commands::status(args).await,
         Command::Events(args) => commands::events(args),
         Command::Runs(args) => commands::runs(args).await,
@@ -102,7 +102,9 @@ mod commands {
             render_events, render_incident_explanation, render_project_status_json,
             render_task_inspection, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
         },
-        events::{record_callback, record_operator_wake_with, CallbackMetadata},
+        events::{
+            callback_group_for_task, record_callback, record_operator_wake_with, CallbackMetadata,
+        },
         execution_policy::{
             load_existing_policy, load_or_create_policy, ResolvedExecutionPolicy,
         },
@@ -400,13 +402,10 @@ mod commands {
         Ok(())
     }
 
-    pub fn event(args: EventArgs) -> Result<(), AppError> {
+    pub async fn event(args: EventArgs) -> Result<(), AppError> {
         if args.event != "callback" {
             return Ok(());
         }
-        let group = args.group.as_deref().ok_or(AppError::Configuration {
-            field: "callback.group",
-        })?;
         let task_id = args.task_id.ok_or(AppError::Configuration {
             field: "callback.task_id",
         })?;
@@ -417,7 +416,16 @@ mod commands {
                     source,
                 }
             })?;
-        let result = record_callback(group, task_id, metadata)?;
+        let group = match args.group {
+            Some(group) => group,
+            None => {
+                let (_, _, _, policy) = resolve_project(None, None)?;
+                let pueue = configured_pueue(policy)?;
+                let tasks = pueue.status_json().await?;
+                callback_group_for_task(&tasks, task_id)?.to_owned()
+            }
+        };
+        let result = record_callback(&group, task_id, metadata)?;
         println!("{}", result.event_id());
         Ok(())
     }

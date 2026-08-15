@@ -6,7 +6,9 @@ use std::{
 use async_trait::async_trait;
 use pueue_agent::{
     db::{Db, EventRepository, ProjectRepository, SubmissionRepository},
-    events::{record_callback_with, CallbackMetadata, CallbackRecordResult},
+    events::{
+        callback_group_for_task, record_callback_with, CallbackMetadata, CallbackRecordResult,
+    },
     models::{EventKind, EventStatus, NewProject, NewSubmission, SubmissionStatus},
     pueue::{PueueApi, PueueError, PueueTask},
     reconcile::{task_signature, Reconciler},
@@ -213,6 +215,32 @@ fn terminal_task(id: i64, enqueue: &str, result: serde_json::Value) -> PueueTask
         ended_at: Some(enqueue.to_owned()),
         result: Some(result),
     }
+}
+
+#[test]
+fn callback_resolves_and_validates_group_from_numeric_task_id() {
+    let tasks = vec![terminal_task(41, "100", json!("Success"))];
+
+    assert_eq!(callback_group_for_task(&tasks, 41).unwrap(), "pa-project");
+    assert!(callback_group_for_task(&tasks, 42)
+        .unwrap_err()
+        .to_string()
+        .contains("callback.task_id was not found"));
+
+    let duplicate = vec![
+        terminal_task(41, "100", json!("Success")),
+        terminal_task(41, "200", json!("Success")),
+    ];
+    assert!(callback_group_for_task(&duplicate, 41)
+        .unwrap_err()
+        .to_string()
+        .contains("callback.task_id is ambiguous"));
+
+    let invalid = vec![PueueTask {
+        group: "x'; touch injected; #".to_owned(),
+        ..terminal_task(41, "100", json!("Success"))
+    }];
+    assert!(callback_group_for_task(&invalid, 41).is_err());
 }
 
 #[tokio::test]

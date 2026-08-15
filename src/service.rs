@@ -512,9 +512,8 @@ impl CallbackRegistry for PueueConfigCallbackRegistry {
 
 pub fn callback_command(paths: &ServicePaths) -> String {
     format!(
-        "{} event callback --group '{}' --task-id '{}'",
+        "{} event callback --task-id '{}'",
         shell_quote(&paths.release_binary),
-        "{{ group }}",
         "{{ id }}"
     )
 }

@@ -482,13 +482,13 @@ fn service_control_propagates_lifecycle_manager_failures() {
 }
 
 #[test]
-fn callback_command_uses_release_binary_and_pueue_placeholders() {
+fn installed_callback_never_interpolates_group_text() {
     let paths = service_paths();
 
     let command = callback_command(&paths);
 
     assert!(command.starts_with("'/opt/pueue-agent/target/release/pueue-agent' event callback"));
-    assert!(command.contains("--group '{{ group }}'"));
+    assert!(!command.contains("{{ group }}"));
     assert!(command.contains("--task-id '{{ id }}'"));
     assert!(!command.contains("bin/pueue-agent' callback"));
 }

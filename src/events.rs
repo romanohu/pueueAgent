@@ -5,7 +5,10 @@ use uuid::Uuid;
 use crate::{
     db::{Db, EventRepository, IntegrationEventRepository, ProjectRepository},
     models::{EventKind, IntegrationEventKind, NewEvent, NewIntegrationEvent},
-    paths, AppError,
+    paths,
+    pueue::PueueTask,
+    pueue_security::validate_group,
+    AppError,
 };
 
 pub type EventId = i64;
@@ -77,6 +80,25 @@ impl CallbackMetadata {
             result,
         }
     }
+}
+
+pub fn callback_group_for_task<'a>(
+    tasks: &'a [PueueTask],
+    task_id: i64,
+) -> Result<&'a str, AppError> {
+    let mut matches = tasks.iter().filter(|task| task.id == task_id);
+    let task = matches.next().ok_or(AppError::Validation {
+        field: "callback.task_id",
+        message: "was not found in the configured Pueue profile",
+    })?;
+    if matches.next().is_some() {
+        return Err(AppError::Validation {
+            field: "callback.task_id",
+            message: "is ambiguous in the configured Pueue profile",
+        });
+    }
+    validate_group(&task.group)?;
+    Ok(&task.group)
 }
 
 pub fn record_callback(

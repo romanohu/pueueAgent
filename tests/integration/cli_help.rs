@@ -926,6 +926,164 @@ struct DiagnosticsCliHarness {
     policy_paths: CliPolicyPaths,
 }
 
+#[cfg(unix)]
+struct CallbackCliHarness {
+    _temp: TempDir,
+    root: PathBuf,
+    db: Db,
+    policy_paths: CliPolicyPaths,
+    injected_marker: PathBuf,
+}
+
+#[cfg(unix)]
+impl CallbackCliHarness {
+    fn with_task(task_id: i64, group: &str) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        pueue_agent::init::run(&root).unwrap();
+
+        let state_dir = temp.path().join("state");
+        let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+        let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project_config.project_id,
+                &root,
+                group,
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+
+        let trusted_dir = temp.path().join("trusted-bin");
+        fs::create_dir_all(&trusted_dir).unwrap();
+        let pueue = trusted_dir.join("pueue");
+        let injected_marker = temp.path().join("injected");
+        let status = serde_json::json!({
+            "tasks": {
+                task_id.to_string(): {
+                    "id": task_id,
+                    "group": group,
+                    "command": "true",
+                    "status": {
+                        "Done": {
+                            "enqueued_at": "100",
+                            "start": "100",
+                            "end": "100",
+                            "result": "Success"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        let source = pueue.with_extension("rs");
+        fs::write(
+            &source,
+            format!(
+                "use std::{{env, fs}};\nfn main() {{\n    let args = env::args().collect::<Vec<_>>();\n    if args.iter().any(|argument| argument.contains(\"touch injected\")) {{ fs::write({:?}, b\"injected\").unwrap(); }}\n    if args.get(1).is_some_and(|argument| argument == \"status\") {{ println!(\"{{}}\", {:?}); }}\n}}\n",
+                injected_marker, status
+            ),
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-O", "-o"])
+            .arg(&pueue)
+            .arg(&source)
+            .output()
+            .expect("compile callback Pueue fixture");
+        assert!(
+            output.status.success(),
+            "callback Pueue fixture failed to compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        make_executable(&pueue);
+        let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
+
+        Self {
+            _temp: temp,
+            root,
+            db,
+            policy_paths,
+            injected_marker,
+        }
+    }
+
+    fn run_installed_callback(&self, task_id: i64) -> std::process::Output {
+        self.command()
+            .args(["event", "callback", "--task-id", &task_id.to_string()])
+            .output()
+            .unwrap()
+    }
+
+    fn command(&self) -> assert_cmd::Command {
+        let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
+        command
+            .env("PUEUE_AGENT_STATE_DIR", &self.policy_paths.state_dir)
+            .env("HOME", &self.policy_paths.home)
+            .env("CODEX_HOME", &self.policy_paths.codex_home)
+            .env("PATH", &self.policy_paths.trusted_dir)
+            .current_dir(&self.root);
+        command
+    }
+
+    fn events_for(&self, task_id: i64) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE payload_json LIKE ?1",
+                [format!("%\"task_id\":{task_id}%")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn event_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn integration_event_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM integration_events", [], |row| row.get(0))
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn callback_resolves_and_validates_group_from_numeric_task_id() {
+    let valid = CallbackCliHarness::with_task(41, "pa-project");
+
+    let first = valid.run_installed_callback(41);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = valid.run_installed_callback(41);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(valid.events_for(41), 1);
+
+    let injected = CallbackCliHarness::with_task(42, "x'; touch injected; #");
+    let output = injected.run_installed_callback(42);
+    assert!(!output.status.success());
+    assert!(!injected.injected_marker.exists());
+    assert_eq!(injected.event_count(), 0);
+    assert_eq!(injected.integration_event_count(), 0);
+}
+
 impl DiagnosticsCliHarness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
