@@ -409,6 +409,11 @@ mod commands {
         let task_id = args.task_id.ok_or(AppError::Configuration {
             field: "callback.task_id",
         })?;
+        if task_id < 0 {
+            return Err(AppError::Configuration {
+                field: "callback.task_id",
+            });
+        }
         let metadata =
             serde_json::from_str::<CallbackMetadata>(&args.metadata).map_err(|source| {
                 AppError::Serialization {
@@ -419,10 +424,17 @@ mod commands {
         let group = match args.group {
             Some(group) => group,
             None => {
-                let (_, _, _, policy) = resolve_project(None, None)?;
+                let (db, _, _, policy) = resolve_project_read_only(None, None)?;
                 let pueue = configured_pueue(policy)?;
                 let tasks = pueue.status_json().await?;
-                callback_group_for_task(&tasks, task_id)?.to_owned()
+                let group = callback_group_for_task(&tasks, task_id)?;
+                if ProjectRepository::new(&db).find_by_group(group)?.is_none() {
+                    return Err(AppError::Validation {
+                        field: "callback.group",
+                        message: "is not registered in the configured Pueue profile",
+                    });
+                }
+                group.to_owned()
             }
         };
         let result = record_callback(&group, task_id, metadata)?;

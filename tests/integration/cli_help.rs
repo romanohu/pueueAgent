@@ -735,7 +735,10 @@ use pueue_agent::{
         NewTaskObservation,
     },
     execution_policy::StartupEnvironment,
-    service::{ServiceDefinition, ServicePaths},
+    service::{
+        callback_command, CallbackRegistry, PueueConfigCallbackRegistry, ServiceDefinition,
+        ServicePaths,
+    },
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -933,11 +936,20 @@ struct CallbackCliHarness {
     db: Db,
     policy_paths: CliPolicyPaths,
     injected_marker: PathBuf,
+    pueue_invoked_marker: PathBuf,
 }
 
 #[cfg(unix)]
 impl CallbackCliHarness {
     fn with_task(task_id: i64, group: &str) -> Self {
+        Self::with_task_and_registered_group(task_id, group, group)
+    }
+
+    fn with_task_and_registered_group(
+        task_id: i64,
+        task_group: &str,
+        registered_group: &str,
+    ) -> Self {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
         fs::create_dir_all(&root).unwrap();
@@ -950,7 +962,7 @@ impl CallbackCliHarness {
             .register(&NewProject::new(
                 &project_config.project_id,
                 &root,
-                group,
+                registered_group,
                 root.join(".pueue-agent/config.toml"),
                 100,
             ))
@@ -960,11 +972,12 @@ impl CallbackCliHarness {
         fs::create_dir_all(&trusted_dir).unwrap();
         let pueue = trusted_dir.join("pueue");
         let injected_marker = temp.path().join("injected");
+        let pueue_invoked_marker = temp.path().join("pueue-invoked");
         let status = serde_json::json!({
             "tasks": {
                 task_id.to_string(): {
                     "id": task_id,
-                    "group": group,
+                    "group": task_group,
                     "command": "true",
                     "status": {
                         "Done": {
@@ -982,8 +995,8 @@ impl CallbackCliHarness {
         fs::write(
             &source,
             format!(
-                "use std::{{env, fs}};\nfn main() {{\n    let args = env::args().collect::<Vec<_>>();\n    if args.iter().any(|argument| argument.contains(\"touch injected\")) {{ fs::write({:?}, b\"injected\").unwrap(); }}\n    if args.get(1).is_some_and(|argument| argument == \"status\") {{ println!(\"{{}}\", {:?}); }}\n}}\n",
-                injected_marker, status
+                "use std::{{env, fs}};\nfn main() {{\n    let args = env::args().collect::<Vec<_>>();\n    fs::write({:?}, b\"invoked\").unwrap();\n    if args.iter().any(|argument| argument.contains(\"touch injected\")) {{ fs::write({:?}, b\"injected\").unwrap(); }}\n    if args.get(1).is_some_and(|argument| argument == \"status\") {{ println!(\"{{}}\", {:?}); }}\n}}\n",
+                pueue_invoked_marker, injected_marker, status
             ),
         )
         .unwrap();
@@ -1007,14 +1020,45 @@ impl CallbackCliHarness {
             db,
             policy_paths,
             injected_marker,
+            pueue_invoked_marker,
         }
     }
 
     fn run_installed_callback(&self, task_id: i64) -> std::process::Output {
-        self.command()
-            .args(["event", "callback", "--task-id", &task_id.to_string()])
+        let config = self.policy_paths.home.join(".config/pueue/pueue.yml");
+        let paths = ServicePaths {
+            release_binary: PathBuf::from(env!("CARGO_BIN_EXE_pueue-agent")),
+            pueue_config: config.clone(),
+            state_dir: self.policy_paths.state_dir.clone(),
+            execution_policy: self.policy_paths.state_dir.join("execution-policy.toml"),
+            working_dir: self.root.clone(),
+            home: self.policy_paths.home.clone(),
+            codex_home: self.policy_paths.codex_home.clone(),
+            path_env: self.policy_paths.trusted_dir.display().to_string(),
+            startup_environment: StartupEnvironment::default(),
+        };
+        let expected = callback_command(&paths);
+        let registry = PueueConfigCallbackRegistry::new(&config);
+        registry.set_callback(&expected).unwrap();
+        let installed = registry.current_callback().unwrap().unwrap();
+        assert_eq!(installed, expected);
+        assert!(!installed.contains("{{ group }}"));
+        let command = installed.replace("{{ id }}", &task_id.to_string());
+        assert!(!command.contains("{{"));
+
+        Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("PUEUE_AGENT_STATE_DIR", &self.policy_paths.state_dir)
+            .env("HOME", &self.policy_paths.home)
+            .env("CODEX_HOME", &self.policy_paths.codex_home)
+            .env("PATH", &self.policy_paths.trusted_dir)
+            .current_dir(&self.root)
             .output()
             .unwrap()
+    }
+
+    fn run_callback_with_arguments(&self, arguments: &[&str]) -> std::process::Output {
+        self.command().args(arguments).output().unwrap()
     }
 
     fn command(&self) -> assert_cmd::Command {
@@ -1082,6 +1126,44 @@ fn callback_resolves_and_validates_group_from_numeric_task_id() {
     assert!(!injected.injected_marker.exists());
     assert_eq!(injected.event_count(), 0);
     assert_eq!(injected.integration_event_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn implicit_callback_rejects_an_unregistered_pueue_group_without_event_mutation() {
+    let harness = CallbackCliHarness::with_task_and_registered_group(
+        43,
+        "pa-unregistered",
+        "pa-registered",
+    );
+
+    let output = harness.run_installed_callback(43);
+
+    assert!(!output.status.success());
+    assert_eq!(harness.event_count(), 0);
+    assert_eq!(harness.integration_event_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn negative_callback_task_id_rejects_before_metadata_pueue_or_sqlite_work() {
+    let harness = CallbackCliHarness::with_task(44, "pa-project");
+    let database = harness.policy_paths.state_dir.join("state.sqlite3");
+    let before = fs::read(&database).unwrap();
+
+    let output = harness.run_callback_with_arguments(&[
+        "event",
+        "callback",
+        "--task-id=-1",
+        "--metadata",
+        "not-json",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(!harness.pueue_invoked_marker.exists());
+    assert_eq!(fs::read(database).unwrap(), before);
+    assert_eq!(harness.event_count(), 0);
+    assert_eq!(harness.integration_event_count(), 0);
 }
 
 impl DiagnosticsCliHarness {
