@@ -241,7 +241,28 @@ fn operator_success_output_bounds_and_redacts_project_and_group_identity() {
     let bin_dir = temp.path().join("bin");
     fs::create_dir(&bin_dir).unwrap();
     let fake_pueue = bin_dir.join("pueue");
-    fs::write(&fake_pueue, "#!/bin/sh\nprintf '%s' '{\"tasks\":{}}'\n").unwrap();
+    let fake_pueue_source = temp.path().join("fake-pueue.rs");
+    fs::write(
+        &fake_pueue_source,
+        r#"fn main() {
+    if std::env::args().any(|argument| argument == "status") {
+        println!("{{\"tasks\":{{}}}}");
+    }
+}
+"#,
+    )
+    .unwrap();
+    let build = std::process::Command::new("rustc")
+        .args(["--edition=2021", "-O", "-o"])
+        .arg(&fake_pueue)
+        .arg(&fake_pueue_source)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
     let fake_codex = bin_dir.join("codex");
     fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &fake_codex).unwrap();
     let home = temp.path().join("home");
@@ -252,7 +273,7 @@ fn operator_success_output_bounds_and_redacts_project_and_group_identity() {
     for directory in [&state_dir, &bin_dir, &home, &codex_home] {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     }
-    fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(&pueue_config, "fixture: true\n").unwrap();
     fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
