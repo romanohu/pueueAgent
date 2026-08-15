@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap, fs};
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
@@ -12,7 +12,7 @@ use crate::{
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
-    execution_policy::{load_existing_policy, resolve_project_policy, LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail, ResolvedExecutionPolicy},
+    execution_policy::{inspect_pueue_config_path, load_existing_policy, resolve_project_policy, LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail, ResolvedExecutionPolicy},
     environment::MAX_PRIVATE_TEMP_RUN_ID,
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
@@ -827,31 +827,19 @@ pub fn build_doctor_report_with_policy(
         MAX_PUEUE_OUTPUT_BYTES,
     );
     checks.push(doctor_ok("pueue.bounds", &pueue_bounds_summary, "none"));
-    checks.push(match fs::symlink_metadata(&paths.pueue_config) {
-        Ok(metadata) if metadata.file_type().is_symlink() => doctor_error(
+    checks.push(match inspect_pueue_config_path(
+        &paths.pueue_config,
+        std::slice::from_ref(&project.root_path),
+    ) {
+        Ok(()) => doctor_ok(
             "pueue.config",
-            "the configured lexical Pueue profile is a symlink",
-            "restore a regular Pueue profile at the configured lexical path",
-        ),
-        Ok(metadata) if metadata.is_file() => doctor_ok(
-            "pueue.config",
-            "the configured lexical Pueue profile is present",
+            "the configured lexical Pueue profile passes no-follow anchoring checks",
             "none",
-        ),
-        Ok(_) => doctor_error(
-            "pueue.config",
-            "the configured lexical Pueue profile is not a regular file",
-            "restore a regular Pueue profile at the configured lexical path",
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => doctor_error(
-            "pueue.config",
-            "the configured lexical Pueue profile is missing",
-            "restore the configured Pueue profile; doctor does not create it",
         ),
         Err(_) => doctor_error(
             "pueue.config",
-            "the configured lexical Pueue profile is unavailable",
-            "restore the configured Pueue profile; doctor does not replace it",
+            "the configured lexical Pueue profile is unavailable or unsafe",
+            "restore the configured Pueue profile; doctor does not create or replace it",
         ),
     });
     checks.extend(execution_doctor_checks(db, project, policy));

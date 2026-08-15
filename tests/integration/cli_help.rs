@@ -1153,7 +1153,8 @@ impl CustomPueueProfileHarness {
             format!(r#"use std::{{fs::OpenOptions, io::Write}};
 fn main() {{
     let args = std::env::args().collect::<Vec<_>>();
-    writeln!(OpenOptions::new().create(true).append(true).open({:?}).unwrap(), "{{}}", args.get(1).map(String::as_str).unwrap_or("")) .unwrap();
+    let config = std::fs::read_to_string("/dev/fd/9").unwrap_or_default();
+    writeln!(OpenOptions::new().create(true).append(true).open({:?}).unwrap(), "{{}}:{{}}", args.get(1).map(String::as_str).unwrap_or(""), config.trim()) .unwrap();
     if args.iter().any(|argument| argument == "add") {{
         println!("701");
     }}
@@ -1442,9 +1443,10 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
         );
     }
     let calls = fs::read_to_string(&harness.pueue_calls).unwrap();
-    assert!(calls.lines().any(|operation| operation == "group"));
-    assert!(calls.lines().filter(|operation| *operation == "add").count() >= 2);
-    assert!(calls.lines().filter(|operation| *operation == "status").count() >= 2);
+    assert!(calls.lines().any(|operation| operation.starts_with("group:fixture: custom")));
+    assert!(calls.lines().filter(|operation| operation.starts_with("add:fixture: custom")).count() >= 2);
+    assert!(calls.lines().filter(|operation| operation.starts_with("status:fixture: custom")).count() >= 2);
+    assert!(!calls.contains("fixture: conflicting"));
 }
 
 #[cfg(unix)]

@@ -561,9 +561,23 @@ pub fn installed_pueue_config(home: &Path) -> Result<Option<PathBuf>, AppError> 
             home.join(".config/systemd/user/pueue-agent.service"),
         )
     };
+    match fs::symlink_metadata(&definition_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(AppError::Configuration {
+                field: "pueue_config",
+            })
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(AppError::Io {
+                operation: "inspect installed service definition",
+                source,
+            })
+        }
+    }
     let contents = match fs::read_to_string(&definition_path) {
         Ok(contents) => contents,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(AppError::Io {
                 operation: "read installed service definition",

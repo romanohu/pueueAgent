@@ -159,6 +159,27 @@ fn installed_profile_discovery_rejects_a_present_definition_without_a_config_arg
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn installed_profile_discovery_rejects_a_dangling_service_definition_symlink() {
+    let temp = TempDir::new().unwrap();
+    let home = fs::canonicalize(temp.path()).unwrap();
+    let definition = if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/com.pueue-agent.plist")
+    } else {
+        home.join(".config/systemd/user/pueue-agent.service")
+    };
+    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(home.join("missing-definition"), &definition).unwrap();
+
+    assert!(matches!(
+        installed_pueue_config(&home),
+        Err(AppError::Configuration {
+            field: "pueue_config"
+        })
+    ));
+}
+
 impl FakeService {
     fn running() -> Self {
         Self {

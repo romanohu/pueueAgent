@@ -147,6 +147,33 @@ fn missing_pueue_config_is_rendered_as_a_degraded_doctor_error() {
 }
 
 #[test]
+fn doctor_rejects_a_project_contained_pueue_config_with_anchor_semantics() {
+    let harness = DiagnosticsHarness::new();
+    let mut paths = doctor_paths(&harness);
+    paths.pueue_config = harness.project().config_path;
+    let policy = Err(PolicyViolation::new(
+        PolicyViolationCode::PolicyMissing,
+        PolicyViolationStage::Startup,
+    ));
+    let report = build_doctor_report_with_policy(
+        &harness.db,
+        &harness.project(),
+        &paths,
+        doctor_external(),
+        100,
+        &policy,
+    )
+    .unwrap();
+
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "pueue.config")
+        .expect("doctor must inspect the Pueue profile independently of policy availability");
+    assert_eq!(check.status, DoctorCheckStatus::Error);
+}
+
+#[test]
 fn doctor_pueue_bounds_source_derives_its_summary_from_production_constants() {
     let source = include_str!("../../src/diagnostics.rs");
     let summary_start = source

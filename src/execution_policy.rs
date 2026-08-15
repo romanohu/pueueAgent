@@ -931,6 +931,15 @@ impl PueueConfigAnchor {
     }
 }
 
+/// Inspect a lexical Pueue configuration using the same no-follow, metadata,
+/// and project-root checks as policy anchoring without creating policy state.
+pub fn inspect_pueue_config_path(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Result<(), PolicyViolation> {
+    PueueConfigAnchor::from_absolute(path, roots).map(|_| ())
+}
+
 pub fn load_or_create_policy(
     input: &PolicyLoadInput,
 ) -> Result<ResolvedExecutionPolicy, PolicyViolation> {
