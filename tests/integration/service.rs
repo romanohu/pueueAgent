@@ -17,8 +17,9 @@ use pueue_agent::{
         launchd_status_from_output, pueue_config_from_service_definition,
         systemd_status_from_load_state_output, systemd_status_from_output, CallbackRegistry,
         EnableOptions, LaunchdAgent,
-        PueueConfigCallbackRegistry, ServiceCommandOutput, ServiceCommandRunner, ServiceControl,
-        ServiceDefinition, ServiceManager, ServicePaths, ServicePlatform, ServiceStatus,
+        resolve_pueue_config_path, PueueConfigCallbackRegistry, ServiceCommandOutput,
+        ServiceCommandRunner, ServiceControl, ServiceDefinition, ServiceManager, ServicePaths,
+        ServicePlatform, ServiceStatus,
     },
     AppError,
 };
@@ -101,6 +102,40 @@ fn accepts_api<P: PueueApi>(_api: &P) {}
 #[test]
 fn service_fake_preserves_the_pueue_api_contract() {
     accepts_api(&FakePueueControl::default());
+}
+
+#[test]
+fn pueue_profile_resolution_uses_precedence_and_rejects_an_invalid_higher_value() {
+    let home = PathBuf::from("/private/tmp/pueue-agent-home");
+    let explicit = PathBuf::from("/private/tmp/explicit-pueue.yml");
+    let environment = PathBuf::from("/private/tmp/environment-pueue.yml");
+    let installed = PathBuf::from("/private/tmp/installed-pueue.yml");
+
+    assert_eq!(
+        resolve_pueue_config_path(
+            Some(&explicit),
+            Some(&environment),
+            Some(&installed),
+            &home,
+        )
+        .unwrap(),
+        explicit
+    );
+    assert_eq!(
+        resolve_pueue_config_path(None, None, Some(&installed), &home).unwrap(),
+        installed
+    );
+    assert!(matches!(
+        resolve_pueue_config_path(
+            Some(std::path::Path::new("relative-pueue.yml")),
+            Some(&environment),
+            Some(&installed),
+            &home,
+        ),
+        Err(AppError::Configuration {
+            field: "pueue_config"
+        })
+    ));
 }
 
 impl FakeService {
@@ -494,6 +529,32 @@ fn policy_pinning_binds_service_and_callback_to_the_verified_launcher() {
     assert!(systemd.contains(policy.launcher_anchor.canonical_path.to_str().unwrap()));
     assert!(!callback.contains(unverified.to_str().unwrap()));
     assert!(!systemd.contains(unverified.to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_pinning_rejects_a_second_pueue_profile() {
+    let temp = TempDir::new().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(&base, &[]);
+    let paths = ServicePaths {
+        release_binary: base.join("unverified-release-binary"),
+        pueue_config: base.join("second-pueue.yml"),
+        state_dir: base.join("execution-policy-state"),
+        execution_policy: base.join("execution-policy-state/execution-policy.toml"),
+        working_dir: base.clone(),
+        home: base.clone(),
+        codex_home: base.join("execution-policy-codex-home"),
+        path_env: base.join("execution-policy-bin").display().to_string(),
+        startup_environment: StartupEnvironment::default(),
+    };
+
+    assert!(matches!(
+        paths.pin_to_policy(&policy),
+        Err(AppError::Configuration {
+            field: "pueue_config"
+        })
+    ));
 }
 
 #[cfg(unix)]

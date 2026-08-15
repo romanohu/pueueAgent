@@ -11,7 +11,8 @@ use pueue_agent::{
         LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
-        build_doctor_report, render_doctor_report, render_doctor_report_value, render_events,
+        build_doctor_report, build_doctor_report_with_policy, render_doctor_report,
+        render_doctor_report_value, render_events,
         render_incident_explanation, render_project_status_json, render_task_inspection,
         DoctorCheckStatus, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
     },
@@ -118,6 +119,31 @@ fn doctor_reports_fixed_pueue_bounds_without_output() {
         "Pueue commands use timeout=30s and independent stdout/stderr caps=65536 bytes"
     ));
     assert!(!rendered.contains("fixture-output"));
+}
+
+#[test]
+fn missing_pueue_config_is_rendered_as_a_degraded_doctor_error() {
+    let harness = DiagnosticsHarness::new();
+    let policy = Err(PolicyViolation::new(
+        PolicyViolationCode::AnchorMissing,
+        PolicyViolationStage::Startup,
+    ));
+    let report = build_doctor_report_with_policy(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        &policy,
+    )
+    .unwrap();
+
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "pueue.config")
+        .expect("doctor must report an unavailable Pueue profile");
+    assert_eq!(check.status, DoctorCheckStatus::Error);
 }
 
 #[test]

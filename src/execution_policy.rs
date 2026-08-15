@@ -847,6 +847,12 @@ impl PueueConfigAnchor {
                 PolicyViolationStage::Startup,
             )
         })?;
+        if opened.canonical_path != path {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::AnchorMissing,
+                PolicyViolationStage::Startup,
+            ));
+        }
         if inside_any_root(&opened.canonical_path, roots) {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::TrustedPathUnsafe,

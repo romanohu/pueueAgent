@@ -1111,6 +1111,111 @@ struct SubmitBatchCliHarness {
     policy_paths: CliPolicyPaths,
 }
 
+struct CustomPueueProfileHarness {
+    _temp: TempDir,
+    root: PathBuf,
+    policy_paths: CliPolicyPaths,
+}
+
+impl CustomPueueProfileHarness {
+    fn new() -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        pueue_agent::init::run(&root).unwrap();
+
+        let state_dir = temp.path().join("state");
+        let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
+        let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project_config.project_id,
+                &root,
+                &project_config.pueue_group,
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+
+        let trusted_dir = temp.path().join("trusted-bin");
+        fs::create_dir_all(&trusted_dir).unwrap();
+        let pueue = trusted_dir.join("pueue");
+        let source = temp.path().join("custom-profile-pueue.rs");
+        fs::write(
+            &source,
+            r#"fn main() {
+    if std::env::args_os().any(|argument| argument == "add") {
+        println!("701");
+    }
+}"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-O", "-o"])
+            .arg(&pueue)
+            .arg(&source)
+            .output()
+            .expect("compile custom-profile Pueue fixture");
+        assert!(
+            output.status.success(),
+            "custom-profile Pueue fixture failed to compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        make_executable(&pueue);
+        let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
+
+        let custom_config = temp.path().join("custom/pueue.yml");
+        fs::create_dir_all(custom_config.parent().unwrap()).unwrap();
+        fs::write(&custom_config, "fixture: custom\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                custom_config.parent().unwrap(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&custom_config, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let definition = if cfg!(target_os = "macos") {
+            policy_paths
+                .home
+                .join("Library/LaunchAgents/com.pueue-agent.plist")
+        } else {
+            policy_paths
+                .home
+                .join(".config/systemd/user/pueue-agent.service")
+        };
+        fs::create_dir_all(definition.parent().unwrap()).unwrap();
+        fs::write(
+            definition,
+            format!(
+                "<string>pueue-agent</string>\n<string>daemon</string>\n<string>--pueue-config</string>\n<string>{}</string>\n",
+                custom_config.display()
+            ),
+        )
+        .unwrap();
+        fs::remove_file(policy_paths.home.join(".config/pueue/pueue.yml")).unwrap();
+
+        Self {
+            _temp: temp,
+            root,
+            policy_paths,
+        }
+    }
+
+    fn command(&self) -> assert_cmd::Command {
+        let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
+        command
+            .env("PUEUE_AGENT_STATE_DIR", &self.policy_paths.state_dir)
+            .env("HOME", &self.policy_paths.home)
+            .env("CODEX_HOME", &self.policy_paths.codex_home)
+            .env("PATH", &self.policy_paths.trusted_dir)
+            .current_dir(&self.root);
+        command
+    }
+}
+
 impl SubmitBatchCliHarness {
     fn new(manifest: &str) -> Self {
         let temp = TempDir::new().unwrap();
@@ -1235,6 +1340,44 @@ fn submit_batch_cli_help_lists_request_manifest_group_and_json_options() {
     for option in ["--request-id", "--manifest", "--group", "--json"] {
         assert!(text.contains(option), "missing {option}: {text}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_repeated_flag() {
+    let harness = CustomPueueProfileHarness::new();
+
+    let output = harness
+        .command()
+        .args(["submit", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_pueue_config_doctor_renders_a_degraded_error_report() {
+    let harness = DiagnosticsCliHarness::new();
+    let config = harness.policy_paths.home.join(".config/pueue/pueue.yml");
+    fs::remove_file(config).unwrap();
+
+    let output = harness
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "pueue.config" && check["status"] == "error"
+    }));
 }
 
 #[test]

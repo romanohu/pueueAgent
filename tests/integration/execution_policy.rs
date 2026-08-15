@@ -94,6 +94,15 @@ impl PolicyHarness {
             updated_at: 0,
         }
     }
+
+    #[cfg(unix)]
+    fn with_symlinked_pueue_config() -> Self {
+        let mut harness = Self::new();
+        let link = harness.path("pueue-link.yml");
+        std::os::unix::fs::symlink(&harness.pueue_config, &link).unwrap();
+        harness.pueue_config = link;
+        harness
+    }
 }
 
 fn custom_config(project_id: &str, program: &str, network: NetworkMode) -> ProjectConfig {
@@ -171,6 +180,14 @@ fn trusted_path_rejects_a_symlink_component() {
             ..
         })
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn pueue_config_symlink_is_rejected_before_anchor_creation() {
+    let harness = PolicyHarness::with_symlinked_pueue_config();
+    let error = load_or_create_policy(&harness.input()).unwrap_err();
+    assert_eq!(error.code, PolicyViolationCode::AnchorMissing);
 }
 
 #[test]

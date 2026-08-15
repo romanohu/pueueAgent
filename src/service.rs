@@ -43,19 +43,6 @@ impl ServicePaths {
                 .ok_or(AppError::Configuration {
                     field: "state_db_path",
                 })?;
-        let pueue_config = match pueue_config {
-            Some(path) => path,
-            None => {
-                let home = env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .ok_or(AppError::Configuration { field: "HOME" })?;
-                home.join(".config/pueue/pueue.yml")
-            }
-        };
-        let pueue_config = fs::canonicalize(pueue_config).map_err(|source| AppError::Io {
-            operation: "resolve Pueue configuration",
-            source,
-        })?;
         let home = env::var_os("HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -64,6 +51,14 @@ impl ServicePaths {
             operation: "resolve service home",
             source,
         })?;
+        let environment_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
+        let installed_service_pueue_config = installed_pueue_config(&home);
+        let pueue_config = resolve_pueue_config_path(
+            pueue_config.as_deref(),
+            environment_pueue_config.as_deref(),
+            installed_service_pueue_config.as_deref(),
+            &home,
+        )?;
         let codex_home = codex_session::home_from_environment()?;
         let release_binary = release_binary_path()?;
         let path_env = env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned());
@@ -109,6 +104,11 @@ impl ServicePaths {
         let verified_launcher = policy.launcher_anchor.verify_identity()?;
         self.release_binary = verified_launcher.anchor.canonical_path;
         self.execution_policy = self.state_dir.join("execution-policy.toml");
+        if self.pueue_config != policy.pueue_config_anchor.canonical_path {
+            return Err(AppError::Configuration {
+                field: "pueue_config",
+            });
+        }
         self.pueue_config = policy.pueue_config_anchor.canonical_path.clone();
         self.codex_home = policy.codex_home.clone();
         self.path_env = env::join_paths(&policy.trusted_path)
@@ -117,6 +117,40 @@ impl ServicePaths {
             .map_err(|_| AppError::Configuration { field: "PATH" })?;
         Ok(self)
     }
+}
+
+/// Select the one Pueue profile used by every command. The result remains a
+/// lexical path until execution-policy anchoring opens it without following
+/// links.
+pub fn resolve_pueue_config_path(
+    explicit: Option<&Path>,
+    environment: Option<&Path>,
+    installed: Option<&Path>,
+    home: &Path,
+) -> Result<PathBuf, AppError> {
+    let selected = explicit
+        .or(environment)
+        .or(installed)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".config/pueue/pueue.yml"));
+    validate_lexical_absolute_path("pueue_config", &selected)?;
+    Ok(selected)
+}
+
+fn validate_lexical_absolute_path(field: &'static str, path: &Path) -> Result<(), AppError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+    {
+        return Err(AppError::Configuration { field });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

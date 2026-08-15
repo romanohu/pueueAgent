@@ -827,6 +827,23 @@ pub fn build_doctor_report_with_policy(
         MAX_PUEUE_OUTPUT_BYTES,
     );
     checks.push(doctor_ok("pueue.bounds", &pueue_bounds_summary, "none"));
+    checks.push(match policy {
+        Ok(_) => doctor_ok(
+            "pueue.config",
+            "the configured Pueue profile is anchored",
+            "none",
+        ),
+        Err(violation) if violation.code == PolicyViolationCode::AnchorMissing => doctor_error(
+            "pueue.config",
+            "the configured Pueue profile is missing or unsafe",
+            "restore the configured Pueue profile; doctor does not create or replace it",
+        ),
+        Err(_) => doctor_warning(
+            "pueue.config",
+            "the configured Pueue profile was not inspected because policy is unavailable",
+            "restore the immutable execution policy before inspecting the Pueue profile",
+        ),
+    });
     checks.extend(execution_doctor_checks(db, project, policy));
     checks.push(match &external.pueue {
         Ok(tasks) if tasks.iter().any(|task| task.group == project.pueue_group) => doctor_ok(

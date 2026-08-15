@@ -20,7 +20,7 @@ use crate::{
     execution_policy::{load_existing_policy, PolicyLoadInput, ResolvedExecutionPolicy},
     output::{bounded_redacted_text, human_summary},
     pueue::{configured_pueue, PueueApi},
-    service::{ServiceControl, ServiceStatus},
+    service::{resolve_pueue_config_path, ServiceControl, ServiceStatus},
     AppError,
 };
 
@@ -95,11 +95,9 @@ pub fn resolve_pueue_config_with_service(
     service_definition: Option<&Path>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    explicit
-        .or(environment)
-        .or(service_definition)
-        .map(Path::to_path_buf)
-        .or_else(|| home.map(|home| home.join(".config/pueue/pueue.yml")))
+    home.and_then(|home| {
+        resolve_pueue_config_path(explicit, environment, service_definition, home).ok()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

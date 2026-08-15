@@ -112,7 +112,7 @@ mod commands {
         paths, project,
         pueue::{configured_pueue, PueueApi},
         service::{
-            enable_with, installed_pueue_config, CallbackRegistry, EnableOptions,
+            enable_with, CallbackRegistry, EnableOptions,
             PueueConfigCallbackRegistry, ServiceControl, ServiceManager, ServicePaths,
             ServiceStatus,
         },
@@ -160,8 +160,8 @@ mod commands {
             project_roots,
             current_launcher_path()?,
         ))?);
-        let pueue = configured_pueue(Arc::clone(&policy))?;
         let service_paths = service_paths.pin_to_policy(&policy)?;
+        let pueue = configured_pueue(Arc::clone(&policy))?;
         let db = Db::open(&state_db)?;
         let options = EnableOptions {
             project_root,
@@ -539,17 +539,6 @@ mod commands {
 
     pub async fn upgrade(args: UpgradeArgs) -> Result<(), AppError> {
         let json = args.json;
-        let home = env::var_os("HOME").map(PathBuf::from);
-        let environment_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
-        let installed_service_pueue_config = home
-            .as_deref()
-            .and_then(installed_pueue_config);
-        let pueue_config = upgrade::resolve_pueue_config_with_service(
-            args.pueue_config.as_deref(),
-            environment_pueue_config.as_deref(),
-            installed_service_pueue_config.as_deref(),
-            home.as_deref(),
-        );
         let current_exe = env::current_exe()
             .map_err(|source| AppError::Io {
                 operation: "resolve current executable for upgrade",
@@ -563,7 +552,7 @@ mod commands {
                 source,
             })
             .map_err(upgrade_diagnostic_error)?;
-        let service_paths = ServicePaths::from_environment(&working_dir, pueue_config)
+        let service_paths = ServicePaths::from_environment(&working_dir, args.pueue_config)
             .map_err(upgrade_diagnostic_error)?;
         let project_roots = registered_roots_if_present(&state_db)
             .map_err(upgrade_diagnostic_error)?;
