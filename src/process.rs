@@ -1898,7 +1898,19 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
 /// Spawn a suspended verified target, bounding bootstrap and readiness by the
 /// caller-owned operation deadline.
 #[cfg(unix)]
-pub(crate) async fn spawn_verified_command_before(
+pub async fn spawn_verified_command_before(
+    spec: VerifiedCommandSpec,
+    deadline: Instant,
+) -> Result<VerifiedChild, AppError> {
+    match spawn_verified_command_before_classified(spec, deadline).await {
+        Ok(child) => Ok(child),
+        Err(SpawnVerifiedCommandBeforeError::Launch(error))
+        | Err(SpawnVerifiedCommandBeforeError::Cleanup(error)) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) async fn spawn_verified_command_before_classified(
     spec: VerifiedCommandSpec,
     deadline: Instant,
 ) -> Result<VerifiedChild, SpawnVerifiedCommandBeforeError> {
@@ -3504,6 +3516,21 @@ mod tests {
         let original = frame();
         let encoded = original.encode().unwrap();
         assert_eq!(ControlFrame::decode(&encoded).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_spawn_verified_command_before_keeps_app_error_contract() {
+        fn requires_app_error_future<F>(_future: F)
+        where
+            F: std::future::Future<Output = Result<VerifiedChild, AppError>>,
+        {}
+
+        fn accepts_public_api(spec: VerifiedCommandSpec) {
+            requires_app_error_future(spawn_verified_command_before(spec, Instant::now()));
+        }
+
+        let _ = accepts_public_api as fn(VerifiedCommandSpec);
     }
 
     #[cfg(unix)]

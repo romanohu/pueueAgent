@@ -162,7 +162,7 @@ impl PueueProcessRunner {
         operation_argv: &[OsString],
     ) -> Result<BoundedOutput, AppError> {
         use crate::process::{
-            spawn_verified_command_before, terminate_process_group,
+            spawn_verified_command_before_classified, terminate_process_group,
             ProcessGroupRequirement,
             VerifiedChildIo, VerifiedCommandSpec,
         };
@@ -198,7 +198,7 @@ impl PueueProcessRunner {
         argv.push(OsString::from(operation));
         argv.extend_from_slice(operation_args);
 
-        let mut verified = match spawn_verified_command_before(VerifiedCommandSpec {
+        let mut verified = match spawn_verified_command_before_classified(VerifiedCommandSpec {
             launcher: policy.launcher_anchor.clone(),
             executable: policy.pueue_anchor.clone(),
             argv,
