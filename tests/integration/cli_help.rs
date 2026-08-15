@@ -156,6 +156,16 @@ fn command_reference_covers_every_public_cli_without_exposing_internal_launch() 
 }
 
 #[test]
+fn operations_redirect_links_to_workflows_and_troubleshooting() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let operations = std::fs::read_to_string(root.join("docs/operations-ja.md")).unwrap();
+
+    assert!(operations.contains("[運用ワークフロー](workflows-ja.md)"));
+    assert!(operations.contains("[トラブルシューティング](troubleshooting-ja.md)"));
+    assert!(root.join("docs/workflows-ja.md").is_file());
+}
+
+#[test]
 fn help_lists_service_lifecycle_commands() {
     for command in ["start", "stop"] {
         let output = assert_cmd::Command::cargo_bin("pueue-agent")
