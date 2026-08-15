@@ -182,7 +182,7 @@
 - **目的:** 次の実行に渡す人による介入メッセージをキューに追加します。
 - **状態変更:** pending の介入メッセージを追加します。キューは実行あたり最大 16 件、合計 16 KiB、各メッセージは最大 4 KiB に制限されます。
 - **主なオプション:** 必須の `MESSAGE...`、`--json`、`--pueue-config`、`--project-root`。
-- **例:** `pueue-agent steer 'CPU 使用量を抑えて再試行する'`
+- **例:** `pueue-agent steer '<MESSAGE>'`
 - **失敗時の確認:** 空でないメッセージと上限を確認し、`steer list` で pending の内容を確認します。
 
 ### `pueue-agent steer list`
