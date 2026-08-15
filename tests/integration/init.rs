@@ -204,6 +204,7 @@ fn init_bounds_and_redacts_successful_project_root_output() {
     assert!(!line.contains("AKIA_INIT_SECRET"));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn operator_success_output_bounds_and_redacts_project_and_group_identity() {
     let temp = TempDir::new().unwrap();
@@ -241,17 +242,42 @@ fn operator_success_output_bounds_and_redacts_project_and_group_identity() {
     fs::create_dir(&bin_dir).unwrap();
     let fake_pueue = bin_dir.join("pueue");
     fs::write(&fake_pueue, "#!/bin/sh\nprintf '%s' '{\"tasks\":{}}'\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_codex = bin_dir.join("codex");
+    fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &fake_codex).unwrap();
+    let home = temp.path().join("home");
+    let codex_home = temp.path().join("codex-home");
+    let pueue_config = home.join(".config/pueue/pueue.yml");
+    fs::create_dir_all(pueue_config.parent().unwrap()).unwrap();
+    fs::create_dir(&codex_home).unwrap();
+    for directory in [&state_dir, &bin_dir, &home, &codex_home] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     }
+    fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&pueue_config, "fixture: true\n").unwrap();
+    fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        state_dir.join("execution-policy.toml"),
+        format!(
+            "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+            bin_dir.display().to_string(),
+            fake_codex.display().to_string(),
+            fake_pueue.display().to_string(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        state_dir.join("execution-policy.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
 
     let command = |args: &[&str]| {
         let mut command = Command::cargo_bin("pueue-agent").unwrap();
         command
             .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+            .env("HOME", &home)
+            .env("CODEX_HOME", &codex_home)
             .env("PATH", &bin_dir)
             .current_dir(&root)
             .args(args)
