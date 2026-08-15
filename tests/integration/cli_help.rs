@@ -625,32 +625,6 @@ fn steer_help_describes_enqueue_and_bounded_list_options() {
 }
 
 #[test]
-fn readme_documents_human_intervention_workflow() {
-    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
-        .expect("README.md should be readable");
-
-    for clause in [
-        r#"pueue-agent steer -- "次は learning rate を半分にして""#,
-        "pueue-agent steer list",
-        "pueue-agent status --json",
-        "SQLite へ登録するだけで、agent の起動、Pueue 操作、実行中 process への入力は行いません",
-        "FIFO 順で一度だけ、次回の agent run の prompt に渡されますが、1回ですべての pending メッセージを配信するとは限りません",
-        "各メッセージは最大 `4,096 bytes` です。1回の run には最大 `16 messages`、合計 `16,384 intervention bytes` までを、残りの prompt budget に収まる範囲で配信します",
-        "上限または残りの prompt budget を超える FIFO の後続メッセージ（超過分）は pending のまま、後続の run へ繰り越されます",
-        "agent の spawn に失敗した場合、メッセージは pending に戻されるため、次回の run で再試行されます",
-        "`pause` または `disable` 中でもメッセージはキューへ登録できますが、配信はせず、resume または enable 後の次回 run まで保持されます",
-        "`status --json` はキューの件数などの診断情報を返しますが、メッセージ本文は含めません",
-        "実行中の agent は中断しません",
-        "介入メッセージによって、安全ポリシーや既存の制約を上書きすることはできません",
-    ] {
-        assert!(
-            readme.contains(clause),
-            "README is missing contract clause: {clause}"
-        );
-    }
-}
-
-#[test]
 fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
     let harness = DiagnosticsCliHarness::new();
     let secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";

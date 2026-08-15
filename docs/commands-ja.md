@@ -190,7 +190,7 @@
 
 ### `pueue-agent steer`
 
-- **構文:** `pueue-agent steer MESSAGE... [--json] [--pueue-config PUEUE_CONFIG] [--project-root PROJECT_ROOT]`
+- **構文:** `pueue-agent steer [--json] [--pueue-config PUEUE_CONFIG] [--project-root PROJECT_ROOT] MESSAGE...`
 - **目的:** 次の実行に渡す人による介入メッセージをキューに追加します。
 - **状態変更:** pending の介入メッセージを追加します。キューは実行あたり最大 16 件、合計 16 KiB、各メッセージは最大 4 KiB に制限されます。
 - **主なオプション:** 必須の `MESSAGE...`、`--json`、`--pueue-config`、`--project-root`。
@@ -199,10 +199,10 @@
 
 ### `pueue-agent steer list`
 
-- **構文:** `pueue-agent steer list [--json] [--pueue-config PUEUE_CONFIG] [--project-root PROJECT_ROOT]`
+- **構文:** `pueue-agent steer [--pueue-config PUEUE_CONFIG] [--project-root PROJECT_ROOT] list [--json]`
 - **目的:** pending の人による介入メッセージを一覧します。
 - **状態変更:** ありません（読み取り専用）。
-- **主なオプション:** `--json`、`--pueue-config`、`--project-root`。
+- **主なオプション:** `--json`。`--pueue-config` と `--project-root` は `list` より前に指定します。
 - **例:** `pueue-agent steer list --json`
 - **失敗時の確認:** 正しいプロジェクトを指定し、投入済みなら実行により消費されることを確認します。
 
