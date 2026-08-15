@@ -1792,8 +1792,9 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
         let output = harness.command().args(arguments).output().unwrap();
         assert!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            "stderr:\n{}\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
         );
     }
     let calls = fs::read_to_string(&harness.pueue_calls).unwrap();
