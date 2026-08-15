@@ -722,7 +722,14 @@ fn wake_cli_persists_scoped_redacted_events_without_running_pueue() {
         .status
         .success());
 }
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use pueue_agent::{
     config,
@@ -935,6 +942,7 @@ struct CallbackCliHarness {
     root: PathBuf,
     db: Db,
     policy_paths: CliPolicyPaths,
+    pueue_config: PathBuf,
     injected_marker: PathBuf,
     pueue_invoked_marker: PathBuf,
 }
@@ -1013,22 +1021,39 @@ impl CallbackCliHarness {
         );
         make_executable(&pueue);
         let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
+        let default_pueue_config = policy_paths.home.join(".config/pueue/pueue.yml");
+        let pueue_config = temp.path().join("callback-profile/pueue.yml");
+        fs::create_dir_all(pueue_config.parent().unwrap()).unwrap();
+        fs::set_permissions(
+            pueue_config.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::rename(&default_pueue_config, &pueue_config).unwrap();
 
         Self {
             _temp: temp,
             root,
             db,
             policy_paths,
+            pueue_config,
             injected_marker,
             pueue_invoked_marker,
         }
     }
 
     fn run_installed_callback(&self, task_id: i64) -> std::process::Output {
-        let config = self.policy_paths.home.join(".config/pueue/pueue.yml");
+        self.run_installed_callback_from(task_id, &self.root)
+    }
+
+    fn run_installed_callback_from(
+        &self,
+        task_id: i64,
+        working_directory: &Path,
+    ) -> std::process::Output {
         let paths = ServicePaths {
             release_binary: PathBuf::from(env!("CARGO_BIN_EXE_pueue-agent")),
-            pueue_config: config.clone(),
+            pueue_config: self.pueue_config.clone(),
             state_dir: self.policy_paths.state_dir.clone(),
             execution_policy: self.policy_paths.state_dir.join("execution-policy.toml"),
             working_dir: self.root.clone(),
@@ -1037,8 +1062,24 @@ impl CallbackCliHarness {
             path_env: self.policy_paths.trusted_dir.display().to_string(),
             startup_environment: StartupEnvironment::default(),
         };
+        let definition = if cfg!(target_os = "macos") {
+            self.policy_paths
+                .home
+                .join("Library/LaunchAgents/com.pueue-agent.plist")
+        } else {
+            self.policy_paths
+                .home
+                .join(".config/systemd/user/pueue-agent.service")
+        };
+        fs::create_dir_all(definition.parent().unwrap()).unwrap();
+        let rendered = if cfg!(target_os = "macos") {
+            ServiceDefinition::launchd(&paths).render()
+        } else {
+            ServiceDefinition::systemd(&paths).render()
+        };
+        fs::write(definition, rendered).unwrap();
         let expected = callback_command(&paths);
-        let registry = PueueConfigCallbackRegistry::new(&config);
+        let registry = PueueConfigCallbackRegistry::new(&self.pueue_config);
         registry.set_callback(&expected).unwrap();
         let installed = registry.current_callback().unwrap().unwrap();
         assert_eq!(installed, expected);
@@ -1052,13 +1093,29 @@ impl CallbackCliHarness {
             .env("HOME", &self.policy_paths.home)
             .env("CODEX_HOME", &self.policy_paths.codex_home)
             .env("PATH", &self.policy_paths.trusted_dir)
-            .current_dir(&self.root)
+            .current_dir(working_directory)
             .output()
             .unwrap()
     }
 
     fn run_callback_with_arguments(&self, arguments: &[&str]) -> std::process::Output {
         self.command().args(arguments).output().unwrap()
+    }
+
+    fn register_additional_project(&self, directory: &str, group: &str) {
+        let root = self._temp.path().join(directory);
+        fs::create_dir(&root).unwrap();
+        pueue_agent::init::run(&root).unwrap();
+        let project_config = config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+        ProjectRepository::new(&self.db)
+            .register(&NewProject::new(
+                &project_config.project_id,
+                &root,
+                group,
+                root.join(".pueue-agent/config.toml"),
+                101,
+            ))
+            .unwrap();
     }
 
     fn command(&self) -> assert_cmd::Command {
@@ -1126,6 +1183,55 @@ fn callback_resolves_and_validates_group_from_numeric_task_id() {
     assert!(!injected.injected_marker.exists());
     assert_eq!(injected.event_count(), 0);
     assert_eq!(injected.integration_event_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn implicit_callback_resolves_registered_project_from_an_unrelated_working_directory() {
+    let harness =
+        CallbackCliHarness::with_task_and_registered_group(45, "pa-second", "pa-first");
+    harness.register_additional_project("second-project", "pa-second");
+    let unrelated = harness._temp.path().join("unrelated-daemon-cwd");
+    fs::create_dir(&unrelated).unwrap();
+
+    let output = harness.run_installed_callback_from(45, &unrelated);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.events_for(45), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_callback_group_remains_independent_of_cwd_and_pueue_status() {
+    let harness = CallbackCliHarness::with_task(46, "pa-project");
+    let unrelated = harness._temp.path().join("explicit-callback-cwd");
+    fs::create_dir(&unrelated).unwrap();
+
+    let output = harness
+        .command()
+        .current_dir(&unrelated)
+        .args([
+            "event",
+            "callback",
+            "--group",
+            "pa-project",
+            "--task-id",
+            "46",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!harness.pueue_invoked_marker.exists());
+    assert_eq!(harness.events_for(46), 1);
 }
 
 #[cfg(unix)]

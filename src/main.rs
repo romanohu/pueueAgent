@@ -424,7 +424,7 @@ mod commands {
         let group = match args.group {
             Some(group) => group,
             None => {
-                let (db, _, _, policy) = resolve_project_read_only(None, None)?;
+                let (db, _service_paths, policy) = resolve_callback_read_only()?;
                 let pueue = configured_pueue(policy)?;
                 let tasks = pueue.status_json().await?;
                 let group = callback_group_for_task(&tasks, task_id)?;
@@ -765,6 +765,35 @@ mod commands {
         ))?);
         let service_paths = service_paths.pin_to_policy(&policy)?;
         Ok((db, project, service_paths, policy))
+    }
+
+    /// Resolve an installed numeric callback without consulting the ambient
+    /// working directory. Pueue launches daemon callbacks without a project
+    /// cwd, so the global state database is the only authoritative project
+    /// index at this entry point.
+    fn resolve_callback_read_only() -> Result<
+        (Db, ServicePaths, Arc<ResolvedExecutionPolicy>),
+        AppError,
+    > {
+        let db = Db::open_read_only(&paths::state_db_path()?)?;
+        let projects = ProjectRepository::new(&db).list_all()?;
+        let working_dir = projects
+            .first()
+            .map(|project| project.root_path.clone())
+            .ok_or(AppError::Runtime {
+                operation: "find registered callback project",
+            })?;
+        let project_roots = projects
+            .into_iter()
+            .map(|project| project.root_path)
+            .collect();
+        let service_paths = ServicePaths::from_environment(&working_dir, None)?;
+        let policy = Arc::new(load_existing_policy(&service_paths.policy_load_input(
+            project_roots,
+            current_launcher_path()?,
+        ))?);
+        let service_paths = service_paths.pin_to_policy(&policy)?;
+        Ok((db, service_paths, policy))
     }
 
     /// Doctor must report an unavailable policy rather than failing before
