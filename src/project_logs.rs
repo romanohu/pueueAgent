@@ -879,16 +879,12 @@ fn create_private_marker(parent: &File) -> Result<(File, std::ffi::OsString), Ap
 fn private_marker_name() -> std::ffi::OsString {
     use std::os::unix::ffi::OsStringExt;
     let counter = PRIVATE_MARKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // arc4random is available on both Linux and macOS and provides an
-    // unpredictable per-process suffix without adding a dependency.
-    let random_a = unsafe { libc::arc4random() };
-    let random_b = unsafe { libc::arc4random() };
+    // UUID v4 uses the operating system RNG on every supported Unix target,
+    // unlike the BSD-specific arc4random API.
+    let random = uuid::Uuid::new_v4().as_u128();
     let pid = unsafe { libc::getpid() };
     OsStringExt::from_vec(
-        format!(
-            ".pueue-agent-marker-{pid}-{counter:016x}-{random_a:08x}{random_b:08x}"
-        )
-        .into_bytes(),
+        format!(".pueue-agent-marker-{pid}-{counter:016x}-{random:032x}").into_bytes(),
     )
 }
 
