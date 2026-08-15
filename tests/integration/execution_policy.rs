@@ -5,26 +5,73 @@ use std::{
 
 use pueue_agent::{
     config::{AgentConfig, AgentCodexConfig, AgentExecutionConfig, ProjectConfig},
+    db::{Db, ProjectRepository},
+    diagnostics::{build_doctor_report_with_policy, DoctorCheckStatus, DoctorExternal},
     execution_policy::{
         load_existing_policy, load_or_create_policy, resolve_project_policy, AgentKind,
         NetworkMode, PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
     },
-    models::{AgentContextMode, Project},
+    models::{AgentContextMode, NewProject, Project},
+    service::{ServicePaths, ServiceStatus},
 };
 use tempfile::{tempdir, TempDir};
 
 #[test]
-fn publication_failure_cleanup_is_descriptor_relative() {
-    let source = include_str!("../../src/execution_policy.rs");
-    let create_start = source
-        .find("fn create_policy_file(")
-        .expect("policy creation must use a temporary file");
-    let create = &source[create_start..];
+fn doctor_detects_replaced_pueue_executable_and_config_anchors() {
+    for replacement in ["pueue", "config"] {
+        let harness = PolicyHarness::new();
+        let db = Db::open(&harness.path("doctor.sqlite3")).unwrap();
+        let project = harness.project("doctor-project");
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project.project_id,
+                &project.root_path,
+                &project.pueue_group,
+                &project.config_path,
+                0,
+            ))
+            .unwrap();
+        let policy = load_or_create_policy(&harness.input()).unwrap();
+        let replaced = if replacement == "pueue" {
+            &harness.pueue
+        } else {
+            &harness.pueue_config
+        };
+        fs::rename(replaced, replaced.with_extension("old")).unwrap();
+        fs::write(replaced, b"replacement").unwrap();
+        secure_file(replaced);
 
-    assert!(!create.contains("fs::remove_file(&temporary)"));
-    assert!(create.contains("cleanup_policy_temporary(state_dir, &temporary)"));
-    assert!(create.contains("unlinkat(&state_dir.file, temporary)"));
-    assert!(create.contains("state_dir.file.sync_all()"));
+        let paths = ServicePaths {
+            release_binary: harness.launcher.clone(),
+            pueue_config: harness.pueue_config.clone(),
+            state_dir: harness.state_dir.clone(),
+            execution_policy: harness.policy(),
+            working_dir: project.root_path.clone(),
+            home: harness.path("home"),
+            codex_home: harness.codex_home.clone(),
+            path_env: harness.trusted_bin.to_string_lossy().into_owned(),
+            startup_environment: StartupEnvironment::default(),
+        };
+        let report = build_doctor_report_with_policy(
+            &db,
+            &project,
+            &paths,
+            DoctorExternal {
+                pueue: Ok(Vec::new()),
+                service: Ok(ServiceStatus::Stopped),
+                callback: Ok(None),
+            },
+            0,
+            &Ok(policy),
+        )
+        .unwrap();
+        let anchors = report
+            .checks
+            .iter()
+            .find(|check| check.name == "execution.anchors")
+            .unwrap();
+        assert_eq!(anchors.status, DoctorCheckStatus::Error, "{replacement:?}");
+    }
 }
 
 struct PolicyHarness {

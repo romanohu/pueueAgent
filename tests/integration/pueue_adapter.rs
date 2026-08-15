@@ -28,10 +28,11 @@ use pueue_agent::{
         AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
         Submission, SubmissionKind, SubmissionStatus,
     },
-    pueue::{configured_pueue, PueueApi, PueueError, PueueTask, PUEUE_TIMEOUT},
+    pueue::{configured_pueue, validate_add_argv, PueueApi, PueueError, PueueTask, PUEUE_TIMEOUT},
     pueue_security::{validate_group, MAX_PUEUE_OUTPUT_BYTES},
     submit, AppError,
 };
+use pueue_agent::process::MAX_FIELD_SIZE;
 #[cfg(all(unix, debug_assertions))]
 use pueue_agent::pueue_process::PueueProcessRunner;
 #[cfg(unix)]
@@ -60,6 +61,43 @@ fn pueue_process_runner_has_a_fail_closed_non_unix_contract() {
 fn production_pueue_limits_are_exact() {
     assert_eq!(PUEUE_TIMEOUT, std::time::Duration::from_secs(30));
     assert_eq!(MAX_PUEUE_OUTPUT_BYTES, 65_536);
+}
+
+#[test]
+fn native_add_preflight_accepts_a_shape_valid_small_request() {
+    assert!(validate_add_argv(&[
+        OsString::from("-g"),
+        OsString::from("pa-project"),
+        OsString::from("--"),
+        OsString::from("python"),
+    ])
+    .is_ok());
+}
+
+#[test]
+fn native_add_preflight_accepts_the_last_conservative_frame_and_rejects_the_next_byte() {
+    let add_args = |bytes| {
+        let mut args = vec![
+            OsString::from("-g"),
+            OsString::from("pa-project"),
+            OsString::from("--"),
+        ];
+        args.extend((0..32).map(|_| OsString::from("x".repeat(bytes))));
+        args
+    };
+    let mut low = 0;
+    let mut high = MAX_FIELD_SIZE;
+    while low < high {
+        let middle = low + (high - low + 1) / 2;
+        if validate_add_argv(&add_args(middle)).is_ok() {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+
+    assert!(validate_add_argv(&add_args(low)).is_ok());
+    assert!(validate_add_argv(&add_args(low + 1)).is_err());
 }
 
 fn source_before_test_module(source: &str) -> &str {
@@ -1317,11 +1355,12 @@ async fn oversized_native_batch_add_argv_is_rejected_before_submission_insert() 
     )
     .unwrap();
     let fake = FakePueue::new().with_add_task_id(73);
+    let request_id = uuid::Uuid::new_v4().to_string();
 
     assert!(batches::run_with(
         &harness.db,
         &harness.root,
-        &uuid::Uuid::new_v4().to_string(),
+        &request_id,
         &manifest_path,
         None,
         &fake,
@@ -1332,6 +1371,10 @@ async fn oversized_native_batch_add_argv_is_rejected_before_submission_insert() 
         .find_unreconciled("project-a")
         .unwrap()
         .is_empty());
+    assert!(BatchRepository::new(&harness.db)
+        .find("project-a", &request_id)
+        .unwrap()
+        .is_none());
     assert!(fake.last_add_args().is_empty());
 }
 

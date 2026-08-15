@@ -21,7 +21,7 @@ use tokio::{
 use crate::{
     environment::SanitizedEnvironment,
     execution_policy::{ExecutableIdentity, ResolvedExecutionPolicy},
-    process::{ControlFrame, LaunchFlags, LaunchMode},
+    process::{ControlFrame, LaunchFlags, LaunchMode, MAX_FIELD_SIZE},
     pueue::{PueueError, PUEUE_TIMEOUT},
     AppError,
 };
@@ -31,6 +31,41 @@ pub use crate::pueue_security::MAX_PUEUE_OUTPUT_BYTES;
 /// Reject an argv that cannot be represented by the native control protocol
 /// before any durable submission state is created.
 pub(crate) fn validate_native_pueue_argv(argv: &[OsString]) -> Result<(), AppError> {
+    let maximum_field = OsString::from("x".repeat(MAX_FIELD_SIZE));
+    let environment = vec![
+        (OsString::from("HOME"), maximum_field.clone()),
+        (OsString::from("PATH"), maximum_field.clone()),
+        (OsString::from("LANG"), OsString::from("C")),
+        (OsString::from("LC_ALL"), OsString::from("C")),
+        (OsString::from("LC_CTYPE"), OsString::from("C")),
+        (OsString::from("TMPDIR"), maximum_field.clone()),
+        (OsString::from("TMP"), maximum_field.clone()),
+        (OsString::from("TEMP"), maximum_field.clone()),
+    ];
+    validate_pueue_frame(argv.to_vec(), environment, maximum_field)
+}
+
+/// Check that the startup-pinned Pueue environment and executable path fit
+/// the full native control frame before submissions can be persisted.
+pub(crate) fn validate_pueue_execution_contract(
+    policy: &ResolvedExecutionPolicy,
+    environment: &SanitizedEnvironment,
+) -> Result<(), AppError> {
+    validate_pueue_frame(
+        Vec::new(),
+        environment
+            .entries()
+            .map(|(name, value)| (name.to_os_string(), value.to_os_string()))
+            .collect(),
+        policy.pueue_anchor.canonical_path.as_os_str().to_os_string(),
+    )
+}
+
+fn validate_pueue_frame(
+    argv: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+    target_path: OsString,
+) -> Result<(), AppError> {
     let identity = ExecutableIdentity {
         device: 0,
         inode: 0,
@@ -39,15 +74,15 @@ pub(crate) fn validate_native_pueue_argv(argv: &[OsString]) -> Result<(), AppErr
     };
     ControlFrame {
         mode: LaunchMode::Pueue,
-        flags: LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP,
-        argv: argv.to_vec(),
-        environment: Vec::new(),
+        flags: LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP | LaunchFlags::LIFECYCLE,
+        argv,
+        environment,
         cwd: None,
         target_identity: identity,
         project_root_identity: None,
         agent_log_identity: None,
         pueue_config_identity: Some(identity),
-        target_path: Some(OsString::new()),
+        target_path: Some(target_path),
     }
     .encode()
     .map_err(|_| AppError::Validation {

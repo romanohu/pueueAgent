@@ -15,7 +15,10 @@ use thiserror::Error;
 use crate::{
     environment::SanitizedEnvironment,
     execution_policy::ResolvedExecutionPolicy,
-    pueue_process::{validate_native_pueue_argv, BoundedOutput, PueueProcessRunner},
+    pueue_process::{
+        validate_native_pueue_argv, validate_pueue_execution_contract, BoundedOutput,
+        PueueProcessRunner,
+    },
     pueue_security::validate_group,
     AppError,
 };
@@ -214,6 +217,7 @@ pub fn configured_pueue(
     policy: Arc<ResolvedExecutionPolicy>,
 ) -> Result<CommandPueue, AppError> {
     let environment = SanitizedEnvironment::for_pueue(&policy)?;
+    validate_pueue_execution_contract(&policy, &environment)?;
     let _ = policy.pueue_anchor.verify_identity()?;
     let _ = policy.launcher_anchor.verify_identity()?;
     let _ = policy

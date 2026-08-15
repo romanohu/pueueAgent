@@ -209,6 +209,9 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     }
     let group = requested_group.unwrap_or(&registered.pueue_group);
     let manifest = load_manifest(manifest_path)?;
+    for job in &manifest.jobs {
+        validate_add_argv(&pueue_add_args(group, &job.argv))?;
+    }
     let now = unix_timestamp()?;
     let request = NewBatchRequest::new(
         request_id,
@@ -247,11 +250,7 @@ pub async fn run_with<P: PueueApi + ?Sized>(
         .cloned()
         .collect::<Vec<_>>();
     for job in dispatch_jobs {
-        let mut add_args = Vec::with_capacity(job.argv.len() + 3);
-        add_args.push(OsString::from("-g"));
-        add_args.push(OsString::from(group));
-        add_args.push(OsString::from("--"));
-        add_args.extend(job.argv.iter().cloned().map(OsString::from));
+        let add_args = pueue_add_args(group, &job.argv);
         validate_add_argv(&add_args)?;
 
         let submission_id = Uuid::new_v4().to_string();
@@ -304,6 +303,15 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     }
 
     Ok(result)
+}
+
+fn pueue_add_args(group: &str, argv: &[String]) -> Vec<OsString> {
+    let mut add_args = Vec::with_capacity(argv.len() + 3);
+    add_args.push(OsString::from("-g"));
+    add_args.push(OsString::from(group));
+    add_args.push(OsString::from("--"));
+    add_args.extend(argv.iter().cloned().map(OsString::from));
+    add_args
 }
 
 pub fn render_batch(

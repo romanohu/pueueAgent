@@ -41,6 +41,20 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static POLICY_PUBLISH_HOOK: std::sync::Mutex<Option<fn(&Path)>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static POLICY_OPEN_HOOK: std::sync::Mutex<Option<fn(&Path)>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static POLICY_TEMPORARY_HOOK: std::sync::Mutex<Option<fn(&OsStr)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyPublicationFailure {
+    Write,
+    Sync,
+    Link,
+}
+
+#[cfg(test)]
+static POLICY_PUBLICATION_FAILURE: std::sync::Mutex<Option<PolicyPublicationFailure>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn invoke_policy_publish_hook(state_dir: &Path) {
@@ -53,6 +67,24 @@ fn invoke_policy_publish_hook(state_dir: &Path) {
 fn invoke_policy_open_hook(state_dir: &Path) {
     if let Some(hook) = *POLICY_OPEN_HOOK.lock().unwrap() {
         hook(state_dir);
+    }
+}
+
+#[cfg(test)]
+fn invoke_policy_temporary_hook(temporary: &OsStr) {
+    if let Some(hook) = *POLICY_TEMPORARY_HOOK.lock().unwrap() {
+        hook(temporary);
+    }
+}
+
+#[cfg(test)]
+fn take_policy_publication_failure(stage: PolicyPublicationFailure) -> bool {
+    let mut failure = POLICY_PUBLICATION_FAILURE.lock().unwrap();
+    if *failure == Some(stage) {
+        *failure = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -1619,7 +1651,21 @@ fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
                 ))
             }
         };
-        if file.write_all(DEFAULT_POLICY.as_bytes()).is_err() || file.sync_all().is_err() {
+        #[cfg(test)]
+        invoke_policy_temporary_hook(&temporary);
+        #[cfg(test)]
+        let force_write = take_policy_publication_failure(PolicyPublicationFailure::Write);
+        #[cfg(not(test))]
+        let force_write = false;
+        #[cfg(test)]
+        let force_sync = take_policy_publication_failure(PolicyPublicationFailure::Sync);
+        #[cfg(not(test))]
+        let force_sync = false;
+        if force_write
+            || file.write_all(DEFAULT_POLICY.as_bytes()).is_err()
+            || force_sync
+            || file.sync_all().is_err()
+        {
             let _ = cleanup_policy_temporary(state_dir, &temporary);
             return Err(PolicyViolation::new(
                 PolicyViolationCode::PolicyUnreadable,
@@ -1628,7 +1674,16 @@ fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
         }
         #[cfg(test)]
         invoke_policy_publish_hook(&state_dir.canonical_path);
-        match linkat(&state_dir.file, &temporary, OsStr::new(POLICY_FILENAME)) {
+        #[cfg(test)]
+        let force_link = take_policy_publication_failure(PolicyPublicationFailure::Link);
+        #[cfg(not(test))]
+        let force_link = false;
+        let link_result = if force_link {
+            Err(io::Error::new(io::ErrorKind::Other, "injected policy link failure"))
+        } else {
+            linkat(&state_dir.file, &temporary, OsStr::new(POLICY_FILENAME))
+        };
+        match link_result {
             Ok(()) => {
                 unlinkat(&state_dir.file, &temporary).map_err(|_| {
                     PolicyViolation::new(
@@ -1645,13 +1700,7 @@ fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                unlinkat(&state_dir.file, &temporary).map_err(|_| {
-                    PolicyViolation::new(
-                        PolicyViolationCode::PolicyUnreadable,
-                        PolicyViolationStage::Startup,
-                    )
-                })?;
-                state_dir.file.sync_all().map_err(|_| {
+                cleanup_policy_temporary(state_dir, &temporary).map_err(|_| {
                     PolicyViolation::new(
                         PolicyViolationCode::PolicyUnreadable,
                         PolicyViolationStage::Startup,
@@ -1807,8 +1856,30 @@ struct RawProjectPolicy {
 mod fix_round_tests {
     use super::*;
 
+    static POLICY_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     fn install_policy_publish_hook(hook: Option<fn(&Path)>) {
         *POLICY_PUBLISH_HOOK.lock().unwrap() = hook;
+    }
+
+    fn install_policy_temporary_hook(hook: Option<fn(&OsStr)>) {
+        *POLICY_TEMPORARY_HOOK.lock().unwrap() = hook;
+    }
+
+    fn install_policy_publication_failure(failure: Option<PolicyPublicationFailure>) {
+        *POLICY_PUBLICATION_FAILURE.lock().unwrap() = failure;
+    }
+
+    fn write_cwd_sentinel(temporary: &OsStr) {
+        fs::write(temporary, b"cwd sentinel").unwrap();
     }
 
     fn publish_winner(state_dir: &Path) {
@@ -1899,6 +1970,38 @@ mod fix_round_tests {
         create_policy_file(&opened).unwrap();
         install_policy_publish_hook(None);
         assert_eq!(fs::read_to_string(state_dir.join(POLICY_FILENAME)).unwrap(), DEFAULT_POLICY);
+    }
+
+    #[test]
+    fn publication_failures_unlink_only_the_descriptor_relative_temporary() {
+        let _lock = POLICY_CWD_LOCK.lock().unwrap();
+        let holder = tempfile::tempdir().unwrap();
+        let state_dir = holder.path().join("state");
+        let cwd = holder.path().join("cwd");
+        fs::create_dir(&state_dir).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let opened = open_path_nofollow(&state_dir).unwrap();
+        let _original_cwd = CurrentDirGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&cwd).unwrap();
+        install_policy_temporary_hook(Some(write_cwd_sentinel));
+
+        for failure in [
+            PolicyPublicationFailure::Write,
+            PolicyPublicationFailure::Sync,
+            PolicyPublicationFailure::Link,
+        ] {
+            install_policy_publication_failure(Some(failure));
+            assert!(create_policy_file(&opened).is_err());
+            assert_eq!(
+                fs::read_dir(&state_dir).unwrap().count(),
+                0,
+                "state temporary leaked after {failure:?}"
+            );
+        }
+
+        install_policy_temporary_hook(None);
+        install_policy_publication_failure(None);
+        assert_eq!(fs::read_dir(&cwd).unwrap().count(), 3);
     }
 
     #[test]

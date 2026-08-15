@@ -178,7 +178,7 @@ impl LaunchFlags {
     pub const AGENT_LOG: Self = Self(FLAG_AGENT_LOG);
     pub const PUEUE_CONFIG: Self = Self(FLAG_PUEUE_CONFIG);
     pub const PROCESS_GROUP: Self = Self(FLAG_PROCESS_GROUP);
-    const LIFECYCLE: Self = Self(FLAG_LIFECYCLE);
+    pub const LIFECYCLE: Self = Self(FLAG_LIFECYCLE);
 
     pub const fn bits(self) -> u16 { self.0 }
     pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
