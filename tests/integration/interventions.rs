@@ -1,5 +1,8 @@
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -14,11 +17,15 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 struct SteerHarness {
-    temp: TempDir,
+    _temp: TempDir,
     state_dir: PathBuf,
     first_root: PathBuf,
     second_root: PathBuf,
     db: Db,
+    home: PathBuf,
+    codex_home: PathBuf,
+    trusted_dir: PathBuf,
+    pueue_marker: PathBuf,
 }
 
 impl SteerHarness {
@@ -42,12 +49,71 @@ impl SteerHarness {
                 .unwrap();
         }
 
+        let home = temp.path().join("home");
+        let codex_home = temp.path().join("codex-home");
+        let trusted_dir = temp.path().join("trusted-bin");
+        let pueue_config = home.join(".config/pueue/pueue.yml");
+        for directory in [&codex_home, &trusted_dir] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::create_dir_all(pueue_config.parent().unwrap()).unwrap();
+        for directory in [&state_dir, &home, &codex_home, &trusted_dir] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let pueue_marker = temp.path().join("pueue-invoked");
+        let fake_pueue = trusted_dir.join("pueue");
+        let fake_source = temp.path().join("fake-pueue.rs");
+        fs::write(
+            &fake_source,
+            format!(
+                "fn main() {{ std::fs::write({:?}, b\"invoked\").unwrap(); }}\n",
+                pueue_marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        let build = std::process::Command::new("rustc")
+            .args(["--edition=2021", "-O", "-o"])
+            .arg(&fake_pueue)
+            .arg(&fake_source)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let fake_codex = trusted_dir.join("codex");
+        fs::copy(&fake_pueue, &fake_codex).unwrap();
+        fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&pueue_config, "fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            state_dir.join("execution-policy.toml"),
+            format!(
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+                trusted_dir.display().to_string(),
+                fake_codex.display().to_string(),
+                fake_pueue.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            state_dir.join("execution-policy.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
         Self {
-            temp,
+            _temp: temp,
             state_dir,
             first_root,
             second_root,
             db,
+            home,
+            codex_home,
+            trusted_dir,
+            pueue_marker,
         }
     }
 
@@ -55,6 +121,9 @@ impl SteerHarness {
         let mut command = Command::cargo_bin("pueue-agent").unwrap();
         command
             .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
+            .env("HOME", &self.home)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("PATH", &self.trusted_dir)
             .current_dir(project_root);
         command
     }
@@ -76,28 +145,11 @@ fn initialize_project(parent: &Path, name: &str) -> PathBuf {
 #[test]
 fn steer_queues_the_exact_message_without_starting_an_agent_or_pueue() {
     let harness = SteerHarness::new();
-    let marker = harness.temp.path().join("pueue-invoked");
-    let bin_dir = harness.temp.path().join("bin");
-    fs::create_dir(&bin_dir).unwrap();
-    let fake_pueue = bin_dir.join("pueue");
-    fs::write(
-        &fake_pueue,
-        "#!/bin/sh\nprintf invoked > \"$PUEUE_STEER_MARKER\"\nexit 1\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(&fake_pueue, fs::Permissions::from_mode(0o755)).unwrap();
-    }
 
     let message = "次の実験では learning rate を下げる";
     let output = harness
         .command(&harness.first_root)
         .args(["steer", "--", message])
-        .env("PUEUE_STEER_MARKER", &marker)
-        .env("PATH", &bin_dir)
         .output()
         .unwrap();
 
@@ -108,7 +160,7 @@ fn steer_queues_the_exact_message_without_starting_an_agent_or_pueue() {
         .and_then(|value| value.trim().strip_suffix('\n').or(Some(value.trim())))
         .expect("steer should return a queued intervention ID");
     assert!(!intervention_id.is_empty());
-    assert!(!marker.exists());
+    assert!(!harness.pueue_marker.exists());
 
     let project_id = harness.project_id(&harness.first_root);
     let queued = InterventionRepository::new(&harness.db)
