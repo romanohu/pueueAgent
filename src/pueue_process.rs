@@ -10,7 +10,7 @@ use std::{
     fmt,
     io,
     process::ExitStatus,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -162,7 +162,8 @@ impl PueueProcessRunner {
         operation_argv: &[OsString],
     ) -> Result<BoundedOutput, AppError> {
         use crate::process::{
-            spawn_verified_command, terminate_process_group, ProcessGroupRequirement,
+            spawn_verified_command_before, terminate_process_group,
+            ProcessGroupRequirement,
             VerifiedChildIo, VerifiedCommandSpec,
         };
 
@@ -176,6 +177,11 @@ impl PueueProcessRunner {
             field: "pueue_operation",
             message: "is not supported",
         })?;
+        // The operation budget starts before the final config verification so
+        // every launch, handshake, wait, and output phase shares one limit.
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(AppError::Pueue(PueueError::Timeout { operation }))?;
 
         // This is deliberately the final path/config check before the core
         // launcher call.  Do not replace it with a path-based argument.
@@ -192,7 +198,7 @@ impl PueueProcessRunner {
         argv.push(OsString::from(operation));
         argv.extend_from_slice(operation_args);
 
-        let mut verified = match spawn_verified_command(VerifiedCommandSpec {
+        let mut verified = match spawn_verified_command_before(VerifiedCommandSpec {
             launcher: policy.launcher_anchor.clone(),
             executable: policy.pueue_anchor.clone(),
             argv,
@@ -203,18 +209,18 @@ impl PueueProcessRunner {
             project_root: None,
             pueue_config: Some(verified_config),
             child_io: VerifiedChildIo::Capture,
-        }) {
+        }, deadline) {
             Ok(child) => child,
-            Err(error) => return Err(map_spawn_error(operation, error)),
+            Err(error) => return Err(map_operation_error(operation, error)),
         };
 
-        if let Err(error) = verified.release() {
+        if let Err(error) = verified.release_before(deadline) {
             return Err(cleanup_after_failure(&mut verified, operation, error).await);
         }
-        if let Err(error) = verified.confirm_exec().await {
+        if let Err(error) = verified.confirm_exec_before(deadline).await {
             return Err(cleanup_after_failure(&mut verified, operation, error).await);
         }
-        if let Err(error) = verified.wait_for_release_ack().await {
+        if let Err(error) = verified.wait_for_release_ack_before(deadline).await {
             return Err(cleanup_after_failure(&mut verified, operation, error).await);
         }
 
@@ -231,13 +237,13 @@ impl PueueProcessRunner {
             }
         };
 
-        let stdout_task = tokio::spawn(read_bounded(stdout, self.output_limit));
-        let stderr_task = tokio::spawn(read_bounded(stderr, self.output_limit));
+        let stdout_task = tokio::spawn(read_bounded(stdout, self.output_limit, deadline));
+        let stderr_task = tokio::spawn(read_bounded(stderr, self.output_limit, deadline));
         let outcome = collect_until_terminal(
             &mut verified,
             stdout_task,
             stderr_task,
-            self.timeout,
+            deadline,
         )
         .await;
 
@@ -356,16 +362,21 @@ impl CollectionFailure {
 }
 
 #[cfg(unix)]
-async fn read_bounded<R>(mut reader: R, limit: usize) -> Result<Vec<u8>, ReadFailure>
+async fn read_bounded<R>(
+    mut reader: R,
+    limit: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, ReadFailure>
 where
     R: AsyncRead + Unpin,
 {
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut buffer = [0u8; 8192];
     loop {
-        let count = reader
-            .read(&mut buffer)
+        let remaining = deadline_remaining(deadline).ok_or(ReadFailure::Timeout)?;
+        let count = tokio::time::timeout(remaining, reader.read(&mut buffer))
             .await
+            .map_err(|_| ReadFailure::Timeout)?
             .map_err(|_| ReadFailure::Io)?;
         if count == 0 {
             return Ok(bytes);
@@ -380,6 +391,7 @@ where
 #[cfg(unix)]
 #[derive(Debug)]
 enum ReadFailure {
+    Timeout,
     Io,
     Limit,
 }
@@ -389,10 +401,10 @@ async fn collect_until_terminal(
     child: &mut crate::process::VerifiedChild,
     mut stdout_task: JoinHandle<Result<Vec<u8>, ReadFailure>>,
     mut stderr_task: JoinHandle<Result<Vec<u8>, ReadFailure>>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<BoundedOutput, PendingCollection> {
     let mut wait = Box::pin(child.wait());
-    let mut deadline = Box::pin(tokio::time::sleep(timeout));
+    let mut deadline = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)));
     let mut status = None;
     let mut stdout = None;
     let mut stderr = None;
@@ -412,6 +424,7 @@ async fn collect_until_terminal(
                 match result {
                     Ok(Ok(value)) => stdout = Some(value),
                     Ok(Err(ReadFailure::Limit)) => break Err(CollectionFailure::OutputLimit("stdout")),
+                    Ok(Err(ReadFailure::Timeout)) => break Err(CollectionFailure::Timeout),
                     Ok(Err(ReadFailure::Io)) | Err(_) => break Err(CollectionFailure::Reader("stdout")),
                 }
             }
@@ -420,6 +433,7 @@ async fn collect_until_terminal(
                 match result {
                     Ok(Ok(value)) => stderr = Some(value),
                     Ok(Err(ReadFailure::Limit)) => break Err(CollectionFailure::OutputLimit("stderr")),
+                    Ok(Err(ReadFailure::Timeout)) => break Err(CollectionFailure::Timeout),
                     Ok(Err(ReadFailure::Io)) | Err(_) => break Err(CollectionFailure::Reader("stderr")),
                 }
             }
@@ -452,7 +466,7 @@ async fn cleanup_after_failure(
     original: AppError,
 ) -> AppError {
     match crate::process::terminate_process_group(child).await {
-        Ok(()) => original,
+        Ok(()) => map_operation_error(operation, original),
         Err(error) => AppError::Pueue(PueueError::Cleanup {
             operation,
             stage: cleanup_stage(&error),
@@ -489,11 +503,27 @@ fn map_spawn_error(operation: &'static str, error: AppError) -> AppError {
     })
 }
 
+#[cfg(unix)]
+fn deadline_remaining(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+}
+
+#[cfg(unix)]
+fn map_operation_error(operation: &'static str, error: AppError) -> AppError {
+    if crate::process::is_lifecycle_deadline_exceeded(&error) {
+        AppError::Pueue(PueueError::Timeout { operation })
+    } else {
+        map_spawn_error(operation, error)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::{cleanup_stage, read_bounded, BoundedOutput, ReadFailure};
     use crate::AppError;
-    use std::os::unix::process::ExitStatusExt;
+    use std::{os::unix::process::ExitStatusExt, time::{Duration, Instant}};
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -507,8 +537,12 @@ mod tests {
             stderr_writer.write_all(&[0u8; 64]).await.unwrap();
         });
 
-        assert!(matches!(read_bounded(stdout_reader, 64).await, Err(ReadFailure::Limit)));
-        assert_eq!(read_bounded(stderr_reader, 64).await.unwrap().len(), 64);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(matches!(
+            read_bounded(stdout_reader, 64, deadline).await,
+            Err(ReadFailure::Limit)
+        ));
+        assert_eq!(read_bounded(stderr_reader, 64, deadline).await.unwrap().len(), 64);
         stdout_task.await.unwrap();
         stderr_task.await.unwrap();
     }

@@ -349,6 +349,7 @@ pub enum ProcessLaunchError {
     Bootstrap(BootstrapError),
     ReadinessRejected,
     HelperFailure(HelperFailureKind),
+    DeadlineExceeded,
     Io,
 }
 
@@ -373,6 +374,7 @@ impl fmt::Display for ProcessLaunchError {
             Self::HelperFailure(HelperFailureKind::Security) => {
                 "helper rejected the verified launch contract"
             }
+            Self::DeadlineExceeded => "helper lifecycle deadline elapsed",
             Self::Io => "helper readiness I/O failed",
         })
     }
@@ -685,6 +687,10 @@ impl VerifiedChild {
     }
 
     pub fn release(&mut self) -> Result<(), AppError> {
+        self.release_before(lifecycle_deadline())
+    }
+
+    pub fn release_before(&mut self, deadline: Instant) -> Result<(), AppError> {
         if self.released {
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
@@ -698,14 +704,18 @@ impl VerifiedChild {
         // unbounded amount of time for this byte while the marker is being
         // durably created, so only the parent-side write gets a fresh
         // operation deadline.
-        write_all_fd_before(&mut writer, &RELEASE_AUTHORIZATION, lifecycle_deadline())
-            .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
+        write_all_fd_before(&mut writer, &RELEASE_AUTHORIZATION, deadline)
+            .map_err(map_lifecycle_io_failure)?;
         drop(writer);
         self.released = true;
         Ok(())
     }
 
     pub async fn confirm_exec(&mut self) -> Result<(), AppError> {
+        self.confirm_exec_before(lifecycle_deadline()).await
+    }
+
+    pub async fn confirm_exec_before(&mut self, deadline: Instant) -> Result<(), AppError> {
         if !self.released {
             return Err(native_gate_error(PolicyViolationStage::RunBoundPreMarker));
         }
@@ -714,10 +724,6 @@ impl VerifiedChild {
             .reader
             .take()
             .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
-        // Do not reuse a deadline captured during spawn.  Marker creation can
-        // take an arbitrary amount of time before release; proof gets its own
-        // lifecycle budget once release has completed.
-        let deadline = lifecycle_deadline();
         tokio::task::spawn_blocking(move || read_exec_proof(reader, deadline))
             .await
             .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))??;
@@ -726,6 +732,10 @@ impl VerifiedChild {
     }
 
     pub async fn wait_for_release_ack(&mut self) -> Result<(), AppError> {
+        self.wait_for_release_ack_before(lifecycle_deadline()).await
+    }
+
+    pub async fn wait_for_release_ack_before(&mut self, deadline: Instant) -> Result<(), AppError> {
         if !self.released {
             return Err(native_gate_error(PolicyViolationStage::RunBoundPreMarker));
         }
@@ -737,9 +747,6 @@ impl VerifiedChild {
             .reader
             .take()
             .ok_or_else(|| native_gate_error(PolicyViolationStage::PostMarker))?;
-        // Ack has an independent budget from exec proof.  In particular, a
-        // slow proof must not consume the ack operation's entire budget.
-        let deadline = lifecycle_deadline();
         tokio::task::spawn_blocking(move || read_exact_ack(reader, deadline))
             .await
             .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))??;
@@ -1805,6 +1812,37 @@ pub fn spawn_validated_helper(
 /// returned one-shot gate is released.
 #[cfg(unix)]
 pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild, AppError> {
+    let bootstrap_deadline = Instant::now()
+        .checked_add(BOOTSTRAP_IO_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    spawn_verified_command_with_deadlines(
+        spec,
+        bootstrap_deadline,
+        lifecycle_deadline(),
+        false,
+    )
+}
+
+/// Spawn a suspended verified target, bounding bootstrap and readiness by the
+/// caller-owned operation deadline.
+#[cfg(unix)]
+pub fn spawn_verified_command_before(
+    spec: VerifiedCommandSpec,
+    deadline: Instant,
+) -> Result<VerifiedChild, AppError> {
+    spawn_verified_command_with_deadlines(spec, deadline, deadline, true)
+}
+
+#[cfg(unix)]
+fn spawn_verified_command_with_deadlines(
+    spec: VerifiedCommandSpec,
+    bootstrap_deadline: Instant,
+    lifecycle_deadline: Instant,
+    deadline_is_operation_timeout: bool,
+) -> Result<VerifiedChild, AppError> {
+    if Instant::now() >= lifecycle_deadline {
+        return Err(lifecycle_deadline_exceeded());
+    }
     if spec.process_group != ProcessGroupRequirement::Required || !spec.start_suspended {
         return Err(native_gate_error(PolicyViolationStage::NativeGate));
     }
@@ -1913,22 +1951,35 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
 
     let parent_raw = parent_socket.into_raw_fd();
     let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
-    if let Err(error) = send_bootstrap_packet(
+    if let Err(error) = send_bootstrap_packet_before(
         parent_stream.as_raw_fd(),
         &frame,
         &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+        bootstrap_deadline,
     ) {
         cleanup_failed_tokio_helper(&mut child, pid);
-        return Err(map_verified_launch_error(ProcessLaunchError::Bootstrap(error)));
+        let error = match error {
+            BootstrapError::Io(source)
+                if deadline_is_operation_timeout && source.kind() == io::ErrorKind::TimedOut => {
+                ProcessLaunchError::DeadlineExceeded
+            }
+            error => ProcessLaunchError::Bootstrap(error),
+        };
+        return Err(map_verified_launch_error(error));
     }
     // Suspended target creation is a distinct lifecycle operation from the
     // bounded bootstrap transfer. On macOS, posix_spawn may synchronously
     // assess a newly generated executable, so this operation receives its own
     // lifecycle deadline instead of the shorter bootstrap-only budget.
-    if let Err(error) =
-        read_helper_readiness_with_timeout(&mut parent_stream, LIFECYCLE_IO_TIMEOUT)
-    {
+    if let Err(error) = read_helper_readiness_before(&mut parent_stream, lifecycle_deadline) {
         cleanup_failed_tokio_helper(&mut child, pid);
+        let error = if !deadline_is_operation_timeout
+            && matches!(error, ProcessLaunchError::DeadlineExceeded)
+        {
+            ProcessLaunchError::ReadinessRejected
+        } else {
+            error
+        };
         return Err(map_verified_launch_error(error));
     }
     drop(rights);
@@ -2021,6 +2072,7 @@ fn map_helper_spawn_error(error: &io::Error) -> AppError {
 #[cfg(unix)]
 fn map_verified_launch_error(error: ProcessLaunchError) -> AppError {
     match error {
+        ProcessLaunchError::DeadlineExceeded => lifecycle_deadline_exceeded(),
         ProcessLaunchError::Spawn
         | ProcessLaunchError::Io
         | ProcessLaunchError::HelperFailure(HelperFailureKind::Transient)
@@ -2092,6 +2144,32 @@ fn lifecycle_deadline() -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
+/// The only internal classification used to carry an expired caller-owned
+/// lifecycle deadline across the verified process boundary.
+#[cfg(unix)]
+const LIFECYCLE_DEADLINE_OPERATION: &str = "verified lifecycle deadline elapsed";
+
+#[cfg(unix)]
+fn lifecycle_deadline_exceeded() -> AppError {
+    AppError::Runtime {
+        operation: LIFECYCLE_DEADLINE_OPERATION,
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn is_lifecycle_deadline_exceeded(error: &AppError) -> bool {
+    matches!(error, AppError::Runtime { operation: LIFECYCLE_DEADLINE_OPERATION })
+}
+
+#[cfg(unix)]
+fn map_lifecycle_io_failure(error: io::Error) -> AppError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        lifecycle_deadline_exceeded()
+    } else {
+        native_gate_error(PolicyViolationStage::PostMarker)
+    }
+}
+
 #[cfg(unix)]
 fn wait_fd(raw: RawFd, events: i16, deadline: Instant) -> io::Result<()> {
     loop {
@@ -2143,7 +2221,7 @@ fn read_fd_before(file: &mut std::fs::File, buffer: &mut [u8], deadline: Instant
 fn read_exec_proof(mut reader: std::fs::File, deadline: Instant) -> Result<(), AppError> {
     let mut record = [0u8; 9];
     let count = read_fd_before(&mut reader, &mut record, deadline)
-        .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
+        .map_err(map_lifecycle_io_failure)?;
     if count == 0 {
         return Ok(());
     }
@@ -2158,7 +2236,7 @@ fn read_exact_ack(mut reader: std::fs::File, deadline: Instant) -> Result<(), Ap
     let mut offset = 0;
     while offset < received.len() {
         let count = read_fd_before(&mut reader, &mut received[offset..], deadline)
-            .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?;
+            .map_err(map_lifecycle_io_failure)?;
         if count == 0 {
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
@@ -2169,7 +2247,7 @@ fn read_exact_ack(mut reader: std::fs::File, deadline: Instant) -> Result<(), Ap
     }
     let mut trailing = [0u8; 1];
     if read_fd_before(&mut reader, &mut trailing, deadline)
-        .map_err(|_| native_gate_error(PolicyViolationStage::PostMarker))?
+        .map_err(map_lifecycle_io_failure)?
         != 0
     {
         return Err(native_gate_error(PolicyViolationStage::PostMarker));
@@ -2199,13 +2277,24 @@ fn read_helper_readiness_with_timeout(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ProcessLaunchError::Io)?;
+    match read_helper_readiness_before(stream, deadline) {
+        Err(ProcessLaunchError::DeadlineExceeded) => Err(ProcessLaunchError::ReadinessRejected),
+        result => result,
+    }
+}
+
+#[cfg(unix)]
+fn read_helper_readiness_before(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> Result<(), ProcessLaunchError> {
     let mut record = [0u8; 8];
     let mut offset = 0usize;
     while offset < record.len() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|duration| !duration.is_zero())
-            .ok_or(ProcessLaunchError::ReadinessRejected)?;
+            .ok_or(ProcessLaunchError::DeadlineExceeded)?;
         stream
             .set_read_timeout(Some(remaining))
             .map_err(|_| ProcessLaunchError::Io)?;
@@ -2214,7 +2303,7 @@ fn read_helper_readiness_with_timeout(
             Ok(count) => offset += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(ProcessLaunchError::ReadinessRejected)
+                return Err(ProcessLaunchError::DeadlineExceeded)
             }
             Err(_) => return Err(ProcessLaunchError::Io),
         }
@@ -2245,7 +2334,7 @@ fn read_helper_readiness_with_timeout(
         Ok(_) => Err(ProcessLaunchError::ReadinessRejected),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ProcessLaunchError::Io),
         Err(error) if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock => {
-            Err(ProcessLaunchError::ReadinessRejected)
+            Err(ProcessLaunchError::DeadlineExceeded)
         }
         Err(_) => Err(ProcessLaunchError::Io),
     }
@@ -2315,13 +2404,32 @@ pub(crate) fn send_bootstrap_packet(
 }
 
 #[cfg(unix)]
+fn send_bootstrap_packet_before(
+    socket: RawFd,
+    frame: &ControlFrame,
+    rights: &[RawFd],
+    at: Instant,
+) -> Result<(), BootstrapError> {
+    send_bootstrap_packet_with_deadline(socket, frame, rights, ProtocolDeadline::at(at))
+}
+
+#[cfg(unix)]
 fn send_bootstrap_packet_with_timeout(
     socket: RawFd,
     frame: &ControlFrame,
     rights: &[RawFd],
     timeout: Duration,
 ) -> Result<(), BootstrapError> {
-    let deadline = ProtocolDeadline::new(timeout)?;
+    send_bootstrap_packet_with_deadline(socket, frame, rights, ProtocolDeadline::new(timeout)?)
+}
+
+#[cfg(unix)]
+fn send_bootstrap_packet_with_deadline(
+    socket: RawFd,
+    frame: &ControlFrame,
+    rights: &[RawFd],
+    deadline: ProtocolDeadline,
+) -> Result<(), BootstrapError> {
     let bytes = frame.encode()?;
     if rights.len() != bootstrap_right_slots(frame)?.len() {
         return Err(BootstrapError::WrongRightCount);
@@ -2509,6 +2617,7 @@ impl ProtocolDeadline {
         Instant::now().checked_add(timeout).map(|at| Self { at })
             .ok_or(BootstrapError::BootstrapCorrupt)
     }
+    fn at(at: Instant) -> Self { Self { at } }
     fn remaining(&self) -> Result<Duration, BootstrapError> {
         self.at.checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())

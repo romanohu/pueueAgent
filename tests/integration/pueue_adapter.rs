@@ -7,6 +7,9 @@ mod native_process_fixture;
 use std::{ffi::OsString, fs, path::PathBuf};
 
 #[cfg(all(unix, debug_assertions))]
+use std::time::{Duration, Instant};
+
+#[cfg(all(unix, debug_assertions))]
 use std::process::Command;
 
 #[cfg(unix)]
@@ -331,6 +334,27 @@ async fn pueue_timeout_terminates_the_process_group() {
         TIMEOUT_SENTINEL_REPETITIONS,
     );
     assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn pueue_launch_phases_share_one_absolute_deadline() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::delays(150, 150, 150);
+    let policy = fixture.policy();
+    let started = Instant::now();
+
+    let error = PueueProcessRunner::with_limits(Duration::from_millis(300), MAX_PUEUE_OUTPUT_BYTES)
+        .run(
+            policy.as_ref(),
+            &[OsString::from("status"), OsString::from("--json")],
+        )
+        .await
+        .expect_err("cumulative launch delays unexpectedly fit the operation deadline");
+
+    assert!(matches!(error, AppError::Pueue(PueueError::Timeout { .. })));
+    assert!(started.elapsed() < Duration::from_millis(700));
+    fixture.wait_for_processes_gone().await;
 }
 
 #[cfg(all(unix, debug_assertions))]

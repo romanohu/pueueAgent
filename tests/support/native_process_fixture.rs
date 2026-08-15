@@ -83,6 +83,9 @@ fn main() {
         );
         thread::sleep(Duration::from_millis(5));
     }
+    thread::sleep(Duration::from_millis(__READINESS_DELAY_MS__));
+    thread::sleep(Duration::from_millis(__EXEC_PROOF_DELAY_MS__));
+    thread::sleep(Duration::from_millis(__ACK_DELAY_MS__));
     fs::write(__READY__, b"ready").expect("write fixture readiness");
 
     let output = __OUTPUT_PAYLOAD__.as_bytes().repeat(__OUTPUT_REPETITIONS__);
@@ -168,12 +171,31 @@ pub struct NativeFakePueue {
 
 impl NativeFakePueue {
     pub fn new(behavior: NativeBehavior) -> Self {
-        Self::new_with_ambient_path(behavior, None)
+        Self::new_with_delays(behavior, None, [0; 3])
+    }
+
+    /// Build a holding fixture whose startup is divided into three explicit
+    /// delay segments. The operation runner must consume all three under one
+    /// absolute deadline instead of granting each lifecycle phase a new one.
+    pub fn delays(readiness_ms: u64, exec_proof_ms: u64, ack_ms: u64) -> Self {
+        Self::new_with_delays(
+            NativeBehavior::Hold,
+            None,
+            [readiness_ms, exec_proof_ms, ack_ms],
+        )
     }
 
     pub fn new_with_ambient_path(
         behavior: NativeBehavior,
         ambient_path: Option<&Path>,
+    ) -> Self {
+        Self::new_with_delays(behavior, ambient_path, [0; 3])
+    }
+
+    fn new_with_delays(
+        behavior: NativeBehavior,
+        ambient_path: Option<&Path>,
+        delays_ms: [u64; 3],
     ) -> Self {
         let temp = TempDir::new().expect("create native Pueue fixture root");
         let base = fs::canonicalize(temp.path()).expect("canonicalize fixture root");
@@ -217,7 +239,10 @@ impl NativeFakePueue {
             .replace("__OUTPUT_PAYLOAD__", &format!("{output_payload:?}"))
             .replace("__OUTPUT_REPETITIONS__", &output_repetitions.to_string())
             .replace("__TERM_STREAM__", &format!("{term_stream:?}"))
-            .replace("__EXIT_CODE__", &exit_code.to_string());
+            .replace("__EXIT_CODE__", &exit_code.to_string())
+            .replace("__READINESS_DELAY_MS__", &delays_ms[0].to_string())
+            .replace("__EXEC_PROOF_DELAY_MS__", &delays_ms[1].to_string())
+            .replace("__ACK_DELAY_MS__", &delays_ms[2].to_string());
         fs::write(&source_path, source).expect("write generated native Pueue source");
         let output = Command::new("rustc")
             .args(["--edition=2021", "-O", "-o"])
