@@ -174,11 +174,11 @@ launch-gate state は OS process state の別名ではありません。例え�
 | `resume` | project の自律 dispatch | 継続 | 新規 dispatch を再開 | pause/halt を解除 |
 | `stop` | supervisor user service | 継続し、kill しない | daemon shutdown policy で grace 付き drain | 変更なし |
 | `start` | supervisor user service | 継続 | active project の新規 dispatch を再開 | 変更なし |
-| `cancel --task-id ID` | 同じ project group の指定 task | queued は remove、running は kill を対象 task だけに要求 | 関連 event を記録 | 継続 |
+| `cancel --task-id ID` | 同じ project group の指定 task | queued は remove、running は kill を対象 task だけに要求 | 直接停止・変更しない | 継続 |
 | `disable` | project の自動運用登録 | 継続 | 新規起動なし | `enabled=false`、group 予約は維持 |
 | `disable --remove` | project 登録と group 予約 | 継続 | 新規起動なし | 登録解除 |
 
-`stop`、`pause`、`disable` は Pueue task 停止の代替ではありません。task を止める操作は、所有権と stale status を再検証する `cancel --task-id ID` です。
+`stop`、`pause`、`disable` は Pueue task 停止の代替ではありません。task を止める操作は、所有権と stale status を再検証する `cancel --task-id ID` です。`cancel` は operator log を記録し、停止を確認できない場合にだけ `termination_failed` event を作成します。
 
 ## Daemon startup recovery
 
