@@ -1787,7 +1787,6 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
     for arguments in [
         vec!["submit-batch", "--request-id", BATCH_REQUEST_ID, "--manifest", manifest.to_str().unwrap()],
         vec!["status", "--json"],
-        vec!["doctor", "--json"],
     ] {
         let output = harness.command().args(arguments).output().unwrap();
         assert!(
@@ -1797,6 +1796,21 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
             String::from_utf8_lossy(&output.stdout),
         );
     }
+    let doctor = harness
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let doctor_report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let doctor_checks = doctor_report["checks"].as_array().unwrap();
+    let check_status = |name: &str| {
+        doctor_checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .and_then(|check| check["status"].as_str())
+    };
+    assert_eq!(check_status("pueue.config"), Some("ok"));
+    assert_ne!(check_status("pueue.status"), Some("error"));
     let calls = fs::read_to_string(&harness.pueue_calls).unwrap();
     assert!(calls.lines().any(|operation| operation.starts_with("group:fixture: custom")));
     assert!(calls.lines().filter(|operation| operation.starts_with("add:fixture: custom")).count() >= 2);
