@@ -1223,7 +1223,7 @@ fn main() {{
         fs::create_dir_all(definition.parent().unwrap()).unwrap();
         let service_paths = ServicePaths {
             release_binary: PathBuf::from("/usr/bin/pueue-agent"),
-            pueue_config: custom_config,
+            pueue_config: custom_config.clone(),
             state_dir: policy_paths.state_dir.clone(),
             execution_policy: policy_paths.state_dir.join("execution-policy.toml"),
             working_dir: root.clone(),
@@ -1237,7 +1237,7 @@ fn main() {{
         } else {
             ServiceDefinition::systemd(&service_paths).render()
         };
-        fs::write(definition, rendered).unwrap();
+        fs::write(&definition, rendered).unwrap();
         fs::remove_file(policy_paths.home.join(".config/pueue/pueue.yml")).unwrap();
 
         Self {
