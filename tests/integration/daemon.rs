@@ -1118,6 +1118,13 @@ async fn bound_cleanup_pending_project_defers_without_attempt_while_other_projec
 #[tokio::test]
 async fn daemon_run_once_invokes_reconciliation_detection_termination_and_scheduler() {
     let harness = DaemonHarness::new();
+    harness.register_project_with_agent(
+        "project-a",
+        "pa-project",
+        "/bin/sh",
+        &["-c", "sleep 1"],
+        1,
+    );
     let scheduled = harness.enqueue(EventKind::DeepCheck, "project-a", "deep-check");
 
     let mut daemon = harness.daemon();
@@ -2249,10 +2256,12 @@ async fn startup_recovery_closes_pending_marker_evidence_crash_window() {
 #[tokio::test]
 async fn recovery_retries_pre_marker_and_dead_letters_post_marker() {
     let harness = DaemonHarness::new();
+    harness.register_project("project-b", "pa-project-b", "/bin/echo");
     harness.pause_project("project-a");
+    harness.pause_project("project-b");
 
     let pre_event = harness.enqueue(EventKind::TaskFailed, "project-a", "pre-marker-recovery");
-    let post_event = harness.enqueue(EventKind::TaskFailed, "project-a", "post-marker-recovery");
+    let post_event = harness.enqueue(EventKind::TaskFailed, "project-b", "post-marker-recovery");
     for event_id in [pre_event, post_event] {
         harness.claim_with_lease(event_id, harness.now + 600);
     }
@@ -2273,15 +2282,28 @@ async fn recovery_retries_pre_marker_and_dead_letters_post_marker() {
     )
     .unwrap();
 
-    let intervention_id =
-        harness.reserve_intervention("already delivered", "post-marker-token", harness.now + 600);
+    let interventions = InterventionRepository::new(&harness.db);
+    let intervention_id = interventions
+        .insert_pending("project-b", "already delivered", harness.now - 20)
+        .unwrap()
+        .intervention_id;
+    interventions
+        .reserve_pending(
+            "project-b",
+            "post-marker-token",
+            harness.now - 10,
+            harness.now + 600,
+            1,
+            "already delivered".len(),
+        )
+        .unwrap();
     let post_log = harness
-        .registered_root("project-a")
+        .registered_root("project-b")
         .join(format!(".pueue-agent/logs/agent-190-{post_event}.log"));
     let post_run = runs
         .insert_with_events_and_reservation(
             &NewAgentRun::new(
-                "project-a",
+                "project-b",
                 post_event,
                 None,
                 AgentRunStatus::Starting,
@@ -2293,13 +2315,13 @@ async fn recovery_retries_pre_marker_and_dead_letters_post_marker() {
         )
         .unwrap();
     runs.mark_running_and_apply_interventions(
-        "project-a",
+        "project-b",
         post_run.run_id,
         42_424,
         harness.now - 5,
     )
     .unwrap();
-    runs.mark_gate_release_requested("project-a", post_run.run_id)
+    runs.mark_gate_release_requested("project-b", post_run.run_id)
         .unwrap();
     let marker_path = PathBuf::from(format!("{}.gate-started", post_log.display()));
     fs::write(&marker_path, b"authorized\n").unwrap();
