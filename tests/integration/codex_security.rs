@@ -605,7 +605,7 @@ fn private_temp_inventory_allows_empty_generations_and_rejects_nonempty_or_unsaf
 
     let harness = Harness::new();
     let tmp = harness.root.join(".pueue-agent/tmp");
-    fs::remove_dir_all(tmp.join("run")).unwrap();
+    fs::remove_dir_all(harness.private_run_temp.path()).unwrap();
     for run_id in ["1", "2", "3"] {
         fs::create_dir(tmp.join(run_id)).unwrap();
         fs::set_permissions(tmp.join(run_id), fs::Permissions::from_mode(0o700)).unwrap();
@@ -661,7 +661,7 @@ fn private_temp_inventory_rejects_generation_overflow_without_mutation() {
 
     let harness = Harness::new();
     let tmp = harness.root.join(".pueue-agent/tmp");
-    fs::remove_dir_all(tmp.join("run")).unwrap();
+    fs::remove_dir_all(harness.private_run_temp.path()).unwrap();
     for run_id in 1..=pueue_agent::environment::MAX_PRIVATE_TEMP_GENERATIONS + 1 {
         let path = tmp.join(run_id.to_string());
         fs::create_dir(&path).unwrap();
@@ -686,7 +686,7 @@ fn private_temp_inventory_rejects_noncanonical_decimal_generation_names() {
     for name in ["+1", "+01"] {
         let harness = Harness::new();
         let tmp = harness.root.join(".pueue-agent/tmp");
-        fs::remove_dir_all(tmp.join("run")).unwrap();
+        fs::remove_dir_all(harness.private_run_temp.path()).unwrap();
         let generation = tmp.join(name);
         fs::create_dir(&generation).unwrap();
         fs::set_permissions(&generation, fs::Permissions::from_mode(0o700)).unwrap();
