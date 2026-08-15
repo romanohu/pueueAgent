@@ -222,19 +222,25 @@ fn callback_resolves_and_validates_group_from_numeric_task_id() {
     let tasks = vec![terminal_task(41, "100", json!("Success"))];
 
     assert_eq!(callback_group_for_task(&tasks, 41).unwrap(), "pa-project");
-    assert!(callback_group_for_task(&tasks, 42)
-        .unwrap_err()
-        .to_string()
-        .contains("callback.task_id was not found"));
+    assert!(matches!(
+        callback_group_for_task(&tasks, 42),
+        Err(AppError::Validation {
+            field: "callback.task_id",
+            message: "was not found in the configured Pueue profile"
+        })
+    ));
 
     let duplicate = vec![
         terminal_task(41, "100", json!("Success")),
         terminal_task(41, "200", json!("Success")),
     ];
-    assert!(callback_group_for_task(&duplicate, 41)
-        .unwrap_err()
-        .to_string()
-        .contains("callback.task_id is ambiguous"));
+    assert!(matches!(
+        callback_group_for_task(&duplicate, 41),
+        Err(AppError::Validation {
+            field: "callback.task_id",
+            message: "is ambiguous in the configured Pueue profile"
+        })
+    ));
 
     let invalid = vec![PueueTask {
         group: "x'; touch injected; #".to_owned(),
