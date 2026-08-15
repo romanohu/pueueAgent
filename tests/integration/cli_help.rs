@@ -140,6 +140,22 @@ fn help_lists_diagnostics_commands_and_status_options() {
 }
 
 #[test]
+fn command_reference_covers_every_public_cli_without_exposing_internal_launch() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let commands = std::fs::read_to_string(root.join("docs/commands-ja.md")).unwrap();
+    for command in [
+        "init", "enable", "disable", "cancel", "submit", "submit-batch", "event",
+        "status", "events", "runs", "inspect", "explain", "doctor", "pause",
+        "resume", "steer", "wake", "version", "upgrade", "start", "stop", "daemon",
+    ] {
+        let heading = format!("### `pueue-agent {command}");
+        assert!(commands.contains(&heading), "command reference is missing {command}");
+    }
+    assert!(commands.contains("### `pueue-agent steer list`"));
+    assert!(!commands.contains("### `pueue-agent internal-launch`"));
+}
+
+#[test]
 fn help_lists_service_lifecycle_commands() {
     for command in ["start", "stop"] {
         let output = assert_cmd::Command::cargo_bin("pueue-agent")
