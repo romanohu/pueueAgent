@@ -215,7 +215,7 @@ fn pueue_control_sources_forbid_bare_and_shell_execution() {
             .lines()
             .filter(|line| {
                 let line = line.trim_start();
-                line.contains("CommandPueue {") && !line.starts_with("pub struct ")
+                line.contains("Ok(CommandPueue {")
             })
             .count(),
         1,

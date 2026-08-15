@@ -282,30 +282,34 @@ impl PueueProcessRunner {
         };
 
         if let Err(error) = verified.release_before(deadline) {
-            return Err(cleanup_after_failure(&mut verified, operation, error).await);
+            return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await);
         }
         if let Err(error) = verified.confirm_exec_before(deadline).await {
-            return Err(cleanup_after_failure(&mut verified, operation, error).await);
+            return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await);
         }
         if let Err(error) = verified.wait_for_release_ack_before(deadline).await {
-            return Err(cleanup_after_failure(&mut verified, operation, error).await);
+            return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await);
         }
 
         let stdout = match verified.take_stdout() {
             Ok(stream) => stream,
             Err(error) => {
-                return Err(cleanup_after_failure(&mut verified, operation, error).await)
+                return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await)
             }
         };
         let stderr = match verified.take_stderr() {
             Ok(stream) => stream,
             Err(error) => {
-                return Err(cleanup_after_failure(&mut verified, operation, error).await)
+                return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await)
             }
         };
 
-        let stdout_task = tokio::spawn(read_bounded(stdout, self.output_limit, deadline));
-        let stderr_task = tokio::spawn(read_bounded(stderr, self.output_limit, deadline));
+        // The collector owns the one absolute operation deadline. Readers do
+        // not independently expire and close their pipe descriptors: on a
+        // timeout those descriptors must remain open until the verified
+        // process group has received TERM and has been reaped.
+        let stdout_task = tokio::spawn(read_bounded(stdout, self.output_limit));
+        let stderr_task = tokio::spawn(read_bounded(stderr, self.output_limit));
         let outcome = collect_until_terminal(
             &mut verified,
             stdout_task,
@@ -432,7 +436,6 @@ impl CollectionFailure {
 async fn read_bounded<R>(
     mut reader: R,
     limit: usize,
-    deadline: Instant,
 ) -> Result<Vec<u8>, ReadFailure>
 where
     R: AsyncRead + Unpin,
@@ -440,11 +443,7 @@ where
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut buffer = [0u8; 8192];
     loop {
-        let remaining = deadline_remaining(deadline).ok_or(ReadFailure::Timeout)?;
-        let count = tokio::time::timeout(remaining, reader.read(&mut buffer))
-            .await
-            .map_err(|_| ReadFailure::Timeout)?
-            .map_err(|_| ReadFailure::Io)?;
+        let count = reader.read(&mut buffer).await.map_err(|_| ReadFailure::Io)?;
         if count == 0 {
             return Ok(bytes);
         }
@@ -458,7 +457,6 @@ where
 #[cfg(unix)]
 #[derive(Debug)]
 enum ReadFailure {
-    Timeout,
     Io,
     Limit,
 }
@@ -491,7 +489,6 @@ async fn collect_until_terminal(
                 match result {
                     Ok(Ok(value)) => stdout = Some(value),
                     Ok(Err(ReadFailure::Limit)) => break Err(CollectionFailure::OutputLimit("stdout")),
-                    Ok(Err(ReadFailure::Timeout)) => break Err(CollectionFailure::Timeout),
                     Ok(Err(ReadFailure::Io)) | Err(_) => break Err(CollectionFailure::Reader("stdout")),
                 }
             }
@@ -500,7 +497,6 @@ async fn collect_until_terminal(
                 match result {
                     Ok(Ok(value)) => stderr = Some(value),
                     Ok(Err(ReadFailure::Limit)) => break Err(CollectionFailure::OutputLimit("stderr")),
-                    Ok(Err(ReadFailure::Timeout)) => break Err(CollectionFailure::Timeout),
                     Ok(Err(ReadFailure::Io)) | Err(_) => break Err(CollectionFailure::Reader("stderr")),
                 }
             }
@@ -531,8 +527,9 @@ async fn cleanup_after_failure(
     child: &mut crate::process::VerifiedChild,
     operation: &'static str,
     original: AppError,
+    deadline: Instant,
 ) -> AppError {
-    match crate::process::terminate_process_group(child).await {
+    match crate::process::terminate_process_group_before(child, deadline).await {
         Ok(()) => map_operation_error(operation, original),
         Err(error) => AppError::Pueue(PueueError::Cleanup {
             operation,
@@ -568,13 +565,6 @@ fn map_spawn_error(operation: &'static str, error: AppError) -> AppError {
         operation,
         source_kind,
     })
-}
-
-#[cfg(unix)]
-fn deadline_remaining(deadline: Instant) -> Option<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
 }
 
 #[cfg(unix)]
@@ -615,7 +605,7 @@ mod tests {
         pueue::PueueError,
         AppError,
     };
-    use std::{os::unix::process::ExitStatusExt, time::{Duration, Instant}};
+    use std::os::unix::process::ExitStatusExt;
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -629,12 +619,11 @@ mod tests {
             stderr_writer.write_all(&[0u8; 64]).await.unwrap();
         });
 
-        let deadline = Instant::now() + Duration::from_secs(1);
         assert!(matches!(
-            read_bounded(stdout_reader, 64, deadline).await,
+            read_bounded(stdout_reader, 64).await,
             Err(ReadFailure::Limit)
         ));
-        assert_eq!(read_bounded(stderr_reader, 64, deadline).await.unwrap().len(), 64);
+        assert_eq!(read_bounded(stderr_reader, 64).await.unwrap().len(), 64);
         stdout_task.await.unwrap();
         stderr_task.await.unwrap();
     }

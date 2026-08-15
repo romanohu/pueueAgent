@@ -811,12 +811,21 @@ async fn drain_owned_process_group(
     child: &mut VerifiedChild,
     group: libc::pid_t,
 ) -> Result<(), AppError> {
-    if let Err(error) = signal_owned_process_group(child, group, libc::SIGTERM) {
-        return Err(error);
-    }
     let term_deadline = Instant::now()
         .checked_add(PROCESS_GROUP_TERM_GRACE)
         .unwrap_or_else(Instant::now);
+    drain_owned_process_group_before(child, group, term_deadline).await
+}
+
+#[cfg(unix)]
+async fn drain_owned_process_group_before(
+    child: &mut VerifiedChild,
+    group: libc::pid_t,
+    term_deadline: Instant,
+) -> Result<(), AppError> {
+    if let Err(error) = signal_owned_process_group(child, group, libc::SIGTERM) {
+        return Err(error);
+    }
     loop {
         match process_group_exists(child, group) {
             Ok(false) => return Ok(()),
@@ -2025,7 +2034,7 @@ pub(crate) async fn spawn_verified_command_before_classified(
             Err(SpawnVerifiedCommandBeforeError::Launch(error))
         }
         Err(SpawnVerifiedCommandFailure::Started { mut child, error }) => {
-            match terminate_process_group(&mut child).await {
+            match terminate_process_group_before(&mut child, deadline).await {
                 Ok(()) => Err(SpawnVerifiedCommandBeforeError::Launch(error)),
                 Err(cleanup) => Err(SpawnVerifiedCommandBeforeError::Cleanup(cleanup)),
             }
@@ -2250,6 +2259,17 @@ fn spawn_verified_command_with_deadlines(
 
 #[cfg(unix)]
 pub async fn terminate_process_group(child: &mut VerifiedChild) -> Result<(), AppError> {
+    let term_deadline = Instant::now()
+        .checked_add(PROCESS_GROUP_TERM_GRACE)
+        .unwrap_or_else(Instant::now);
+    terminate_process_group_before(child, term_deadline).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn terminate_process_group_before(
+    child: &mut VerifiedChild,
+    term_deadline: Instant,
+) -> Result<(), AppError> {
     child.start_gate.writer.take();
     let Some(group) = child.process_group.id() else {
         return Ok(());
@@ -2257,7 +2277,7 @@ pub async fn terminate_process_group(child: &mut VerifiedChild) -> Result<(), Ap
     // The unreaped helper reserves its process-group identifier. Signal the
     // typed owned group directly; probing/reaping first could release that
     // reservation while a descendant remains alive.
-    drain_owned_process_group(child, group).await?;
+    drain_owned_process_group_before(child, group, term_deadline).await?;
     match tokio::time::timeout(Duration::from_secs(1), child.child.wait()).await {
         Ok(Ok(_)) => {
             child.process_group.release();
