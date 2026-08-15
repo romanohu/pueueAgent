@@ -18,7 +18,10 @@ use crate::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
-    output::{bounded_execution_path, bounded_redacted_text, format_state, human_header, human_summary, render_id},
+    output::{
+        bounded_execution_path, bounded_redacted_text, bounded_typed_text, format_state,
+        human_header, human_summary, render_id,
+    },
     pueue::{PueueTask, PUEUE_TIMEOUT},
     pueue_security::MAX_PUEUE_OUTPUT_BYTES,
     project_logs::{inspect_agent_log_dir, ProjectRootLogReader},
@@ -858,7 +861,11 @@ pub fn build_doctor_report_with_policy_and_roots(
         PUEUE_TIMEOUT.as_secs(),
         MAX_PUEUE_OUTPUT_BYTES,
     );
-    checks.push(doctor_ok("pueue.bounds", &pueue_bounds_summary, "none"));
+    checks.push(doctor_ok_with_typed_summary(
+        "pueue.bounds",
+        &pueue_bounds_summary,
+        "none",
+    ));
     checks.push(match inspect_pueue_config_path(
         &paths.pueue_config,
         project_roots,
@@ -1105,7 +1112,7 @@ pub fn build_doctor_report_with_policy_and_roots(
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>()
             .join(", ");
-        doctor_warning(
+        doctor_warning_with_typed_summary(
             "execution.policy_blocked",
             &format!("policy-blocked events: {summary}"),
             "inspect bounded policy code and stage diagnostics; doctor does not retry or repair events",
@@ -1344,7 +1351,7 @@ fn execution_doctor_checks(
                     "none",
                 )
             } else {
-                doctor_warning(
+                doctor_warning_with_typed_summary(
                     "execution.recent",
                     &format!("recent bounded execution evidence: {}", summaries.join("; ")),
                     "inspect the associated run without exposing command inputs or log output",
@@ -1397,11 +1404,33 @@ fn doctor_ok(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
     }
 }
 
+fn doctor_ok_with_typed_summary(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_owned(),
+        status: DoctorCheckStatus::Ok,
+        summary: bounded_typed_text(summary),
+        remediation: bounded_redacted_text(remediation),
+    }
+}
+
 fn doctor_warning(name: &str, summary: &str, remediation: &str) -> DoctorCheck {
     DoctorCheck {
         name: name.to_owned(),
         status: DoctorCheckStatus::Warning,
         summary: bounded_redacted_text(summary),
+        remediation: bounded_redacted_text(remediation),
+    }
+}
+
+fn doctor_warning_with_typed_summary(
+    name: &str,
+    summary: &str,
+    remediation: &str,
+) -> DoctorCheck {
+    DoctorCheck {
+        name: name.to_owned(),
+        status: DoctorCheckStatus::Warning,
+        summary: bounded_typed_text(summary),
         remediation: bounded_redacted_text(remediation),
     }
 }

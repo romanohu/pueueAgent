@@ -227,7 +227,8 @@ fn doctor_pueue_bounds_source_derives_its_summary_from_production_constants() {
 
     assert!(bounds.contains("PUEUE_TIMEOUT.as_secs()"));
     assert!(bounds.contains("MAX_PUEUE_OUTPUT_BYTES"));
-    assert!(bounds.contains("doctor_ok(\"pueue.bounds\", &pueue_bounds_summary, \"none\")"));
+    assert!(bounds.contains("doctor_ok_with_typed_summary("));
+    assert!(bounds.contains("\"pueue.bounds\""));
     assert!(!bounds.contains("timeout=30s"));
     assert!(!bounds.contains("caps=65536 bytes"));
 }

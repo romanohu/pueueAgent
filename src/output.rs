@@ -260,13 +260,24 @@ fn is_assignment_boundary(tokens: &[LexToken], index: usize) -> bool {
 }
 
 pub fn bounded_redacted_text(value: &str) -> String {
-    let redacted = redact_sensitive_text(value);
-    if redacted.len() <= MAX_OUTPUT_TEXT_BYTES {
-        return redacted;
+    bounded_text(redact_sensitive_text(value))
+}
+
+/// Bound text assembled exclusively from static or typed, already-validated
+/// diagnostic fields. Unlike generic redaction, this preserves deliberate
+/// separators and verified absolute paths while still removing terminal
+/// control sequences.
+pub(crate) fn bounded_typed_text(value: &str) -> String {
+    bounded_text(strip_control_and_ansi(value))
+}
+
+fn bounded_text(value: String) -> String {
+    if value.len() <= MAX_OUTPUT_TEXT_BYTES {
+        return value;
     }
 
     let mut prefix = String::new();
-    for character in redacted.chars() {
+    for character in value.chars() {
         if prefix.len() + character.len_utf8() > MAX_OUTPUT_TEXT_BYTES - 3 {
             break;
         }
