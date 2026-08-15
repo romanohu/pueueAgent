@@ -98,9 +98,9 @@ mod commands {
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
         diagnostics::{
-            build_doctor_report_with_policy, render_doctor_report_value, render_events,
-            render_incident_explanation, render_project_status_json, render_task_inspection,
-            DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
+            build_doctor_report_with_policy_and_roots, render_doctor_report_value,
+            render_events, render_incident_explanation, render_project_status_json,
+            render_task_inspection, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
         },
         events::{record_callback, record_operator_wake_with, CallbackMetadata},
         execution_policy::{
@@ -311,7 +311,7 @@ mod commands {
         let (db, project, service_paths, project_roots) =
             resolve_project_doctor_read_only(args.project_root, args.pueue_config)?;
         let policy = load_existing_policy(&service_paths.policy_load_input(
-            project_roots,
+            project_roots.clone(),
             current_launcher_path()?,
         ));
         let pueue_status = match &policy {
@@ -327,13 +327,14 @@ mod commands {
             service: ServiceManager.status().map_err(|error| error.render()),
             callback: callbacks.current_callback().map_err(|error| error.render()),
         };
-        let report = build_doctor_report_with_policy(
+        let report = build_doctor_report_with_policy_and_roots(
             &db,
             &project,
             &service_paths,
             external,
             unix_timestamp()?,
             &policy,
+            &project_roots,
         )?;
         println!("{}", render_doctor_report_value(&report, args.json)?);
         if report.has_errors() {

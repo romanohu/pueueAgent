@@ -7,8 +7,8 @@ use crate::{
     config,
     db::{
         inferred_pre_binding_policy_code, AgentRunRepository, Db, EventExecutionProjection,
-        EventRepository, IncidentRepository, InterventionRepository, SubmissionRepository,
-        TaskObservationRepository,
+        EventRepository, IncidentRepository, InterventionRepository, ProjectRepository,
+        SubmissionRepository, TaskObservationRepository,
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
@@ -499,11 +499,20 @@ pub fn build_doctor_report(
     external: DoctorExternal,
     now: i64,
 ) -> Result<DoctorReport, AppError> {
+    let project_roots = registered_project_roots(db)?;
     let policy = load_existing_policy(&paths.policy_load_input(
-        vec![project.root_path.clone()],
+        project_roots.clone(),
         paths.release_binary.clone(),
     ));
-    build_doctor_report_with_policy(db, project, paths, external, now, &policy)
+    build_doctor_report_with_policy_and_roots(
+        db,
+        project,
+        paths,
+        external,
+        now,
+        &policy,
+        &project_roots,
+    )
 }
 
 pub fn build_doctor_report_with_policy(
@@ -513,6 +522,29 @@ pub fn build_doctor_report_with_policy(
     external: DoctorExternal,
     now: i64,
     policy: &Result<ResolvedExecutionPolicy, PolicyViolation>,
+) -> Result<DoctorReport, AppError> {
+    let project_roots = registered_project_roots(db)?;
+    build_doctor_report_with_policy_and_roots(
+        db,
+        project,
+        paths,
+        external,
+        now,
+        policy,
+        &project_roots,
+    )
+}
+
+/// Build doctor projections with the exact registered-root inventory used to
+/// load policy, while retaining the non-mutating diagnostics boundary.
+pub fn build_doctor_report_with_policy_and_roots(
+    db: &Db,
+    project: &Project,
+    paths: &ServicePaths,
+    external: DoctorExternal,
+    now: i64,
+    policy: &Result<ResolvedExecutionPolicy, PolicyViolation>,
+    project_roots: &[std::path::PathBuf],
 ) -> Result<DoctorReport, AppError> {
     let connection = db.connect()?;
     let mut checks = Vec::new();
@@ -829,7 +861,7 @@ pub fn build_doctor_report_with_policy(
     checks.push(doctor_ok("pueue.bounds", &pueue_bounds_summary, "none"));
     checks.push(match inspect_pueue_config_path(
         &paths.pueue_config,
-        std::slice::from_ref(&project.root_path),
+        project_roots,
     ) {
         Ok(()) => doctor_ok(
             "pueue.config",
@@ -1182,6 +1214,14 @@ pub fn build_doctor_report_with_policy(
         status,
         checks,
     })
+}
+
+fn registered_project_roots(db: &Db) -> Result<Vec<std::path::PathBuf>, AppError> {
+    Ok(ProjectRepository::new(db)
+        .list_all()?
+        .into_iter()
+        .map(|project| project.root_path)
+        .collect())
 }
 
 /// Check the immutable execution boundary without creating policy files,
