@@ -73,7 +73,7 @@ deep_check_interval_minutes = 60
 次回の agent run に渡す短い指示は `steer` で登録します。
 
 ```bash
-pueue-agent steer -- "learning rate を半分にして再評価する"
+pueue-agent steer -- "<MESSAGE>"
 pueue-agent steer list
 pueue-agent status --json
 ```
