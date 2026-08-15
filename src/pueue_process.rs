@@ -84,6 +84,7 @@ fn validate_pueue_frame(
         agent_log_identity: None,
         pueue_config_identity: Some(identity),
         target_path: Some(target_path),
+        private_temp_identity: None,
     }
     .encode()
     .map_err(|_| AppError::Validation {

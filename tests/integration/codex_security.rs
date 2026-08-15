@@ -17,7 +17,7 @@ use pueue_agent::{
         PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor, ResolvedProjectExecutionPolicy,
         StartupEnvironment,
     },
-    environment::SanitizedEnvironment,
+    environment::{PrivateRunTemp, SanitizedEnvironment, VerifiedPrivateTemp},
     models::AgentContextMode,
 };
 use tempfile::TempDir;
@@ -26,7 +26,6 @@ use tempfile::TempDir;
 use std::time::Instant;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use pueue_agent::{
-    environment::PrivateRunTemp,
     execution_policy::{PolicyViolationDetail, TempUnsafeReason},
 };
 
@@ -86,6 +85,9 @@ fn task_env_is_default_deny_and_auth_never_inherits() {
     let environment = SanitizedEnvironment::for_codex_task(&startup, &policy, 41).unwrap();
     assert_eq!(environment.get("DATASET_ROOT"), Some(std::ffi::OsStr::new("/data")));
     assert_eq!(environment.get("OPENAI_API_KEY"), None);
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        assert_eq!(environment.get(name), Some(std::ffi::OsStr::new("/dev/fd/11")));
+    }
     assert!(!format!("{environment:?}").contains("secret"));
 }
 
@@ -913,50 +915,26 @@ fn explicit_and_latest_resume_reject_symlinked_candidate_files() {
 }
 
 #[test]
-fn private_tmp_under_trusted_project_root_is_allowed_when_root_is_in_tmp() {
+fn private_tmp_uses_only_the_fixed_verified_descriptor_path() {
     let harness = Harness::new();
-    let mut policy = harness.builder().policy().clone();
-    policy.root_anchor.canonical_path = PathBuf::from("/tmp/trusted-project");
-    let private_tmp = PathBuf::from("/tmp/trusted-project/.pueue-agent/tmp/run");
-
-    CodexArgvBuilder::new(policy, CodexCapabilities::all())
-        .build(&config_with_args(vec!["{prompt}"]), "p", &private_tmp)
-        .expect("trusted project temp must remain an allowed writable root");
-}
-
-#[test]
-fn private_tmp_requires_fixed_root_and_one_bounded_run_component() {
-    let harness = Harness::new();
-    let fixed_root = harness.root.join(".pueue-agent/tmp");
-    for private_tmp in [
-        fixed_root.clone(),
-        fixed_root.join("run/nested"),
-        harness.root.join("other/run"),
-        harness.root.join(".pueue-agent/tmp/../tmp/run"),
-    ] {
-        let error = harness
-            .builder()
-            .build(&config_with_args(vec!["{prompt}"]), "p", &private_tmp)
-            .unwrap_err();
-        assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
-    }
-
-    for relative_root in [
-        PathBuf::from("/absolute/private-tmp"),
-        PathBuf::from("."),
-        PathBuf::from(".pueue-agent/tmp/nested"),
-    ] {
-        let mut policy = harness.builder().policy().clone();
-        policy.private_temp_relative_root = relative_root;
-        let error = CodexArgvBuilder::new(policy, CodexCapabilities::all())
-            .build(
-                &config_with_args(vec!["{prompt}"]),
-                "p",
-                &harness.private_tmp,
-            )
-            .unwrap_err();
-        assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
-    }
+    let argv = harness
+        .builder()
+        .build(&config_with_args(vec!["{prompt}"]), "p", &harness.private_tmp)
+        .unwrap();
+    let writable_root = argv
+        .iter()
+        .filter_map(|argument| argument.to_str())
+        .find(|argument| argument.starts_with("sandbox_workspace_write.writable_roots="))
+        .unwrap();
+    assert_eq!(
+        writable_root,
+        "sandbox_workspace_write.writable_roots=[\"/dev/fd/11\"]"
+    );
+    assert!(!argv.iter().any(|argument| {
+        argument
+            .to_string_lossy()
+            .contains(harness.private_run_temp.path().to_string_lossy().as_ref())
+    }));
 }
 
 #[test]
@@ -1009,7 +987,8 @@ struct Harness {
     root: PathBuf,
     other: PathBuf,
     home: PathBuf,
-    private_tmp: PathBuf,
+    private_run_temp: PrivateRunTemp,
+    private_tmp: VerifiedPrivateTemp,
 }
 
 impl Harness {
@@ -1018,8 +997,7 @@ impl Harness {
         let root = temp.path().join("project");
         let other = temp.path().join("other");
         let home = temp.path().join("codex-home");
-        let private_tmp = root.join(".pueue-agent/tmp/run");
-        fs::create_dir_all(&private_tmp).unwrap();
+        fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&other).unwrap();
         fs::create_dir_all(home.join("sessions")).unwrap();
         fs::create_dir_all(home.join("archived_sessions")).unwrap();
@@ -1027,8 +1005,7 @@ impl Harness {
         {
             use std::os::unix::fs::PermissionsExt;
             for directory in [
-                root.join(".pueue-agent"),
-                root.join(".pueue-agent/tmp"),
+                root.clone(),
                 other.clone(),
                 home.clone(),
                 home.join("sessions"),
@@ -1040,12 +1017,19 @@ impl Harness {
         let root = fs::canonicalize(root).unwrap();
         let other = fs::canonicalize(other).unwrap();
         let home = fs::canonicalize(home).unwrap();
+        let verified_root = ProjectRootAnchor::resolve(&root)
+            .unwrap()
+            .verify_identity()
+            .unwrap();
+        let private_run_temp = PrivateRunTemp::create(&verified_root, 1).unwrap();
+        let private_tmp = private_run_temp.verified_target().unwrap();
         Self {
             _temp: temp,
             root,
             other,
             home,
-            private_tmp: fs::canonicalize(private_tmp).unwrap(),
+            private_run_temp,
+            private_tmp,
         }
     }
 

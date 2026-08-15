@@ -8,7 +8,7 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use crate::{
-    environment::SanitizedEnvironment,
+    environment::{SanitizedEnvironment, VerifiedPrivateTemp},
     execution_policy::{
         ExecutableAnchor, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
         VerifiedProjectRoot,
@@ -35,6 +35,7 @@ pub struct NativeLaunchSpec {
     pub cwd: Option<PathBuf>,
     pub environment: SanitizedEnvironment,
     pub project_root: VerifiedProjectRoot,
+    pub private_temp: VerifiedPrivateTemp,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
 }
@@ -49,6 +50,7 @@ pub struct NativeLaunchSpec {
     pub cwd: Option<PathBuf>,
     pub environment: SanitizedEnvironment,
     pub project_root: VerifiedProjectRoot,
+    pub private_temp: VerifiedPrivateTemp,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
 }
@@ -91,7 +93,7 @@ impl NativeLauncher {
         let stderr = agent_log.into_file();
 
         let executable_anchor = spec.executable.clone();
-        let verified = crate::process::spawn_verified_command(
+        let verified = crate::process::spawn_verified_agent_command(
             crate::process::VerifiedCommandSpec {
                 launcher: spec.launcher,
                 executable: spec.executable,
@@ -108,6 +110,7 @@ impl NativeLauncher {
                     identity,
                 },
             },
+            spec.private_temp,
         )?;
 
         Ok(NativeAgentChild {

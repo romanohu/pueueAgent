@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::execution_policy::{
-    PolicyViolation, PolicyViolationCode, PolicyViolationStage,
+    ExecutableIdentity, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
     PolicyViolationDetail, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
     TempUnsafeReason, VerifiedProjectRoot,
 };
@@ -28,6 +28,10 @@ pub use crate::execution_policy::StartupEnvironment;
 const PRIVATE_TEMP_ROOT: &str = ".pueue-agent";
 const PRIVATE_TEMP_DIR: &str = "tmp";
 const MAX_RUN_ID_BYTES: usize = 20;
+
+/// The sole private-temp descriptor inherited by native agent targets.
+pub const PRIVATE_TEMP_TARGET_FD: i32 = 11;
+const PRIVATE_TEMP_TARGET_PATH: &str = "/dev/fd/11";
 
 pub const MAX_PRIVATE_TEMP_CLEANUP_DEPTH: usize = 32;
 pub const MAX_PRIVATE_TEMP_CLEANUP_ENTRIES: usize = 4096;
@@ -266,15 +270,10 @@ impl SanitizedEnvironment {
         include_proxy_cert: bool,
     ) -> Result<Self, PolicyViolation> {
         validate_run_id(run_id)?;
-        let temp_path = policy
-            .root_anchor
-            .canonical_path
-            .join(&policy.private_temp_relative_root)
-            .join(run_id.to_string());
         Self::default_baseline(
             startup,
             &policy.trusted_path,
-            Some(temp_path.as_os_str()),
+            Some(OsStr::new(PRIVATE_TEMP_TARGET_PATH)),
             Some((run_id, policy.project_id.as_str())),
             include_proxy_cert,
         )
@@ -561,6 +560,32 @@ pub struct PrivateRunTemp {
     identity: (u64, u64),
 }
 
+/// An opaque, verified directory capability for the native target's private
+/// temporary directory role. It has no raw-descriptor or path constructor.
+/// This capability proves only the directory itself; descriptor-relative
+/// descendant containment remains outside this launch ABI's scope.
+pub struct VerifiedPrivateTemp {
+    pub(crate) directory: File,
+    pub(crate) identity: ExecutableIdentity,
+    run_id: i64,
+}
+
+impl VerifiedPrivateTemp {
+    pub(crate) fn target_path(&self) -> &'static Path {
+        Path::new(PRIVATE_TEMP_TARGET_PATH)
+    }
+}
+
+impl fmt::Debug for VerifiedPrivateTemp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedPrivateTemp")
+            .field("role", &"private-temp-target")
+            .field("run_id", &self.run_id)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TempCleanupReport {
     pub entries_removed: usize,
@@ -768,6 +793,44 @@ impl PrivateRunTemp {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Clone and revalidate the retained directory capability for target use.
+    pub fn verified_target(&self) -> Result<VerifiedPrivateTemp, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let directory = self.directory.try_clone().map_err(|_| temp_error())?;
+            validate_private_directory(&directory)?;
+            let metadata = directory.metadata().map_err(|_| temp_error())?;
+            let identity = ExecutableIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                owner: metadata.uid(),
+                mode: metadata.mode() & 0o7777,
+            };
+            if (identity.device, identity.inode) != self.identity {
+                return Err(temp_error());
+            }
+            let run_id = self
+                .name
+                .to_str()
+                .and_then(|name| name.parse::<i64>().ok())
+                .ok_or_else(temp_error)?;
+            Ok(VerifiedPrivateTemp {
+                directory,
+                identity,
+                run_id,
+            })
+        }
     }
 
     pub fn cleanup_contents_before(

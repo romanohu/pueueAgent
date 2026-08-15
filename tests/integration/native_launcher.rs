@@ -13,10 +13,10 @@ mod unix {
     };
 
     use pueue_agent::{
-        environment::SanitizedEnvironment,
+        environment::{PrivateRunTemp, SanitizedEnvironment},
         execution_policy::{ExecutableAnchor, ExecutableIdentity, PueueConfigAnchor},
         process::{
-            spawn_validated_helper, spawn_verified_command, BootstrapError, ControlFrame,
+            spawn_validated_helper, spawn_verified_agent_command, spawn_verified_command, BootstrapError, ControlFrame,
             LaunchFlags, LaunchMode, ProcessGroupRequirement, ProcessLaunchError,
             VerifiedChildIo, VerifiedCommandSpec, terminate_process_group,
         },
@@ -99,6 +99,13 @@ extern "C" { fn umask(mask: u32) -> u32; }
 
 fn main() {
     let private_temp = PathBuf::from(env::args_os().nth(1).expect("private temp argument"));
+    assert!(private_temp.is_dir(), "private temp target descriptor is not visible");
+    for descriptor in 3..=10 {
+        assert!(
+            !PathBuf::from(format!("/dev/fd/{descriptor}")).exists(),
+            "protocol descriptor {descriptor} leaked into target"
+        );
+    }
     let created = private_temp.join("target-created");
     fs::create_dir(&created).expect("create private temp directory");
     let mode = fs::metadata(&created)
@@ -239,12 +246,13 @@ fn main() {
         (child, parent)
     }
 
-    fn frame(target: &File, root: &File, log: &File) -> ControlFrame {
+    fn frame(target: &File, root: &File, log: &File, private_temp: &File) -> ControlFrame {
         ControlFrame {
             mode: LaunchMode::Agent,
             flags: LaunchFlags::PROCESS_GROUP
                 .union(LaunchFlags::PROJECT_ROOT)
-                .union(LaunchFlags::AGENT_LOG),
+                .union(LaunchFlags::AGENT_LOG)
+                .union(LaunchFlags::PRIVATE_TEMP),
             argv: vec![OsString::from("generated-fixture"), OsString::from("payload-sentinel")],
             environment: vec![(OsString::from("FIXTURE_NAME"), OsString::from("fixture-value"))],
             cwd: None,
@@ -253,10 +261,11 @@ fn main() {
             agent_log_identity: Some(identity(&log.metadata().unwrap())),
             pueue_config_identity: None,
             target_path: None,
+            private_temp_identity: Some(identity(&private_temp.metadata().unwrap())),
         }
     }
 
-    fn rights(target: &File, root: &File, log: &File) -> (Vec<OwnedFd>, Vec<OwnedFd>) {
+    fn rights(target: &File, root: &File, log: &File, private_temp: &File) -> (Vec<OwnedFd>, Vec<OwnedFd>) {
         let (release_read, release_write) = pipe();
         let (exec_read, exec_write) = pipe();
         let (ack_read, ack_write) = pipe();
@@ -268,12 +277,13 @@ fn main() {
                 unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
                 unsafe { OwnedFd::from_raw_fd(log.try_clone().unwrap().into_raw_fd()) },
                 ack_write,
+                unsafe { OwnedFd::from_raw_fd(private_temp.try_clone().unwrap().into_raw_fd()) },
             ],
             vec![release_write, exec_read, ack_read],
         )
     }
 
-    fn files(directory: &Path) -> (File, File, File) {
+    fn files(directory: &Path) -> (File, File, File, File) {
         let target_path = directory.join("generated-target");
         fs::write(&target_path, b"generated fixture bytes").unwrap();
         fs::set_permissions(&target_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -285,7 +295,11 @@ fn main() {
             .mode(0o600)
             .open(directory.join("agent.log"))
             .unwrap();
-        (target, root, log)
+        let private_temp_path = directory.join("private-temp");
+        fs::create_dir(&private_temp_path).unwrap();
+        fs::set_permissions(&private_temp_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let private_temp = File::open(private_temp_path).unwrap();
+        (target, root, log, private_temp)
     }
 
     #[test]
@@ -322,9 +336,9 @@ fn main() {
     #[test]
     fn validated_helper_sends_readiness_and_exits_without_target_execution() {
         let temporary = tempdir().unwrap();
-        let (target, root, log) = files(temporary.path());
-        let launch = frame(&target, &root, &log);
-        let (rights, _keepers) = rights(&target, &root, &log);
+        let (target, root, log, private_temp) = files(temporary.path());
+        let launch = frame(&target, &root, &log, &private_temp);
+        let (rights, _keepers) = rights(&target, &root, &log, &private_temp);
         let (launcher, _) = copy_launcher(temporary.path());
         let mut helper = spawn_validated_helper(&launcher, launch, rights).unwrap();
         assert!(helper.wait().unwrap().success());
@@ -333,9 +347,9 @@ fn main() {
     #[test]
     fn parent_right_without_cloexec_is_prepared_before_helper_spawn() {
         let temporary = tempdir().unwrap();
-        let (target, root, log) = files(temporary.path());
-        let launch = frame(&target, &root, &log);
-        let (rights, _keepers) = rights(&target, &root, &log);
+        let (target, root, log, private_temp) = files(temporary.path());
+        let launch = frame(&target, &root, &log, &private_temp);
+        let (rights, _keepers) = rights(&target, &root, &log, &private_temp);
         let raw = rights[2].as_raw_fd();
         let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
         assert!(flags >= 0);
@@ -350,12 +364,12 @@ fn main() {
     #[test]
     fn identity_and_release_gate_failures_are_bounded_and_redacted() {
         let temporary = tempdir().unwrap();
-        let (target, root, log) = files(temporary.path());
+        let (target, root, log, private_temp) = files(temporary.path());
         let (launcher, _) = copy_launcher(temporary.path());
 
-        let mut identity_mismatch = frame(&target, &root, &log);
+        let mut identity_mismatch = frame(&target, &root, &log, &private_temp);
         identity_mismatch.target_identity.inode = identity_mismatch.target_identity.inode.wrapping_add(1);
-        let (identity_rights, _identity_keepers) = rights(&target, &root, &log);
+        let (identity_rights, _identity_keepers) = rights(&target, &root, &log, &private_temp);
         let started = Instant::now();
         let identity_error = match spawn_validated_helper(&launcher, identity_mismatch, identity_rights) {
             Ok(_) => panic!("identity mismatch unexpectedly produced readiness"),
@@ -373,7 +387,67 @@ fn main() {
         assert!(!rendered.contains("fixture-value"));
         assert!(!rendered.contains(temporary.path().to_string_lossy().as_ref()));
 
-        let launch = frame(&target, &root, &log);
+        let mut private_temp_mismatch = frame(&target, &root, &log, &private_temp);
+        let mut wrong_private_temp_identity = private_temp_mismatch.private_temp_identity.unwrap();
+        wrong_private_temp_identity.inode = wrong_private_temp_identity.inode.wrapping_add(1);
+        private_temp_mismatch.private_temp_identity = Some(wrong_private_temp_identity);
+        let (private_temp_rights, _private_temp_keepers) =
+            rights(&target, &root, &log, &private_temp);
+        assert!(matches!(
+            spawn_validated_helper(&launcher, private_temp_mismatch, private_temp_rights),
+            Err(ProcessLaunchError::HelperFailure(
+                pueue_agent::process::HelperFailureKind::Security
+            ))
+        ));
+
+        let (mut wrong_type_rights, _wrong_type_keepers) =
+            rights(&target, &root, &log, &private_temp);
+        wrong_type_rights.pop();
+        wrong_type_rights.push(unsafe {
+            OwnedFd::from_raw_fd(target.try_clone().unwrap().into_raw_fd())
+        });
+        assert!(matches!(
+            spawn_validated_helper(
+                &launcher,
+                frame(&target, &root, &log, &private_temp),
+                wrong_type_rights,
+            ),
+            Err(ProcessLaunchError::HelperFailure(
+                pueue_agent::process::HelperFailureKind::Security
+            ))
+        ));
+
+        let (mut duplicate_role_rights, _duplicate_role_keepers) =
+            rights(&target, &root, &log, &private_temp);
+        duplicate_role_rights[3] = unsafe {
+            OwnedFd::from_raw_fd(private_temp.try_clone().unwrap().into_raw_fd())
+        };
+        assert!(matches!(
+            spawn_validated_helper(
+                &launcher,
+                frame(&target, &root, &log, &private_temp),
+                duplicate_role_rights,
+            ),
+            Err(ProcessLaunchError::HelperFailure(
+                pueue_agent::process::HelperFailureKind::Security
+            ))
+        ));
+
+        let (mut reordered_rights, _reordered_keepers) =
+            rights(&target, &root, &log, &private_temp);
+        reordered_rights.swap(3, 6);
+        assert!(matches!(
+            spawn_validated_helper(
+                &launcher,
+                frame(&target, &root, &log, &private_temp),
+                reordered_rights,
+            ),
+            Err(ProcessLaunchError::HelperFailure(
+                pueue_agent::process::HelperFailureKind::Security
+            ))
+        ));
+
+        let launch = frame(&target, &root, &log, &private_temp);
         let (release_read, release_write) = pipe();
         drop(release_write);
         let (exec_read, exec_write) = pipe();
@@ -385,6 +459,7 @@ fn main() {
             unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
             unsafe { OwnedFd::from_raw_fd(log.try_clone().unwrap().into_raw_fd()) },
             ack_write,
+            unsafe { OwnedFd::from_raw_fd(private_temp.try_clone().unwrap().into_raw_fd()) },
         ];
         let started = Instant::now();
         let gate_error = match spawn_validated_helper(&launcher, launch, gate_rights) {
@@ -404,9 +479,9 @@ fn main() {
     #[test]
     fn malformed_parent_request_terminates_helper_and_preserves_parent_sentinel() {
         let temporary = tempdir().unwrap();
-        let (target, root, log) = files(temporary.path());
+        let (target, root, log, private_temp) = files(temporary.path());
         let (launcher, _) = copy_launcher(temporary.path());
-        let launch = frame(&target, &root, &log);
+        let launch = frame(&target, &root, &log, &private_temp);
 
         let started = Instant::now();
         let malformed_error = match spawn_validated_helper(&launcher, launch.clone(), Vec::new()) {
@@ -423,7 +498,7 @@ fn main() {
         assert!(sentinel_raw >= 200);
         let sentinel = unsafe { File::from_raw_fd(sentinel_raw) };
         let sentinel_identity = identity(&sentinel.metadata().unwrap());
-        let (valid_rights, _keepers) = rights(&target, &root, &log);
+        let (valid_rights, _keepers) = rights(&target, &root, &log, &private_temp);
         let mut helper = spawn_validated_helper(&launcher, launch, valid_rights).unwrap();
         assert!(helper.wait().unwrap().success());
         assert_eq!(identity(&sentinel.metadata().unwrap()), sentinel_identity);
@@ -456,6 +531,7 @@ fn main() {
                 agent_log_identity: None,
                 pueue_config_identity: Some(ExecutableIdentity { device: 0, inode: 0, owner: 0, mode: 0 }),
                 target_path: None,
+                private_temp_identity: None,
             },
             Vec::new(),
         );
@@ -473,8 +549,11 @@ fn main() {
         .unwrap();
         let canonical_root = root_anchor.canonical_path.clone();
         let started = temporary.path().join("target-started");
+        let verified_root = root_anchor.verify_identity().unwrap();
+        let private_temp = PrivateRunTemp::create(&verified_root, 1).unwrap();
+        let private_temp_target = private_temp.verified_target().unwrap();
 
-        let mut child = spawn_verified_command(VerifiedCommandSpec {
+        let mut child = spawn_verified_agent_command(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
@@ -485,10 +564,10 @@ fn main() {
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
-            project_root: Some(root_anchor.verify_identity().unwrap()),
+            project_root: Some(verified_root),
             pueue_config: None,
             child_io: VerifiedChildIo::Capture,
-        })
+        }, private_temp_target)
         .unwrap();
 
         assert!(!started.exists(), "target executed before release");
@@ -506,29 +585,29 @@ fn main() {
         let temporary = tempdir().unwrap();
         let (launcher, _) = copy_launcher(temporary.path());
         let target = compile_generated_private_temp_fixture(temporary.path());
-        let private_temp = temporary.path().join("private-run-temp");
-        fs::create_dir(&private_temp).unwrap();
-        fs::set_permissions(&private_temp, fs::Permissions::from_mode(0o700)).unwrap();
         let root_anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(
             &fs::canonicalize(temporary.path()).unwrap(),
         )
         .unwrap();
 
-        let mut child = spawn_verified_command(VerifiedCommandSpec {
+        let verified_root = root_anchor.verify_identity().unwrap();
+        let private_temp = PrivateRunTemp::create(&verified_root, 2).unwrap();
+        let private_temp_target = private_temp.verified_target().unwrap();
+        let mut child = spawn_verified_agent_command(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
                 OsString::from("generated-private-temp-target"),
-                private_temp.as_os_str().to_os_string(),
+                OsString::from("/dev/fd/11"),
             ],
             cwd: Some(root_anchor.canonical_path.clone()),
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
-            project_root: Some(root_anchor.verify_identity().unwrap()),
+            project_root: Some(verified_root),
             pueue_config: None,
             child_io: VerifiedChildIo::Capture,
-        })
+        }, private_temp_target)
         .unwrap();
 
         child.release().unwrap();
@@ -536,13 +615,13 @@ fn main() {
         child.wait_for_release_ack().await.unwrap();
         assert!(child.wait().await.unwrap().success());
 
-        let created = private_temp.join("target-created");
+        let created = private_temp.path().join("target-created");
         assert_eq!(
             fs::metadata(&created).unwrap().permissions().mode() & 0o777,
             0o700,
         );
         assert_eq!(
-            fs::read_to_string(private_temp.join("target-report")).unwrap(),
+            fs::read_to_string(private_temp.path().join("target-report")).unwrap(),
             "700,77",
         );
     }
@@ -598,7 +677,10 @@ fn main() {
         )
         .unwrap();
         let pid_path = temporary.path().join("descendant.pid");
-        let mut child = spawn_verified_command(VerifiedCommandSpec {
+        let verified_root = root_anchor.verify_identity().unwrap();
+        let private_temp = PrivateRunTemp::create(&verified_root, 3).unwrap();
+        let private_temp_target = private_temp.verified_target().unwrap();
+        let mut child = spawn_verified_agent_command(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
@@ -610,10 +692,10 @@ fn main() {
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
-            project_root: Some(root_anchor.verify_identity().unwrap()),
+            project_root: Some(verified_root),
             pueue_config: None,
             child_io: VerifiedChildIo::Capture,
-        })
+        }, private_temp_target)
         .unwrap();
         child.release().unwrap();
         child.confirm_exec().await.unwrap();

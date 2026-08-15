@@ -8,13 +8,15 @@
 use std::{
     collections::BTreeSet,
     ffi::OsString,
-    path::{Component, Path},
+    path::Path,
 };
 
 use crate::{
     codex_session,
     config::AgentConfig,
-    environment::{is_auth_name, is_proxy_or_cert_name, shell_baseline_names},
+    environment::{
+        is_auth_name, is_proxy_or_cert_name, shell_baseline_names, VerifiedPrivateTemp,
+    },
     execution_policy::{
         AgentKind, NetworkMode, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
         ResolvedProjectExecutionPolicy,
@@ -22,9 +24,6 @@ use crate::{
     models::AgentContextMode,
     AppError,
 };
-
-const MAX_PRIVATE_RUN_COMPONENT_BYTES: usize = 128;
-const MAX_PRIVATE_ROOT_COMPONENTS: usize = 16;
 
 /// Capabilities discovered from the installed Codex CLI.
 ///
@@ -98,16 +97,12 @@ impl CodexArgvBuilder {
         &self,
         config: &AgentConfig,
         prompt: &str,
-        private_tmp: &Path,
+        private_tmp: &VerifiedPrivateTemp,
     ) -> Result<Vec<OsString>, PolicyViolation> {
         self.preflight(config, prompt)?;
 
         let root = path_text(&self.policy.root_anchor.canonical_path)?;
-        let private_tmp = validate_private_tmp(
-            private_tmp,
-            &self.policy.root_anchor.canonical_path,
-            &self.policy.private_temp_relative_root,
-        )?;
+        let private_tmp = path_text(private_tmp.target_path())?;
         let mut argv = vec![
             OsString::from("--ask-for-approval"),
             OsString::from("never"),
@@ -252,42 +247,6 @@ fn validate_compatibility_args(args: &[String]) -> Result<(), PolicyViolation> {
         _ => false,
     };
     valid.then_some(()).ok_or_else(unsafe_argument)
-}
-
-fn validate_private_tmp(
-    path: &Path,
-    project_root: &Path,
-    private_root: &Path,
-) -> Result<String, PolicyViolation> {
-    let private_root_components = private_root.components().collect::<Vec<_>>();
-    if private_root.is_absolute()
-        || private_root_components.is_empty()
-        || private_root_components.len() > MAX_PRIVATE_ROOT_COMPONENTS
-        || private_root_components
-            .iter()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(unsafe_argument());
-    }
-    let fixed_root = project_root.join(private_root);
-    let Some(run_component) = path.file_name().and_then(|value| value.to_str()) else {
-        return Err(unsafe_argument());
-    };
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(component, Component::CurDir | Component::ParentDir)
-        })
-        || path == Path::new("/")
-        || path.parent() != Some(fixed_root.as_path())
-        || run_component.is_empty()
-        || run_component == "."
-        || run_component == ".."
-        || run_component.len() > MAX_PRIVATE_RUN_COMPONENT_BYTES
-        || run_component.chars().any(char::is_control)
-    {
-        return Err(unsafe_argument());
-    }
-    path_text(path)
 }
 
 fn path_text(path: &Path) -> Result<String, PolicyViolation> {

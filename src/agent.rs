@@ -14,7 +14,7 @@ use crate::{
     db::{AgentRunRepository, GateFailurePolicy},
     environment::{
         PrivateRunTemp, ProjectAdmissionLock, RunIdAdmissionGuard, SanitizedEnvironment,
-        TempInventoryReport,
+        TempInventoryReport, VerifiedPrivateTemp,
     },
     execution_policy::{
         resolve_project_policy, AgentKind, PolicyViolation, PolicyViolationCode,
@@ -465,7 +465,7 @@ impl AgentRunner {
         policy: &ResolvedProjectExecutionPolicy,
         config: &AgentConfig,
         prompt: &str,
-        private_tmp: &std::path::Path,
+        private_tmp: &VerifiedPrivateTemp,
     ) -> Result<AgentCommand, AppError> {
         let program = policy
             .agent_anchor
@@ -616,10 +616,20 @@ impl AgentRunner {
                     error.into(),
                 )
             })?;
+        let private_temp_target = temp.verified_target().map_err(|error| {
+            resolve_bound_failure(
+                &repository,
+                project,
+                run.run_id,
+                now,
+                retry_policy,
+                error.into(),
+            )
+        })?;
         drop(run_id_guard);
         drop(project_lock);
         let command = self
-            .command_for(project_policy, config, prompt, temp.path())
+            .command_for(project_policy, config, prompt, &private_temp_target)
             .map_err(|error| {
                 resolve_bound_failure(
                     &repository,
@@ -652,6 +662,7 @@ impl AgentRunner {
             cwd: Some(project_policy.root_anchor.canonical_path.clone()),
             environment,
             project_root: verified_root,
+            private_temp: private_temp_target,
             relative_log_path,
             relative_marker_path,
         })

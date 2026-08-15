@@ -10,7 +10,7 @@ use std::{
 };
 
 use pueue_agent::{
-    environment::SanitizedEnvironment,
+    environment::{PrivateRunTemp, SanitizedEnvironment},
     execution_policy::{
         ExecutableAnchor, PolicyViolationCode, PolicyViolationStage, ProjectRootAnchor,
         VerifiedProjectRoot,
@@ -28,6 +28,7 @@ struct Harness {
     launcher: ExecutableAnchor,
     target: ExecutableAnchor,
     root: VerifiedProjectRoot,
+    private_temp: PrivateRunTemp,
 }
 
 impl Harness {
@@ -48,7 +49,7 @@ impl Harness {
         let target_path = temporary.path().join("generated-native-agent");
         fs::write(
             &source,
-            r#"use std::{env, fs, thread, time::Duration};
+r#"use std::{env, fs, thread, time::Duration};
 fn main() {
     let mut args = env::args_os();
     let _program = args.next();
@@ -56,8 +57,15 @@ fn main() {
     fs::write(started, b"started").expect("write started marker");
     println!("fixture-stdout");
     eprintln!("fixture-stderr");
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("hold")) {
-        thread::sleep(Duration::from_secs(30));
+    match args.next().as_deref() {
+        Some(value) if value == std::ffi::OsStr::new("hold") => {
+            thread::sleep(Duration::from_secs(30));
+        }
+        Some(value) if value == std::ffi::OsStr::new("write-temp") => {
+            fs::write(std::path::PathBuf::from(env::var_os("TMPDIR").unwrap()).join("target-write"), b"ok")
+                .expect("write through private temp descriptor");
+        }
+        _ => {}
     }
 }"#,
         )
@@ -85,11 +93,13 @@ fn main() {
         .expect("project root anchor");
         let root = root_anchor.verify_identity().expect("verified project root");
 
+        let private_temp = PrivateRunTemp::create(&root, 1).expect("private run temp");
         Self {
             temporary,
             launcher,
             target,
             root,
+            private_temp,
         }
     }
 
@@ -108,6 +118,7 @@ fn main() {
             cwd: Some(self.root.anchor.canonical_path.clone()),
             environment: SanitizedEnvironment::default(),
             project_root: self.root.try_clone().expect("clone verified root"),
+            private_temp: self.private_temp.verified_target().expect("verified private temp"),
             relative_log_path: PathBuf::from(LOG),
             relative_marker_path: PathBuf::from(MARKER),
         }
@@ -116,6 +127,26 @@ fn main() {
     fn reader(&self) -> ProjectRootLogReader {
         ProjectRootLogReader::from_verified(self.root.try_clone().expect("clone verified root"))
     }
+}
+
+#[tokio::test]
+async fn private_temp_path_replacement_cannot_redirect_target_writes() {
+    let harness = Harness::new();
+    let mut spec = harness.spec();
+    spec.argv.push(OsString::from("write-temp"));
+    let mut child = NativeLauncher::spawn(spec).expect("spawn blocked temp writer");
+
+    let replacement_path = harness.private_temp.path().to_path_buf();
+    let old_generation = harness.path("retired-private-temp");
+    fs::rename(&replacement_path, &old_generation).expect("retire private temp generation");
+    fs::create_dir(&replacement_path).expect("create replacement private temp generation");
+    fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o700))
+        .expect("set replacement private temp permissions");
+
+    child.authorize_marker().await.expect("authorize target");
+    assert!(child.wait().await.expect("wait for target").success());
+    assert_eq!(fs::read(old_generation.join("target-write")).unwrap(), b"ok");
+    assert!(!replacement_path.join("target-write").exists());
 }
 
 async fn assert_pre_marker_authorization_failure(
