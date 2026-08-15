@@ -41,6 +41,8 @@ pueue-agent submit-batch \
 
 ネットワーク障害や supervisor 再起動後に再送するときは、**同じ manifest に同じ request ID** を使います。すでに accepted の job は二重投入せず、部分失敗で未確定の job だけを再開します。別の内容を同じ request ID に載せないでください。出力の job ごとの状態、accepted task ID、失敗 job を確認します。
 
+manifest の JSON schema と上限、および `--group` の一致条件は[コマンドリファレンス](commands-ja.md#pueue-agent-submit-batch)を確認してください。
+
 ## 状態を監視する
 
 まず supervisor の project-scoped な投影を確認し、必要に応じて原因を絞り込みます。
@@ -64,7 +66,7 @@ pueue-agent doctor --json
 deep_check_interval_minutes = 60
 ```
 
-`0`（既定値）は無効です。正の値では、通常の reconciliation が周期条件を確認し、必要なときだけ fresh agent を起動します。正常な tick の確認や異常検知だけでは agent token を消費しません。Periodic DeepCheck event が dispatch されたときだけ token を消費します。
+`0`（既定値）は無効です。正の値では、通常の reconciliation が周期条件を確認し、必要なときだけ設定済みの `agent.context.mode` を使う新しい agent run を起動します。`fresh` は既定値ですが、明示的に設定した `resume` / `resume_latest` もそのまま適用されます。正常な tick の確認や異常検知だけでは agent token を消費しません。Periodic DeepCheck event が dispatch されたときだけ token を消費します。
 
 同じ project では pending、claimed、retry 待ちの periodic DeepCheck がある間、新しい event は追加されません。複数の長時間 task があっても project ごとに coalesce されます。`STATE.md` には確認できた task、metric、短い判断だけを記録し、値を補完しません。
 
@@ -140,7 +142,7 @@ pueue-agent disable --remove
 | 目的 | コマンド | 影響する対象 | 影響しない対象 |
 | --- | --- | --- | --- |
 | 自律動作だけ止める | `pueue-agent pause` | 新しい agent 起動と自動 termination | 実行中 Pueue task、実行中 agent run、pending event |
-| 自律動作を再開する | `pueue-agent resume` | pause/halt された automation の dispatch | 実行中 Pueue task の状態 |
+| 自律動作を再開する | `pueue-agent resume` | pause/halt の解除と automation の dispatch | project の enabled/disabled、service、実行中 Pueue task の状態 |
 | supervisor だけ止める | `pueue-agent stop` | user service と active agent の graceful shutdown | Pueue task、project 登録 |
 | supervisor を起動する | `pueue-agent start` | user service | Pueue task、project の pause/halt 状態 |
 | 実験 task を止める | `pueue-agent cancel --task-id <ID>` | 指定 project group の登録済み Pueue task 1件 | 別 task、supervisor service、project 登録 |
@@ -178,7 +180,7 @@ enabled project に active agent run がある場合、upgrade は source の fe
 
 binary install の前に service を停止して SQLite の整合性境界を作り、停止後に `VACUUM INTO` で snapshot を取得します。この短い窓では operator による SQLite の直接書き込みを避けてください。snapshot または binary install の前段で失敗した場合も、変更前の service を再起動して recovery 結果を記録します。更新後の restart または health check に失敗すると、SQLite snapshot と旧 binary を復元してから service を再起動し、health check を行う rollback を試みます。report の rollback 状態と表示された診断コマンドを確認し、原因を直して `pueue-agent upgrade` を再実行してください。
 
-upgrade は supervisor service と binary だけを扱います。Pueue daemon、group、実験 task を kill、stop、cancel しません。通常の upgrade を実行できない場合に限り、復旧手順として `git pull --ff-only` の後に `./install.sh` を使い、`pueue-agent version --json`、`pueue-agent status --json`、必要なら `pueue-agent doctor --json` で確認します。
+upgrade は supervisor service と binary だけを扱います。Pueue daemon、group、実験 task を kill、stop、cancel しません。失敗時は report の rollback 状態と next diagnostic を確認し、安全な orchestration を迂回せずに原因を解消して同じ `pueue-agent upgrade` を再実行します。
 
 ## daemon 再起動後を確認する
 

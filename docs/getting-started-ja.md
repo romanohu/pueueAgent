@@ -11,12 +11,14 @@
 ## 必要条件
 
 - Rust toolchain（`cargo`）
-- 実行時に利用する Pueue（`pueue`）
+- 実行時に利用する Pueue（`pueue`）と、選択した profile で起動済みの `pueued`
+- Linux の systemd user service または macOS の launchd user service を利用できるユーザー環境
+- `agent.program` に設定する agent executable。既定テンプレートでは `codex` が利用でき、`CODEX_HOME`（未指定時は `$HOME/.codex`）に必要な Codex 環境が用意されていること
 - 実験を実行するプロジェクトディレクトリ
 
 ## インストール
 
-リポジトリを取得し、インストールスクリプトを実行します。`PA_INSTALL_PREFIX` を指定しない場合、実行ファイルは `$HOME/.local/bin/pueue-agent` に配置されます。
+リポジトリを取得し、インストールスクリプトを実行します。スクリプトは release binary を build し、`PA_INSTALL_PREFIX`（既定は `$HOME/.local/bin`）に `pueue-agent` のシンボリックリンクを作成します。この prefix が `PATH` にない場合は、以後の手順の前に `PATH` へ追加するか、表示された絶対パスで実行してください。
 
 ```bash
 git clone <repository-url>
@@ -82,7 +84,7 @@ session_id = "<SESSION_ID>"
 mode = "resume_latest"
 ```
 
-継続モードは `agent.program = "codex"` の場合だけ利用できます。session が存在しない、壊れている、または別 project に属する場合は agent-run failure となり、`fresh` へ暗黙に fallback しません。
+継続モードは `agent.program = "codex"` の場合だけ利用できます。session が存在しない、壊れている、または別 project に属する場合は agent run を bind する前に拒否され、event が `dead_letter`、`last_error` が `policy_blocked:session_missing` または `policy_blocked:session_not_owned` になります。`fresh` へ暗黙に fallback しません。
 
 ## Detector を設定する
 

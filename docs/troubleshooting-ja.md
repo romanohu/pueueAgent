@@ -39,7 +39,8 @@ CLI ごとに別の profile を混在させないでください。profile の�
 | --- | --- | --- | --- |
 | `execution.policy` が error | `pueue-agent doctor` の policy code | service-owned policy が missing、unreadable、weak permissions、または unknown field と判定された | `pueue-agent stop` で新規 dispatch を止める。信頼できる管理者がインストール済み policy を正規の配布物から復元した後だけ、`pueue-agent start` と `pueue-agent doctor` を実行する |
 | `execution.anchors` が error | `doctor` の anchor check と `pueue-agent version --json` | pinned executable、launcher、Pueue、または config の identity が変わった | 置換物を自動承認しない。管理者が信頼済み版を復元した後に `pueue-agent start`、`version --json`、`doctor` で再検証する |
-| recent run に policy code と stage がある | `pueue-agent runs --limit 100 --json` | project policy または run-bound 検証で拒否された | code と stage を管理者へ渡す。原因が解消し `doctor` が通った後、必要性を確認して `pueue-agent wake --reason "policy recovery verified"` を使う |
+| run に結合される前に policy block された | `pueue-agent events --status dead-letter --limit 100 --json` の run link と、永続化された `last_error=policy_blocked:<code>` | project policy、argv、network、session ownership などの pre-binding admission で拒否された | agent run がないため `runs --json` を根拠にしない。code を管理者へ渡し、原因の解消と `doctor` の再確認後だけ、必要なら `pueue-agent wake --reason "<REASON>"` を使う |
+| 結合済み run に policy code と stage がある | `pueue-agent runs --limit 100 --json` の `policy_code` と `failure_stage` | agent run bind 後の run-bound / native-gate 検証で拒否された | code と stage を管理者へ渡す。原因が解消し `doctor` が通った後、必要性を確認して `pueue-agent wake --reason "<REASON>"` を使う |
 
 `doctor` は policy の作成、修復、replacement の enrollment を行いません。これは診断の読み取り専用境界です。
 
@@ -58,7 +59,7 @@ CLI ごとに別の profile を混在させないでください。profile の�
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |
 | --- | --- | --- | --- |
 | event が `retry_wait` | `pueue-agent events --status retry-wait --limit 100` と関連 run | transient な起動・実行失敗後の bounded backoff | service を `pueue-agent status --compact` で確認し、`running` なら scheduler の再試行を待つ。重複する event や task を追加しない |
-| event が `dead_letter` | `pueue-agent events --status dead-letter --limit 100 --json` と `pueue-agent runs --limit 100 --json` | retry 上限超過、policy block、または実行結果が不明な recovery | terminal 状態をその場で書き換えない。原因を解消し、元の副作用が発生していないと確認できた場合だけ、新しい判断として `pueue-agent wake --reason "dead-letter reviewed"` を使う |
+| event が `dead_letter` | まず `pueue-agent events --status dead-letter --limit 100 --json`。run link がある場合だけ `pueue-agent runs --limit 100 --json` | retry 上限超過、pre-binding policy block、または実行結果が不明な recovery | terminal 状態をその場で書き換えない。原因を解消し、元の副作用が発生していないと確認できた場合だけ、新しい判断として `pueue-agent wake --reason "<REASON>"` を使う |
 | task/incident との関係が不明 | `pueue-agent inspect <TASK_ID>` または `pueue-agent explain <INCIDENT_ID>` | 複数 event が同じ run に束ねられた、または termination 記録がある | bounded な lineage を確認し、task の取消が必要なら確認済み ID に対してだけ `pueue-agent cancel --task-id <TASK_ID>` を使う |
 
 `dead_letter` は自動再試行しない terminal 状態です。とくに restart 後に実行結果が不明な場合、安易な再投入は副作用を重複させます。
@@ -67,9 +68,9 @@ CLI ごとに別の profile を混在させないでください。profile の�
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |
 | --- | --- | --- | --- |
-| run が開始前に失敗し policy code がある | `pueue-agent runs --limit 100 --json` の `policy_code` と `failure_stage` | executable、root、argument、network、session、log の検証拒否 | `pueue-agent doctor` で policy と anchor を確認する。管理者が登録済み構成を復元し診断が通った後だけ、必要なら `pueue-agent wake --reason "native gate recovery verified"` を使う |
+| `session_missing`、`session_not_owned` などで agent run がない | `pueue-agent events --status dead-letter --limit 100 --json` の run link と、永続化された `last_error=policy_blocked:<code>` | session ownership、argv、network などの pre-binding policy/session 検証で拒否された | `fresh` へ暗黙に切り替えない。正しい project/context と policy を管理者が確認し、`doctor` が通った後だけ、必要なら `pueue-agent wake --reason "<REASON>"` を使う |
 | `native_gate_failed` または `setsid_failed` | `runs` と `doctor` の bounded summary | helper readiness、process-group 作成、marker/ack 境界で失敗した | `pueue-agent stop` で新規 dispatch を止め、管理者の確認後に `pueue-agent start` と `doctor` を実行する。結果不明の run は再投入しない |
-| `session_missing` または `session_not_owned` | `runs --json` の code と [設定テンプレート](../templates/config.toml) の context mode | 指定 session が存在しない、または project に属さない | 暗黙に fresh へ切り替えない。正しい project/context を管理者が確認した後に `pueue-agent doctor` を再実行する |
+| agent run bind 後に policy evidence が記録された | `pueue-agent runs --limit 100 --json` の `policy_code` と `failure_stage` | native helper、marker、release、exec proof、ack の run-bound gate で失敗した | `doctor` で policy と anchor を確認する。post-marker または実行結果不明の run は再投入せず、bounded report を管理者へ渡す |
 
 hidden の `internal-launch` は利用者向け復旧コマンドではありません。直接呼び出さないでください。
 

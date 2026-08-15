@@ -61,14 +61,26 @@
 - **例:** `pueue-agent submit-batch --request-id 550e8400-e29b-41d4-a716-446655440000 --manifest batch.json`
 - **失敗時の確認:** UUID とマニフェストの形式、グループ名、対象プロジェクトの有効状態を確認します。
 
-### `pueue-agent event`
+manifest は未知の field を許さない JSON object で、次の形式です。
 
-- **構文:** `pueue-agent event EVENT [--group GROUP] [--task-id TASK_ID] [--metadata JSON]`
-- **目的:** インストール済み Pueue コールバック用インターフェースです。通常の利用者が手動でイベントを投入する用途ではありません。
-- **状態変更:** `callback` イベントでは対応するタスクのコールバックイベントを記録します。
-- **主なオプション:** `EVENT`、`--group`、`--task-id`、`--metadata`（既定 `{}`）。`callback` には非負の `--task-id` が必要です。
-- **例:** `pueue-agent event callback --task-id 42 --group project-a --metadata '{"status":"done"}'`
-- **失敗時の確認:** Pueue 側のコールバック設定、タスク ID、グループの登録、および JSON を確認します。
+```json
+{
+  "jobs": [
+    {
+      "id": "train-01",
+      "argv": ["python", "train.py", "--epochs", "5"]
+    },
+    {
+      "id": "evaluate-01",
+      "argv": ["python", "evaluate.py"],
+      "kind": "control",
+      "metadata": {"dataset": "validation"}
+    }
+  ]
+}
+```
+
+`jobs` は 1〜128 件です。各 job の `id` は空でない 128 byte 以下の文字列で、manifest 内で一意でなければなりません。`argv` は空でない文字列配列で、JSON 直列化後 64 KiB 以下です。任意の `kind` は `experiment`（既定）または `control`、任意の `metadata` は JSON object（既定 `{}`）で直列化後 16 KiB 以下です。manifest 全体は 1 MiB 以下です。`--group` は登録済み project group と完全一致する場合だけ受理され、登録値を上書きしません。
 
 ## 状態確認
 
@@ -132,6 +144,19 @@
 
 ## 運用制御
 
+状態変更コマンドは lifecycle 境界をまたぎません。停止・再開の全体表は[運用ワークフローの停止境界 matrix](workflows-ja.md#project-を無効化登録解除する)も参照してください。
+
+| コマンド | 影響する対象 | 影響しない対象 |
+| --- | --- | --- |
+| `enable` | disabled project の有効化、登録済み group/callback と user service の整合 | 既存 Pueue task の実行状態 |
+| `disable` | project の automation | Pueue task、project 登録、group の予約 |
+| `disable --remove` | project 登録と group の予約 | Pueue task |
+| `pause` | 新しい agent dispatch と自動 termination | 実行中 Pueue task、実行中 agent run、pending event |
+| `resume` | pause/halt の解除 | disabled project、user service、Pueue task |
+| `cancel --task-id` | 検証済み Pueue task 1件 | 別 task、project 登録、user service |
+| `start` | user service | project の pause/halt、Pueue task |
+| `stop` | user service と active agent の graceful shutdown | Pueue task、project 登録 |
+
 ### `pueue-agent pause`
 
 - **構文:** `pueue-agent pause [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
@@ -144,8 +169,8 @@
 ### `pueue-agent resume`
 
 - **構文:** `pueue-agent resume [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
-- **目的:** 一時停止したプロジェクトの agent 処理を再開します。
-- **状態変更:** プロジェクトを active に戻します。
+- **目的:** プロジェクトの pause/halt を解除し、agent dispatch を再開可能にします。
+- **状態変更:** `paused` を解除し、`halted_reason` を消去します。disabled project の `enabled` は変更しないため、その管理を再開するには `enable` を使います。
 - **主なオプション:** `--pueue-config`、任意の `PROJECT_ROOT`。
 - **例:** `pueue-agent resume .`
 - **失敗時の確認:** `status` と `doctor` でプロジェクトおよびサービスが利用可能か確認します。
@@ -158,15 +183,6 @@
 - **主なオプション:** 必須の `--task-id`、`--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
 - **例:** `pueue-agent cancel --task-id 42 --json`
 - **失敗時の確認:** タスク ID を `inspect` で確認し、意図したプロジェクトのタスクだけを指定します。
-
-### `pueue-agent wake`
-
-- **構文:** `pueue-agent wake --reason TEXT [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
-- **目的:** オペレーターによる wake イベントをキューへ追加します。
-- **状態変更:** pending の `operator_wake` イベントを記録します。
-- **主なオプション:** 必須の `--reason`、`--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
-- **例:** `pueue-agent wake --reason '確認後に再評価'`
-- **失敗時の確認:** 理由と対象プロジェクトを確認し、`events --kind operator-wake` で記録を確認します。
 
 ### `pueue-agent start`
 
@@ -181,12 +197,21 @@
 
 - **構文:** `pueue-agent stop [--json]`
 - **目的:** OS の agent サービスを停止します。
-- **状態変更:** サービスを停止します。
+- **状態変更:** user service を停止し、active agent を graceful shutdown の対象にします。shutdown timeout 後は process tree を終了して `timed_out` と記録され得ます。Pueue task と project 登録は変更しません。
 - **主なオプション:** `--json`。
 - **例:** `pueue-agent stop`
 - **失敗時の確認:** 停止対象のサービスを確認し、必要なら `start` で再開します。
 
 ## 人による介入
+
+### `pueue-agent wake`
+
+- **構文:** `pueue-agent wake --reason TEXT [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
+- **目的:** オペレーターによる wake イベントをキューへ追加します。
+- **状態変更:** pending の `operator_wake` イベントを記録します。service や Pueue task を直接起動・変更しません。
+- **主なオプション:** 必須の `--reason`、`--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
+- **例:** `pueue-agent wake --reason "<REASON>"`
+- **失敗時の確認:** 理由と対象プロジェクトを確認し、`events --kind operator-wake` で記録を確認します。
 
 ### `pueue-agent steer`
 
@@ -227,6 +252,15 @@
 - **失敗時の確認:** エラーに示される `pueue-agent version` を実行し、ソース、実行ポリシー、Pueue 設定を確認します。
 
 ## 内部・連携用
+
+### `pueue-agent event`
+
+- **構文:** `pueue-agent event EVENT [--group GROUP] [--task-id TASK_ID] [--metadata JSON]`
+- **目的:** インストール済み Pueue コールバック用インターフェースです。通常の利用者が手動でイベントを投入する用途ではありません。
+- **状態変更:** `callback` イベントでは対応するタスクのコールバックイベントを記録します。
+- **主なオプション:** `EVENT`、`--group`、`--task-id`、`--metadata`（既定 `{}`）。`callback` には非負の `--task-id` が必要です。
+- **例:** `pueue-agent event callback --task-id 42 --group project-a --metadata '{"status":"done"}'`
+- **失敗時の確認:** Pueue 側のコールバック設定、タスク ID、グループの登録、および JSON を確認します。
 
 ### `pueue-agent daemon`
 

@@ -141,18 +141,40 @@ fn help_lists_diagnostics_commands_and_status_options() {
 
 #[test]
 fn command_reference_covers_every_public_cli_without_exposing_internal_launch() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    let visible_commands = help
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|command| *command != "help")
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!visible_commands.contains("internal-launch"));
+
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let commands = std::fs::read_to_string(root.join("docs/commands-ja.md")).unwrap();
-    for command in [
-        "init", "enable", "disable", "cancel", "submit", "submit-batch", "event",
-        "status", "events", "runs", "inspect", "explain", "doctor", "pause",
-        "resume", "steer", "wake", "version", "upgrade", "start", "stop", "daemon",
-    ] {
-        let heading = format!("### `pueue-agent {command}");
-        assert!(commands.contains(&heading), "command reference is missing {command}");
-    }
-    assert!(commands.contains("### `pueue-agent steer list`"));
-    assert!(!commands.contains("### `pueue-agent internal-launch`"));
+    let documented_headings = commands
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("### `pueue-agent ")
+                .and_then(|heading| heading.strip_suffix('`'))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut expected_headings = visible_commands;
+    expected_headings.insert("steer list");
+
+    assert_eq!(documented_headings, expected_headings);
+    assert!(commands.lines().any(|line| line == "### `pueue-agent steer list`"));
+    assert!(!commands
+        .lines()
+        .any(|line| line == "### `pueue-agent internal-launch`"));
 }
 
 #[test]
@@ -163,6 +185,7 @@ fn operations_redirect_links_to_workflows_and_troubleshooting() {
     assert!(operations.contains("[運用ワークフロー](workflows-ja.md)"));
     assert!(operations.contains("[トラブルシューティング](troubleshooting-ja.md)"));
     assert!(root.join("docs/workflows-ja.md").is_file());
+    assert!(root.join("docs/troubleshooting-ja.md").is_file());
 }
 
 #[test]

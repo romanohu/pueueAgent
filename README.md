@@ -61,8 +61,8 @@ pueue-agent submit -- python train.py --lr 0.001
 | 総合診断 | `pueue-agent doctor` |
 | 単発実験の投入 | `pueue-agent submit -- <command...>` |
 | automation の停止・再開 | `pueue-agent pause` / `pueue-agent resume` |
-| 次回 agent run への指示 | `pueue-agent steer -- "<message>"` |
-| 明示的な wake | `pueue-agent wake --reason "<reason>"` |
+| 次回 agent run への指示 | `pueue-agent steer -- "<MESSAGE>"` |
+| 明示的な wake | `pueue-agent wake --reason "<REASON>"` |
 | agent run の追跡 | `pueue-agent runs --follow` |
 
 全コマンドの構文、状態変更の有無、失敗時の確認先はコマンドリファレンスにあります。
