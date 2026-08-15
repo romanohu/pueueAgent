@@ -1003,7 +1003,7 @@ impl CallbackCliHarness {
         fs::write(
             &source,
             format!(
-                "use std::{{env, fs}};\nfn main() {{\n    let args = env::args().collect::<Vec<_>>();\n    fs::write({:?}, b\"invoked\").unwrap();\n    if args.iter().any(|argument| argument.contains(\"touch injected\")) {{ fs::write({:?}, b\"injected\").unwrap(); }}\n    if args.get(1).is_some_and(|argument| argument == \"status\") {{ println!(\"{{}}\", {:?}); }}\n}}\n",
+                "use std::{{env, fs}};\nfn main() {{\n    let args = env::args().collect::<Vec<_>>();\n    fs::write({:?}, b\"invoked\").unwrap();\n    if args.iter().any(|argument| argument.contains(\"touch injected\")) {{ fs::write({:?}, b\"injected\").unwrap(); }}\n    if args.iter().any(|argument| argument == \"status\") {{ println!(\"{{}}\", {:?}); }}\n}}\n",
                 pueue_invoked_marker, injected_marker, status
             ),
         )
@@ -1499,13 +1499,21 @@ impl CustomPueueProfileHarness {
             format!(r#"use std::{{fs::OpenOptions, io::Write}};
 fn main() {{
     let args = std::env::args().collect::<Vec<_>>();
+    let operation = args
+        .iter()
+        .find(|argument| matches!(argument.as_str(), "status" | "add" | "group" | "kill" | "remove"))
+        .map(String::as_str)
+        .unwrap_or("");
     let config = std::fs::read_to_string("/dev/fd/9").unwrap_or_default();
-    writeln!(OpenOptions::new().create(true).append(true).open({:?}).unwrap(), "{{}}:{{}}", args.get(1).map(String::as_str).unwrap_or(""), config.trim()) .unwrap();
-    if args.iter().any(|argument| argument == "add") {{
+    writeln!(OpenOptions::new().create(true).append(true).open({:?}).unwrap(), "{{}}:{{}}", operation, config.trim()) .unwrap();
+    if operation == "add" {{
         println!("701");
     }}
-    if args.iter().any(|argument| argument == "status") {{
-        println!("[]");
+    if operation == "status" {{
+        std::io::stdout().write_all(b"\x7b\"tasks\":\x7b\x7d\x7d\n").unwrap();
+    }}
+    if operation == "group" && args.iter().any(|argument| argument == "-j") {{
+        std::io::stdout().write_all(b"\x7b\x7d\n").unwrap();
     }}
 }}"#, pueue_calls),
         )
