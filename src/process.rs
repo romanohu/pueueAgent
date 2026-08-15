@@ -3391,6 +3391,9 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     let lifecycle = frame.flags.contains(LaunchFlags::LIFECYCLE);
     let private_temp = frame.flags.contains(LaunchFlags::PRIVATE_TEMP);
     if !frame.flags.contains(LaunchFlags::PROCESS_GROUP) { return Err(CodecError::MissingProcessGroup); }
+    if !private_temp && frame.private_temp_identity.is_some() {
+        return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY));
+    }
     match frame.mode {
         LaunchMode::Agent => {
             if !root { return Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)); }
@@ -4019,15 +4022,22 @@ mod tests {
     fn mode_and_descriptor_matrix_is_closed() {
         let mut agent = frame();
         assert!(agent.encode().is_ok());
-        agent.flags = LaunchFlags::PROJECT_ROOT | LaunchFlags::PROCESS_GROUP;
+        agent.flags = LaunchFlags::PROJECT_ROOT
+            | LaunchFlags::PROCESS_GROUP
+            | LaunchFlags::PRIVATE_TEMP;
         assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)));
-        agent.flags = LaunchFlags::PROJECT_ROOT | LaunchFlags::AGENT_LOG | LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP;
+        agent.flags = LaunchFlags::PROJECT_ROOT
+            | LaunchFlags::AGENT_LOG
+            | LaunchFlags::PUEUE_CONFIG
+            | LaunchFlags::PROCESS_GROUP
+            | LaunchFlags::PRIVATE_TEMP;
         assert_eq!(agent.encode(), Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY)));
         agent.mode = LaunchMode::Pueue;
         agent.flags = LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP;
         agent.project_root_identity = None;
         agent.agent_log_identity = None;
         agent.pueue_config_identity = Some(identity());
+        agent.private_temp_identity = None;
         assert!(agent.encode().is_ok());
         agent.flags = LaunchFlags::PROCESS_GROUP;
         assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY)));
@@ -4035,11 +4045,14 @@ mod tests {
         assert_eq!(agent.encode(), Err(CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY)));
         agent.flags = LaunchFlags::PUEUE_CONFIG | LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP;
         assert_eq!(agent.encode(), Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY)));
-        agent.flags = LaunchFlags::PROJECT_ROOT | LaunchFlags::AGENT_LOG;
+        agent.flags = LaunchFlags::PROJECT_ROOT
+            | LaunchFlags::AGENT_LOG
+            | LaunchFlags::PRIVATE_TEMP;
         agent.mode = LaunchMode::Agent;
         agent.project_root_identity = Some(identity());
         agent.agent_log_identity = Some(identity());
         agent.pueue_config_identity = None;
+        agent.private_temp_identity = Some(identity());
         assert_eq!(agent.encode(), Err(CodecError::MissingProcessGroup));
     }
 
