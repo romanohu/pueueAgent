@@ -1951,8 +1951,8 @@ fn spawn_verified_command_with_deadlines(
         return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
     }
 
-    let verified_launcher = spec.launcher.verify_identity()?;
-    let verified_target = spec.executable.verify_identity()?;
+    let verified_launcher = spec.launcher.verify_identity().map_err(AppError::from)?;
+    let verified_target = spec.executable.verify_identity().map_err(AppError::from)?;
     let target_file = verified_target.file;
     let target_identity = verified_target.anchor.identity;
 
