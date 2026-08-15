@@ -1538,7 +1538,7 @@ fn main() {{
         let service_script = if cfg!(target_os = "macos") {
             "#!/bin/sh\necho 'state = running'\n"
         } else {
-            "#!/bin/sh\ncase \"$*\" in\n  *LoadState*) echo loaded ;;\n  *ActiveState*) echo active ;;\nesac\n"
+            "#!/bin/sh\ncase \"$*\" in\n  *LoadState*) echo loaded ;;\n  *is-active*) echo active ;;\nesac\n"
         };
         fs::write(&service_command, service_script).unwrap();
         make_executable(&service_command);
