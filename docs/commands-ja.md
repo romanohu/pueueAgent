@@ -4,6 +4,12 @@
 
 `PROJECT_ROOT` を省略したコマンドは通常はカレントディレクトリからプロジェクトを解決します。`--pueue-config PUEUE_CONFIG` は使用する Pueue 設定を明示します。`--json` は機械可読出力を選びます。失敗時は、まず対象プロジェクトで `pueue-agent doctor`、状態の確認に `pueue-agent status` を実行してください。
 
+## 人間向け出力と JSON 出力
+
+既定の人間向け出力は見出し、状態行、`summary:` で構成されます。`--json` は同じ project scope の機械可読な JSON 出力を返し、ANSI escape を含めません。診断投影は件数と本文が bounded / redacted ですが、投入時の argv、metadata、intervention message そのものを secret-safe に変換する機能ではありません。
+
+`pueue-agent` の出力は SQLite の event、incident、termination、agent run と最新の Pueue snapshot をまとめた supervisor の投影です。raw Pueue data の `pueue status --json` とは形式も責務も異なります。accounting と guardrail は `pueue-agent` の `status`、`events`、`runs` で確認し、raw Pueue data は低レベル調査に限って使います。
+
 ## セットアップ
 
 ### `pueue-agent init`
@@ -44,6 +50,8 @@
 - **例:** `pueue-agent submit --kind experiment --metadata-json '{"dataset":"a"}' -- python train.py --epochs 5`
 - **失敗時の確認:** プロジェクトが有効であること、コマンド argv とメタデータ JSON、Pueue 接続を確認します。
 
+`experiment` は既定の submission kind で `guardrails.max_experiments` を消費します。bootstrap、診断、後片付けなどを `pueue-agent submit --kind control` で投入すると、この experiment budget には数えません。`control` も SQLite と Pueue task に記録され、ほかの guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。
+
 ### `pueue-agent submit-batch`
 
 - **構文:** `pueue-agent submit-batch --request-id UUID --manifest PATH [--group GROUP] [--json] [PROJECT_ROOT]`
@@ -73,6 +81,8 @@
 - **例:** `pueue-agent status --compact .`
 - **失敗時の確認:** Pueue の状態を取得できない場合も表示内容を確認し、`pueue-agent doctor` を実行します。
 
+`pueue-agent status --json` には submission の一覧を含めません。submission と task の lineage は `pueue-agent runs --json`、特定 task の詳細は `inspect <TASK_ID>` で確認します。
+
 ### `pueue-agent events`
 
 - **構文:** `pueue-agent events [--kind KIND] [--status STATUS] [--limit N] [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
@@ -90,6 +100,8 @@
 - **主なオプション:** 更新を追跡する `--follow`、表示上限 `--limit`（1〜128）、`--json`、`--pueue-config`。
 - **例:** `pueue-agent runs --follow --limit 20`
 - **失敗時の確認:** `--limit` の範囲、接続を維持できる端末、プロジェクト解決を確認します。
+
+`pueue-agent runs --follow --json` は Ctrl-C まで読み取り専用で追跡し、新しい lineage を検出した polling 単位ごとに1つの bounded JSON report を出力します。1 report の `runs` には複数 run が含まれることがあります。行全体を単一 JSON document として連結しないでください。
 
 ### `pueue-agent inspect`
 

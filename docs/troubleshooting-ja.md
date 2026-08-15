@@ -77,11 +77,11 @@ hidden の `internal-launch` は利用者向け復旧コマンドではありま
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |
 | --- | --- | --- | --- |
-| `temp_unsafe` | `pueue-agent runs --limit 100 --json` と `doctor` の policy evidence | ownership、identity、mount boundary、entry/byte limit、cleanup deadline の検証失敗 | service が稼働中なら bounded cleanup retry に任せる。繰り返す場合は `pueue-agent stop` し、管理者が原因を確認した後に `pueue-agent start` と `doctor` を実行する |
+| agent が private temp admission で `temp_unsafe` | `pueue-agent runs --limit 100 --json` と `doctor` の policy evidence | ownership、identity、mount boundary、entry/byte limit の検証失敗 | 検証を迂回しない。原因を管理者が解消した後、`pueue-agent doctor` で admission policy を再確認する |
 | `unsupported_platform` | `doctor` と[対応環境](getting-started-ja.md#対応環境) | 必要な mount identity 機能を確認できない、または未対応 OS | 検証を迂回しない。対応済み Linux 環境へ移した後に `pueue-agent enable` と `pueue-agent doctor` で再確認する |
-| cleanup failure が run 後に残る | `runs` の run state と policy stage | descriptor-bound cleanup が安全に完了できず authority を保持している | service を稼働させて再試行させ、`pueue-agent doctor` で状態を確認する。手動削除で競合を作らない |
+| terminal run 後も private temp が残っているように見える | `pueue-agent status --compact` で service、`pueue-agent runs --limit 100` で run の終端状態を別々に確認 | post-terminal cleanup が daemon 内で ownership を保持して再試行中、または別世代の directory を見ている可能性がある | service が `running` なら daemon の bounded retry に任せる。手動削除はせず、残り続ける場合は `pueue-agent stop` 後に管理者へ調査を依頼する |
 
-private temp の検証は安全側に停止します。弱い platform 判定へ fallback する設定はありません。
+private temp admission の policy evidence は `status`、`doctor`、`runs` で確認できます。一方、retained post-terminal cleanup は daemon の in-memory state で再試行され、現在の CLI に `cleanup_pending` のような専用診断 field はありません。上のコマンドは service と run の状態確認であり、retained cleanup の有無を証明しません。private temp の検証は安全側に停止し、弱い platform 判定へ fallback する設定はありません。
 
 ## Callback を取りこぼしたように見える
 
@@ -98,8 +98,8 @@ callback の補償経路は reconciliation です。利用者が `pueue-agent ev
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |
 | --- | --- | --- | --- |
 | upgrade が install 前に失敗 | `pueue-agent version --json` と表示された next diagnostic | dirty/diverged source、active agent run、test/build failure、profile/policy error | 原因を解消して `pueue-agent doctor` で確認し、同じ `pueue-agent upgrade` を再実行する |
-| `rollback: succeeded` | `version --json`、`status --compact`、`doctor` | install 後の restart または health check failure | 旧 binary と SQLite snapshot が復元されたことを確認し、原因を解消してから `pueue-agent upgrade` を再実行する |
-| `rollback: failed` または service 状態が不明 | `version --json`、`status --compact`、`doctor --json` の bounded report | binary、database restore、service restart のいずれかが完了しなかった | `pueue-agent stop` で新規 dispatch を止め、report を信頼できる管理者へ渡す。管理者の復旧後に `pueue-agent start` と `doctor` で確認する |
+| human 出力が `rollback=succeeded`、または JSON が `"rollback":"succeeded"` | `version --json`、`status --compact`、`doctor` | install 後の restart または health check failure | 旧 binary と SQLite snapshot が復元されたことを確認し、原因を解消してから `pueue-agent upgrade` を再実行する |
+| human 出力が `rollback=failed`、JSON が `"rollback":"failed"`、または service 状態が不明 | `version --json`、`status --compact`、`doctor --json` の bounded report | binary、database restore、service restart のいずれかが完了しなかった | `pueue-agent stop` で新規 dispatch を止め、report を信頼できる管理者へ渡す。管理者の復旧後に `pueue-agent start` と `doctor` で確認する |
 
 upgrade の transaction 境界、snapshot、再実行条件は[運用ワークフロー](workflows-ja.md#supervisor-を更新rollbackする)を参照してください。
 

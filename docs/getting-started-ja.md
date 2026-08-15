@@ -58,6 +58,50 @@ $EDITOR .pueue-agent/STATE.md
 
 既存の `config.toml` があるプロジェクトでは、初期化は上書きせず失敗します。
 
+現在の全設定は [`templates/config.toml`](../templates/config.toml) を参照してください。未知のキーや不正な値は無視されず、設定エラーになります。
+
+## Agent context を選ぶ
+
+`agent.context.mode` の既定値は `fresh` です。通常は run ごとに新しい context を使います。
+
+```toml
+[agent.context]
+mode = "fresh"
+```
+
+特定の Codex session を明示的に継続する場合だけ `resume` と `session_id` を指定します。project に属する最新 session を選ぶ場合は `resume_latest` を opt in します。
+
+```toml
+[agent.context]
+mode = "resume"
+session_id = "<SESSION_ID>"
+```
+
+```toml
+[agent.context]
+mode = "resume_latest"
+```
+
+継続モードは `agent.program = "codex"` の場合だけ利用できます。session が存在しない、壊れている、または別 project に属する場合は agent-run failure となり、`fresh` へ暗黙に fallback しません。
+
+## Detector を設定する
+
+detector は `check.log_tail_bytes` で制限した task log 末尾と、`check.extra_log_paths` の project 相対 log を確認します。pattern ごとに regex、action、必要な一致回数を設定します。
+
+```toml
+[[check.patterns]]
+name = "training-failure"
+regex = "FATAL"
+action = "wake"
+confirm_matches = 2
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+```
+
+`notify` は incident の記録、`wake` は agent event の記録、`kill` は検証済み Pueue task への termination request です。自動終了は opt in です。pattern の `kill` には名前が必要で、stall の `kill` には正の `kill_after_minutes` が必要です。OS process へ直接 signal を送る設定ではありません。
+
 ## プロジェクトを有効化する
 
 設定を保存したら user service をインストールして起動します。
@@ -67,6 +111,16 @@ pueue-agent enable
 ```
 
 Linux では systemd user service、macOS では launchd 経路を使います。対応環境の制約は「対応環境」を確認してください。
+
+## Service の state directory を確認する
+
+SQLite database は次の優先順位で解決した directory の `state.sqlite3` です。
+
+1. 空でない絶対パスの `PUEUE_AGENT_STATE_DIR`
+2. 空でない絶対パスの `XDG_STATE_HOME` 配下の `pueue-agent/`
+3. Linux などでは `$HOME/.local/state/pueue-agent/`、macOS では `$HOME/Library/Application Support/pueue-agent/`
+
+相対パスや空の override は採用されません。`enable` は解決済みの state directory を user service 定義へ固定するため、対話 CLI と service で別の state database を参照しないよう、同じ環境と profile で `pueue-agent status` と `pueue-agent doctor` を確認してください。
 
 ## 最初の実験を投入する
 
