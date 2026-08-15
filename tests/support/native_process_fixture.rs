@@ -1,6 +1,7 @@
 #![cfg(all(unix, debug_assertions))]
 
 use std::{
+    env,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -83,9 +84,6 @@ fn main() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    thread::sleep(Duration::from_millis(__READINESS_DELAY_MS__));
-    thread::sleep(Duration::from_millis(__EXEC_PROOF_DELAY_MS__));
-    thread::sleep(Duration::from_millis(__ACK_DELAY_MS__));
     fs::write(__READY__, b"ready").expect("write fixture readiness");
 
     let output = __OUTPUT_PAYLOAD__.as_bytes().repeat(__OUTPUT_REPETITIONS__);
@@ -167,36 +165,45 @@ pub struct NativeFakePueue {
     term_observation_path: PathBuf,
     argv_capture_path: PathBuf,
     config_capture_path: PathBuf,
+    _lifecycle_trace_temp: Option<TempDir>,
+    lifecycle_trace_path: Option<PathBuf>,
+    previous_lifecycle_delays: Option<Option<std::ffi::OsString>>,
+    previous_lifecycle_trace: Option<Option<std::ffi::OsString>>,
 }
 
 impl NativeFakePueue {
     pub fn new(behavior: NativeBehavior) -> Self {
-        Self::new_with_delays(behavior, None, [0; 3])
+        Self::new_with_ambient_path(behavior, None)
     }
 
     /// Build a holding fixture whose startup is divided into three explicit
-    /// delay segments. The operation runner must consume all three under one
-    /// absolute deadline instead of granting each lifecycle phase a new one.
+    /// helper lifecycle phases. The debug-only helper trace proves that these
+    /// delays occur at readiness, exec proof, and acknowledgement boundaries.
     pub fn delays(readiness_ms: u64, exec_proof_ms: u64, ack_ms: u64) -> Self {
-        Self::new_with_delays(
-            NativeBehavior::Hold,
-            None,
-            [readiness_ms, exec_proof_ms, ack_ms],
-        )
+        let trace = TempDir::new().expect("create helper lifecycle trace root");
+        let trace_path = trace.path().join("helper-lifecycle-trace");
+        let previous_lifecycle_delays = env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS");
+        let previous_lifecycle_trace = env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_TRACE");
+        env::set_var(
+            "PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS",
+            format!("{readiness_ms},{exec_proof_ms},{ack_ms}"),
+        );
+        env::set_var("PUEUE_AGENT_TEST_LIFECYCLE_TRACE", &trace_path);
+        let mut fixture = Self::new_with_ambient_path(NativeBehavior::Hold, None);
+        fixture._lifecycle_trace_temp = Some(trace);
+        fixture.lifecycle_trace_path = Some(trace_path);
+        fixture.previous_lifecycle_delays = Some(previous_lifecycle_delays);
+        fixture.previous_lifecycle_trace = Some(previous_lifecycle_trace);
+        fixture
     }
 
     pub fn new_with_ambient_path(
         behavior: NativeBehavior,
         ambient_path: Option<&Path>,
     ) -> Self {
-        Self::new_with_delays(behavior, ambient_path, [0; 3])
-    }
-
-    fn new_with_delays(
-        behavior: NativeBehavior,
-        ambient_path: Option<&Path>,
-        delays_ms: [u64; 3],
-    ) -> Self {
+        let lifecycle_trace_path = None;
+        let previous_lifecycle_delays = None;
+        let previous_lifecycle_trace = None;
         let temp = TempDir::new().expect("create native Pueue fixture root");
         let base = fs::canonicalize(temp.path()).expect("canonicalize fixture root");
         let state_dir = base.join("state");
@@ -239,10 +246,7 @@ impl NativeFakePueue {
             .replace("__OUTPUT_PAYLOAD__", &format!("{output_payload:?}"))
             .replace("__OUTPUT_REPETITIONS__", &output_repetitions.to_string())
             .replace("__TERM_STREAM__", &format!("{term_stream:?}"))
-            .replace("__EXIT_CODE__", &exit_code.to_string())
-            .replace("__READINESS_DELAY_MS__", &delays_ms[0].to_string())
-            .replace("__EXEC_PROOF_DELAY_MS__", &delays_ms[1].to_string())
-            .replace("__ACK_DELAY_MS__", &delays_ms[2].to_string());
+            .replace("__EXIT_CODE__", &exit_code.to_string());
         fs::write(&source_path, source).expect("write generated native Pueue source");
         let output = Command::new("rustc")
             .args(["--edition=2021", "-O", "-o"])
@@ -312,6 +316,10 @@ impl NativeFakePueue {
             term_observation_path,
             argv_capture_path,
             config_capture_path,
+            _lifecycle_trace_temp: None,
+            lifecycle_trace_path,
+            previous_lifecycle_delays,
+            previous_lifecycle_trace,
         }
     }
 
@@ -382,6 +390,42 @@ impl NativeFakePueue {
     pub async fn captured_config(&self) -> Vec<u8> {
         read_file_bounded(&self.config_capture_path).await
     }
+
+    pub async fn assert_helper_lifecycle_deadline_started(&self) {
+        let trace_path = self
+            .lifecycle_trace_path
+            .as_ref()
+            .expect("fixture has helper lifecycle delays");
+        let trace = String::from_utf8(read_file_bounded(trace_path).await)
+            .expect("helper lifecycle trace is UTF-8");
+        let mut lines = trace.lines();
+        let readiness = lines.next().expect("helper did not enter readiness delay");
+        let exec_proof = lines.next().expect("helper did not enter exec-proof delay");
+        assert!(readiness.starts_with("readiness:"), "unexpected trace: {trace:?}");
+        assert!(exec_proof.starts_with("exec-proof:"), "unexpected trace: {trace:?}");
+        let helper_pid = readiness
+            .split_once(':')
+            .and_then(|(_, pid)| pid.parse::<libc::pid_t>().ok())
+            .expect("readiness trace has helper pid");
+        wait_for_process_group_gone(helper_pid).await;
+    }
+}
+
+impl Drop for NativeFakePueue {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous_lifecycle_delays.take() {
+            match previous {
+                Some(value) => env::set_var("PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS", value),
+                None => env::remove_var("PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS"),
+            }
+        }
+        if let Some(previous) = self.previous_lifecycle_trace.take() {
+            match previous {
+                Some(value) => env::set_var("PUEUE_AGENT_TEST_LIFECYCLE_TRACE", value),
+                None => env::remove_var("PUEUE_AGENT_TEST_LIFECYCLE_TRACE"),
+            }
+        }
+    }
 }
 
 fn rust_string(path: &Path) -> String {
@@ -436,6 +480,22 @@ async fn wait_for_pid_gone(pid: libc::pid_t) {
         assert!(
             Instant::now() < deadline,
             "fixture PID {pid} survived adapter cleanup"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_process_group_gone(group: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if unsafe { libc::kill(-group, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture helper process group {group} survived adapter cleanup"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

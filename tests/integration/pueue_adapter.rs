@@ -354,7 +354,7 @@ async fn pueue_launch_phases_share_one_absolute_deadline() {
 
     assert!(matches!(error, AppError::Pueue(PueueError::Timeout { .. })));
     assert!(started.elapsed() < Duration::from_millis(700));
-    fixture.wait_for_processes_gone().await;
+    fixture.assert_helper_lifecycle_deadline_started().await;
 }
 
 #[cfg(all(unix, debug_assertions))]

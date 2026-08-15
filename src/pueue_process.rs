@@ -209,7 +209,7 @@ impl PueueProcessRunner {
             project_root: None,
             pueue_config: Some(verified_config),
             child_io: VerifiedChildIo::Capture,
-        }, deadline) {
+        }, deadline).await {
             Ok(child) => child,
             Err(error) => return Err(map_operation_error(operation, error)),
         };

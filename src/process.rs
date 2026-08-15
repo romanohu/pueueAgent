@@ -74,6 +74,10 @@ const LIFECYCLE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const RELEASE_AUTHORIZATION: [u8; 1] = [0xa5];
 #[cfg(unix)]
 const EXEC_FAILURE_RECORD: [u8; 8] = *b"PAEE\x01\x01\0\0";
+#[cfg(all(unix, debug_assertions))]
+const TEST_LIFECYCLE_DELAYS_ENV: &str = "PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS";
+#[cfg(all(unix, debug_assertions))]
+const TEST_LIFECYCLE_TRACE_ENV: &str = "PUEUE_AGENT_TEST_LIFECYCLE_TRACE";
 
 const HEADER_SIZE: usize = 12;
 const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT | FLAG_AGENT_LOG | FLAG_PUEUE_CONFIG | FLAG_PROCESS_GROUP | FLAG_LIFECYCLE;
@@ -800,19 +804,22 @@ async fn drain_owned_process_group(
     if let Err(error) = signal_owned_process_group(child, group, libc::SIGTERM) {
         return Err(error);
     }
-    tokio::time::sleep(PROCESS_GROUP_TERM_GRACE).await;
-    let group_exists = match process_group_exists(child, group) {
-        Ok(exists) => exists,
-        Err(error) => {
-            return Err(error);
-        }
-    };
-    if group_exists {
-        if let Err(error) = signal_owned_process_group(child, group, libc::SIGKILL) {
-            return Err(error);
+    let term_deadline = Instant::now()
+        .checked_add(PROCESS_GROUP_TERM_GRACE)
+        .unwrap_or_else(Instant::now);
+    loop {
+        match process_group_exists(child, group) {
+            Ok(false) => return Ok(()),
+            Ok(true) if Instant::now() >= term_deadline => {
+                if let Err(error) = signal_owned_process_group(child, group, libc::SIGKILL) {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Ok(true) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(error) => return Err(error),
         }
     }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -1022,17 +1029,23 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
     let mut target = PlatformTarget::prepare(&frame)?;
     #[cfg(test)]
     TEST_PREPARED_TARGET_PID.store(target.pid(), Ordering::SeqCst);
+    #[cfg(debug_assertions)]
+    test_lifecycle_delay(TestLifecyclePhase::Readiness);
     write_fixed_record(CONTROL_FD, &HELPER_READY_RECORD)?;
     if read_release_authorization().is_err() {
         target.cancel_and_reap();
         return Err(BootstrapError::GateClosed);
     }
+    #[cfg(debug_assertions)]
+    test_lifecycle_delay(TestLifecyclePhase::ExecProof);
     if target.release_and_confirm().is_err() {
         let _ = write_exec_failure();
         target.cancel_and_reap();
         return Err(BootstrapError::BootstrapCorrupt);
     }
     close_raw(EXEC_STATUS_FD);
+    #[cfg(debug_assertions)]
+    test_lifecycle_delay(TestLifecyclePhase::Ack);
     write_release_ack()?;
     #[cfg(test)]
     if TEST_REAP_TARGET_BEFORE_WAIT.swap(false, Ordering::SeqCst) {
@@ -1095,6 +1108,60 @@ fn write_release_ack() -> Result<(), BootstrapError> {
     let mut writer = unsafe { std::fs::File::from_raw_fd(RELEASE_ACK_FD) };
     write_all_fd_before(&mut writer, RELEASE_ACK, lifecycle_deadline())?;
     Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[derive(Clone, Copy)]
+enum TestLifecyclePhase {
+    Readiness,
+    ExecProof,
+    Ack,
+}
+
+#[cfg(all(unix, debug_assertions))]
+impl TestLifecyclePhase {
+    const fn index(self) -> usize {
+        match self {
+            Self::Readiness => 0,
+            Self::ExecProof => 1,
+            Self::Ack => 2,
+        }
+    }
+
+    const fn trace(self) -> &'static str {
+        match self {
+            Self::Readiness => "readiness",
+            Self::ExecProof => "exec-proof",
+            Self::Ack => "ack",
+        }
+    }
+}
+
+/// Debug-only native-fixture hook. Release binaries neither read nor inherit
+/// these names; this exists solely to exercise the three parent-visible
+/// lifecycle boundaries with real helper protocol I/O.
+#[cfg(all(unix, debug_assertions))]
+fn test_lifecycle_delay(phase: TestLifecyclePhase) {
+    let Some(delays) = std::env::var_os(TEST_LIFECYCLE_DELAYS_ENV) else {
+        return;
+    };
+    let delays = delays.to_string_lossy();
+    let mut values = delays.split(',').map(str::parse::<u64>);
+    let parsed = [
+        values.next().and_then(Result::ok),
+        values.next().and_then(Result::ok),
+        values.next().and_then(Result::ok),
+    ];
+    if values.next().is_some() || parsed.iter().any(Option::is_none) {
+        return;
+    }
+    if let Some(path) = std::env::var_os(TEST_LIFECYCLE_TRACE_ENV) {
+        use std::io::Write;
+        if let Ok(mut trace) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(trace, "{}:{}", phase.trace(), std::process::id());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(parsed[phase.index()].unwrap_or_default()));
 }
 
 #[cfg(target_os = "macos")]
@@ -1556,6 +1623,12 @@ fn build_helper_command(
         .stdin(child_input)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(debug_assertions)]
+    for name in [TEST_LIFECYCLE_DELAYS_ENV, TEST_LIFECYCLE_TRACE_ENV] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     command
 }
 
@@ -1812,47 +1885,70 @@ pub fn spawn_validated_helper(
 /// returned one-shot gate is released.
 #[cfg(unix)]
 pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild, AppError> {
-    let bootstrap_deadline = Instant::now()
-        .checked_add(BOOTSTRAP_IO_TIMEOUT)
-        .unwrap_or_else(Instant::now);
-    spawn_verified_command_with_deadlines(
-        spec,
-        bootstrap_deadline,
-        lifecycle_deadline(),
-        false,
-    )
+    match spawn_verified_command_with_deadlines(spec, None, None, false) {
+        Ok(child) => Ok(child),
+        Err(SpawnVerifiedCommandFailure::BeforeStart(error)) => Err(error),
+        Err(SpawnVerifiedCommandFailure::Started { child, error }) => {
+            drop(child);
+            Err(error)
+        }
+    }
 }
 
 /// Spawn a suspended verified target, bounding bootstrap and readiness by the
 /// caller-owned operation deadline.
 #[cfg(unix)]
-pub fn spawn_verified_command_before(
+pub async fn spawn_verified_command_before(
     spec: VerifiedCommandSpec,
     deadline: Instant,
 ) -> Result<VerifiedChild, AppError> {
-    spawn_verified_command_with_deadlines(spec, deadline, deadline, true)
+    match spawn_verified_command_with_deadlines(spec, Some(deadline), Some(deadline), true) {
+        Ok(child) => Ok(child),
+        Err(SpawnVerifiedCommandFailure::BeforeStart(error)) => Err(error),
+        Err(SpawnVerifiedCommandFailure::Started { mut child, error }) => {
+            match terminate_process_group(&mut child).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(cleanup),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+enum SpawnVerifiedCommandFailure {
+    BeforeStart(AppError),
+    Started { child: VerifiedChild, error: AppError },
+}
+
+#[cfg(unix)]
+impl From<AppError> for SpawnVerifiedCommandFailure {
+    fn from(error: AppError) -> Self {
+        Self::BeforeStart(error)
+    }
 }
 
 #[cfg(unix)]
 fn spawn_verified_command_with_deadlines(
     spec: VerifiedCommandSpec,
-    bootstrap_deadline: Instant,
-    lifecycle_deadline: Instant,
+    bootstrap_deadline: Option<Instant>,
+    operation_deadline: Option<Instant>,
     deadline_is_operation_timeout: bool,
-) -> Result<VerifiedChild, AppError> {
-    if Instant::now() >= lifecycle_deadline {
-        return Err(lifecycle_deadline_exceeded());
+) -> Result<VerifiedChild, SpawnVerifiedCommandFailure> {
+    if let Some(deadline) = operation_deadline {
+        if Instant::now() >= deadline {
+            return Err(lifecycle_deadline_exceeded().into());
+        }
     }
     if spec.process_group != ProcessGroupRequirement::Required || !spec.start_suspended {
-        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
     }
     let mode = match (&spec.project_root, &spec.pueue_config) {
         (Some(_), None) => LaunchMode::Agent,
         (None, Some(_)) => LaunchMode::Pueue,
-        _ => return Err(native_gate_error(PolicyViolationStage::NativeGate)),
+        _ => return Err(native_gate_error(PolicyViolationStage::NativeGate).into()),
     };
     if spec.argv.is_empty() {
-        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+        return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
     }
 
     let verified_launcher = spec.launcher.verify_identity()?;
@@ -1866,7 +1962,7 @@ fn spawn_verified_command_with_deadlines(
             .as_ref()
             .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))?;
         if cwd != root.anchor.canonical_path {
-            return Err(native_gate_error(PolicyViolationStage::NativeGate));
+            return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
         }
     }
 
@@ -1949,42 +2045,7 @@ fn spawn_verified_command_with_deadlines(
         .ok_or_else(retryable_native_launch_error)? as i64;
     drop(launch_guard);
 
-    let parent_raw = parent_socket.into_raw_fd();
-    let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
-    if let Err(error) = send_bootstrap_packet_before(
-        parent_stream.as_raw_fd(),
-        &frame,
-        &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
-        bootstrap_deadline,
-    ) {
-        cleanup_failed_tokio_helper(&mut child, pid);
-        let error = match error {
-            BootstrapError::Io(source)
-                if deadline_is_operation_timeout && source.kind() == io::ErrorKind::TimedOut => {
-                ProcessLaunchError::DeadlineExceeded
-            }
-            error => ProcessLaunchError::Bootstrap(error),
-        };
-        return Err(map_verified_launch_error(error));
-    }
-    // Suspended target creation is a distinct lifecycle operation from the
-    // bounded bootstrap transfer. On macOS, posix_spawn may synchronously
-    // assess a newly generated executable, so this operation receives its own
-    // lifecycle deadline instead of the shorter bootstrap-only budget.
-    if let Err(error) = read_helper_readiness_before(&mut parent_stream, lifecycle_deadline) {
-        cleanup_failed_tokio_helper(&mut child, pid);
-        let error = if !deadline_is_operation_timeout
-            && matches!(error, ProcessLaunchError::DeadlineExceeded)
-        {
-            ProcessLaunchError::ReadinessRejected
-        } else {
-            error
-        };
-        return Err(map_verified_launch_error(error));
-    }
-    drop(rights);
-
-    Ok(VerifiedChild {
+    let verified = VerifiedChild {
         child,
         pid,
         process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
@@ -2002,7 +2063,57 @@ fn spawn_verified_command_with_deadlines(
         injected_group_signal_error: false,
         #[cfg(test)]
         force_ownership_loss_before_reap: false,
-    })
+    };
+
+    let parent_raw = parent_socket.into_raw_fd();
+    let mut parent_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(parent_raw) };
+    let bootstrap_deadline = bootstrap_deadline.unwrap_or_else(|| {
+        Instant::now()
+            .checked_add(BOOTSTRAP_IO_TIMEOUT)
+            .unwrap_or_else(Instant::now)
+    });
+    if let Err(error) = send_bootstrap_packet_before(
+        parent_stream.as_raw_fd(),
+        &frame,
+        &rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+        bootstrap_deadline,
+    ) {
+        drop(rights);
+        let error = match error {
+            BootstrapError::Io(source)
+                if deadline_is_operation_timeout
+                    && matches!(source.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                ProcessLaunchError::DeadlineExceeded
+            }
+            error => ProcessLaunchError::Bootstrap(error),
+        };
+        return Err(SpawnVerifiedCommandFailure::Started {
+            child: verified,
+            error: map_verified_launch_error(error),
+        });
+    }
+    // Suspended target creation is a distinct lifecycle operation from the
+    // bounded bootstrap transfer. On macOS, posix_spawn may synchronously
+    // assess a newly generated executable, so this operation receives its own
+    // lifecycle deadline instead of the shorter bootstrap-only budget.
+    let readiness_deadline = operation_deadline.unwrap_or_else(lifecycle_deadline);
+    if let Err(error) = read_helper_readiness_before(&mut parent_stream, readiness_deadline) {
+        drop(rights);
+        let error = if !deadline_is_operation_timeout
+            && matches!(error, ProcessLaunchError::DeadlineExceeded)
+        {
+            ProcessLaunchError::ReadinessRejected
+        } else {
+            error
+        };
+        return Err(SpawnVerifiedCommandFailure::Started {
+            child: verified,
+            error: map_verified_launch_error(error),
+        });
+    }
+    drop(rights);
+
+    Ok(verified)
 }
 
 #[cfg(unix)]
@@ -2318,12 +2429,8 @@ fn read_helper_readiness_before(
     // A successful helper closes the channel immediately after its fixed
     // record. Reject any trailing byte and bound the wait by the same
     // absolute deadline.
-    // The final exact-read iteration already installed a timeout bounded by
-    // this same deadline. Do not reset SO_RCVTIMEO after peer half-close: on
-    // some Unix implementations that transition rejects a second timeout
-    // update with EINVAL. The existing timeout still bounds this read.
     let mut trailing = [0u8; 1];
-    match stream.read(&mut trailing) {
+    match read_stream_before(stream, &mut trailing, deadline) {
         Ok(0) if record == HELPER_READY_RECORD => Ok(()),
         Ok(0) if record == HELPER_TRANSIENT_FAILURE_RECORD => Err(
             ProcessLaunchError::HelperFailure(HelperFailureKind::Transient),
@@ -2337,6 +2444,21 @@ fn read_helper_readiness_before(
             Err(ProcessLaunchError::DeadlineExceeded)
         }
         Err(_) => Err(ProcessLaunchError::Io),
+    }
+}
+
+#[cfg(unix)]
+fn read_stream_before(
+    stream: &mut std::os::unix::net::UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<usize> {
+    loop {
+        wait_fd(stream.as_raw_fd(), libc::POLLIN | libc::POLLHUP, deadline)?;
+        match stream.read(buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
     }
 }
 
