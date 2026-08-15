@@ -4014,7 +4014,7 @@ mod tests {
     fn optional_descriptor_flags_must_match_identity_fields() {
         let mut missing = frame(); missing.project_root_identity = None;
         assert_eq!(missing.encode(), Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)));
-        let mut unexpected = frame(); unexpected.flags = LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP;
+        let mut unexpected = frame(); unexpected.flags = LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP | LaunchFlags::PRIVATE_TEMP;
         assert_eq!(unexpected.encode(), Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)));
     }
 
