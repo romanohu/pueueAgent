@@ -232,6 +232,24 @@ fn doctor_pueue_bounds_source_derives_its_summary_from_production_constants() {
     assert!(!bounds.contains("caps=65536 bytes"));
 }
 
+#[test]
+fn doctor_execution_anchors_include_the_complete_pueue_boundary() {
+    let source = include_str!("../../src/diagnostics.rs");
+    let checks_start = source
+        .find("fn execution_doctor_checks(")
+        .expect("doctor must define execution boundary checks");
+    let checks = &source[checks_start..];
+
+    for anchor in [
+        "policy.codex_anchor.verify_identity()",
+        "policy.launcher_anchor.verify_identity()",
+        "policy.pueue_anchor.verify_identity()",
+        ".pueue_config_anchor\n                    .verify_identity(&policy.project_roots)",
+    ] {
+        assert!(checks.contains(anchor), "missing doctor anchor: {anchor}");
+    }
+}
+
 fn state_check<'a>(value: &'a Value, name: &str) -> &'a Value {
     value["checks"]
         .as_array()

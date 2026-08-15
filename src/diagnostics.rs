@@ -1238,14 +1238,17 @@ fn execution_doctor_checks(
                 "immutable execution policy is readable",
                 "none",
             )];
-            let anchors = [
-                policy.codex_anchor.verify_identity(),
-                policy.launcher_anchor.verify_identity(),
-            ];
-            checks.push(if anchors.iter().all(Result::is_ok) {
+            let anchors_valid = policy.codex_anchor.verify_identity().is_ok()
+                && policy.launcher_anchor.verify_identity().is_ok()
+                && policy.pueue_anchor.verify_identity().is_ok()
+                && policy
+                    .pueue_config_anchor
+                    .verify_identity(&policy.project_roots)
+                    .is_ok();
+            checks.push(if anchors_valid {
                 doctor_ok(
                     "execution.anchors",
-                    "execution anchors retain their pinned identity",
+                    "Codex, launcher, Pueue executable, and Pueue config anchors retain their pinned identity",
                     "none",
                 )
             } else {

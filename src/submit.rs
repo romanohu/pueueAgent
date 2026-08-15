@@ -17,7 +17,7 @@ use crate::{
     models::{NewSubmission, Submission, SubmissionKind},
     output::{bounded_redacted_text, format_state, human_header, human_summary},
     paths, project,
-    pueue::{configured_pueue, PueueApi},
+    pueue::{configured_pueue, validate_add_argv, PueueApi},
     service::ServicePaths,
     AppError,
 };
@@ -140,6 +140,13 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     validate_metadata(&options.metadata)?;
     validate_active_origin(db, &registered.project_id, options.origin_agent_run_id)?;
 
+    let mut add_args = Vec::with_capacity(args.len() + 3);
+    add_args.push(OsString::from("-g"));
+    add_args.push(registered.pueue_group.clone().into());
+    add_args.push(OsString::from("--"));
+    add_args.extend_from_slice(args);
+    validate_add_argv(&add_args)?;
+
     let argv = args
         .iter()
         .map(|argument| {
@@ -164,12 +171,6 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     );
     let repository = SubmissionRepository::new(db);
     repository.insert_idempotent(&intent)?;
-
-    let mut add_args = Vec::with_capacity(args.len() + 3);
-    add_args.push(OsString::from("-g"));
-    add_args.push(registered.pueue_group.clone().into());
-    add_args.push(OsString::from("--"));
-    add_args.extend_from_slice(args);
 
     let task_id = pueue.add(&add_args).await?;
     let task_signature =

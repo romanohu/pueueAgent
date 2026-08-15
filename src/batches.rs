@@ -20,7 +20,7 @@ use crate::{
     },
     output::{bounded_redacted_text, format_state, human_header, human_summary},
     project,
-    pueue::PueueApi,
+    pueue::{validate_add_argv, PueueApi},
     submit, AppError,
 };
 
@@ -247,6 +247,13 @@ pub async fn run_with<P: PueueApi + ?Sized>(
         .cloned()
         .collect::<Vec<_>>();
     for job in dispatch_jobs {
+        let mut add_args = Vec::with_capacity(job.argv.len() + 3);
+        add_args.push(OsString::from("-g"));
+        add_args.push(OsString::from(group));
+        add_args.push(OsString::from("--"));
+        add_args.extend(job.argv.iter().cloned().map(OsString::from));
+        validate_add_argv(&add_args)?;
+
         let submission_id = Uuid::new_v4().to_string();
         submission_repository.insert_idempotent(&NewSubmission::with_kind_metadata(
             submission_id.clone(),
@@ -257,12 +264,6 @@ pub async fn run_with<P: PueueApi + ?Sized>(
             job.metadata.clone(),
             None,
         ))?;
-
-        let mut add_args = Vec::with_capacity(job.argv.len() + 3);
-        add_args.push(OsString::from("-g"));
-        add_args.push(OsString::from(group));
-        add_args.push(OsString::from("--"));
-        add_args.extend(job.argv.iter().cloned().map(OsString::from));
 
         match pueue.add(&add_args).await {
             Ok(task_id) => {

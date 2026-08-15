@@ -20,12 +20,42 @@ use tokio::{
 
 use crate::{
     environment::SanitizedEnvironment,
-    execution_policy::ResolvedExecutionPolicy,
+    execution_policy::{ExecutableIdentity, ResolvedExecutionPolicy},
+    process::{ControlFrame, LaunchFlags, LaunchMode},
     pueue::{PueueError, PUEUE_TIMEOUT},
     AppError,
 };
 
 pub use crate::pueue_security::MAX_PUEUE_OUTPUT_BYTES;
+
+/// Reject an argv that cannot be represented by the native control protocol
+/// before any durable submission state is created.
+pub(crate) fn validate_native_pueue_argv(argv: &[OsString]) -> Result<(), AppError> {
+    let identity = ExecutableIdentity {
+        device: 0,
+        inode: 0,
+        owner: 0,
+        mode: 0,
+    };
+    ControlFrame {
+        mode: LaunchMode::Pueue,
+        flags: LaunchFlags::PUEUE_CONFIG | LaunchFlags::PROCESS_GROUP,
+        argv: argv.to_vec(),
+        environment: Vec::new(),
+        cwd: None,
+        target_identity: identity,
+        project_root_identity: None,
+        agent_log_identity: None,
+        pueue_config_identity: Some(identity),
+        target_path: Some(OsString::new()),
+    }
+    .encode()
+    .map_err(|_| AppError::Validation {
+        field: "pueue.argv",
+        message: "does not fit the native control frame",
+    })
+    .map(|_| ())
+}
 
 /// The result of a successful, bounded Pueue process collection.
 pub struct BoundedOutput {

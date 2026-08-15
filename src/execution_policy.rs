@@ -1620,7 +1620,7 @@ fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
             }
         };
         if file.write_all(DEFAULT_POLICY.as_bytes()).is_err() || file.sync_all().is_err() {
-            let _ = fs::remove_file(&temporary);
+            let _ = cleanup_policy_temporary(state_dir, &temporary);
             return Err(PolicyViolation::new(
                 PolicyViolationCode::PolicyUnreadable,
                 PolicyViolationStage::Startup,
@@ -1651,10 +1651,16 @@ fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
                         PolicyViolationStage::Startup,
                     )
                 })?;
+                state_dir.file.sync_all().map_err(|_| {
+                    PolicyViolation::new(
+                        PolicyViolationCode::PolicyUnreadable,
+                        PolicyViolationStage::Startup,
+                    )
+                })?;
                 return Ok(());
             }
             Err(_) => {
-                let _ = unlinkat(&state_dir.file, &temporary);
+                let _ = cleanup_policy_temporary(state_dir, &temporary);
                 return Err(PolicyViolation::new(
                     PolicyViolationCode::PolicyUnreadable,
                     PolicyViolationStage::Startup,
@@ -1666,6 +1672,13 @@ fn create_policy_file(state_dir: &OpenedPath) -> Result<(), PolicyViolation> {
         PolicyViolationCode::PolicyUnreadable,
         PolicyViolationStage::Startup,
     ))
+}
+
+#[cfg(unix)]
+fn cleanup_policy_temporary(state_dir: &OpenedPath, temporary: &OsStr) -> io::Result<()> {
+    let unlink_result = unlinkat(&state_dir.file, temporary);
+    let sync_result = state_dir.file.sync_all();
+    unlink_result.and(sync_result)
 }
 
 fn secure_metadata(metadata: &Metadata) -> bool {

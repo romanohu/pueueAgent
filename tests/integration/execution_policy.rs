@@ -13,6 +13,20 @@ use pueue_agent::{
 };
 use tempfile::{tempdir, TempDir};
 
+#[test]
+fn publication_failure_cleanup_is_descriptor_relative() {
+    let source = include_str!("../../src/execution_policy.rs");
+    let create_start = source
+        .find("fn create_policy_file(")
+        .expect("policy creation must use a temporary file");
+    let create = &source[create_start..];
+
+    assert!(!create.contains("fs::remove_file(&temporary)"));
+    assert!(create.contains("cleanup_policy_temporary(state_dir, &temporary)"));
+    assert!(create.contains("unlinkat(&state_dir.file, temporary)"));
+    assert!(create.contains("state_dir.file.sync_all()"));
+}
+
 struct PolicyHarness {
     temp: TempDir,
     state_dir: PathBuf,

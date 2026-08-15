@@ -15,12 +15,41 @@ use thiserror::Error;
 use crate::{
     environment::SanitizedEnvironment,
     execution_policy::ResolvedExecutionPolicy,
-    pueue_process::{BoundedOutput, PueueProcessRunner},
+    pueue_process::{validate_native_pueue_argv, BoundedOutput, PueueProcessRunner},
     pueue_security::validate_group,
     AppError,
 };
 
 pub const PUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Validate the complete native Pueue argv that `CommandPueue::add` will
+/// eventually launch. This keeps durable submission intent from referring to
+/// a request the native control protocol cannot carry.
+pub fn validate_add_argv(args: &[OsString]) -> Result<(), AppError> {
+    let mut argv = Vec::with_capacity(args.len() + 9);
+    argv.extend([
+        OsString::from("pueue"),
+        OsString::from("--config"),
+        OsString::from("/dev/fd/9"),
+        OsString::from("add"),
+    ]);
+    argv.extend(add_operation_args(args));
+    validate_native_pueue_argv(&argv)
+}
+
+fn add_operation_args(args: &[OsString]) -> Vec<OsString> {
+    let mut operation_args = Vec::with_capacity(args.len() + 2);
+    operation_args.push(OsString::from("--print-task-id"));
+    if let Some(separator_index) = args.iter().position(|argument| argument == "--") {
+        operation_args.extend_from_slice(&args[..separator_index]);
+        operation_args.push(OsString::from("--escape"));
+        operation_args.extend_from_slice(&args[separator_index..]);
+    } else {
+        operation_args.push(OsString::from("--escape"));
+        operation_args.extend_from_slice(args);
+    }
+    operation_args
+}
 
 #[derive(Error)]
 pub enum PueueError {
@@ -274,16 +303,8 @@ impl PueueApi for CommandPueue {
     }
 
     async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
-        let mut operation_args = Vec::with_capacity(args.len() + 2);
-        operation_args.push(OsString::from("--print-task-id"));
-        if let Some(separator_index) = args.iter().position(|argument| argument == "--") {
-            operation_args.extend_from_slice(&args[..separator_index]);
-            operation_args.push(OsString::from("--escape"));
-            operation_args.extend_from_slice(&args[separator_index..]);
-        } else {
-            operation_args.push(OsString::from("--escape"));
-            operation_args.extend_from_slice(args);
-        }
+        validate_add_argv(args)?;
+        let operation_args = add_operation_args(args);
         let output = self.execute("add", &operation_args).await?;
         let task_id = std::str::from_utf8(&output.stdout)
             .ok()
@@ -338,11 +359,9 @@ impl PueueApi for CommandPueue {
 impl CommandPueue {
     async fn group_exists(&self, group: &str) -> Result<bool, AppError> {
         let output = self.execute("group", &[OsString::from("-j")]).await?;
-        let groups: Value = serde_json::from_slice(&output.stdout)
+        let groups: BTreeMap<String, Value> = serde_json::from_slice(&output.stdout)
             .map_err(|source| PueueError::InvalidGroupJson { source })?;
-        Ok(groups
-            .as_object()
-            .is_some_and(|groups| groups.contains_key(group)))
+        Ok(groups.contains_key(group))
     }
 }
 

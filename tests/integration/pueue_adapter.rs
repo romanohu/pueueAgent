@@ -22,7 +22,7 @@ use native_process_fixture::{
     TIMEOUT_SENTINEL_REPETITIONS,
 };
 use pueue_agent::{
-    batches::BatchJobResult,
+    batches::{self, BatchJobResult},
     db::{BatchRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
     models::{
         AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
@@ -984,6 +984,27 @@ async fn command_adapter_adds_missing_group_after_json_list_check() {
 }
 
 #[tokio::test]
+async fn command_adapter_rejects_non_object_group_json() {
+    for groups in ["[]", "null", "\"pa-project\""] {
+        let fixture = FakePueueCommand::new_with_group_lists(
+            STATUS_JSON,
+            "73\n",
+            &[groups],
+            None,
+        );
+        let adapter = configured_pueue(fixture.policy()).unwrap();
+
+        let error = adapter.ensure_group("pa-project").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Pueue(PueueError::InvalidGroupJson { .. })
+        ));
+        assert_eq!(fixture.captured_invocations().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn command_adapter_treats_racing_group_add_as_success_when_group_appears() {
     let fixture = FakePueueCommand::new_with_group_lists(
         STATUS_JSON,
@@ -1246,6 +1267,72 @@ async fn submit_records_intent_before_add_and_preserves_arguments() {
         accepted.task_signature.as_deref(),
         Some(expected_provisional_signature("pa-project", 73, &accepted.submission_id).as_str())
     );
+}
+
+#[tokio::test]
+async fn oversized_native_add_argv_is_rejected_before_submission_insert() {
+    // Native argv contains the user's command plus the submit group separator,
+    // add flags, and the fixed pueue --config operation prefix.
+    let max_user_add_args = 256 - 9;
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let command = vec![OsString::from("x"); max_user_add_args + 1];
+
+    assert!(submit::run_with(&harness.db, &harness.root, &command, &fake)
+        .await
+        .is_err());
+    assert!(SubmissionRepository::new(&harness.db)
+        .find_unreconciled("project-a")
+        .unwrap()
+        .is_empty());
+    assert!(fake.last_add_args().is_empty());
+}
+
+#[tokio::test]
+async fn maximum_native_add_argv_is_persisted_and_submitted() {
+    let max_user_add_args = 256 - 9;
+    let harness = SubmitHarness::new();
+    let fake = FakePueue::new().with_add_task_id(73);
+    let command = vec![OsString::from("x"); max_user_add_args];
+
+    let submission = submit::run_with(&harness.db, &harness.root, &command, &fake)
+        .await
+        .unwrap();
+
+    assert_eq!(submission.status, SubmissionStatus::Accepted);
+    assert_eq!(fake.last_add_args().len(), max_user_add_args + 3);
+}
+
+#[tokio::test]
+async fn oversized_native_batch_add_argv_is_rejected_before_submission_insert() {
+    let max_user_add_args = 256 - 9;
+    let harness = SubmitHarness::new();
+    let manifest_path = harness.root.join("oversized-jobs.json");
+    let argv = std::iter::repeat("x")
+        .take(max_user_add_args + 1)
+        .collect::<Vec<_>>();
+    fs::write(
+        &manifest_path,
+        serde_json::json!({"jobs":[{"id":"too-large","argv":argv}]}).to_string(),
+    )
+    .unwrap();
+    let fake = FakePueue::new().with_add_task_id(73);
+
+    assert!(batches::run_with(
+        &harness.db,
+        &harness.root,
+        &uuid::Uuid::new_v4().to_string(),
+        &manifest_path,
+        None,
+        &fake,
+    )
+    .await
+    .is_err());
+    assert!(SubmissionRepository::new(&harness.db)
+        .find_unreconciled("project-a")
+        .unwrap()
+        .is_empty());
+    assert!(fake.last_add_args().is_empty());
 }
 
 #[tokio::test]
