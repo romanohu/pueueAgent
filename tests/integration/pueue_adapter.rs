@@ -76,28 +76,56 @@ fn native_add_preflight_accepts_a_shape_valid_small_request() {
 
 #[test]
 fn native_add_preflight_accepts_the_last_conservative_frame_and_rejects_the_next_byte() {
-    let add_args = |bytes| {
-        let mut args = vec![
-            OsString::from("-g"),
-            OsString::from("pa-project"),
-            OsString::from("--"),
-        ];
-        args.extend((0..32).map(|_| OsString::from("x".repeat(bytes))));
-        args
+    let (prefix_bytes, tail_bytes) = native_add_byte_boundary();
+    let accepted = native_add_byte_boundary_args(prefix_bytes, tail_bytes);
+    let rejected = native_add_byte_boundary_args(prefix_bytes, tail_bytes + 1);
+
+    assert!(validate_add_argv(&accepted).is_ok());
+    assert!(validate_add_argv(&rejected).is_err());
+}
+
+fn native_add_byte_boundary() -> (usize, usize) {
+    let add_args = |prefix_bytes, tail_bytes| {
+        native_add_byte_boundary_args(prefix_bytes, tail_bytes)
     };
     let mut low = 0;
     let mut high = MAX_FIELD_SIZE;
     while low < high {
         let middle = low + (high - low + 1) / 2;
-        if validate_add_argv(&add_args(middle)).is_ok() {
+        if validate_add_argv(&add_args(middle, middle)).is_ok() {
             low = middle;
         } else {
             high = middle - 1;
         }
     }
+    let mut tail_low = 0;
+    let mut tail_high = MAX_FIELD_SIZE;
+    while tail_low < tail_high {
+        let middle = tail_low + (tail_high - tail_low + 1) / 2;
+        if validate_add_argv(&add_args(low, middle)).is_ok() {
+            tail_low = middle;
+        } else {
+            tail_high = middle - 1;
+        }
+    }
 
-    assert!(validate_add_argv(&add_args(low)).is_ok());
-    assert!(validate_add_argv(&add_args(low + 1)).is_err());
+    (low, tail_low)
+}
+
+fn native_add_byte_boundary_args(prefix_bytes: usize, tail_bytes: usize) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-g"),
+        OsString::from("pa-project"),
+        OsString::from("--"),
+    ];
+    args.extend((0..31).map(|_| OsString::from("x".repeat(prefix_bytes))));
+    args.push(OsString::from("x".repeat(tail_bytes)));
+    args
+}
+
+fn native_add_byte_boundary_command(rejected: bool) -> Vec<OsString> {
+    let (prefix_bytes, tail_bytes) = native_add_byte_boundary();
+    native_add_byte_boundary_args(prefix_bytes, tail_bytes + usize::from(rejected))[3..].to_vec()
 }
 
 fn source_before_test_module(source: &str) -> &str {
@@ -1339,6 +1367,38 @@ async fn maximum_native_add_argv_is_persisted_and_submitted() {
 
     assert_eq!(submission.status, SubmissionStatus::Accepted);
     assert_eq!(fake.last_add_args().len(), max_user_add_args + 3);
+}
+
+#[tokio::test]
+async fn first_excess_native_add_byte_is_rejected_before_direct_persistence() {
+    let accepted_harness = SubmitHarness::new();
+    let accepted_fake = FakePueue::new().with_add_task_id(73);
+    let accepted = native_add_byte_boundary_command(false);
+    assert!(submit::run_with(
+        &accepted_harness.db,
+        &accepted_harness.root,
+        &accepted,
+        &accepted_fake,
+    )
+    .await
+    .is_ok());
+
+    let rejected_harness = SubmitHarness::new();
+    let rejected_fake = FakePueue::new().with_add_task_id(73);
+    let rejected = native_add_byte_boundary_command(true);
+    assert!(submit::run_with(
+        &rejected_harness.db,
+        &rejected_harness.root,
+        &rejected,
+        &rejected_fake,
+    )
+    .await
+    .is_err());
+    assert!(SubmissionRepository::new(&rejected_harness.db)
+        .find_unreconciled("project-a")
+        .unwrap()
+        .is_empty());
+    assert!(rejected_fake.last_add_args().is_empty());
 }
 
 #[tokio::test]

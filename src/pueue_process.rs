@@ -42,7 +42,8 @@ pub(crate) fn validate_native_pueue_argv(argv: &[OsString]) -> Result<(), AppErr
         (OsString::from("TMP"), maximum_field.clone()),
         (OsString::from("TEMP"), maximum_field.clone()),
     ];
-    validate_pueue_frame(argv.to_vec(), environment, maximum_field)
+    let target_path = OsString::from(format!("/{}", "x".repeat(MAX_FIELD_SIZE - 1)));
+    validate_pueue_frame(argv.to_vec(), environment, target_path)
 }
 
 /// Check that the startup-pinned Pueue environment and executable path fit
