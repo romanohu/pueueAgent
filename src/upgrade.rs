@@ -95,8 +95,17 @@ pub fn resolve_pueue_config_with_service(
     service_definition: Option<&Path>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
+    if explicit.or(environment).or(service_definition).is_some() {
+        return resolve_pueue_config_path(
+            explicit,
+            environment,
+            service_definition,
+            Path::new("/"),
+        )
+        .ok();
+    }
     home.and_then(|home| {
-        resolve_pueue_config_path(explicit, environment, service_definition, home).ok()
+        resolve_pueue_config_path(None, None, None, home).ok()
     })
 }
 

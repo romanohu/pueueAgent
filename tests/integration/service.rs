@@ -14,7 +14,7 @@ use pueue_agent::{
     pueue::{PueueApi, PueueTask},
     service::{
         callback_command, enable_with, install_callback_once,
-        launchd_status_from_output, pueue_config_from_service_definition,
+        installed_pueue_config, launchd_status_from_output, pueue_config_from_service_definition,
         systemd_status_from_load_state_output, systemd_status_from_output, CallbackRegistry,
         EnableOptions, LaunchdAgent,
         resolve_pueue_config_path, PueueConfigCallbackRegistry, ServiceCommandOutput,
@@ -111,16 +111,17 @@ fn pueue_profile_resolution_uses_precedence_and_rejects_an_invalid_higher_value(
     let environment = PathBuf::from("/private/tmp/environment-pueue.yml");
     let installed = PathBuf::from("/private/tmp/installed-pueue.yml");
 
-    assert_eq!(
+    assert!(matches!(
         resolve_pueue_config_path(
             Some(&explicit),
             Some(&environment),
             Some(&installed),
             &home,
-        )
-        .unwrap(),
-        explicit
-    );
+        ),
+        Err(AppError::Configuration {
+            field: "pueue_config"
+        })
+    ));
     assert_eq!(
         resolve_pueue_config_path(None, None, Some(&installed), &home).unwrap(),
         installed
@@ -132,6 +133,26 @@ fn pueue_profile_resolution_uses_precedence_and_rejects_an_invalid_higher_value(
             Some(&installed),
             &home,
         ),
+        Err(AppError::Configuration {
+            field: "pueue_config"
+        })
+    ));
+}
+
+#[test]
+fn installed_profile_discovery_rejects_a_present_definition_without_a_config_argument() {
+    let temp = TempDir::new().unwrap();
+    let home = fs::canonicalize(temp.path()).unwrap();
+    let definition = if cfg!(target_os = "macos") {
+        home.join("Library/LaunchAgents/com.pueue-agent.plist")
+    } else {
+        home.join(".config/systemd/user/pueue-agent.service")
+    };
+    fs::create_dir_all(definition.parent().unwrap()).unwrap();
+    fs::write(definition, "configured service without a Pueue profile\n").unwrap();
+
+    assert!(matches!(
+        installed_pueue_config(&home),
         Err(AppError::Configuration {
             field: "pueue_config"
         })

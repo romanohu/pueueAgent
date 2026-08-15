@@ -102,6 +102,17 @@ fn pueue_config_resolution_prefers_explicit_env_and_default() {
 }
 
 #[test]
+fn pueue_config_resolution_does_not_require_home_for_an_explicit_profile() {
+    let explicit = PathBuf::from("/tmp/explicit-pueue.yml");
+    let from_env = PathBuf::from("/tmp/env-pueue.yml");
+
+    assert_eq!(
+        resolve_pueue_config(Some(&explicit), Some(&from_env), None),
+        Some(explicit)
+    );
+}
+
+#[test]
 fn pueue_config_resolution_uses_the_installed_service_before_the_default() {
     let service = PathBuf::from("/tmp/custom-pueue.yml");
     let home = PathBuf::from("/tmp/home");

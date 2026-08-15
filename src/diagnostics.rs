@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{cmp::Ordering, collections::BTreeMap, fs};
 
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
@@ -827,21 +827,31 @@ pub fn build_doctor_report_with_policy(
         MAX_PUEUE_OUTPUT_BYTES,
     );
     checks.push(doctor_ok("pueue.bounds", &pueue_bounds_summary, "none"));
-    checks.push(match policy {
-        Ok(_) => doctor_ok(
+    checks.push(match fs::symlink_metadata(&paths.pueue_config) {
+        Ok(metadata) if metadata.file_type().is_symlink() => doctor_error(
             "pueue.config",
-            "the configured Pueue profile is anchored",
+            "the configured lexical Pueue profile is a symlink",
+            "restore a regular Pueue profile at the configured lexical path",
+        ),
+        Ok(metadata) if metadata.is_file() => doctor_ok(
+            "pueue.config",
+            "the configured lexical Pueue profile is present",
             "none",
         ),
-        Err(violation) if violation.code == PolicyViolationCode::AnchorMissing => doctor_error(
+        Ok(_) => doctor_error(
             "pueue.config",
-            "the configured Pueue profile is missing or unsafe",
-            "restore the configured Pueue profile; doctor does not create or replace it",
+            "the configured lexical Pueue profile is not a regular file",
+            "restore a regular Pueue profile at the configured lexical path",
         ),
-        Err(_) => doctor_warning(
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => doctor_error(
             "pueue.config",
-            "the configured Pueue profile was not inspected because policy is unavailable",
-            "restore the immutable execution policy before inspecting the Pueue profile",
+            "the configured lexical Pueue profile is missing",
+            "restore the configured Pueue profile; doctor does not create it",
+        ),
+        Err(_) => doctor_error(
+            "pueue.config",
+            "the configured lexical Pueue profile is unavailable",
+            "restore the configured Pueue profile; doctor does not replace it",
         ),
     });
     checks.extend(execution_doctor_checks(db, project, policy));

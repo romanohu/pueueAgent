@@ -734,6 +734,8 @@ use pueue_agent::{
         AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewIncident, NewProject, NewSubmission,
         NewTaskObservation,
     },
+    execution_policy::StartupEnvironment,
+    service::{ServiceDefinition, ServicePaths},
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1115,6 +1117,10 @@ struct CustomPueueProfileHarness {
     _temp: TempDir,
     root: PathBuf,
     policy_paths: CliPolicyPaths,
+    custom_config: PathBuf,
+    conflicting_config: PathBuf,
+    pueue_calls: PathBuf,
+    service_definition: PathBuf,
 }
 
 impl CustomPueueProfileHarness {
@@ -1140,14 +1146,21 @@ impl CustomPueueProfileHarness {
         let trusted_dir = temp.path().join("trusted-bin");
         fs::create_dir_all(&trusted_dir).unwrap();
         let pueue = trusted_dir.join("pueue");
+        let pueue_calls = temp.path().join("pueue-calls");
         let source = temp.path().join("custom-profile-pueue.rs");
         fs::write(
             &source,
-            r#"fn main() {
-    if std::env::args_os().any(|argument| argument == "add") {
+            format!(r#"use std::{{fs::OpenOptions, io::Write}};
+fn main() {{
+    let args = std::env::args().collect::<Vec<_>>();
+    writeln!(OpenOptions::new().create(true).append(true).open({:?}).unwrap(), "{{}}", args.get(1).map(String::as_str).unwrap_or("")) .unwrap();
+    if args.iter().any(|argument| argument == "add") {{
         println!("701");
-    }
-}"#,
+    }}
+    if args.iter().any(|argument| argument == "status") {{
+        println!("[]");
+    }}
+}}"#, pueue_calls),
         )
         .unwrap();
         let output = Command::new("rustc")
@@ -1162,11 +1175,26 @@ impl CustomPueueProfileHarness {
             String::from_utf8_lossy(&output.stderr)
         );
         make_executable(&pueue);
+        let service_command = if cfg!(target_os = "macos") {
+            trusted_dir.join("launchctl")
+        } else {
+            trusted_dir.join("systemctl")
+        };
+        let service_script = if cfg!(target_os = "macos") {
+            "#!/bin/sh\necho 'state = running'\n"
+        } else {
+            "#!/bin/sh\ncase \"$*\" in\n  *LoadState*) echo loaded ;;\n  *ActiveState*) echo active ;;\nesac\n"
+        };
+        fs::write(&service_command, service_script).unwrap();
+        make_executable(&service_command);
         let policy_paths = install_cli_policy(temp.path(), &state_dir, &trusted_dir, &pueue);
 
         let custom_config = temp.path().join("custom/pueue.yml");
+        let conflicting_config = temp.path().join("conflicting/pueue.yml");
         fs::create_dir_all(custom_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(conflicting_config.parent().unwrap()).unwrap();
         fs::write(&custom_config, "fixture: custom\n").unwrap();
+        fs::write(&conflicting_config, "fixture: conflicting\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1176,6 +1204,12 @@ impl CustomPueueProfileHarness {
             )
             .unwrap();
             fs::set_permissions(&custom_config, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(
+                conflicting_config.parent().unwrap(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&conflicting_config, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let definition = if cfg!(target_os = "macos") {
             policy_paths
@@ -1187,20 +1221,33 @@ impl CustomPueueProfileHarness {
                 .join(".config/systemd/user/pueue-agent.service")
         };
         fs::create_dir_all(definition.parent().unwrap()).unwrap();
-        fs::write(
-            definition,
-            format!(
-                "<string>pueue-agent</string>\n<string>daemon</string>\n<string>--pueue-config</string>\n<string>{}</string>\n",
-                custom_config.display()
-            ),
-        )
-        .unwrap();
+        let service_paths = ServicePaths {
+            release_binary: PathBuf::from("/usr/bin/pueue-agent"),
+            pueue_config: custom_config,
+            state_dir: policy_paths.state_dir.clone(),
+            execution_policy: policy_paths.state_dir.join("execution-policy.toml"),
+            working_dir: root.clone(),
+            home: policy_paths.home.clone(),
+            codex_home: policy_paths.codex_home.clone(),
+            path_env: policy_paths.trusted_dir.display().to_string(),
+            startup_environment: StartupEnvironment::default(),
+        };
+        let rendered = if cfg!(target_os = "macos") {
+            ServiceDefinition::launchd(&service_paths).render()
+        } else {
+            ServiceDefinition::systemd(&service_paths).render()
+        };
+        fs::write(definition, rendered).unwrap();
         fs::remove_file(policy_paths.home.join(".config/pueue/pueue.yml")).unwrap();
 
         Self {
             _temp: temp,
             root,
             policy_paths,
+            custom_config,
+            conflicting_config,
+            pueue_calls,
+            service_definition: definition,
         }
     }
 
@@ -1210,7 +1257,10 @@ impl CustomPueueProfileHarness {
             .env("PUEUE_AGENT_STATE_DIR", &self.policy_paths.state_dir)
             .env("HOME", &self.policy_paths.home)
             .env("CODEX_HOME", &self.policy_paths.codex_home)
-            .env("PATH", &self.policy_paths.trusted_dir)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.policy_paths.trusted_dir.display()),
+            )
             .current_dir(&self.root);
         command
     }
@@ -1347,6 +1397,21 @@ fn submit_batch_cli_help_lists_request_manifest_group_and_json_options() {
 fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_repeated_flag() {
     let harness = CustomPueueProfileHarness::new();
 
+    let enable = harness
+        .command()
+        .args(["enable", harness.root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        enable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fs::read(&harness.service_definition).unwrap())
+            .contains(harness.custom_config.to_str().unwrap())
+    );
+
     let output = harness
         .command()
         .args(["submit", "--", "/usr/bin/true"])
@@ -1357,6 +1422,94 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = harness.root.join("jobs.json");
+    fs::write(
+        &manifest,
+        r#"{"jobs":[{"id":"custom-profile-batch","argv":["/usr/bin/true"]}]}"#,
+    )
+    .unwrap();
+    for arguments in [
+        vec!["submit-batch", "--request-id", BATCH_REQUEST_ID, "--manifest", manifest.to_str().unwrap()],
+        vec!["status", "--json"],
+        vec!["doctor", "--json"],
+    ] {
+        let output = harness.command().args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let calls = fs::read_to_string(&harness.pueue_calls).unwrap();
+    assert!(calls.lines().any(|operation| operation == "group"));
+    assert!(calls.lines().filter(|operation| *operation == "add").count() >= 2);
+    assert!(calls.lines().filter(|operation| *operation == "status").count() >= 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn conflicting_explicit_profile_fails_before_pueue_database_callback_or_service_mutation() {
+    let harness = CustomPueueProfileHarness::new();
+    let config_before = fs::read(&harness.custom_config).unwrap();
+    let definition_before = fs::read(&harness.service_definition).unwrap();
+    let database_before = fs::read(
+        harness
+            .policy_paths
+            .state_dir
+            .join("state.sqlite3"),
+    )
+    .unwrap();
+
+    let output = harness
+        .command()
+        .args([
+            "enable",
+            "--pueue-config",
+            harness.conflicting_config.to_str().unwrap(),
+            harness.root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!harness.pueue_calls.exists());
+    assert_eq!(fs::read(&harness.custom_config).unwrap(), config_before);
+    assert_eq!(fs::read(&harness.service_definition).unwrap(), definition_before);
+    assert_eq!(
+        fs::read(harness.policy_paths.state_dir.join("state.sqlite3")).unwrap(),
+        database_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn conflicting_environment_profile_fails_before_pueue_database_callback_or_service_mutation() {
+    let harness = CustomPueueProfileHarness::new();
+    let config_before = fs::read(&harness.custom_config).unwrap();
+    let definition_before = fs::read(&harness.service_definition).unwrap();
+    let database_before = fs::read(
+        harness
+            .policy_paths
+            .state_dir
+            .join("state.sqlite3"),
+    )
+    .unwrap();
+
+    let output = harness
+        .command()
+        .env("PUEUE_CONFIG", &harness.conflicting_config)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!harness.pueue_calls.exists());
+    assert_eq!(fs::read(&harness.custom_config).unwrap(), config_before);
+    assert_eq!(fs::read(&harness.service_definition).unwrap(), definition_before);
+    assert_eq!(
+        fs::read(harness.policy_paths.state_dir.join("state.sqlite3")).unwrap(),
+        database_before
     );
 }
 

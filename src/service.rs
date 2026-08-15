@@ -52,7 +52,7 @@ impl ServicePaths {
             source,
         })?;
         let environment_pueue_config = env::var_os("PUEUE_CONFIG").map(PathBuf::from);
-        let installed_service_pueue_config = installed_pueue_config(&home);
+        let installed_service_pueue_config = installed_pueue_config(&home)?;
         let pueue_config = resolve_pueue_config_path(
             pueue_config.as_deref(),
             environment_pueue_config.as_deref(),
@@ -133,6 +133,13 @@ pub fn resolve_pueue_config_path(
         .or(installed)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".config/pueue/pueue.yml"));
+    if let Some(installed) = installed {
+        if explicit.or(environment).is_some_and(|selected| selected != installed) {
+            return Err(AppError::Configuration {
+                field: "pueue_config",
+            });
+        }
+    }
     validate_lexical_absolute_path("pueue_config", &selected)?;
     Ok(selected)
 }
@@ -542,7 +549,7 @@ pub fn pueue_config_from_service_definition(
     }
 }
 
-pub fn installed_pueue_config(home: &Path) -> Option<PathBuf> {
+pub fn installed_pueue_config(home: &Path) -> Result<Option<PathBuf>, AppError> {
     let (platform, definition_path) = if cfg!(target_os = "macos") {
         (
             ServicePlatform::Launchd,
@@ -554,8 +561,21 @@ pub fn installed_pueue_config(home: &Path) -> Option<PathBuf> {
             home.join(".config/systemd/user/pueue-agent.service"),
         )
     };
-    let contents = fs::read_to_string(definition_path).ok()?;
+    let contents = match fs::read_to_string(&definition_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(AppError::Io {
+                operation: "read installed service definition",
+                source,
+            })
+        }
+    };
     pueue_config_from_service_definition(platform, &contents)
+        .map(Some)
+        .ok_or(AppError::Configuration {
+            field: "pueue_config",
+        })
 }
 
 pub fn install_callback_once(
