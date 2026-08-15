@@ -1577,7 +1577,7 @@ fn main() {{
         };
         fs::create_dir_all(definition.parent().unwrap()).unwrap();
         let service_paths = ServicePaths {
-            release_binary: PathBuf::from("/usr/bin/pueue-agent"),
+            release_binary: PathBuf::from(env!("CARGO_BIN_EXE_pueue-agent")),
             pueue_config: custom_config.clone(),
             state_dir: policy_paths.state_dir.clone(),
             execution_policy: policy_paths.state_dir.join("execution-policy.toml"),
