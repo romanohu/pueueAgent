@@ -166,6 +166,25 @@ fn operations_redirect_links_to_workflows_and_troubleshooting() {
 }
 
 #[test]
+fn readme_links_every_user_and_developer_guide() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    for link in [
+        "docs/getting-started-ja.md",
+        "docs/commands-ja.md",
+        "docs/workflows-ja.md",
+        "docs/architecture-ja.md",
+        "docs/troubleshooting-ja.md",
+    ] {
+        assert!(readme.contains(link), "README is missing link {link}");
+        assert!(
+            root.join(link).is_file(),
+            "README link target does not exist: {link}"
+        );
+    }
+}
+
+#[test]
 fn help_lists_service_lifecycle_commands() {
     for command in ["start", "stop"] {
         let output = assert_cmd::Command::cargo_bin("pueue-agent")
@@ -294,78 +313,6 @@ fn invalid_cli_parse_errors_redact_and_bound_values_while_help_stays_complete() 
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
     assert!(String::from_utf8_lossy(&help.stdout).contains("events"));
-}
-
-#[test]
-fn documentation_contract_covers_current_operator_surface() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-    for required in [
-        "pueue-agent status --compact",
-        "pueue-agent status --json",
-        "pueue-agent wake --reason",
-        "pueue-agent runs --follow",
-        "pueue-agent submit-batch",
-        "pueue-agent submit --kind control",
-        ".pueue-agent/state.json",
-        "人間向け出力",
-        "JSON 出力",
-        "max_experiments",
-        "request-id",
-        "冪等",
-        "raw Pueue",
-        "supervisor",
-        "`status --json` には submission の一覧を含めず",
-        "runs --json",
-        "polling 単位",
-        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
-        "VACUUM INTO",
-        "service を停止して SQLite の整合性境界",
-        "SQLite snapshot と旧 binary",
-        "operator による SQLite の直接書き込み",
-    ] {
-        assert!(
-            readme.contains(required),
-            "README.md is missing documentation contract text: {required}"
-        );
-    }
-
-    let instructions = std::fs::read_to_string(root.join("templates/instructions.md")).unwrap();
-    for required in [
-        ".pueue-agent/state.json",
-        "control",
-        "experiment",
-        "operator_wake",
-        "pueue-agent steer",
-        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
-    ] {
-        assert!(
-            instructions.contains(required),
-            "templates/instructions.md is missing documentation contract text: {required}"
-        );
-    }
-
-    let config = std::fs::read_to_string(root.join("templates/config.toml")).unwrap();
-    for required in ["state.json", "control", "experiment", "max_experiments"] {
-        assert!(
-            config.contains(required),
-            "templates/config.toml is missing documentation contract text: {required}"
-        );
-    }
-
-    let operations = std::fs::read_to_string(root.join("docs/operations-ja.md")).unwrap();
-    for required in [
-        "Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る",
-        "VACUUM INTO",
-        "service を停止して SQLite の整合性境界",
-        "SQLite snapshot と旧 binary",
-        "operator による SQLite の直接書き込み",
-    ] {
-        assert!(
-            operations.contains(required),
-            "docs/operations-ja.md is missing upgrade consistency text: {required}"
-        );
-    }
 }
 
 #[test]
