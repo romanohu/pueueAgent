@@ -1443,7 +1443,7 @@ fn status_human_bounds_and_redacts_task_state() {
 }
 
 #[test]
-fn status_human_bounds_and_redacts_project_root_path() {
+fn status_human_bounds_and_preserves_typed_project_root_path() {
     let harness = OperatorHarness::new();
     let mut project = harness.project();
     project.root_path = std::path::PathBuf::from(format!(
@@ -1464,7 +1464,7 @@ fn status_human_bounds_and_redacts_project_root_path() {
         .find(|line| line.starts_with("root: "))
         .unwrap();
     assert!(root_line.len() <= "root: ".len() + 243);
-    assert!(root_line.contains("[path]"));
+    assert!(root_line.starts_with("root: /tmp/"));
     assert!(!root_line.contains("AWS_SECRET_ACCESS_KEY"));
     assert!(!root_line.contains("AKIA_ROOT_SECRET"));
 }
@@ -1516,7 +1516,8 @@ fn status_text_output_has_stable_active_project_projection() {
     assert_eq!(
         output,
         format!(
-            "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: [path]\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 claimed=0 retry_wait=0 in_flight=0 dispatched=0 failed=0 dead_letter=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
+            "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 claimed=0 retry_wait=0 in_flight=0 dispatched=0 failed=0 dead_letter=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
+            project.root_path.display(),
         )
     );
 }

@@ -6,7 +6,10 @@ use crate::{
     config,
     db::{inferred_pre_binding_policy_code, AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
     models::{Event, Project},
-    output::{bounded_execution_path, bounded_redacted_text, format_state, human_header, human_summary, render_id},
+    output::{
+        bounded_execution_path, bounded_redacted_text, bounded_typed_text, format_state,
+        human_header, human_summary, render_id,
+    },
     pueue::PueueTask,
     service::ServiceStatus,
     AppError,
@@ -51,9 +54,10 @@ pub fn render_project_status(
     ));
     lines.push(project_lifecycle_line(project));
     let root_path = project.root_path.to_string_lossy();
+    let root_path = bounded_execution_path(&root_path).unwrap_or_else(|| "[invalid]".to_owned());
     lines.push(format!(
         "root: {}",
-        bounded_execution_path(&root_path).unwrap_or_else(|| "[invalid]".to_owned())
+        bounded_typed_text(&root_path)
     ));
     lines.push(format!(
         "group: {}",
