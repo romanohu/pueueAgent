@@ -12,7 +12,8 @@ use std::{
 use pueue_agent::{
     environment::{PrivateRunTemp, SanitizedEnvironment},
     execution_policy::{
-        ExecutableAnchor, PolicyViolationCode, PolicyViolationStage, ProjectRootAnchor,
+        AgentKind, ExecutableAnchor, NetworkMode, PolicyViolationCode, PolicyViolationStage,
+        ProjectRootAnchor, ResolvedProjectExecutionPolicy, StartupEnvironment,
         VerifiedProjectRoot,
     },
     native_launcher::{NativeLaunchSpec, NativeLauncher},
@@ -108,6 +109,27 @@ fn main() {
     }
 
     fn spec(&self) -> NativeLaunchSpec {
+        let policy = ResolvedProjectExecutionPolicy {
+            project_id: "native-agent-gate".to_owned(),
+            root_anchor: self.root.anchor.clone(),
+            agent_anchor: self.target.clone(),
+            agent_kind: AgentKind::Custom,
+            network: NetworkMode::Disabled,
+            agent_environment_allow: Default::default(),
+            task_environment_allow: Default::default(),
+            codex_home: self.path("codex-home"),
+            trusted_path: Vec::new(),
+            private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
+        };
+        let environment = SanitizedEnvironment::for_custom_agent(
+            &StartupEnvironment::from_pairs(std::iter::empty::<(&str, &str)>()),
+            &policy,
+            1,
+        )
+        .expect("sanitized agent environment");
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(environment.get(name), Some(std::ffi::OsStr::new("/dev/fd/11")));
+        }
         NativeLaunchSpec {
             launcher: self.launcher.clone(),
             executable: self.target.clone(),
@@ -116,9 +138,8 @@ fn main() {
                 self.path("target-started").into_os_string(),
             ],
             cwd: Some(self.root.anchor.canonical_path.clone()),
-            environment: SanitizedEnvironment::default(),
+            environment,
             project_root: self.root.try_clone().expect("clone verified root"),
-            private_temp: self.private_temp.verified_target().expect("verified private temp"),
             relative_log_path: PathBuf::from(LOG),
             relative_marker_path: PathBuf::from(MARKER),
         }
@@ -134,7 +155,8 @@ async fn private_temp_path_replacement_cannot_redirect_target_writes() {
     let harness = Harness::new();
     let mut spec = harness.spec();
     spec.argv.push(OsString::from("write-temp"));
-    let mut child = NativeLauncher::spawn(spec).expect("spawn blocked temp writer");
+    let mut child = NativeLauncher::spawn(spec, &harness.private_temp)
+        .expect("spawn blocked temp writer");
 
     let replacement_path = harness.private_temp.path().to_path_buf();
     let old_generation = harness.path("retired-private-temp");
@@ -175,7 +197,8 @@ async fn assert_pre_marker_authorization_failure(
 #[tokio::test]
 async fn durable_marker_precedes_release_and_agent_output_uses_verified_log() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!harness.path("target-started").exists());
@@ -212,7 +235,7 @@ async fn existing_marker_rejects_before_target_creation() {
     ensure_agent_log_dir(&reader).expect("agent log directory");
     create_gate_marker(&reader, Path::new(MARKER)).expect("pre-existing marker");
 
-    let error = match NativeLauncher::spawn(harness.spec()) {
+    let error = match NativeLauncher::spawn(harness.spec(), &harness.private_temp) {
         Ok(_) => panic!("existing marker unexpectedly allowed a child"),
         Err(error) => error,
     };
@@ -233,7 +256,8 @@ async fn existing_marker_rejects_before_target_creation() {
 #[tokio::test]
 async fn published_marker_then_directory_swap_is_post_marker_and_reaps() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
     let reader = harness.reader();
     create_gate_marker(&reader, Path::new(MARKER)).expect("publish marker in bound generation");
     let current = harness.path(".pueue-agent/logs");
@@ -274,7 +298,7 @@ async fn unsafe_log_symlink_rejects_before_target_creation() {
     fs::write(harness.path("outside.log"), b"sentinel").expect("outside sentinel");
     symlink(harness.path("outside.log"), harness.path(LOG)).expect("unsafe log symlink");
 
-    assert!(NativeLauncher::spawn(harness.spec()).is_err());
+    assert!(NativeLauncher::spawn(harness.spec(), &harness.private_temp).is_err());
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!harness.path("target-started").exists());
     assert!(!harness.path(MARKER).exists());
@@ -289,7 +313,8 @@ async fn duplicate_authorization_terminates_the_running_group() {
     let harness = Harness::new();
     let mut spec = harness.spec();
     spec.argv.push(OsString::from("hold"));
-    let mut child = NativeLauncher::spawn(spec).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(spec, &harness.private_temp)
+        .expect("spawn blocked agent");
     child.authorize_marker().await.expect("first authorization");
 
     assert!(child.authorize_marker().await.is_err());
@@ -306,7 +331,8 @@ async fn duplicate_authorization_terminates_the_running_group() {
 #[tokio::test]
 async fn target_replacement_after_spawn_fails_before_marker_and_reaps() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
     let retired = harness.path("retired-target");
     fs::rename(&harness.target.canonical_path, &retired).expect("retire target inode");
     fs::copy(&retired, &harness.target.canonical_path).expect("replace target inode");
@@ -319,7 +345,8 @@ async fn target_replacement_after_spawn_fails_before_marker_and_reaps() {
 #[tokio::test]
 async fn log_replacement_after_spawn_fails_before_marker_and_reaps() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
     fs::rename(harness.path(LOG), harness.path("retired.log")).expect("retire opened log");
     fs::write(harness.path(LOG), b"replacement").expect("replace log inode");
     fs::set_permissions(harness.path(LOG), fs::Permissions::from_mode(0o600))
@@ -333,7 +360,8 @@ async fn log_replacement_after_spawn_fails_before_marker_and_reaps() {
 #[tokio::test]
 async fn log_directory_replacement_after_spawn_fails_before_marker_and_reaps() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
     let log_directory = harness.path(".pueue-agent/logs");
     let retired = harness.path(".pueue-agent/retired-logs");
     fs::rename(&log_directory, &retired).expect("retire log directory");
@@ -351,7 +379,8 @@ async fn log_directory_replacement_after_spawn_fails_before_marker_and_reaps() {
 #[tokio::test]
 async fn missing_log_directory_after_spawn_is_a_pre_marker_policy_failure() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
     let log_directory = harness.path(".pueue-agent/logs");
     let retired = harness.path(".pueue-agent/retired-logs");
     fs::rename(&log_directory, &retired).expect("retire log directory");
@@ -364,7 +393,8 @@ async fn missing_log_directory_after_spawn_is_a_pre_marker_policy_failure() {
 #[tokio::test]
 async fn project_root_replacement_after_spawn_fails_before_marker_and_reaps() {
     let harness = Harness::new();
-    let mut child = NativeLauncher::spawn(harness.spec()).expect("spawn blocked agent");
+    let mut child = NativeLauncher::spawn(harness.spec(), &harness.private_temp)
+        .expect("spawn blocked agent");
     let original = harness.temporary.path().to_path_buf();
     let retired = original.with_extension("retired-root");
     fs::rename(&original, &retired).expect("retire project root");

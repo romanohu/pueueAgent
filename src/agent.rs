@@ -460,7 +460,7 @@ impl AgentRunner {
         }
     }
 
-    pub fn command_for(
+    pub(crate) fn command_for(
         &self,
         policy: &ResolvedProjectExecutionPolicy,
         config: &AgentConfig,
@@ -478,7 +478,7 @@ impl AgentRunner {
         let args = match policy.agent_kind {
             AgentKind::BuiltInCodex => {
                 CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
-                    .build(config, prompt, private_tmp)
+                    .build_with_private_temp(config, prompt, private_tmp)
                     .map_err(AppError::from)?
                     .into_iter()
                     .map(|argument| {
@@ -655,17 +655,19 @@ impl AgentRunner {
         let mut argv = Vec::with_capacity(command.args.len() + 1);
         argv.push(OsString::from(&command.program));
         argv.extend(command.args.into_iter().map(OsString::from));
-        let mut child = NativeLauncher::spawn(NativeLaunchSpec {
-            launcher: self.policy.launcher_anchor.clone(),
-            executable: project_policy.agent_anchor.clone(),
-            argv,
-            cwd: Some(project_policy.root_anchor.canonical_path.clone()),
-            environment,
-            project_root: verified_root,
-            private_temp: private_temp_target,
-            relative_log_path,
-            relative_marker_path,
-        })
+        let mut child = NativeLauncher::spawn_verified(
+            NativeLaunchSpec {
+                launcher: self.policy.launcher_anchor.clone(),
+                executable: project_policy.agent_anchor.clone(),
+                argv,
+                cwd: Some(project_policy.root_anchor.canonical_path.clone()),
+                environment,
+                project_root: verified_root,
+                relative_log_path,
+                relative_marker_path,
+            },
+            private_temp_target,
+        )
         .map_err(|error| {
             resolve_native_spawn_failure(
                 &repository,

@@ -17,7 +17,7 @@ use pueue_agent::{
         PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor, ResolvedProjectExecutionPolicy,
         StartupEnvironment,
     },
-    environment::{PrivateRunTemp, SanitizedEnvironment, VerifiedPrivateTemp},
+    environment::{PrivateRunTemp, SanitizedEnvironment},
     models::AgentContextMode,
 };
 use tempfile::TempDir;
@@ -38,7 +38,7 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
 
     let argv = harness
         .builder()
-        .build(&config, "literal ; $(touch pwned)", &harness.private_tmp)
+        .build(&config, "literal ; $(touch pwned)")
         .unwrap();
     assert!(contains_pair(&argv, "--sandbox", "workspace-write"));
     assert!(contains_pair(&argv, "--ask-for-approval", "never"));
@@ -63,7 +63,7 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
     ] {
         let error = harness
             .builder()
-            .build(&config_with_args(args), "p", &harness.private_tmp)
+            .build(&config_with_args(args), "p")
             .unwrap_err();
         assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
     }
@@ -336,7 +336,7 @@ fn codex_shell_filters_always_have_a_nonsecret_baseline() {
     let mut policy = harness.builder().policy().clone();
     policy.task_environment_allow.clear();
     let argv = CodexArgvBuilder::new(policy, CodexCapabilities::all())
-        .build(&config_with_args(vec!["{prompt}"]), "p", &harness.private_tmp)
+        .build(&config_with_args(vec!["{prompt}"]), "p")
         .unwrap();
     let filters = argv
         .iter()
@@ -723,7 +723,7 @@ fn prompts_are_literal_after_separator_for_fresh_and_resume() {
     for prompt in prompts {
         let fresh = harness
             .builder()
-            .build(&config_with_args(vec!["exec", "{prompt}"]), prompt, &harness.private_tmp)
+            .build(&config_with_args(vec!["exec", "{prompt}"]), prompt)
             .unwrap();
         assert_prompt_after_separator(&fresh, prompt);
 
@@ -733,7 +733,7 @@ fn prompts_are_literal_after_separator_for_fresh_and_resume() {
         };
         let resumed = harness
             .builder()
-            .build(&resume_config, prompt, &harness.private_tmp)
+            .build(&resume_config, prompt)
             .unwrap();
         assert_prompt_after_separator(&resumed, prompt);
     }
@@ -752,17 +752,13 @@ fn missing_capability_fails_closed_and_auth_names_never_enter_filters() {
         harness.builder().policy().clone(),
         CodexCapabilities::none(),
     )
-    .build(
-        &config_with_args(vec!["{prompt}"]),
-        "p",
-        &harness.private_tmp,
-    )
+    .build(&config_with_args(vec!["{prompt}"]), "p")
     .unwrap_err();
     assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
 
     let argv = harness
         .builder()
-        .build(&config_with_args(vec!["{prompt}"]), "p", &harness.private_tmp)
+        .build(&config_with_args(vec!["{prompt}"]), "p")
         .unwrap();
     let filters = argv
         .iter()
@@ -919,7 +915,7 @@ fn private_tmp_uses_only_the_fixed_verified_descriptor_path() {
     let harness = Harness::new();
     let argv = harness
         .builder()
-        .build(&config_with_args(vec!["{prompt}"]), "p", &harness.private_tmp)
+        .build(&config_with_args(vec!["{prompt}"]), "p")
         .unwrap();
     let writable_root = argv
         .iter()
@@ -954,7 +950,7 @@ fn latest_chooses_verified_same_project_and_never_last_or_fresh() {
     };
     let argv = harness
         .builder()
-        .build(&config, "p", &harness.private_tmp)
+        .build(&config, "p")
         .unwrap();
     assert!(!argv.iter().any(|arg| arg == "--last"));
     assert!(argv.iter().any(|arg| arg == id.as_str()));
@@ -988,7 +984,6 @@ struct Harness {
     other: PathBuf,
     home: PathBuf,
     private_run_temp: PrivateRunTemp,
-    private_tmp: VerifiedPrivateTemp,
 }
 
 impl Harness {
@@ -1022,14 +1017,12 @@ impl Harness {
             .verify_identity()
             .unwrap();
         let private_run_temp = PrivateRunTemp::create(&verified_root, 1).unwrap();
-        let private_tmp = private_run_temp.verified_target().unwrap();
         Self {
             _temp: temp,
             root,
             other,
             home,
             private_run_temp,
-            private_tmp,
         }
     }
 

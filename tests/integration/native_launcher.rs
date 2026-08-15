@@ -16,7 +16,8 @@ mod unix {
         environment::{PrivateRunTemp, SanitizedEnvironment},
         execution_policy::{ExecutableAnchor, ExecutableIdentity, PueueConfigAnchor},
         process::{
-            spawn_validated_helper, spawn_verified_agent_command, spawn_verified_command, BootstrapError, ControlFrame,
+            spawn_validated_helper, spawn_verified_command, spawn_verified_command_in_private_temp,
+            BootstrapError, ControlFrame,
             LaunchFlags, LaunchMode, ProcessGroupRequirement, ProcessLaunchError,
             VerifiedChildIo, VerifiedCommandSpec, terminate_process_group,
         },
@@ -551,9 +552,7 @@ fn main() {
         let started = temporary.path().join("target-started");
         let verified_root = root_anchor.verify_identity().unwrap();
         let private_temp = PrivateRunTemp::create(&verified_root, 1).unwrap();
-        let private_temp_target = private_temp.verified_target().unwrap();
-
-        let mut child = spawn_verified_agent_command(VerifiedCommandSpec {
+        let mut child = spawn_verified_command_in_private_temp(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
@@ -567,7 +566,7 @@ fn main() {
             project_root: Some(verified_root),
             pueue_config: None,
             child_io: VerifiedChildIo::Capture,
-        }, private_temp_target)
+        }, &private_temp)
         .unwrap();
 
         assert!(!started.exists(), "target executed before release");
@@ -592,8 +591,7 @@ fn main() {
 
         let verified_root = root_anchor.verify_identity().unwrap();
         let private_temp = PrivateRunTemp::create(&verified_root, 2).unwrap();
-        let private_temp_target = private_temp.verified_target().unwrap();
-        let mut child = spawn_verified_agent_command(VerifiedCommandSpec {
+        let mut child = spawn_verified_command_in_private_temp(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
@@ -607,7 +605,7 @@ fn main() {
             project_root: Some(verified_root),
             pueue_config: None,
             child_io: VerifiedChildIo::Capture,
-        }, private_temp_target)
+        }, &private_temp)
         .unwrap();
 
         child.release().unwrap();
@@ -679,8 +677,7 @@ fn main() {
         let pid_path = temporary.path().join("descendant.pid");
         let verified_root = root_anchor.verify_identity().unwrap();
         let private_temp = PrivateRunTemp::create(&verified_root, 3).unwrap();
-        let private_temp_target = private_temp.verified_target().unwrap();
-        let mut child = spawn_verified_agent_command(VerifiedCommandSpec {
+        let mut child = spawn_verified_command_in_private_temp(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
@@ -695,7 +692,7 @@ fn main() {
             project_root: Some(verified_root),
             pueue_config: None,
             child_io: VerifiedChildIo::Capture,
-        }, private_temp_target)
+        }, &private_temp)
         .unwrap();
         child.release().unwrap();
         child.confirm_exec().await.unwrap();

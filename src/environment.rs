@@ -33,6 +33,10 @@ const MAX_RUN_ID_BYTES: usize = 20;
 pub const PRIVATE_TEMP_TARGET_FD: i32 = 11;
 const PRIVATE_TEMP_TARGET_PATH: &str = "/dev/fd/11";
 
+pub(crate) fn private_temp_target_path() -> &'static Path {
+    Path::new(PRIVATE_TEMP_TARGET_PATH)
+}
+
 pub const MAX_PRIVATE_TEMP_CLEANUP_DEPTH: usize = 32;
 pub const MAX_PRIVATE_TEMP_CLEANUP_ENTRIES: usize = 4096;
 pub const MAX_PRIVATE_TEMP_ALLOCATED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -564,7 +568,7 @@ pub struct PrivateRunTemp {
 /// temporary directory role. It has no raw-descriptor or path constructor.
 /// This capability proves only the directory itself; descriptor-relative
 /// descendant containment remains outside this launch ABI's scope.
-pub struct VerifiedPrivateTemp {
+pub(crate) struct VerifiedPrivateTemp {
     pub(crate) directory: File,
     pub(crate) identity: ExecutableIdentity,
     run_id: i64,
@@ -572,7 +576,7 @@ pub struct VerifiedPrivateTemp {
 
 impl VerifiedPrivateTemp {
     pub(crate) fn target_path(&self) -> &'static Path {
-        Path::new(PRIVATE_TEMP_TARGET_PATH)
+        private_temp_target_path()
     }
 }
 
@@ -796,7 +800,7 @@ impl PrivateRunTemp {
     }
 
     /// Clone and revalidate the retained directory capability for target use.
-    pub fn verified_target(&self) -> Result<VerifiedPrivateTemp, PolicyViolation> {
+    pub(crate) fn verified_target(&self) -> Result<VerifiedPrivateTemp, PolicyViolation> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Err(PolicyViolation::new(
@@ -806,20 +810,9 @@ impl PrivateRunTemp {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            use std::os::unix::fs::MetadataExt;
-
             let directory = self.directory.try_clone().map_err(|_| temp_error())?;
-            validate_private_directory(&directory)?;
             let metadata = directory.metadata().map_err(|_| temp_error())?;
-            let identity = ExecutableIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                owner: metadata.uid(),
-                mode: metadata.mode() & 0o7777,
-            };
-            if (identity.device, identity.inode) != self.identity {
-                return Err(temp_error());
-            }
+            let identity = verified_private_temp_identity(&metadata, self.identity)?;
             let run_id = self
                 .name
                 .to_str()
@@ -2351,11 +2344,34 @@ fn validate_private_directory_at(
     use std::os::unix::fs::MetadataExt;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() as u32 }
-        || metadata.mode() & 0o777 != 0o700
+        || metadata.mode() & 0o7777 != 0o700
     {
         return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn verified_private_temp_identity(
+    metadata: &std::fs::Metadata,
+    expected: (u64, u64),
+) -> Result<ExecutableIdentity, PolicyViolation> {
+    use std::os::unix::fs::MetadataExt;
+
+    let identity = ExecutableIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+    };
+    if !metadata.is_dir()
+        || identity.owner != unsafe { libc::geteuid() as u32 }
+        || identity.mode != 0o700
+        || (identity.device, identity.inode) != expected
+    {
+        return Err(temp_error());
+    }
+    Ok(identity)
 }
 
 #[cfg(unix)]
@@ -2690,6 +2706,31 @@ mod tests {
         let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFD) };
         unsafe { libc::close(duplicate) };
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn verified_target_rejects_private_directory_special_bits() {
+        let (_holder, temp) = test_temp(702);
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o1700)).unwrap();
+
+        let error = temp.verified_target().unwrap_err();
+
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+    }
+
+    #[test]
+    fn verified_private_temp_identity_uses_one_validated_metadata_snapshot() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_holder, temp) = test_temp(703);
+        let metadata = temp.directory.metadata().unwrap();
+
+        let identity = verified_private_temp_identity(&metadata, temp.identity).unwrap();
+
+        assert_eq!(identity.device, metadata.dev());
+        assert_eq!(identity.inode, metadata.ino());
+        assert_eq!(identity.owner, metadata.uid());
+        assert_eq!(identity.mode, metadata.mode() & 0o7777);
     }
 
     #[test]

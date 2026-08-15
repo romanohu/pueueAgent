@@ -21,7 +21,7 @@ use crate::execution_policy::ExecutableIdentity;
 
 #[cfg(unix)]
 use crate::{
-    environment::{SanitizedEnvironment, VerifiedPrivateTemp},
+    environment::{PrivateRunTemp, SanitizedEnvironment, VerifiedPrivateTemp},
     execution_policy::{
         ExecutableAnchor, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
         VerifiedProjectRoot, VerifiedPueueConfig,
@@ -1978,7 +1978,15 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
 }
 
 #[cfg(unix)]
-pub fn spawn_verified_agent_command(
+pub fn spawn_verified_command_in_private_temp(
+    spec: VerifiedCommandSpec,
+    private_temp: &PrivateRunTemp,
+) -> Result<VerifiedChild, AppError> {
+    spawn_verified_agent_command(spec, private_temp.verified_target()?)
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_verified_agent_command(
     spec: VerifiedCommandSpec,
     private_temp: VerifiedPrivateTemp,
 ) -> Result<VerifiedChild, AppError> {

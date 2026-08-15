@@ -8,7 +8,7 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use crate::{
-    environment::{SanitizedEnvironment, VerifiedPrivateTemp},
+    environment::{PrivateRunTemp, SanitizedEnvironment, VerifiedPrivateTemp},
     execution_policy::{
         ExecutableAnchor, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
         VerifiedProjectRoot,
@@ -35,7 +35,6 @@ pub struct NativeLaunchSpec {
     pub cwd: Option<PathBuf>,
     pub environment: SanitizedEnvironment,
     pub project_root: VerifiedProjectRoot,
-    pub private_temp: VerifiedPrivateTemp,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
 }
@@ -50,7 +49,6 @@ pub struct NativeLaunchSpec {
     pub cwd: Option<PathBuf>,
     pub environment: SanitizedEnvironment,
     pub project_root: VerifiedProjectRoot,
-    pub private_temp: VerifiedPrivateTemp,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
 }
@@ -69,7 +67,18 @@ impl NativeLauncher {
     /// [`NativeAgentChild::authorize_marker`] after all run admission work has
     /// succeeded.
     #[cfg(unix)]
-    pub fn spawn(spec: NativeLaunchSpec) -> Result<NativeAgentChild, AppError> {
+    pub fn spawn(
+        spec: NativeLaunchSpec,
+        private_temp: &PrivateRunTemp,
+    ) -> Result<NativeAgentChild, AppError> {
+        Self::spawn_verified(spec, private_temp.verified_target()?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn spawn_verified(
+        spec: NativeLaunchSpec,
+        private_temp: VerifiedPrivateTemp,
+    ) -> Result<NativeAgentChild, AppError> {
         let command_root = spec.project_root.try_clone()?;
         let reader = ProjectRootLogReader::from_verified(spec.project_root);
 
@@ -110,7 +119,7 @@ impl NativeLauncher {
                     identity,
                 },
             },
-            spec.private_temp,
+            private_temp,
         )?;
 
         Ok(NativeAgentChild {
@@ -129,7 +138,22 @@ impl NativeLauncher {
     }
 
     #[cfg(not(unix))]
-    pub fn spawn(_spec: NativeLaunchSpec) -> Result<NativeAgentChild, AppError> {
+    pub fn spawn(
+        _spec: NativeLaunchSpec,
+        _private_temp: &PrivateRunTemp,
+    ) -> Result<NativeAgentChild, AppError> {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::NativeGate,
+        )
+        .into())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn spawn_verified(
+        _spec: NativeLaunchSpec,
+        _private_temp: VerifiedPrivateTemp,
+    ) -> Result<NativeAgentChild, AppError> {
         Err(PolicyViolation::new(
             PolicyViolationCode::UnsupportedPlatform,
             PolicyViolationStage::NativeGate,

@@ -15,7 +15,8 @@ use crate::{
     codex_session,
     config::AgentConfig,
     environment::{
-        is_auth_name, is_proxy_or_cert_name, shell_baseline_names, VerifiedPrivateTemp,
+        is_auth_name, is_proxy_or_cert_name, private_temp_target_path, shell_baseline_names,
+        VerifiedPrivateTemp,
     },
     execution_policy::{
         AgentKind, NetworkMode, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
@@ -97,12 +98,29 @@ impl CodexArgvBuilder {
         &self,
         config: &AgentConfig,
         prompt: &str,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_for_private_temp_path(config, prompt, private_temp_target_path())
+    }
+
+    pub(crate) fn build_with_private_temp(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
         private_tmp: &VerifiedPrivateTemp,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_for_private_temp_path(config, prompt, private_tmp.target_path())
+    }
+
+    fn build_for_private_temp_path(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &Path,
     ) -> Result<Vec<OsString>, PolicyViolation> {
         self.preflight(config, prompt)?;
 
         let root = path_text(&self.policy.root_anchor.canonical_path)?;
-        let private_tmp = path_text(private_tmp.target_path())?;
+        let private_tmp = path_text(private_tmp)?;
         let mut argv = vec![
             OsString::from("--ask-for-approval"),
             OsString::from("never"),
