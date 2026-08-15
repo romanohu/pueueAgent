@@ -552,7 +552,7 @@ mod commands {
                 source,
             })
             .map_err(upgrade_diagnostic_error)?;
-        let service_paths = ServicePaths::from_environment(&working_dir, args.pueue_config)
+        let service_paths = ServicePaths::from_environment(&working_dir, args.pueue_config.clone())
             .map_err(upgrade_diagnostic_error)?;
         let project_roots = registered_roots_if_present(&state_db)
             .map_err(upgrade_diagnostic_error)?;
