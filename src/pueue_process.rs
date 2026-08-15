@@ -211,7 +211,7 @@ impl PueueProcessRunner {
             child_io: VerifiedChildIo::Capture,
         }, deadline).await {
             Ok(child) => child,
-            Err(error) => return Err(map_operation_error(operation, error)),
+            Err(error) => return Err(map_spawn_before_error(operation, error)),
         };
 
         if let Err(error) = verified.release_before(deadline) {
@@ -519,10 +519,35 @@ fn map_operation_error(operation: &'static str, error: AppError) -> AppError {
     }
 }
 
+#[cfg(unix)]
+fn map_spawn_before_error(
+    operation: &'static str,
+    error: crate::process::SpawnVerifiedCommandBeforeError,
+) -> AppError {
+    match error {
+        crate::process::SpawnVerifiedCommandBeforeError::Launch(error) => {
+            map_operation_error(operation, error)
+        }
+        crate::process::SpawnVerifiedCommandBeforeError::Cleanup(error) => {
+            AppError::Pueue(PueueError::Cleanup {
+                operation,
+                stage: cleanup_stage(&error),
+            })
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{cleanup_stage, read_bounded, BoundedOutput, ReadFailure};
-    use crate::AppError;
+    use super::{
+        cleanup_stage, map_spawn_before_error, read_bounded, BoundedOutput,
+        ReadFailure,
+    };
+    use crate::{
+        process::SpawnVerifiedCommandBeforeError,
+        pueue::PueueError,
+        AppError,
+    };
     use std::{os::unix::process::ExitStatusExt, time::{Duration, Instant}};
     use tokio::io::AsyncWriteExt;
 
@@ -583,5 +608,24 @@ mod tests {
         assert_eq!(cleanup_stage(&reap_timeout), "reap");
         assert_eq!(cleanup_stage(&terminate), "terminate");
         assert_eq!(cleanup_stage(&unrelated_runtime), "terminate");
+    }
+
+    #[test]
+    fn spawn_cleanup_failure_keeps_the_pueue_cleanup_classification() {
+        let cleanup = AppError::Io {
+            operation: "signal verified process group",
+            source: std::io::Error::other("fixture"),
+        };
+
+        assert!(matches!(
+            map_spawn_before_error(
+                "status",
+                SpawnVerifiedCommandBeforeError::Cleanup(cleanup)
+            ),
+            AppError::Pueue(PueueError::Cleanup {
+                operation: "status",
+                stage: "terminate"
+            })
+        ));
     }
 }

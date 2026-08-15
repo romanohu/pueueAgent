@@ -1898,20 +1898,28 @@ pub fn spawn_verified_command(spec: VerifiedCommandSpec) -> Result<VerifiedChild
 /// Spawn a suspended verified target, bounding bootstrap and readiness by the
 /// caller-owned operation deadline.
 #[cfg(unix)]
-pub async fn spawn_verified_command_before(
+pub(crate) async fn spawn_verified_command_before(
     spec: VerifiedCommandSpec,
     deadline: Instant,
-) -> Result<VerifiedChild, AppError> {
+) -> Result<VerifiedChild, SpawnVerifiedCommandBeforeError> {
     match spawn_verified_command_with_deadlines(spec, Some(deadline), Some(deadline), true) {
         Ok(child) => Ok(child),
-        Err(SpawnVerifiedCommandFailure::BeforeStart(error)) => Err(error),
+        Err(SpawnVerifiedCommandFailure::BeforeStart(error)) => {
+            Err(SpawnVerifiedCommandBeforeError::Launch(error))
+        }
         Err(SpawnVerifiedCommandFailure::Started { mut child, error }) => {
             match terminate_process_group(&mut child).await {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(cleanup),
+                Ok(()) => Err(SpawnVerifiedCommandBeforeError::Launch(error)),
+                Err(cleanup) => Err(SpawnVerifiedCommandBeforeError::Cleanup(cleanup)),
             }
         }
     }
+}
+
+#[cfg(unix)]
+pub(crate) enum SpawnVerifiedCommandBeforeError {
+    Launch(AppError),
+    Cleanup(AppError),
 }
 
 #[cfg(unix)]
