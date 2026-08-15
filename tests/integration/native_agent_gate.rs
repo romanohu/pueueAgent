@@ -152,7 +152,7 @@ fn main() {
 
 #[tokio::test]
 async fn private_temp_path_replacement_cannot_redirect_target_writes() {
-    let harness = Harness::new();
+    let mut harness = Harness::new();
     let mut spec = harness.spec();
     spec.argv.push(OsString::from("write-temp"));
     let mut child = NativeLauncher::spawn(spec, &harness.private_temp)
@@ -164,11 +164,24 @@ async fn private_temp_path_replacement_cannot_redirect_target_writes() {
     fs::create_dir(&replacement_path).expect("create replacement private temp generation");
     fs::set_permissions(&replacement_path, fs::Permissions::from_mode(0o700))
         .expect("set replacement private temp permissions");
+    fs::write(replacement_path.join("replacement-sentinel"), b"keep")
+        .expect("write replacement sentinel");
 
     child.authorize_marker().await.expect("authorize target");
     assert!(child.wait().await.expect("wait for target").success());
     assert_eq!(fs::read(old_generation.join("target-write")).unwrap(), b"ok");
     assert!(!replacement_path.join("target-write").exists());
+
+    let cleanup = harness
+        .private_temp
+        .cleanup_contents_before(None)
+        .expect("clean retired private temp generation through retained descriptor");
+    assert_eq!(cleanup.entries_removed, 1);
+    assert!(!old_generation.join("target-write").exists());
+    assert_eq!(
+        fs::read(replacement_path.join("replacement-sentinel")).unwrap(),
+        b"keep"
+    );
 }
 
 async fn assert_pre_marker_authorization_failure(
