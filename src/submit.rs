@@ -177,7 +177,14 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     if options.kind == SubmissionKind::Experiment {
         let objective = state::load_objective(&root)?;
         return CampaignCoordinator::new(db, pueue, *limits)
-            .start_baseline(&registered, &objective, &argv, created_at)
+            .start_baseline(
+                &registered,
+                &objective,
+                &argv,
+                &options.metadata,
+                options.origin_agent_run_id,
+                created_at,
+            )
             .await;
     }
 

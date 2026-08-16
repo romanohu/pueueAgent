@@ -203,6 +203,8 @@ impl Harness {
                     submission_id: "campaign-submission-baseline",
                     experiment_id: "campaign-experiment-baseline",
                     proposal_id: "campaign-proposal-baseline",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
                     now: 100,
                 },
                 &CampaignLimits::default(),

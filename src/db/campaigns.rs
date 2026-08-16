@@ -3,7 +3,7 @@ use rusqlite::{
     types::Type,
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
-use serde_json::json;
+use serde_json::{Map, Value};
 
 use crate::{
     execution_policy::CampaignLimits,
@@ -54,6 +54,8 @@ pub struct StartCampaignRequest<'a> {
     pub submission_id: &'a str,
     pub experiment_id: &'a str,
     pub proposal_id: &'a str,
+    pub metadata: &'a Value,
+    pub origin_agent_run_id: Option<i64>,
     pub now: i64,
 }
 
@@ -90,6 +92,7 @@ impl<'db> CampaignRepository<'db> {
             "serialize baseline expected evidence",
         )?;
         let metadata_json = serialize_submission_metadata(
+            Some(request.metadata),
             request.campaign_id,
             request.proposal_id,
             request.experiment_id,
@@ -149,6 +152,11 @@ impl<'db> CampaignRepository<'db> {
                 "the project already has a live campaign",
             ));
         }
+        validate_submission_origin_agent_run(
+            &transaction,
+            request.project_id,
+            request.origin_agent_run_id,
+        )?;
 
         transaction
             .execute(
@@ -184,6 +192,7 @@ impl<'db> CampaignRepository<'db> {
             request.project_id,
             &proposal_argv_json,
             &metadata_json,
+            request.origin_agent_run_id,
             request.now,
         )?;
         insert_experiment(
@@ -245,7 +254,7 @@ impl<'db> CampaignRepository<'db> {
             "serialize campaign proposal expected evidence",
         )?;
         let metadata_json =
-            serialize_submission_metadata(campaign_id, proposal_id, experiment_id)?;
+            serialize_submission_metadata(None, campaign_id, proposal_id, experiment_id)?;
         let window_ends_at = rolling_window_end(now)?;
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -447,6 +456,7 @@ impl<'db> CampaignRepository<'db> {
             &campaign.project_id,
             &argv_json,
             &metadata_json,
+            None,
             now,
         )?;
         insert_experiment(
@@ -891,6 +901,7 @@ fn insert_submission(
     project_id: &str,
     argv_json: &str,
     metadata_json: &str,
+    origin_agent_run_id: Option<i64>,
     now: i64,
 ) -> Result<(), AppError> {
     transaction
@@ -898,7 +909,7 @@ fn insert_submission(
             "INSERT INTO submissions (
                 submission_id, project_id, argv_json, created_at, pueue_task_id, task_signature,
                 status, kind, metadata_json, origin_agent_run_id
-             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8)",
             params![
                 submission_id,
                 project_id,
@@ -907,6 +918,7 @@ fn insert_submission(
                 SubmissionStatus::Pending,
                 SubmissionKind::Experiment,
                 metadata_json,
+                origin_agent_run_id,
             ],
         )
         .map_err(database_error("insert campaign submission intent"))?;
@@ -1224,19 +1236,65 @@ fn serialize_strings(values: &[String], operation: &'static str) -> Result<Strin
 }
 
 fn serialize_submission_metadata(
+    user_metadata: Option<&Value>,
     campaign_id: &str,
     proposal_id: &str,
     experiment_id: &str,
 ) -> Result<String, AppError> {
-    serde_json::to_string(&json!({
-        "campaign_id": campaign_id,
-        "proposal_id": proposal_id,
-        "experiment_id": experiment_id,
-    }))
+    let mut metadata = match user_metadata {
+        Some(Value::Object(metadata)) => metadata.clone(),
+        Some(_) => {
+            return Err(validation_error(
+                "submission.metadata",
+                "must be a JSON object",
+            ));
+        }
+        None => Map::new(),
+    };
+    metadata.insert(
+        "campaign_id".to_owned(),
+        Value::String(campaign_id.to_owned()),
+    );
+    metadata.insert(
+        "proposal_id".to_owned(),
+        Value::String(proposal_id.to_owned()),
+    );
+    metadata.insert(
+        "experiment_id".to_owned(),
+        Value::String(experiment_id.to_owned()),
+    );
+    serde_json::to_string(&Value::Object(metadata))
     .map_err(|source| AppError::Serialization {
         operation: "serialize campaign submission metadata",
         source,
     })
+}
+
+fn validate_submission_origin_agent_run(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    origin_agent_run_id: Option<i64>,
+) -> Result<(), AppError> {
+    let Some(origin_agent_run_id) = origin_agent_run_id else {
+        return Ok(());
+    };
+    let belongs_to_project: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_runs WHERE run_id = ?1 AND project_id = ?2
+             )",
+            params![origin_agent_run_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("validate campaign submission origin agent run"))?;
+    if belongs_to_project {
+        Ok(())
+    } else {
+        Err(validation_error(
+            "origin_agent_run_id",
+            "must identify an agent run in the submission project",
+        ))
+    }
 }
 
 fn rolling_window_end(now: i64) -> Result<i64, AppError> {

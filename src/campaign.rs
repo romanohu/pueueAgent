@@ -1,14 +1,17 @@
 use std::{ffi::OsString, path::Path};
 
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
     db::{
         CampaignRepository, Db, ExperimentRepository, ManagedSubmissionIntent,
-        StartCampaignRequest, SubmissionRepository,
+        ProjectRepository, ProposalRepository, StartCampaignRequest, SubmissionRepository,
     },
     execution_policy::CampaignLimits,
-    models::{ExperimentStatus, Project, ProposalKind, Submission},
+    models::{
+        Campaign, Experiment, ExperimentStatus, Project, Proposal, ProposalKind, Submission,
+    },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
     state::ObjectiveSnapshot,
@@ -35,6 +38,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         objective: &ObjectiveSnapshot,
         initial_argv: &[String],
+        metadata: &Value,
+        origin_agent_run_id: Option<i64>,
         now: i64,
     ) -> Result<Submission, AppError> {
         let baseline = proposals::validate_initial_baseline(
@@ -69,6 +74,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 submission_id: &submission_id,
                 experiment_id: &experiment_id,
                 proposal_id: &proposal_id,
+                metadata,
+                origin_agent_run_id,
                 now,
             },
             &self.limits,
@@ -82,20 +89,48 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         now: i64,
     ) -> Result<Submission, AppError> {
-        validate_intent_project(intent, project)?;
-        let add_args = pueue_add_args(
-            &project.pueue_group,
-            &project.root_path,
-            &intent.submission.argv,
-        );
-        validate_add_argv(&add_args)?;
-
         let experiments = ExperimentRepository::new(self.db);
         let current = experiments
             .find_by_id(&intent.experiment.experiment_id)?
             .ok_or(AppError::Runtime {
                 operation: "read campaign experiment before Pueue submission",
             })?;
+        let durable_campaign = CampaignRepository::new(self.db)
+            .find_by_id(&current.campaign_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read campaign before Pueue submission",
+            })?;
+        let durable_proposal = ProposalRepository::new(self.db)
+            .find_by_id(&current.proposal_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read campaign proposal before Pueue submission",
+            })?;
+        let durable_submission = SubmissionRepository::new(self.db)
+            .find_by_id(&current.submission_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read campaign submission before Pueue submission",
+            })?;
+        let durable_project = ProjectRepository::new(self.db)
+            .find_by_id(&durable_campaign.project_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read campaign project before Pueue submission",
+            })?;
+        validate_intent_identity(
+            intent,
+            project,
+            &durable_campaign,
+            &durable_proposal,
+            &current,
+            &durable_submission,
+            &durable_project,
+        )?;
+        let add_args = pueue_add_args(
+            &durable_project.pueue_group,
+            &durable_project.root_path,
+            &durable_submission.argv,
+        );
+        validate_add_argv(&add_args)?;
+
         match current.status {
             ExperimentStatus::Reserved => {
                 experiments.mark_submitting(&current.experiment_id, now)?;
@@ -129,9 +164,9 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             }
         };
         let task_signature = provisional_task_signature(
-            &project.pueue_group,
+            &durable_project.pueue_group,
             task_id,
-            &intent.submission.submission_id,
+            &durable_submission.submission_id,
         );
         if let Err(error) =
             experiments.mark_accepted(&current.experiment_id, task_id, &task_signature, now)
@@ -147,16 +182,37 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     }
 }
 
-fn validate_intent_project(
+#[allow(clippy::too_many_arguments)]
+fn validate_intent_identity(
     intent: &ManagedSubmissionIntent,
+    caller_project: &Project,
+    campaign: &Campaign,
+    proposal: &Proposal,
+    experiment: &Experiment,
+    submission: &Submission,
     project: &Project,
 ) -> Result<(), AppError> {
-    if intent.campaign.project_id != project.project_id
-        || intent.submission.project_id != project.project_id
+    if caller_project.project_id != project.project_id
+        || campaign.project_id != project.project_id
+        || proposal.campaign_id != campaign.campaign_id
+        || experiment.campaign_id != campaign.campaign_id
+        || experiment.proposal_id != proposal.proposal_id
+        || experiment.submission_id != submission.submission_id
+        || submission.project_id != project.project_id
+        || intent.campaign.campaign_id != campaign.campaign_id
+        || intent.campaign.project_id != campaign.project_id
+        || intent.proposal.proposal_id != proposal.proposal_id
+        || intent.proposal.campaign_id != proposal.campaign_id
+        || intent.experiment.experiment_id != experiment.experiment_id
+        || intent.experiment.campaign_id != experiment.campaign_id
+        || intent.experiment.proposal_id != experiment.proposal_id
+        || intent.experiment.submission_id != experiment.submission_id
+        || intent.submission.submission_id != submission.submission_id
+        || intent.submission.project_id != submission.project_id
     {
         return Err(AppError::Validation {
-            field: "campaign.project_id",
-            message: "must match the validated project",
+            field: "campaign.intent",
+            message: "must match the durable managed submission identity",
         });
     }
     Ok(())

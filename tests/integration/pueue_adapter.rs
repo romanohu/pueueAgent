@@ -967,6 +967,8 @@ max_experiments = 20
                     submission_id: &uuid::Uuid::new_v4().to_string(),
                     experiment_id: &uuid::Uuid::new_v4().to_string(),
                     proposal_id: &uuid::Uuid::new_v4().to_string(),
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
                     now: 100,
                 },
                 &CampaignLimits::default(),
@@ -1125,6 +1127,68 @@ async fn campaign_submit_first_experiment_creates_baseline_and_one_pueue_task() 
 }
 
 #[tokio::test]
+async fn campaign_submit_preserves_user_metadata_and_agent_origin_with_managed_ids() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            "campaign-submit-metadata-origin",
+            json!({}),
+            101,
+            101,
+        ))
+        .unwrap();
+    let run = pueue_agent::db::AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event.event_id,
+            None,
+            AgentRunStatus::Running,
+            101,
+            harness.root.join("agent.log"),
+        ))
+        .unwrap();
+    let args = vec![OsString::from("python"), OsString::from("train.py")];
+
+    let result = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(
+            SubmissionKind::Experiment,
+            json!({"trial":"baseline","epochs":3}),
+            Some(run.run_id),
+        ),
+        &CampaignLimits::default(),
+        &harness.fake,
+    )
+    .await
+    .unwrap();
+
+    let stored = SubmissionRepository::new(&harness.db)
+        .find_by_id(&result.submission_id)
+        .unwrap()
+        .unwrap();
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_live_by_project("project-a")
+        .unwrap()
+        .unwrap();
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(stored.metadata["experiment_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.origin_agent_run_id, Some(run.run_id));
+    assert_eq!(stored.metadata["trial"], "baseline");
+    assert_eq!(stored.metadata["epochs"], 3);
+    assert_eq!(stored.metadata["campaign_id"], campaign.campaign_id);
+    assert_eq!(stored.metadata["proposal_id"], experiment.proposal_id);
+    assert_eq!(stored.metadata["experiment_id"], experiment.experiment_id);
+    assert_eq!(experiment.submission_id, stored.submission_id);
+    assert_eq!(result, stored);
+}
+
+#[tokio::test]
 async fn campaign_submit_active_campaign_rejects_human_and_agent_before_persistence() {
     let harness = SubmitHarness::with_active_campaign();
 
@@ -1226,6 +1290,79 @@ async fn campaign_submit_reserved_intent_resumes_with_exactly_one_add() {
             .unwrap()
             .status,
         ExperimentStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_mutated_values_cannot_change_the_durable_pueue_add() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let mut intent = harness.reserve_baseline(&["python", "train.py"]);
+    intent.submission.argv = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "echo changed".to_owned(),
+    ];
+    let mut caller_project = harness.project();
+    caller_project.pueue_group = "changed-group".to_owned();
+    caller_project.root_path = harness.root.join("changed-root");
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    );
+
+    let result = coordinator
+        .submit_accepted_intent(&intent, &caller_project, 101)
+        .await
+        .unwrap();
+
+    assert_eq!(result.argv, vec!["python", "train.py"]);
+    assert_eq!(harness.pueue_add_calls(), 1);
+    assert_eq!(
+        harness.fake.last_add_args(),
+        vec![
+            OsString::from("-g"),
+            OsString::from("pa-project"),
+            OsString::from("--working-directory"),
+            fs::canonicalize(&harness.root).unwrap().into_os_string(),
+            OsString::from("--"),
+            OsString::from("python"),
+            OsString::from("train.py"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_conflicting_intent_identity_fails_before_pueue_add() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let mut intent = harness.reserve_baseline(&["python", "train.py"]);
+    intent.submission.submission_id = "conflicting-submission".to_owned();
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    );
+
+    let error = coordinator
+        .submit_accepted_intent(&intent, &harness.project(), 101)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "campaign.intent",
+            message: "must match the durable managed submission identity",
+        }
+    ));
+    assert_eq!(harness.pueue_add_calls(), 0);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
     );
 }
 
