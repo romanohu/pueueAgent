@@ -214,6 +214,16 @@ database_enum!(BudgetReservationStatus {
     Released => "released",
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperimentTerminalOutcome<'a> {
+    Succeeded,
+    Failed {
+        failure_code: &'a str,
+        failure_fingerprint: &'a str,
+    },
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum AgentContextMode {

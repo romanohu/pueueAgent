@@ -9,13 +9,15 @@ use std::{
 use pueue_agent::{
     batches::BatchJobResult,
     db::{
-        inferred_pre_binding_policy_code, AgentRunRepository, BatchRepository, Db, EventRepository,
-        IncidentRepository, InterventionRepository, ProjectRepository, RunLineageRepository,
-        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
-        LATEST_SCHEMA_VERSION,
+        inferred_pre_binding_policy_code, AgentRunRepository, BatchRepository, CampaignRepository,
+        Db, EventRepository, ExperimentRepository, IncidentRepository, InterventionRepository,
+        ProjectRepository, RunLineageRepository, StartCampaignRequest, SubmissionRepository,
+        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
-    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
+    execution_policy::{
+        CampaignLimits, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
+    },
     interventions::{
         InterventionStatus, MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES,
         MAX_INTERVENTION_BYTES_PER_RUN,
@@ -23,14 +25,16 @@ use pueue_agent::{
     models::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
         BudgetReservationStatus, Campaign, CampaignState, EventKind, EventStatus,
-        ExecutionProjection, Experiment, ExperimentStatus, IncidentStatus, IncidentTransition,
-        NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident, NewProject, NewSubmission,
-        NewTaskObservation, NewTerminationRequest, Proposal, ProposalKind, ProposalStatus,
-        SubmissionKind, SubmissionStatus, TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES,
-        MAX_EXECUTABLE_PATH_BYTES,
+        ExecutionProjection, Experiment, ExperimentStatus, ExperimentTerminalOutcome,
+        IncidentStatus, IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent,
+        NewIncident, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
+        ProposalKind, ProposalStatus, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
+        MAX_EXECUTABLE_IDENTITY_BYTES, MAX_EXECUTABLE_PATH_BYTES,
     },
+    proposals::{self, ProposalInput, ValidatedProposal},
     runs::{collect_fresh, FollowCursor},
     retry::{EventResolution, RetryPolicy},
+    state::ObjectiveSnapshot,
     AppError,
 };
 use rusqlite::{params, Connection};
@@ -59,6 +63,181 @@ impl TestDatabase {
         let root = self._temp.path().join(name);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+}
+
+struct CampaignDbHarness {
+    test: TestDatabase,
+}
+
+impl CampaignDbHarness {
+    const PROJECT_ID: &'static str = "campaign-project";
+    const CAMPAIGN_ID: &'static str = "campaign-1";
+    const BASELINE_EXPERIMENT_ID: &'static str = "experiment-baseline";
+
+    fn new() -> Self {
+        let test = TestDatabase::new();
+        let root = test.project_root("campaign-project");
+        register_project(&test.db, Self::PROJECT_ID, &root, "pa-campaign-project");
+        Self { test }
+    }
+
+    fn objective() -> ObjectiveSnapshot {
+        ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "objective-digest".to_owned(),
+        }
+    }
+
+    fn proposal(
+        kind: ProposalKind,
+        hypothesis: &str,
+        source_experiment_id: Option<&str>,
+        argv: &[&str],
+    ) -> ValidatedProposal {
+        let input = ProposalInput {
+            kind,
+            hypothesis: hypothesis.to_owned(),
+            source_experiment_id: source_experiment_id.map(str::to_owned),
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+            working_directory: ".".to_owned(),
+            expected_evidence: vec!["validation loss".to_owned()],
+        };
+        if source_experiment_id.is_none() {
+            proposals::validate_initial_baseline(input, "objective-digest").unwrap()
+        } else {
+            proposals::validate(input, "objective-digest").unwrap()
+        }
+    }
+
+    fn start_with_ids(
+        db: &Db,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> Result<pueue_agent::db::ManagedSubmissionIntent, AppError> {
+        let objective = Self::objective();
+        let baseline = Self::proposal(
+            ProposalKind::Experiment,
+            "Measure the initial command",
+            None,
+            &["python", "train.py"],
+        );
+        let initial_argv = baseline.argv().to_vec();
+        CampaignRepository::new(db).start_with_baseline(
+            StartCampaignRequest {
+                campaign_id,
+                project_id: Self::PROJECT_ID,
+                objective: &objective,
+                initial_argv: &initial_argv,
+                baseline: &baseline,
+                submission_id,
+                experiment_id,
+                proposal_id,
+                now,
+            },
+            limits,
+        )
+    }
+
+    fn start(&self, limits: &CampaignLimits, now: i64) -> pueue_agent::db::ManagedSubmissionIntent {
+        Self::start_with_ids(
+            &self.test.db,
+            Self::CAMPAIGN_ID,
+            "proposal-baseline",
+            Self::BASELINE_EXPERIMENT_ID,
+            "submission-baseline",
+            limits,
+            now,
+        )
+        .unwrap()
+    }
+
+    fn accept(
+        &self,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &ValidatedProposal,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> Result<Option<pueue_agent::db::ManagedSubmissionIntent>, AppError> {
+        CampaignRepository::new(&self.test.db).accept_proposal(
+            Self::CAMPAIGN_ID,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            limits,
+            now,
+        )
+    }
+
+    fn finish_baseline(&self, task_id: i64, now: i64, outcome: ExperimentTerminalOutcome<'_>) {
+        let repository = ExperimentRepository::new(&self.test.db);
+        repository
+            .mark_submitting(Self::BASELINE_EXPERIMENT_ID, now)
+            .unwrap();
+        repository
+            .mark_accepted(
+                Self::BASELINE_EXPERIMENT_ID,
+                task_id,
+                "pueue-task:v1:baseline",
+                now + 1,
+            )
+            .unwrap();
+        repository
+            .project_terminal_submission(
+                Self::BASELINE_EXPERIMENT_ID,
+                task_id,
+                outcome,
+                now + 2,
+            )
+            .unwrap();
+    }
+
+    fn count(&self, table: &str) -> i64 {
+        assert!(matches!(
+            table,
+            "campaigns" | "proposals" | "experiments" | "budget_reservations" | "submissions"
+        ));
+        self.test
+            .db
+            .connect()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn concurrent_start_same_project(
+        &self,
+    ) -> Vec<Result<pueue_agent::db::ManagedSubmissionIntent, AppError>> {
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|ordinal| {
+                let barrier = Arc::clone(&barrier);
+                let db = self.test.db.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    Self::start_with_ids(
+                        &db,
+                        &format!("campaign-{ordinal}"),
+                        &format!("proposal-{ordinal}"),
+                        &format!("experiment-{ordinal}"),
+                        &format!("submission-{ordinal}"),
+                        &CampaignLimits::default(),
+                        1_000,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
     }
 }
 
@@ -1235,6 +1414,853 @@ fn campaign_models_use_typed_exact_database_values() {
     assert_eq!(proposal.campaign_id, campaign.campaign_id);
     assert_eq!(experiment.proposal_id, proposal.proposal_id);
     assert_eq!(reservation.experiment_id, Some(experiment.experiment_id));
+}
+
+#[test]
+fn parallel_baseline_start_creates_exactly_one_live_campaign_and_reservation() {
+    let harness = CampaignDbHarness::new();
+    let results = harness.concurrent_start_same_project();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(harness.count("campaigns"), 1);
+    assert_eq!(harness.count("proposals"), 1);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("budget_reservations"), 1);
+    assert_eq!(harness.count("submissions"), 1);
+}
+
+#[test]
+fn campaign_atomic_parallel_limit_one_acceptance_creates_one_experiment() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+
+    let mut setup_limits = CampaignLimits::default();
+    setup_limits.max_parallel_experiments = 2;
+    setup_limits.max_proposals_per_cycle = 2;
+    let seed = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Create a second completed source",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--seed", "2"],
+    );
+    let seed_intent = harness
+        .accept(
+            "proposal-seed",
+            "experiment-seed",
+            "submission-seed",
+            &seed,
+            &setup_limits,
+            120,
+        )
+        .unwrap()
+        .unwrap();
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(&seed_intent.experiment.experiment_id, 121)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            &seed_intent.experiment.experiment_id,
+            42,
+            "pueue-task:v1:seed",
+            122,
+        )
+        .unwrap();
+    experiments
+        .project_terminal_submission(
+            &seed_intent.experiment.experiment_id,
+            42,
+            ExperimentTerminalOutcome::Succeeded,
+            123,
+        )
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let proposals = [
+        CampaignDbHarness::proposal(
+            ProposalKind::Experiment,
+            "First parallel contender",
+            Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+            &["python", "train.py", "--lr", "0.1"],
+        ),
+        CampaignDbHarness::proposal(
+            ProposalKind::Experiment,
+            "Second parallel contender",
+            Some("experiment-seed"),
+            &["python", "train.py", "--lr", "0.2"],
+        ),
+    ];
+    let handles = proposals
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, proposal)| {
+            let db = harness.test.db.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let limits = CampaignLimits::default();
+                barrier.wait();
+                CampaignRepository::new(&db).accept_proposal(
+                    CampaignDbHarness::CAMPAIGN_ID,
+                    &format!("proposal-race-{ordinal}"),
+                    &format!("experiment-race-{ordinal}"),
+                    &format!("submission-race-{ordinal}"),
+                    &proposal,
+                    &limits,
+                    130,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(harness.count("proposals"), 3);
+    assert_eq!(harness.count("experiments"), 3);
+    assert_eq!(harness.count("submissions"), 3);
+    assert_eq!(harness.count("budget_reservations"), 3);
+}
+
+#[test]
+fn rolling_budget_reopens_at_exact_24_hour_boundary() {
+    const DAY: i64 = 24 * 60 * 60;
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_new_experiments_per_24h = 1;
+    harness.start(&limits, 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Use the released rolling slot",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+    );
+
+    assert!(harness
+        .accept(
+            "proposal-before-boundary",
+            "experiment-before-boundary",
+            "submission-before-boundary",
+            &proposal,
+            &limits,
+            100 + DAY - 1,
+        )
+        .is_err());
+    let accepted = harness
+        .accept(
+            "proposal-at-boundary",
+            "experiment-at-boundary",
+            "submission-at-boundary",
+            &proposal,
+            &limits,
+            100 + DAY,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.experiment.experiment_id, "experiment-at-boundary");
+}
+
+#[test]
+fn campaign_atomic_duplicate_digest_returns_existing_intent_without_new_rows() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Try a lower learning rate",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+    );
+    let first = harness
+        .accept(
+            "proposal-first",
+            "experiment-first",
+            "submission-first",
+            &proposal,
+            &CampaignLimits::default(),
+            120,
+        )
+        .unwrap()
+        .unwrap();
+    let duplicate = harness
+        .accept(
+            "proposal-duplicate",
+            "experiment-duplicate",
+            "submission-duplicate",
+            &proposal,
+            &CampaignLimits::default(),
+            121,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(duplicate.proposal.proposal_id, first.proposal.proposal_id);
+    assert_eq!(duplicate.experiment.experiment_id, first.experiment.experiment_id);
+    assert_eq!(duplicate.submission.submission_id, first.submission.submission_id);
+    assert_eq!(harness.count("proposals"), 2);
+    assert_eq!(harness.count("experiments"), 2);
+    assert_eq!(harness.count("budget_reservations"), 2);
+    assert_eq!(harness.count("submissions"), 2);
+}
+
+#[test]
+fn campaign_atomic_submission_insert_failure_rolls_back_all_owned_rows() {
+    let harness = CampaignDbHarness::new();
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_campaign_submission
+             BEFORE INSERT ON submissions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected campaign submission failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(CampaignDbHarness::start_with_ids(
+        &harness.test.db,
+        CampaignDbHarness::CAMPAIGN_ID,
+        "proposal-baseline",
+        CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+        "submission-baseline",
+        &CampaignLimits::default(),
+        100,
+    )
+    .is_err());
+    assert_eq!(harness.count("campaigns"), 0);
+    assert_eq!(harness.count("proposals"), 0);
+    assert_eq!(harness.count("experiments"), 0);
+    assert_eq!(harness.count("budget_reservations"), 0);
+    assert_eq!(harness.count("submissions"), 0);
+}
+
+#[test]
+fn campaign_atomic_project_state_is_revalidated_before_baseline_writes() {
+    let harness = CampaignDbHarness::new();
+    ProjectRepository::new(&harness.test.db)
+        .pause(CampaignDbHarness::PROJECT_ID, 99)
+        .unwrap();
+
+    assert!(CampaignDbHarness::start_with_ids(
+        &harness.test.db,
+        CampaignDbHarness::CAMPAIGN_ID,
+        "proposal-baseline",
+        CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+        "submission-baseline",
+        &CampaignLimits::default(),
+        100,
+    )
+    .is_err());
+    assert_eq!(harness.count("campaigns"), 0);
+    assert_eq!(harness.count("proposals"), 0);
+    assert_eq!(harness.count("experiments"), 0);
+    assert_eq!(harness.count("budget_reservations"), 0);
+    assert_eq!(harness.count("submissions"), 0);
+}
+
+#[test]
+fn campaign_atomic_campaign_state_is_revalidated_before_proposal_writes() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET state = 'paused' WHERE campaign_id = ?1",
+            [CampaignDbHarness::CAMPAIGN_ID],
+        )
+        .unwrap();
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "This proposal must not race a pause",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+    );
+
+    assert!(harness
+        .accept(
+            "proposal-paused",
+            "experiment-paused",
+            "submission-paused",
+            &proposal,
+            &CampaignLimits::default(),
+            120,
+        )
+        .is_err());
+    assert_eq!(harness.count("proposals"), 1);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("budget_reservations"), 1);
+    assert_eq!(harness.count("submissions"), 1);
+}
+
+#[test]
+fn campaign_atomic_cross_campaign_source_is_rejected_without_any_insert() {
+    let first = CampaignDbHarness::new();
+    first.start(&CampaignLimits::default(), 100);
+    first.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let second_root = first.test.project_root("campaign-project-b");
+    register_project(
+        &first.test.db,
+        "campaign-project-b",
+        &second_root,
+        "pa-campaign-project-b",
+    );
+    let objective = CampaignDbHarness::objective();
+    let baseline = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Second campaign baseline",
+        None,
+        &["python", "other.py"],
+    );
+    let initial_argv = baseline.argv().to_vec();
+    let second = CampaignRepository::new(&first.test.db)
+        .start_with_baseline(
+            StartCampaignRequest {
+                campaign_id: "campaign-2",
+                project_id: "campaign-project-b",
+                objective: &objective,
+                initial_argv: &initial_argv,
+                baseline: &baseline,
+                submission_id: "submission-campaign-2",
+                experiment_id: "experiment-campaign-2",
+                proposal_id: "proposal-campaign-2",
+                now: 100,
+            },
+            &CampaignLimits::default(),
+        )
+        .unwrap();
+    let second_experiments = ExperimentRepository::new(&first.test.db);
+    second_experiments
+        .mark_submitting(&second.experiment.experiment_id, 110)
+        .unwrap();
+    second_experiments
+        .mark_accepted(
+            &second.experiment.experiment_id,
+            42,
+            "pueue-task:v1:second",
+            111,
+        )
+        .unwrap();
+    second_experiments
+        .project_terminal_submission(
+            &second.experiment.experiment_id,
+            42,
+            ExperimentTerminalOutcome::Succeeded,
+            112,
+        )
+        .unwrap();
+    let before = (
+        first.count("proposals"),
+        first.count("experiments"),
+        first.count("budget_reservations"),
+        first.count("submissions"),
+    );
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Cross-campaign lineage must fail closed",
+        Some("experiment-campaign-2"),
+        &["python", "train.py", "--lr", "0.02"],
+    );
+
+    assert!(first
+        .accept(
+            "proposal-cross-campaign",
+            "experiment-cross-campaign",
+            "submission-cross-campaign",
+            &proposal,
+            &CampaignLimits::default(),
+            120,
+        )
+        .is_err());
+    assert_eq!(
+        (
+            first.count("proposals"),
+            first.count("experiments"),
+            first.count("budget_reservations"),
+            first.count("submissions"),
+        ),
+        before
+    );
+}
+
+#[test]
+fn campaign_atomic_proposal_cycle_limit_rejects_before_insert() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let first = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "First decision",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+    );
+    harness
+        .accept(
+            "proposal-cycle-first",
+            "experiment-cycle-first",
+            "submission-cycle-first",
+            &first,
+            &CampaignLimits::default(),
+            120,
+        )
+        .unwrap();
+    let second = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Second decision from the same source",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.02"],
+    );
+
+    assert!(harness
+        .accept(
+            "proposal-cycle-second",
+            "experiment-cycle-second",
+            "submission-cycle-second",
+            &second,
+            &CampaignLimits::default(),
+            121,
+        )
+        .is_err());
+    assert_eq!(harness.count("proposals"), 2);
+    assert_eq!(harness.count("experiments"), 2);
+}
+
+#[test]
+fn campaign_atomic_same_spec_retry_limit_is_finite() {
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_same_spec_retries = 1;
+    harness.start(&limits, 100);
+    harness.finish_baseline(
+        41,
+        110,
+        ExperimentTerminalOutcome::Failed {
+            failure_code: "exit_nonzero",
+            failure_fingerprint: "fingerprint-a",
+        },
+    );
+    let retry = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Retry the exact baseline spec",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py"],
+    );
+    let retry_intent = harness
+        .accept(
+            "proposal-retry-1",
+            "experiment-retry-1",
+            "submission-retry-1",
+            &retry,
+            &limits,
+            120,
+        )
+        .unwrap()
+        .unwrap();
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(&retry_intent.experiment.experiment_id, 121)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            &retry_intent.experiment.experiment_id,
+            42,
+            "pueue-task:v1:retry-1",
+            122,
+        )
+        .unwrap();
+    experiments
+        .project_terminal_submission(
+            &retry_intent.experiment.experiment_id,
+            42,
+            ExperimentTerminalOutcome::Failed {
+                failure_code: "exit_nonzero",
+                failure_fingerprint: "fingerprint-a",
+            },
+            123,
+        )
+        .unwrap();
+    let excess = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "A second exact retry must be rejected",
+        Some("experiment-retry-1"),
+        &["python", "train.py"],
+    );
+
+    assert!(harness
+        .accept(
+            "proposal-retry-2",
+            "experiment-retry-2",
+            "submission-retry-2",
+            &excess,
+            &limits,
+            130,
+        )
+        .is_err());
+    assert_eq!(harness.count("experiments"), 2);
+}
+
+#[test]
+fn campaign_atomic_repair_limit_uses_trusted_source_fingerprint() {
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_repairs_per_failure_fingerprint = 1;
+    harness.start(&limits, 100);
+    harness.finish_baseline(
+        41,
+        110,
+        ExperimentTerminalOutcome::Failed {
+            failure_code: "oom",
+            failure_fingerprint: "trusted-oom-fingerprint",
+        },
+    );
+    let repair = CampaignDbHarness::proposal(
+        ProposalKind::Repair,
+        "Reduce the batch size",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--batch-size", "8"],
+    );
+    let repair_intent = harness
+        .accept(
+            "proposal-repair-1",
+            "experiment-repair-1",
+            "submission-repair-1",
+            &repair,
+            &limits,
+            120,
+        )
+        .unwrap()
+        .unwrap();
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(&repair_intent.experiment.experiment_id, 121)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            &repair_intent.experiment.experiment_id,
+            42,
+            "pueue-task:v1:repair-1",
+            122,
+        )
+        .unwrap();
+    experiments
+        .project_terminal_submission(
+            &repair_intent.experiment.experiment_id,
+            42,
+            ExperimentTerminalOutcome::Failed {
+                failure_code: "oom",
+                failure_fingerprint: "trusted-oom-fingerprint",
+            },
+            123,
+        )
+        .unwrap();
+    let excess = CampaignDbHarness::proposal(
+        ProposalKind::Repair,
+        "A second repair for the same failure is capped",
+        Some("experiment-repair-1"),
+        &["python", "train.py", "--batch-size", "4"],
+    );
+
+    assert!(harness
+        .accept(
+            "proposal-repair-2",
+            "experiment-repair-2",
+            "submission-repair-2",
+            &excess,
+            &limits,
+            130,
+        )
+        .is_err());
+    assert_eq!(harness.count("experiments"), 2);
+}
+
+#[test]
+fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
+    const DAY: i64 = 24 * 60 * 60;
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_code_change_proposals_per_24h = 1;
+    limits.max_proposals_per_cycle = 3;
+    harness.start(&limits, 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let first = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Change the training implementation",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v2"],
+    );
+    assert!(harness
+        .accept(
+            "proposal-code-1",
+            "experiment-code-1",
+            "submission-code-1",
+            &first,
+            &limits,
+            120,
+        )
+        .unwrap()
+        .is_none());
+    let before_boundary = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Another code change before expiry",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v3"],
+    );
+    assert!(harness
+        .accept(
+            "proposal-code-2",
+            "experiment-code-2",
+            "submission-code-2",
+            &before_boundary,
+            &limits,
+            120 + DAY - 1,
+        )
+        .is_err());
+    let at_boundary = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Code change after exact expiry",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v4"],
+    );
+    assert!(harness
+        .accept(
+            "proposal-code-3",
+            "experiment-code-3",
+            "submission-code-3",
+            &at_boundary,
+            &limits,
+            120 + DAY,
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(harness.count("proposals"), 3);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("submissions"), 1);
+    assert_eq!(harness.count("budget_reservations"), 3);
+}
+
+#[test]
+fn campaign_atomic_external_transitions_are_exact_and_idempotent() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+
+    let submitting = experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 110)
+        .unwrap();
+    assert_eq!(submitting.status, ExperimentStatus::Submitting);
+    assert!(experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 111)
+        .is_err());
+
+    let accepted = experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "pueue-task:v1:baseline",
+            112,
+        )
+        .unwrap();
+    assert_eq!(accepted.status, ExperimentStatus::Accepted);
+    let replay = experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "pueue-task:v1:baseline",
+            113,
+        )
+        .unwrap();
+    assert_eq!(replay.updated_at, accepted.updated_at);
+    assert!(experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            99,
+            "pueue-task:v1:conflict",
+            114,
+        )
+        .is_err());
+    let stored = experiments
+        .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.pueue_task_id, Some(41));
+    let submission = SubmissionRepository::new(&harness.test.db)
+        .find_by_id("submission-baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(submission.pueue_task_id, Some(41));
+    assert_eq!(submission.status, SubmissionStatus::Accepted);
+}
+
+#[test]
+fn campaign_atomic_unreconciled_transition_updates_both_rows_and_replays_exactly() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 110)
+        .unwrap();
+    let unreconciled = experiments
+        .mark_unreconciled(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            "pueue_add_timeout",
+            111,
+        )
+        .unwrap();
+    let replay = experiments
+        .mark_unreconciled(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            "pueue_add_timeout",
+            112,
+        )
+        .unwrap();
+
+    assert_eq!(unreconciled.status, ExperimentStatus::Unreconciled);
+    assert_eq!(replay.updated_at, unreconciled.updated_at);
+    assert!(experiments
+        .mark_unreconciled(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            "different_reason",
+            113,
+        )
+        .is_err());
+    let submission = SubmissionRepository::new(&harness.test.db)
+        .find_by_id("submission-baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(submission.status, SubmissionStatus::Unreconciled);
+}
+
+#[test]
+fn campaign_atomic_terminal_projection_consumes_reservation_and_rejects_conflicts() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 110)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "pueue-task:v1:baseline",
+            111,
+        )
+        .unwrap();
+    let terminal = experiments
+        .project_terminal_submission(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            ExperimentTerminalOutcome::Failed {
+                failure_code: "exit_nonzero",
+                failure_fingerprint: "failure-fingerprint",
+            },
+            112,
+        )
+        .unwrap();
+    let replay = experiments
+        .project_terminal_submission(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            ExperimentTerminalOutcome::Failed {
+                failure_code: "exit_nonzero",
+                failure_fingerprint: "failure-fingerprint",
+            },
+            113,
+        )
+        .unwrap();
+
+    assert_eq!(terminal.status, ExperimentStatus::Failed);
+    assert_eq!(terminal.failure_fingerprint.as_deref(), Some("failure-fingerprint"));
+    assert_eq!(replay.updated_at, terminal.updated_at);
+    assert!(experiments
+        .project_terminal_submission(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            ExperimentTerminalOutcome::Succeeded,
+            114,
+        )
+        .is_err());
+    assert!(experiments
+        .project_terminal_submission(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            99,
+            ExperimentTerminalOutcome::Failed {
+                failure_code: "exit_nonzero",
+                failure_fingerprint: "failure-fingerprint",
+            },
+            115,
+        )
+        .is_err());
+    let reservation_status: BudgetReservationStatus = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE experiment_id = ?1",
+            [CampaignDbHarness::BASELINE_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_status, BudgetReservationStatus::Consumed);
+}
+
+#[test]
+fn campaign_atomic_terminal_projection_revalidates_owned_submission_identity() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 110)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "pueue-task:v1:baseline",
+            111,
+        )
+        .unwrap();
+    SubmissionRepository::new(&harness.test.db)
+        .mark_accepted("submission-baseline", 99, "pueue-task:v1:drifted")
+        .unwrap();
+
+    assert!(experiments
+        .project_terminal_submission(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            ExperimentTerminalOutcome::Succeeded,
+            112,
+        )
+        .is_err());
+    assert_eq!(
+        experiments
+            .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+    let reservation_status: BudgetReservationStatus = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE experiment_id = ?1",
+            [CampaignDbHarness::BASELINE_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_status, BudgetReservationStatus::Reserved);
 }
 
 #[test]

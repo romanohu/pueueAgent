@@ -1,6 +1,11 @@
+mod campaigns;
 mod migrations;
 mod repositories;
 
+pub use campaigns::{
+    CampaignRepository, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
+    StartCampaignRequest,
+};
 pub use migrations::LATEST_SCHEMA_VERSION;
 
 use std::{fs, path::Path, path::PathBuf, sync::{Arc, Mutex}, time::Duration};
