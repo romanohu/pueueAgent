@@ -30,6 +30,16 @@ const DEFAULT_POLICY: &str = r#"version = 1
 [defaults]
 network = "enabled"
 
+[campaign]
+max_parallel_experiments = 1
+max_new_experiments_per_24h = 24
+max_agent_runs_per_hour = 6
+max_code_change_proposals_per_24h = 10
+max_same_spec_retries = 2
+max_repairs_per_failure_fingerprint = 2
+max_proposals_per_cycle = 1
+observer_interval_minutes = 30
+
 [executables]
 codex = "codex"
 pueue = "pueue"
@@ -209,6 +219,33 @@ pub enum NetworkMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CampaignLimits {
+    pub max_parallel_experiments: u32,
+    pub max_new_experiments_per_24h: u32,
+    pub max_agent_runs_per_hour: u32,
+    pub max_code_change_proposals_per_24h: u32,
+    pub max_same_spec_retries: u32,
+    pub max_repairs_per_failure_fingerprint: u32,
+    pub max_proposals_per_cycle: u32,
+    pub observer_interval_minutes: u32,
+}
+
+impl Default for CampaignLimits {
+    fn default() -> Self {
+        Self {
+            max_parallel_experiments: 1,
+            max_new_experiments_per_24h: 24,
+            max_agent_runs_per_hour: 6,
+            max_code_change_proposals_per_24h: 10,
+            max_same_spec_retries: 2,
+            max_repairs_per_failure_fingerprint: 2,
+            max_proposals_per_cycle: 1,
+            observer_interval_minutes: 30,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentKind {
     BuiltInCodex,
     Custom,
@@ -226,6 +263,7 @@ pub struct ResolvedExecutionPolicy {
     pub startup_environment: StartupEnvironment,
     pub codex_home: PathBuf,
     pub default_network: NetworkMode,
+    pub campaign_limits: CampaignLimits,
     pub custom_allowlist: BTreeMap<String, ExecutableAnchor>,
     project_environment_allow: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
     #[allow(dead_code)]
@@ -245,6 +283,7 @@ impl fmt::Debug for ResolvedExecutionPolicy {
             .field("startup_environment", &self.startup_environment)
             .field("codex_home", &self.codex_home)
             .field("default_network", &self.default_network)
+            .field("campaign_limits", &self.campaign_limits)
             .field("custom_allowlist", &self.custom_allowlist)
             .finish()
     }
@@ -1195,6 +1234,7 @@ fn load_policy(
     let launcher_anchor = ExecutableAnchor::from_absolute(&input.launcher_path, &project_roots)?;
     let pueue_config_anchor = PueueConfigAnchor::from_absolute(&input.pueue_config, &project_roots)?;
     let default_network = parse_network(raw.defaults.network.as_deref())?;
+    let campaign_limits = parse_campaign_limits(raw.campaign)?;
 
     let mut custom_allowlist = BTreeMap::new();
     let mut project_environment_allow = BTreeMap::new();
@@ -1222,6 +1262,7 @@ fn load_policy(
         startup_environment: input.startup_environment.clone(),
         codex_home,
         default_network,
+        campaign_limits,
         custom_allowlist,
         project_environment_allow,
         trusted_path_descriptors: trusted_path_descriptors
@@ -1311,6 +1352,51 @@ fn parse_network(value: Option<&str>) -> Result<NetworkMode, PolicyViolation> {
             PolicyViolationStage::Startup,
         )),
     }
+}
+
+fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, PolicyViolation> {
+    let defaults = CampaignLimits::default();
+    let limits = CampaignLimits {
+        max_parallel_experiments: raw
+            .max_parallel_experiments
+            .unwrap_or(defaults.max_parallel_experiments),
+        max_new_experiments_per_24h: raw
+            .max_new_experiments_per_24h
+            .unwrap_or(defaults.max_new_experiments_per_24h),
+        max_agent_runs_per_hour: raw
+            .max_agent_runs_per_hour
+            .unwrap_or(defaults.max_agent_runs_per_hour),
+        max_code_change_proposals_per_24h: raw
+            .max_code_change_proposals_per_24h
+            .unwrap_or(defaults.max_code_change_proposals_per_24h),
+        max_same_spec_retries: raw
+            .max_same_spec_retries
+            .unwrap_or(defaults.max_same_spec_retries),
+        max_repairs_per_failure_fingerprint: raw
+            .max_repairs_per_failure_fingerprint
+            .unwrap_or(defaults.max_repairs_per_failure_fingerprint),
+        max_proposals_per_cycle: raw
+            .max_proposals_per_cycle
+            .unwrap_or(defaults.max_proposals_per_cycle),
+        observer_interval_minutes: raw
+            .observer_interval_minutes
+            .unwrap_or(defaults.observer_interval_minutes),
+    };
+    if !(1..=64).contains(&limits.max_parallel_experiments)
+        || !(1..=10_000).contains(&limits.max_new_experiments_per_24h)
+        || !(1..=1_000).contains(&limits.max_agent_runs_per_hour)
+        || limits.max_code_change_proposals_per_24h > 1_000
+        || limits.max_same_spec_retries > 100
+        || limits.max_repairs_per_failure_fingerprint > 100
+        || !(1..=32).contains(&limits.max_proposals_per_cycle)
+        || !(1..=1_440).contains(&limits.observer_interval_minutes)
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyUnknownField,
+            PolicyViolationStage::Startup,
+        ));
+    }
+    Ok(limits)
 }
 
 fn parse_environment_names(
@@ -1818,6 +1904,7 @@ struct RawPolicy {
     version: Option<u32>,
     trusted_path: Option<String>,
     defaults: RawDefaults,
+    campaign: RawCampaignLimits,
     executables: RawExecutables,
     projects: BTreeMap<String, RawProjectPolicy>,
 }
@@ -1826,6 +1913,19 @@ struct RawPolicy {
 #[serde(default, deny_unknown_fields)]
 struct RawDefaults {
     network: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawCampaignLimits {
+    max_parallel_experiments: Option<u32>,
+    max_new_experiments_per_24h: Option<u32>,
+    max_agent_runs_per_hour: Option<u32>,
+    max_code_change_proposals_per_24h: Option<u32>,
+    max_same_spec_retries: Option<u32>,
+    max_repairs_per_failure_fingerprint: Option<u32>,
+    max_proposals_per_cycle: Option<u32>,
+    observer_interval_minutes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

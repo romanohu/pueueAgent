@@ -9,7 +9,7 @@ use pueue_agent::{
     diagnostics::{build_doctor_report_with_policy, DoctorCheckStatus, DoctorExternal},
     execution_policy::{
         load_existing_policy, load_or_create_policy, resolve_project_policy, AgentKind,
-        NetworkMode, PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
+        CampaignLimits, NetworkMode, PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
     },
     models::{AgentContextMode, NewProject, Project},
     service::{ServicePaths, ServiceStatus},
@@ -209,6 +209,79 @@ fn missing_policy_is_atomic_secure_default() {
     assert_eq!(p.default_network, NetworkMode::Enabled);
     assert!(p.custom_allowlist.is_empty());
     assert_eq!(policy_mode(&h.policy()) & 0o077, 0);
+}
+
+#[test]
+fn campaign_limits_have_safe_service_defaults() {
+    let harness = PolicyHarness::new();
+    let policy = load_or_create_policy(&harness.input()).unwrap();
+    assert_eq!(
+        policy.campaign_limits,
+        CampaignLimits {
+            max_parallel_experiments: 1,
+            max_new_experiments_per_24h: 24,
+            max_agent_runs_per_hour: 6,
+            max_code_change_proposals_per_24h: 10,
+            max_same_spec_retries: 2,
+            max_repairs_per_failure_fingerprint: 2,
+            max_proposals_per_cycle: 1,
+            observer_interval_minutes: 30,
+        }
+    );
+    assert_eq!(policy.default_network, NetworkMode::Enabled);
+}
+
+#[test]
+fn campaign_limits_reject_values_outside_service_bounds() {
+    let harness = PolicyHarness::new();
+    load_or_create_policy(&harness.input()).unwrap();
+    let default_policy = fs::read_to_string(harness.policy()).unwrap();
+
+    for (field, value) in [
+        ("max_parallel_experiments", 0),
+        ("max_parallel_experiments", 65),
+        ("max_new_experiments_per_24h", 0),
+        ("max_new_experiments_per_24h", 10_001),
+        ("max_agent_runs_per_hour", 0),
+        ("max_agent_runs_per_hour", 1_001),
+        ("max_code_change_proposals_per_24h", 1_001),
+        ("max_same_spec_retries", 101),
+        ("max_repairs_per_failure_fingerprint", 101),
+        ("max_proposals_per_cycle", 0),
+        ("max_proposals_per_cycle", 33),
+        ("observer_interval_minutes", 0),
+        ("observer_interval_minutes", 1_441),
+    ] {
+        let updated = default_policy.replacen(
+            &format!("{field} = {}", campaign_limit_default(field)),
+            &format!("{field} = {value}"),
+            1,
+        );
+        fs::write(harness.policy(), updated).unwrap();
+        secure_file(&harness.policy());
+        assert!(matches!(
+            load_existing_policy(&harness.input()),
+            Err(pueue_agent::execution_policy::PolicyViolation {
+                code: PolicyViolationCode::PolicyUnknownField,
+                ..
+            })
+        ), "{field} = {value}");
+    }
+
+    for field in [
+        "max_code_change_proposals_per_24h",
+        "max_same_spec_retries",
+        "max_repairs_per_failure_fingerprint",
+    ] {
+        let updated = default_policy.replacen(
+            &format!("{field} = {}", campaign_limit_default(field)),
+            &format!("{field} = 0"),
+            1,
+        );
+        fs::write(harness.policy(), updated).unwrap();
+        secure_file(&harness.policy());
+        assert!(load_existing_policy(&harness.input()).is_ok(), "{field} = 0");
+    }
 }
 
 #[test]
@@ -672,5 +745,19 @@ fn set_mode(path: &Path, mode: u32) {
     #[cfg(not(unix))]
     {
         let _ = (path, mode);
+    }
+}
+
+fn campaign_limit_default(field: &str) -> u32 {
+    match field {
+        "max_parallel_experiments" => 1,
+        "max_new_experiments_per_24h" => 24,
+        "max_agent_runs_per_hour" => 6,
+        "max_code_change_proposals_per_24h" => 10,
+        "max_same_spec_retries" => 2,
+        "max_repairs_per_failure_fingerprint" => 2,
+        "max_proposals_per_cycle" => 1,
+        "observer_interval_minutes" => 30,
+        _ => unreachable!(),
     }
 }

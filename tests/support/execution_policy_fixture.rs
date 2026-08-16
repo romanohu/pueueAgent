@@ -85,7 +85,12 @@ pub fn resolved_policy(
             state_dir,
             project_roots,
             inherited_path: joined_path,
-            startup_environment: StartupEnvironment::from_pairs([("HOME", "/fixture")]),
+            startup_environment: StartupEnvironment::from_pairs([
+                ("HOME", "/fixture"),
+                ("AWS_SECRET_ACCESS_KEY", "fixture-aws-secret"),
+                ("WANDB_API_KEY", "fixture-wandb-key"),
+                ("SSH_AUTH_SOCK", "/fixture/ssh-agent.sock"),
+            ]),
             codex_home,
             pueue_config,
             launcher_path: launcher,

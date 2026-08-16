@@ -22,6 +22,9 @@ use pueue_agent::{
 };
 use tempfile::TempDir;
 
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -89,6 +92,51 @@ fn task_env_is_default_deny_and_auth_never_inherits() {
         assert_eq!(environment.get(name), Some(std::ffi::OsStr::new("/dev/fd/11")));
     }
     assert!(!format!("{environment:?}").contains("secret"));
+}
+
+#[test]
+fn fixture_policy_environment_keeps_network_enabled_without_unlisted_credentials() {
+    let fixture = tempfile::tempdir().unwrap();
+    let global = execution_policy_fixture::resolved_policy(fixture.path(), &[]);
+    assert_eq!(global.default_network, NetworkMode::Enabled);
+
+    let identity = ExecutableIdentity {
+        device: 1,
+        inode: 1,
+        owner: 1,
+        mode: 0o700,
+    };
+    let project_policy = ResolvedProjectExecutionPolicy {
+        project_id: "fixture".to_owned(),
+        root_anchor: ProjectRootAnchor {
+            canonical_path: fixture.path().to_owned(),
+            identity,
+            resolution_fingerprint: "fixture".to_owned(),
+        },
+        agent_anchor: ExecutableAnchor {
+            canonical_path: PathBuf::from("/usr/bin/codex"),
+            identity,
+            resolution_fingerprint: "fixture".to_owned(),
+        },
+        agent_kind: AgentKind::BuiltInCodex,
+        network: global.default_network,
+        agent_environment_allow: Default::default(),
+        task_environment_allow: Default::default(),
+        codex_home: global.codex_home.clone(),
+        trusted_path: global.trusted_path.clone(),
+        private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
+    };
+
+    for environment in [
+        SanitizedEnvironment::for_codex_agent(&global.startup_environment, &project_policy, 41)
+            .unwrap(),
+        SanitizedEnvironment::for_codex_task(&global.startup_environment, &project_policy, 41)
+            .unwrap(),
+    ] {
+        for name in ["AWS_SECRET_ACCESS_KEY", "WANDB_API_KEY", "SSH_AUTH_SOCK"] {
+            assert_eq!(environment.get(name), None, "{name}");
+        }
+    }
 }
 
 #[test]
