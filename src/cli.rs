@@ -40,6 +40,108 @@ pub enum Command {
     Start(ServiceLifecycleArgs),
     Stop(ServiceLifecycleArgs),
     Daemon(DaemonArgs),
+    Campaign(CampaignArgs),
+    Proposal(ProposalArgs),
+    Experiment(ExperimentArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CampaignArgs {
+    #[command(subcommand)]
+    pub action: CampaignAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CampaignAction {
+    Status(CampaignStatusArgs),
+    Pause(CampaignMutationArgs),
+    Resume(CampaignMutationArgs),
+    Retire(CampaignMutationArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CampaignStatusArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct CampaignMutationArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProposalArgs {
+    #[command(subcommand)]
+    pub action: ProposalAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProposalAction {
+    List(CampaignListArgs),
+    Inspect(ProposalInspectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExperimentArgs {
+    #[command(subcommand)]
+    pub action: ExperimentAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExperimentAction {
+    List(CampaignListArgs),
+    Inspect(ExperimentInspectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CampaignListArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = crate::campaign::DEFAULT_INSPECTION_LIMIT,
+        value_parser = parse_campaign_list_limit,
+        value_name = "N"
+    )]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProposalInspectArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROPOSAL_ID")]
+    pub proposal_id: String,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ExperimentInspectArgs {
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "EXPERIMENT_ID")]
+    pub experiment_id: String,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -267,4 +369,15 @@ pub struct DaemonArgs {
     pub foreground: bool,
     #[arg(long, value_name = "PUEUE_CONFIG")]
     pub pueue_config: Option<PathBuf>,
+}
+
+fn parse_campaign_list_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer between 1 and 100".to_owned())?;
+    if (1..=crate::campaign::MAX_INSPECTION_LIMIT).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err("limit must be between 1 and 100".to_owned())
+    }
 }

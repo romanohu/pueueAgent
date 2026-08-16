@@ -1,5 +1,10 @@
 use std::{io::IsTerminal, path::Path};
 
+use crate::{
+    models::{Campaign, Experiment, Proposal},
+    AppError,
+};
+
 const MAX_OUTPUT_TEXT_BYTES: usize = 240;
 const MAX_EXECUTION_PATH_BYTES: usize = 4096;
 
@@ -46,6 +51,392 @@ pub fn human_header(command: &str, project_id: &str) -> String {
 
 pub fn human_summary(summary: impl AsRef<str>) -> String {
     format!("summary: {}", bounded_redacted_text(summary.as_ref()))
+}
+
+pub fn render_campaign_status(
+    campaign: &Campaign,
+    proposal_count: i64,
+    experiment_counts: &std::collections::BTreeMap<String, i64>,
+    budget_usage: &std::collections::BTreeMap<String, i64>,
+    task_ids: &[i64],
+    json: bool,
+) -> Result<String, AppError> {
+    let experiment_count = experiment_counts.values().sum::<i64>();
+    if json {
+        return serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_id": bounded_redacted_text(&campaign.project_id),
+            "campaign_id": bounded_redacted_text(&campaign.campaign_id),
+            "state": campaign.state.as_str(),
+            "state_reason": safe_optional_text(campaign.state_reason.as_deref()),
+            "objective_digest": bounded_redacted_text(&campaign.objective_digest),
+            "baseline_experiment_id": safe_optional_text(campaign.baseline_experiment_id.as_deref()),
+            "next_eligible_at": campaign.next_eligible_at,
+            "created_at": campaign.created_at,
+            "updated_at": campaign.updated_at,
+            "counts": {
+                "proposals": proposal_count,
+                "experiments": experiment_count,
+                "experiment_states": experiment_counts,
+            },
+            "budget_usage": budget_usage,
+            "task_ids": task_ids,
+        }))
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize campaign status",
+            source,
+        });
+    }
+
+    Ok([
+        human_header("campaign status", &campaign.project_id),
+        format!("campaign: {}", bounded_redacted_text(&campaign.campaign_id)),
+        format!("state: {}", format_state(campaign.state.as_str())),
+        format!(
+            "state_reason: {}",
+            safe_optional_text(campaign.state_reason.as_deref())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "objective_digest: {}",
+            bounded_redacted_text(&campaign.objective_digest)
+        ),
+        format!(
+            "baseline_experiment: {}",
+            safe_optional_text(campaign.baseline_experiment_id.as_deref())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "counts: proposals={} experiments={} states={}",
+            proposal_count,
+            experiment_count,
+            render_counts(experiment_counts)
+        ),
+        format!("budget_usage: {}", render_counts(budget_usage)),
+        format!(
+            "task_ids: {}",
+            if task_ids.is_empty() {
+                "none".to_owned()
+            } else {
+                task_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ),
+        format!(
+            "timestamps: created_at={} updated_at={} next_eligible_at={}",
+            campaign.created_at,
+            campaign.updated_at,
+            campaign
+                .next_eligible_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        human_summary("campaign state inspected"),
+    ]
+    .join("\n"))
+}
+
+pub fn render_campaign_mutation(
+    campaign: &Campaign,
+    operation: &'static str,
+    json: bool,
+) -> Result<String, AppError> {
+    if json {
+        return serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "operation": operation,
+            "project_id": bounded_redacted_text(&campaign.project_id),
+            "campaign_id": bounded_redacted_text(&campaign.campaign_id),
+            "state": campaign.state.as_str(),
+            "state_reason": safe_optional_text(campaign.state_reason.as_deref()),
+            "updated_at": campaign.updated_at,
+        }))
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize campaign mutation",
+            source,
+        });
+    }
+    Ok([
+        human_header(&format!("campaign {operation}"), &campaign.project_id),
+        format!("campaign: {}", bounded_redacted_text(&campaign.campaign_id)),
+        format!("state: {}", format_state(campaign.state.as_str())),
+        format!(
+            "state_reason: {}",
+            safe_optional_text(campaign.state_reason.as_deref())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!("updated_at: {}", campaign.updated_at),
+        human_summary(format!("campaign {operation} complete")),
+    ]
+    .join("\n"))
+}
+
+pub fn render_proposal_list(
+    campaign: &Campaign,
+    proposals: &[Proposal],
+    json: bool,
+) -> Result<String, AppError> {
+    if json {
+        let proposals = proposals
+            .iter()
+            .map(proposal_list_value)
+            .collect::<Vec<_>>();
+        return serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_id": bounded_redacted_text(&campaign.project_id),
+            "campaign_id": bounded_redacted_text(&campaign.campaign_id),
+            "proposals": proposals,
+        }))
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize campaign proposal list",
+            source,
+        });
+    }
+    let mut lines = vec![human_header("proposal list", &campaign.project_id)];
+    lines.push(format!(
+        "campaign: {}",
+        bounded_redacted_text(&campaign.campaign_id)
+    ));
+    lines.extend(proposals.iter().map(|proposal| {
+        format!(
+            "proposal={} kind={} state={} source_experiment={} created_at={} updated_at={}",
+            bounded_redacted_text(&proposal.proposal_id),
+            proposal.kind.as_str(),
+            format_state(proposal.status.as_str()),
+            safe_optional_text(proposal.source_experiment_id.as_deref())
+                .unwrap_or_else(|| "none".to_owned()),
+            proposal.created_at,
+            proposal.updated_at,
+        )
+    }));
+    lines.push(human_summary(format!("{} proposal(s)", proposals.len())));
+    Ok(lines.join("\n"))
+}
+
+pub fn render_proposal_inspection(
+    campaign: &Campaign,
+    proposal: &Proposal,
+    json: bool,
+) -> Result<String, AppError> {
+    let evidence = proposal
+        .expected_evidence
+        .iter()
+        .map(|value| bounded_redacted_text(value))
+        .collect::<Vec<_>>();
+    if json {
+        let mut value = proposal_list_value(proposal);
+        let object = value.as_object_mut().expect("proposal projection is an object");
+        object.insert(
+            "hypothesis".to_owned(),
+            serde_json::Value::String(bounded_redacted_text(&proposal.hypothesis)),
+        );
+        object.insert("expected_evidence".to_owned(), serde_json::json!(evidence));
+        object.insert(
+            "canonical_digest".to_owned(),
+            serde_json::Value::String(bounded_redacted_text(&proposal.canonical_digest)),
+        );
+        object.insert(
+            "project_id".to_owned(),
+            serde_json::Value::String(bounded_redacted_text(&campaign.project_id)),
+        );
+        object.insert("schema_version".to_owned(), serde_json::json!(1));
+        return serde_json::to_string(&value).map_err(|source| AppError::Serialization {
+            operation: "serialize campaign proposal inspection",
+            source,
+        });
+    }
+    Ok([
+        human_header("proposal inspect", &campaign.project_id),
+        format!("proposal: {}", bounded_redacted_text(&proposal.proposal_id)),
+        format!("campaign: {}", bounded_redacted_text(&proposal.campaign_id)),
+        format!("kind: {}", proposal.kind.as_str()),
+        format!("state: {}", format_state(proposal.status.as_str())),
+        format!("hypothesis: {}", bounded_redacted_text(&proposal.hypothesis)),
+        format!(
+            "expected_evidence: {}",
+            if evidence.is_empty() {
+                "none".to_owned()
+            } else {
+                evidence.join(", ")
+            }
+        ),
+        format!(
+            "canonical_digest: {}",
+            bounded_redacted_text(&proposal.canonical_digest)
+        ),
+        format!("timestamps: created_at={} updated_at={}", proposal.created_at, proposal.updated_at),
+        human_summary("proposal inspected"),
+    ]
+    .join("\n"))
+}
+
+pub fn render_experiment_list(
+    campaign: &Campaign,
+    experiments: &[Experiment],
+    json: bool,
+) -> Result<String, AppError> {
+    if json {
+        let experiments = experiments
+            .iter()
+            .map(experiment_list_value)
+            .collect::<Vec<_>>();
+        return serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_id": bounded_redacted_text(&campaign.project_id),
+            "campaign_id": bounded_redacted_text(&campaign.campaign_id),
+            "experiments": experiments,
+        }))
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize campaign experiment list",
+            source,
+        });
+    }
+    let mut lines = vec![human_header("experiment list", &campaign.project_id)];
+    lines.push(format!(
+        "campaign: {}",
+        bounded_redacted_text(&campaign.campaign_id)
+    ));
+    lines.extend(experiments.iter().map(|experiment| {
+        format!(
+            "experiment={} state={} proposal={} submission={} task_id={} created_at={} updated_at={}",
+            bounded_redacted_text(&experiment.experiment_id),
+            format_state(experiment.status.as_str()),
+            bounded_redacted_text(&experiment.proposal_id),
+            bounded_redacted_text(&experiment.submission_id),
+            experiment
+                .pueue_task_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            experiment.created_at,
+            experiment.updated_at,
+        )
+    }));
+    lines.push(human_summary(format!("{} experiment(s)", experiments.len())));
+    Ok(lines.join("\n"))
+}
+
+pub fn render_experiment_inspection(
+    campaign: &Campaign,
+    experiment: &Experiment,
+    argv_digest: &str,
+    json: bool,
+) -> Result<String, AppError> {
+    if json {
+        let mut value = experiment_list_value(experiment);
+        let object = value
+            .as_object_mut()
+            .expect("experiment projection is an object");
+        object.insert("schema_version".to_owned(), serde_json::json!(1));
+        object.insert(
+            "project_id".to_owned(),
+            serde_json::Value::String(bounded_redacted_text(&campaign.project_id)),
+        );
+        object.insert(
+            "argv_digest".to_owned(),
+            serde_json::Value::String(argv_digest.to_owned()),
+        );
+        object.insert(
+            "task_signature".to_owned(),
+            safe_optional_text(experiment.task_signature.as_deref())
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        return serde_json::to_string(&value).map_err(|source| AppError::Serialization {
+            operation: "serialize campaign experiment inspection",
+            source,
+        });
+    }
+    Ok([
+        human_header("experiment inspect", &campaign.project_id),
+        format!("experiment: {}", bounded_redacted_text(&experiment.experiment_id)),
+        format!("campaign: {}", bounded_redacted_text(&experiment.campaign_id)),
+        format!("proposal: {}", bounded_redacted_text(&experiment.proposal_id)),
+        format!("submission: {}", bounded_redacted_text(&experiment.submission_id)),
+        format!(
+            "parent_experiment: {}",
+            safe_optional_text(experiment.parent_experiment_id.as_deref())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!("attempt: {}", experiment.attempt),
+        format!("state: {}", format_state(experiment.status.as_str())),
+        format!(
+            "task_id: {}",
+            experiment
+                .pueue_task_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "task_signature: {}",
+            safe_optional_text(experiment.task_signature.as_deref())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!("argv_digest: {argv_digest}"),
+        format!(
+            "failure_code: {}",
+            safe_optional_text(experiment.failure_code.as_deref())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "timestamps: created_at={} updated_at={} finished_at={}",
+            experiment.created_at,
+            experiment.updated_at,
+            experiment
+                .finished_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        human_summary("experiment inspected"),
+    ]
+    .join("\n"))
+}
+
+fn proposal_list_value(proposal: &Proposal) -> serde_json::Value {
+    serde_json::json!({
+        "proposal_id": bounded_redacted_text(&proposal.proposal_id),
+        "campaign_id": bounded_redacted_text(&proposal.campaign_id),
+        "kind": proposal.kind.as_str(),
+        "status": proposal.status.as_str(),
+        "source_experiment_id": safe_optional_text(proposal.source_experiment_id.as_deref()),
+        "reject_reason": safe_optional_text(proposal.reject_reason.as_deref()),
+        "created_at": proposal.created_at,
+        "updated_at": proposal.updated_at,
+    })
+}
+
+fn experiment_list_value(experiment: &Experiment) -> serde_json::Value {
+    serde_json::json!({
+        "experiment_id": bounded_redacted_text(&experiment.experiment_id),
+        "campaign_id": bounded_redacted_text(&experiment.campaign_id),
+        "proposal_id": bounded_redacted_text(&experiment.proposal_id),
+        "submission_id": bounded_redacted_text(&experiment.submission_id),
+        "parent_experiment_id": safe_optional_text(experiment.parent_experiment_id.as_deref()),
+        "attempt": experiment.attempt,
+        "status": experiment.status.as_str(),
+        "pueue_task_id": experiment.pueue_task_id,
+        "failure_code": safe_optional_text(experiment.failure_code.as_deref()),
+        "created_at": experiment.created_at,
+        "updated_at": experiment.updated_at,
+        "finished_at": experiment.finished_at,
+    })
+}
+
+fn safe_optional_text(value: Option<&str>) -> Option<String> {
+    value.map(bounded_redacted_text)
+}
+
+fn render_counts(counts: &std::collections::BTreeMap<String, i64>) -> String {
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(key, value)| format!("{}={value}", bounded_redacted_text(key)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn format_state(state: &str) -> String {

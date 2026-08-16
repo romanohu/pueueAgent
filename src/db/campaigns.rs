@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+
 use rusqlite::{
     params,
     types::Type,
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     execution_policy::CampaignLimits,
@@ -21,6 +24,7 @@ use super::{database_error, Db};
 
 const ROLLING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const MAX_FAILURE_FIELD_BYTES: usize = 128;
+const MAX_STATUS_TASK_IDS: i64 = 100;
 
 const CAMPAIGN_SELECT: &str = "SELECT campaign_id, project_id, objective_text, objective_digest,
         initial_argv_json, state, state_reason, baseline_experiment_id, next_eligible_at,
@@ -501,6 +505,221 @@ impl<'db> CampaignRepository<'db> {
             .optional()
             .map_err(database_error("find live campaign by project"))
     }
+
+    pub fn find_latest_by_project(&self, project_id: &str) -> Result<Option<Campaign>, AppError> {
+        let connection = self.db.connect()?;
+        find_latest_campaign_by_project(&connection, project_id)
+    }
+
+    pub fn status_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<
+        (
+            Campaign,
+            i64,
+            BTreeMap<String, i64>,
+            BTreeMap<String, i64>,
+            Vec<i64>,
+        ),
+        AppError,
+    > {
+        let connection = self.db.connect()?;
+        let campaign = find_latest_campaign_by_project(&connection, project_id)?
+            .ok_or_else(|| validation_error("campaign", "the project has no campaign"))?;
+        let proposal_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM proposals WHERE campaign_id = ?1",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count campaign proposals for status"))?;
+        let experiment_counts = grouped_campaign_counts(
+            &connection,
+            "SELECT status, COUNT(*) FROM experiments WHERE campaign_id = ?1 GROUP BY status",
+            &campaign.campaign_id,
+            "count campaign experiments for status",
+        )?;
+        let budget_usage = grouped_campaign_counts(
+            &connection,
+            "SELECT status, COUNT(*) FROM budget_reservations WHERE campaign_id = ?1 GROUP BY status",
+            &campaign.campaign_id,
+            "count campaign budget reservations for status",
+        )?;
+        let mut statement = connection
+            .prepare(
+                "SELECT pueue_task_id FROM experiments
+                 WHERE campaign_id = ?1 AND pueue_task_id IS NOT NULL
+                 ORDER BY pueue_task_id DESC, experiment_id DESC LIMIT ?2",
+            )
+            .map_err(database_error("prepare campaign task IDs for status"))?;
+        let task_ids = statement
+            .query_map(
+                params![campaign.campaign_id, MAX_STATUS_TASK_IDS],
+                |row| row.get(0),
+            )
+            .map_err(database_error("query campaign task IDs for status"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read campaign task IDs for status"))?;
+        Ok((
+            campaign,
+            proposal_count,
+            experiment_counts,
+            budget_usage,
+            task_ids,
+        ))
+    }
+
+    pub fn pause(&self, project_id: &str, now: i64) -> Result<Campaign, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign pause transition"))?;
+        let campaign = read_latest_campaign_by_project(&transaction, project_id)?;
+        if campaign.state == CampaignState::Paused {
+            return Ok(campaign);
+        }
+        if !matches!(
+            campaign.state,
+            CampaignState::Active | CampaignState::BudgetWaiting | CampaignState::Degraded
+        ) {
+            return Err(validation_error(
+                "campaign",
+                "state does not permit an operator pause",
+            ));
+        }
+        update_campaign_state(
+            &transaction,
+            &campaign.campaign_id,
+            CampaignState::Paused,
+            Some("operator_paused"),
+            now,
+            "pause campaign",
+        )?;
+        let stored = read_campaign(&transaction, &campaign.campaign_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign pause transition"))?;
+        Ok(stored)
+    }
+
+    pub fn resume(&self, project_id: &str, now: i64) -> Result<Campaign, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign resume transition"))?;
+        let campaign = read_latest_campaign_by_project(&transaction, project_id)?;
+        if !matches!(
+            campaign.state,
+            CampaignState::Active
+                | CampaignState::Paused
+                | CampaignState::BudgetWaiting
+                | CampaignState::Degraded
+                | CampaignState::GoalReachedPendingReview
+        ) {
+            return Err(validation_error(
+                "campaign",
+                "state does not permit an operator resume",
+            ));
+        }
+        validate_project_available(&transaction, project_id)?;
+        let unsafe_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                 WHERE campaign_id = ?1
+                   AND (status = 'unreconciled' OR failure_code = 'termination_unknown')",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign reconciliation before resume"))?;
+        if unsafe_count != 0 {
+            return Err(validation_error(
+                "campaign",
+                "cannot resume while reconciliation or termination state is unknown",
+            ));
+        }
+        if campaign.state == CampaignState::Active {
+            return Ok(campaign);
+        }
+        update_campaign_state(
+            &transaction,
+            &campaign.campaign_id,
+            CampaignState::Active,
+            Some("operator_resumed"),
+            now,
+            "resume campaign",
+        )?;
+        let stored = read_campaign(&transaction, &campaign.campaign_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign resume transition"))?;
+        Ok(stored)
+    }
+
+    pub fn retire(&self, project_id: &str, now: i64) -> Result<Campaign, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign retire transition"))?;
+        let campaign = read_latest_campaign_by_project(&transaction, project_id)?;
+        if campaign.state == CampaignState::Retired {
+            return Ok(campaign);
+        }
+        if !matches!(
+            campaign.state,
+            CampaignState::Active
+                | CampaignState::Paused
+                | CampaignState::GoalReachedPendingReview
+        ) {
+            return Err(validation_error(
+                "campaign",
+                "state does not permit operator retirement",
+            ));
+        }
+        let nonterminal_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                 WHERE campaign_id = ?1
+                   AND (status NOT IN ('succeeded','failed','cancelled')
+                        OR failure_code = 'termination_unknown')",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign experiments before retire"))?;
+        if nonterminal_count != 0 {
+            return Err(validation_error(
+                "campaign",
+                "cannot retire while experiments are nonterminal or termination is unknown",
+            ));
+        }
+        let reserved_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND status = 'reserved'",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign reservations before retire"))?;
+        if reserved_count != 0 {
+            return Err(validation_error(
+                "campaign",
+                "cannot retire while budget reservations remain reserved",
+            ));
+        }
+        update_campaign_state(
+            &transaction,
+            &campaign.campaign_id,
+            CampaignState::Retired,
+            Some("operator_retired"),
+            now,
+            "retire campaign",
+        )?;
+        let stored = read_campaign(&transaction, &campaign.campaign_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign retire transition"))?;
+        Ok(stored)
+    }
 }
 
 impl<'db> ProposalRepository<'db> {
@@ -519,6 +738,43 @@ impl<'db> ProposalRepository<'db> {
             .optional()
             .map_err(database_error("find campaign proposal by ID"))
     }
+
+    pub fn list_for_campaign(
+        &self,
+        campaign_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Proposal>, AppError> {
+        validate_inspection_limit(limit)?;
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{PROPOSAL_SELECT} WHERE campaign_id = ?1
+                 ORDER BY created_at DESC, proposal_id DESC LIMIT ?2"
+            ))
+            .map_err(database_error("prepare scoped campaign proposal list"))?;
+        let proposals = statement
+            .query_map(params![campaign_id, limit as i64], proposal_from_row)
+            .map_err(database_error("query scoped campaign proposal list"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read scoped campaign proposal list"))?;
+        Ok(proposals)
+    }
+
+    pub fn find_for_campaign(
+        &self,
+        campaign_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<Proposal>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{PROPOSAL_SELECT} WHERE campaign_id = ?1 AND proposal_id = ?2"),
+                params![campaign_id, proposal_id],
+                proposal_from_row,
+            )
+            .optional()
+            .map_err(database_error("find scoped campaign proposal by ID"))
+    }
 }
 
 impl<'db> ExperimentRepository<'db> {
@@ -529,6 +785,58 @@ impl<'db> ExperimentRepository<'db> {
     pub fn find_by_id(&self, experiment_id: &str) -> Result<Option<Experiment>, AppError> {
         let connection = self.db.connect()?;
         find_experiment(&connection, experiment_id)
+    }
+
+    pub fn list_for_campaign(
+        &self,
+        campaign_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Experiment>, AppError> {
+        validate_inspection_limit(limit)?;
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{EXPERIMENT_SELECT} WHERE campaign_id = ?1
+                 ORDER BY created_at DESC, experiment_id DESC LIMIT ?2"
+            ))
+            .map_err(database_error("prepare scoped campaign experiment list"))?;
+        let experiments = statement
+            .query_map(params![campaign_id, limit as i64], experiment_from_row)
+            .map_err(database_error("query scoped campaign experiment list"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read scoped campaign experiment list"))?;
+        Ok(experiments)
+    }
+
+    pub fn inspect_for_campaign(
+        &self,
+        campaign_id: &str,
+        experiment_id: &str,
+    ) -> Result<Option<(Experiment, String)>, AppError> {
+        let connection = self.db.connect()?;
+        let experiment = connection
+            .query_row(
+                &format!("{EXPERIMENT_SELECT} WHERE campaign_id = ?1 AND experiment_id = ?2"),
+                params![campaign_id, experiment_id],
+                experiment_from_row,
+            )
+            .optional()
+            .map_err(database_error("find scoped campaign experiment by ID"))?;
+        let Some(experiment) = experiment else {
+            return Ok(None);
+        };
+        let argv_json: String = connection
+            .query_row(
+                "SELECT argv_json FROM proposals
+                 WHERE campaign_id = ?1 AND proposal_id = ?2",
+                params![campaign_id, experiment.proposal_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read scoped experiment argv digest source"))?;
+        Ok(Some((
+            experiment,
+            format!("{:x}", Sha256::digest(argv_json.as_bytes())),
+        )))
     }
 
     pub fn find_by_submission_id(
@@ -1099,6 +1407,82 @@ fn find_campaign(connection: &Connection, campaign_id: &str) -> Result<Option<Ca
         )
         .optional()
         .map_err(database_error("find campaign by ID"))
+}
+
+fn find_latest_campaign_by_project(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Option<Campaign>, AppError> {
+    connection
+        .query_row(
+            &format!(
+                "{CAMPAIGN_SELECT} WHERE project_id = ?1
+                 ORDER BY (state = 'retired') ASC, created_at DESC, campaign_id DESC LIMIT 1"
+            ),
+            [project_id],
+            campaign_from_row,
+        )
+        .optional()
+        .map_err(database_error("find latest campaign by project"))
+}
+
+fn read_latest_campaign_by_project(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Campaign, AppError> {
+    find_latest_campaign_by_project(connection, project_id)?
+        .ok_or_else(|| validation_error("campaign", "the project has no campaign"))
+}
+
+fn grouped_campaign_counts(
+    connection: &Connection,
+    sql: &str,
+    campaign_id: &str,
+    operation: &'static str,
+) -> Result<BTreeMap<String, i64>, AppError> {
+    let mut statement = connection.prepare(sql).map_err(database_error(operation))?;
+    let counts = statement
+        .query_map([campaign_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(database_error(operation))?
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(database_error(operation))?;
+    Ok(counts)
+}
+
+fn update_campaign_state(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    state: CampaignState,
+    state_reason: Option<&str>,
+    now: i64,
+    operation: &'static str,
+) -> Result<(), AppError> {
+    let updated = transaction
+        .execute(
+            "UPDATE campaigns
+             SET state = ?1, state_reason = ?2, next_eligible_at = NULL, updated_at = ?3
+             WHERE campaign_id = ?4",
+            params![state, state_reason, now, campaign_id],
+        )
+        .map_err(database_error(operation))?;
+    if updated != 1 {
+        return Err(validation_error(
+            "campaign",
+            "state changed concurrently during operator transition",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_inspection_limit(limit: usize) -> Result<(), AppError> {
+    if (1..=100).contains(&limit) {
+        Ok(())
+    } else {
+        Err(validation_error(
+            "limit",
+            "must be between 1 and 100",
+        ))
+    }
 }
 
 fn read_campaign(connection: &Connection, campaign_id: &str) -> Result<Campaign, AppError> {

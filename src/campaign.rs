@@ -12,15 +12,146 @@ use crate::{
     models::{
         Campaign, Experiment, ExperimentStatus, Project, Proposal, ProposalKind, Submission,
     },
+    output::{
+        render_campaign_mutation, render_campaign_status, render_experiment_inspection,
+        render_experiment_list, render_proposal_inspection, render_proposal_list,
+    },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
     state::ObjectiveSnapshot,
     AppError,
 };
 
+pub const DEFAULT_INSPECTION_LIMIT: usize = 20;
+pub const MAX_INSPECTION_LIMIT: usize = 100;
+
 const BASELINE_HYPOTHESIS: &str = "Establish the initial campaign baseline";
 const ADD_UNKNOWN_REASON: &str = "pueue_add_unknown";
 const ADD_INTERRUPTED_REASON: &str = "pueue_add_interrupted";
+
+pub fn render_status_for_project(
+    db: &Db,
+    project: &Project,
+    json: bool,
+) -> Result<String, AppError> {
+    let (campaign, proposal_count, experiment_counts, budget_usage, task_ids) =
+        CampaignRepository::new(db).status_for_project(&project.project_id)?;
+    render_campaign_status(
+        &campaign,
+        proposal_count,
+        &experiment_counts,
+        &budget_usage,
+        &task_ids,
+        json,
+    )
+}
+
+pub fn pause_for_project(
+    db: &Db,
+    project: &Project,
+    now: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = CampaignRepository::new(db).pause(&project.project_id, now)?;
+    render_campaign_mutation(&campaign, "pause", json)
+}
+
+pub fn resume_for_project(
+    db: &Db,
+    project: &Project,
+    now: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = CampaignRepository::new(db).resume(&project.project_id, now)?;
+    render_campaign_mutation(&campaign, "resume", json)
+}
+
+pub fn retire_for_project(
+    db: &Db,
+    project: &Project,
+    now: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = CampaignRepository::new(db).retire(&project.project_id, now)?;
+    render_campaign_mutation(&campaign, "retire", json)
+}
+
+pub fn render_proposals_for_project(
+    db: &Db,
+    project: &Project,
+    limit: usize,
+    json: bool,
+) -> Result<String, AppError> {
+    validate_inspection_limit(limit)?;
+    let campaign = latest_campaign(db, project)?;
+    let proposals = ProposalRepository::new(db).list_for_campaign(&campaign.campaign_id, limit)?;
+    render_proposal_list(&campaign, &proposals, json)
+}
+
+pub fn render_proposal_for_project(
+    db: &Db,
+    project: &Project,
+    proposal_id: &str,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = latest_campaign(db, project)?;
+    let proposal = ProposalRepository::new(db)
+        .find_for_campaign(&campaign.campaign_id, proposal_id)?
+        .ok_or(AppError::Validation {
+            field: "proposal_id",
+            message: "does not identify a proposal in this project campaign",
+        })?;
+    render_proposal_inspection(&campaign, &proposal, json)
+}
+
+pub fn render_experiments_for_project(
+    db: &Db,
+    project: &Project,
+    limit: usize,
+    json: bool,
+) -> Result<String, AppError> {
+    validate_inspection_limit(limit)?;
+    let campaign = latest_campaign(db, project)?;
+    let experiments =
+        ExperimentRepository::new(db).list_for_campaign(&campaign.campaign_id, limit)?;
+    render_experiment_list(&campaign, &experiments, json)
+}
+
+pub fn render_experiment_for_project(
+    db: &Db,
+    project: &Project,
+    experiment_id: &str,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = latest_campaign(db, project)?;
+    let (experiment, argv_digest) = ExperimentRepository::new(db)
+        .inspect_for_campaign(&campaign.campaign_id, experiment_id)?
+        .ok_or(AppError::Validation {
+            field: "experiment_id",
+            message: "does not identify an experiment in this project campaign",
+        })?;
+    render_experiment_inspection(&campaign, &experiment, &argv_digest, json)
+}
+
+fn latest_campaign(db: &Db, project: &Project) -> Result<Campaign, AppError> {
+    CampaignRepository::new(db)
+        .find_latest_by_project(&project.project_id)?
+        .ok_or(AppError::Validation {
+            field: "campaign",
+            message: "the project has no campaign",
+        })
+}
+
+fn validate_inspection_limit(limit: usize) -> Result<(), AppError> {
+    if (1..=MAX_INSPECTION_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(AppError::Validation {
+            field: "limit",
+            message: "must be between 1 and 100",
+        })
+    }
+}
 
 pub struct CampaignCoordinator<'a, P: PueueApi + ?Sized> {
     db: &'a Db,

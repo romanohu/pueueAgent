@@ -140,6 +140,37 @@ fn help_lists_diagnostics_commands_and_status_options() {
 }
 
 #[test]
+fn campaign_command_help_exposes_campaign_proposal_and_experiment_actions() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for command in ["campaign", "proposal", "experiment"] {
+        assert!(text.contains(command), "missing {command} from top-level help");
+    }
+
+    for (command, actions) in [
+        ("campaign", &["status", "pause", "resume", "retire"][..]),
+        ("proposal", &["list", "inspect"][..]),
+        ("experiment", &["list", "inspect"][..]),
+    ] {
+        let output = assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        for action in actions {
+            assert!(text.contains(action), "missing {command} {action} from help");
+        }
+    }
+}
+
+#[test]
 fn command_reference_covers_every_public_cli_without_exposing_internal_launch() {
     let output = assert_cmd::Command::cargo_bin("pueue-agent")
         .unwrap()

@@ -16,14 +16,17 @@ use pueue_agent::{
     cancel::{cancel_task_with, render_cancel_result},
     daemon::{Daemon, DaemonConfig},
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
-        TaskObservationRepository, TerminationRequestRepository,
+        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        IncidentRepository, ProjectRepository, StartCampaignRequest, TaskObservationRepository,
+        TerminationRequestRepository,
     },
     diagnostics::render_project_status_json,
     models::{
-        AgentContextMode, AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewIncident,
-        NewProject, NewTaskObservation, NewTerminationRequest, TerminationRequestStatus,
+        AgentContextMode, AgentRunStatus, CampaignState, EventKind, ExperimentTerminalOutcome,
+        NewAgentRun, NewEvent, NewIncident, NewProject, NewTaskObservation,
+        NewTerminationRequest, ProposalKind, TerminationRequestStatus,
     },
+    proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
     service::ServiceStatus,
     status::{self, DisableMode, PueueSnapshot, StatusInput},
@@ -990,7 +993,9 @@ max_agent_runs = 10
             ),
         )
         .unwrap();
-        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let state_dir = temp.path().join("execution-policy-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
         let now = 100;
         ProjectRepository::new(&db)
             .register(&NewProject::new(
@@ -1008,6 +1013,234 @@ max_agent_runs = 10
         ProjectRepository::new(&self.db)
             .find_by_id("project-a")
             .unwrap()
+            .unwrap()
+    }
+
+    fn with_campaign() -> Self {
+        let harness = Self::new();
+        harness.create_campaign();
+        harness
+    }
+
+    fn with_accepted_experiment() -> Self {
+        let harness = Self::with_campaign();
+        let experiment = ExperimentRepository::new(&harness.db)
+            .find_by_id("experiment-cli")
+            .unwrap()
+            .unwrap();
+        let experiments = ExperimentRepository::new(&harness.db);
+        experiments
+            .mark_submitting(&experiment.experiment_id, harness.now + 1)
+            .unwrap();
+        experiments
+            .mark_accepted(
+                &experiment.experiment_id,
+                41,
+                "task-signature-cli",
+                harness.now + 2,
+            )
+            .unwrap();
+        harness
+    }
+
+    fn with_terminal_experiment() -> Self {
+        let harness = Self::with_accepted_experiment();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                "experiment-cli",
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                harness.now + 3,
+            )
+            .unwrap();
+        harness
+    }
+
+    fn with_unreconciled_experiment() -> Self {
+        let harness = Self::with_campaign();
+        let experiments = ExperimentRepository::new(&harness.db);
+        experiments
+            .mark_submitting("experiment-cli", harness.now + 1)
+            .unwrap();
+        experiments
+            .mark_unreconciled("experiment-cli", "pueue_add_unknown", harness.now + 2)
+            .unwrap();
+        harness
+    }
+
+    fn with_termination_unknown_experiment() -> Self {
+        let harness = Self::with_accepted_experiment();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                "experiment-cli",
+                41,
+                ExperimentTerminalOutcome::Failed {
+                    failure_code: "termination_unknown",
+                    failure_fingerprint: "termination-unknown-cli",
+                },
+                harness.now + 3,
+            )
+            .unwrap();
+        harness
+    }
+
+    fn add_historical_campaign_tasks(&self, count: i64) {
+        let mut connection = self.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for offset in 0..count {
+            let proposal_id = format!("proposal-history-{offset:03}");
+            let submission_id = format!("submission-history-{offset:03}");
+            let experiment_id = format!("experiment-history-{offset:03}");
+            transaction
+                .execute(
+                    "INSERT INTO proposals (
+                        proposal_id, campaign_id, kind, status, hypothesis,
+                        source_experiment_id, argv_json, working_directory,
+                        expected_evidence_json, canonical_digest, reject_reason,
+                        created_at, updated_at
+                     ) VALUES (?1, 'campaign-cli', 'experiment', 'accepted', 'history',
+                        'experiment-cli', '[\"true\"]', '.', '[]', ?1, NULL, ?2, ?2)",
+                    rusqlite::params![proposal_id, self.now + offset + 1],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO submissions (
+                        submission_id, project_id, argv_json, created_at, pueue_task_id,
+                        task_signature, status, kind, metadata_json, origin_agent_run_id
+                     ) VALUES (?1, 'project-a', '[\"true\"]', ?2, ?3, ?4,
+                        'accepted', 'experiment', '{}', NULL)",
+                    rusqlite::params![
+                        submission_id,
+                        self.now + offset + 1,
+                        1_000 + offset,
+                        format!("history-signature-{offset:03}"),
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO experiments (
+                        experiment_id, campaign_id, proposal_id, submission_id,
+                        parent_experiment_id, attempt, status, pueue_task_id,
+                        task_signature, failure_code, failure_fingerprint,
+                        created_at, updated_at, finished_at
+                     ) VALUES (?1, 'campaign-cli', ?2, ?3, 'experiment-cli', ?4,
+                        'succeeded', ?5, ?6, NULL, NULL, ?7, ?7, ?7)",
+                    rusqlite::params![
+                        experiment_id,
+                        proposal_id,
+                        submission_id,
+                        offset + 1,
+                        1_000 + offset,
+                        format!("history-signature-{offset:03}"),
+                        self.now + offset + 1,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    fn create_campaign(&self) {
+        let objective = pueue_agent::state::ObjectiveSnapshot {
+            text: "OBJECTIVE_SECRET_TEXT must never be printed".to_owned(),
+            digest: "objective-digest-cli".to_owned(),
+        };
+        let argv = vec![
+            "python".to_owned(),
+            "--token".to_owned(),
+            "RAW_ARGV_SECRET".to_owned(),
+        ];
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "bounded baseline hypothesis".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["metrics.json".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "campaign-cli",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &baseline,
+                    submission_id: "submission-cli",
+                    experiment_id: "experiment-cli",
+                    proposal_id: "proposal-cli",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    now: self.now,
+                },
+                &self.policy().campaign_limits,
+            )
+            .unwrap();
+    }
+
+    fn campaign_state(&self) -> CampaignState {
+        CampaignRepository::new(&self.db)
+            .find_by_id("campaign-cli")
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    #[cfg(unix)]
+    fn run(&self, arguments: &[&str]) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = fs::canonicalize(self.temp.path()).unwrap();
+        let state_dir = base.join("execution-policy-state");
+        let home = base.join("cli-home");
+        let codex_home = base.join("cli-codex-home");
+        let trusted_dir = base.join("cli-trusted-bin");
+        let pueue_config = home.join(".config/pueue/pueue.yml");
+        for directory in [
+            &state_dir,
+            &home,
+            &codex_home,
+            &trusted_dir,
+            pueue_config.parent().unwrap(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let executable = trusted_dir.join("pueue-agent-fixture");
+        fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&pueue_config, "fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            state_dir.join("execution-policy.toml"),
+            format!(
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+                trusted_dir.display().to_string(),
+                executable.display().to_string(),
+                executable.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            state_dir.join("execution-policy.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_cmd::Command::cargo_bin("pueue-agent")
+            .unwrap()
+            .current_dir(self.project().root_path)
+            .env("HOME", home)
+            .env("CODEX_HOME", codex_home)
+            .env("PUEUE_AGENT_STATE_DIR", state_dir)
+            .env("PATH", trusted_dir)
+            .args(arguments)
+            .output()
             .unwrap()
     }
 
@@ -1087,6 +1320,175 @@ max_agent_runs = 10
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_pause_and_resume_change_only_campaign_state_and_are_idempotent() {
+    let harness = OperatorHarness::with_campaign();
+
+    for _ in 0..2 {
+        let output = harness.run(&["campaign", "pause", "--json"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(harness.campaign_state(), CampaignState::Paused);
+        assert!(!harness.project().paused);
+    }
+    for _ in 0..2 {
+        let output = harness.run(&["campaign", "resume", "--json"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(harness.campaign_state(), CampaignState::Active);
+        assert!(!harness.project().paused);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_retire_requires_no_nonterminal_experiment() {
+    let harness = OperatorHarness::with_accepted_experiment();
+
+    let output = harness.run(&["campaign", "retire"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nonterminal"));
+    assert_eq!(harness.campaign_state(), CampaignState::Active);
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_retire_and_resume_reject_unreconciled_experiment() {
+    let harness = OperatorHarness::with_unreconciled_experiment();
+
+    let retire = harness.run(&["campaign", "retire"]);
+    assert!(!retire.status.success());
+    assert!(String::from_utf8_lossy(&retire.stderr).contains("nonterminal"));
+    assert_eq!(harness.campaign_state(), CampaignState::Active);
+
+    assert!(harness.run(&["campaign", "pause"]).status.success());
+    let resume = harness.run(&["campaign", "resume"]);
+    assert!(!resume.status.success());
+    assert!(String::from_utf8_lossy(&resume.stderr).contains("reconciliation"));
+    assert_eq!(harness.campaign_state(), CampaignState::Paused);
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_retire_rejects_terminal_experiment_with_unknown_termination() {
+    let harness = OperatorHarness::with_termination_unknown_experiment();
+
+    let output = harness.run(&["campaign", "retire"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("termination"));
+    assert_eq!(harness.campaign_state(), CampaignState::Active);
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_status_bounds_historical_task_ids() {
+    let harness = OperatorHarness::with_campaign();
+    harness.add_historical_campaign_tasks(105);
+
+    let output = harness.run(&["campaign", "status", "--json"]);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let task_ids = body["task_ids"].as_array().unwrap();
+    assert_eq!(task_ids.len(), 100);
+    assert_eq!(task_ids[0], 1_104);
+    assert_eq!(task_ids[99], 1_005);
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_retire_is_idempotent_after_terminal_experiments() {
+    let harness = OperatorHarness::with_terminal_experiment();
+
+    for _ in 0..2 {
+        let output = harness.run(&["campaign", "retire", "--json"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(harness.campaign_state(), CampaignState::Retired);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_json_status_omits_objective_text_and_raw_argv() {
+    let harness = OperatorHarness::with_campaign();
+
+    let output = harness.run(&["campaign", "status", "--json"]);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["campaign_id"], "campaign-cli");
+    assert_eq!(body["objective_digest"], "objective-digest-cli");
+    assert!(!text.contains("OBJECTIVE_SECRET_TEXT"));
+    assert!(!text.contains("RAW_ARGV_SECRET"));
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_resume_revalidates_project_availability() {
+    let harness = OperatorHarness::with_campaign();
+    assert!(harness.run(&["campaign", "pause"]).status.success());
+    ProjectRepository::new(&harness.db)
+        .disable("project-a", harness.now + 1, &[])
+        .unwrap();
+
+    let output = harness.run(&["campaign", "resume"]);
+
+    assert!(!output.status.success());
+    assert_eq!(harness.campaign_state(), CampaignState::Paused);
+}
+
+#[cfg(unix)]
+#[test]
+fn proposal_list_and_inspect_are_scoped_bounded_and_omit_raw_argv() {
+    let harness = OperatorHarness::with_campaign();
+
+    let list = harness.run(&["proposal", "list", "--limit", "20", "--json"]);
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    let list_text = String::from_utf8(list.stdout).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&list_text).unwrap();
+    assert_eq!(body["proposals"][0]["proposal_id"], "proposal-cli");
+    assert!(!list_text.contains("RAW_ARGV_SECRET"));
+
+    let inspect = harness.run(&["proposal", "inspect", "proposal-cli", "--json"]);
+    assert!(inspect.status.success(), "{}", String::from_utf8_lossy(&inspect.stderr));
+    let inspect_text = String::from_utf8(inspect.stdout).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&inspect_text).unwrap();
+    assert_eq!(body["hypothesis"], "bounded baseline hypothesis");
+    assert_eq!(body["expected_evidence"][0], "metrics.json");
+    assert!(body.get("argv").is_none());
+    assert!(!inspect_text.contains("RAW_ARGV_SECRET"));
+
+    assert!(!harness
+        .run(&["proposal", "list", "--limit", "101"])
+        .status
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn experiment_list_and_inspect_use_argv_digest_and_task_identity() {
+    let harness = OperatorHarness::with_accepted_experiment();
+
+    let list = harness.run(&["experiment", "list", "--json"]);
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    let list_text = String::from_utf8(list.stdout).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&list_text).unwrap();
+    assert_eq!(body["experiments"][0]["experiment_id"], "experiment-cli");
+    assert!(!list_text.contains("RAW_ARGV_SECRET"));
+
+    let inspect = harness.run(&["experiment", "inspect", "experiment-cli", "--json"]);
+    assert!(inspect.status.success(), "{}", String::from_utf8_lossy(&inspect.stderr));
+    let inspect_text = String::from_utf8(inspect.stdout).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&inspect_text).unwrap();
+    assert_eq!(body["submission_id"], "submission-cli");
+    assert_eq!(body["pueue_task_id"], 41);
+    assert!(body["argv_digest"].as_str().is_some_and(|digest| digest.len() == 64));
+    assert!(body.get("argv").is_none());
+    assert!(!inspect_text.contains("RAW_ARGV_SECRET"));
 }
 
 #[test]

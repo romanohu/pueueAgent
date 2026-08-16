@@ -80,6 +80,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Start(args) => commands::start(args),
         Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
+        Command::Campaign(args) => commands::campaign(args),
+        Command::Proposal(args) => commands::proposal(args),
+        Command::Experiment(args) => commands::experiment(args),
     }
 }
 
@@ -90,10 +93,11 @@ mod commands {
         agent::{AgentRunner, AgentRunnerConfig},
         cancel::{cancel_task_with, render_cancel_result},
         cli::{
-            CancelArgs, DaemonArgs, DisableArgs, DoctorArgs, EventArgs, EventsArgs, ExplainArgs,
-            InitArgs, InspectArgs, ProjectArgs, RunsArgs, ServiceLifecycleArgs, StatusArgs,
-            SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs, UpgradeArgs, VersionArgs,
-            WakeArgs,
+            CampaignAction, CampaignArgs, CancelArgs, DaemonArgs, DisableArgs, DoctorArgs,
+            EventArgs, EventsArgs, ExperimentAction, ExperimentArgs, ExplainArgs, InitArgs,
+            InspectArgs, ProjectArgs, ProposalAction, ProposalArgs, RunsArgs,
+            ServiceLifecycleArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs,
+            UpgradeArgs, VersionArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{Db, InterventionRepository, ProjectRepository},
@@ -455,6 +459,120 @@ mod commands {
         let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
         let project = status_command::resume_project(&db, &project.project_id, unix_timestamp()?)?;
         println!("resumed: {}", bounded_redacted_text(&project.project_id));
+        Ok(())
+    }
+
+    pub fn campaign(args: CampaignArgs) -> Result<(), AppError> {
+        match args.action {
+            CampaignAction::Status(args) => {
+                let (db, project, _, _) =
+                    resolve_project_read_only(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::render_status_for_project(&db, &project, args.json)?
+                );
+            }
+            CampaignAction::Pause(args) => {
+                let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::pause_for_project(
+                        &db,
+                        &project,
+                        unix_timestamp()?,
+                        args.json,
+                    )?
+                );
+            }
+            CampaignAction::Resume(args) => {
+                let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::resume_for_project(
+                        &db,
+                        &project,
+                        unix_timestamp()?,
+                        args.json,
+                    )?
+                );
+            }
+            CampaignAction::Retire(args) => {
+                let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::retire_for_project(
+                        &db,
+                        &project,
+                        unix_timestamp()?,
+                        args.json,
+                    )?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn proposal(args: ProposalArgs) -> Result<(), AppError> {
+        match args.action {
+            ProposalAction::List(args) => {
+                let (db, project, _, _) =
+                    resolve_project_read_only(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::render_proposals_for_project(
+                        &db,
+                        &project,
+                        args.limit,
+                        args.json,
+                    )?
+                );
+            }
+            ProposalAction::Inspect(args) => {
+                let (db, project, _, _) =
+                    resolve_project_read_only(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::render_proposal_for_project(
+                        &db,
+                        &project,
+                        &args.proposal_id,
+                        args.json,
+                    )?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn experiment(args: ExperimentArgs) -> Result<(), AppError> {
+        match args.action {
+            ExperimentAction::List(args) => {
+                let (db, project, _, _) =
+                    resolve_project_read_only(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::render_experiments_for_project(
+                        &db,
+                        &project,
+                        args.limit,
+                        args.json,
+                    )?
+                );
+            }
+            ExperimentAction::Inspect(args) => {
+                let (db, project, _, _) =
+                    resolve_project_read_only(args.project_root, args.pueue_config)?;
+                println!(
+                    "{}",
+                    pueue_agent::campaign::render_experiment_for_project(
+                        &db,
+                        &project,
+                        &args.experiment_id,
+                        args.json,
+                    )?
+                );
+            }
+        }
         Ok(())
     }
 
