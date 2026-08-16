@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 15;
+pub const LATEST_SCHEMA_VERSION: i64 = 16;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -63,6 +63,105 @@ const OPERATOR_LOGS_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS operator_logs_project_created_idx
         ON operator_logs(project_id, created_at, log_id);
 "#;
+const CAMPAIGNS_V16_TABLE_SQL: &str = r#"
+CREATE TABLE campaigns (
+    campaign_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    objective_text TEXT NOT NULL,
+    objective_digest TEXT NOT NULL,
+    initial_argv_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'active','budget_waiting','goal_reached_pending_review','paused',
+        'degraded','halted','retired'
+    )),
+    state_reason TEXT,
+    baseline_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    next_eligible_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+const PROPOSALS_V16_TABLE_SQL: &str = r#"
+CREATE TABLE proposals (
+    proposal_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'experiment','repair','broader_search','recipe','code_change','data_evaluation'
+    )),
+    status TEXT NOT NULL CHECK (status IN ('pending','accepted','rejected')),
+    hypothesis TEXT NOT NULL,
+    source_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    argv_json TEXT NOT NULL,
+    working_directory TEXT NOT NULL,
+    expected_evidence_json TEXT NOT NULL,
+    canonical_digest TEXT NOT NULL,
+    reject_reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(campaign_id, canonical_digest)
+);
+"#;
+const EXPERIMENTS_V16_TABLE_SQL: &str = r#"
+CREATE TABLE experiments (
+    experiment_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    proposal_id TEXT NOT NULL REFERENCES proposals(proposal_id) ON DELETE RESTRICT,
+    submission_id TEXT NOT NULL UNIQUE REFERENCES submissions(submission_id) ON DELETE RESTRICT,
+    parent_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    status TEXT NOT NULL CHECK (status IN (
+        'reserved','submitting','accepted','unreconciled',
+        'succeeded','failed','cancelled'
+    )),
+    pueue_task_id INTEGER,
+    task_signature TEXT,
+    failure_code TEXT,
+    failure_fingerprint TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    UNIQUE(proposal_id, attempt),
+    CHECK ((pueue_task_id IS NULL) = (task_signature IS NULL))
+);
+"#;
+const BUDGET_RESERVATIONS_V16_TABLE_SQL: &str = r#"
+CREATE TABLE budget_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    dimension TEXT NOT NULL CHECK (dimension IN ('experiment','agent_run','code_change')),
+    subject_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('reserved','consumed','released')),
+    window_started_at INTEGER NOT NULL,
+    window_ends_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(campaign_id, dimension, subject_key),
+    CHECK (window_ends_at > window_started_at),
+    CHECK (
+        (dimension = 'experiment' AND experiment_id IS NOT NULL)
+        OR (dimension <> 'experiment' AND experiment_id IS NULL)
+    )
+);
+"#;
+const CAMPAIGNS_ONE_LIVE_PROJECT_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX campaigns_one_live_project_idx
+    ON campaigns(project_id) WHERE state <> 'retired';";
+const CAMPAIGNS_STATE_NEXT_ELIGIBLE_INDEX_SQL: &str =
+    "CREATE INDEX campaigns_state_next_eligible_idx
+    ON campaigns(state, next_eligible_at, campaign_id);";
+const PROPOSALS_CAMPAIGN_STATUS_CREATED_INDEX_SQL: &str =
+    "CREATE INDEX proposals_campaign_status_created_idx
+    ON proposals(campaign_id, status, created_at, proposal_id);";
+const EXPERIMENTS_CAMPAIGN_STATUS_CREATED_INDEX_SQL: &str =
+    "CREATE INDEX experiments_campaign_status_created_idx
+    ON experiments(campaign_id, status, created_at, experiment_id);";
+const EXPERIMENTS_PUEUE_TASK_LOOKUP_INDEX_SQL: &str =
+    "CREATE INDEX experiments_pueue_task_lookup_idx
+    ON experiments(pueue_task_id, task_signature);";
+const BUDGET_RESERVATIONS_CAMPAIGN_DIMENSION_WINDOW_INDEX_SQL: &str =
+    "CREATE INDEX budget_reservations_campaign_dimension_window_idx
+    ON budget_reservations(campaign_id, dimension, window_started_at, window_ends_at, reservation_id);";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -102,6 +201,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             && current_schema_has_execution_projection
             && has_canonical_event_status_not_before_index
         {
+            verify_campaign_schema_v16(connection)?;
             return Ok(());
         }
     }
@@ -479,6 +579,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     )?;
     if version != LATEST_SCHEMA_VERSION || !current_schema_has_composite_origin_foreign_key {
         ensure_submission_indexes(&transaction)?;
+    }
+    if version <= 15 {
+        migrate_campaign_schema_to_v16(&transaction)?;
+    } else {
+        verify_campaign_schema_v16(&transaction)?;
     }
     transaction
         .commit()
@@ -1248,6 +1353,306 @@ fn compact_sql(sql: &str) -> String {
         .trim_end_matches(';')
         .to_owned()
         .to_ascii_lowercase()
+}
+
+fn migrate_campaign_schema_to_v16(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    if !campaign_schema_v16_is_canonical(transaction).unwrap_or(false) {
+        for sql in [
+            CAMPAIGNS_V16_TABLE_SQL,
+            CAMPAIGNS_ONE_LIVE_PROJECT_INDEX_SQL,
+            PROPOSALS_V16_TABLE_SQL,
+            EXPERIMENTS_V16_TABLE_SQL,
+            BUDGET_RESERVATIONS_V16_TABLE_SQL,
+            CAMPAIGNS_STATE_NEXT_ELIGIBLE_INDEX_SQL,
+            PROPOSALS_CAMPAIGN_STATUS_CREATED_INDEX_SQL,
+            EXPERIMENTS_CAMPAIGN_STATUS_CREATED_INDEX_SQL,
+            EXPERIMENTS_PUEUE_TASK_LOOKUP_INDEX_SQL,
+            BUDGET_RESERVATIONS_CAMPAIGN_DIMENSION_WINDOW_INDEX_SQL,
+        ] {
+            transaction
+                .execute_batch(sql)
+                .map_err(database_error("apply SQLite v16 campaign migration"))?;
+        }
+    }
+    verify_campaign_schema_v16(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 16;")
+        .map_err(database_error("set SQLite v16 schema version"))
+}
+
+fn verify_campaign_schema_v16(connection: &Connection) -> Result<(), AppError> {
+    if campaign_schema_v16_is_canonical(connection).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v16 campaign schema",
+        })
+    }
+}
+
+fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+    for (table, expected_sql) in [
+        ("campaigns", CAMPAIGNS_V16_TABLE_SQL),
+        ("proposals", PROPOSALS_V16_TABLE_SQL),
+        ("experiments", EXPERIMENTS_V16_TABLE_SQL),
+        ("budget_reservations", BUDGET_RESERVATIONS_V16_TABLE_SQL),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+
+    if !campaign_table_info_matches(
+        connection,
+        "campaigns",
+        &[
+            ("campaign_id", "TEXT", 0, 1),
+            ("project_id", "TEXT", 1, 0),
+            ("objective_text", "TEXT", 1, 0),
+            ("objective_digest", "TEXT", 1, 0),
+            ("initial_argv_json", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("state_reason", "TEXT", 0, 0),
+            ("baseline_experiment_id", "TEXT", 0, 0),
+            ("next_eligible_at", "INTEGER", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+        ],
+    )? || !campaign_table_info_matches(
+        connection,
+        "proposals",
+        &[
+            ("proposal_id", "TEXT", 0, 1),
+            ("campaign_id", "TEXT", 1, 0),
+            ("kind", "TEXT", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("hypothesis", "TEXT", 1, 0),
+            ("source_experiment_id", "TEXT", 0, 0),
+            ("argv_json", "TEXT", 1, 0),
+            ("working_directory", "TEXT", 1, 0),
+            ("expected_evidence_json", "TEXT", 1, 0),
+            ("canonical_digest", "TEXT", 1, 0),
+            ("reject_reason", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+        ],
+    )? || !campaign_table_info_matches(
+        connection,
+        "experiments",
+        &[
+            ("experiment_id", "TEXT", 0, 1),
+            ("campaign_id", "TEXT", 1, 0),
+            ("proposal_id", "TEXT", 1, 0),
+            ("submission_id", "TEXT", 1, 0),
+            ("parent_experiment_id", "TEXT", 0, 0),
+            ("attempt", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("pueue_task_id", "INTEGER", 0, 0),
+            ("task_signature", "TEXT", 0, 0),
+            ("failure_code", "TEXT", 0, 0),
+            ("failure_fingerprint", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("finished_at", "INTEGER", 0, 0),
+        ],
+    )? || !campaign_table_info_matches(
+        connection,
+        "budget_reservations",
+        &[
+            ("reservation_id", "TEXT", 0, 1),
+            ("campaign_id", "TEXT", 1, 0),
+            ("experiment_id", "TEXT", 0, 0),
+            ("dimension", "TEXT", 1, 0),
+            ("subject_key", "TEXT", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("window_started_at", "INTEGER", 1, 0),
+            ("window_ends_at", "INTEGER", 1, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    if !campaign_foreign_keys_match(
+        connection,
+        "campaigns",
+        &[
+            ("projects", "project_id", "project_id", "CASCADE"),
+            (
+                "experiments",
+                "baseline_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ],
+    )? || !campaign_foreign_keys_match(
+        connection,
+        "proposals",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            (
+                "experiments",
+                "source_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ],
+    )? || !campaign_foreign_keys_match(
+        connection,
+        "experiments",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("proposals", "proposal_id", "proposal_id", "RESTRICT"),
+            (
+                "submissions",
+                "submission_id",
+                "submission_id",
+                "RESTRICT",
+            ),
+            (
+                "experiments",
+                "parent_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ],
+    )? || !campaign_foreign_keys_match(
+        connection,
+        "budget_reservations",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            (
+                "experiments",
+                "experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    for (name, expected_sql) in [
+        (
+            "campaigns_one_live_project_idx",
+            CAMPAIGNS_ONE_LIVE_PROJECT_INDEX_SQL,
+        ),
+        (
+            "campaigns_state_next_eligible_idx",
+            CAMPAIGNS_STATE_NEXT_ELIGIBLE_INDEX_SQL,
+        ),
+        (
+            "proposals_campaign_status_created_idx",
+            PROPOSALS_CAMPAIGN_STATUS_CREATED_INDEX_SQL,
+        ),
+        (
+            "experiments_campaign_status_created_idx",
+            EXPERIMENTS_CAMPAIGN_STATUS_CREATED_INDEX_SQL,
+        ),
+        (
+            "experiments_pueue_task_lookup_idx",
+            EXPERIMENTS_PUEUE_TASK_LOOKUP_INDEX_SQL,
+        ),
+        (
+            "budget_reservations_campaign_dimension_window_idx",
+            BUDGET_RESERVATIONS_CAMPAIGN_DIMENSION_WINDOW_INDEX_SQL,
+        ),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn campaign_table_info_matches(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, i64, i64)],
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(actual
+        == expected
+            .iter()
+            .map(|(name, declared_type, not_null, primary_key)| {
+                (
+                    (*name).to_owned(),
+                    (*declared_type).to_owned(),
+                    *not_null,
+                    *primary_key,
+                )
+            })
+            .collect::<Vec<_>>())
+}
+
+fn campaign_foreign_keys_match(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, &str, &str)],
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let mut actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    actual.sort();
+    let mut expected = expected
+        .iter()
+        .map(|(target_table, from, to, on_delete)| {
+            (
+                (*target_table).to_owned(),
+                (*from).to_owned(),
+                (*to).to_owned(),
+                "NO ACTION".to_owned(),
+                (*on_delete).to_owned(),
+                "NONE".to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    Ok(actual == expected)
 }
 
 fn migrate_termination_requests_to_v5(

@@ -9,9 +9,10 @@ use std::{
 use pueue_agent::{
     batches::BatchJobResult,
     db::{
-        inferred_pre_binding_policy_code, AgentRunRepository, BatchRepository, Db, EventRepository, IncidentRepository,
-        InterventionRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
-        RunLineageRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+        inferred_pre_binding_policy_code, AgentRunRepository, BatchRepository, Db, EventRepository,
+        IncidentRepository, InterventionRepository, ProjectRepository, RunLineageRepository,
+        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+        LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage},
@@ -20,11 +21,12 @@ use pueue_agent::{
         MAX_INTERVENTION_BYTES_PER_RUN,
     },
     models::{
-        AgentRunStatus, BatchJobStatus, BatchStatus, EventKind, EventStatus, ExecutionProjection,
-        IncidentStatus,
-        IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident,
-        NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, SubmissionKind,
-        SubmissionStatus, TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES,
+        AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
+        BudgetReservationStatus, Campaign, CampaignState, EventKind, EventStatus,
+        ExecutionProjection, Experiment, ExperimentStatus, IncidentStatus, IncidentTransition,
+        NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident, NewProject, NewSubmission,
+        NewTaskObservation, NewTerminationRequest, Proposal, ProposalKind, ProposalStatus,
+        SubmissionKind, SubmissionStatus, TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES,
         MAX_EXECUTABLE_PATH_BYTES,
     },
     runs::{collect_fresh, FollowCursor},
@@ -58,6 +60,499 @@ impl TestDatabase {
         fs::create_dir_all(&root).unwrap();
         root
     }
+}
+
+struct V15Fixture {
+    _temp: TempDir,
+    path: PathBuf,
+}
+
+impl V15Fixture {
+    fn with_submission(submission_id: &str) -> Self {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("schema-v15.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE projects (
+                    project_id TEXT PRIMARY KEY,
+                    root_path TEXT NOT NULL UNIQUE,
+                    pueue_group TEXT NOT NULL UNIQUE,
+                    config_path TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+                    halted_reason TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE events (
+                    event_id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK (kind IN (
+                        'task_finished', 'task_failed', 'crash', 'stalled',
+                        'deep_check', 'auto_killed', 'termination_failed', 'operator_wake'
+                    )),
+                    dedup_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN (
+                        'pending', 'claimed', 'in_flight', 'dispatched',
+                        'completed', 'retry_wait', 'failed', 'dead_letter'
+                    )),
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    not_before INTEGER NOT NULL,
+                    lease_until INTEGER,
+                    created_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    last_error TEXT,
+                    UNIQUE(project_id, dedup_key),
+                    UNIQUE(project_id, event_id),
+                    CHECK (
+                        (status = 'claimed' AND lease_until IS NOT NULL)
+                        OR (status <> 'claimed' AND lease_until IS NULL)
+                    )
+                );
+
+                CREATE TABLE integration_events (
+                    integration_event_id INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK (kind IN ('unknown_callback_group')),
+                    dedup_key TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE incidents (
+                    incident_id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    task_key TEXT,
+                    fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('open', 'acknowledged', 'resolved')),
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    acknowledged_at INTEGER,
+                    resolved_at INTEGER,
+                    UNIQUE(project_id, incident_id)
+                );
+
+                CREATE TABLE agent_runs (
+                    run_id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    primary_event_id INTEGER NOT NULL,
+                    pid INTEGER,
+                    status TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER,
+                    exit_code INTEGER,
+                    log_path TEXT NOT NULL,
+                    last_error TEXT,
+                    launch_gate_state TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        launch_gate_state IN ('pending', 'release_requested', 'released', 'failed')
+                    ),
+                    context_mode TEXT NOT NULL DEFAULT 'fresh' CHECK (context_mode IN (
+                        'fresh', 'resume', 'resume_latest'
+                    )),
+                    context_session_id TEXT,
+                    context_lineage_json TEXT NOT NULL DEFAULT '[]',
+                    execution_kind TEXT,
+                    executable_path TEXT,
+                    executable_identity TEXT,
+                    policy_code TEXT,
+                    failure_stage TEXT,
+                    UNIQUE(project_id, run_id),
+                    FOREIGN KEY(project_id, primary_event_id)
+                        REFERENCES events(project_id, event_id) ON DELETE RESTRICT
+                );
+
+                CREATE TABLE agent_run_events (
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    run_id INTEGER NOT NULL,
+                    event_id INTEGER NOT NULL,
+                    PRIMARY KEY(run_id, event_id),
+                    FOREIGN KEY(project_id, run_id)
+                        REFERENCES agent_runs(project_id, run_id) ON DELETE CASCADE,
+                    FOREIGN KEY(project_id, event_id)
+                        REFERENCES events(project_id, event_id) ON DELETE RESTRICT
+                );
+
+                CREATE TABLE submissions (
+                    submission_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    argv_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    pueue_task_id INTEGER,
+                    task_signature TEXT,
+                    status TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'experiment',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    origin_agent_run_id INTEGER,
+                    FOREIGN KEY (project_id, origin_agent_run_id)
+                        REFERENCES agent_runs(project_id, run_id) ON DELETE RESTRICT
+                );
+
+                CREATE TABLE termination_requests (
+                    request_id INTEGER PRIMARY KEY,
+                    incident_id INTEGER NOT NULL,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    task_signature TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN (
+                        'requested', 'dispatching', 'sent', 'confirmed', 'timed_out', 'failed'
+                    )),
+                    requested_at INTEGER NOT NULL,
+                    dispatch_lease_until INTEGER,
+                    grace_until INTEGER,
+                    confirmed_at INTEGER,
+                    last_error TEXT,
+                    UNIQUE(project_id, incident_id, task_signature),
+                    FOREIGN KEY(project_id, incident_id)
+                        REFERENCES incidents(project_id, incident_id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE task_observations (
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    task_signature TEXT NOT NULL,
+                    pueue_task_id INTEGER NOT NULL,
+                    pueue_group TEXT NOT NULL,
+                    command_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    enqueued_at INTEGER,
+                    started_at INTEGER,
+                    ended_at INTEGER,
+                    result TEXT,
+                    first_observed_at INTEGER NOT NULL,
+                    observed_at INTEGER NOT NULL,
+                    PRIMARY KEY(project_id, task_signature)
+                );
+
+                CREATE TABLE operator_logs (
+                    log_id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    pueue_group TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (action IN (
+                        'pause', 'resume', 'halt', 'disable', 'remove', 'cancel'
+                    )),
+                    details_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE interventions (
+                    intervention_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    insertion_sequence INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'reserved', 'applied')),
+                    created_at INTEGER NOT NULL,
+                    reserved_at INTEGER,
+                    applied_at INTEGER,
+                    agent_run_id INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                    lease_expires_at INTEGER,
+                    reservation_token TEXT,
+                    FOREIGN KEY (project_id, agent_run_id)
+                        REFERENCES agent_runs(project_id, run_id) ON DELETE SET NULL,
+                    CHECK (
+                        (status = 'pending' AND reserved_at IS NULL AND applied_at IS NULL AND agent_run_id IS NULL AND lease_expires_at IS NULL AND reservation_token IS NULL)
+                        OR (status = 'reserved' AND reserved_at IS NOT NULL AND applied_at IS NULL AND lease_expires_at IS NOT NULL AND reservation_token IS NOT NULL)
+                        OR (status = 'applied' AND reserved_at IS NOT NULL AND applied_at IS NOT NULL AND agent_run_id IS NOT NULL)
+                    )
+                );
+
+                CREATE TABLE batch_requests (
+                    request_id TEXT PRIMARY KEY CHECK (length(request_id) BETWEEN 1 AND 128),
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    manifest_hash TEXT NOT NULL CHECK (length(manifest_hash) BETWEEN 1 AND 128),
+                    status TEXT NOT NULL CHECK (status IN (
+                        'pending', 'dispatching', 'accepted', 'partial', 'failed', 'completed'
+                    )),
+                    lease_until INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 2048),
+                    lease_token TEXT CHECK (lease_token IS NULL OR length(lease_token) <= 128),
+                    CHECK (
+                        (status = 'dispatching' AND lease_until IS NOT NULL)
+                        OR status = 'accepted'
+                        OR (status <> 'dispatching' AND lease_until IS NULL)
+                    )
+                );
+
+                CREATE TABLE batch_jobs (
+                    request_id TEXT NOT NULL REFERENCES batch_requests(request_id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL CHECK (length(job_id) BETWEEN 1 AND 128),
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    kind TEXT NOT NULL CHECK (kind IN ('experiment', 'control')),
+                    argv_json TEXT NOT NULL CHECK (length(argv_json) <= 65536),
+                    metadata_json TEXT NOT NULL CHECK (length(metadata_json) <= 16384),
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'dispatching', 'accepted', 'failed')),
+                    pueue_task_id INTEGER CHECK (pueue_task_id IS NULL OR pueue_task_id >= 0),
+                    submission_id TEXT CHECK (submission_id IS NULL OR length(submission_id) BETWEEN 1 AND 128),
+                    last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 2048),
+                    PRIMARY KEY (request_id, job_id),
+                    UNIQUE (request_id, ordinal),
+                    CHECK (
+                        (status = 'accepted' AND pueue_task_id IS NOT NULL AND submission_id IS NOT NULL)
+                        OR (status <> 'accepted' AND pueue_task_id IS NULL AND submission_id IS NULL)
+                    )
+                );
+
+                CREATE TABLE agent_run_id_sequence (
+                    sequence_id INTEGER PRIMARY KEY CHECK (sequence_id = 1),
+                    last_run_id INTEGER NOT NULL CHECK (
+                        last_run_id >= 0 AND last_run_id <= 9223372036854775806
+                    )
+                );
+
+                CREATE INDEX events_claimable_idx
+                    ON events(status, not_before, created_at, event_id)
+                    WHERE status IN ('pending', 'retry_wait');
+                CREATE INDEX events_project_status_idx
+                    ON events(project_id, status, created_at);
+                CREATE INDEX events_project_status_not_before_idx
+                    ON events(project_id, status, not_before, event_id);
+                CREATE INDEX integration_events_kind_created_idx
+                    ON integration_events(kind, created_at);
+                CREATE UNIQUE INDEX incidents_active_fingerprint_idx
+                    ON incidents(project_id, kind, fingerprint)
+                    WHERE status IN ('open', 'acknowledged');
+                CREATE INDEX incidents_project_status_idx
+                    ON incidents(project_id, status, last_seen_at);
+                CREATE INDEX agent_runs_project_status_idx
+                    ON agent_runs(project_id, status, started_at);
+                CREATE UNIQUE INDEX agent_runs_one_active_per_project_idx
+                    ON agent_runs(project_id)
+                    WHERE status IN ('starting', 'running');
+                CREATE INDEX agent_run_events_event_idx ON agent_run_events(event_id);
+                CREATE INDEX submissions_project_status_idx
+                    ON submissions(project_id, status, created_at);
+                CREATE INDEX submissions_project_kind_status_idx
+                    ON submissions(project_id, kind, status, created_at);
+                CREATE INDEX submissions_project_origin_agent_run_idx
+                    ON submissions(project_id, origin_agent_run_id, created_at, submission_id);
+                CREATE INDEX termination_requests_project_status_idx
+                    ON termination_requests(project_id, status, requested_at);
+                CREATE INDEX task_observations_group_state_idx
+                    ON task_observations(project_id, pueue_group, state, observed_at);
+                CREATE INDEX operator_logs_project_created_idx
+                    ON operator_logs(project_id, created_at, log_id);
+                CREATE UNIQUE INDEX interventions_project_sequence_idx
+                    ON interventions(project_id, insertion_sequence);
+                CREATE INDEX interventions_project_status_created_idx
+                    ON interventions(project_id, status, insertion_sequence, intervention_id);
+                CREATE INDEX interventions_reservation_lease_idx
+                    ON interventions(status, lease_expires_at, reservation_token);
+                CREATE INDEX batch_requests_project_status_idx
+                    ON batch_requests(project_id, status, updated_at, request_id);
+                CREATE INDEX batch_requests_lease_idx
+                    ON batch_requests(status, lease_until, project_id, request_id);
+                CREATE INDEX batch_jobs_request_status_idx
+                    ON batch_jobs(request_id, status, ordinal, job_id);
+
+                INSERT INTO agent_run_id_sequence (sequence_id, last_run_id) VALUES (1, 0);
+                PRAGMA user_version = 15;
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects (
+                    project_id, root_path, pueue_group, config_path,
+                    enabled, paused, created_at, updated_at
+                 ) VALUES ('legacy-project', '/tmp/legacy-project', 'pa-legacy-project',
+                    '/tmp/legacy-project/config.toml', 1, 0, 100, 100)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at, status, kind, metadata_json
+                 ) VALUES (?1, 'legacy-project', '[\"python\",\"train.py\"]', 101,
+                    'accepted', 'experiment', '{}')",
+                [submission_id],
+            )
+            .unwrap();
+        drop(connection);
+        Self { _temp: temp, path }
+    }
+
+    fn open_and_migrate(&self) -> Db {
+        Db::open(&self.path).unwrap()
+    }
+}
+
+const CAMPAIGNS_V16_SQL: &str = r#"
+CREATE TABLE campaigns (
+    campaign_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    objective_text TEXT NOT NULL,
+    objective_digest TEXT NOT NULL,
+    initial_argv_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'active','budget_waiting','goal_reached_pending_review','paused',
+        'degraded','halted','retired'
+    )),
+    state_reason TEXT,
+    baseline_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    next_eligible_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)
+"#;
+
+const PROPOSALS_V16_SQL: &str = r#"
+CREATE TABLE proposals (
+    proposal_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'experiment','repair','broader_search','recipe','code_change','data_evaluation'
+    )),
+    status TEXT NOT NULL CHECK (status IN ('pending','accepted','rejected')),
+    hypothesis TEXT NOT NULL,
+    source_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    argv_json TEXT NOT NULL,
+    working_directory TEXT NOT NULL,
+    expected_evidence_json TEXT NOT NULL,
+    canonical_digest TEXT NOT NULL,
+    reject_reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(campaign_id, canonical_digest)
+)
+"#;
+
+const EXPERIMENTS_V16_SQL: &str = r#"
+CREATE TABLE experiments (
+    experiment_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    proposal_id TEXT NOT NULL REFERENCES proposals(proposal_id) ON DELETE RESTRICT,
+    submission_id TEXT NOT NULL UNIQUE REFERENCES submissions(submission_id) ON DELETE RESTRICT,
+    parent_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    status TEXT NOT NULL CHECK (status IN (
+        'reserved','submitting','accepted','unreconciled',
+        'succeeded','failed','cancelled'
+    )),
+    pueue_task_id INTEGER,
+    task_signature TEXT,
+    failure_code TEXT,
+    failure_fingerprint TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    UNIQUE(proposal_id, attempt),
+    CHECK ((pueue_task_id IS NULL) = (task_signature IS NULL))
+)
+"#;
+
+const BUDGET_RESERVATIONS_V16_SQL: &str = r#"
+CREATE TABLE budget_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+    experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+    dimension TEXT NOT NULL CHECK (dimension IN ('experiment','agent_run','code_change')),
+    subject_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('reserved','consumed','released')),
+    window_started_at INTEGER NOT NULL,
+    window_ends_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(campaign_id, dimension, subject_key),
+    CHECK (window_ends_at > window_started_at),
+    CHECK (
+        (dimension = 'experiment' AND experiment_id IS NOT NULL)
+        OR (dimension <> 'experiment' AND experiment_id IS NULL)
+    )
+)
+"#;
+
+fn compact_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_ascii_lowercase()
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Vec<(String, String, i64, i64)> {
+    connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(5)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn table_foreign_keys(
+    connection: &Connection,
+    table: &str,
+) -> BTreeSet<(String, String, String, String)> {
+    connection
+        .prepare(&format!("PRAGMA foreign_key_list({table})"))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
+        })
+        .unwrap()
+        .collect::<Result<BTreeSet<_>, _>>()
+        .unwrap()
+}
+
+fn expected_foreign_keys(
+    values: &[(&str, &str, &str, &str)],
+) -> BTreeSet<(String, String, String, String)> {
+    values
+        .iter()
+        .map(|(table, from, to, on_delete)| {
+            (
+                (*table).to_owned(),
+                (*from).to_owned(),
+                (*to).to_owned(),
+                (*on_delete).to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn assert_current_campaign_schema_rejected(path: &Path) {
+    let error = match Db::open(path) {
+        Err(error) => error,
+        Ok(_) => panic!("malformed current campaign schema was accepted"),
+    };
+    assert!(matches!(
+        &error,
+        AppError::Runtime {
+            operation: "verify SQLite v16 campaign schema"
+        }
+    ));
+    let rendered = error.render();
+    assert!(rendered.len() <= 240);
+    assert!(!rendered.contains(path.to_string_lossy().as_ref()));
+}
+
+fn mutate_current_campaign_schema(sql: &str) -> TestDatabase {
+    let test = TestDatabase::new();
+    test.db.connect().unwrap().execute_batch(sql).unwrap();
+    test
+}
+
+fn remove_campaign_schema_for_legacy_fixture(connection: &Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE budget_reservations;
+             DROP TABLE experiments;
+             DROP TABLE proposals;
+             DROP TABLE campaigns;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
 }
 
 fn register_project(db: &Db, project_id: &str, root: &Path, group: &str) {
@@ -441,6 +936,459 @@ fn open_v10_operator_log_fixture() -> (TempDir, PathBuf) {
 }
 
 #[test]
+fn campaign_schema_v16_installs_exact_tables_constraints_indexes_and_foreign_keys() {
+    let test = TestDatabase::new();
+    let connection = test.db.connect().unwrap();
+
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 16);
+
+    for (table, expected_sql, expected_columns) in [
+        (
+            "campaigns",
+            CAMPAIGNS_V16_SQL,
+            vec![
+                ("campaign_id", "TEXT", 0, 1),
+                ("project_id", "TEXT", 1, 0),
+                ("objective_text", "TEXT", 1, 0),
+                ("objective_digest", "TEXT", 1, 0),
+                ("initial_argv_json", "TEXT", 1, 0),
+                ("state", "TEXT", 1, 0),
+                ("state_reason", "TEXT", 0, 0),
+                ("baseline_experiment_id", "TEXT", 0, 0),
+                ("next_eligible_at", "INTEGER", 0, 0),
+                ("created_at", "INTEGER", 1, 0),
+                ("updated_at", "INTEGER", 1, 0),
+            ],
+        ),
+        (
+            "proposals",
+            PROPOSALS_V16_SQL,
+            vec![
+                ("proposal_id", "TEXT", 0, 1),
+                ("campaign_id", "TEXT", 1, 0),
+                ("kind", "TEXT", 1, 0),
+                ("status", "TEXT", 1, 0),
+                ("hypothesis", "TEXT", 1, 0),
+                ("source_experiment_id", "TEXT", 0, 0),
+                ("argv_json", "TEXT", 1, 0),
+                ("working_directory", "TEXT", 1, 0),
+                ("expected_evidence_json", "TEXT", 1, 0),
+                ("canonical_digest", "TEXT", 1, 0),
+                ("reject_reason", "TEXT", 0, 0),
+                ("created_at", "INTEGER", 1, 0),
+                ("updated_at", "INTEGER", 1, 0),
+            ],
+        ),
+        (
+            "experiments",
+            EXPERIMENTS_V16_SQL,
+            vec![
+                ("experiment_id", "TEXT", 0, 1),
+                ("campaign_id", "TEXT", 1, 0),
+                ("proposal_id", "TEXT", 1, 0),
+                ("submission_id", "TEXT", 1, 0),
+                ("parent_experiment_id", "TEXT", 0, 0),
+                ("attempt", "INTEGER", 1, 0),
+                ("status", "TEXT", 1, 0),
+                ("pueue_task_id", "INTEGER", 0, 0),
+                ("task_signature", "TEXT", 0, 0),
+                ("failure_code", "TEXT", 0, 0),
+                ("failure_fingerprint", "TEXT", 0, 0),
+                ("created_at", "INTEGER", 1, 0),
+                ("updated_at", "INTEGER", 1, 0),
+                ("finished_at", "INTEGER", 0, 0),
+            ],
+        ),
+        (
+            "budget_reservations",
+            BUDGET_RESERVATIONS_V16_SQL,
+            vec![
+                ("reservation_id", "TEXT", 0, 1),
+                ("campaign_id", "TEXT", 1, 0),
+                ("experiment_id", "TEXT", 0, 0),
+                ("dimension", "TEXT", 1, 0),
+                ("subject_key", "TEXT", 1, 0),
+                ("status", "TEXT", 1, 0),
+                ("window_started_at", "INTEGER", 1, 0),
+                ("window_ends_at", "INTEGER", 1, 0),
+                ("created_at", "INTEGER", 1, 0),
+                ("updated_at", "INTEGER", 1, 0),
+            ],
+        ),
+    ] {
+        let actual_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compact_schema_sql(&actual_sql), compact_schema_sql(expected_sql));
+        assert_eq!(
+            table_columns(&connection, table),
+            expected_columns
+                .into_iter()
+                .map(|(name, declared_type, not_null, primary_key)| {
+                    (
+                        name.to_owned(),
+                        declared_type.to_owned(),
+                        not_null,
+                        primary_key,
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    assert_eq!(
+        table_foreign_keys(&connection, "campaigns"),
+        expected_foreign_keys(&[
+            ("projects", "project_id", "project_id", "CASCADE"),
+            (
+                "experiments",
+                "baseline_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ])
+    );
+    assert_eq!(
+        table_foreign_keys(&connection, "proposals"),
+        expected_foreign_keys(&[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            (
+                "experiments",
+                "source_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ])
+    );
+    assert_eq!(
+        table_foreign_keys(&connection, "experiments"),
+        expected_foreign_keys(&[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("proposals", "proposal_id", "proposal_id", "RESTRICT"),
+            (
+                "submissions",
+                "submission_id",
+                "submission_id",
+                "RESTRICT",
+            ),
+            (
+                "experiments",
+                "parent_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ])
+    );
+    assert_eq!(
+        table_foreign_keys(&connection, "budget_reservations"),
+        expected_foreign_keys(&[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            (
+                "experiments",
+                "experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+        ])
+    );
+
+    for (name, sql) in [
+        (
+            "campaigns_one_live_project_idx",
+            "CREATE UNIQUE INDEX campaigns_one_live_project_idx ON campaigns(project_id) WHERE state <> 'retired'",
+        ),
+        (
+            "campaigns_state_next_eligible_idx",
+            "CREATE INDEX campaigns_state_next_eligible_idx ON campaigns(state, next_eligible_at, campaign_id)",
+        ),
+        (
+            "proposals_campaign_status_created_idx",
+            "CREATE INDEX proposals_campaign_status_created_idx ON proposals(campaign_id, status, created_at, proposal_id)",
+        ),
+        (
+            "experiments_campaign_status_created_idx",
+            "CREATE INDEX experiments_campaign_status_created_idx ON experiments(campaign_id, status, created_at, experiment_id)",
+        ),
+        (
+            "experiments_pueue_task_lookup_idx",
+            "CREATE INDEX experiments_pueue_task_lookup_idx ON experiments(pueue_task_id, task_signature)",
+        ),
+        (
+            "budget_reservations_campaign_dimension_window_idx",
+            "CREATE INDEX budget_reservations_campaign_dimension_window_idx ON budget_reservations(campaign_id, dimension, window_started_at, window_ends_at, reservation_id)",
+        ),
+    ] {
+        let actual_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compact_schema_sql(&actual_sql), compact_schema_sql(sql));
+    }
+}
+
+#[test]
+fn campaign_models_use_typed_exact_database_values() {
+    for (actual, expected) in [
+        (CampaignState::Active.as_str(), "active"),
+        (CampaignState::BudgetWaiting.as_str(), "budget_waiting"),
+        (
+            CampaignState::GoalReachedPendingReview.as_str(),
+            "goal_reached_pending_review",
+        ),
+        (CampaignState::Paused.as_str(), "paused"),
+        (CampaignState::Degraded.as_str(), "degraded"),
+        (CampaignState::Halted.as_str(), "halted"),
+        (CampaignState::Retired.as_str(), "retired"),
+        (ProposalKind::Experiment.as_str(), "experiment"),
+        (ProposalKind::Repair.as_str(), "repair"),
+        (ProposalKind::BroaderSearch.as_str(), "broader_search"),
+        (ProposalKind::Recipe.as_str(), "recipe"),
+        (ProposalKind::CodeChange.as_str(), "code_change"),
+        (ProposalKind::DataEvaluation.as_str(), "data_evaluation"),
+        (ProposalStatus::Pending.as_str(), "pending"),
+        (ProposalStatus::Accepted.as_str(), "accepted"),
+        (ProposalStatus::Rejected.as_str(), "rejected"),
+        (ExperimentStatus::Reserved.as_str(), "reserved"),
+        (ExperimentStatus::Submitting.as_str(), "submitting"),
+        (ExperimentStatus::Accepted.as_str(), "accepted"),
+        (ExperimentStatus::Unreconciled.as_str(), "unreconciled"),
+        (ExperimentStatus::Succeeded.as_str(), "succeeded"),
+        (ExperimentStatus::Failed.as_str(), "failed"),
+        (ExperimentStatus::Cancelled.as_str(), "cancelled"),
+        (BudgetDimension::Experiment.as_str(), "experiment"),
+        (BudgetDimension::AgentRun.as_str(), "agent_run"),
+        (BudgetDimension::CodeChange.as_str(), "code_change"),
+        (BudgetReservationStatus::Reserved.as_str(), "reserved"),
+        (BudgetReservationStatus::Consumed.as_str(), "consumed"),
+        (BudgetReservationStatus::Released.as_str(), "released"),
+    ] {
+        assert_eq!(actual, expected);
+    }
+
+    let campaign = Campaign {
+        campaign_id: "campaign-1".to_owned(),
+        project_id: "project-1".to_owned(),
+        objective_text: "reduce validation loss".to_owned(),
+        objective_digest: "objective-digest".to_owned(),
+        initial_argv: vec!["python".to_owned(), "train.py".to_owned()],
+        state: CampaignState::Active,
+        state_reason: None,
+        baseline_experiment_id: Some("experiment-1".to_owned()),
+        next_eligible_at: None,
+        created_at: 100,
+        updated_at: 100,
+    };
+    let proposal = Proposal {
+        proposal_id: "proposal-1".to_owned(),
+        campaign_id: campaign.campaign_id.clone(),
+        kind: ProposalKind::Experiment,
+        status: ProposalStatus::Accepted,
+        hypothesis: "baseline".to_owned(),
+        source_experiment_id: None,
+        argv: campaign.initial_argv.clone(),
+        working_directory: ".".to_owned(),
+        expected_evidence: vec!["validation loss".to_owned()],
+        canonical_digest: "proposal-digest".to_owned(),
+        reject_reason: None,
+        created_at: 100,
+        updated_at: 100,
+    };
+    let experiment = Experiment {
+        experiment_id: "experiment-1".to_owned(),
+        campaign_id: campaign.campaign_id.clone(),
+        proposal_id: proposal.proposal_id.clone(),
+        submission_id: "submission-1".to_owned(),
+        parent_experiment_id: None,
+        attempt: 0,
+        status: ExperimentStatus::Reserved,
+        pueue_task_id: None,
+        task_signature: None,
+        failure_code: None,
+        failure_fingerprint: None,
+        created_at: 100,
+        updated_at: 100,
+        finished_at: None,
+    };
+    let reservation = BudgetReservation {
+        reservation_id: "reservation-1".to_owned(),
+        campaign_id: campaign.campaign_id.clone(),
+        experiment_id: Some(experiment.experiment_id.clone()),
+        dimension: BudgetDimension::Experiment,
+        subject_key: experiment.experiment_id.clone(),
+        status: BudgetReservationStatus::Reserved,
+        window_started_at: 100,
+        window_ends_at: 200,
+        created_at: 100,
+        updated_at: 100,
+    };
+
+    assert_eq!(proposal.campaign_id, campaign.campaign_id);
+    assert_eq!(experiment.proposal_id, proposal.proposal_id);
+    assert_eq!(reservation.experiment_id, Some(experiment.experiment_id));
+}
+
+#[test]
+fn v15_migrates_campaign_tables_without_claiming_legacy_submissions() {
+    let fixture = V15Fixture::with_submission("legacy-submission");
+    let _db = fixture.open_and_migrate();
+    let connection = Connection::open(&fixture.path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let campaigns: i64 = connection
+        .query_row("SELECT COUNT(*) FROM campaigns", [], |row| row.get(0))
+        .unwrap();
+    let legacy: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM submissions WHERE submission_id = 'legacy-submission'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let projects: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM projects WHERE project_id = 'legacy-project'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 16);
+    assert_eq!(campaigns, 0);
+    assert_eq!(legacy, 1);
+    assert_eq!(projects, 1);
+}
+
+#[test]
+fn campaign_schema_v15_migration_rolls_back_every_new_object_on_failure() {
+    let fixture = V15Fixture::with_submission("rollback-submission");
+    Connection::open(&fixture.path)
+        .unwrap()
+        .execute_batch("CREATE TABLE proposals (wrong_column TEXT);")
+        .unwrap();
+
+    assert!(Db::open(&fixture.path).is_err());
+
+    let connection = Connection::open(&fixture.path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'campaigns'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM submissions WHERE submission_id = 'rollback-submission'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn campaign_schema_current_v16_rejects_a_missing_state_check() {
+    let test = mutate_current_campaign_schema(
+        r#"
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master
+           SET sql = replace(
+               sql,
+               'state TEXT NOT NULL CHECK (state IN (
+        ''active'',''budget_waiting'',''goal_reached_pending_review'',''paused'',
+        ''degraded'',''halted'',''retired''
+    ))',
+               'state TEXT NOT NULL'
+           )
+         WHERE type = 'table' AND name = 'campaigns';
+        PRAGMA writable_schema = OFF;
+        PRAGMA user_version = 16;
+        "#,
+    );
+
+    assert_current_campaign_schema_rejected(&test.path);
+}
+
+#[test]
+fn campaign_schema_current_v16_rejects_wrong_nullability() {
+    let test = mutate_current_campaign_schema(
+        r#"
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master
+           SET sql = replace(sql, 'objective_text TEXT NOT NULL', 'objective_text TEXT')
+         WHERE type = 'table' AND name = 'campaigns';
+        PRAGMA writable_schema = OFF;
+        PRAGMA user_version = 16;
+        "#,
+    );
+
+    assert_current_campaign_schema_rejected(&test.path);
+}
+
+#[test]
+fn campaign_schema_current_v16_rejects_missing_partial_unique_index_without_repair() {
+    let test = mutate_current_campaign_schema(
+        "DROP INDEX IF EXISTS campaigns_one_live_project_idx; PRAGMA user_version = 16;",
+    );
+
+    assert_current_campaign_schema_rejected(&test.path);
+
+    let connection = Connection::open(&test.path).unwrap();
+    let index_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'campaigns_one_live_project_idx'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!index_exists);
+}
+
+#[test]
+fn campaign_schema_current_v16_rejects_missing_foreign_key() {
+    let test = mutate_current_campaign_schema(
+        r#"
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master
+           SET sql = replace(
+               sql,
+               'project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE',
+               'project_id TEXT NOT NULL'
+           )
+         WHERE type = 'table' AND name = 'campaigns';
+        PRAGMA writable_schema = OFF;
+        PRAGMA user_version = 16;
+        "#,
+    );
+
+    assert_current_campaign_schema_rejected(&test.path);
+}
+
+#[test]
 fn open_configures_sqlite_and_installs_all_tables() {
     let test = TestDatabase::new();
     let connection = test.db.connect().unwrap();
@@ -701,6 +1649,7 @@ fn v7_event_check_migrates_to_v8_preserving_events_foreign_keys_and_indexes() {
     register_project(&test.db, "v7-project", &root, "pa-v7-project");
     insert_event(&test.db, "v7-project", "before-v8", 100);
     let connection = test.db.connect().unwrap();
+    remove_campaign_schema_for_legacy_fixture(&connection);
     connection.execute_batch(
         "PRAGMA writable_schema = ON;
          UPDATE sqlite_master
@@ -810,7 +1759,7 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     let event_sql: String = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
@@ -939,7 +1888,7 @@ fn v14_adds_projection_and_preserves_v13_rows() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     let columns = connection
         .prepare("PRAGMA table_info(agent_runs)")
         .unwrap()
@@ -1929,6 +2878,7 @@ fn existing_v6_interventions_are_backfilled_with_project_sequences() {
     let root = test.project_root("project");
     register_project(&test.db, "project-a", &root, "pa-project");
     let connection = test.db.connect().unwrap();
+    remove_campaign_schema_for_legacy_fixture(&connection);
     connection
         .execute_batch(
             r#"
@@ -1991,6 +2941,7 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
         ))
         .unwrap();
     let connection = test.db.connect().unwrap();
+    remove_campaign_schema_for_legacy_fixture(&connection);
     connection
         .execute_batch(
             r#"
@@ -2080,6 +3031,7 @@ fn schema_v6_migration_backfills_submission_kind_and_metadata_defaults() {
         ))
         .unwrap();
     let connection = migrated.connect().unwrap();
+    remove_campaign_schema_for_legacy_fixture(&connection);
     connection
         .execute_batch(
             r#"
@@ -2947,6 +3899,7 @@ fn schema_v5_migration_preserves_projects_and_events_and_adds_interventions() {
     register_project(&test.db, "project-a", &root, "pa-project");
     let event_id = insert_event(&test.db, "project-a", "v5-event", 100);
     let connection = test.db.connect().unwrap();
+    remove_campaign_schema_for_legacy_fixture(&connection);
     connection
         .execute_batch("DROP TABLE IF EXISTS interventions; PRAGMA user_version = 5;")
         .unwrap();
@@ -4789,7 +5742,16 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
     test.db
         .connect()
         .unwrap()
-        .execute_batch("DROP TABLE interventions; PRAGMA user_version = 4;")
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE budget_reservations;
+             DROP TABLE experiments;
+             DROP TABLE proposals;
+             DROP TABLE campaigns;
+             DROP TABLE interventions;
+             PRAGMA user_version = 4;
+             PRAGMA foreign_keys = ON;",
+        )
         .unwrap();
 
     let migrated = Db::open(&test.path).unwrap();

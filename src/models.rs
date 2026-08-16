@@ -167,6 +167,53 @@ database_enum!(AgentRunStatus {
     Cancelled => "cancelled",
 });
 
+database_enum!(CampaignState {
+    Active => "active",
+    BudgetWaiting => "budget_waiting",
+    GoalReachedPendingReview => "goal_reached_pending_review",
+    Paused => "paused",
+    Degraded => "degraded",
+    Halted => "halted",
+    Retired => "retired",
+});
+
+database_enum!(ProposalKind {
+    Experiment => "experiment",
+    Repair => "repair",
+    BroaderSearch => "broader_search",
+    Recipe => "recipe",
+    CodeChange => "code_change",
+    DataEvaluation => "data_evaluation",
+});
+
+database_enum!(ProposalStatus {
+    Pending => "pending",
+    Accepted => "accepted",
+    Rejected => "rejected",
+});
+
+database_enum!(ExperimentStatus {
+    Reserved => "reserved",
+    Submitting => "submitting",
+    Accepted => "accepted",
+    Unreconciled => "unreconciled",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+database_enum!(BudgetDimension {
+    Experiment => "experiment",
+    AgentRun => "agent_run",
+    CodeChange => "code_change",
+});
+
+database_enum!(BudgetReservationStatus {
+    Reserved => "reserved",
+    Consumed => "consumed",
+    Released => "released",
+});
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum AgentContextMode {
@@ -404,6 +451,70 @@ pub struct Submission {
     pub kind: SubmissionKind,
     pub metadata: Value,
     pub origin_agent_run_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Campaign {
+    pub campaign_id: String,
+    pub project_id: String,
+    pub objective_text: String,
+    pub objective_digest: String,
+    pub initial_argv: Vec<String>,
+    pub state: CampaignState,
+    pub state_reason: Option<String>,
+    pub baseline_experiment_id: Option<String>,
+    pub next_eligible_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    pub proposal_id: String,
+    pub campaign_id: String,
+    pub kind: ProposalKind,
+    pub status: ProposalStatus,
+    pub hypothesis: String,
+    pub source_experiment_id: Option<String>,
+    pub argv: Vec<String>,
+    pub working_directory: String,
+    pub expected_evidence: Vec<String>,
+    pub canonical_digest: String,
+    pub reject_reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Experiment {
+    pub experiment_id: String,
+    pub campaign_id: String,
+    pub proposal_id: String,
+    pub submission_id: String,
+    pub parent_experiment_id: Option<String>,
+    pub attempt: i64,
+    pub status: ExperimentStatus,
+    pub pueue_task_id: Option<i64>,
+    pub task_signature: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_fingerprint: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetReservation {
+    pub reservation_id: String,
+    pub campaign_id: String,
+    pub experiment_id: Option<String>,
+    pub dimension: BudgetDimension,
+    pub subject_key: String,
+    pub status: BudgetReservationStatus,
+    pub window_started_at: i64,
+    pub window_ends_at: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
