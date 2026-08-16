@@ -95,6 +95,22 @@ impl CampaignDbHarness {
         source_experiment_id: Option<&str>,
         argv: &[&str],
     ) -> ValidatedProposal {
+        Self::proposal_for_objective(
+            kind,
+            hypothesis,
+            source_experiment_id,
+            argv,
+            "objective-digest",
+        )
+    }
+
+    fn proposal_for_objective(
+        kind: ProposalKind,
+        hypothesis: &str,
+        source_experiment_id: Option<&str>,
+        argv: &[&str],
+        objective_digest: &str,
+    ) -> ValidatedProposal {
         let input = ProposalInput {
             kind,
             hypothesis: hypothesis.to_owned(),
@@ -104,9 +120,9 @@ impl CampaignDbHarness {
             expected_evidence: vec!["validation loss".to_owned()],
         };
         if source_experiment_id.is_none() {
-            proposals::validate_initial_baseline(input, "objective-digest").unwrap()
+            proposals::validate_initial_baseline(input, objective_digest).unwrap()
         } else {
-            proposals::validate(input, "objective-digest").unwrap()
+            proposals::validate(input, objective_digest).unwrap()
         }
     }
 
@@ -1426,6 +1442,148 @@ fn parallel_baseline_start_creates_exactly_one_live_campaign_and_reservation() {
     assert_eq!(harness.count("experiments"), 1);
     assert_eq!(harness.count("budget_reservations"), 1);
     assert_eq!(harness.count("submissions"), 1);
+}
+
+#[test]
+fn campaign_objective_baseline_rejects_a_proposal_validated_for_another_objective() {
+    let harness = CampaignDbHarness::new();
+    let objective = CampaignDbHarness::objective();
+    let baseline = CampaignDbHarness::proposal_for_objective(
+        ProposalKind::Experiment,
+        "Baseline tied to a changed objective",
+        None,
+        &["python", "train.py"],
+        "changed-objective-digest",
+    );
+    let initial_argv = baseline.argv().to_vec();
+
+    let error = CampaignRepository::new(&harness.test.db)
+        .start_with_baseline(
+            StartCampaignRequest {
+                campaign_id: CampaignDbHarness::CAMPAIGN_ID,
+                project_id: CampaignDbHarness::PROJECT_ID,
+                objective: &objective,
+                initial_argv: &initial_argv,
+                baseline: &baseline,
+                submission_id: "submission-baseline",
+                experiment_id: CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+                proposal_id: "proposal-baseline",
+                now: 100,
+            },
+            &CampaignLimits::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "baseline.objective_digest",
+            ..
+        }
+    ));
+    assert_eq!(harness.count("campaigns"), 0);
+    assert_eq!(harness.count("proposals"), 0);
+    assert_eq!(harness.count("experiments"), 0);
+    assert_eq!(harness.count("budget_reservations"), 0);
+    assert_eq!(harness.count("submissions"), 0);
+}
+
+#[test]
+fn campaign_objective_acceptance_rejects_a_proposal_validated_for_another_objective() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal_for_objective(
+        ProposalKind::Experiment,
+        "Proposal tied to a changed objective",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+        "changed-objective-digest",
+    );
+
+    let error = harness
+        .accept(
+            "proposal-changed-objective",
+            "experiment-changed-objective",
+            "submission-changed-objective",
+            &proposal,
+            &CampaignLimits::default(),
+            120,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "proposal.objective_digest",
+            ..
+        }
+    ));
+    assert_eq!(harness.count("campaigns"), 1);
+    assert_eq!(harness.count("proposals"), 1);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("budget_reservations"), 1);
+    assert_eq!(harness.count("submissions"), 1);
+}
+
+#[test]
+fn campaign_atomic_pending_code_change_does_not_consume_an_accepted_cycle_slot() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let code_change = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Change the training implementation later",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v2"],
+    );
+    assert!(harness
+        .accept(
+            "proposal-code-pending",
+            "experiment-code-pending",
+            "submission-code-pending",
+            &code_change,
+            &CampaignLimits::default(),
+            120,
+        )
+        .unwrap()
+        .is_none());
+    let code_change_reservations: i64 = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations
+             WHERE campaign_id = ?1 AND dimension = 'code_change'
+               AND subject_key = 'proposal-code-pending' AND status = 'consumed'",
+            [CampaignDbHarness::CAMPAIGN_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(code_change_reservations, 1);
+
+    let experiment = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Accept an experiment from the same decision source",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+    );
+    let accepted = harness
+        .accept(
+            "proposal-after-code",
+            "experiment-after-code",
+            "submission-after-code",
+            &experiment,
+            &CampaignLimits::default(),
+            121,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(accepted.proposal.status, ProposalStatus::Accepted);
+    assert_eq!(harness.count("proposals"), 3);
+    assert_eq!(harness.count("experiments"), 2);
+    assert_eq!(harness.count("budget_reservations"), 3);
+    assert_eq!(harness.count("submissions"), 2);
 }
 
 #[test]

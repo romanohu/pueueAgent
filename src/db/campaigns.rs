@@ -101,6 +101,12 @@ impl<'db> CampaignRepository<'db> {
             .map_err(database_error("begin campaign baseline reservation"))?;
 
         validate_project_available(&transaction, request.project_id)?;
+        if request.baseline.objective_digest() != request.objective.digest {
+            return Err(validation_error(
+                "baseline.objective_digest",
+                "must match the campaign objective digest",
+            ));
+        }
         if request.baseline.kind() != ProposalKind::Experiment {
             return Err(validation_error(
                 "baseline.kind",
@@ -254,6 +260,12 @@ impl<'db> CampaignRepository<'db> {
             ));
         }
         validate_project_available(&transaction, &campaign.project_id)?;
+        if proposal.objective_digest() != campaign.objective_digest {
+            return Err(validation_error(
+                "proposal.objective_digest",
+                "must match the persisted campaign objective digest",
+            ));
+        }
 
         if let Some(existing) = find_proposal_by_digest(
             &transaction,
@@ -295,7 +307,7 @@ impl<'db> CampaignRepository<'db> {
         let cycle_count: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM proposals
-                 WHERE campaign_id = ?1 AND source_experiment_id = ?2",
+                 WHERE campaign_id = ?1 AND source_experiment_id = ?2 AND status = 'accepted'",
                 params![campaign_id, source_experiment_id],
                 |row| row.get(0),
             )

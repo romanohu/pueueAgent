@@ -28,6 +28,7 @@ pub struct ProposalInput {
 
 #[derive(Clone, Debug)]
 pub struct ValidatedProposal {
+    objective_digest: String,
     kind: ProposalKind,
     hypothesis: String,
     source_experiment_id: Option<String>,
@@ -38,6 +39,8 @@ pub struct ValidatedProposal {
 }
 
 impl ValidatedProposal {
+    pub fn objective_digest(&self) -> &str { &self.objective_digest }
+
     pub const fn kind(&self) -> ProposalKind { self.kind }
 
     pub fn hypothesis(&self) -> &str { &self.hypothesis }
@@ -75,6 +78,7 @@ pub fn validate(
     })?;
 
     Ok(ValidatedProposal {
+        objective_digest: objective_digest.to_owned(),
         kind: input.kind,
         hypothesis: input.hypothesis,
         source_experiment_id: input.source_experiment_id,
