@@ -218,15 +218,30 @@ fn objective_rejects_comment_and_table_only_content() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("project");
     fs::create_dir_all(root.join(".pueue-agent")).unwrap();
-    fs::write(
-        root.join(".pueue-agent/STATE.md"),
-        "# Goal\n<!-- define an objective -->\n| Metric | Target |\n|---|---|\n",
-    )
-    .unwrap();
 
-    let error = state::load_objective(&root).unwrap_err();
+    for contents in [
+        "# Goal\n<!-- define an objective\ncontinued comment -->\n",
+        "# Goal\n| Metric | Target |\n|---|---|\n",
+        "# Goal\nMetric | Target\n--- | ---\n",
+    ] {
+        fs::write(root.join(".pueue-agent/STATE.md"), contents).unwrap();
+        let error = state::load_objective(&root).unwrap_err();
+        assert!(matches!(error, AppError::Validation { field: "STATE.md", .. }));
+    }
+}
 
-    assert!(matches!(error, AppError::Validation { field: "STATE.md", .. }));
+#[test]
+fn init_instructions_preserve_the_state_md_objective() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    fs::create_dir(&root).unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    let instructions = fs::read_to_string(root.join(".pueue-agent/instructions.md")).unwrap();
+    assert!(instructions.contains("`STATE.md` の人間が定めた目的は変更しない"));
+    assert!(!instructions.contains("health record を `STATE.md` に追記"));
 }
 
 #[test]

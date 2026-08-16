@@ -380,18 +380,55 @@ fn validate_objective_text(text: &str) -> Result<(), AppError> {
     {
         return Err(invalid_objective("objective contains unsafe control characters"));
     }
-    if !text.lines().any(is_meaningful_objective_line) {
+    if !has_meaningful_objective_line(text) {
         return Err(invalid_objective("objective must contain a meaningful line"));
     }
     Ok(())
+}
+
+fn has_meaningful_objective_line(text: &str) -> bool {
+    let visible = strip_html_comments(text);
+    let lines = visible.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(index, line)| {
+        is_meaningful_objective_line(line)
+            && !lines
+                .get(index + 1)
+                .is_some_and(|next| is_markdown_table_separator(next))
+    })
 }
 
 fn is_meaningful_objective_line(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty()
         && !trimmed.starts_with('#')
-        && !trimmed.starts_with("<!--")
         && !(trimmed.starts_with('|') && trimmed.ends_with('|'))
+        && !is_markdown_table_separator(trimmed)
+}
+
+fn strip_html_comments(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<!--") {
+        visible.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<!--".len()..];
+        match after_start.find("-->") {
+            Some(end) => remaining = &after_start[end + "-->".len()..],
+            None => return visible,
+        }
+    }
+    visible.push_str(remaining);
+    visible
+}
+
+fn is_markdown_table_separator(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('|');
+    !trimmed.is_empty()
+        && trimmed.split('|').all(|cell| {
+            let cell = cell.trim();
+            !cell.is_empty()
+                && cell.contains('-')
+                && cell.chars().all(|character| matches!(character, '-' | ':'))
+        })
 }
 
 fn invalid_objective(message: &'static str) -> AppError {
