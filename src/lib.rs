@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod batches;
+pub mod campaign;
 pub mod cancel;
 pub mod cli;
 pub mod codex_command;

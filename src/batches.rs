@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     config,
-    db::{BatchRepository, Db, ProjectRepository, SubmissionRepository},
+    db::{BatchRepository, CampaignRepository, Db, ProjectRepository, SubmissionRepository},
     models::{
         BatchJob, BatchJobStatus, BatchRequest, BatchStatus, NewBatchJob, NewBatchRequest,
         NewSubmission,
@@ -205,6 +205,15 @@ pub async fn run_with<P: PueueApi + ?Sized>(
         return Err(AppError::Validation {
             field: "group",
             message: "must exactly match the registered project group",
+        });
+    }
+    if CampaignRepository::new(db)
+        .find_live_by_project(&registered.project_id)?
+        .is_some()
+    {
+        return Err(AppError::Validation {
+            field: "submit-batch",
+            message: "a managed campaign is active; use pueue-agent steer",
         });
     }
     let group = requested_group.unwrap_or(&registered.pueue_group);

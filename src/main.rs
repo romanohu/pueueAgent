@@ -362,6 +362,7 @@ mod commands {
         let project_root = project::find_root(&current_dir)?;
         let (db, registered, _service_paths, policy) =
             resolve_project(Some(project_root.clone()), None)?;
+        let limits = policy.campaign_limits;
         let pueue = configured_pueue(policy)?;
         let options = submit_command::SubmitOptions::new(
             kind,
@@ -373,6 +374,7 @@ mod commands {
             &project_root,
             &command,
             &options,
+            &limits,
             &pueue,
         )
         .await?;

@@ -4,7 +4,17 @@ mod fake_pueue;
 #[path = "../support/native_process_fixture.rs"]
 mod native_process_fixture;
 
-use std::{ffi::OsString, fs, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
+use async_trait::async_trait;
 
 #[cfg(all(unix, debug_assertions))]
 use std::time::{Duration, Instant};
@@ -23,13 +33,20 @@ use native_process_fixture::{
 };
 use pueue_agent::{
     batches::{self, BatchJobResult},
-    db::{BatchRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
+    campaign::CampaignCoordinator,
+    db::{
+        BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        ManagedSubmissionIntent, ProjectRepository, StartCampaignRequest, SubmissionRepository,
+    },
+    execution_policy::CampaignLimits,
     models::{
         AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
-        Submission, SubmissionKind, SubmissionStatus,
+        ExperimentStatus, ProposalKind, Submission, SubmissionKind, SubmissionStatus,
     },
+    proposals::{self, ProposalInput},
     pueue::{configured_pueue, validate_add_argv, PueueApi, PueueError, PueueTask, PUEUE_TIMEOUT},
     pueue_security::{validate_group, MAX_PUEUE_OUTPUT_BYTES},
+    state::{self, ObjectiveSnapshot},
     submit, AppError,
 };
 use pueue_agent::process::MAX_FIELD_SIZE;
@@ -781,10 +798,61 @@ fn secure_executable(path: &std::path::Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[derive(Clone)]
+struct CountingFakePueue {
+    inner: FakePueue,
+    add_calls: Arc<AtomicUsize>,
+}
+
+impl CountingFakePueue {
+    fn new() -> Self {
+        Self {
+            inner: FakePueue::new(),
+            add_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn last_add_args(&self) -> Vec<OsString> {
+        self.inner.last_add_args()
+    }
+
+    fn add_calls(&self) -> usize {
+        self.add_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl PueueApi for CountingFakePueue {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        self.inner.status_json().await
+    }
+
+    async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
+        self.add_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.add(args).await
+    }
+
+    async fn kill(&self, task_id: i64) -> Result<(), AppError> {
+        self.inner.kill(task_id).await
+    }
+
+    async fn remove(&self, task_id: i64) -> Result<(), AppError> {
+        self.inner.remove(task_id).await
+    }
+
+    async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
+        self.inner.ensure_group(group).await
+    }
+}
+
 struct SubmitHarness {
     _temp: TempDir,
     db: Db,
     root: PathBuf,
+    fake: CountingFakePueue,
+    initial_campaigns: i64,
+    initial_experiments: i64,
+    initial_submissions: i64,
 }
 
 impl SubmitHarness {
@@ -836,12 +904,415 @@ max_experiments = 20
             _temp: temp,
             db,
             root,
+            fake: CountingFakePueue::new(),
+            initial_campaigns: 0,
+            initial_experiments: 0,
+            initial_submissions: 0,
         }
+    }
+
+    fn with_objective(objective: &str) -> Self {
+        let harness = Self::new();
+        fs::write(
+            harness.root.join(".pueue-agent/STATE.md"),
+            format!("{objective}\n"),
+        )
+        .unwrap();
+        harness
+    }
+
+    fn with_active_campaign() -> Self {
+        let mut harness = Self::with_objective("Reach validation loss below 0.20");
+        let _ = harness.reserve_baseline(&["python", "train.py"]);
+        harness.initial_campaigns = harness.table_count("campaigns");
+        harness.initial_experiments = harness.table_count("experiments");
+        harness.initial_submissions = harness.table_count("submissions");
+        harness
+    }
+
+    fn project(&self) -> pueue_agent::models::Project {
+        ProjectRepository::new(&self.db)
+            .find_by_root(&self.root)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn objective(&self) -> ObjectiveSnapshot {
+        state::load_objective(&self.root).unwrap()
+    }
+
+    fn reserve_baseline(&self, argv: &[&str]) -> ManagedSubmissionIntent {
+        let objective = self.objective();
+        let argv = argv.iter().map(|argument| (*argument).to_owned()).collect::<Vec<_>>();
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: &uuid::Uuid::new_v4().to_string(),
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &baseline,
+                    submission_id: &uuid::Uuid::new_v4().to_string(),
+                    experiment_id: &uuid::Uuid::new_v4().to_string(),
+                    proposal_id: &uuid::Uuid::new_v4().to_string(),
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap()
+    }
+
+    async fn submit(&self, argv: &[&str]) -> Result<Submission, AppError> {
+        let argv = argv.iter().map(OsString::from).collect::<Vec<_>>();
+        submit::run_with_options(
+            &self.db,
+            &self.root,
+            &argv,
+            &submit::SubmitOptions::default(),
+            &CampaignLimits::default(),
+            &self.fake,
+        )
+        .await
+    }
+
+    async fn submit_from_agent_run(&self, argv: &[&str]) -> Result<Submission, AppError> {
+        let event = EventRepository::new(&self.db)
+            .insert_idempotent(&NewEvent::new(
+                "project-a",
+                EventKind::TaskFinished,
+                format!("campaign-submit-origin-{}", uuid::Uuid::new_v4()),
+                json!({}),
+                101,
+                101,
+            ))?;
+        let run = pueue_agent::db::AgentRunRepository::new(&self.db).insert(&NewAgentRun::new(
+            "project-a",
+            event.event_id,
+            None,
+            AgentRunStatus::Running,
+            101,
+            self.root.join("agent.log"),
+        ))?;
+        let argv = argv.iter().map(OsString::from).collect::<Vec<_>>();
+        submit::run_with_options(
+            &self.db,
+            &self.root,
+            &argv,
+            &submit::SubmitOptions::new(SubmissionKind::Experiment, json!({}), Some(run.run_id)),
+            &CampaignLimits::default(),
+            &self.fake,
+        )
+        .await
+    }
+
+    fn live_campaigns(&self) -> i64 {
+        self.table_count("campaigns") - self.initial_campaigns
+    }
+
+    fn experiments(&self) -> i64 {
+        self.table_count("experiments") - self.initial_experiments
+    }
+
+    fn submissions(&self) -> i64 {
+        self.table_count("submissions") - self.initial_submissions
+    }
+
+    fn table_count(&self, table: &str) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn pueue_add_calls(&self) -> usize {
+        self.fake.add_calls()
+    }
+}
+
+async fn submit_legacy_control<P: PueueApi + ?Sized>(
+    db: &Db,
+    project_root: &std::path::Path,
+    args: &[OsString],
+    pueue: &P,
+) -> Result<Submission, AppError> {
+    submit::run_with_options(
+        db,
+        project_root,
+        args,
+        &submit::SubmitOptions::new(SubmissionKind::Control, json!({}), None),
+        &CampaignLimits::default(),
+        pueue,
+    )
+    .await
+}
+
+struct TimeoutPueue {
+    add_calls: AtomicUsize,
+}
+
+impl TimeoutPueue {
+    fn new() -> Self {
+        Self {
+            add_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl PueueApi for TimeoutPueue {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn add(&self, _args: &[OsString]) -> Result<i64, AppError> {
+        self.add_calls.fetch_add(1, Ordering::SeqCst);
+        Err(PueueError::Timeout { operation: "add" }.into())
+    }
+
+    async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        Ok(())
     }
 }
 
 fn expected_provisional_signature(group: &str, task_id: i64, submission_id: &str) -> String {
     format!("provisional-submit:v1:group={group}:task-id={task_id}:intent={submission_id}")
+}
+
+#[tokio::test]
+async fn campaign_submit_first_experiment_creates_baseline_and_one_pueue_task() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+
+    let result = harness.submit(&["python", "train.py"]).await.unwrap();
+
+    assert_eq!(harness.live_campaigns(), 1);
+    assert_eq!(harness.experiments(), 1);
+    assert_eq!(harness.submissions(), 1);
+    assert_eq!(harness.pueue_add_calls(), 1);
+    assert_eq!(result.pueue_task_id, Some(41));
+    assert_eq!(
+        harness.fake.last_add_args(),
+        vec![
+            OsString::from("-g"),
+            OsString::from("pa-project"),
+            OsString::from("--working-directory"),
+            fs::canonicalize(&harness.root).unwrap().into_os_string(),
+            OsString::from("--"),
+            OsString::from("python"),
+            OsString::from("train.py"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_active_campaign_rejects_human_and_agent_before_persistence() {
+    let harness = SubmitHarness::with_active_campaign();
+
+    let human = harness.submit(&["python", "other.py"]).await.unwrap_err();
+    let agent = harness
+        .submit_from_agent_run(&["python", "other.py"])
+        .await
+        .unwrap_err();
+
+    for error in [human, agent] {
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "submit",
+                message: "a managed campaign is active; use pueue-agent steer",
+            }
+        ));
+    }
+    assert_eq!(harness.submissions(), 0);
+    assert_eq!(harness.pueue_add_calls(), 0);
+}
+
+#[tokio::test]
+async fn campaign_submit_active_campaign_rejects_batch_before_manifest_persistence() {
+    let harness = SubmitHarness::with_active_campaign();
+    let manifest = harness.root.join("campaign-batch.json");
+    fs::write(
+        &manifest,
+        r#"{"jobs":[{"id":"job-a","argv":["python","other.py"]}]}"#,
+    )
+    .unwrap();
+
+    let error = batches::run_with(
+        &harness.db,
+        &harness.root,
+        &uuid::Uuid::new_v4().to_string(),
+        &manifest,
+        None,
+        &harness.fake,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "submit-batch",
+            message: "a managed campaign is active; use pueue-agent steer",
+        }
+    ));
+    assert_eq!(harness.table_count("batch_requests"), 0);
+    assert_eq!(harness.submissions(), 0);
+    assert_eq!(harness.pueue_add_calls(), 0);
+}
+
+#[tokio::test]
+async fn campaign_submit_control_remains_a_legacy_one_off_without_a_live_campaign() {
+    let harness = SubmitHarness::new();
+    let args = vec![OsString::from("python"), OsString::from("control.py")];
+
+    let result = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Control, json!({}), None),
+        &CampaignLimits::default(),
+        &harness.fake,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.kind, SubmissionKind::Control);
+    assert_eq!(harness.live_campaigns(), 0);
+    assert_eq!(harness.submissions(), 1);
+    assert_eq!(harness.pueue_add_calls(), 1);
+}
+
+#[tokio::test]
+async fn campaign_submit_reserved_intent_resumes_with_exactly_one_add() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    );
+
+    let result = coordinator
+        .submit_accepted_intent(&intent, &harness.project(), 101)
+        .await
+        .unwrap();
+
+    assert_eq!(result.pueue_task_id, Some(41));
+    assert_eq!(harness.pueue_add_calls(), 1);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_restart_after_submitting_before_add_never_readds() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&intent.experiment.experiment_id, 101)
+        .unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    );
+
+    assert!(coordinator
+        .submit_accepted_intent(&intent, &harness.project(), 102)
+        .await
+        .is_err());
+
+    assert_eq!(harness.pueue_add_calls(), 0);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_restart_after_success_before_acceptance_never_readds() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&intent.experiment.experiment_id, 101)
+        .unwrap();
+    assert_eq!(harness.fake.add(&[]).await.unwrap(), 41);
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    );
+
+    assert!(coordinator
+        .submit_accepted_intent(&intent, &harness.project(), 102)
+        .await
+        .is_err());
+
+    assert_eq!(harness.pueue_add_calls(), 1);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_add_timeout_is_unreconciled_before_returning_original_error() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    let pueue = TimeoutPueue::new();
+    let coordinator = CampaignCoordinator::new(&harness.db, &pueue, CampaignLimits::default());
+
+    let error = coordinator
+        .submit_accepted_intent(&intent, &harness.project(), 101)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::Pueue(PueueError::Timeout { operation: "add" })
+    ));
+    assert_eq!(pueue.add_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
 }
 
 #[test]
@@ -1297,10 +1768,9 @@ async fn submit_records_intent_before_add_and_preserves_arguments() {
     let task_db = harness.db.clone();
     let task_root = harness.root.clone();
     let task_fake = fake.clone();
-    let submit_task =
-        tokio::spawn(
-            async move { submit::run_with(&task_db, &task_root, &args, &task_fake).await },
-        );
+    let submit_task = tokio::spawn(async move {
+        submit_legacy_control(&task_db, &task_root, &args, &task_fake).await
+    });
 
     fake.wait_for_add().await;
     let pending = SubmissionRepository::new(&harness.db)
@@ -1344,7 +1814,7 @@ async fn oversized_native_add_argv_is_rejected_before_submission_insert() {
     let fake = FakePueue::new().with_add_task_id(73);
     let command = vec![OsString::from("x"); max_user_add_args + 1];
 
-    assert!(submit::run_with(&harness.db, &harness.root, &command, &fake)
+    assert!(submit_legacy_control(&harness.db, &harness.root, &command, &fake)
         .await
         .is_err());
     assert!(SubmissionRepository::new(&harness.db)
@@ -1361,7 +1831,7 @@ async fn maximum_native_add_argv_is_persisted_and_submitted() {
     let fake = FakePueue::new().with_add_task_id(73);
     let command = vec![OsString::from("x"); max_user_add_args];
 
-    let submission = submit::run_with(&harness.db, &harness.root, &command, &fake)
+    let submission = submit_legacy_control(&harness.db, &harness.root, &command, &fake)
         .await
         .unwrap();
 
@@ -1374,7 +1844,7 @@ async fn first_excess_native_add_byte_is_rejected_before_direct_persistence() {
     let accepted_harness = SubmitHarness::new();
     let accepted_fake = FakePueue::new().with_add_task_id(73);
     let accepted = native_add_byte_boundary_command(false);
-    assert!(submit::run_with(
+    assert!(submit_legacy_control(
         &accepted_harness.db,
         &accepted_harness.root,
         &accepted,
@@ -1386,7 +1856,7 @@ async fn first_excess_native_add_byte_is_rejected_before_direct_persistence() {
     let rejected_harness = SubmitHarness::new();
     let rejected_fake = FakePueue::new().with_add_task_id(73);
     let rejected = native_add_byte_boundary_command(true);
-    assert!(submit::run_with(
+    assert!(submit_legacy_control(
         &rejected_harness.db,
         &rejected_harness.root,
         &rejected,
@@ -1439,7 +1909,7 @@ async fn oversized_native_batch_add_argv_is_rejected_before_submission_insert() 
 }
 
 #[tokio::test]
-async fn submit_options_default_to_experiment_and_persist_metadata_without_changing_pueue_argv() {
+async fn submit_options_persist_control_metadata_without_changing_pueue_argv() {
     let harness = SubmitHarness::new();
     let fake = FakePueue::new().with_add_task_id(73);
     let args = vec![OsString::from("python"), OsString::from("train.py")];
@@ -1449,13 +1919,14 @@ async fn submit_options_default_to_experiment_and_persist_metadata_without_chang
         &harness.db,
         &harness.root,
         &args,
-        &submit::SubmitOptions::new(SubmissionKind::Experiment, metadata, None),
+        &submit::SubmitOptions::new(SubmissionKind::Control, metadata, None),
+        &CampaignLimits::default(),
         &fake,
     )
     .await
     .unwrap();
 
-    assert_eq!(submission.kind, SubmissionKind::Experiment);
+    assert_eq!(submission.kind, SubmissionKind::Control);
     assert_eq!(submission.metadata, json!({"trial":"baseline","epochs":3}));
     assert_eq!(submission.origin_agent_run_id, None);
     assert_eq!(
@@ -1481,6 +1952,7 @@ async fn submit_options_accept_explicit_control_kind() {
         &harness.root,
         &args,
         &submit::SubmitOptions::new(SubmissionKind::Control, json!({}), None),
+        &CampaignLimits::default(),
         &fake,
     )
     .await
@@ -1558,6 +2030,7 @@ async fn run_with_options_rejects_oversized_metadata_before_pueue_add() {
         &harness.root,
         &args,
         &submit::SubmitOptions::new(SubmissionKind::Experiment, oversized, None),
+        &CampaignLimits::default(),
         &fake,
     )
     .await
@@ -1588,6 +2061,7 @@ async fn invalid_origin_is_rejected_before_pueue_add_and_valid_origin_is_persist
         &harness.root,
         &args,
         &submit::SubmitOptions::new(SubmissionKind::Experiment, json!({}), Some(999)),
+        &CampaignLimits::default(),
         &fake,
     )
     .await;
@@ -1618,7 +2092,8 @@ async fn invalid_origin_is_rejected_before_pueue_add_and_valid_origin_is_persist
         &harness.db,
         &harness.root,
         &args,
-        &submit::SubmitOptions::new(SubmissionKind::Experiment, json!({}), Some(run.run_id)),
+        &submit::SubmitOptions::new(SubmissionKind::Control, json!({}), Some(run.run_id)),
+        &CampaignLimits::default(),
         &fake,
     )
     .await
@@ -1717,7 +2192,7 @@ async fn submit_keeps_pending_intent_when_add_fails() {
         OsString::from("a b; echo bad"),
     ];
 
-    let error = submit::run_with(&harness.db, &harness.root, &args, &fake)
+    let error = submit_legacy_control(&harness.db, &harness.root, &args, &fake)
         .await
         .unwrap_err();
 
@@ -1748,10 +2223,10 @@ async fn submit_provisional_signature_uses_submission_intent_to_avoid_task_id_co
     let fake = FakePueue::new().with_add_task_id(73);
     let args = vec![OsString::from("python"), OsString::from("train.py")];
 
-    let first = submit::run_with(&harness.db, &harness.root, &args, &fake)
+    let first = submit_legacy_control(&harness.db, &harness.root, &args, &fake)
         .await
         .unwrap();
-    let second = submit::run_with(&harness.db, &harness.root, &args, &fake)
+    let second = submit_legacy_control(&harness.db, &harness.root, &args, &fake)
         .await
         .unwrap();
 

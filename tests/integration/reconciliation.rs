@@ -5,11 +5,19 @@ use std::{
 
 use async_trait::async_trait;
 use pueue_agent::{
-    db::{Db, EventRepository, ProjectRepository, SubmissionRepository},
+    db::{
+        CampaignRepository, Db, EventRepository, ExperimentRepository, ProjectRepository,
+        ManagedSubmissionIntent, StartCampaignRequest, SubmissionRepository,
+    },
+    execution_policy::CampaignLimits,
     events::{
         callback_group_for_task, record_callback_with, CallbackMetadata, CallbackRecordResult,
     },
-    models::{EventKind, EventStatus, NewProject, NewSubmission, SubmissionStatus},
+    models::{
+        BudgetReservationStatus, EventKind, EventStatus, ExperimentStatus, NewProject,
+        NewSubmission, ProposalKind, SubmissionStatus,
+    },
+    proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueError, PueueTask},
     reconcile::{task_signature, Reconciler},
     AppError,
@@ -161,6 +169,63 @@ impl Harness {
             .unwrap()
     }
 
+    fn campaign_intent(&self) -> ManagedSubmissionIntent {
+        let objective = pueue_agent::state::ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "objective-digest".to_owned(),
+        };
+        let argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--name".to_owned(),
+            "experiment".to_owned(),
+        ];
+        let proposal = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "campaign-reconciliation",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &proposal,
+                    submission_id: "campaign-submission-baseline",
+                    experiment_id: "campaign-experiment-baseline",
+                    proposal_id: "campaign-proposal-baseline",
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap()
+    }
+
+    fn accepted_campaign_experiment(&self, task_id: i64) -> String {
+        let intent = self.campaign_intent();
+        let experiment_id = intent.experiment.experiment_id;
+        let experiments = ExperimentRepository::new(&self.db);
+        experiments.mark_submitting(&experiment_id, 101).unwrap();
+        experiments
+            .mark_accepted(
+                &experiment_id,
+                task_id,
+                "campaign-provisional-signature",
+                102,
+            )
+            .unwrap();
+        experiment_id
+    }
+
     fn set_event_status(&self, event_id: i64, status: EventStatus) {
         let lease_until = if status == EventStatus::Claimed {
             Some(10_000)
@@ -215,6 +280,101 @@ fn terminal_task(id: i64, enqueue: &str, result: serde_json::Value) -> PueueTask
         ended_at: Some(enqueue.to_owned()),
         result: Some(result),
     }
+}
+
+#[tokio::test]
+async fn campaign_experiment_terminal_success_is_projected_and_consumes_reservation() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+
+    Reconciler::new(&harness.db, fake).run_once_at(200).await.unwrap();
+
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Succeeded);
+    let reservation: BudgetReservationStatus = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE experiment_id = ?1",
+            [&experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation, BudgetReservationStatus::Consumed);
+}
+
+#[tokio::test]
+async fn campaign_experiment_terminal_failure_is_projected_idempotently() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let task = terminal_task(41, "100", json!({"Failed": 17}));
+    let fake = FakePueue::with_tasks(vec![task]);
+    let mut reconciler = Reconciler::new(&harness.db, fake);
+
+    reconciler.run_once_at(200).await.unwrap();
+    reconciler.run_once_at(201).await.unwrap();
+
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Failed);
+    assert!(experiment.failure_code.is_some());
+    assert!(experiment.failure_fingerprint.is_some());
+    assert_eq!(experiment.finished_at, Some(200));
+}
+
+#[tokio::test]
+async fn campaign_experiment_unreconciled_is_not_adopted_by_legacy_recovery() {
+    let harness = Harness::new();
+    let intent = harness.campaign_intent();
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments
+        .mark_submitting(&intent.experiment.experiment_id, 101)
+        .unwrap();
+    experiments
+        .mark_unreconciled(&intent.experiment.experiment_id, "pueue_add_unknown", 102)
+        .unwrap();
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+
+    Reconciler::new(&harness.db, fake).run_once_at(200).await.unwrap();
+
+    let experiment = experiments
+        .find_by_id(&intent.experiment.experiment_id)
+        .unwrap()
+        .unwrap();
+    let submission = SubmissionRepository::new(&harness.db)
+        .find_by_id(&intent.submission.submission_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+    assert_eq!(submission.status, SubmissionStatus::Unreconciled);
+    assert_eq!(submission.pueue_task_id, None);
+}
+
+#[tokio::test]
+async fn campaign_experiment_conflicting_terminal_observation_is_rejected() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+    let mut reconciler = Reconciler::new(&harness.db, fake.clone());
+    reconciler.run_once_at(200).await.unwrap();
+    fake.set_tasks(vec![terminal_task(41, "100", json!({"Failed": 17}))]);
+
+    assert!(reconciler.run_once_at(201).await.is_err());
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Succeeded
+    );
 }
 
 #[test]

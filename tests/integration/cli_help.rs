@@ -704,14 +704,15 @@ use std::os::unix::fs::PermissionsExt;
 use pueue_agent::{
     config,
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, ProjectRepository,
-        SubmissionRepository, TaskObservationRepository,
+        AgentRunRepository, CampaignRepository, Db, EventRepository, IncidentRepository,
+        ProjectRepository, StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
     },
+    execution_policy::{CampaignLimits, StartupEnvironment},
     models::{
         AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewIncident, NewProject, NewSubmission,
-        NewTaskObservation,
+        NewTaskObservation, ProposalKind,
     },
-    execution_policy::StartupEnvironment,
+    proposals::{self, ProposalInput},
     service::{
         callback_command, CallbackRegistry, PueueConfigCallbackRegistry, ServiceDefinition,
         ServicePaths,
@@ -1423,6 +1424,8 @@ fn main() {
 struct SubmitBatchCliHarness {
     _temp: TempDir,
     root: PathBuf,
+    db: Db,
+    project_id: String,
     manifest: PathBuf,
     add_count: PathBuf,
     fail_on_add: PathBuf,
@@ -1445,6 +1448,11 @@ impl CustomPueueProfileHarness {
         let root = temp.path().join("project");
         fs::create_dir_all(&root).unwrap();
         pueue_agent::init::run(&root).unwrap();
+        fs::write(
+            root.join(".pueue-agent/STATE.md"),
+            "Reach validation loss below 0.20\n",
+        )
+        .unwrap();
 
         let state_dir = temp.path().join("state");
         let db = Db::open(&state_dir.join("state.sqlite3")).unwrap();
@@ -1642,6 +1650,8 @@ impl SubmitBatchCliHarness {
         Self {
             _temp: temp,
             root,
+            db,
+            project_id: project_config.project_id,
             manifest: manifest_path,
             add_count,
             fail_on_add,
@@ -1685,6 +1695,44 @@ impl SubmitBatchCliHarness {
             .parse()
             .unwrap()
     }
+
+    fn activate_campaign(&self) {
+        fs::write(
+            self.root.join(".pueue-agent/STATE.md"),
+            "Reach validation loss below 0.20\n",
+        )
+        .unwrap();
+        let objective = pueue_agent::state::load_objective(&self.root).unwrap();
+        let argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let proposal = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "active-campaign-submit-cli",
+                    project_id: &self.project_id,
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &proposal,
+                    submission_id: "active-campaign-submit-cli-submission",
+                    experiment_id: "active-campaign-submit-cli-experiment",
+                    proposal_id: "active-campaign-submit-cli-proposal",
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -1701,6 +1749,37 @@ fn rust_string(path: &std::path::Path) -> String {
 }
 
 const BATCH_REQUEST_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test]
+fn active_campaign_submit_and_batch_are_rejected_before_persistence_or_pueue_add() {
+    let harness = SubmitBatchCliHarness::new(
+        r#"{"jobs":[{"id":"job-a","argv":["python","other.py"]}]}"#,
+    );
+    harness.activate_campaign();
+
+    let submit = harness
+        .command()
+        .args(["submit", "--", "python", "other.py"])
+        .output()
+        .unwrap();
+    let batch = harness.run_json(BATCH_REQUEST_ID);
+
+    assert!(!submit.status.success());
+    assert!(!batch.status.success());
+    let message = "a managed campaign is active; use pueue-agent steer";
+    assert!(String::from_utf8_lossy(&submit.stderr).contains(message));
+    assert!(String::from_utf8_lossy(&batch.stderr).contains(message));
+    assert_eq!(harness.add_count(), 0);
+    let connection = harness.db.connect().unwrap();
+    let submissions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM submissions", [], |row| row.get(0))
+        .unwrap();
+    let batches: i64 = connection
+        .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(submissions, 1);
+    assert_eq!(batches, 0);
+}
 
 #[test]
 fn submit_batch_cli_help_lists_request_manifest_group_and_json_options() {
@@ -1737,17 +1816,6 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
             .contains(harness.custom_config.to_str().unwrap())
     );
 
-    let output = harness
-        .command()
-        .args(["submit", "--", "/usr/bin/true"])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     let manifest = harness.root.join("jobs.json");
     fs::write(
         &manifest,
@@ -1766,6 +1834,16 @@ fn custom_pueue_profile_submit_reuses_the_profile_pinned_by_enable_without_a_rep
             String::from_utf8_lossy(&output.stdout),
         );
     }
+    let output = harness
+        .command()
+        .args(["submit", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let doctor = harness
         .command()
         .args(["doctor", "--json"])

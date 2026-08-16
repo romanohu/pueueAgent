@@ -1,13 +1,20 @@
 use std::{collections::BTreeMap, time::SystemTime};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
-    db::{Db, EventRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository},
+    db::{
+        Db, EventRepository, ExperimentRepository, ProjectRepository, SubmissionRepository,
+        TaskObservationRepository,
+    },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
     incidents::IncidentStore,
-    models::{EventKind, NewEvent, NewTaskObservation, Submission, SubmissionStatus},
+    models::{
+        EventKind, ExperimentTerminalOutcome, NewEvent, NewTaskObservation, Submission,
+        SubmissionStatus,
+    },
     pueue::{PueueApi, PueueTask},
     termination::{
         auto_kill_request_for_terminal_task, confirm_auto_kill_terminal_observation,
@@ -126,6 +133,7 @@ where
                     ),
                 }
                 let _ = event;
+                project_terminal_experiment(self.db, &project.project_id, task, now)?;
                 let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(
                     project.project_id.as_str(),
                     task_incident_key(task),
@@ -137,6 +145,91 @@ where
         recover_submissions(self.db, &projects, &tasks, &mut report)?;
         Ok(report)
     }
+}
+
+fn project_terminal_experiment(
+    db: &Db,
+    project_id: &str,
+    task: &PueueTask,
+    now: i64,
+) -> Result<(), AppError> {
+    let connection = db.connect()?;
+    let mut statement = connection
+        .prepare(
+             "SELECT submission_id FROM submissions
+             WHERE project_id = ?1 AND pueue_task_id = ?2
+               AND status = 'accepted'
+             ORDER BY created_at, submission_id",
+        )
+        .map_err(|source| AppError::Database {
+            operation: "prepare terminal campaign submission lookup",
+            source,
+        })?;
+    let submission_ids = statement
+        .query_map(rusqlite::params![project_id, task.id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| AppError::Database {
+            operation: "query terminal campaign submissions",
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::Database {
+            operation: "read terminal campaign submissions",
+            source,
+        })?;
+    drop(statement);
+    drop(connection);
+
+    let submissions = SubmissionRepository::new(db);
+    let mut matches = Vec::new();
+    for submission_id in submission_ids {
+        let Some(submission) = submissions.find_by_id(&submission_id)? else {
+            continue;
+        };
+        if submission_matches_task(&submission, task) {
+            matches.push(submission);
+        }
+    }
+    if matches.len() != 1 {
+        return Ok(());
+    }
+    let experiments = ExperimentRepository::new(db);
+    let Some(experiment) = experiments.find_by_submission_id(&matches[0].submission_id)? else {
+        return Ok(());
+    };
+    if task.state.eq_ignore_ascii_case("killed") {
+        experiments.project_terminal_submission(
+            &experiment.experiment_id,
+            task.id,
+            ExperimentTerminalOutcome::Cancelled,
+            now,
+        )?;
+    } else if terminal_event_kind(task) == EventKind::TaskFailed {
+        let failure_code = if task.state.eq_ignore_ascii_case("failed") {
+            "pueue_failed"
+        } else {
+            "pueue_result_failed"
+        };
+        let failure_fingerprint = format!("{:x}", Sha256::digest(task_signature(task)));
+        experiments.project_terminal_submission(
+            &experiment.experiment_id,
+            task.id,
+            ExperimentTerminalOutcome::Failed {
+                failure_code,
+                failure_fingerprint: &failure_fingerprint,
+            },
+            now,
+        )?;
+    } else {
+        experiments.project_terminal_submission(
+            &experiment.experiment_id,
+            task.id,
+            ExperimentTerminalOutcome::Succeeded,
+            now,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn task_signature(task: &PueueTask) -> TaskSignature {
@@ -252,6 +345,7 @@ fn recover_submissions(
     report: &mut ReconcileReport,
 ) -> Result<(), AppError> {
     let repository = SubmissionRepository::new(db);
+    let experiments = ExperimentRepository::new(db);
     for project in projects {
         let mut candidates = tasks
             .iter()
@@ -259,6 +353,15 @@ fn recover_submissions(
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|task| task.id);
         for submission in repository.find_unreconciled(&project.project_id)? {
+            // Managed submissions require an experiment transition in the same
+            // repository transaction. Leave them for managed reconciliation;
+            // the legacy adoption path only owns standalone submissions.
+            if experiments
+                .find_by_submission_id(&submission.submission_id)?
+                .is_some()
+            {
+                continue;
+            }
             let matches = candidates
                 .iter()
                 .filter(|task| submission_matches_task(submission_ref(&submission), task))
