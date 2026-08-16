@@ -568,7 +568,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             &missing_execution_projection_columns,
         )?;
     }
-    ensure_agent_run_id_sequence(&transaction)?;
+    ensure_agent_run_id_sequence(&transaction, version)?;
     ensure_agent_run_launch_gate(&transaction)?;
     ensure_intervention_insertion_sequence(&transaction)?;
     ensure_invariant_indexes(&transaction)?;
@@ -712,6 +712,7 @@ fn invalid_agent_run_id_sequence() -> AppError {
 
 fn ensure_agent_run_id_sequence(
     transaction: &rusqlite::Transaction<'_>,
+    source_version: i64,
 ) -> Result<(), AppError> {
     let table_sql: Option<String> = transaction
         .query_row(
@@ -751,9 +752,12 @@ fn ensure_agent_run_id_sequence(
         .map_err(|_| AppError::Runtime {
             operation: "validate SQLite agent run ID sequence after migration",
         })?;
-    transaction
-        .execute_batch("PRAGMA user_version = 15;")
-        .map_err(database_error("set SQLite v15 schema version"))
+    if source_version < 15 {
+        transaction
+            .execute_batch("PRAGMA user_version = 15;")
+            .map_err(database_error("set SQLite v15 schema version"))?;
+    }
+    Ok(())
 }
 
 fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
@@ -1347,12 +1351,15 @@ fn ensure_index_definition(
 }
 
 fn compact_sql(sql: &str) -> String {
+    compact_sql_exact(sql).to_ascii_lowercase()
+}
+
+fn compact_sql_exact(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .trim_end_matches(';')
         .to_owned()
-        .to_ascii_lowercase()
 }
 
 fn migrate_campaign_schema_to_v16(
@@ -1408,7 +1415,7 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
             .optional()?;
         if !actual_sql
             .as_deref()
-            .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql))
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
         {
             return Ok(false);
         }
@@ -1580,7 +1587,7 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
             .optional()?;
         if !actual_sql
             .as_deref()
-            .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql))
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
         {
             return Ok(false);
         }

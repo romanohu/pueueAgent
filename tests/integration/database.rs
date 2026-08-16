@@ -1331,6 +1331,32 @@ fn campaign_schema_current_v16_rejects_a_missing_state_check() {
 }
 
 #[test]
+fn campaign_schema_current_v16_rejects_case_changed_state_literal_without_repair() {
+    let test = mutate_current_campaign_schema(
+        r#"
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master
+           SET sql = replace(sql, '''active''', '''ACTIVE''')
+         WHERE type = 'table' AND name = 'campaigns';
+        PRAGMA writable_schema = OFF;
+        PRAGMA user_version = 16;
+        "#,
+    );
+
+    assert_current_campaign_schema_rejected(&test.path);
+
+    let campaign_sql: String = Connection::open(&test.path)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'campaigns'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(campaign_sql.contains("'ACTIVE'"));
+}
+
+#[test]
 fn campaign_schema_current_v16_rejects_wrong_nullability() {
     let test = mutate_current_campaign_schema(
         r#"
@@ -1366,6 +1392,33 @@ fn campaign_schema_current_v16_rejects_missing_partial_unique_index_without_repa
         )
         .unwrap();
     assert!(!index_exists);
+}
+
+#[test]
+fn campaign_schema_current_v16_rejects_case_changed_partial_index_literal_without_repair() {
+    let test = mutate_current_campaign_schema(
+        r#"
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master
+           SET sql = replace(sql, '''retired''', '''RETIRED''')
+         WHERE type = 'index' AND name = 'campaigns_one_live_project_idx';
+        PRAGMA writable_schema = OFF;
+        PRAGMA user_version = 16;
+        "#,
+    );
+
+    assert_current_campaign_schema_rejected(&test.path);
+
+    let index_sql: String = Connection::open(&test.path)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index'
+             AND name = 'campaigns_one_live_project_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_sql.contains("'RETIRED'"));
 }
 
 #[test]
@@ -2382,6 +2435,35 @@ fn current_v13_reopen_repairs_missing_event_status_not_before_index() {
         )
         .unwrap();
     assert!(exists);
+}
+
+#[test]
+fn campaign_schema_current_v16_repair_preserves_user_version() {
+    let test = TestDatabase::new();
+    test.db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX events_project_status_not_before_idx", [])
+        .unwrap();
+
+    Db::open(&test.path).unwrap();
+
+    let connection = Connection::open(&test.path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let index_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'events_project_status_not_before_idx'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 16);
+    assert!(index_exists);
 }
 
 #[test]
