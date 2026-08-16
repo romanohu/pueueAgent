@@ -1,5 +1,7 @@
 # 実験キャンペーン: (目的をここに書く)
 
+このファイルは人間が定める変更不可のキャンペーン目的を保持します。SQLite が campaign、objective、budget、lineage の正本であり、`state.json` は agent が使う境界付き scratch projection です。
+
 ## 方針・制約
 <!-- 人が記入する: 探索してよい範囲、やってはいけないこと、成功の定義 -->
 - (例) lr、batch_size、model depth は変更可。データセットと評価指標は変更不可

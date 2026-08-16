@@ -855,7 +855,7 @@ fn operator_intervention_prompt_keeps_the_empty_base_prompt_byte_compatible() {
     assert_eq!(
         prompt,
         format!(
-            "Dispatch mode: failure\nProject ID: project-a\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/state.json (canonical)\n- .pueue-agent/STATE.md (supplementary)\n\nBounded event summary:\n\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/state.json as canonical machine state, and finally .pueue-agent/STATE.md as supplementary context. Preserve the configured guardrails and update canonical state before exiting.\n",
+            "Dispatch mode: failure\nProject ID: project-a\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md (human campaign objective)\n- .pueue-agent/state.json (bounded agent scratch projection)\n\nBounded event summary:\n\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md as the human campaign objective, and finally .pueue-agent/state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails.\n",
             project.root_path.display(),
         )
     );
@@ -2757,8 +2757,22 @@ async fn guardrails_pause_when_experiment_limit_is_reached() {
 }
 
 #[tokio::test]
-async fn canonical_state_budget_zero_prevents_experiment_dispatch() {
+async fn legacy_state_budget_does_not_override_project_guardrails() {
     let harness = SchedulerHarness::new();
+    for index in 0..20 {
+        let submission = NewSubmission {
+            status: SubmissionStatus::Accepted,
+            ..NewSubmission::new(
+                format!("legacy-budget-submission-{index}"),
+                "project-a",
+                vec!["python".to_owned(), "train.py".to_owned()],
+                harness.now - 20 + index,
+            )
+        };
+        SubmissionRepository::new(&harness.db)
+            .insert_idempotent(&submission)
+            .unwrap();
+    }
     fs::write(
         harness.root("project-a").join(".pueue-agent/state.json"),
         serde_json::to_vec(&json!({
@@ -2767,7 +2781,7 @@ async fn canonical_state_budget_zero_prevents_experiment_dispatch() {
             "historical_facts": [],
             "next_action": "inspect current loss",
             "budgets": {
-                "max_experiments": 0,
+                "max_experiments": 1_000_000,
                 "max_agent_runs": 10,
                 "max_consecutive_failures": 3
             },

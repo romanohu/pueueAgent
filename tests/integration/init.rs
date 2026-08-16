@@ -12,6 +12,7 @@ use pueue_agent::{
     models::{
         AgentContextMode, AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject,
     },
+    state, AppError,
 };
 use tempfile::TempDir;
 
@@ -150,12 +151,82 @@ fn canonical_state_init_creates_bounded_machine_state() {
     assert!(output.status.success());
     let state = root.join(".pueue-agent/state.json");
     let value: serde_json::Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert!(value["current_facts"].is_array());
     assert!(value["historical_facts"].is_array());
     assert!(value["next_action"].is_string());
-    assert!(value["budgets"].is_object());
+    assert!(value.get("budgets").is_none());
     assert!(value["active_lineage"].is_object());
+}
+
+#[test]
+fn objective_snapshot_is_bounded_normalized_and_stable() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(root.join(".pueue-agent")).unwrap();
+    fs::write(
+        root.join(".pueue-agent/STATE.md"),
+        "# Goal\r\nReach validation loss below 0.20\r\n",
+    )
+    .unwrap();
+
+    let first = state::load_objective(&root).unwrap();
+    let second = state::load_objective(&root).unwrap();
+
+    assert_eq!(first.text, "# Goal\nReach validation loss below 0.20\n");
+    assert_eq!(first.digest, second.digest);
+    assert_eq!(first.digest.len(), 64);
+}
+
+#[test]
+fn untouched_state_template_is_not_a_campaign_objective() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(root.join(".pueue-agent")).unwrap();
+    fs::write(
+        root.join(".pueue-agent/STATE.md"),
+        include_str!("../../templates/STATE.md"),
+    )
+    .unwrap();
+
+    let error = state::load_objective(&root).unwrap_err();
+
+    assert!(matches!(error, AppError::Validation { field: "STATE.md", .. }));
+}
+
+#[test]
+fn objective_rejects_empty_unsafe_and_oversized_content() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    let state_dir = root.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    for contents in [
+        " \t\n",
+        "# Goal\n\0unsafe\n",
+        "# Goal\nunsafe\u{1}\n",
+        &format!("goal\n{}", "x".repeat(state::MAX_OBJECTIVE_BYTES)),
+    ] {
+        fs::write(state_dir.join("STATE.md"), contents).unwrap();
+        let error = state::load_objective(&root).unwrap_err();
+        assert!(matches!(error, AppError::Validation { field: "STATE.md", .. }));
+    }
+}
+
+#[test]
+fn objective_rejects_comment_and_table_only_content() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(root.join(".pueue-agent")).unwrap();
+    fs::write(
+        root.join(".pueue-agent/STATE.md"),
+        "# Goal\n<!-- define an objective -->\n| Metric | Target |\n|---|---|\n",
+    )
+    .unwrap();
+
+    let error = state::load_objective(&root).unwrap_err();
+
+    assert!(matches!(error, AppError::Validation { field: "STATE.md", .. }));
 }
 
 #[test]

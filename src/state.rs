@@ -10,19 +10,20 @@ use serde_json::Value;
 
 use crate::{config::GuardrailsConfig, AppError};
 
-pub const CANONICAL_STATE_SCHEMA_VERSION: u32 = 1;
+pub const CANONICAL_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_STATE_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_DEPTH: usize = 32;
 pub const MAX_CURRENT_FACTS: usize = 64;
 pub const MAX_HISTORICAL_FACTS: usize = 256;
 pub const MAX_FACT_BYTES: usize = 1_024;
 pub const MAX_NEXT_ACTION_BYTES: usize = 2_048;
-pub const MAX_BUDGETS: usize = 32;
-pub const MAX_BUDGET_KEY_BYTES: usize = 64;
-pub const MAX_BUDGET_VALUE: u64 = 1_000_000;
+const MAX_LEGACY_BUDGETS: usize = 32;
+const MAX_LEGACY_BUDGET_KEY_BYTES: usize = 64;
+const MAX_LEGACY_BUDGET_VALUE: u64 = 1_000_000;
 pub const MAX_LINEAGE_IDS: usize = 64;
 pub const MAX_LINEAGE_ID_BYTES: usize = 128;
 pub const MAX_STATE_MARKDOWN_BYTES: usize = 64 * 1024;
+pub const MAX_OBJECTIVE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,8 +32,34 @@ pub struct CanonicalState {
     pub current_facts: Vec<String>,
     pub historical_facts: Vec<String>,
     pub next_action: String,
-    pub budgets: BTreeMap<String, u64>,
     pub active_lineage: ActiveLineage,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCanonicalState {
+    schema_version: u32,
+    current_facts: Vec<String>,
+    historical_facts: Vec<String>,
+    next_action: String,
+    budgets: Option<BTreeMap<String, u64>>,
+    active_lineage: ActiveLineage,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ObjectiveSnapshot {
+    pub text: String,
+    pub digest: String,
+}
+
+impl std::fmt::Debug for ObjectiveSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectiveSnapshot")
+            .field("bytes", &self.text.len())
+            .field("digest", &self.digest)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,18 +88,49 @@ pub fn path(project_root: &Path) -> PathBuf {
 }
 
 pub fn load(path: &Path) -> Result<CanonicalState, AppError> {
-    let bytes = read_bounded(path, MAX_STATE_BYTES, "open canonical state")?;
+    let bytes = read_bounded(path, MAX_STATE_BYTES, "open canonical state", "state.json")?;
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|source| AppError::Serialization {
             operation: "parse canonical state",
             source,
         })?;
     validate_depth(&value, 1)?;
-    let state: CanonicalState =
+    let has_budgets = value
+        .as_object()
+        .ok_or_else(|| invalid_state("canonical state must be a JSON object"))?
+        .contains_key("budgets");
+    let raw: RawCanonicalState =
         serde_json::from_value(value).map_err(|source| AppError::Serialization {
             operation: "decode canonical state schema",
             source,
         })?;
+    let state = match raw.schema_version {
+        1 => {
+            if let Some(budgets) = raw.budgets.as_ref() {
+                validate_legacy_budgets(budgets)?;
+            }
+            CanonicalState {
+                schema_version: CANONICAL_STATE_SCHEMA_VERSION,
+                current_facts: raw.current_facts,
+                historical_facts: raw.historical_facts,
+                next_action: raw.next_action,
+                active_lineage: raw.active_lineage,
+            }
+        }
+        CANONICAL_STATE_SCHEMA_VERSION => {
+            if has_budgets {
+                return Err(invalid_state("schema v2 must not contain budgets"));
+            }
+            CanonicalState {
+                schema_version: raw.schema_version,
+                current_facts: raw.current_facts,
+                historical_facts: raw.historical_facts,
+                next_action: raw.next_action,
+                active_lineage: raw.active_lineage,
+            }
+        }
+        _ => return Err(invalid_state("unsupported schema_version")),
+    };
     state.validate()
 }
 
@@ -92,6 +150,7 @@ pub fn load_state_markdown(path: &Path) -> Result<String, AppError> {
         path,
         MAX_STATE_MARKDOWN_BYTES,
         "read supplementary STATE.md",
+        "STATE.md",
     )?;
     String::from_utf8(bytes).map_err(|source| AppError::Io {
         operation: "decode supplementary STATE.md",
@@ -99,14 +158,31 @@ pub fn load_state_markdown(path: &Path) -> Result<String, AppError> {
     })
 }
 
+pub fn load_objective(project_root: &Path) -> Result<ObjectiveSnapshot, AppError> {
+    let path = project_root.join(".pueue-agent/STATE.md");
+    let bytes = read_bounded(
+        &path,
+        MAX_OBJECTIVE_BYTES,
+        "read campaign objective",
+        "STATE.md",
+    )?;
+    let source = String::from_utf8(bytes).map_err(|source| AppError::Io {
+        operation: "decode campaign objective",
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })?;
+    let text = source.replace("\r\n", "\n");
+    validate_objective_text(&text)?;
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    Ok(ObjectiveSnapshot { text, digest })
+}
+
 pub fn load_effective_guardrails(
     path: &Path,
     configured: &GuardrailsConfig,
 ) -> Result<GuardrailsConfig, AppError> {
-    match load_if_present(path)? {
-        Some(state) => state.effective_guardrails(configured),
-        None => Ok(configured.clone()),
-    }
+    let _ = load_if_present(path)?;
+    Ok(configured.clone())
 }
 
 pub fn check_consistency(state: &CanonicalState, state_markdown: &str) -> Vec<StateWarning> {
@@ -140,30 +216,12 @@ pub fn check_consistency(state: &CanonicalState, state_markdown: &str) -> Vec<St
 impl CanonicalState {
     pub fn summary(&self) -> String {
         format!(
-            "current_facts={} historical_facts={} next_action={} budgets={} active_lineage={}",
+            "current_facts={} historical_facts={} next_action={} active_lineage={}",
             self.current_facts.len(),
             self.historical_facts.len(),
             usize::from(!self.next_action.is_empty()),
-            self.budgets.len(),
             usize::from(self.active_lineage.is_active()),
         )
-    }
-
-    pub fn effective_guardrails(
-        &self,
-        configured: &GuardrailsConfig,
-    ) -> Result<GuardrailsConfig, AppError> {
-        let mut effective = configured.clone();
-        if let Some(value) = budget_u32(&self.budgets, "max_experiments")? {
-            effective.max_experiments = value;
-        }
-        if let Some(value) = budget_u32(&self.budgets, "max_agent_runs")? {
-            effective.max_agent_runs = value;
-        }
-        if let Some(value) = budget_u32(&self.budgets, "max_consecutive_failures")? {
-            effective.max_consecutive_failures = value;
-        }
-        Ok(effective)
     }
 
     fn has_current_fact(&self, sentinel: &str) -> bool {
@@ -194,23 +252,6 @@ impl CanonicalState {
             MAX_NEXT_ACTION_BYTES,
             true,
         )?;
-        if self.budgets.len() > MAX_BUDGETS {
-            return Err(invalid_state(
-                "budgets exceed the maximum number of entries",
-            ));
-        }
-        for (key, value) in &self.budgets {
-            if !matches!(
-                key.as_str(),
-                "max_experiments" | "max_agent_runs" | "max_consecutive_failures"
-            ) {
-                return Err(invalid_state("unknown budget key"));
-            }
-            validate_text("budget key", key, MAX_BUDGET_KEY_BYTES, true)?;
-            if *value > MAX_BUDGET_VALUE {
-                return Err(invalid_state("budget value exceeds the supported bound"));
-            }
-        }
         self.active_lineage.validate()?;
         Ok(self)
     }
@@ -260,13 +301,19 @@ impl ActiveLineage {
     }
 }
 
-fn budget_u32(budgets: &BTreeMap<String, u64>, key: &str) -> Result<Option<u32>, AppError> {
-    match budgets.get(key) {
-        Some(value) => u32::try_from(*value)
-            .map(Some)
-            .map_err(|_| invalid_state("budget value exceeds the supported integer range")),
-        None => Ok(None),
+fn validate_legacy_budgets(budgets: &BTreeMap<String, u64>) -> Result<(), AppError> {
+    if budgets.len() > MAX_LEGACY_BUDGETS {
+        return Err(invalid_state(
+            "legacy budgets exceed the maximum number of entries",
+        ));
     }
+    for (key, value) in budgets {
+        validate_text("legacy budget key", key, MAX_LEGACY_BUDGET_KEY_BYTES, true)?;
+        if *value > MAX_LEGACY_BUDGET_VALUE {
+            return Err(invalid_state("legacy budget value exceeds the supported bound"));
+        }
+    }
+    Ok(())
 }
 
 fn has_markdown_sentinel(markdown: &str, sentinel: &str) -> bool {
@@ -301,7 +348,12 @@ fn normalize_sentinel_text(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn read_bounded(path: &Path, maximum: usize, operation: &'static str) -> Result<Vec<u8>, AppError> {
+fn read_bounded(
+    path: &Path,
+    maximum: usize,
+    operation: &'static str,
+    field: &'static str,
+) -> Result<Vec<u8>, AppError> {
     let file = File::open(path).map_err(|source| AppError::Io { operation, source })?;
     let mut bytes = Vec::with_capacity(maximum.min(16 * 1024));
     file.take((maximum + 1) as u64)
@@ -309,11 +361,44 @@ fn read_bounded(path: &Path, maximum: usize, operation: &'static str) -> Result<
         .map_err(|source| AppError::Io { operation, source })?;
     if bytes.len() > maximum {
         return Err(AppError::Validation {
-            field: "state",
-            message: "canonical state content exceeds the supported bound",
+            field,
+            message: "content exceeds the supported bound",
         });
     }
     Ok(bytes)
+}
+
+fn validate_objective_text(text: &str) -> Result<(), AppError> {
+    if text == include_str!("../templates/STATE.md") || text.contains("(目的をここに書く)") {
+        return Err(invalid_objective("replace the generated objective template"));
+    }
+    if text
+        .chars()
+        .any(|character| {
+            character == '\0' || (character.is_control() && !character.is_whitespace())
+        })
+    {
+        return Err(invalid_objective("objective contains unsafe control characters"));
+    }
+    if !text.lines().any(is_meaningful_objective_line) {
+        return Err(invalid_objective("objective must contain a meaningful line"));
+    }
+    Ok(())
+}
+
+fn is_meaningful_objective_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && !trimmed.starts_with("<!--")
+        && !(trimmed.starts_with('|') && trimmed.ends_with('|'))
+}
+
+fn invalid_objective(message: &'static str) -> AppError {
+    AppError::Validation {
+        field: "STATE.md",
+        message,
+    }
 }
 
 fn validate_depth(value: &Value, depth: usize) -> Result<(), AppError> {

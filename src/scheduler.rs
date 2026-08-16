@@ -689,7 +689,7 @@ fn build_base_prompt(
     events: &[Event],
 ) -> Result<String, AppError> {
     let mut prompt = format!(
-        "Dispatch mode: {mode}\nProject ID: {}\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/state.json (canonical)\n- .pueue-agent/STATE.md (supplementary)\n\nBounded event summary:\n",
+        "Dispatch mode: {mode}\nProject ID: {}\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md (human campaign objective)\n- .pueue-agent/state.json (bounded agent scratch projection)\n\nBounded event summary:\n",
         project.project_id,
         project
             .root_path
@@ -707,7 +707,7 @@ fn build_base_prompt(
         ));
     }
     prompt.push_str(
-        "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/state.json as canonical machine state, and finally .pueue-agent/STATE.md as supplementary context. Preserve the configured guardrails and update canonical state before exiting.\n",
+        "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md as the human campaign objective, and finally .pueue-agent/state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails.\n",
     );
 
     Ok(prompt)

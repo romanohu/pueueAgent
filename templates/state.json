@@ -1,15 +1,8 @@
 {
-  "schema_version": 1,
-  "current_facts": [
-    "campaign not started"
-  ],
+  "schema_version": 2,
+  "current_facts": ["campaign not started"],
   "historical_facts": [],
   "next_action": "define experiment objective",
-  "budgets": {
-    "max_experiments": 20,
-    "max_agent_runs": 100,
-    "max_consecutive_failures": 3
-  },
   "active_lineage": {
     "event_id": null,
     "run_id": null,

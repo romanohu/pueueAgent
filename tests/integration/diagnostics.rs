@@ -48,15 +48,10 @@ fn bounded_redaction_removes_bare_provider_tokens_but_keeps_normal_reason() {
 
 fn canonical_state_json() -> Value {
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "current_facts": ["campaign active"],
         "historical_facts": ["campaign started"],
         "next_action": "inspect current loss",
-        "budgets": {
-            "max_experiments": 3,
-            "max_agent_runs": 4,
-            "max_consecutive_failures": 2
-        },
         "active_lineage": {
             "event_id": 17,
             "run_id": 23,
@@ -288,18 +283,18 @@ fn canonical_state_doctor_rejects_duplicate_current_facts() {
 }
 
 #[test]
-fn canonical_state_doctor_rejects_invalid_budget_values_and_oversized_state() {
+fn canonical_state_doctor_rejects_v2_budgets_and_oversized_state() {
     let harness = DiagnosticsHarness::new();
     fs::create_dir_all(harness.project().root_path.join(".pueue-agent")).unwrap();
     let mut state = canonical_state_json();
-    state["budgets"]["max_experiments"] = json!(-1);
+    state["budgets"] = json!({"max_experiments": 1});
     fs::write(
         harness.project().root_path.join(".pueue-agent/state.json"),
         serde_json::to_vec(&state).unwrap(),
     )
     .unwrap();
 
-    let invalid_budget = render_doctor_report(
+    let v2_budget = render_doctor_report(
         &harness.db,
         &harness.project(),
         &doctor_paths(&harness),
@@ -308,9 +303,9 @@ fn canonical_state_doctor_rejects_invalid_budget_values_and_oversized_state() {
         true,
     )
     .unwrap();
-    let invalid_budget: Value = serde_json::from_str(&invalid_budget).unwrap();
+    let v2_budget: Value = serde_json::from_str(&v2_budget).unwrap();
     assert_eq!(
-        state_check(&invalid_budget, "state.schema")["status"],
+        state_check(&v2_budget, "state.schema")["status"],
         "error"
     );
 
@@ -410,12 +405,12 @@ fn canonical_state_doctor_rejects_normalized_current_fact_duplicates() {
 }
 
 #[test]
-fn canonical_state_doctor_rejects_unknown_budget_keys() {
+fn canonical_state_doctor_rejects_v2_budget_fields_regardless_of_key() {
     let harness = DiagnosticsHarness::new();
     let state_dir = harness.project().root_path.join(".pueue-agent");
     fs::create_dir_all(&state_dir).unwrap();
     let mut state = canonical_state_json();
-    state["budgets"]["unexpected_budget"] = json!(1);
+    state["budgets"] = json!({"unexpected_budget": 1});
     fs::write(
         state_dir.join("state.json"),
         serde_json::to_vec(&state).unwrap(),
@@ -434,7 +429,7 @@ fn canonical_state_doctor_rejects_unknown_budget_keys() {
     let value: Value = serde_json::from_str(&rendered).unwrap();
     let check = state_check(&value, "state.schema");
     assert_eq!(check["status"], "error");
-    assert!(check["summary"].as_str().unwrap().contains("unknown"));
+    assert!(check["summary"].as_str().unwrap().contains("budgets"));
 }
 
 #[cfg(unix)]
