@@ -133,7 +133,7 @@ where
                     ),
                 }
                 let _ = event;
-                project_terminal_experiment(self.db, &project.project_id, task, now)?;
+                project_terminal_experiment(self.db, &project.project_id, task, &tasks, now)?;
                 let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(
                     project.project_id.as_str(),
                     task_incident_key(task),
@@ -151,6 +151,7 @@ fn project_terminal_experiment(
     db: &Db,
     project_id: &str,
     task: &PueueTask,
+    tasks: &[PueueTask],
     now: i64,
 ) -> Result<(), AppError> {
     let connection = db.connect()?;
@@ -187,7 +188,13 @@ fn project_terminal_experiment(
         let Some(submission) = submissions.find_by_id(&submission_id)? else {
             continue;
         };
-        if submission_matches_task(&submission, task) {
+        if accepted_submission_matches_task(&submission, task)
+            && tasks
+                .iter()
+                .filter(|candidate| accepted_submission_matches_task(&submission, candidate))
+                .count()
+                == 1
+        {
             matches.push(submission);
         }
     }
@@ -230,6 +237,21 @@ fn project_terminal_experiment(
         )?;
     }
     Ok(())
+}
+
+fn accepted_submission_matches_task(submission: &Submission, task: &PueueTask) -> bool {
+    if submission.pueue_task_id != Some(task.id) {
+        return false;
+    }
+    let Some(stored_signature) = submission.task_signature.as_deref() else {
+        return false;
+    };
+    stored_signature == task_signature(task)
+        || stored_signature
+            == format!(
+                "provisional-submit:v1:group={}:task-id={}:intent={}",
+                task.group, task.id, submission.submission_id
+            )
 }
 
 pub fn task_signature(task: &PueueTask) -> TaskSignature {

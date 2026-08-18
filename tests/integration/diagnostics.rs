@@ -6,9 +6,9 @@ use std::os::unix::fs::symlink;
 use pueue_agent::{
     cli::Cli,
     db::{
-        AgentRunRepository, Db, EventRepository, IncidentRepository, InterventionRepository,
-        ProjectRepository, TaskObservationRepository, TerminationRequestRepository,
-        LATEST_SCHEMA_VERSION,
+        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        IncidentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
+        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
         build_doctor_report, build_doctor_report_with_policy, render_doctor_report,
@@ -16,14 +16,18 @@ use pueue_agent::{
         render_incident_explanation, render_project_status_json, render_task_inspection,
         DoctorCheckStatus, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
     },
-    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage, StartupEnvironment},
+    execution_policy::{
+        CampaignLimits, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
+        StartupEnvironment,
+    },
     models::{
         AgentRunStatus, EventKind, EventStatus, ExecutionProjection, NewAgentRun, NewEvent,
-        NewIncident, NewProject, NewTaskObservation, NewTerminationRequest,
+        NewIncident, NewProject, NewTaskObservation, NewTerminationRequest, ProposalKind,
         TerminationRequestStatus,
     },
     output::redact_sensitive_text,
     pueue::PueueTask,
+    proposals::{self, ProposalInput},
     service::{ServicePaths, ServiceStatus},
     status::{render_project_status, render_project_status_compact, PueueSnapshot, StatusInput},
     runs::render_runs,
@@ -844,6 +848,188 @@ impl DiagnosticsHarness {
             pueue,
         }
     }
+
+    fn start_campaign(&self) -> String {
+        let state_dir = self.project().root_path.join(".pueue-agent");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("STATE.md"),
+            "Reach SECRET_OBJECTIVE validation loss below 0.20\n",
+        )
+        .unwrap();
+        let objective = pueue_agent::state::load_objective(&self.project().root_path).unwrap();
+        let argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--token".to_owned(),
+            "SECRET_ARGV".to_owned(),
+        ];
+        let proposal = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "diagnostics-campaign",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &proposal,
+                    submission_id: "diagnostics-campaign-submission",
+                    experiment_id: "diagnostics-campaign-experiment",
+                    proposal_id: "diagnostics-campaign-proposal",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    now: unix_now(),
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap()
+            .campaign
+            .campaign_id
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[test]
+fn campaign_status_human_compact_and_json_project_bounded_campaign_state() {
+    let harness = DiagnosticsHarness::new();
+    let campaign_id = harness.start_campaign();
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments
+        .mark_submitting("diagnostics-campaign-experiment", unix_now())
+        .unwrap();
+    experiments
+        .mark_unreconciled(
+            "diagnostics-campaign-experiment",
+            "pueue_add_unknown",
+            unix_now(),
+        )
+        .unwrap();
+    CampaignRepository::new(&harness.db)
+        .reserve_agent_decision(
+            &campaign_id,
+            "diagnostics-decision",
+            &CampaignLimits::default(),
+            unix_now(),
+        )
+        .unwrap();
+    let input = harness.input(PueueSnapshot::Tasks(Vec::new()));
+
+    let human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    let compact =
+        render_project_status_compact(&harness.db, &harness.project(), &input).unwrap();
+    let json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+    for rendered in [&human, &compact, &json] {
+        assert!(rendered.contains("campaign"), "{rendered}");
+        assert!(rendered.contains("active"), "{rendered}");
+        assert!(rendered.contains("objective_digest"), "{rendered}");
+        assert!(rendered.contains("unreconciled"), "{rendered}");
+        assert!(rendered.contains("agent_run"), "{rendered}");
+        assert!(!rendered.contains("SECRET_OBJECTIVE"), "{rendered}");
+        assert!(!rendered.contains("SECRET_ARGV"), "{rendered}");
+    }
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["campaign"]["campaign_id"], campaign_id);
+    assert_eq!(value["campaign"]["experiment_counts"]["unreconciled"], 1);
+    assert_eq!(value["campaign"]["rolling_usage"]["agent_run"], 1);
+    assert_eq!(value["campaign"]["unreconciled_count"], 1);
+}
+
+#[test]
+fn campaign_status_is_absent_for_legacy_projects() {
+    let harness = DiagnosticsHarness::new();
+    let input = harness.input(PueueSnapshot::Tasks(Vec::new()));
+
+    let human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    let compact =
+        render_project_status_compact(&harness.db, &harness.project(), &input).unwrap();
+    let json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+
+    assert!(!human.lines().any(|line| line.starts_with("campaign:")));
+    assert!(!compact.lines().any(|line| line.starts_with("campaign:")));
+    assert!(serde_json::from_str::<Value>(&json).unwrap().get("campaign").is_none());
+}
+
+#[test]
+fn campaign_doctor_reports_invariants_and_objective_digest_drift_without_repair() {
+    let harness = DiagnosticsHarness::new();
+    let campaign_id = harness.start_campaign();
+    let stored_digest = CampaignRepository::new(&harness.db)
+        .find_by_id(&campaign_id)
+        .unwrap()
+        .unwrap()
+        .objective_digest;
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "UPDATE campaigns
+             SET baseline_experiment_id = NULL, state = 'budget_waiting', next_eligible_at = NULL;
+             UPDATE experiments
+             SET status = 'unreconciled', pueue_task_id = 41, task_signature = 'experiment-signature';
+             UPDATE submissions
+             SET status = 'accepted', pueue_task_id = 41, task_signature = 'submission-signature';
+             INSERT INTO budget_reservations (
+                 reservation_id, campaign_id, experiment_id, dimension, subject_key, status,
+                 window_started_at, window_ends_at, created_at, updated_at
+             ) VALUES (
+                 'orphan-code-change', 'diagnostics-campaign', NULL, 'code_change',
+                 'missing-proposal', 'consumed', 100, 200, 100, 100
+             );",
+        )
+        .unwrap();
+    fs::write(
+        harness.project().root_path.join(".pueue-agent/STATE.md"),
+        "A different objective that must not replace the snapshot\n",
+    )
+    .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        unix_now(),
+    )
+    .unwrap();
+    let status = |name: &str| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap()
+            .status
+    };
+    assert_eq!(status("campaign.live_count"), DoctorCheckStatus::Ok);
+    assert_eq!(status("campaign.baseline_linkage"), DoctorCheckStatus::Error);
+    assert_eq!(status("campaign.orphan_reservations"), DoctorCheckStatus::Error);
+    assert_eq!(status("campaign.task_identity"), DoctorCheckStatus::Error);
+    assert_eq!(status("campaign.submission_boundaries"), DoctorCheckStatus::Warning);
+    assert_eq!(status("campaign.budget_wake"), DoctorCheckStatus::Error);
+    assert_eq!(status("campaign.objective_digest"), DoctorCheckStatus::Warning);
+    assert_eq!(
+        CampaignRepository::new(&harness.db)
+            .find_by_id(&campaign_id)
+            .unwrap()
+            .unwrap()
+            .objective_digest,
+        stored_digest
+    );
 }
 
 #[test]

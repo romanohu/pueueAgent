@@ -9,12 +9,18 @@ use std::{
 use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
+    db::{
+        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        InterventionRepository, ProjectRepository, StartCampaignRequest,
+    },
     daemon::{Daemon, DaemonConfig, DaemonReport},
-    db::{AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository},
+    execution_policy::CampaignLimits,
     interventions::InterventionStatus,
     models::{
-        AgentContextMode, AgentRunStatus, EventKind, EventStatus, NewAgentRun, NewEvent, NewProject,
+        AgentContextMode, AgentRunStatus, EventKind, EventStatus, ExperimentStatus, NewAgentRun,
+        NewEvent, NewProject, ProposalKind,
     },
+    proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
     AppError,
 };
@@ -34,6 +40,7 @@ mod execution_policy_fixture;
 struct FakePueue {
     tasks: Arc<Mutex<Vec<PueueTask>>>,
     status_calls: Arc<Mutex<usize>>,
+    add_calls: Arc<Mutex<Vec<Vec<OsString>>>>,
     kill_calls: Arc<Mutex<Vec<i64>>>,
     status_observed: Arc<Notify>,
 }
@@ -43,6 +50,7 @@ impl FakePueue {
         Self {
             tasks: Arc::new(Mutex::new(tasks)),
             status_calls: Arc::new(Mutex::new(0)),
+            add_calls: Arc::new(Mutex::new(Vec::new())),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
             status_observed: Arc::new(Notify::new()),
         }
@@ -50,6 +58,10 @@ impl FakePueue {
 
     fn status_calls(&self) -> usize {
         *self.status_calls.lock().unwrap()
+    }
+
+    fn add_calls(&self) -> Vec<Vec<OsString>> {
+        self.add_calls.lock().unwrap().clone()
     }
 
     fn set_tasks(&self, tasks: Vec<PueueTask>) {
@@ -73,8 +85,9 @@ impl PueueApi for FakePueue {
         Ok(self.tasks.lock().unwrap().clone())
     }
 
-    async fn add(&self, _args: &[OsString]) -> Result<i64, AppError> {
-        panic!("daemon loop must not submit Pueue tasks")
+    async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
+        self.add_calls.lock().unwrap().push(args.to_vec());
+        Ok(42)
     }
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
@@ -280,6 +293,51 @@ max_agent_runs = 10
 
     async fn run_once_at(&self, now: i64) -> DaemonReport {
         self.daemon_at(now).run_once().await.unwrap()
+    }
+
+    fn campaign_experiment(&self) -> String {
+        let objective = pueue_agent::state::ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "daemon-campaign-objective-digest".to_owned(),
+        };
+        let argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let proposal = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: "nested".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        fs::create_dir_all(self.root("project-a").join("nested")).unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "daemon-campaign",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &proposal,
+                    submission_id: "daemon-campaign-submission",
+                    experiment_id: "daemon-campaign-experiment",
+                    proposal_id: "daemon-campaign-proposal",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap()
+            .experiment
+            .experiment_id
+    }
+
+    async fn restart_at(&self, now: i64) -> Result<DaemonReport, AppError> {
+        self.daemon_at(now).run_once().await
     }
 
     fn enqueue(&self, kind: EventKind, project_id: &str, dedup_key: &str) -> i64 {
@@ -516,6 +574,95 @@ fn running_task() -> PueueTask {
         started_at: Some("101".to_owned()),
         ended_at: None,
         result: None,
+    }
+}
+
+#[tokio::test]
+async fn campaign_recovery_resumes_only_reserved_intents_with_the_stored_working_directory() {
+    let harness = DaemonHarness::new();
+    let experiment_id = harness.campaign_experiment();
+
+    harness.restart_at(200).await.unwrap();
+
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Accepted);
+    assert_eq!(harness.count("experiments"), 1);
+    let add_calls = harness.fake_pueue.add_calls();
+    assert_eq!(add_calls.len(), 1);
+    assert_eq!(
+        add_calls[0],
+        vec![
+            OsString::from("-g"),
+            OsString::from("pa-project"),
+            OsString::from("--working-directory"),
+            harness.registered_root("project-a").join("nested").into_os_string(),
+            OsString::from("--"),
+            OsString::from("python"),
+            OsString::from("train.py"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn campaign_recovery_quarantines_submitting_without_readding() {
+    let harness = DaemonHarness::new();
+    let experiment_id = harness.campaign_experiment();
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&experiment_id, 150)
+        .unwrap();
+
+    harness.restart_at(200).await.unwrap();
+
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+    assert!(harness.fake_pueue.add_calls().is_empty());
+    assert_eq!(harness.count("experiments"), 1);
+}
+
+#[tokio::test]
+async fn campaign_recovery_never_readds_unreconciled_or_accepted_intents() {
+    for target in [ExperimentStatus::Unreconciled, ExperimentStatus::Accepted] {
+        let harness = DaemonHarness::new();
+        let experiment_id = harness.campaign_experiment();
+        let experiments = ExperimentRepository::new(&harness.db);
+        experiments.mark_submitting(&experiment_id, 150).unwrap();
+        match target {
+            ExperimentStatus::Unreconciled => {
+                experiments
+                    .mark_unreconciled(&experiment_id, "pueue_add_unknown", 151)
+                    .unwrap();
+            }
+            ExperimentStatus::Accepted => {
+                experiments
+                    .mark_accepted(
+                        &experiment_id,
+                        42,
+                        "provisional-submit:v1:group=pa-project:task-id=42:intent=daemon-campaign-submission",
+                        151,
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        harness.restart_at(200).await.unwrap();
+
+        assert_eq!(
+            ExperimentRepository::new(&harness.db)
+                .find_by_id(&experiment_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            target
+        );
+        assert!(harness.fake_pueue.add_calls().is_empty());
+        assert_eq!(harness.count("experiments"), 1);
     }
 }
 

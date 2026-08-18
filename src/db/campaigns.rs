@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     execution_policy::CampaignLimits,
     models::{
-        BudgetDimension, BudgetReservationStatus, Campaign, CampaignState, Experiment,
-        ExperimentStatus, ExperimentTerminalOutcome, Proposal, ProposalKind, ProposalStatus,
-        Submission, SubmissionKind, SubmissionStatus,
+        BudgetDimension, BudgetReservation, BudgetReservationStatus, Campaign, CampaignState,
+        Experiment, ExperimentStatus, ExperimentTerminalOutcome, Proposal, ProposalKind,
+        ProposalStatus, Submission, SubmissionKind, SubmissionStatus,
     },
     proposals::ValidatedProposal,
     state::ObjectiveSnapshot,
@@ -23,6 +23,7 @@ use crate::{
 use super::{database_error, Db};
 
 const ROLLING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const AGENT_RUN_WINDOW_SECONDS: i64 = 60 * 60;
 const MAX_FAILURE_FIELD_BYTES: usize = 128;
 const MAX_STATUS_TASK_IDS: i64 = 100;
 
@@ -41,12 +42,42 @@ const EXPERIMENT_SELECT: &str = "SELECT experiment_id, campaign_id, proposal_id,
 const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, created_at,
         pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
     FROM submissions";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedSubmissionIntent {
     pub campaign: Campaign,
     pub proposal: Proposal,
     pub experiment: Experiment,
     pub submission: Submission,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentDecisionReservation {
+    Reserved(BudgetReservation),
+    BudgetWaiting { next_eligible_at: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignStatusProjection {
+    pub campaign_id: String,
+    pub state: CampaignState,
+    pub state_reason: Option<String>,
+    pub objective_digest: String,
+    pub next_eligible_at: Option<i64>,
+    pub experiment_counts: BTreeMap<String, i64>,
+    pub rolling_usage: BTreeMap<String, i64>,
+    pub unreconciled_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignDoctorProjection {
+    pub live_campaign_count: i64,
+    pub objective_digest: Option<String>,
+    pub baseline_linkage_errors: i64,
+    pub orphan_reservations: i64,
+    pub task_identity_disagreements: i64,
+    pub submission_boundary_count: i64,
+    pub budget_wake_errors: i64,
 }
 
 pub struct StartCampaignRequest<'a> {
@@ -509,6 +540,490 @@ impl<'db> CampaignRepository<'db> {
     pub fn find_latest_by_project(&self, project_id: &str) -> Result<Option<Campaign>, AppError> {
         let connection = self.db.connect()?;
         find_latest_campaign_by_project(&connection, project_id)
+    }
+
+    pub fn recover_submission_boundaries(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign submission boundary recovery"))?;
+        let inconsistent: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM experiments
+                 JOIN submissions USING (submission_id)
+                 WHERE experiments.status = 'submitting'
+                   AND (submissions.status <> 'pending'
+                        OR experiments.pueue_task_id IS NOT NULL
+                        OR experiments.task_signature IS NOT NULL
+                        OR submissions.pueue_task_id IS NOT NULL
+                        OR submissions.task_signature IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error(
+                "validate stale campaign submission boundaries",
+            ))?;
+        if inconsistent != 0 {
+            return Err(validation_error(
+                "campaign.submission",
+                "submitting campaign identity is inconsistent",
+            ));
+        }
+        let recovered_submissions = transaction
+            .execute(
+                "UPDATE submissions
+                 SET status = 'unreconciled'
+                 WHERE status = 'pending' AND submission_id IN (
+                     SELECT submission_id FROM experiments WHERE status = 'submitting'
+                 )",
+                [],
+            )
+            .map_err(database_error(
+                "quarantine stale campaign submission intents",
+            ))?;
+        let recovered = transaction
+            .execute(
+                "UPDATE experiments
+                 SET status = 'unreconciled', failure_code = 'pueue_add_interrupted',
+                     updated_at = ?1
+                 WHERE status = 'submitting'",
+                [now],
+            )
+            .map_err(database_error(
+                "quarantine stale campaign experiment submissions",
+            ))?;
+        if recovered_submissions != recovered {
+            return Err(validation_error(
+                "campaign.submission",
+                "submitting campaign rows changed inconsistently during recovery",
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign submission boundary recovery"))?;
+        Ok(recovered)
+    }
+
+    pub fn list_reserved_submission_intents(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ManagedSubmissionIntent>, AppError> {
+        validate_inspection_limit(limit)?;
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT experiment_id FROM experiments
+                 WHERE status = 'reserved'
+                 ORDER BY experiment_id
+                 LIMIT ?1",
+            )
+            .map_err(database_error(
+                "prepare reserved campaign submission intent list",
+            ))?;
+        let experiment_ids = statement
+            .query_map([limit as i64], |row| row.get::<_, String>(0))
+            .map_err(database_error(
+                "query reserved campaign submission intent list",
+            ))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error(
+                "read reserved campaign submission intent list",
+            ))?;
+        drop(statement);
+        experiment_ids
+            .iter()
+            .map(|experiment_id| read_intent_by_experiment(&connection, experiment_id))
+            .collect()
+    }
+
+    pub fn reserve_agent_decision(
+        &self,
+        campaign_id: &str,
+        decision_key: &str,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> Result<AgentDecisionReservation, AppError> {
+        if decision_key.is_empty()
+            || decision_key.len() > 256
+            || decision_key.chars().any(char::is_control)
+        {
+            return Err(validation_error(
+                "decision_key",
+                "must be non-empty, bounded, and contain no control characters",
+            ));
+        }
+        let window_ends_at = now.checked_add(AGENT_RUN_WINDOW_SECONDS).ok_or_else(|| {
+            validation_error(
+                "now",
+                "cannot represent the end of the agent-run rolling window",
+            )
+        })?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign agent decision reservation"))?;
+        let campaign = read_campaign(&transaction, campaign_id)?;
+
+        if let Some(existing) = find_agent_decision_reservation(
+            &transaction,
+            campaign_id,
+            decision_key,
+        )? {
+            transaction
+                .commit()
+                .map_err(database_error("commit existing campaign agent decision"))?;
+            return Ok(AgentDecisionReservation::Reserved(existing));
+        }
+
+        if campaign.state == CampaignState::BudgetWaiting {
+            let next_eligible_at = campaign.next_eligible_at.ok_or_else(|| {
+                validation_error(
+                    "campaign.next_eligible_at",
+                    "budget-waiting campaign must have a finite wake time",
+                )
+            })?;
+            transaction
+                .commit()
+                .map_err(database_error("commit waiting campaign agent decision"))?;
+            return Ok(AgentDecisionReservation::BudgetWaiting { next_eligible_at });
+        }
+        if campaign.state != CampaignState::Active {
+            return Err(validation_error(
+                "campaign",
+                "must be active to reserve an agent decision",
+            ));
+        }
+
+        let live_count = count_live_reservations(
+            &transaction,
+            campaign_id,
+            BudgetDimension::AgentRun,
+            now,
+        )?;
+        if live_count >= i64::from(limits.max_agent_runs_per_hour) {
+            let next_eligible_at = earliest_live_reservation_expiry(
+                &transaction,
+                campaign_id,
+                BudgetDimension::AgentRun,
+                now,
+            )?
+            .ok_or_else(|| {
+                validation_error(
+                    "campaign.agent_run_budget",
+                    "exhausted rolling budget has no finite reservation expiry",
+                )
+            })?;
+            let updated = transaction
+                .execute(
+                    "UPDATE campaigns
+                     SET state = 'budget_waiting', state_reason = 'agent_run_budget_exhausted',
+                         next_eligible_at = ?1, updated_at = ?2
+                     WHERE campaign_id = ?3 AND state = 'active'",
+                    params![next_eligible_at, now, campaign_id],
+                )
+                .map_err(database_error("wait for campaign agent-run budget"))?;
+            if updated != 1 {
+                return Err(validation_error(
+                    "campaign",
+                    "state changed while reserving an agent decision",
+                ));
+            }
+            transaction
+                .commit()
+                .map_err(database_error("commit campaign agent-run budget wait"))?;
+            return Ok(AgentDecisionReservation::BudgetWaiting { next_eligible_at });
+        }
+
+        let reservation_id = format!(
+            "agent-run:{}:{:x}",
+            campaign_id,
+            Sha256::digest(decision_key.as_bytes())
+        );
+        transaction
+            .execute(
+                "INSERT INTO budget_reservations (
+                    reservation_id, campaign_id, experiment_id, dimension, subject_key, status,
+                    window_started_at, window_ends_at, created_at, updated_at
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?6, ?6)",
+                params![
+                    reservation_id,
+                    campaign_id,
+                    BudgetDimension::AgentRun,
+                    decision_key,
+                    BudgetReservationStatus::Consumed,
+                    now,
+                    window_ends_at,
+                ],
+            )
+            .map_err(database_error("insert campaign agent decision reservation"))?;
+        let reservation = read_budget_reservation(&transaction, &reservation_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign agent decision reservation"))?;
+        Ok(AgentDecisionReservation::Reserved(reservation))
+    }
+
+    pub fn wake_eligible_campaigns(&self, now: i64) -> Result<Vec<String>, AppError> {
+        self.wake_eligible_campaigns_with_limits(&CampaignLimits::default(), now)
+    }
+
+    pub fn wake_eligible_campaigns_with_limits(
+        &self,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> Result<Vec<String>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign rolling-budget wake"))?;
+        let campaign_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT campaign_id FROM campaigns
+                     WHERE state = 'budget_waiting' AND next_eligible_at <= ?1
+                     ORDER BY next_eligible_at, campaign_id
+                     LIMIT 100",
+                )
+                .map_err(database_error("prepare eligible campaign wake list"))?;
+            let rows = statement
+                .query_map([now], |row| row.get::<_, String>(0))
+                .map_err(database_error("query eligible campaign wake list"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read eligible campaign wake list"))?;
+            rows
+        };
+        let dimensions = [
+            (
+                BudgetDimension::Experiment,
+                limits.max_new_experiments_per_24h,
+            ),
+            (BudgetDimension::AgentRun, limits.max_agent_runs_per_hour),
+            (
+                BudgetDimension::CodeChange,
+                limits.max_code_change_proposals_per_24h,
+            ),
+        ];
+        let mut woken = Vec::new();
+        for campaign_id in campaign_ids {
+            let mut next_expiry = None;
+            for (dimension, limit) in dimensions {
+                let used = count_live_reservations(&transaction, &campaign_id, dimension, now)?;
+                if used >= i64::from(limit) {
+                    let expiry = earliest_live_reservation_expiry(
+                        &transaction,
+                        &campaign_id,
+                        dimension,
+                        now,
+                    )?
+                    .ok_or_else(|| {
+                        validation_error(
+                            "campaign.next_eligible_at",
+                            "exhausted rolling budget has no finite wake time",
+                        )
+                    })?;
+                    next_expiry = Some(next_expiry.map_or(expiry, |current: i64| {
+                        current.min(expiry)
+                    }));
+                }
+            }
+            if let Some(next_eligible_at) = next_expiry {
+                transaction
+                    .execute(
+                        "UPDATE campaigns
+                         SET next_eligible_at = ?1, updated_at = ?2
+                         WHERE campaign_id = ?3 AND state = 'budget_waiting'",
+                        params![next_eligible_at, now, campaign_id],
+                    )
+                    .map_err(database_error("advance campaign rolling-budget wake"))?;
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE campaigns
+                         SET state = 'active', state_reason = 'rolling_budget_available',
+                             next_eligible_at = NULL, updated_at = ?1
+                         WHERE campaign_id = ?2 AND state = 'budget_waiting'",
+                        params![now, campaign_id],
+                    )
+                    .map_err(database_error("wake campaign rolling budget"))?;
+                woken.push(campaign_id);
+            }
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign rolling-budget wake"))?;
+        Ok(woken)
+    }
+
+    pub fn status_projection_for_project(
+        &self,
+        project_id: &str,
+        now: i64,
+    ) -> Result<Option<CampaignStatusProjection>, AppError> {
+        let connection = self.db.connect()?;
+        let campaign = connection
+            .query_row(
+                "SELECT campaign_id, state, state_reason, objective_digest, next_eligible_at
+                 FROM campaigns
+                 WHERE project_id = ?1
+                 ORDER BY (state = 'retired') ASC, created_at DESC, campaign_id DESC
+                 LIMIT 1",
+                [project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, CampaignState>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("read bounded campaign status projection"))?;
+        let Some((campaign_id, state, state_reason, objective_digest, next_eligible_at)) = campaign
+        else {
+            return Ok(None);
+        };
+        let experiment_counts = grouped_campaign_counts(
+            &connection,
+            "SELECT status, COUNT(*) FROM experiments
+             WHERE campaign_id = ?1 GROUP BY status",
+            &campaign_id,
+            "count campaign status experiment states",
+        )?;
+        let mut statement = connection
+            .prepare(
+                "SELECT dimension, COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND status IN ('reserved','consumed')
+                   AND window_ends_at > ?2
+                 GROUP BY dimension",
+            )
+            .map_err(database_error("prepare campaign rolling usage projection"))?;
+        let rolling_usage = statement
+            .query_map(params![campaign_id, now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(database_error("query campaign rolling usage projection"))?
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(database_error("read campaign rolling usage projection"))?;
+        let unreconciled_count = experiment_counts.get("unreconciled").copied().unwrap_or(0);
+        Ok(Some(CampaignStatusProjection {
+            campaign_id,
+            state,
+            state_reason,
+            objective_digest,
+            next_eligible_at,
+            experiment_counts,
+            rolling_usage,
+            unreconciled_count,
+        }))
+    }
+
+    pub fn doctor_projection_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<CampaignDoctorProjection, AppError> {
+        let connection = self.db.connect()?;
+        let live_campaign_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM campaigns
+                 WHERE project_id = ?1 AND state <> 'retired'",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count live campaigns for doctor"))?;
+        let objective_digest = connection
+            .query_row(
+                "SELECT objective_digest FROM campaigns
+                 WHERE project_id = ?1 AND state <> 'retired'
+                 ORDER BY created_at DESC, campaign_id DESC LIMIT 1",
+                [project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error("read live campaign objective digest for doctor"))?;
+        let baseline_linkage_errors = connection
+            .query_row(
+                "SELECT COUNT(*) FROM campaigns AS campaign
+                 WHERE campaign.project_id = ?1 AND campaign.state <> 'retired'
+                   AND (campaign.baseline_experiment_id IS NULL OR NOT EXISTS (
+                       SELECT 1 FROM experiments AS experiment
+                       JOIN proposals AS proposal
+                         ON proposal.proposal_id = experiment.proposal_id
+                        AND proposal.campaign_id = experiment.campaign_id
+                       WHERE experiment.experiment_id = campaign.baseline_experiment_id
+                         AND experiment.campaign_id = campaign.campaign_id
+                         AND proposal.source_experiment_id IS NULL
+                   ))",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign baseline linkage"))?;
+        let orphan_reservations = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM budget_reservations AS reservation
+                 JOIN campaigns AS campaign ON campaign.campaign_id = reservation.campaign_id
+                 WHERE campaign.project_id = ?1 AND (
+                     (reservation.dimension = 'experiment' AND NOT EXISTS (
+                         SELECT 1 FROM experiments AS experiment
+                         WHERE experiment.experiment_id = reservation.experiment_id
+                           AND experiment.campaign_id = reservation.campaign_id
+                     ))
+                     OR (reservation.dimension = 'code_change' AND NOT EXISTS (
+                         SELECT 1 FROM proposals AS proposal
+                         WHERE proposal.proposal_id = reservation.subject_key
+                           AND proposal.campaign_id = reservation.campaign_id
+                     ))
+                 )",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check orphan campaign reservations"))?;
+        let task_identity_disagreements = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM experiments AS experiment
+                 JOIN campaigns AS campaign ON campaign.campaign_id = experiment.campaign_id
+                 JOIN submissions AS submission
+                   ON submission.submission_id = experiment.submission_id
+                 WHERE campaign.project_id = ?1
+                   AND (experiment.pueue_task_id IS NOT submission.pueue_task_id
+                        OR experiment.task_signature IS NOT submission.task_signature)",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign task identity agreement"))?;
+        let submission_boundary_count = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM experiments AS experiment
+                 JOIN campaigns AS campaign ON campaign.campaign_id = experiment.campaign_id
+                 WHERE campaign.project_id = ?1
+                   AND experiment.status IN ('submitting','unreconciled')",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count campaign submission boundaries"))?;
+        let budget_wake_errors = connection
+            .query_row(
+                "SELECT COUNT(*) FROM campaigns
+                 WHERE project_id = ?1 AND state = 'budget_waiting'
+                   AND next_eligible_at IS NULL",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign budget wake times"))?;
+        Ok(CampaignDoctorProjection {
+            live_campaign_count,
+            objective_digest,
+            baseline_linkage_errors,
+            orphan_reservations,
+            task_identity_disagreements,
+            submission_boundary_count,
+            budget_wake_errors,
+        })
     }
 
     pub fn status_for_project(
@@ -1337,6 +1852,58 @@ fn count_live_reservations(
         .map_err(database_error("count live rolling budget reservations"))
 }
 
+fn earliest_live_reservation_expiry(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    dimension: BudgetDimension,
+    now: i64,
+) -> Result<Option<i64>, AppError> {
+    transaction
+        .query_row(
+            "SELECT MIN(window_ends_at) FROM budget_reservations
+             WHERE campaign_id = ?1 AND dimension = ?2
+               AND status IN ('reserved','consumed') AND window_ends_at > ?3",
+            params![campaign_id, dimension, now],
+            |row| row.get(0),
+        )
+        .map_err(database_error(
+            "find earliest live rolling budget reservation expiry",
+        ))
+}
+
+fn find_agent_decision_reservation(
+    connection: &Connection,
+    campaign_id: &str,
+    decision_key: &str,
+) -> Result<Option<BudgetReservation>, AppError> {
+    connection
+        .query_row(
+            "SELECT reservation_id, campaign_id, experiment_id, dimension, subject_key, status,
+                    window_started_at, window_ends_at, created_at, updated_at
+             FROM budget_reservations
+             WHERE campaign_id = ?1 AND dimension = 'agent_run' AND subject_key = ?2",
+            params![campaign_id, decision_key],
+            budget_reservation_from_row,
+        )
+        .optional()
+        .map_err(database_error("find campaign agent decision reservation"))
+}
+
+fn read_budget_reservation(
+    connection: &Connection,
+    reservation_id: &str,
+) -> Result<BudgetReservation, AppError> {
+    connection
+        .query_row(
+            "SELECT reservation_id, campaign_id, experiment_id, dimension, subject_key, status,
+                    window_started_at, window_ends_at, created_at, updated_at
+             FROM budget_reservations WHERE reservation_id = ?1",
+            [reservation_id],
+            budget_reservation_from_row,
+        )
+        .map_err(database_error("read campaign budget reservation"))
+}
+
 fn reservation_is_consumed(
     transaction: &Transaction<'_>,
     experiment_id: &str,
@@ -1605,6 +2172,21 @@ fn submission_from_row(row: &Row<'_>) -> rusqlite::Result<Submission> {
         kind: row.get(7)?,
         metadata,
         origin_agent_run_id: row.get(9)?,
+    })
+}
+
+fn budget_reservation_from_row(row: &Row<'_>) -> rusqlite::Result<BudgetReservation> {
+    Ok(BudgetReservation {
+        reservation_id: row.get(0)?,
+        campaign_id: row.get(1)?,
+        experiment_id: row.get(2)?,
+        dimension: row.get(3)?,
+        subject_key: row.get(4)?,
+        status: row.get(5)?,
+        window_started_at: row.get(6)?,
+        window_ends_at: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 

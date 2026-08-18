@@ -221,7 +221,9 @@ impl Harness {
             .mark_accepted(
                 &experiment_id,
                 task_id,
-                "campaign-provisional-signature",
+                &format!(
+                    "provisional-submit:v1:group=pa-project:task-id={task_id}:intent=campaign-submission-baseline"
+                ),
                 102,
             )
             .unwrap();
@@ -357,6 +359,61 @@ async fn campaign_experiment_unreconciled_is_not_adopted_by_legacy_recovery() {
     assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
     assert_eq!(submission.status, SubmissionStatus::Unreconciled);
     assert_eq!(submission.pueue_task_id, None);
+}
+
+#[tokio::test]
+async fn campaign_unreconciled_accepted_identity_rejects_command_only_task_match() {
+    let harness = Harness::new();
+    let intent = harness.campaign_intent();
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments
+        .mark_submitting(&intent.experiment.experiment_id, 101)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            &intent.experiment.experiment_id,
+            41,
+            "provisional-submit:v1:group=pa-project:task-id=99:intent=campaign-submission-baseline",
+            102,
+        )
+        .unwrap();
+    let fake = FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]);
+
+    Reconciler::new(&harness.db, fake)
+        .run_once_at(200)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        experiments
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn campaign_unreconciled_accepted_identity_requires_one_unique_status_task() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let task = terminal_task(41, "100", json!("Success"));
+    let fake = FakePueue::with_tasks(vec![task.clone(), task]);
+
+    Reconciler::new(&harness.db, fake)
+        .run_once_at(200)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
 }
 
 #[tokio::test]

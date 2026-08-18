@@ -12,8 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{AgentHandle, AgentRunner, BoundCleanupHandle},
+    campaign::CampaignCoordinator,
     config,
-    db::{AgentRunRepository, Db, ProjectRepository, TerminationRequestRepository},
+    db::{
+        AgentRunRepository, CampaignRepository, Db, ProjectRepository,
+        TerminationRequestRepository,
+    },
     detect::Detector,
     execution_policy::ResolvedExecutionPolicy,
     incidents::IncidentStore,
@@ -65,7 +69,7 @@ pub struct DaemonReport {
 pub struct Daemon<P> {
     db: Db,
     pueue: P,
-    _policy: Arc<ResolvedExecutionPolicy>,
+    policy: Arc<ResolvedExecutionPolicy>,
     runner: Option<AgentRunner>,
     config: DaemonConfig,
     active_agents: Vec<AgentHandle>,
@@ -87,7 +91,7 @@ where
         Self {
             db,
             pueue,
-            _policy: policy,
+            policy,
             runner: Some(runner),
             config,
             active_agents: Vec::new(),
@@ -143,11 +147,36 @@ where
                     &indeterminate_pending_marker_ids,
                     &indeterminate_release_requested_ids,
                 )?;
+            let campaigns = CampaignRepository::new(&self.db);
+            campaigns.recover_submission_boundaries(now)?;
+            loop {
+                let intents = campaigns.list_reserved_submission_intents(100)?;
+                if intents.is_empty() {
+                    break;
+                }
+                for intent in intents {
+                    let project = ProjectRepository::new(&self.db)
+                        .find_by_id(&intent.campaign.project_id)?
+                        .ok_or(AppError::Runtime {
+                            operation: "read campaign project during startup recovery",
+                        })?;
+                    CampaignCoordinator::new(
+                        &self.db,
+                        &self.pueue,
+                        self.policy.campaign_limits,
+                    )
+                    .submit_accepted_intent(&intent, &project, now)
+                    .await?;
+                }
+            }
             self.startup_recovery_pending = false;
             report.recovered_agent_runs = recovery.failed_runs;
             report.requeued_agent_events = recovery.requeued_events;
             report.dead_lettered_agent_events = recovery.dead_lettered_events;
         }
+
+        CampaignRepository::new(&self.db)
+            .wake_eligible_campaigns_with_limits(&self.policy.campaign_limits, now)?;
 
         report.finished_agents += self.poll_retained_ownership_at(now).await?;
 
@@ -180,6 +209,7 @@ where
                 claim_limit: self.config.claim_limit,
             },
         )
+        .with_campaign_limits(self.policy.campaign_limits)
         .with_cleanup_blocked_projects(cleanup_blocked_projects);
         let scheduler_result = scheduler.tick().await;
         self.runner = Some(scheduler.into_runner());

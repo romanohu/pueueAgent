@@ -6,9 +6,10 @@ use serde::Serialize;
 use crate::{
     config,
     db::{
-        inferred_pre_binding_policy_code, AgentRunRepository, Db, EventExecutionProjection,
-        EventRepository, IncidentRepository, InterventionRepository, ProjectRepository,
-        SubmissionRepository, TaskObservationRepository,
+        inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
+        CampaignStatusProjection, Db, EventExecutionProjection, EventRepository,
+        IncidentRepository, InterventionRepository, ProjectRepository, SubmissionRepository,
+        TaskObservationRepository,
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
@@ -642,6 +643,132 @@ pub fn build_doctor_report_with_policy_and_roots(
                 "review the human-readable project context; state.json remains canonical",
             ));
         }
+    }
+
+    let campaign = CampaignRepository::new(db).doctor_projection_for_project(&project.project_id)?;
+    checks.push(if campaign.live_campaign_count <= 1 {
+        doctor_ok(
+            "campaign.live_count",
+            if campaign.live_campaign_count == 0 {
+                "no live campaign is registered"
+            } else {
+                "exactly one live campaign is registered"
+            },
+            "none",
+        )
+    } else {
+        doctor_error(
+            "campaign.live_count",
+            "more than one live campaign is registered",
+            "inspect campaign rows without mutating them from doctor",
+        )
+    });
+    if campaign.live_campaign_count != 0 {
+        checks.push(if campaign.baseline_linkage_errors == 0 {
+            doctor_ok(
+                "campaign.baseline_linkage",
+                "the live campaign baseline links to its initial experiment",
+                "none",
+            )
+        } else {
+            doctor_error(
+                "campaign.baseline_linkage",
+                &format!(
+                    "{} live campaign baseline linkage error(s)",
+                    campaign.baseline_linkage_errors
+                ),
+                "inspect campaign, proposal, and experiment linkage without automatic repair",
+            )
+        });
+        checks.push(if campaign.orphan_reservations == 0 {
+            doctor_ok(
+                "campaign.orphan_reservations",
+                "campaign reservations have valid scoped owners",
+                "none",
+            )
+        } else {
+            doctor_error(
+                "campaign.orphan_reservations",
+                &format!(
+                    "{} campaign reservation(s) have no valid scoped owner",
+                    campaign.orphan_reservations
+                ),
+                "inspect reservation linkage without deleting records from doctor",
+            )
+        });
+        checks.push(if campaign.task_identity_disagreements == 0 {
+            doctor_ok(
+                "campaign.task_identity",
+                "experiment and submission task identities agree",
+                "none",
+            )
+        } else {
+            doctor_error(
+                "campaign.task_identity",
+                &format!(
+                    "{} experiment/submission task identity disagreement(s)",
+                    campaign.task_identity_disagreements
+                ),
+                "quarantine conflicting task identities; doctor does not reconcile them",
+            )
+        });
+        checks.push(if campaign.submission_boundary_count == 0 {
+            doctor_ok(
+                "campaign.submission_boundaries",
+                "no submitting or unreconciled campaign intent is present",
+                "none",
+            )
+        } else {
+            doctor_warning(
+                "campaign.submission_boundaries",
+                &format!(
+                    "{} submitting or unreconciled campaign intent(s) require recovery review",
+                    campaign.submission_boundary_count
+                ),
+                "keep unreconciled intents quarantined and inspect exact task identity",
+            )
+        });
+        checks.push(if campaign.budget_wake_errors == 0 {
+            doctor_ok(
+                "campaign.budget_wake",
+                "every budget-waiting campaign has a finite wake time",
+                "none",
+            )
+        } else {
+            doctor_error(
+                "campaign.budget_wake",
+                &format!(
+                    "{} budget-waiting campaign(s) have no finite wake time",
+                    campaign.budget_wake_errors
+                ),
+                "inspect rolling reservation windows; doctor does not wake campaigns",
+            )
+        });
+        checks.push(match (
+            campaign.objective_digest.as_deref(),
+            state::load_objective(&project.root_path),
+        ) {
+            (Some(expected), Ok(on_disk)) if expected == on_disk.digest => doctor_ok(
+                "campaign.objective_digest",
+                "STATE.md matches the immutable campaign objective digest",
+                "none",
+            ),
+            (Some(_), Ok(_)) => doctor_warning(
+                "campaign.objective_digest",
+                "STATE.md differs from the immutable campaign objective digest",
+                "restore or review STATE.md; doctor never rewrites the active snapshot",
+            ),
+            (Some(_), Err(_)) => doctor_warning(
+                "campaign.objective_digest",
+                "STATE.md cannot be validated against the immutable campaign objective digest",
+                "inspect STATE.md without changing the active SQLite snapshot",
+            ),
+            (None, _) => doctor_error(
+                "campaign.objective_digest",
+                "the live campaign objective digest is unavailable",
+                "inspect the campaign row without rewriting it from doctor",
+            ),
+        });
     }
 
     let required_tables = [
@@ -1496,6 +1623,9 @@ pub fn render_project_status_json(
         interventions: InterventionStatusProjection {
             counts: intervention_counts(db, &project.project_id)?,
         },
+        campaign: CampaignRepository::new(db)
+            .status_projection_for_project(&project.project_id, crate::status::status_timestamp()?)?
+            .map(CampaignStatusSummary::from),
         policy: FutureSection::default(),
         resource: FutureSection::default(),
     };
@@ -1519,6 +1649,8 @@ struct ProjectStatusReport {
     termination: TerminationSection,
     agent_runs: AgentRunSection,
     interventions: InterventionStatusProjection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    campaign: Option<CampaignStatusSummary>,
     policy: FutureSection,
     resource: FutureSection,
 }
@@ -1805,6 +1937,33 @@ struct InterventionCountsProjection {
     pending: i64,
     reserved: i64,
     applied: i64,
+}
+
+#[derive(Serialize)]
+struct CampaignStatusSummary {
+    campaign_id: String,
+    state: crate::models::CampaignState,
+    state_reason: Option<String>,
+    objective_digest: String,
+    next_eligible_at: Option<i64>,
+    experiment_counts: BTreeMap<String, i64>,
+    rolling_usage: BTreeMap<String, i64>,
+    unreconciled_count: i64,
+}
+
+impl From<CampaignStatusProjection> for CampaignStatusSummary {
+    fn from(campaign: CampaignStatusProjection) -> Self {
+        Self {
+            campaign_id: bounded_summary(&campaign.campaign_id),
+            state: campaign.state,
+            state_reason: campaign.state_reason.as_deref().map(bounded_summary),
+            objective_digest: bounded_summary(&campaign.objective_digest),
+            next_eligible_at: campaign.next_eligible_at,
+            experiment_counts: campaign.experiment_counts,
+            rolling_usage: campaign.rolling_usage,
+            unreconciled_count: campaign.unreconciled_count,
+        }
+    }
 }
 
 impl From<&AgentRun> for AgentRunSummary {

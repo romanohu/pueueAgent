@@ -1,12 +1,20 @@
-use std::{collections::{BTreeMap, BTreeSet}, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle},
     config,
-    db::{AgentRunRepository, EventRepository, InterventionRepository, ProjectRepository},
+    db::{
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, EventRepository,
+        InterventionRepository, ProjectRepository,
+    },
+    execution_policy::CampaignLimits,
     guardrails::{DispatchDecision, Guardrails},
     interventions::{
         Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
@@ -33,6 +41,7 @@ pub struct Scheduler {
     db: crate::db::Db,
     runner: AgentRunner,
     config: SchedulerConfig,
+    campaign_limits: CampaignLimits,
     cleanup_blocked_projects: BTreeSet<String>,
 }
 
@@ -105,8 +114,14 @@ impl Scheduler {
             db,
             runner,
             config,
+            campaign_limits: CampaignLimits::default(),
             cleanup_blocked_projects: BTreeSet::new(),
         }
+    }
+
+    pub fn with_campaign_limits(mut self, limits: CampaignLimits) -> Self {
+        self.campaign_limits = limits;
+        self
     }
 
     pub fn with_cleanup_blocked_projects(mut self, project_ids: BTreeSet<String>) -> Self {
@@ -480,6 +495,38 @@ impl Scheduler {
                 }
                 continue;
             }
+            if let Some(campaign) = return_scheduler_error!(
+                CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
+            ) {
+                let decision_key = agent_decision_key(&events);
+                match return_scheduler_error!(CampaignRepository::new(&self.db)
+                    .reserve_agent_decision(
+                        &campaign.campaign_id,
+                        &decision_key,
+                        &self.campaign_limits,
+                        self.config.now,
+                    )) {
+                    AgentDecisionReservation::Reserved(_) => {}
+                    AgentDecisionReservation::BudgetWaiting { next_eligible_at } => {
+                        let release_error = reservation.as_ref().and_then(|reservation| {
+                            InterventionRepository::new(&self.db)
+                                .release_reservation(&project.project_id, &reservation.token)
+                                .err()
+                        });
+                        return_scheduler_error!(EventRepository::new(&self.db).transition_many(
+                            &event_ids,
+                            EventStatus::RetryWait,
+                            self.config.now,
+                            Some(next_eligible_at),
+                            None,
+                        ));
+                        if first_error.is_none() {
+                            first_error = release_error;
+                        }
+                        continue;
+                    }
+                }
+            }
             match self
                 .runner
                 .spawn(
@@ -594,6 +641,21 @@ impl Scheduler {
             Ok(report)
         }
     }
+}
+
+fn agent_decision_key(events: &[Event]) -> String {
+    let mut identities = events
+        .iter()
+        .map(|event| (event.event_id, event.attempts))
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(b"campaign-agent-decision:v1\0");
+    for (event_id, attempts) in identities {
+        digest.update(event_id.to_le_bytes());
+        digest.update(attempts.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn unresolved_spawn_error(stage: AgentSpawnStage, source: AppError) -> AppError {

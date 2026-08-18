@@ -1,10 +1,13 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::SystemTime};
 
 use rusqlite::OptionalExtension;
 
 use crate::{
     config,
-    db::{inferred_pre_binding_policy_code, AgentRunRepository, Db, EventRepository, ProjectRepository, SubmissionRepository},
+    db::{
+        inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
+        CampaignStatusProjection, Db, EventRepository, ProjectRepository, SubmissionRepository,
+    },
     models::{Event, Project},
     output::{
         bounded_execution_path, bounded_redacted_text, bounded_typed_text, format_state,
@@ -188,6 +191,12 @@ pub fn render_project_status(
         ));
     }
 
+    if let Some(campaign) = CampaignRepository::new(db)
+        .status_projection_for_project(&project.project_id, status_timestamp()?)?
+    {
+        lines.push(campaign_status_line(&campaign));
+    }
+
     lines.extend(guardrail_lines(db, project)?);
     lines.extend(context_lines(db, project)?);
     lines.push(human_summary(format!(
@@ -275,6 +284,12 @@ pub fn render_project_status_compact(
         }
     }
 
+    if let Some(campaign) = CampaignRepository::new(db)
+        .status_projection_for_project(&project.project_id, status_timestamp()?)?
+    {
+        lines.push(campaign_status_line(&campaign));
+    }
+
     let event_counts = event_status_counts(db, &project.project_id)?;
     lines.push(event_counts_line(&event_counts));
 
@@ -288,6 +303,46 @@ pub fn render_project_status_compact(
     )));
 
     Ok(lines.join("\n"))
+}
+
+fn campaign_status_line(campaign: &CampaignStatusProjection) -> String {
+    format!(
+        "campaign: id={} state={} reason={} experiments={} rolling_usage={} next_eligible_at={} unreconciled={} objective_digest={}",
+        bounded_redacted_text(&campaign.campaign_id),
+        campaign.state,
+        bounded_redacted_text(campaign.state_reason.as_deref().unwrap_or("none")),
+        render_counts(&campaign.experiment_counts),
+        render_counts(&campaign.rolling_usage),
+        campaign
+            .next_eligible_at
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        campaign.unreconciled_count,
+        bounded_redacted_text(&campaign.objective_digest),
+    )
+}
+
+fn render_counts(counts: &BTreeMap<String, i64>) -> String {
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(key, value)| format!("{}={value}", bounded_redacted_text(key)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(crate) fn status_timestamp() -> Result<i64, AppError> {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AppError::Runtime {
+            operation: "read the system clock for status",
+        })?
+        .as_secs()
+        .try_into()
+        .map_err(|_| AppError::Runtime {
+            operation: "represent the status timestamp",
+        })
 }
 
 pub fn pause_project(db: &Db, project_id: &str, now: i64) -> Result<Project, AppError> {

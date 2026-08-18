@@ -1,4 +1,11 @@
-use std::{collections::BTreeSet, fs, fs::OpenOptions, path::PathBuf, process::Command, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fs,
+    fs::OpenOptions,
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Barrier},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -8,18 +15,20 @@ use std::os::unix::io::AsRawFd;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     db::{
-        AgentRunRepository, Db, EventRepository, InterventionRepository, ProjectRepository,
-        SubmissionRepository,
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
+        InterventionRepository, ProjectRepository, StartCampaignRequest, SubmissionRepository,
     },
     models::{
-        AgentContextMode, AgentRunStatus, Event, EventKind, EventStatus, NewAgentRun, NewEvent,
-        NewProject, NewSubmission, SubmissionStatus,
+        AgentContextMode, AgentRunStatus, CampaignState, Event, EventKind, EventStatus,
+        NewAgentRun, NewEvent, NewProject, NewSubmission, ProposalKind, SubmissionStatus,
     },
     execution_policy::{
-        load_existing_policy, PolicyLoadInput, PolicyViolationDetail, StartupEnvironment,
-        TempUnsafeReason,
+        load_existing_policy, CampaignLimits, PolicyLoadInput, PolicyViolationDetail,
+        StartupEnvironment, TempUnsafeReason,
     },
+    proposals::{self, ProposalInput},
     scheduler::{build_prompt, Scheduler, SchedulerConfig},
+    state::ObjectiveSnapshot,
 };
 use rusqlite::params;
 use serde_json::json;
@@ -302,6 +311,46 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn start_campaign(&self) -> String {
+        let objective = ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "scheduler-campaign-objective-digest".to_owned(),
+        };
+        let argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let proposal = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "scheduler-campaign",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &proposal,
+                    submission_id: "scheduler-campaign-submission",
+                    experiment_id: "scheduler-campaign-experiment",
+                    proposal_id: "scheduler-campaign-proposal",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    now: self.now,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap()
+            .campaign
+            .campaign_id
+    }
+
     fn queue_intervention(&self, message: &str) -> String {
         InterventionRepository::new(&self.db)
             .insert_pending("project-a", message, self.now)
@@ -448,6 +497,189 @@ max_agent_runs = 10
             )
             .unwrap()
     }
+}
+
+#[test]
+fn campaign_agent_budget_two_connection_race_allows_six_and_waits_the_seventh() {
+    let harness = SchedulerHarness::new();
+    let campaign_id = harness.start_campaign();
+    let barrier = Arc::new(Barrier::new(7));
+    let mut threads = Vec::new();
+    for index in 0..7 {
+        let db = harness.db.clone();
+        let barrier = Arc::clone(&barrier);
+        let campaign_id = campaign_id.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            CampaignRepository::new(&db).reserve_agent_decision(
+                &campaign_id,
+                &format!("decision-{index}"),
+                &CampaignLimits::default(),
+                100,
+            )
+        }));
+    }
+    let outcomes = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AgentDecisionReservation::Reserved(_)))
+            .count(),
+        6
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                AgentDecisionReservation::BudgetWaiting { next_eligible_at } => {
+                    Some(*next_eligible_at)
+                }
+                AgentDecisionReservation::Reserved(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![3_700]
+    );
+    let connection = harness.db.connect().unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND dimension = 'agent_run'",
+                [&campaign_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        6
+    );
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_by_id(&campaign_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.state, CampaignState::BudgetWaiting);
+    assert_eq!(campaign.next_eligible_at, Some(3_700));
+}
+
+#[test]
+fn campaign_agent_budget_same_key_crash_retry_is_charged_once() {
+    let harness = SchedulerHarness::new();
+    let campaign_id = harness.start_campaign();
+
+    let first = CampaignRepository::new(&harness.db)
+        .reserve_agent_decision(
+            &campaign_id,
+            "same-decision",
+            &CampaignLimits::default(),
+            100,
+        )
+        .unwrap();
+    let retry = CampaignRepository::new(&harness.db)
+        .reserve_agent_decision(
+            &campaign_id,
+            "same-decision",
+            &CampaignLimits::default(),
+            101,
+        )
+        .unwrap();
+
+    let AgentDecisionReservation::Reserved(first) = first else {
+        panic!("first decision must reserve")
+    };
+    let AgentDecisionReservation::Reserved(retry) = retry else {
+        panic!("same-key retry must reuse the reservation")
+    };
+    assert_eq!(first, retry);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND dimension = 'agent_run'",
+                [&campaign_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn campaign_agent_budget_wake_uses_the_exact_window_boundary() {
+    let harness = SchedulerHarness::new();
+    let campaign_id = harness.start_campaign();
+    let repository = CampaignRepository::new(&harness.db);
+    for index in 0..6 {
+        repository
+            .reserve_agent_decision(
+                &campaign_id,
+                &format!("decision-{index}"),
+                &CampaignLimits::default(),
+                100,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        repository
+            .reserve_agent_decision(
+                &campaign_id,
+                "decision-seven",
+                &CampaignLimits::default(),
+                100,
+            )
+            .unwrap(),
+        AgentDecisionReservation::BudgetWaiting {
+            next_eligible_at: 3_700
+        }
+    ));
+
+    assert!(repository.wake_eligible_campaigns(3_699).unwrap().is_empty());
+    assert_eq!(
+        repository.wake_eligible_campaigns(3_700).unwrap(),
+        vec![campaign_id.clone()]
+    );
+    let campaign = repository.find_by_id(&campaign_id).unwrap().unwrap();
+    assert_eq!(campaign.state, CampaignState::Active);
+    assert_eq!(campaign.next_eligible_at, None);
+}
+
+#[tokio::test]
+async fn campaign_agent_budget_scheduler_defers_without_creating_an_agent_run() {
+    let harness = SchedulerHarness::new();
+    let campaign_id = harness.start_campaign();
+    let repository = CampaignRepository::new(&harness.db);
+    for index in 0..6 {
+        repository
+            .reserve_agent_decision(
+                &campaign_id,
+                &format!("preexisting-{index}"),
+                &CampaignLimits::default(),
+                100,
+            )
+            .unwrap();
+    }
+    let event_id = harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "campaign-agent-budget-scheduler",
+    );
+
+    harness.scheduler().tick().await.unwrap();
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 3_700);
+    assert_eq!(harness.active_runs("project-a"), 0);
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .count_by_project("project-a")
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]

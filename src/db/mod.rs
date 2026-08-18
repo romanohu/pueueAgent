@@ -3,7 +3,8 @@ mod migrations;
 mod repositories;
 
 pub use campaigns::{
-    CampaignRepository, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
+    AgentDecisionReservation, CampaignDoctorProjection, CampaignRepository,
+    CampaignStatusProjection, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
     StartCampaignRequest,
 };
 pub use migrations::LATEST_SCHEMA_VERSION;

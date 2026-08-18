@@ -257,7 +257,10 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         )?;
         let add_args = pueue_add_args(
             &durable_project.pueue_group,
-            &durable_project.root_path,
+            &explicit_working_directory(
+                &durable_project.root_path,
+                &durable_proposal.working_directory,
+            ),
             &durable_submission.argv,
         );
         validate_add_argv(&add_args)?;
@@ -358,6 +361,14 @@ fn pueue_add_args(group: &str, project_root: &Path, argv: &[String]) -> Vec<OsSt
     add_args.push(OsString::from("--"));
     add_args.extend(argv.iter().map(OsString::from));
     add_args
+}
+
+fn explicit_working_directory(project_root: &Path, relative: &str) -> std::path::PathBuf {
+    if relative == "." {
+        project_root.to_owned()
+    } else {
+        project_root.join(relative)
+    }
 }
 
 fn provisional_task_signature(group: &str, task_id: i64, submission_id: &str) -> String {
