@@ -95,6 +95,39 @@ manifest は未知の field を許さない JSON object で、次の形式です
 
 `pueue-agent status --json` には submission の一覧を含めません。submission と task の lineage は `pueue-agent runs --json`、特定 task の詳細は `inspect <TASK_ID>` で確認します。
 
+### `pueue-agent campaign`
+
+- **構文:** `pueue-agent campaign <status|pause|resume|retire> [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
+- **目的:** 対象プロジェクトの最新 campaign の状態を確認、または operator による状態遷移を実行します。
+- **状態変更:** `status` は読み取り専用です。`pause`、`resume`、`retire` は campaign の状態だけを変更し、project や既存 Pueue task を直接変更しません。
+- **主なオプション:** `--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
+- **例:** `pueue-agent campaign status --json .`、`pueue-agent campaign pause .`
+- **失敗時の確認:** project に campaign があることを確認します。`resume` は project が有効で pause/halt されておらず、未照合または termination 状態不明の experiment がない場合だけ実行できます。`retire` はすべての experiment が終端かつ照合済みの場合だけ実行できます。
+
+`status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。objective 本文や raw argv は既定出力と JSON に含めません。
+
+### `pueue-agent proposal`
+
+- **構文:** `pueue-agent proposal <list|inspect> [OPTIONS] [PROJECT_ROOT]`
+- **目的:** 対象プロジェクトの最新 campaign に属する proposal を一覧または 1 件確認します。
+- **状態変更:** ありません（読み取り専用）。
+- **主なオプション:** `list` は `--limit N`（既定 20、1〜100）、`--json`、`--pueue-config` を受け付けます。`inspect` は `PROPOSAL_ID`、`--json`、`--pueue-config` を受け付けます。
+- **例:** `pueue-agent proposal list --limit 20 --json .`、`pueue-agent proposal inspect PROPOSAL_ID --json .`
+- **失敗時の確認:** proposal ID が対象 project の最新 campaign に属すること、`--limit` が 1〜100 であることを確認します。
+
+一覧は campaign scope 内で安定順に最大 100 件を返します。inspect の hypothesis と expected evidence は bounded / redacted で表示され、raw argv は表示しません。
+
+### `pueue-agent experiment`
+
+- **構文:** `pueue-agent experiment <list|inspect> [OPTIONS] [PROJECT_ROOT]`
+- **目的:** 対象プロジェクトの最新 campaign に属する experiment を一覧または 1 件確認します。
+- **状態変更:** ありません（読み取り専用）。
+- **主なオプション:** `list` は `--limit N`（既定 20、1〜100）、`--json`、`--pueue-config` を受け付けます。`inspect` は `EXPERIMENT_ID`、`--json`、`--pueue-config` を受け付けます。
+- **例:** `pueue-agent experiment list --limit 20 --json .`、`pueue-agent experiment inspect EXPERIMENT_ID --json .`
+- **失敗時の確認:** experiment ID が対象 project の最新 campaign に属すること、`--limit` が 1〜100 であることを確認します。
+
+一覧と inspect は campaign / proposal / submission / task の identity と状態を表示します。inspect は raw argv ではなく argv digest を表示します。
+
 ### `pueue-agent events`
 
 - **構文:** `pueue-agent events [--kind KIND] [--status STATUS] [--limit N] [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
