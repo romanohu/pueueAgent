@@ -808,6 +808,9 @@ impl<'db> CampaignRepository<'db> {
         for campaign_id in campaign_ids {
             let mut next_expiry = None;
             for (dimension, limit) in dimensions {
+                if limit == 0 {
+                    continue;
+                }
                 let used = count_live_reservations(&transaction, &campaign_id, dimension, now)?;
                 if used >= i64::from(limit) {
                     let expiry = earliest_live_reservation_expiry(

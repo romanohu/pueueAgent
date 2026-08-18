@@ -17,8 +17,8 @@ use pueue_agent::{
     execution_policy::CampaignLimits,
     interventions::InterventionStatus,
     models::{
-        AgentContextMode, AgentRunStatus, EventKind, EventStatus, ExperimentStatus, NewAgentRun,
-        NewEvent, NewProject, ProposalKind,
+        AgentContextMode, AgentRunStatus, CampaignState, EventKind, EventStatus, ExperimentStatus,
+        NewAgentRun, NewEvent, NewProject, ProposalKind,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
@@ -664,6 +664,80 @@ async fn campaign_recovery_never_readds_unreconciled_or_accepted_intents() {
         assert!(harness.fake_pueue.add_calls().is_empty());
         assert_eq!(harness.count("experiments"), 1);
     }
+}
+
+#[tokio::test]
+async fn campaign_budget_wake_ignores_zero_code_change_limit_without_reservations() {
+    let harness = DaemonHarness::new();
+    let experiment_id = harness.campaign_experiment();
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments.mark_submitting(&experiment_id, 100).unwrap();
+    experiments
+        .mark_accepted(
+            &experiment_id,
+            42,
+            "provisional-submit:v1:group=pa-project:task-id=42:intent=daemon-campaign-submission",
+            100,
+        )
+        .unwrap();
+    let campaigns = CampaignRepository::new(&harness.db);
+    for index in 0..6 {
+        campaigns
+            .reserve_agent_decision(
+                "daemon-campaign",
+                &format!("decision-{index}"),
+                &CampaignLimits::default(),
+                100,
+            )
+            .unwrap();
+    }
+    campaigns
+        .reserve_agent_decision(
+            "daemon-campaign",
+            "decision-seven",
+            &CampaignLimits::default(),
+            100,
+        )
+        .unwrap();
+    let waiting = campaigns
+        .find_by_id("daemon-campaign")
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.state, CampaignState::BudgetWaiting);
+    assert_eq!(waiting.next_eligible_at, Some(3_700));
+
+    let mut policy = harness.policy();
+    Arc::get_mut(&mut policy)
+        .unwrap()
+        .campaign_limits
+        .max_code_change_proposals_per_24h = 0;
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production()
+            .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+        policy.clone(),
+    );
+    let mut daemon = Daemon::new(
+        harness.db.clone(),
+        harness.fake_pueue.clone(),
+        policy,
+        runner,
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(3_700),
+            shutdown_grace_period: Duration::from_secs(30),
+        },
+    );
+
+    daemon.run_once().await.unwrap();
+
+    let campaign = campaigns
+        .find_by_id("daemon-campaign")
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.state, CampaignState::Active);
+    assert_eq!(campaign.next_eligible_at, None);
 }
 
 #[cfg(unix)]
