@@ -33,6 +33,15 @@ pueue-agent runs --limit 100
 
 CLI ごとに別の profile を混在させないでください。profile の優先順位は[導入ガイド](getting-started-ja.md)にあります。
 
+## Campaign experiment が `unreconciled` になった
+
+| 症状 | まず確認 | 想定原因 | 安全な復旧 |
+| --- | --- | --- | --- |
+| `campaign status` の unreconciled 件数が 1 以上 | `pueue-agent campaign status --json`、`pueue-agent experiment list --json`、`pueue-agent doctor --json` | Pueue add の開始後に timeout、非ゼロ応答、または daemon interruption が発生し、外部 task の有無を一意に証明できない | 同じ command を再投入しない。表示された submission/experiment ID と、同じ profile の `pueue status --json` を管理者が突合し、一意な task identity を証明できるまで campaign を停止したままにする |
+| restart 後も `unreconciled` のまま | 上記3コマンドと Pueue task 数・ID | 自動再 add を禁止する quarantine が意図どおり維持されている | SQLite の status や task ID を直接更新しない。bounded な診断結果を管理者へ渡し、supported reconciliation が用意されるまで新しい baseline を作らない |
+
+`unreconciled` は「失敗したので同じ task をもう一度追加してよい」という意味ではありません。外部 Pueue add が成功した可能性を保持する安全状態です。`campaign resume`、service restart、`wake` は、この experiment を自動的に再 add しません。
+
 ## Execution policy を読み込めない
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |

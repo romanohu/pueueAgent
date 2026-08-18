@@ -2,6 +2,26 @@ setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 }
 
+@test "real Pueue campaign acceptance is explicitly Linux-only" {
+  fake_bin="$BATS_TEST_TMPDIR/non-linux-bin"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo Darwin' > "$fake_bin/uname"
+  chmod +x "$fake_bin/uname"
+
+  run env PATH="$fake_bin:/usr/bin:/bin" bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh"
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"real-Pueue campaign acceptance requires Linux"* ]]
+}
+
+@test "real Pueue harness asserts the production-derived Codex network argument" {
+  awk '
+    index($0, "sandbox_workspace_write.network_access=true") &&
+      index($0, "PUEUE_AGENT_TEST_CODEX_LOG") { found = 1 }
+    END { exit !found }
+  ' "$REPO_ROOT/tests/e2e/rust_supervisor.sh"
+}
+
 @test "development launcher explains how to build a missing Rust binary" {
   fake_repo="$BATS_TEST_TMPDIR/repository"
   mkdir -p "$fake_repo/bin"
@@ -35,15 +55,12 @@ setup() {
   else
     status=$?
   fi
-  mapfile -t lines < "$output_file"
+  expected_file="$BATS_TEST_TMPDIR/launcher-expected"
+  printf '%s\n' '<submit>' '<-->' '<python>' '<train.py>' '<--name>' '<a b; echo no>' \
+    > "$expected_file"
 
   [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "<submit>" ]
-  [ "${lines[1]}" = "<-->" ]
-  [ "${lines[2]}" = "<python>" ]
-  [ "${lines[3]}" = "<train.py>" ]
-  [ "${lines[4]}" = "<--name>" ]
-  [ "${lines[5]}" = "<a b; echo no>" ]
+  diff -u "$expected_file" "$output_file"
 }
 
 @test "fake agent records literal argv boundaries and allowlisted environment names only" {

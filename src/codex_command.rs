@@ -145,7 +145,7 @@ impl CodexArgvBuilder {
         push_config(
             &mut argv,
             format!(
-                "sandbox_workspace_write.network_access=\"{}\"",
+                "sandbox_workspace_write.network_access={}",
                 network_mode(self.policy.network)
             ),
         );
@@ -278,8 +278,8 @@ fn push_config(argv: &mut Vec<OsString>, value: String) {
 
 fn network_mode(network: NetworkMode) -> &'static str {
     match network {
-        NetworkMode::Enabled => "enabled",
-        NetworkMode::Disabled => "disabled",
+        NetworkMode::Enabled => "true",
+        NetworkMode::Disabled => "false",
     }
 }
 

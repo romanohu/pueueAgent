@@ -245,6 +245,25 @@ fn init_instructions_preserve_the_state_md_objective() {
 }
 
 #[test]
+fn objective_template_and_getting_started_pin_the_snapshot_contract() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    fs::create_dir(&root).unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    let objective = fs::read_to_string(root.join(".pueue-agent/STATE.md")).unwrap();
+    assert!(objective.contains("人間が定める変更不可のキャンペーン目的"));
+    assert!(objective.contains("SQLite が campaign、objective、budget、lineage の正本"));
+
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let guide = fs::read_to_string(repository.join("docs/getting-started-ja.md")).unwrap();
+    assert!(guide.contains("active campaign の objective snapshot は変更されません"));
+    assert!(guide.contains("STATE.md に credential や secret を書かないでください"));
+}
+
+#[test]
 fn canonical_state_init_preserves_existing_state_json_and_state_md() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("experiment");

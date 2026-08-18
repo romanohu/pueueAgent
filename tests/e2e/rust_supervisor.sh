@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -eu
 
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "Rust E2E FAIL: real-Pueue campaign acceptance requires Linux" >&2
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PA_BIN="$REPO_ROOT/bin/pueue-agent"
 REAL_PUEUE="$(command -v pueue)"
@@ -143,6 +148,62 @@ wait_for_task_terminal() {
   fail "task $task_id did not become terminal"
 }
 
+pueue_group_task_count() {
+  group="$1"
+  "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json \
+    | jq -r --arg group "$group" \
+      '[.tasks | to_entries[] | select(.value.group == $group)] | length'
+}
+
+insert_campaign_boundary() {
+  project_id="$1"
+  campaign_id="$2"
+  experiment_status="$3"
+  now="$(date +%s)"
+  window_ends_at=$((now + 86400))
+  proposal_id="$campaign_id-proposal"
+  experiment_id="$campaign_id-experiment"
+  submission_id="$campaign_id-submission"
+  argv_json="[\"$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh\"]"
+
+  sql "INSERT INTO campaigns (
+         campaign_id, project_id, objective_text, objective_digest, initial_argv_json,
+         state, baseline_experiment_id, created_at, updated_at
+       ) VALUES (
+         '$campaign_id', '$project_id', 'Reach validation loss below 0.20',
+         '$campaign_id-objective-digest', '$argv_json', 'active', NULL, $now, $now
+       );
+       INSERT INTO proposals (
+         proposal_id, campaign_id, kind, status, hypothesis, argv_json, working_directory,
+         expected_evidence_json, canonical_digest, created_at, updated_at
+       ) VALUES (
+         '$proposal_id', '$campaign_id', 'experiment', 'accepted',
+         'Establish the initial campaign baseline', '$argv_json', '.', '[]',
+         '$campaign_id-canonical-digest', $now, $now
+       );
+       INSERT INTO submissions (
+         submission_id, project_id, argv_json, created_at, status, kind, metadata_json
+       ) VALUES (
+         '$submission_id', '$project_id', '$argv_json', $now, 'pending', 'experiment', '{}'
+       );
+       INSERT INTO experiments (
+         experiment_id, campaign_id, proposal_id, submission_id, attempt, status,
+         created_at, updated_at
+       ) VALUES (
+         '$experiment_id', '$campaign_id', '$proposal_id', '$submission_id', 0,
+         '$experiment_status', $now, $now
+       );
+       INSERT INTO budget_reservations (
+         reservation_id, campaign_id, experiment_id, dimension, subject_key, status,
+         window_started_at, window_ends_at, created_at, updated_at
+       ) VALUES (
+         'experiment:$experiment_id', '$campaign_id', '$experiment_id', 'experiment',
+         '$experiment_id', 'reserved', $now, $window_ends_at, $now, $now
+       );
+       UPDATE campaigns SET baseline_experiment_id = '$experiment_id'
+       WHERE campaign_id = '$campaign_id';"
+}
+
 submission_task_id() {
   summary="$1"
   task_id="$(printf '%s\n' "$summary" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^task=[0-9]+$/) { sub(/^task=/, "", $i); print $i } }')"
@@ -214,24 +275,70 @@ export PUEUE_CONFIG_PATH="$WORK/pueue.yml"
 export PUEUE_AGENT_TEST_AGENT_LOG="$WORK/agent-calls.log"
 export PUEUE_AGENT_TEST_AGENT_STATE="$WORK/agent-state"
 export PUEUE_AGENT_TEST_CODEX_LOG="$WORK/codex-calls.log"
-export PUEUE_AGENT_E2E_REAL_PUEUE="$REAL_PUEUE"
-export PUEUE_AGENT_E2E_KILL_LOG="$WORK/pueue-kills.log"
-export PUEUE_AGENT_E2E_DEFER_KILL=1
+export AWS_SECRET_ACCESS_KEY="campaign-credential-must-not-reach-agent"
+export WANDB_API_KEY="campaign-wandb-key-must-not-reach-agent"
+export SSH_AUTH_SOCK="campaign-ssh-socket-must-not-reach-agent"
 mkdir -p "$HOME" "$CODEX_HOME" "$WORK/bin" "$WORK/pueue"
+: > "$WORK/defer-kill"
 
 cat > "$WORK/bin/pueue" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+work_dir="__PUEUE_AGENT_E2E_WORK__"
+real_pueue="__PUEUE_AGENT_E2E_REAL_PUEUE__"
+operation=""
 for argument in "$@"; do
-  if [ "$argument" = "kill" ]; then
-    printf '%s\n' "$*" >> "$PUEUE_AGENT_E2E_KILL_LOG"
-    if [ "${PUEUE_AGENT_E2E_DEFER_KILL:-0}" = "1" ]; then
-      exit 0
-    fi
-    break
-  fi
+  case "$argument" in
+    add|kill) operation="$argument"; break ;;
+  esac
 done
-exec "$PUEUE_AGENT_E2E_REAL_PUEUE" "$@"
+if [ "$operation" = "kill" ]; then
+  printf '%s\n' "$*" >> "$work_dir/pueue-kills.log"
+  if [ -f "$work_dir/defer-kill" ]; then
+    exit 0
+  fi
+fi
+if [ "$operation" = "add" ] && [ -f "$work_dir/add-uncertain" ]; then
+  "$real_pueue" "$@"
+  exit 17
+fi
+exec "$real_pueue" "$@"
+EOF
+sed \
+  -e "s|__PUEUE_AGENT_E2E_WORK__|$WORK|g" \
+  -e "s|__PUEUE_AGENT_E2E_REAL_PUEUE__|$REAL_PUEUE|g" \
+  "$WORK/bin/pueue" > "$WORK/bin/pueue.rendered"
+mv "$WORK/bin/pueue.rendered" "$WORK/bin/pueue"
+cat > "$WORK/bin/capture-agent-environment" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+capture="${HOME:?HOME is required}/../captured-agent-environment"
+if [ -n "${AWS_SECRET_ACCESS_KEY+x}" ] || [ -n "${WANDB_API_KEY+x}" ] \
+  || [ -n "${SSH_AUTH_SOCK+x}" ]; then
+  printf '%s\n' 'credential-value-present' >> "$capture"
+fi
+printf '%s\n' "${PUEUE_AGENT_RUN_ID:?missing run ID}:${PUEUE_AGENT_PROJECT_ID:?missing project ID}" \
+  >> "$capture"
+EOF
+cat > "$WORK/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+capture="${HOME:?HOME is required}/../codex-calls.log"
+{
+  if [ -n "${CODEX_HOME+x}" ]; then
+    printf 'ENV_NAME=CODEX_HOME\n'
+  fi
+  if [ -n "${AWS_SECRET_ACCESS_KEY+x}" ] || [ -n "${WANDB_API_KEY+x}" ] \
+    || [ -n "${SSH_AUTH_SOCK+x}" ]; then
+    printf 'credential-value-present\n'
+  fi
+  printf 'ARGC=%s\n' "$#"
+  index=1
+  for argument in "$@"; do
+    printf 'ARG_%s=%s\n' "$index" "$argument"
+    index=$((index + 1))
+  done
+} >> "$capture"
 EOF
 cat > "$WORK/bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
@@ -244,8 +351,8 @@ if [ "${3:-}" = "is-active" ] || [ "${2:-}" = "is-active" ]; then
 fi
 exit 0
 EOF
-chmod +x "$WORK/bin/pueue" "$WORK/bin/launchctl" "$WORK/bin/systemctl"
-ln -s "$REPO_ROOT/tests/support/fake_codex.sh" "$WORK/bin/codex"
+chmod +x "$WORK/bin/pueue" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
+  "$WORK/bin/launchctl" "$WORK/bin/systemctl"
 export PATH="$WORK/bin:$PATH"
 
 cat > "$WORK/pueue.yml" <<EOF
@@ -256,6 +363,7 @@ shared:
 daemon:
   callback: null
 EOF
+chmod 600 "$WORK/pueue.yml"
 
 cargo build --quiet --offline --manifest-path "$REPO_ROOT/Cargo.toml"
 "$PA_BIN" --help | grep -q "SQLite-backed Pueue agent supervisor" \
@@ -273,28 +381,91 @@ fi
 
 PROJECT_A="$WORK/a/shared"
 PROJECT_B="$WORK/b/shared"
-mkdir -p "$PROJECT_A" "$PROJECT_B"
+PROJECT_C="$WORK/c/campaign"
+PROJECT_D="$WORK/d/campaign"
+mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D"
 PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_A"
 "$PA_BIN" init "$PROJECT_B"
+"$PA_BIN" init "$PROJECT_C"
+"$PA_BIN" init "$PROJECT_D"
 
 CONFIG_A="$PROJECT_A/.pueue-agent/config.toml"
 CONFIG_B="$PROJECT_B/.pueue-agent/config.toml"
-[ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] || fail "init did not create TOML configuration"
+CONFIG_C="$PROJECT_C/.pueue-agent/config.toml"
+CONFIG_D="$PROJECT_D/.pueue-agent/config.toml"
+[ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] && [ -f "$CONFIG_C" ] && [ -f "$CONFIG_D" ] \
+  || fail "init did not create TOML configuration"
 PROJECT_ID_A="$(toml_value project_id "$CONFIG_A")"
 PROJECT_ID_B="$(toml_value project_id "$CONFIG_B")"
+PROJECT_ID_C="$(toml_value project_id "$CONFIG_C")"
+PROJECT_ID_D="$(toml_value project_id "$CONFIG_D")"
 GROUP_A="$(toml_value pueue_group "$CONFIG_A")"
 GROUP_B="$(toml_value pueue_group "$CONFIG_B")"
+GROUP_C="$(toml_value pueue_group "$CONFIG_C")"
+GROUP_D="$(toml_value pueue_group "$CONFIG_D")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
 write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/fake_agent.sh" 20
 write_config "$PROJECT_B" "$PROJECT_ID_B" "$GROUP_B" "$REPO_ROOT/tests/support/fake_agent.sh" 20
+write_config "$PROJECT_C" "$PROJECT_ID_C" "$GROUP_C" "$WORK/bin/capture-agent-environment" 20
+write_config "$PROJECT_D" "$PROJECT_ID_D" "$GROUP_D" "$REPO_ROOT/tests/support/fake_agent.sh" 20
+printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
+  > "$PROJECT_A/.pueue-agent/STATE.md"
+printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
+  > "$PROJECT_B/.pueue-agent/STATE.md"
+printf '%s\n' 'Reach validation loss below 0.20 without changing the dataset.' \
+  > "$PROJECT_C/.pueue-agent/STATE.md"
+printf '%s\n' 'Reach validation loss below 0.25 without changing the dataset.' \
+  > "$PROJECT_D/.pueue-agent/STATE.md"
+
+mkdir -p "$XDG_STATE_HOME"
+chmod 700 "$XDG_STATE_HOME"
+mkdir -m 700 "$PUEUE_AGENT_STATE_DIR"
+cat > "$PUEUE_AGENT_STATE_DIR/execution-policy.toml" <<EOF
+version = 1
+
+[defaults]
+network = "enabled"
+
+[campaign]
+max_parallel_experiments = 1
+max_new_experiments_per_24h = 24
+max_agent_runs_per_hour = 6
+max_code_change_proposals_per_24h = 10
+max_same_spec_retries = 2
+max_repairs_per_failure_fingerprint = 2
+max_proposals_per_cycle = 1
+observer_interval_minutes = 30
+
+[executables]
+codex = "codex"
+pueue = "pueue"
+
+[projects."$PROJECT_ID_A"]
+custom_agent = "$REPO_ROOT/tests/support/fake_agent.sh"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_B"]
+custom_agent = "$REPO_ROOT/tests/support/fake_agent.sh"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_C"]
+custom_agent = "$WORK/bin/capture-agent-environment"
+
+[projects."$PROJECT_ID_D"]
+custom_agent = "$REPO_ROOT/tests/support/fake_agent.sh"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+EOF
+chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_A"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_B"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_C"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_D"
 STATE_DB="$XDG_STATE_HOME/pueue-agent/state.sqlite3"
-[ "$(sql 'SELECT COUNT(*) FROM projects')" = "2" ] || fail "projects were not registered"
+[ "$(sql 'SELECT COUNT(*) FROM projects')" = "4" ] || fail "projects were not registered"
 
 # Healthy monitoring performs reconciliation without spending agent tokens.
 start_daemon
@@ -302,10 +473,177 @@ sleep 0.2
 stop_daemon
 [ ! -f "$PUEUE_AGENT_TEST_AGENT_LOG" ] || fail "healthy monitoring started an agent"
 
+# One default submit creates exactly one durable campaign baseline and one real Pueue task.
+campaign_summary="$(cd "$PROJECT_C" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+campaign_task="$(submission_task_id "$campaign_summary")"
+CAMPAIGN_C="$(sql "SELECT campaign_id FROM campaigns WHERE project_id = '$PROJECT_ID_C' AND state <> 'retired'")"
+[ -n "$CAMPAIGN_C" ] || fail "default submit did not create a live campaign"
+for table in campaigns proposals experiments budget_reservations submissions; do
+  case "$table" in
+    campaigns|submissions)
+      count="$(sql "SELECT COUNT(*) FROM $table WHERE project_id = '$PROJECT_ID_C'")"
+      ;;
+    *)
+      count="$(sql "SELECT COUNT(*) FROM $table WHERE campaign_id = '$CAMPAIGN_C'")"
+      ;;
+  esac
+  [ "$count" = "1" ] || fail "managed baseline created $count $table rows instead of one"
+done
+[ "$(pueue_group_task_count "$GROUP_C")" = "1" ] \
+  || fail "managed baseline did not create exactly one Pueue task"
+[ "$(sql "SELECT COUNT(DISTINCT pueue_task_id) FROM experiments WHERE campaign_id = '$CAMPAIGN_C'")" = "1" ] \
+  || fail "managed baseline did not retain one stable external task identity"
+
+# A live campaign rejects both direct submission interfaces before any durable or external write.
+cat > "$WORK/rejected-batch.json" <<EOF
+{"jobs":[{"id":"second","argv":["$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh"]}]}
+EOF
+before_submissions="$(sql "SELECT COUNT(*) FROM submissions WHERE project_id = '$PROJECT_ID_C'")"
+before_batches="$(sql "SELECT COUNT(*) FROM batch_requests WHERE project_id = '$PROJECT_ID_C'")"
+before_batch_jobs="$(sql "SELECT COUNT(*) FROM batch_jobs")"
+before_tasks="$(pueue_group_task_count "$GROUP_C")"
+if (cd "$PROJECT_C" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh") \
+  >"$WORK/rejected-submit.out" 2>"$WORK/rejected-submit.err"; then
+  fail "second direct submit was accepted during a live campaign"
+fi
+if (cd "$PROJECT_C" && "$PA_BIN" submit-batch \
+  --request-id 22222222-2222-4222-8222-222222222222 \
+  --manifest "$WORK/rejected-batch.json") \
+  >"$WORK/rejected-batch.out" 2>"$WORK/rejected-batch.err"; then
+  fail "batch submit was accepted during a live campaign"
+fi
+[ "$(sql "SELECT COUNT(*) FROM submissions WHERE project_id = '$PROJECT_ID_C'")" = "$before_submissions" ] \
+  || fail "rejected direct submit created a submission row"
+[ "$(sql "SELECT COUNT(*) FROM batch_requests WHERE project_id = '$PROJECT_ID_C'")" = "$before_batches" ] \
+  || fail "rejected batch created a batch row"
+[ "$(sql "SELECT COUNT(*) FROM batch_jobs")" = "$before_batch_jobs" ] \
+  || fail "rejected batch created a batch job row"
+for table in campaigns proposals experiments budget_reservations; do
+  case "$table" in
+    campaigns)
+      count="$(sql "SELECT COUNT(*) FROM campaigns WHERE project_id = '$PROJECT_ID_C'")"
+      ;;
+    *)
+      count="$(sql "SELECT COUNT(*) FROM $table WHERE campaign_id = '$CAMPAIGN_C'")"
+      ;;
+  esac
+  [ "$count" = "1" ] || fail "rejected submit changed the managed $table row count to $count"
+done
+[ "$(pueue_group_task_count "$GROUP_C")" = "$before_tasks" ] \
+  || fail "rejected submit created a Pueue task"
+
+# Restarting an accepted intent never performs a second external add.
+start_daemon
+sleep 0.2
+stop_daemon
+[ "$(pueue_group_task_count "$GROUP_C")" = "1" ] \
+  || fail "accepted campaign restart duplicated the Pueue task"
+[ "$(sql "SELECT COUNT(DISTINCT pueue_task_id) FROM experiments WHERE campaign_id = '$CAMPAIGN_C'")" = "1" ] \
+  || fail "accepted campaign restart changed its stable task identity"
+
+# Terminal reconciliation launches a sanitized fake agent without ambient credentials.
+wait_for_task_terminal "$campaign_task"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$CAMPAIGN_C'" "succeeded" \
+  "campaign baseline was not projected terminal"
+wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_C' AND status = 'completed'" "1" \
+  "campaign terminal event did not complete the capture agent"
+stop_daemon
+[ -s "$WORK/captured-agent-environment" ] || fail "fake agent did not capture its sanitized environment"
+! grep -Eq 'credential-value-present|campaign-credential-must-not-reach-agent|campaign-wandb-key-must-not-reach-agent|campaign-ssh-socket-must-not-reach-agent' \
+  "$WORK/captured-agent-environment" \
+  || fail "network-enabled agent inherited an unlisted credential value"
+
+# A due rolling budget wait keeps a finite wake and becomes active after expiry advances.
+budget_now="$(date +%s)"
+budget_end=$((budget_now + 3600))
+for ordinal in 1 2 3 4 5 6; do
+  sql "INSERT OR IGNORE INTO budget_reservations (
+         reservation_id, campaign_id, dimension, subject_key, status,
+         window_started_at, window_ends_at, created_at, updated_at
+       ) VALUES (
+         'e2e-agent-budget-$ordinal', '$CAMPAIGN_C', 'agent_run',
+         'e2e-agent-budget-$ordinal', 'consumed', $budget_now, $budget_end,
+         $budget_now, $budget_now
+       )"
+done
+sql "UPDATE campaigns SET state = 'budget_waiting', state_reason = 'agent_run_budget_exhausted',
+       next_eligible_at = $((budget_now - 1)) WHERE campaign_id = '$CAMPAIGN_C'"
+start_daemon
+wait_for_sql "SELECT CASE WHEN next_eligible_at > $budget_now THEN 1 ELSE 0 END FROM campaigns WHERE campaign_id = '$CAMPAIGN_C'" "1" \
+  "budget wait did not retain a finite next wake"
+stop_daemon
+sql "UPDATE budget_reservations
+     SET window_started_at = $((budget_now - 2)), window_ends_at = $((budget_now - 1))
+     WHERE campaign_id = '$CAMPAIGN_C' AND dimension = 'agent_run';
+     UPDATE campaigns SET next_eligible_at = $((budget_now - 1)) WHERE campaign_id = '$CAMPAIGN_C';"
+start_daemon
+wait_for_sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_C'" "active" \
+  "expired rolling budget did not reactivate the campaign"
+stop_daemon
+"$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_C" >/dev/null
+
+# Reserved restart recovery adds once; a second accepted restart adds nothing.
+RESERVED_CAMPAIGN="e2e-reserved-boundary"
+insert_campaign_boundary "$PROJECT_ID_C" "$RESERVED_CAMPAIGN" "reserved"
+reserved_before="$(pueue_group_task_count "$GROUP_C")"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'" "accepted" \
+  "reserved restart did not resume its durable intent"
+stop_daemon
+[ "$(pueue_group_task_count "$GROUP_C")" = "$((reserved_before + 1))" ] \
+  || fail "reserved restart did not perform exactly one Pueue add"
+reserved_task="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'")"
+start_daemon
+sleep 0.2
+stop_daemon
+[ "$(pueue_group_task_count "$GROUP_C")" = "$((reserved_before + 1))" ] \
+  || fail "accepted restart repeated the recovered Pueue add"
+[ "$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'")" = "$reserved_task" ] \
+  || fail "accepted restart changed recovered task identity"
+wait_for_task_terminal "$reserved_task"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'" "succeeded" \
+  "recovered reserved experiment was not projected terminal"
+stop_daemon
+"$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_C" >/dev/null
+
+# A submitting restart is quarantined and never reaches Pueue again.
+SUBMITTING_CAMPAIGN="e2e-submitting-boundary"
+insert_campaign_boundary "$PROJECT_ID_C" "$SUBMITTING_CAMPAIGN" "submitting"
+submitting_before="$(pueue_group_task_count "$GROUP_C")"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$SUBMITTING_CAMPAIGN'" "unreconciled" \
+  "submitting restart was not quarantined"
+stop_daemon
+[ "$(pueue_group_task_count "$GROUP_C")" = "$submitting_before" ] \
+  || fail "submitting restart performed an unsafe second Pueue add"
+
+# A real Pueue add followed by a failed response remains unreconciled across restart.
+: > "$WORK/add-uncertain"
+uncertain_before="$(pueue_group_task_count "$GROUP_D")"
+if (cd "$PROJECT_D" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh") \
+  >"$WORK/uncertain-submit.out" 2>"$WORK/uncertain-submit.err"; then
+  fail "uncertain Pueue add unexpectedly returned success"
+fi
+rm -f "$WORK/add-uncertain"
+UNCERTAIN_CAMPAIGN="$(sql "SELECT campaign_id FROM campaigns WHERE project_id = '$PROJECT_ID_D' AND state <> 'retired'")"
+[ "$(sql "SELECT status FROM experiments WHERE campaign_id = '$UNCERTAIN_CAMPAIGN'")" = "unreconciled" ] \
+  || fail "uncertain Pueue add did not persist unreconciled"
+[ "$(pueue_group_task_count "$GROUP_D")" = "$((uncertain_before + 1))" ] \
+  || fail "uncertain fixture did not create exactly one external Pueue task"
+start_daemon
+sleep 0.2
+stop_daemon
+[ "$(sql "SELECT status FROM experiments WHERE campaign_id = '$UNCERTAIN_CAMPAIGN'")" = "unreconciled" ] \
+  || fail "restart changed the unreconciled quarantine"
+[ "$(pueue_group_task_count "$GROUP_D")" = "$((uncertain_before + 1))" ] \
+  || fail "restart re-added an unreconciled Pueue task"
+
 # Callback + reconciliation deduplicate, and a missed callback remains durable while paused.
-"$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B"
 submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
 task_ok="$(submission_task_id "$submit_summary")"
+"$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B"
 wait_for_task_state "$task_ok" Done
 "$PA_BIN" event callback --group "$GROUP_B" --task-id "$task_ok" \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
@@ -318,8 +656,11 @@ stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND kind = 'task_finished'")" = "1" ] \
   || fail "duplicate callback plus reconciliation created duplicate events"
 
+"$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
+"$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
 submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
 task_missed="$(submission_task_id "$submit_summary")"
+"$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
 wait_for_task_state "$task_missed" Done
 start_daemon
 wait_for_sql "SELECT COUNT(*) FROM task_observations WHERE project_id = '$PROJECT_ID_B'" "2" \
@@ -339,7 +680,7 @@ start_daemon
 wait_for_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID_A'" "1" \
   "fatal pattern did not request termination"
 stop_daemon
-[ "$(wc -l < "$PUEUE_AGENT_E2E_KILL_LOG" | tr -d ' ')" = "1" ] \
+[ "$(wc -l < "$WORK/pueue-kills.log" | tr -d ' ')" = "1" ] \
   || fail "fatal pattern did not invoke exactly one Pueue kill"
 
 start_daemon
@@ -348,10 +689,10 @@ wait_for_sql "SELECT COUNT(*) FROM incidents WHERE project_id = '$PROJECT_ID_A' 
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM incidents WHERE project_id = '$PROJECT_ID_A'")" = "1" ] \
   || fail "repeated fatal observation duplicated the incident"
-[ "$(wc -l < "$PUEUE_AGENT_E2E_KILL_LOG" | tr -d ' ')" = "1" ] \
+[ "$(wc -l < "$WORK/pueue-kills.log" | tr -d ' ')" = "1" ] \
   || fail "repeated fatal observation invoked a second Pueue kill"
 
-PUEUE_AGENT_E2E_DEFER_KILL=0 "$REAL_PUEUE" --config "$WORK/pueue.yml" kill "$task_bad" >/dev/null
+"$REAL_PUEUE" --config "$WORK/pueue.yml" kill "$task_bad" >/dev/null
 wait_for_task_terminal "$task_bad"
 start_daemon
 wait_for_agent_calls "1" "auto-kill event did not launch the agent"
@@ -361,24 +702,22 @@ stop_daemon
 [ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "1" ] \
   || fail "auto-kill should produce exactly one agent invocation"
 
-# Spawn failures enter retry_wait; a later daemon run can retry the same event.
-write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/missing-agent" 20
+# Agent execution failures enter retry_wait; a later daemon run can retry the same event.
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 900 \
   --metadata '{"state":"Failed","result":"Failed"}' >/dev/null
-if "$PA_BIN" daemon --foreground --pueue-config "$WORK/pueue.yml" \
+if PUEUE_AGENT_TEST_AGENT_MODE=fail "$PA_BIN" daemon --foreground --pueue-config "$WORK/pueue.yml" \
   > "$WORK/retry-daemon.log" 2>&1; then
-  fail "missing agent executable should fail the daemon cycle"
+  fail "failed agent execution should fail the daemon cycle"
 fi
 [ "$(sql "SELECT status FROM events WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'")" = "retry_wait" ] \
-  || fail "agent spawn failure did not enter retry_wait"
-write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/fake_agent.sh" 20
+  || fail "agent execution failure did not enter retry_wait"
 sql "UPDATE events SET not_before = 0 WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'"
 start_daemon
-wait_for_agent_calls "2" "retry event was not recoverable"
+wait_for_agent_calls "3" "retry event was not recoverable"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'")" = "2" ] \
   || fail "retried agent run was not completed during shutdown drain"
-[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "2" ] \
+[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "3" ] \
   || fail "retry should execute the fake agent once after spawn recovery"
 
 # max_agent_runs halts scheduling; resume clears the halt after policy adjustment.
@@ -393,7 +732,7 @@ for _ in $(seq 100); do
 done
 stop_daemon
 [ "$halted" = "1" ] || fail "max_agent_runs did not halt the project"
-[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "2" ] \
+[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "3" ] \
   || fail "halted project launched an agent"
 
 write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/fake_agent.sh" 20
@@ -403,7 +742,7 @@ write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/f
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 902 \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
 start_daemon
-wait_for_agent_calls "3" "resumed project did not schedule a new event"
+wait_for_agent_calls "4" "resumed project did not schedule a new event"
 stop_daemon
 
 # Resuming the other project consumes its coalesced pending callback events.
@@ -424,7 +763,7 @@ wait_for_sql "SELECT status FROM events WHERE dedup_key = '$restart_key'" "pendi
   "restart did not recover the expired event lease"
 stop_daemon
 
-# Explicit Codex continuation reaches the process boundary and is recorded in SQLite.
+# Explicit Codex continuation exposes the production-derived network argument and no credentials.
 context_session_id="019f9f30-5f31-7a40-8e28-bd95e1f6c537"
 context_session_store="$CODEX_HOME/sessions/2026/08/09"
 mkdir -p "$context_session_store"
@@ -443,18 +782,23 @@ wait_for_codex_call "Codex resume context was not invoked"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND context_mode = 'resume' AND context_session_id = '$context_session_id' AND status = 'completed'")" = "1" ] \
   || fail "Codex resume context was not completed and recorded"
-grep -qx 'ARG_1=exec' "$PUEUE_AGENT_TEST_CODEX_LOG" \
+grep -Eq '^ARG_[0-9]+=exec$' "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex resume did not invoke exec"
-grep -qx 'ARG_2=-C' "$PUEUE_AGENT_TEST_CODEX_LOG" \
+grep -Eq '^ARG_[0-9]+=-C$' "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex resume did not scope the project with -C"
-grep -qx "ARG_3=$PROJECT_A_CANONICAL" "$PUEUE_AGENT_TEST_CODEX_LOG" \
+grep -Fq "=$PROJECT_A_CANONICAL" "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex resume used the wrong project root"
-grep -qx 'ARG_4=resume' "$PUEUE_AGENT_TEST_CODEX_LOG" \
+grep -Eq '^ARG_[0-9]+=resume$' "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation silently used a fresh execution"
-grep -qx "ARG_5=$context_session_id" "$PUEUE_AGENT_TEST_CODEX_LOG" \
+grep -Fq "=$context_session_id" "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation used the wrong session ID"
+grep -Fq 'sandbox_workspace_write.network_access=true' "$PUEUE_AGENT_TEST_CODEX_LOG" \
+  || fail "production Codex argv did not enable network access"
 grep -qx 'ENV_NAME=CODEX_HOME' "$PUEUE_AGENT_TEST_CODEX_LOG" \
   || fail "Codex continuation did not expose the fixture CODEX_HOME name"
+! grep -Eq 'credential-value-present|campaign-credential-must-not-reach-agent|campaign-wandb-key-must-not-reach-agent|campaign-ssh-socket-must-not-reach-agent' \
+  "$PUEUE_AGENT_TEST_CODEX_LOG" \
+  || fail "network-enabled built-in Codex inherited an unlisted credential value"
 
 PA_INSTALL_PREFIX="$WORK/install" "$REPO_ROOT/install.sh" >/dev/null
 [ -L "$WORK/install/pueue-agent" ] || fail "install did not create pueue-agent symlink"

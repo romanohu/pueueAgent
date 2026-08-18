@@ -2,7 +2,7 @@
 
 ## 何をするツールか
 
-`pueue-agent` は、Pueue で実行する長時間の実験を監視する Rust + SQLite 製の supervisor です。通常の監視は coding agent を起動せず、永続化された event が処理対象になったときだけ agent を起動します。投入、状態確認、人による介入、停止、診断、更新を一つの CLI から行えます。
+`pueue-agent` は、Pueue で実行する長時間の実験を監視する Rust + SQLite 製の supervisor です。最初の通常 `submit` を managed campaign と baseline experiment として記録し、通常の監視は coding agent を起動せず、永続化された event が処理対象になったときだけ agent を起動します。投入、状態確認、人による介入、停止、診断、更新を一つの CLI から行えます。
 
 ## 全体像
 
@@ -11,7 +11,9 @@ operator / coding agent
         |
         | pueue-agent submit
         v
-SQLite submission intent -----> Pueue project group
+SQLite campaign / proposal / experiment
+        | durable submission intent
+        +------------------------> Pueue project group
         ^                            |
         |                            | callback / status reconciliation
         +-------- event / incident <-+
@@ -25,13 +27,15 @@ SQLite submission intent -----> Pueue project group
                  agent run
 ```
 
-SQLite は project、submission、event、incident、agent run の durable な関連を保持します。Pueue task の実行と agent の判断は分離され、1つの supervisor は1つの Pueue daemon または profile を担当します。
+SQLite は project、campaign、proposal、experiment、budget reservation、submission、event、incident、agent run の durable な関連を保持します。Pueue task の実行と agent の判断は分離され、1つの supervisor は1つの Pueue daemon または profile を担当します。
+
+現在の Phase 1 は campaign、baseline、hard budget、外部投入の復旧境界を持つ control plane までです。実験完了後の自律的な次 proposal の生成、実行中の periodic observer とそれに基づく campaign health-decision loop、goal evaluation、隔離された code worktree は後続 Phase であり、まだ自動実行されません。
 
 ## 対応環境
 
 | 環境 | 対応状況 |
 | --- | --- |
-| Linux | Ubuntu GitHub Actions で debug check、release check、全ターゲットの serial test、shell syntax を検証済み。private temp の mount 境界確認には kernel 5.8 以降が必要です。 |
+| Linux | 正式な対応対象です。Ubuntu の検証に加え、Phase 1 の完了判定では隔離した real `pueued` による `tests/e2e/run.sh` の成功が必要です。private temp の mount 境界確認には kernel 5.8 以降が必要です。 |
 | macOS | launchd 経路はありますが、private temp を `/dev/fd/11` の子パスとして利用できない既知制約があり、Linux と同等の agent 実行対応は主張しません。 |
 | その他 | 安全側に停止します。対応済み環境ではありません。 |
 
@@ -39,16 +43,13 @@ SQLite は project、submission、event、incident、agent run の durable な�
 
 ## クイックスタート
 
-次の7コマンドでインストール、project 初期化、登録、最初の投入まで進めます。`init` 後、`enable` の前に生成ファイルを確認する手順は導入ガイドにあります。
+インストール後、ML リポジトリのルートで次の4段階を実行します。`STATE.md` には具体的な目標、成功条件、変更してよい範囲を書きます。
 
 ```bash
-git clone <repository-url>
-cd pueueAgent
-./install.sh
-cd /path/to/experiment-project
 pueue-agent init
+# edit .pueue-agent/STATE.md
 pueue-agent enable
-pueue-agent submit -- python train.py --lr 0.001
+pueue-agent submit -- python train.py
 ```
 
 現在の完全な設定テンプレートは [`templates/config.toml`](templates/config.toml) です。
@@ -78,7 +79,11 @@ pueue-agent submit -- python train.py --lr 0.001
 ## セキュリティ上の重要事項
 
 - 監視対象は raw `pueue add` ではなく `pueue-agent submit` から投入してください。submission intent と project ownership の記録を迂回しないためです。
+- 最初の通常 `submit` は campaign と baseline を作ります。live campaign 中の二回目の `submit` / `submit-batch` は拒否されるため、追加指示は `steer` を使います。
+- campaign の objective は最初の `submit` 時の `STATE.md` snapshot で固定されます。新しい目的へ移るときは既存 campaign を安全に `retire` してから `STATE.md` を編集し、新しい最初の `submit` を実行します。
+- Pueue add の結果が不明な experiment は `unreconciled` のまま隔離され、自動で同じ task を追加しません。`campaign status` と `doctor` で確認してください。
 - execution policy、実行ファイル、project root、Pueue config、agent log、private temp の検証に失敗した場合は安全側に起動を拒否します。検証を弱めて通さないでください。
+- service policy の network 既定値は enabled ですが、network 利用許可と credential 継承許可は別です。allowlist にない credential/environment value は agent や agent task へ継承されません。
 - `status`、`events`、`runs`、`doctor` などの診断投影は bounded / redacted です。ただし、SQLite には submission の argv と任意 metadata、`steer` の intervention message が保存されます。これらの入力に credential や secret を含めないでください。
 - service、automation、agent run、Pueue task は別の lifecycle です。停止や取消は、対象に対応する `stop`、`pause`、`resume`、`cancel --task-id` を使ってください。
 - 障害時も SQLite や immutable execution policy を直接修復せず、[トラブルシューティング](docs/troubleshooting-ja.md)の診断順序と supported CLI を使ってください。

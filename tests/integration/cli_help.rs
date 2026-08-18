@@ -239,6 +239,74 @@ fn readme_links_every_user_and_developer_guide() {
 }
 
 #[test]
+fn campaign_documentation_covers_managed_start_and_phase_boundary() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    let getting_started =
+        std::fs::read_to_string(root.join("docs/getting-started-ja.md")).unwrap();
+    let commands = std::fs::read_to_string(root.join("docs/commands-ja.md")).unwrap();
+    let workflows = std::fs::read_to_string(root.join("docs/workflows-ja.md")).unwrap();
+    let architecture = std::fs::read_to_string(root.join("docs/architecture-ja.md")).unwrap();
+    let troubleshooting =
+        std::fs::read_to_string(root.join("docs/troubleshooting-ja.md")).unwrap();
+
+    let quick_start = concat!(
+        "pueue-agent init\n",
+        "# edit .pueue-agent/STATE.md\n",
+        "pueue-agent enable\n",
+        "pueue-agent submit -- python train.py"
+    );
+    assert!(readme.contains(quick_start));
+    assert!(getting_started.contains(quick_start));
+
+    for command in [
+        "pueue-agent campaign status",
+        "pueue-agent campaign pause",
+        "pueue-agent campaign resume",
+        "pueue-agent campaign retire",
+        "pueue-agent proposal list",
+        "pueue-agent proposal inspect <proposal-id>",
+        "pueue-agent experiment list",
+        "pueue-agent experiment inspect <experiment-id>",
+    ] {
+        assert!(
+            commands.contains(command),
+            "command reference is missing {command}"
+        );
+    }
+
+    assert!(workflows.contains("Campaign を retire して新しい目的を開始する"));
+    assert!(workflows.contains(
+        "pueue-agent campaign retire\n# edit .pueue-agent/STATE.md\npueue-agent submit -- python train.py"
+    ));
+
+    let intent = architecture
+        .find("campaign、baseline proposal、experiment、budget reservation、submission intent")
+        .expect("architecture must describe the atomic managed intent");
+    let add = architecture[intent..]
+        .find("verified Pueue add")
+        .map(|offset| intent + offset)
+        .expect("architecture must place Pueue add after the durable intent");
+    let accepted = architecture[add..]
+        .find("accepted task ID/signature")
+        .map(|offset| add + offset)
+        .expect("architecture must place accepted identity after Pueue add");
+    assert!(intent < add && add < accepted);
+
+    assert!(troubleshooting.contains("unreconciled"));
+    assert!(!troubleshooting.to_ascii_lowercase().contains("retry submit"));
+
+    for document in [&readme, &getting_started] {
+        assert!(document.contains("Phase 1"));
+        assert!(document.contains("自律的な次 proposal の生成"));
+        assert!(document.contains("periodic observer"));
+        assert!(document.contains("campaign health-decision loop"));
+        assert!(document.contains("goal evaluation"));
+        assert!(document.contains("code worktree"));
+    }
+}
+
+#[test]
 fn help_lists_service_lifecycle_commands() {
     for command in ["start", "stop"] {
         let output = assert_cmd::Command::cargo_bin("pueue-agent")

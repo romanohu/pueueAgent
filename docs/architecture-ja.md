@@ -7,6 +7,7 @@
 | コンポーネント | 所有する責務 | 所有しないもの | 主な実装 |
 | --- | --- | --- | --- |
 | submit 経路 | project と argv の検証、submission intent の先行永続化、Pueue add 結果の記録 | Pueue の task 実行 | [`submit.rs`](../src/submit.rs), [`pueue.rs`](../src/pueue.rs) |
+| campaign coordinator | 最初の submit を campaign/baseline に変換し、durable intent commit 後の Pueue add と accepted/unreconciled 遷移を調停 | 完了結果の解釈や次 proposal の自律生成 | [`campaign.rs`](../src/campaign.rs), [`db/campaigns.rs`](../src/db/campaigns.rs) |
 | Pueue adapter | 許可済み operation の argv 組み立て、検証済み Pueue/config の利用、timeout と stdout/stderr 上限 | event の永続化や retry 判定 | [`pueue.rs`](../src/pueue.rs), [`pueue_process.rs`](../src/pueue_process.rs) |
 | callback / reconciliation | callback の idempotent 取り込み、Pueue status の観測、terminal event の正規化、submission の突合 | agent dispatch | [`events.rs`](../src/events.rs), [`reconcile.rs`](../src/reconcile.rs) |
 | repository 層 | SQLite の制約、lease、状態遷移、run/event 結合、終端処理の transaction | OS process の生死 | [`db/repositories.rs`](../src/db/repositories.rs), [`models.rs`](../src/models.rs) |
@@ -23,14 +24,17 @@
 | --- | --- | --- |
 | project 登録、submission、event、task observation、incident、termination request、intervention、agent run | service state directory の SQLite `state.sqlite3` | repository 層のみが状態遷移を書き込む。運用時に直接 SQL で編集しない |
 | agent、check、guardrail、Pueue group | project の `.pueue-agent/config.toml` | submit と daemon startup recovery は DB 登録の project ID/group と一致を検証する |
-| budget、current/historical facts、active lineage | `.pueue-agent/state.json` | guardrail の機械判定で canonical state として読む |
-| 人間向けの実験メモ | `.pueue-agent/STATE.md` | canonical state との整合性診断に使うが、budget/lineage を上書きしない |
+| campaign、immutable objective snapshot、proposal、experiment、rolling budget reservation、submission/task lineage | service state directory の SQLite `state.sqlite3` | repository と coordinator が transaction 内で状態遷移する |
+| current/historical facts、active lineage の bounded scratch projection | `.pueue-agent/state.json` | agent の補助 context。objective/budget/lineage の authority にはしない |
+| 人間が定める campaign objective と制約 | `.pueue-agent/STATE.md` | 最初の submit で bounded snapshot 化する。active campaign 中の編集で SQLite objective を上書きしない |
 | 起動時の executable、trusted path、Pueue config、network/environment policy | service state directory の `execution-policy.toml` を検証して作る immutable anchor/capability | daemon 起動後は ambient `PATH` で実行ファイルを再解決せず、使用直前に identity を再検証する |
 | agent log、authorization marker、private temp generation | project root からの descriptor-relative な `.pueue-agent/` 配下 | SQLite の絶対パスは相対名との一致検証用であり、startup recovery でそのパスを直接 reopen しない |
 
 SQLite は durable lifecycle の source of truth ですが、「process が実際に動いたか」の proof そのものではありません。その境界は launch marker、exec-status pipe、release ack、および所有する child/process group の観測で補います。
 
 ## Submission から event まで
+
+managed baseline の外部副作用境界は、(1) 一つの immediate transaction で campaign、baseline proposal、experiment、budget reservation、submission intent を commit、(2) verified Pueue add、(3) 別の transaction で accepted task ID/signature を保存、という順序です。reserved は再起動後も一度だけ add を再開できますが、外部 add を開始済みの submitting は `unreconciled` に隔離し、自動再 add しません。
 
 ```mermaid
 flowchart TD
@@ -48,6 +52,10 @@ flowchart TD
 ```
 
 submit は、native control frame に収まらない argv を永続化前に拒否します。検証後の順序は、(1) `pending` submission intent を immediate transaction で commit、(2) 外部の `pueue add`、(3) 返却された task ID と provisional signature を別 transaction で `accepted` として commit、です。SQLite と Pueue を跨ぐ transaction はないため、この間の中断は意図的に reconciliation の対象です。
+
+Phase 1 の daemon recovery は stale `submitting` を `unreconciled` へ進め、`unreconciled` と `accepted` を再 add せず、`reserved` だけを durable argv/working directory から再開します。rolling budget は有限の `next_eligible_at` を持ち、window expiry 後に `active` へ戻します。完了 event から次 proposal を生成するループ、periodic observer と campaign health-decision loop、goal evaluation、code worktree はこの Phase には含まれません。
+
+service policy の network default は `enabled` ですが、sanitized environment は別の allowlist 境界です。network を利用可能にしても、allowlist 外の credential/environment value を agent または agent task に継承しません。
 
 reconciliation は Pueue status を正常に取得してから observation を書きます。status の取得失敗を「空のキュー」と扱いません。terminal task は lifecycle 情報と result を含む dedup key で `task_finished` / `task_failed` / `auto_killed` event に正規化されます。callback event が先にある場合は、重複を増やすのではなく terminal event で置き換え、または重複した pending callback を捨てます。
 
@@ -246,5 +254,5 @@ Linux private temp の mount 境界検証は `openat2(RESOLVE_NO_XDEV)` と `sta
 - event/run/gate の atomic transition と startup recovery: [`db/repositories.rs`](../src/db/repositories.rs)
 - daemon tick、retained cleanup、shutdown drain: [`daemon.rs`](../src/daemon.rs)
 - DB の状態語彙: [`models.rs`](../src/models.rs)
-- canonical `state.json` と `STATE.md` の整合性: [`state.rs`](../src/state.rs)
+- bounded `state.json` projection と `STATE.md` objective snapshot の検証: [`state.rs`](../src/state.rs)
 - 有界な診断投影: [`diagnostics.rs`](../src/diagnostics.rs), [`output.rs`](../src/output.rs)

@@ -4,7 +4,7 @@
 
 ## 対応環境
 
-- Linux: Ubuntu GitHub Actions で debug check、release check、全ターゲットの serial test、shell syntax を検証済み。private temp の mount 境界確認には kernel 5.8 以降を要求する。
+- Linux: 正式な対応対象。Phase 1 の完了判定では、通常の build/test に加えて隔離した real `pueued` を使う `tests/e2e/run.sh` の成功を要求する。private temp の mount 境界確認には kernel 5.8 以降を要求する。
 - macOS: launchd 経路は存在するが、private temp を `/dev/fd/11` の子パスとして利用できない既知制約があるため、Linux と同等の agent 実行対応を主張しない。
 - その他: fail closed とし、対応済みとは記載しない。
 
@@ -48,13 +48,22 @@ $EDITOR .pueue-agent/config.toml
 $EDITOR .pueue-agent/STATE.md
 ```
 
+インストール済みの環境で campaign を開始する最短手順は次の4段階です。
+
+```bash
+pueue-agent init
+# edit .pueue-agent/STATE.md
+pueue-agent enable
+pueue-agent submit -- python train.py
+```
+
 ## 生成ファイルを確認する
 
 `init` はプロジェクト直下に `.pueue-agent/` を作成し、次のファイルとディレクトリを生成します。
 
 - `.pueue-agent/config.toml`: project ID、Pueue group、agent、check、guardrails の設定
-- `.pueue-agent/STATE.md`: 人が管理する実験方針、履歴、現在の状況、次の計画
-- `.pueue-agent/state.json`: supervisor の機械的な状態（canonical state）
+- `.pueue-agent/STATE.md`: 人が管理する campaign の目的、成功条件、変更可能範囲。STATE.md に credential や secret を書かないでください
+- `.pueue-agent/state.json`: agent 用の bounded scratch projection。campaign、objective、budget、lineage の正本は SQLite
 - `.pueue-agent/instructions.md`: agent に渡すプロジェクト指示のテンプレート
 - `.pueue-agent/logs/`: プロジェクトログのディレクトリ
 
@@ -126,13 +135,23 @@ SQLite database は次の優先順位で解決した directory の `state.sqlite
 
 ## 最初の実験を投入する
 
-監視対象の job は、raw `pueue add` ではなく必ず `pueue-agent submit` で投入してください。これにより project の設定、state、guardrails、agent supervisor の管理対象として登録されます。
+監視対象の job は、raw `pueue add` ではなく必ず `pueue-agent submit` で投入してください。live campaign がない場合、最初の通常 `submit` は `STATE.md` の bounded snapshot、campaign、baseline proposal、baseline experiment、rolling budget reservation、submission intent を SQLite に作成してから Pueue へ追加します。
 
 ```bash
 pueue-agent submit -- python train.py --lr 0.001
 ```
 
 `--` より後ろが実行するコマンドです。ここでは例として `train.py` を実行します。
+
+目的は最初の `submit` 時に immutable snapshot と digest として固定されます。その後に on-disk の `STATE.md` を編集しても、active campaign の objective snapshot は変更されません。新しい目的を開始するには、現在の experiment がすべて終端・照合済みであることを確認し、`pueue-agent campaign retire` 後に `STATE.md` を編集して、新しい最初の `submit` を実行します。
+
+live campaign 中の追加 `submit` と `submit-batch` は、別 campaign や別 task の重複作成を防ぐため副作用前に拒否されます。現在の目的への追加指示は `pueue-agent steer -- "<MESSAGE>"` を使います。
+
+## Phase 1 で自動化される範囲
+
+Phase 1 が提供するのは、最初の baseline を managed campaign として安全に開始し、hard policy、予算予約、Pueue task identity、再起動復旧、診断を supervisor が所有する control plane です。実験完了後の自律的な次 proposal の生成、実行中の periodic observer とそれに基づく campaign health-decision loop、goal evaluation、隔離された code worktree は後続 Phase で実装する範囲であり、現時点では自動で次の学習を投入しません。
+
+service-owned execution policy では network が既定で enabled です。ただし network access と credential access は別の権限であり、明示 allowlist にない credential/environment value は agent や agent task に継承されません。
 
 ## 状態を確認する
 

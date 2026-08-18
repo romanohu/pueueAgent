@@ -15,22 +15,36 @@ pueue-agent submit -- python train.py --lr 0.001
 pueue-agent status
 ```
 
-監視対象の job は raw の `pueue add` ではなく `pueue-agent submit` で投入します。`submit` は Pueue へ追加する前に submission intent を SQLite に記録します。
+監視対象の job は raw の `pueue add` ではなく `pueue-agent submit` で投入します。最初の通常 `submit` は Pueue へ追加する前に campaign、baseline proposal、experiment、budget reservation、submission intent を SQLite に一度だけ記録します。live campaign 中の二回目の `submit` と `submit-batch` は副作用前に拒否されるため、追加指示には `steer` を使います。
 
-## 単発実験を投入する
+Phase 1 はこの baseline/control plane と安全な復旧までを提供します。完了後の自律 proposal、実行中の periodic observer とそれに基づく campaign health-decision loop、goal evaluation、code worktree は後続 Phase の範囲です。
 
-有効なプロジェクトのルートで、`--` の後ろに実行する argv を渡します。
+## Campaign を retire して新しい目的を開始する
+
+現在の campaign に running、reserved、submitting、`unreconciled` の experiment がなく、すべて終端・照合済みであることを `campaign status` と `experiment list` で確認します。その後だけ次の順序で新しい objective を開始します。
 
 ```bash
-pueue-agent submit --kind experiment -- python train.py --epochs 5
+pueue-agent campaign retire
+# edit .pueue-agent/STATE.md
+pueue-agent submit -- python train.py
+```
+
+`STATE.md` を先に編集しても active campaign の immutable objective snapshot は変わりません。`campaign retire` は既存 task を停止するコマンドではなく、retired campaign の履歴も SQLite に残ります。新しい `submit` が新しい snapshot と baseline を作成します。
+
+## Campaign 外の単発 control task を投入する
+
+live campaign がない有効なプロジェクトで、bootstrap、診断、後片付けなどを direct submission として投入する場合だけ `control` を使います。
+
+```bash
+pueue-agent submit --kind control -- python prepare_data.py
 pueue-agent runs --json
 ```
 
-通常の学習・評価は既定の `experiment` を使います。bootstrap、診断、後片付けなどを実験数に数えない場合だけ `--kind control` を指定します。`control` も SQLite と Pueue task に記録され、ほかの guardrail を無効化しません。
+通常の学習・評価に既定の `experiment` を使うと managed campaign と baseline が始まります。以後は `control` を含む direct `submit` も拒否されます。`control` は SQLite と Pueue task に記録され、ほかの guardrail を無効化しません。
 
 ## batch を冪等に投入・再開する
 
-複数 job は JSON manifest と UUID の request ID を一組の durable request として投入します。
+live campaign がない direct workflow でのみ、複数 job を JSON manifest と UUID の request ID を一組の durable request として投入します。managed campaign 開始後は `submit-batch` も副作用前に拒否されます。
 
 ```bash
 pueue-agent submit-batch \
@@ -67,6 +81,8 @@ deep_check_interval_minutes = 60
 ```
 
 `0`（既定値）は無効です。正の値では、通常の reconciliation が周期条件を確認し、必要なときだけ設定済みの `agent.context.mode` を使う新しい agent run を起動します。`fresh` は既定値ですが、明示的に設定した `resume` / `resume_latest` もそのまま適用されます。正常な tick の確認や異常検知だけでは agent token を消費しません。Periodic DeepCheck event が dispatch されたときだけ token を消費します。
+
+この既存 Periodic DeepCheck は project 単位の event を起こす機能であり、実行中 experiment を継続観測して改善見込みや棄却を判断する campaign health-decision loop ではありません。後者は Phase 1 には含まれません。
 
 同じ project では pending、claimed、retry 待ちの periodic DeepCheck がある間、新しい event は追加されません。複数の長時間 task があっても project ごとに coalesce されます。`STATE.md` には確認できた task、metric、短い判断だけを記録し、値を補完しません。
 

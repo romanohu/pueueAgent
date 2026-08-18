@@ -73,6 +73,37 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
 }
 
 #[test]
+fn codex_network_config_uses_exact_toml_booleans() {
+    let harness = Harness::new();
+
+    for (network, expected) in [
+        (
+            NetworkMode::Enabled,
+            "sandbox_workspace_write.network_access=true",
+        ),
+        (
+            NetworkMode::Disabled,
+            "sandbox_workspace_write.network_access=false",
+        ),
+    ] {
+        let mut policy = harness.builder().policy().clone();
+        policy.network = network;
+        let argv = CodexArgvBuilder::new(policy, CodexCapabilities::all())
+            .build(&config_with_args(vec!["{prompt}"]), "p")
+            .unwrap();
+
+        assert_eq!(
+            argv.iter().filter(|argument| *argument == expected).count(),
+            1
+        );
+        assert!(!argv.iter().any(|argument| {
+            argument == "sandbox_workspace_write.network_access=\"enabled\""
+                || argument == "sandbox_workspace_write.network_access=\"disabled\""
+        }));
+    }
+}
+
+#[test]
 fn task_env_is_default_deny_and_auth_never_inherits() {
     let harness = Harness::new();
     let startup = pueue_agent::execution_policy::StartupEnvironment::from_pairs([

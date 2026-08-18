@@ -50,7 +50,7 @@
 - **例:** `pueue-agent submit --kind experiment --metadata-json '{"dataset":"a"}' -- python train.py --epochs 5`
 - **失敗時の確認:** プロジェクトが有効であること、コマンド argv とメタデータ JSON、Pueue 接続を確認します。
 
-`experiment` は既定の submission kind で `guardrails.max_experiments` を消費します。bootstrap、診断、後片付けなどを `pueue-agent submit --kind control` で投入すると、この experiment budget には数えません。`control` も SQLite と Pueue task に記録され、ほかの guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。
+`experiment` は既定の submission kind で、live campaign がなければ managed campaign と baseline を開始します。`control` は campaign 外の bootstrap、診断、後片付け用の direct submission です。どちらも live campaign 中は拒否され、追加指示には `steer` を使います。`control` も SQLite と Pueue task に記録され、guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。
 
 ### `pueue-agent submit-batch`
 
@@ -82,6 +82,8 @@ manifest は未知の field を許さない JSON object で、次の形式です
 
 `jobs` は 1〜128 件です。各 job の `id` は空でない 128 byte 以下の文字列で、manifest 内で一意でなければなりません。`argv` は空でない文字列配列で、JSON 直列化後 64 KiB 以下です。任意の `kind` は `experiment`（既定）または `control`、任意の `metadata` は JSON object（既定 `{}`）で直列化後 16 KiB 以下です。manifest 全体は 1 MiB 以下です。`--group` は登録済み project group と完全一致する場合だけ受理され、登録値を上書きしません。
 
+`submit-batch` は live campaign がない direct workflow 専用です。managed campaign 開始後は副作用前に拒否され、campaign 内の次 experiment を作る interface ではありません。
+
 ## 状態確認
 
 ### `pueue-agent status`
@@ -106,6 +108,15 @@ manifest は未知の field を許さない JSON object で、次の形式です
 
 `status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。objective 本文や raw argv は既定出力と JSON に含めません。
 
+公開 action は次のとおりです。
+
+```text
+pueue-agent campaign status
+pueue-agent campaign pause
+pueue-agent campaign resume
+pueue-agent campaign retire
+```
+
 ### `pueue-agent proposal`
 
 - **構文:** `pueue-agent proposal <list|inspect> [OPTIONS] [PROJECT_ROOT]`
@@ -117,6 +128,11 @@ manifest は未知の field を許さない JSON object で、次の形式です
 
 一覧は campaign scope 内で安定順に最大 100 件を返します。inspect の hypothesis と expected evidence は bounded / redacted で表示され、raw argv は表示しません。
 
+```text
+pueue-agent proposal list
+pueue-agent proposal inspect <proposal-id>
+```
+
 ### `pueue-agent experiment`
 
 - **構文:** `pueue-agent experiment <list|inspect> [OPTIONS] [PROJECT_ROOT]`
@@ -127,6 +143,11 @@ manifest は未知の field を許さない JSON object で、次の形式です
 - **失敗時の確認:** experiment ID が対象 project の最新 campaign に属すること、`--limit` が 1〜100 であることを確認します。
 
 一覧と inspect は campaign / proposal / submission / task の identity と状態を表示します。inspect は raw argv ではなく argv digest を表示します。
+
+```text
+pueue-agent experiment list
+pueue-agent experiment inspect <experiment-id>
+```
 
 ### `pueue-agent events`
 
