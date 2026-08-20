@@ -280,3 +280,70 @@ Phase 2 proposal loop, observer, evaluator, autonomous code-change path, or work
 The user-owned untracked `docs/report/` tree was not read, modified, or staged. The additional wave
 is committed with subject `fix: close residual campaign races`; the exact commit hash is reported
 in the handoff.
+
+## Supported-Linux real-Pueue acceptance wave
+
+The user authorized updating and testing an isolated checkout on host `roko`. The existing remote
+checkout and its unrelated branch were not modified. Verification used Ubuntu 24.04 x86_64,
+Pueue 4.0.4, Rust/Cargo 1.97, the isolated worktree
+`/home/romanohu/project/.worktrees/pueue-agent-campaign-phase1-linux`, `umask 077`, an owner-only
+TMPDIR, and an owner-only `CARGO_TARGET_DIR`.
+
+Initial broad Linux failures were caused by the host's ambient `0002` umask and group-writable
+build/temp parents. Re-running with the production security contract (`077` plus owner-only roots)
+made the unchanged security checks pass. The real-Pueue E2E then exposed five genuine acceptance
+gaps, each preserved as RED evidence before its fix:
+
+1. The custom-profile fake returned an invented add ID but no status identity, so managed submit
+   correctly quarantined it. The fixture now persists monotonically increasing task IDs and returns
+   a matching queued task identity.
+2. Pueue's official `FailedToSpawn`, `Errored`, and `DependencyFailed` terminal variants were not
+   classified as failures. The classifier now covers every official non-success Pueue 4.0.4
+   variant in string and externally tagged object form; unit and managed-reconciliation coverage
+   prove `FailedToSpawn` produces a failed experiment rather than success.
+3. `AgentRunnerConfig::production()` supplied no Codex capabilities, so real built-in Codex was
+   always rejected as `unsafe_codex_argument`. Production now enables the complete forced policy
+   surface; strict immutable argv/config, session ownership, and unsafe-argument validation remain
+   mandatory. A direct unit RED/GREEN and the real resume E2E cover this wiring.
+4. The Linux harness inherited Pueue's PATH-resolved default shell while production intentionally
+   supplies a minimal sanitized PATH. The isolated Pueue config now pins the official absolute
+   `/bin/sh -c {{ pueue_command_string }}` form, has a private runtime directory, and uses compiled
+   fixture launchers rather than shebang executables that cannot satisfy the native `execveat`
+   boundary. Synthetic callback events are explicitly attached to their durable campaign before
+   scheduler dispatch, and an agent failure is observed as durable `retry_wait` while the daemon
+   remains available.
+5. The development launcher and installer ignored an absolute `CARGO_TARGET_DIR`, selecting or
+   linking a different artifact. Both now honor the Cargo target directory, with separate tests
+   proving both explicit and default behavior.
+
+Fresh supported-Linux evidence after the final edits:
+
+- `tests/e2e/run.sh` with real isolated pueued/SQLite/native launch — `Rust E2E PASS`.
+- `cargo test --all-targets -- --test-threads=1` — exit 0.
+- Pueue result-variant unit regression — 1 passed, 0 failed.
+- managed `FailedToSpawn` reconciliation regression — 1 passed, 0 failed.
+- production Codex capability regression — 1 passed, 0 failed.
+- `bats tests/test_shell_entrypoints.bats` — 11 passed, 0 failed.
+- `cargo check --all-targets` and `cargo check --release --all-targets` — passed.
+- `bash -n` and `git diff --check` — passed.
+
+Two Linux-only warnings in untouched process/mount cfg branches remain pre-existing and were not
+reformatted or refactored. `cargo fmt --all -- --check` was attempted on `roko`, but that toolchain
+does not include the `fmt` subcommand; shellcheck is also unavailable in the isolated Devbox.
+`git diff --check` remains clean. The user-owned untracked `docs/report/` tree was not read,
+modified, or staged. The acceptance-wave commit hash is pending the final independent diff review.
+
+### Acceptance-wave independent review
+
+The first independent review found two Important E2E portability defects: the final installer
+assertion dereferenced an unset or relative `CARGO_TARGET_DIR`, and fixture creation still depended
+on the caller's umask. It also noted early cleanup could observe an unset runtime directory and an
+isolated pueued could outlive a failed client shutdown. The harness now sets `umask 077` itself,
+normalizes and exports Cargo's default/relative/absolute target location before any use, initializes
+the runtime directory before installing the EXIT trap, and retains a validated pueued PID for
+bounded shutdown fallback.
+
+Fresh review-condition proof ran the full real-Pueue E2E with the outer shell deliberately set to
+`umask 0002` and `CARGO_TARGET_DIR` explicitly unset; it completed with `Rust E2E PASS`. The final
+independent re-review verdict is **APPROVE**, with no Critical or Important finding in the tracked
+acceptance-wave diff.

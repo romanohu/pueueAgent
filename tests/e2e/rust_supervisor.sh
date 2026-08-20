@@ -5,14 +5,23 @@ if [ "$(uname -s)" != "Linux" ]; then
   echo "Rust E2E FAIL: real-Pueue campaign acceptance requires Linux" >&2
   exit 1
 fi
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PA_BIN="$REPO_ROOT/bin/pueue-agent"
 REAL_PUEUE="$(command -v pueue)"
 REAL_PUEUED="$(command -v pueued)"
 ORIGINAL_HOME="${HOME:?HOME is required}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+case "$CARGO_TARGET_DIR" in
+  /*) : ;;
+  *) CARGO_TARGET_DIR="$(pwd)/$CARGO_TARGET_DIR" ;;
+esac
+export CARGO_TARGET_DIR
 WORK="$(mktemp -d /tmp/pa-rust-e2e.XXXXXX)"
+XDG_RUNTIME_DIR="$WORK/runtime"
 DAEMON_PID=""
+PUEUED_PID=""
 
 fail() {
   echo "Rust E2E FAIL: $*" >&2
@@ -25,21 +34,34 @@ cleanup() {
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
   "$REAL_PUEUE" --config "$WORK/pueue.yml" shutdown >/dev/null 2>&1 || true
-  if [ -f "$WORK/pueue/pueue.pid" ]; then
-    pueue_pid="$(cat "$WORK/pueue/pueue.pid" 2>/dev/null || true)"
-    if [ -n "$pueue_pid" ]; then
+  if [ -z "$PUEUED_PID" ] && [ -f "$XDG_RUNTIME_DIR/pueue.pid" ]; then
+    PUEUED_PID="$(cat "$XDG_RUNTIME_DIR/pueue.pid" 2>/dev/null || true)"
+  fi
+  case "$PUEUED_PID" in
+    ''|*[!0-9]*) ;;
+    *)
       for _ in $(seq 50); do
-        kill -0 "$pueue_pid" 2>/dev/null || break
+        kill -0 "$PUEUED_PID" 2>/dev/null || break
         sleep 0.1
       done
-    fi
-  fi
+      if kill -0 "$PUEUED_PID" 2>/dev/null; then
+        kill -TERM "$PUEUED_PID" 2>/dev/null || true
+        for _ in $(seq 50); do
+          kill -0 "$PUEUED_PID" 2>/dev/null || break
+          sleep 0.1
+        done
+      fi
+      if kill -0 "$PUEUED_PID" 2>/dev/null; then
+        kill -KILL "$PUEUED_PID" 2>/dev/null || true
+      fi
+      ;;
+  esac
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 sql() {
-  sqlite3 "$STATE_DB" "$1"
+  sqlite3 -cmd '.timeout 5000' "$STATE_DB" "$1"
 }
 
 toml_value() {
@@ -59,10 +81,12 @@ wait_for_sql() {
     fi
     if [ -n "$DAEMON_PID" ] && ! kill -0 "$DAEMON_PID" 2>/dev/null; then
       wait "$DAEMON_PID" || true
+      cat "$WORK/daemon.log" >&2
       fail "$label (daemon exited early; see $WORK/daemon.log)"
     fi
     sleep 0.1
   done
+  "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json >&2 || true
   fail "$label (expected $expected, got $(sql "$query"))"
 }
 
@@ -94,6 +118,7 @@ wait_for_codex_call() {
     fi
     if [ -n "$DAEMON_PID" ] && ! kill -0 "$DAEMON_PID" 2>/dev/null; then
       wait "$DAEMON_PID" || true
+      cat "$WORK/daemon.log" >&2
       fail "$label (daemon exited early; see $WORK/daemon.log)"
     fi
     sleep 0.1
@@ -116,6 +141,13 @@ stop_daemon() {
   daemon_status=0
   wait "$DAEMON_PID" || daemon_status=$?
   if [ "$daemon_status" -ne 0 ] && [ "$daemon_status" -ne 143 ]; then
+    cat "$WORK/daemon.log" >&2
+    if [ -f "${STATE_DB:-}" ]; then
+      sqlite3 "$STATE_DB" \
+        "SELECT event_id, project_id, kind, status, dedup_key, payload_json, last_error FROM events ORDER BY event_id" >&2 || true
+      sqlite3 "$STATE_DB" \
+        "SELECT run_id, status, failure_stage, policy_code FROM agent_runs ORDER BY run_id" >&2 || true
+    fi
     fail "daemon shutdown failed; see $WORK/daemon.log"
   fi
   DAEMON_PID=""
@@ -132,6 +164,7 @@ wait_for_task_state() {
     fi
     sleep 0.1
   done
+  "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json >&2 || true
   fail "task $task_id did not reach $wanted"
 }
 
@@ -164,7 +197,7 @@ insert_campaign_boundary() {
   proposal_id="$campaign_id-proposal"
   experiment_id="$campaign_id-experiment"
   submission_id="$campaign_id-submission"
-  argv_json="[\"$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh\"]"
+  argv_json="[\"/bin/sh\",\"$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh\"]"
 
   sql "INSERT INTO campaigns (
          campaign_id, project_id, objective_text, objective_digest, initial_argv_json,
@@ -269,6 +302,7 @@ command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required"
 export HOME="$WORK/home"
 export CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}"
 export CODEX_HOME="$WORK/codex-home"
+export XDG_RUNTIME_DIR
 export XDG_STATE_HOME="$WORK/state"
 export PUEUE_AGENT_STATE_DIR="$WORK/state/pueue-agent"
 export PUEUE_CONFIG_PATH="$WORK/pueue.yml"
@@ -278,38 +312,54 @@ export PUEUE_AGENT_TEST_CODEX_LOG="$WORK/codex-calls.log"
 export AWS_SECRET_ACCESS_KEY="campaign-credential-must-not-reach-agent"
 export WANDB_API_KEY="campaign-wandb-key-must-not-reach-agent"
 export SSH_AUTH_SOCK="campaign-ssh-socket-must-not-reach-agent"
-mkdir -p "$HOME" "$CODEX_HOME" "$WORK/bin" "$WORK/pueue"
+mkdir -p "$HOME" "$CODEX_HOME" "$XDG_RUNTIME_DIR" "$WORK/bin" "$WORK/pueue"
+chmod 700 "$XDG_RUNTIME_DIR"
 : > "$WORK/defer-kill"
 
-cat > "$WORK/bin/pueue" <<'EOF'
-#!/usr/bin/env bash
-set -eu
-work_dir="__PUEUE_AGENT_E2E_WORK__"
-real_pueue="__PUEUE_AGENT_E2E_REAL_PUEUE__"
-operation=""
-for argument in "$@"; do
-  case "$argument" in
-    add|kill) operation="$argument"; break ;;
-  esac
-done
-if [ "$operation" = "kill" ]; then
-  printf '%s\n' "$*" >> "$work_dir/pueue-kills.log"
-  if [ -f "$work_dir/defer-kill" ]; then
-    exit 0
-  fi
-fi
-if [ "$operation" = "add" ] && [ -f "$work_dir/add-uncertain" ]; then
-  "$real_pueue" "$@"
-  exit 17
-fi
-exec "$real_pueue" "$@"
+cat > "$WORK/bin/pueue-proxy.rs" <<'EOF'
+use std::{env, fs::OpenOptions, io::Write, process::Command};
+
+fn main() {
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    let operation = arguments
+        .iter()
+        .find(|argument| argument.as_os_str() == "add" || argument.as_os_str() == "kill")
+        .and_then(|argument| argument.to_str())
+        .unwrap_or("");
+    if operation == "kill" {
+        let rendered = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        writeln!(
+            OpenOptions::new().create(true).append(true).open("__PUEUE_AGENT_E2E_WORK__/pueue-kills.log").unwrap(),
+            "{rendered}",
+        )
+        .unwrap();
+        if std::path::Path::new("__PUEUE_AGENT_E2E_WORK__/defer-kill").exists() {
+            return;
+        }
+    }
+    let status = Command::new("__PUEUE_AGENT_E2E_REAL_PUEUE__")
+        .args(&arguments)
+        .status()
+        .expect("run real Pueue");
+    if operation == "add"
+        && std::path::Path::new("__PUEUE_AGENT_E2E_WORK__/add-uncertain").exists()
+    {
+        std::process::exit(17);
+    }
+    std::process::exit(status.code().unwrap_or(125));
+}
 EOF
 sed \
   -e "s|__PUEUE_AGENT_E2E_WORK__|$WORK|g" \
   -e "s|__PUEUE_AGENT_E2E_REAL_PUEUE__|$REAL_PUEUE|g" \
-  "$WORK/bin/pueue" > "$WORK/bin/pueue.rendered"
-mv "$WORK/bin/pueue.rendered" "$WORK/bin/pueue"
-cat > "$WORK/bin/capture-agent-environment" <<'EOF'
+  "$WORK/bin/pueue-proxy.rs" > "$WORK/bin/pueue-proxy.rendered.rs"
+rustc --edition=2021 --crate-name pueue_proxy -O \
+  -o "$WORK/bin/pueue" "$WORK/bin/pueue-proxy.rendered.rs"
+cat > "$WORK/bin/capture-agent-environment.sh" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 capture="${HOME:?HOME is required}/../captured-agent-environment"
@@ -320,7 +370,7 @@ fi
 printf '%s\n' "${PUEUE_AGENT_RUN_ID:?missing run ID}:${PUEUE_AGENT_PROJECT_ID:?missing project ID}" \
   >> "$capture"
 EOF
-cat > "$WORK/bin/codex" <<'EOF'
+cat > "$WORK/bin/codex.sh" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 capture="${HOME:?HOME is required}/../codex-calls.log"
@@ -340,18 +390,46 @@ capture="${HOME:?HOME is required}/../codex-calls.log"
   done
 } >> "$capture"
 EOF
+cp "$REPO_ROOT/tests/support/fake_agent.sh" "$WORK/bin/fake-agent.sh"
+cat > "$WORK/bin/native-script-runner.rs" <<'EOF'
+use std::{env, os::unix::process::CommandExt, path::PathBuf, process::Command};
+
+fn main() {
+    let executable = env::current_exe().expect("resolve fixture executable");
+    let name = env::args_os()
+        .next()
+        .and_then(|argument| PathBuf::from(argument).file_name().map(ToOwned::to_owned))
+        .expect("fixture executable name");
+    let mut script = executable.parent().expect("fixture directory").join(name);
+    script.set_extension("sh");
+    let error = Command::new("/bin/bash")
+        .arg(script)
+        .args(env::args_os().skip(1))
+        .exec();
+    eprintln!("failed to execute fixture script: {error}");
+    std::process::exit(127);
+}
+EOF
+rustc --edition=2021 --crate-name native_script_runner -O \
+  -o "$WORK/bin/native-script-runner" "$WORK/bin/native-script-runner.rs"
+cp "$WORK/bin/native-script-runner" "$WORK/bin/fake-agent"
+cp "$WORK/bin/native-script-runner" "$WORK/bin/capture-agent-environment"
+cp "$WORK/bin/native-script-runner" "$WORK/bin/codex"
+cp /usr/bin/bash /usr/bin/cat /usr/bin/sleep "$WORK/bin/"
 cat > "$WORK/bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
 cat > "$WORK/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-if [ "${3:-}" = "is-active" ] || [ "${2:-}" = "is-active" ]; then
-  echo active
-fi
+case "$*" in
+  *--property=LoadState*) echo loaded ;;
+  *is-active*) echo active ;;
+esac
 exit 0
 EOF
-chmod +x "$WORK/bin/pueue" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
+chmod +x "$WORK/bin/pueue" "$WORK/bin/bash" "$WORK/bin/cat" "$WORK/bin/sleep" \
+  "$WORK/bin/fake-agent" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
   "$WORK/bin/launchctl" "$WORK/bin/systemctl"
 export PATH="$WORK/bin:$PATH"
 
@@ -362,6 +440,7 @@ shared:
   unix_socket_path: "$WORK/pueue.socket"
 daemon:
   callback: null
+  shell_command: ["/bin/sh", "-c", "{{ pueue_command_string }}"]
 EOF
 chmod 600 "$WORK/pueue.yml"
 
@@ -378,6 +457,10 @@ if ! "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json >/dev/null 2>&1; the
   cat "$WORK/pueued.log" >&2
   fail "isolated pueued did not start"
 fi
+PUEUED_PID="$(cat "$XDG_RUNTIME_DIR/pueue.pid")"
+case "$PUEUED_PID" in
+  ''|*[!0-9]*) fail "isolated pueued did not publish a numeric PID" ;;
+esac
 
 PROJECT_A="$WORK/a/shared"
 PROJECT_B="$WORK/b/shared"
@@ -407,10 +490,10 @@ GROUP_D="$(toml_value pueue_group "$CONFIG_D")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
-write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/fake_agent.sh" 20
-write_config "$PROJECT_B" "$PROJECT_ID_B" "$GROUP_B" "$REPO_ROOT/tests/support/fake_agent.sh" 20
+write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_B" "$PROJECT_ID_B" "$GROUP_B" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_C" "$PROJECT_ID_C" "$GROUP_C" "$WORK/bin/capture-agent-environment" 20
-write_config "$PROJECT_D" "$PROJECT_ID_D" "$GROUP_D" "$REPO_ROOT/tests/support/fake_agent.sh" 20
+write_config "$PROJECT_D" "$PROJECT_ID_D" "$GROUP_D" "$WORK/bin/fake-agent" 20
 printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
   > "$PROJECT_A/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
@@ -425,6 +508,7 @@ chmod 700 "$XDG_STATE_HOME"
 mkdir -m 700 "$PUEUE_AGENT_STATE_DIR"
 cat > "$PUEUE_AGENT_STATE_DIR/execution-policy.toml" <<EOF
 version = 1
+trusted_path = "$WORK/bin"
 
 [defaults]
 network = "enabled"
@@ -444,18 +528,18 @@ codex = "codex"
 pueue = "pueue"
 
 [projects."$PROJECT_ID_A"]
-custom_agent = "$REPO_ROOT/tests/support/fake_agent.sh"
+custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 
 [projects."$PROJECT_ID_B"]
-custom_agent = "$REPO_ROOT/tests/support/fake_agent.sh"
+custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 
 [projects."$PROJECT_ID_C"]
 custom_agent = "$WORK/bin/capture-agent-environment"
 
 [projects."$PROJECT_ID_D"]
-custom_agent = "$REPO_ROOT/tests/support/fake_agent.sh"
+custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 EOF
 chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
@@ -474,7 +558,7 @@ stop_daemon
 [ ! -f "$PUEUE_AGENT_TEST_AGENT_LOG" ] || fail "healthy monitoring started an agent"
 
 # One default submit creates exactly one durable campaign baseline and one real Pueue task.
-campaign_summary="$(cd "$PROJECT_C" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+campaign_summary="$(cd "$PROJECT_C" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
 campaign_task="$(submission_task_id "$campaign_summary")"
 CAMPAIGN_C="$(sql "SELECT campaign_id FROM campaigns WHERE project_id = '$PROJECT_ID_C' AND state <> 'retired'")"
 [ -n "$CAMPAIGN_C" ] || fail "default submit did not create a live campaign"
@@ -496,13 +580,13 @@ done
 
 # A live campaign rejects both direct submission interfaces before any durable or external write.
 cat > "$WORK/rejected-batch.json" <<EOF
-{"jobs":[{"id":"second","argv":["$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh"]}]}
+{"jobs":[{"id":"second","argv":["/bin/sh","$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh"]}]}
 EOF
 before_submissions="$(sql "SELECT COUNT(*) FROM submissions WHERE project_id = '$PROJECT_ID_C'")"
 before_batches="$(sql "SELECT COUNT(*) FROM batch_requests WHERE project_id = '$PROJECT_ID_C'")"
 before_batch_jobs="$(sql "SELECT COUNT(*) FROM batch_jobs")"
 before_tasks="$(pueue_group_task_count "$GROUP_C")"
-if (cd "$PROJECT_C" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh") \
+if (cd "$PROJECT_C" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh") \
   >"$WORK/rejected-submit.out" 2>"$WORK/rejected-submit.err"; then
   fail "second direct submit was accepted during a live campaign"
 fi
@@ -622,7 +706,7 @@ stop_daemon
 # A real Pueue add followed by a failed response remains unreconciled across restart.
 : > "$WORK/add-uncertain"
 uncertain_before="$(pueue_group_task_count "$GROUP_D")"
-if (cd "$PROJECT_D" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh") \
+if (cd "$PROJECT_D" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh") \
   >"$WORK/uncertain-submit.out" 2>"$WORK/uncertain-submit.err"; then
   fail "uncertain Pueue add unexpectedly returned success"
 fi
@@ -641,7 +725,7 @@ stop_daemon
   || fail "restart re-added an unreconciled Pueue task"
 
 # Callback + reconciliation deduplicate, and a missed callback remains durable while paused.
-submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
 task_ok="$(submission_task_id "$submit_summary")"
 "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B"
 wait_for_task_state "$task_ok" Done
@@ -658,8 +742,9 @@ stop_daemon
 
 "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
 "$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
-submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
 task_missed="$(submission_task_id "$submit_summary")"
+CAMPAIGN_B="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $task_missed")"
 "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
 wait_for_task_state "$task_missed" Done
 start_daemon
@@ -674,6 +759,7 @@ stop_daemon
 # A persistent fatal task log opens one incident and requests exactly one Pueue kill.
 submit_summary="$(cd "$PROJECT_A" && "$PA_BIN" submit -- /bin/sh -c 'sleep 30')"
 task_bad="$(submission_task_id "$submit_summary")"
+CAMPAIGN_A="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $task_bad")"
 wait_for_task_state "$task_bad" Running
 printf 'step=10 FATAL_LOSS detected\n' > "$PROJECT_A/.pueue-agent/logs/$task_bad.log"
 start_daemon
@@ -705,12 +791,17 @@ stop_daemon
 # Agent execution failures enter retry_wait; a later daemon run can retry the same event.
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 900 \
   --metadata '{"state":"Failed","result":"Failed"}' >/dev/null
-if PUEUE_AGENT_TEST_AGENT_MODE=fail "$PA_BIN" daemon --foreground --pueue-config "$WORK/pueue.yml" \
-  > "$WORK/retry-daemon.log" 2>&1; then
-  fail "failed agent execution should fail the daemon cycle"
-fi
-[ "$(sql "SELECT status FROM events WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'")" = "retry_wait" ] \
-  || fail "agent execution failure did not enter retry_wait"
+sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
+     WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'"
+: > "$WORK/retry-daemon.log"
+PUEUE_AGENT_TEST_AGENT_MODE=fail \
+  "$PA_BIN" daemon --foreground --pueue-config "$WORK/pueue.yml" \
+  > "$WORK/retry-daemon.log" 2>&1 &
+DAEMON_PID=$!
+wait_for_sql \
+  "SELECT status FROM events WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'" \
+  "retry_wait" "agent execution failure did not enter retry_wait"
+stop_daemon
 sql "UPDATE events SET not_before = 0 WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'"
 start_daemon
 wait_for_agent_calls "3" "retry event was not recoverable"
@@ -721,9 +812,11 @@ stop_daemon
   || fail "retry should execute the fake agent once after spawn recovery"
 
 # max_agent_runs halts scheduling; resume clears the halt after policy adjustment.
-write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/fake_agent.sh" 3
+write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 3
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 901 \
   --metadata '{"state":"Failed","result":"Failed"}' >/dev/null
+sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
+     WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=901'"
 start_daemon
 for _ in $(seq 100); do
   halted="$(sql "SELECT CASE WHEN halted_reason IS NULL THEN 0 ELSE 1 END FROM projects WHERE project_id = '$PROJECT_ID_A'")"
@@ -735,12 +828,14 @@ stop_daemon
 [ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "3" ] \
   || fail "halted project launched an agent"
 
-write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$REPO_ROOT/tests/support/fake_agent.sh" 20
+write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 20
 "$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_A" >/dev/null
 [ "$(sql "SELECT CASE WHEN halted_reason IS NULL THEN 0 ELSE 1 END FROM projects WHERE project_id = '$PROJECT_ID_A'")" = "0" ] \
   || fail "resume did not clear halted state"
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 902 \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
+sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
+     WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=902'"
 start_daemon
 wait_for_agent_calls "4" "resumed project did not schedule a new event"
 stop_daemon
@@ -756,6 +851,8 @@ stop_daemon
 "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
 "$PA_BIN" event callback --group "$GROUP_B" --task-id 903 \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
+sql "UPDATE events SET campaign_id = '$CAMPAIGN_B'
+     WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_B:task-id=903'"
 restart_key="pueue-callback:v1:group=$GROUP_B:task-id=903"
 sql "UPDATE events SET status = 'claimed', lease_until = 0 WHERE dedup_key = '$restart_key'"
 start_daemon
@@ -777,6 +874,8 @@ mkdir -p "$context_session_store"
 write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "codex" 20 "resume" "$context_session_id"
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 904 \
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
+sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
+     WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=904'"
 start_daemon
 wait_for_codex_call "Codex resume context was not invoked"
 stop_daemon
@@ -802,14 +901,15 @@ grep -qx 'ENV_NAME=CODEX_HOME' "$PUEUE_AGENT_TEST_CODEX_LOG" \
 
 PA_INSTALL_PREFIX="$WORK/install" "$REPO_ROOT/install.sh" >/dev/null
 [ -L "$WORK/install/pueue-agent" ] || fail "install did not create pueue-agent symlink"
-[ "$(readlink "$WORK/install/pueue-agent")" = "$REPO_ROOT/target/release/pueue-agent" ] \
+[ "$(readlink "$WORK/install/pueue-agent")" = "$CARGO_TARGET_DIR/release/pueue-agent" ] \
   || fail "installed symlink does not target the Rust release binary"
 "$WORK/install/pueue-agent" --help | grep -q 'SQLite-backed Pueue agent supervisor' \
   || fail "installed Rust release binary is not executable"
 
 mkdir -p "$WORK/unbuilt-repository/bin"
 cp "$REPO_ROOT/bin/pueue-agent" "$WORK/unbuilt-repository/bin/pueue-agent"
-if launcher_error="$("$WORK/unbuilt-repository/bin/pueue-agent" --help 2>&1)"; then
+if launcher_error="$(CARGO_TARGET_DIR="$WORK/unbuilt-target" \
+  "$WORK/unbuilt-repository/bin/pueue-agent" --help 2>&1)"; then
   fail "development launcher succeeded without a built binary"
 fi
 printf '%s\n' "$launcher_error" | grep -q 'cargo build --manifest-path' \

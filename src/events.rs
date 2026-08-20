@@ -206,9 +206,40 @@ pub(crate) fn callback_kind(metadata: &CallbackMetadata) -> EventKind {
 
 pub(crate) fn result_is_failure(result: &Value) -> bool {
     match result {
-        Value::String(value) => matches!(value.to_ascii_lowercase().as_str(), "failed" | "killed"),
-        Value::Object(object) => object.contains_key("Failed") || object.contains_key("Killed"),
+        Value::String(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "failed" | "failedtospawn" | "killed" | "errored" | "dependencyfailed"
+        ),
+        Value::Object(object) => [
+            "Failed",
+            "FailedToSpawn",
+            "Killed",
+            "Errored",
+            "DependencyFailed",
+        ]
+        .iter()
+        .any(|variant| object.contains_key(*variant)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::result_is_failure;
+    use serde_json::json;
+
+    #[test]
+    fn pueue_terminal_result_classifies_every_official_non_success_variant() {
+        assert!(!result_is_failure(&json!("Success")));
+        for result in [
+            json!({"Failed": 17}),
+            json!({"FailedToSpawn": "missing executable"}),
+            json!("Killed"),
+            json!("Errored"),
+            json!("DependencyFailed"),
+        ] {
+            assert!(result_is_failure(&result), "{result}");
+        }
     }
 }
 

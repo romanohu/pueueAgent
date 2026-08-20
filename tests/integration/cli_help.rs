@@ -1570,29 +1570,55 @@ impl CustomPueueProfileHarness {
         fs::create_dir_all(&trusted_dir).unwrap();
         let pueue = trusted_dir.join("pueue");
         let pueue_calls = temp.path().join("pueue-calls");
+        let pueue_state = temp.path().join("pueue-state");
         let source = temp.path().join("custom-profile-pueue.rs");
-        fs::write(
-            &source,
-            format!(r#"use std::{{fs::OpenOptions, io::Write}};
-fn main() {{
+        let source_template = r#"use std::{fs, fs::OpenOptions, io::Write};
+fn current_count() -> usize {
+    fs::read_to_string(__STATE__)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let operation = args
         .iter()
         .find(|argument| matches!(argument.as_str(), "status" | "add" | "group" | "kill" | "remove"))
         .map(String::as_str)
         .unwrap_or("");
-    let config = std::fs::read_to_string("/dev/fd/9").unwrap_or_default();
-    writeln!(OpenOptions::new().create(true).append(true).open({:?}).unwrap(), "{{}}:{{}}", operation, config.trim()) .unwrap();
-    if operation == "add" {{
-        println!("701");
-    }}
-    if operation == "status" {{
-        std::io::stdout().write_all(b"\x7b\"tasks\":\x7b\x7d\x7d\n").unwrap();
-    }}
-    if operation == "group" && args.iter().any(|argument| argument == "-j") {{
+    let config = fs::read_to_string("/dev/fd/9").unwrap_or_default();
+    writeln!(OpenOptions::new().create(true).append(true).open(__CALLS__).unwrap(), "{}:{}", operation, config.trim()).unwrap();
+    if operation == "add" {
+        let count = current_count() + 1;
+        fs::write(__STATE__, count.to_string()).unwrap();
+        println!("{}", 700 + count);
+    }
+    if operation == "status" {
+        let count = current_count();
+        if count == 0 {
+            std::io::stdout().write_all(b"\x7b\"tasks\":\x7b\x7d\x7d\n").unwrap();
+        } else {
+            let task_id = 700 + count;
+            println!(
+                "{{\"tasks\":{{\"{}\":{{\"id\":{},\"group\":{:?},\"command\":\"/usr/bin/true\",\"status\":{{\"Queued\":{{\"enqueued_at\":\"{}\"}}}}}}}}}}",
+                task_id,
+                task_id,
+                __GROUP__,
+                task_id,
+            );
+        }
+    }
+    if operation == "group" && args.iter().any(|argument| argument == "-j") {
         std::io::stdout().write_all(b"\x7b\x7d\n").unwrap();
-    }}
-}}"#, pueue_calls),
+    }
+}"#;
+        let source_body = source_template
+            .replace("__STATE__", &format!("{pueue_state:?}"))
+            .replace("__CALLS__", &format!("{pueue_calls:?}"))
+            .replace("__GROUP__", &format!("{:?}", project_config.pueue_group));
+        fs::write(
+            &source,
+            source_body,
         )
         .unwrap();
         let output = Command::new("rustc")

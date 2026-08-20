@@ -44,7 +44,7 @@ pub struct AgentRunnerConfig {
 impl AgentRunnerConfig {
     pub fn production() -> Self {
         Self {
-            codex_capabilities: CodexCapabilities::none(),
+            codex_capabilities: CodexCapabilities::all(),
         }
     }
 
@@ -1524,6 +1524,14 @@ fn deadline_scoped_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_runner_enables_the_forced_codex_policy_surface() {
+        assert_eq!(
+            AgentRunnerConfig::production().codex_capabilities,
+            CodexCapabilities::all()
+        );
+    }
 
     #[test]
     #[ignore = "internal agent-handle subprocess entry"]

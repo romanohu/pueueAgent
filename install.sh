@@ -2,6 +2,11 @@
 set -eu
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${PA_INSTALL_PREFIX:-$HOME/.local/bin}"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+case "$TARGET_DIR" in
+  /*) : ;;
+  *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;;
+esac
 
 command -v cargo >/dev/null 2>&1 || {
   echo "error: Rust toolchain (cargo) is required" >&2
@@ -12,7 +17,7 @@ command -v pueue >/dev/null 2>&1 || echo "warning: pueue was not found; it is re
 cargo build --locked --release --manifest-path "$REPO_ROOT/Cargo.toml"
 
 mkdir -p "$PREFIX"
-ln -sf "$REPO_ROOT/target/release/pueue-agent" "$PREFIX/pueue-agent"
+ln -sf "$TARGET_DIR/release/pueue-agent" "$PREFIX/pueue-agent"
 echo "installed: $PREFIX/pueue-agent"
 case ":$PATH:" in
   *":$PREFIX:"*) : ;;

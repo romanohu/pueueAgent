@@ -348,6 +348,29 @@ async fn campaign_experiment_terminal_failure_is_projected_idempotently() {
 }
 
 #[tokio::test]
+async fn campaign_experiment_failed_to_spawn_is_projected_as_failure() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let fake = FakePueue::with_tasks(vec![terminal_task(
+        41,
+        "100",
+        json!({"FailedToSpawn": "missing executable"}),
+    )]);
+
+    Reconciler::new(&harness.db, fake)
+        .run_once_at(200)
+        .await
+        .unwrap();
+
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Failed);
+    assert_eq!(experiment.failure_code.as_deref(), Some("pueue_result_failed"));
+}
+
+#[tokio::test]
 async fn campaign_task_id_reuse_quarantines_the_managed_identity_without_consuming_budget() {
     let harness = Harness::new();
     let experiment_id = harness.accepted_campaign_experiment(41);

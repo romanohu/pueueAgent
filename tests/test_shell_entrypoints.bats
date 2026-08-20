@@ -28,7 +28,7 @@ setup() {
   cp "$REPO_ROOT/bin/pueue-agent" "$fake_repo/bin/pueue-agent"
 
   output_file="$BATS_TEST_TMPDIR/launcher-output"
-  if "$fake_repo/bin/pueue-agent" --help >"$output_file" 2>&1; then
+  if env -u CARGO_TARGET_DIR "$fake_repo/bin/pueue-agent" --help >"$output_file" 2>&1; then
     status=0
   else
     status=$?
@@ -49,7 +49,8 @@ setup() {
   chmod +x "$fake_repo/target/debug/pueue-agent"
 
   output_file="$BATS_TEST_TMPDIR/launcher-output"
-  if "$fake_repo/bin/pueue-agent" submit -- python train.py --name "a b; echo no" \
+  if env -u CARGO_TARGET_DIR \
+    "$fake_repo/bin/pueue-agent" submit -- python train.py --name "a b; echo no" \
     >"$output_file" 2>&1; then
     status=0
   else
@@ -61,6 +62,22 @@ setup() {
 
   [ "$status" -eq 0 ]
   diff -u "$expected_file" "$output_file"
+}
+
+@test "development launcher honors an absolute Cargo target directory" {
+  fake_repo="$BATS_TEST_TMPDIR/repository"
+  cargo_target="$BATS_TEST_TMPDIR/cargo-target"
+  mkdir -p "$fake_repo/bin" "$cargo_target/debug"
+  cp "$REPO_ROOT/bin/pueue-agent" "$fake_repo/bin/pueue-agent"
+  printf '%s\n' '#!/usr/bin/env bash' "printf '<%s>\\n' \"\$@\"" \
+    > "$cargo_target/debug/pueue-agent"
+  chmod +x "$cargo_target/debug/pueue-agent"
+
+  run env CARGO_TARGET_DIR="$cargo_target" \
+    "$fake_repo/bin/pueue-agent" status --json
+
+  [ "$status" -eq 0 ]
+  [ "$output" = $'<status>\n<--json>' ]
 }
 
 @test "fake agent records literal argv boundaries and allowlisted environment names only" {
@@ -156,7 +173,7 @@ setup() {
     > "$fake_bin/cargo"
   chmod +x "$fake_bin/cargo"
 
-  if env TEST_CARGO_LOG="$cargo_log" PA_INSTALL_PREFIX="$prefix" \
+  if env -u CARGO_TARGET_DIR TEST_CARGO_LOG="$cargo_log" PA_INSTALL_PREFIX="$prefix" \
     PATH="$fake_bin:/usr/bin:/bin" bash "$REPO_ROOT/install.sh"; then
     status=0
   else
@@ -167,4 +184,20 @@ setup() {
   [ -L "$prefix/pueue-agent" ]
   [ "$(readlink "$prefix/pueue-agent")" = "$REPO_ROOT/target/release/pueue-agent" ]
   [ "$(cat "$cargo_log")" = "build --locked --release --manifest-path $REPO_ROOT/Cargo.toml" ]
+}
+
+@test "installer honors an absolute Cargo target directory" {
+  fake_bin="$BATS_TEST_TMPDIR/bin"
+  prefix="$BATS_TEST_TMPDIR/install"
+  cargo_target="$BATS_TEST_TMPDIR/cargo-target"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/cargo"
+  chmod +x "$fake_bin/cargo"
+
+  run env CARGO_TARGET_DIR="$cargo_target" PA_INSTALL_PREFIX="$prefix" \
+    PATH="$fake_bin:/usr/bin:/bin" bash "$REPO_ROOT/install.sh"
+
+  [ "$status" -eq 0 ]
+  [ -L "$prefix/pueue-agent" ]
+  [ "$(readlink "$prefix/pueue-agent")" = "$cargo_target/release/pueue-agent" ]
 }
