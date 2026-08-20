@@ -8,7 +8,8 @@ use crate::{
         CampaignRepository, Db, ExperimentRepository, ManagedSubmissionIntent,
         ProjectRepository, ProposalRepository, StartCampaignRequest, SubmissionRepository,
     },
-    execution_policy::CampaignLimits,
+    environment::ProjectAdmissionLock,
+    execution_policy::{CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
     models::{
         Campaign, Experiment, ExperimentStatus, Project, Proposal, ProposalKind, Submission,
     },
@@ -18,6 +19,7 @@ use crate::{
     },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
+    reconcile::{canonical_command_display, managed_task_run_signature},
     state::ObjectiveSnapshot,
     AppError,
 };
@@ -28,6 +30,7 @@ pub const MAX_INSPECTION_LIMIT: usize = 100;
 const BASELINE_HYPOTHESIS: &str = "Establish the initial campaign baseline";
 const ADD_UNKNOWN_REASON: &str = "pueue_add_unknown";
 const ADD_INTERRUPTED_REASON: &str = "pueue_add_interrupted";
+const ADD_IDENTITY_REASON: &str = "pueue_identity_unresolved";
 
 pub fn render_status_for_project(
     db: &Db,
@@ -157,11 +160,27 @@ pub struct CampaignCoordinator<'a, P: PueueApi + ?Sized> {
     db: &'a Db,
     pueue: &'a P,
     limits: CampaignLimits,
+    root_anchor: Option<ProjectRootAnchor>,
+}
+
+struct CampaignAdmission {
+    verified_root: VerifiedProjectRoot,
+    _lock: ProjectAdmissionLock,
 }
 
 impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     pub fn new(db: &'a Db, pueue: &'a P, limits: CampaignLimits) -> Self {
-        Self { db, pueue, limits }
+        Self {
+            db,
+            pueue,
+            limits,
+            root_anchor: None,
+        }
+    }
+
+    pub fn with_root_anchor(mut self, root_anchor: ProjectRootAnchor) -> Self {
+        self.root_anchor = Some(root_anchor);
+        self
     }
 
     pub async fn start_baseline(
@@ -173,6 +192,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         origin_agent_run_id: Option<i64>,
         now: i64,
     ) -> Result<Submission, AppError> {
+        let admission = self.acquire_admission(project)?;
         let baseline = proposals::validate_initial_baseline(
             ProposalInput {
                 kind: ProposalKind::Experiment,
@@ -186,7 +206,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         )?;
         let add_args = pueue_add_args(
             &project.pueue_group,
-            &project.root_path,
+            &admission.verified_root.anchor.canonical_path,
             baseline.argv(),
         );
         validate_add_argv(&add_args)?;
@@ -211,7 +231,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             },
             &self.limits,
         )?;
-        self.submit_accepted_intent(&intent, project, now).await
+        self.submit_accepted_intent_inner(&intent, project, now, Some(admission))
+            .await
     }
 
     pub async fn submit_accepted_intent(
@@ -219,6 +240,17 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         intent: &ManagedSubmissionIntent,
         project: &Project,
         now: i64,
+    ) -> Result<Submission, AppError> {
+        self.submit_accepted_intent_inner(intent, project, now, None)
+            .await
+    }
+
+    async fn submit_accepted_intent_inner(
+        &self,
+        intent: &ManagedSubmissionIntent,
+        project: &Project,
+        now: i64,
+        admission: Option<CampaignAdmission>,
     ) -> Result<Submission, AppError> {
         let experiments = ExperimentRepository::new(self.db);
         let current = experiments
@@ -255,10 +287,20 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &durable_submission,
             &durable_project,
         )?;
+        let admission = match admission {
+            Some(admission) => admission,
+            None => self.acquire_admission(&durable_project)?,
+        };
+        if admission.verified_root.anchor.canonical_path != durable_project.root_path {
+            return Err(AppError::Validation {
+                field: "campaign.project_root",
+                message: "must match the startup-pinned project root",
+            });
+        }
         let add_args = pueue_add_args(
             &durable_project.pueue_group,
             &explicit_working_directory(
-                &durable_project.root_path,
+                &admission.verified_root.anchor.canonical_path,
                 &durable_proposal.working_directory,
             ),
             &durable_submission.argv,
@@ -268,6 +310,11 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         match current.status {
             ExperimentStatus::Reserved => {
                 experiments.mark_submitting(&current.experiment_id, now)?;
+                admission
+                    .verified_root
+                    .anchor
+                    .verify_identity()
+                    .map_err(AppError::from)?;
             }
             ExperimentStatus::Submitting => {
                 experiments.mark_unreconciled(
@@ -297,11 +344,44 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 return Err(error);
             }
         };
-        let task_signature = provisional_task_signature(
-            &durable_project.pueue_group,
-            task_id,
-            &durable_submission.submission_id,
-        );
+        let tasks = match self.pueue.status_json().await {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                experiments.mark_unreconciled(
+                    &current.experiment_id,
+                    ADD_IDENTITY_REASON,
+                    now,
+                )?;
+                return Err(error);
+            }
+        };
+        let expected_command = canonical_command_display(&durable_submission.argv);
+        let mut id_matches = tasks.iter().filter(|task| task.id == task_id);
+        let task = id_matches.next();
+        if task.is_none() || id_matches.next().is_some() {
+            experiments.mark_unreconciled(
+                &current.experiment_id,
+                ADD_IDENTITY_REASON,
+                now,
+            )?;
+            return Err(reconciliation_required());
+        }
+        let task = task.expect("checked one Pueue task ID match");
+        let task_signature = if task.group == durable_project.pueue_group
+            && task.command == expected_command
+        {
+            managed_task_run_signature(task)
+        } else {
+            None
+        };
+        let Some(task_signature) = task_signature else {
+            experiments.mark_unreconciled(
+                &current.experiment_id,
+                ADD_IDENTITY_REASON,
+                now,
+            )?;
+            return Err(reconciliation_required());
+        };
         if let Err(error) =
             experiments.mark_accepted(&current.experiment_id, task_id, &task_signature, now)
         {
@@ -313,6 +393,30 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             .ok_or(AppError::Runtime {
                 operation: "read accepted campaign submission",
             })
+    }
+
+    fn acquire_admission(&self, project: &Project) -> Result<CampaignAdmission, AppError> {
+        let root_anchor = match self.root_anchor.as_ref() {
+            Some(anchor) => anchor.clone(),
+            None => ProjectRootAnchor::resolve(&project.root_path).map_err(AppError::from)?,
+        };
+        if root_anchor.canonical_path != project.root_path {
+            return Err(AppError::Validation {
+                field: "campaign.project_root",
+                message: "must match the startup-pinned project root",
+            });
+        }
+        let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+        let project_lock = ProjectAdmissionLock::try_acquire(&verified_root)
+            .map_err(AppError::from)?
+            .ok_or(AppError::Runtime {
+                operation: "acquire project submission admission lock",
+            })?;
+        let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+        Ok(CampaignAdmission {
+            verified_root,
+            _lock: project_lock,
+        })
     }
 }
 
@@ -369,10 +473,6 @@ fn explicit_working_directory(project_root: &Path, relative: &str) -> std::path:
     } else {
         project_root.join(relative)
     }
-}
-
-fn provisional_task_signature(group: &str, task_id: i64, submission_id: &str) -> String {
-    format!("provisional-submit:v1:group={group}:task-id={task_id}:intent={submission_id}")
 }
 
 fn reconciliation_required() -> AppError {

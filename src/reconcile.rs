@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::SystemTime};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -12,8 +12,8 @@ use crate::{
     events::{callback_dedup_key, result_is_failure},
     incidents::IncidentStore,
     models::{
-        EventKind, ExperimentTerminalOutcome, NewEvent, NewTaskObservation, Submission,
-        SubmissionStatus,
+        EventKind, Experiment, ExperimentTerminalOutcome, NewEvent, NewTaskObservation,
+        Submission, SubmissionStatus,
     },
     pueue::{PueueApi, PueueTask},
     termination::{
@@ -116,12 +116,23 @@ where
                     | Some(AutoKillConfirmation::AlreadyConfirmed) => EventKind::AutoKilled,
                     Some(AutoKillConfirmation::NotSent) | None => terminal_event_kind(task),
                 };
+                let experiment = resolve_terminal_experiment(
+                    self.db,
+                    &project.project_id,
+                    task,
+                    &tasks,
+                    now,
+                )?;
+                if let Some(experiment) = experiment.as_ref() {
+                    project_terminal_experiment(self.db, experiment, task, now)?;
+                }
                 let event = materialize_terminal_event(
                     self.db,
                     project.project_id.as_str(),
                     task,
                     &signature,
                     event_kind,
+                    experiment.as_ref(),
                     now,
                 )?;
                 match event_kind {
@@ -133,7 +144,6 @@ where
                     ),
                 }
                 let _ = event;
-                project_terminal_experiment(self.db, &project.project_id, task, &tasks, now)?;
                 let _ = IncidentStore::new(self.db).observe(Observation::task_terminal(
                     project.project_id.as_str(),
                     task_incident_key(task),
@@ -147,13 +157,13 @@ where
     }
 }
 
-fn project_terminal_experiment(
+fn resolve_terminal_experiment(
     db: &Db,
     project_id: &str,
     task: &PueueTask,
     tasks: &[PueueTask],
     now: i64,
-) -> Result<(), AppError> {
+) -> Result<Option<Experiment>, AppError> {
     let connection = db.connect()?;
     let mut statement = connection
         .prepare(
@@ -183,28 +193,67 @@ fn project_terminal_experiment(
     drop(connection);
 
     let submissions = SubmissionRepository::new(db);
+    let experiments = ExperimentRepository::new(db);
+    if tasks.iter().filter(|candidate| candidate.id == task.id).count() != 1 {
+        for submission_id in submission_ids {
+            if let Some(experiment) = experiments.find_by_submission_id(&submission_id)? {
+                experiments.quarantine_accepted_identity(
+                    &experiment.experiment_id,
+                    "pueue_task_identity_ambiguous",
+                    now,
+                )?;
+            }
+        }
+        return Ok(None);
+    }
     let mut matches = Vec::new();
     for submission_id in submission_ids {
         let Some(submission) = submissions.find_by_id(&submission_id)? else {
             continue;
         };
-        if accepted_submission_matches_task(&submission, task)
-            && tasks
-                .iter()
-                .filter(|candidate| accepted_submission_matches_task(&submission, candidate))
-                .count()
-                == 1
-        {
-            matches.push(submission);
+        let matching_tasks = tasks
+            .iter()
+            .filter(|candidate| accepted_submission_matches_task(&submission, candidate))
+            .collect::<Vec<_>>();
+        if matching_tasks.len() == 1 {
+            if accepted_submission_matches_task(&submission, task) {
+                matches.push(submission);
+            }
+            continue;
+        }
+        if let Some(experiment) = experiments.find_by_submission_id(&submission.submission_id)? {
+            experiments.quarantine_accepted_identity(
+                &experiment.experiment_id,
+                "pueue_task_identity_mismatch",
+                now,
+            )?;
         }
     }
     if matches.len() != 1 {
-        return Ok(());
+        for submission in matches {
+            if let Some(experiment) = experiments.find_by_submission_id(&submission.submission_id)? {
+                experiments.quarantine_accepted_identity(
+                    &experiment.experiment_id,
+                    "pueue_task_identity_ambiguous",
+                    now,
+                )?;
+            }
+        }
+        return Ok(None);
     }
-    let experiments = ExperimentRepository::new(db);
     let Some(experiment) = experiments.find_by_submission_id(&matches[0].submission_id)? else {
-        return Ok(());
+        return Ok(None);
     };
+    Ok(Some(experiment))
+}
+
+fn project_terminal_experiment(
+    db: &Db,
+    experiment: &Experiment,
+    task: &PueueTask,
+    now: i64,
+) -> Result<(), AppError> {
+    let experiments = ExperimentRepository::new(db);
     if task.state.eq_ignore_ascii_case("killed") {
         experiments.project_terminal_submission(
             &experiment.experiment_id,
@@ -218,7 +267,7 @@ fn project_terminal_experiment(
         } else {
             "pueue_result_failed"
         };
-        let failure_fingerprint = format!("{:x}", Sha256::digest(task_signature(task)));
+        let failure_fingerprint = failure_fingerprint(task, failure_code);
         experiments.project_terminal_submission(
             &experiment.experiment_id,
             task.id,
@@ -246,12 +295,52 @@ fn accepted_submission_matches_task(submission: &Submission, task: &PueueTask) -
     let Some(stored_signature) = submission.task_signature.as_deref() else {
         return false;
     };
-    stored_signature == task_signature(task)
-        || stored_signature
-            == format!(
-                "provisional-submit:v1:group={}:task-id={}:intent={}",
-                task.group, task.id, submission.submission_id
-            )
+    managed_task_run_signature(task).as_deref() == Some(stored_signature)
+}
+
+pub fn managed_task_run_signature(task: &PueueTask) -> Option<TaskSignature> {
+    let enqueued_at = task.enqueued_at.as_deref()?;
+    parse_timestamp(enqueued_at)?;
+    let identity = json!({
+        "group": task.group,
+        "id": task.id,
+        "enqueued_at": enqueued_at,
+        "command_sha256": format!("{:x}", Sha256::digest(task.command.as_bytes())),
+    });
+    Some(format!(
+        "pueue-managed-run:v1:{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&identity).expect("managed task identity JSON is serializable")
+        )
+    ))
+}
+
+fn failure_fingerprint(task: &PueueTask, failure_code: &str) -> String {
+    let cause = json!({
+        "version": 1,
+        "failure_code": failure_code,
+        "evidence": normalized_failure_evidence(task.result.as_ref()),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&cause).expect("failure cause JSON is serializable")
+        )
+    )
+}
+
+fn normalized_failure_evidence(result: Option<&Value>) -> Value {
+    match result {
+        Some(Value::Object(object)) => object
+            .get("Failed")
+            .and_then(Value::as_i64)
+            .map(|exit_code| json!({"class": "exit_code", "exit_code": exit_code}))
+            .unwrap_or_else(|| json!({"class": "unclassified"})),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("failed") => {
+            json!({"class": "failed"})
+        }
+        _ => json!({"class": "unclassified"}),
+    }
 }
 
 pub fn task_signature(task: &PueueTask) -> TaskSignature {
@@ -305,6 +394,7 @@ fn materialize_terminal_event(
     task: &PueueTask,
     signature: &str,
     kind: EventKind,
+    experiment: Option<&Experiment>,
     now: i64,
 ) -> Result<crate::models::Event, AppError> {
     let result = task
@@ -318,7 +408,7 @@ fn materialize_terminal_event(
         })?
         .unwrap_or_else(|| "null".to_owned());
     let dedup_key = format!("pueue-terminal:v1:{signature}:result={result}");
-    let event = NewEvent::new(
+    let mut event = NewEvent::new(
         project_id,
         kind,
         dedup_key,
@@ -337,9 +427,30 @@ fn materialize_terminal_event(
         now,
         now,
     );
+    if let Some(experiment) = experiment {
+        event = event.with_campaign_lineage(
+            experiment.campaign_id.clone(),
+            Some(experiment.experiment_id.clone()),
+        );
+    }
     let repository = EventRepository::new(db);
 
     if let Some(existing) = repository.find_by_dedup_key(project_id, &event.dedup_key)? {
+        if event.campaign_id.is_some()
+            && (existing.campaign_id != event.campaign_id
+                || existing.experiment_id != event.experiment_id)
+        {
+            if existing.campaign_id.is_some() || existing.experiment_id.is_some() {
+                return Err(AppError::Validation {
+                    field: "event.lineage",
+                    message: "conflicts with the resolved managed experiment lineage",
+                });
+            }
+            if let Some(upgraded) = repository.replace_pending(existing.event_id, &event)? {
+                return Ok(upgraded);
+            }
+            return repository.replace_callback_with_terminal(existing.event_id, &event);
+        }
         if let Some(callback) =
             repository.find_by_dedup_key(project_id, &callback_dedup_key(&task.group, task.id))?
         {
@@ -427,7 +538,7 @@ fn submission_matches_task(submission: &Submission, task: &PueueTask) -> bool {
     }
 }
 
-fn canonical_command_display(argv: &[String]) -> String {
+pub(crate) fn canonical_command_display(argv: &[String]) -> String {
     argv.iter()
         .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()

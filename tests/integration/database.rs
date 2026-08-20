@@ -9,10 +9,11 @@ use std::{
 use pueue_agent::{
     batches::BatchJobResult,
     db::{
-        inferred_pre_binding_policy_code, AgentRunRepository, BatchRepository, CampaignRepository,
-        Db, EventRepository, ExperimentRepository, IncidentRepository, InterventionRepository,
-        ProjectRepository, RunLineageRepository, StartCampaignRequest, SubmissionRepository,
-        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+        inferred_pre_binding_policy_code, AgentDecisionReservation, AgentRunRepository,
+        BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        IncidentRepository, InterventionRepository, ProjectRepository, RunLineageRepository,
+        ProposalAcceptance, StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
+        TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
@@ -111,12 +112,30 @@ impl CampaignDbHarness {
         argv: &[&str],
         objective_digest: &str,
     ) -> ValidatedProposal {
+        Self::proposal_in_directory_for_objective(
+            kind,
+            hypothesis,
+            source_experiment_id,
+            argv,
+            ".",
+            objective_digest,
+        )
+    }
+
+    fn proposal_in_directory_for_objective(
+        kind: ProposalKind,
+        hypothesis: &str,
+        source_experiment_id: Option<&str>,
+        argv: &[&str],
+        working_directory: &str,
+        objective_digest: &str,
+    ) -> ValidatedProposal {
         let input = ProposalInput {
             kind,
             hypothesis: hypothesis.to_owned(),
             source_experiment_id: source_experiment_id.map(str::to_owned),
             argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
-            working_directory: ".".to_owned(),
+            working_directory: working_directory.to_owned(),
             expected_evidence: vec!["validation loss".to_owned()],
         };
         if source_experiment_id.is_none() {
@@ -182,7 +201,7 @@ impl CampaignDbHarness {
         proposal: &ValidatedProposal,
         limits: &CampaignLimits,
         now: i64,
-    ) -> Result<Option<pueue_agent::db::ManagedSubmissionIntent>, AppError> {
+    ) -> Result<ProposalAcceptance, AppError> {
         CampaignRepository::new(&self.test.db).accept_proposal(
             Self::CAMPAIGN_ID,
             proposal_id,
@@ -1133,14 +1152,14 @@ fn open_v10_operator_log_fixture() -> (TempDir, PathBuf) {
 }
 
 #[test]
-fn campaign_schema_v16_installs_exact_tables_constraints_indexes_and_foreign_keys() {
+fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_keys() {
     let test = TestDatabase::new();
     let connection = test.db.connect().unwrap();
 
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
 
     for (table, expected_sql, expected_columns) in [
         (
@@ -1295,6 +1314,22 @@ fn campaign_schema_v16_installs_exact_tables_constraints_indexes_and_foreign_key
             ),
         ])
     );
+    assert_eq!(
+        table_foreign_keys(&connection, "events"),
+        expected_foreign_keys(&[
+            ("projects", "project_id", "project_id", "CASCADE"),
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            (
+                "experiments",
+                "experiment_id",
+                "experiment_id",
+                "SET NULL",
+            ),
+        ])
+    );
+    let event_columns = table_columns(&connection, "events");
+    assert!(event_columns.contains(&("campaign_id".to_owned(), "TEXT".to_owned(), 0, 0)));
+    assert!(event_columns.contains(&("experiment_id".to_owned(), "TEXT".to_owned(), 0, 0)));
 
     for (name, sql) in [
         (
@@ -1320,6 +1355,10 @@ fn campaign_schema_v16_installs_exact_tables_constraints_indexes_and_foreign_key
         (
             "budget_reservations_campaign_dimension_window_idx",
             "CREATE INDEX budget_reservations_campaign_dimension_window_idx ON budget_reservations(campaign_id, dimension, window_started_at, window_ends_at, reservation_id)",
+        ),
+        (
+            "events_campaign_status_not_before_idx",
+            "CREATE INDEX events_campaign_status_not_before_idx ON events(campaign_id, status, not_before, event_id)",
         ),
     ] {
         let actual_sql: String = connection
@@ -1539,7 +1578,8 @@ fn campaign_atomic_pending_code_change_does_not_consume_an_accepted_cycle_slot()
         Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
         &["python", "train.py", "--implementation", "v2"],
     );
-    assert!(harness
+    assert!(matches!(
+        harness
         .accept(
             "proposal-code-pending",
             "experiment-code-pending",
@@ -1548,8 +1588,9 @@ fn campaign_atomic_pending_code_change_does_not_consume_an_accepted_cycle_slot()
             &CampaignLimits::default(),
             120,
         )
-        .unwrap()
-        .is_none());
+        .unwrap(),
+        ProposalAcceptance::PendingCodeChange
+    ));
     let code_change_reservations: i64 = harness
         .test
         .db
@@ -1581,6 +1622,7 @@ fn campaign_atomic_pending_code_change_does_not_consume_an_accepted_cycle_slot()
             121,
         )
         .unwrap()
+        .accepted()
         .unwrap();
 
     assert_eq!(accepted.proposal.status, ProposalStatus::Accepted);
@@ -1615,6 +1657,7 @@ fn campaign_atomic_parallel_limit_one_acceptance_creates_one_experiment() {
             120,
         )
         .unwrap()
+        .accepted()
         .unwrap();
     let experiments = ExperimentRepository::new(&harness.test.db);
     experiments
@@ -1700,7 +1743,8 @@ fn rolling_budget_reopens_at_exact_24_hour_boundary() {
         &["python", "train.py", "--lr", "0.01"],
     );
 
-    assert!(harness
+    assert!(matches!(
+        harness
         .accept(
             "proposal-before-boundary",
             "experiment-before-boundary",
@@ -1709,7 +1753,15 @@ fn rolling_budget_reopens_at_exact_24_hour_boundary() {
             &limits,
             100 + DAY - 1,
         )
-        .is_err());
+        .unwrap(),
+        ProposalAcceptance::BudgetWaiting {
+            next_eligible_at: 86_500
+        }
+    ));
+    assert!(CampaignRepository::new(&harness.test.db)
+        .wake_eligible_campaigns(100 + DAY)
+        .unwrap()
+        .contains(&CampaignDbHarness::CAMPAIGN_ID.to_owned()));
     let accepted = harness
         .accept(
             "proposal-at-boundary",
@@ -1720,8 +1772,48 @@ fn rolling_budget_reopens_at_exact_24_hour_boundary() {
             100 + DAY,
         )
         .unwrap()
+        .accepted()
         .unwrap();
     assert_eq!(accepted.experiment.experiment_id, "experiment-at-boundary");
+}
+
+#[test]
+fn positive_experiment_budget_exhaustion_enters_a_finite_wait_state() {
+    const DAY: i64 = 24 * 60 * 60;
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_new_experiments_per_24h = 1;
+    harness.start(&limits, 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Wait for the next rolling experiment slot",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--lr", "0.01"],
+    );
+
+    let _ = harness.accept(
+        "proposal-wait",
+        "experiment-wait",
+        "submission-wait",
+        &proposal,
+        &limits,
+        100 + DAY - 1,
+    );
+
+    let campaign = CampaignRepository::new(&harness.test.db)
+        .find_by_id(CampaignDbHarness::CAMPAIGN_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.state, CampaignState::BudgetWaiting);
+    assert_eq!(campaign.next_eligible_at, Some(100 + DAY));
+    assert_eq!(
+        campaign.state_reason.as_deref(),
+        Some("experiment_budget_exhausted")
+    );
+    assert_eq!(harness.count("proposals"), 1);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("submissions"), 1);
 }
 
 #[test]
@@ -1745,6 +1837,7 @@ fn campaign_atomic_duplicate_digest_returns_existing_intent_without_new_rows() {
             120,
         )
         .unwrap()
+        .accepted()
         .unwrap();
     let duplicate = harness
         .accept(
@@ -1756,6 +1849,7 @@ fn campaign_atomic_duplicate_digest_returns_existing_intent_without_new_rows() {
             121,
         )
         .unwrap()
+        .accepted()
         .unwrap();
 
     assert_eq!(duplicate.proposal.proposal_id, first.proposal.proposal_id);
@@ -1861,6 +1955,99 @@ fn campaign_atomic_campaign_state_is_revalidated_before_proposal_writes() {
     assert_eq!(harness.count("experiments"), 1);
     assert_eq!(harness.count("budget_reservations"), 1);
     assert_eq!(harness.count("submissions"), 1);
+}
+
+#[test]
+fn campaign_agent_decision_never_reuses_a_reservation_while_paused() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let repository = CampaignRepository::new(&harness.test.db);
+    assert!(matches!(
+        repository
+            .reserve_agent_decision(
+                CampaignDbHarness::CAMPAIGN_ID,
+                "existing-decision",
+                &CampaignLimits::default(),
+                101,
+            )
+            .unwrap(),
+        AgentDecisionReservation::Reserved(_)
+    ));
+    repository
+        .pause(CampaignDbHarness::PROJECT_ID, 102)
+        .unwrap();
+
+    let existing = repository
+        .reserve_agent_decision(
+            CampaignDbHarness::CAMPAIGN_ID,
+            "existing-decision",
+            &CampaignLimits::default(),
+            103,
+        )
+        .unwrap();
+    let unique = repository
+        .reserve_agent_decision(
+            CampaignDbHarness::CAMPAIGN_ID,
+            "unique-decision",
+            &CampaignLimits::default(),
+            103,
+        )
+        .unwrap();
+
+    assert!(!matches!(existing, AgentDecisionReservation::Reserved(_)));
+    assert!(!matches!(unique, AgentDecisionReservation::Reserved(_)));
+    assert_eq!(
+        harness
+            .test
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND dimension = 'agent_run'",
+                [CampaignDbHarness::CAMPAIGN_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn reserved_submission_cannot_begin_after_campaign_or_project_authority_is_lost() {
+    let campaign_paused = CampaignDbHarness::new();
+    campaign_paused.start(&CampaignLimits::default(), 100);
+    CampaignRepository::new(&campaign_paused.test.db)
+        .pause(CampaignDbHarness::PROJECT_ID, 101)
+        .unwrap();
+    assert!(ExperimentRepository::new(&campaign_paused.test.db)
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 102)
+        .is_err());
+    assert_eq!(
+        ExperimentRepository::new(&campaign_paused.test.db)
+            .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
+    );
+
+    let project_paused = CampaignDbHarness::new();
+    project_paused.start(&CampaignLimits::default(), 100);
+    ProjectRepository::new(&project_paused.test.db)
+        .pause(CampaignDbHarness::PROJECT_ID, 101)
+        .unwrap();
+    assert!(ExperimentRepository::new(&project_paused.test.db)
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 102)
+        .is_err());
+    assert_eq!(
+        ExperimentRepository::new(&project_paused.test.db)
+            .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
+    );
 }
 
 #[test]
@@ -2027,6 +2214,7 @@ fn campaign_atomic_same_spec_retry_limit_is_finite() {
             120,
         )
         .unwrap()
+        .accepted()
         .unwrap();
     let experiments = ExperimentRepository::new(&harness.test.db);
     experiments
@@ -2072,6 +2260,39 @@ fn campaign_atomic_same_spec_retry_limit_is_finite() {
 }
 
 #[test]
+fn same_argv_in_a_different_working_directory_is_a_distinct_specification() {
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_same_spec_retries = 0;
+    harness.start(&limits, 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal_in_directory_for_objective(
+        ProposalKind::Experiment,
+        "Run the same command in a distinct normalized directory",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py"],
+        "variant",
+        "objective-digest",
+    );
+
+    let accepted = harness
+        .accept(
+            "proposal-directory",
+            "experiment-directory",
+            "submission-directory",
+            &proposal,
+            &limits,
+            120,
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+
+    assert_eq!(accepted.proposal.working_directory, "variant");
+    assert_eq!(accepted.experiment.attempt, 0);
+}
+
+#[test]
 fn campaign_atomic_repair_limit_uses_trusted_source_fingerprint() {
     let harness = CampaignDbHarness::new();
     let mut limits = CampaignLimits::default();
@@ -2101,6 +2322,7 @@ fn campaign_atomic_repair_limit_uses_trusted_source_fingerprint() {
             120,
         )
         .unwrap()
+        .accepted()
         .unwrap();
     let experiments = ExperimentRepository::new(&harness.test.db);
     experiments
@@ -2160,7 +2382,8 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
         Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
         &["python", "train.py", "--implementation", "v2"],
     );
-    assert!(harness
+    assert!(matches!(
+        harness
         .accept(
             "proposal-code-1",
             "experiment-code-1",
@@ -2169,15 +2392,17 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
             &limits,
             120,
         )
-        .unwrap()
-        .is_none());
+        .unwrap(),
+        ProposalAcceptance::PendingCodeChange
+    ));
     let before_boundary = CampaignDbHarness::proposal(
         ProposalKind::CodeChange,
         "Another code change before expiry",
         Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
         &["python", "train.py", "--implementation", "v3"],
     );
-    assert!(harness
+    assert!(matches!(
+        harness
         .accept(
             "proposal-code-2",
             "experiment-code-2",
@@ -2186,14 +2411,23 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
             &limits,
             120 + DAY - 1,
         )
-        .is_err());
+        .unwrap(),
+        ProposalAcceptance::BudgetWaiting {
+            next_eligible_at: 86_520
+        }
+    ));
+    assert!(CampaignRepository::new(&harness.test.db)
+        .wake_eligible_campaigns(120 + DAY)
+        .unwrap()
+        .contains(&CampaignDbHarness::CAMPAIGN_ID.to_owned()));
     let at_boundary = CampaignDbHarness::proposal(
         ProposalKind::CodeChange,
         "Code change after exact expiry",
         Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
         &["python", "train.py", "--implementation", "v4"],
     );
-    assert!(harness
+    assert!(matches!(
+        harness
         .accept(
             "proposal-code-3",
             "experiment-code-3",
@@ -2202,12 +2436,69 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
             &limits,
             120 + DAY,
         )
-        .unwrap()
-        .is_none());
+        .unwrap(),
+        ProposalAcceptance::PendingCodeChange
+    ));
     assert_eq!(harness.count("proposals"), 3);
     assert_eq!(harness.count("experiments"), 1);
     assert_eq!(harness.count("submissions"), 1);
     assert_eq!(harness.count("budget_reservations"), 3);
+}
+
+#[test]
+fn positive_code_change_budget_exhaustion_enters_a_finite_wait_state() {
+    const DAY: i64 = 24 * 60 * 60;
+    let harness = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_code_change_proposals_per_24h = 1;
+    limits.max_proposals_per_cycle = 3;
+    harness.start(&limits, 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let first = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Use the only code-change slot",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v2"],
+    );
+    harness
+        .accept(
+            "proposal-code-first",
+            "experiment-code-first",
+            "submission-code-first",
+            &first,
+            &limits,
+            120,
+        )
+        .unwrap();
+    let second = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Wait for another code-change slot",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v3"],
+    );
+
+    let _ = harness.accept(
+        "proposal-code-wait",
+        "experiment-code-wait",
+        "submission-code-wait",
+        &second,
+        &limits,
+        120 + DAY - 1,
+    );
+
+    let campaign = CampaignRepository::new(&harness.test.db)
+        .find_by_id(CampaignDbHarness::CAMPAIGN_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.state, CampaignState::BudgetWaiting);
+    assert_eq!(campaign.next_eligible_at, Some(120 + DAY));
+    assert_eq!(
+        campaign.state_reason.as_deref(),
+        Some("code_change_budget_exhausted")
+    );
+    assert_eq!(harness.count("proposals"), 2);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("submissions"), 1);
 }
 
 #[test]
@@ -2452,10 +2743,52 @@ fn v15_migrates_campaign_tables_without_claiming_legacy_submissions() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     assert_eq!(campaigns, 0);
     assert_eq!(legacy, 1);
     assert_eq!(projects, 1);
+}
+
+#[test]
+fn v16_migration_quarantines_accepted_managed_provisional_identities() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 101)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "provisional-submit:v1:legacy-managed",
+            102,
+        )
+        .unwrap();
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 16;")
+        .unwrap();
+
+    Db::open(&harness.test.path).unwrap();
+
+    let experiment = experiments
+        .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+        .unwrap()
+        .unwrap();
+    let submission = SubmissionRepository::new(&harness.test.db)
+        .find_by_id("submission-baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+    assert_eq!(
+        experiment.failure_code.as_deref(),
+        Some("legacy_provisional_task_identity")
+    );
+    assert_eq!(submission.status, SubmissionStatus::Unreconciled);
 }
 
 #[test]
@@ -3628,7 +3961,7 @@ fn current_v13_reopen_repairs_missing_event_status_not_before_index() {
 }
 
 #[test]
-fn campaign_schema_current_v16_repair_preserves_user_version() {
+fn latest_campaign_schema_repair_preserves_user_version() {
     let test = TestDatabase::new();
     test.db
         .connect()
@@ -3652,7 +3985,7 @@ fn campaign_schema_current_v16_repair_preserves_user_version() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     assert!(index_exists);
 }
 

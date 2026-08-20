@@ -19,7 +19,7 @@ use pueue_agent::{
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueError, PueueTask},
-    reconcile::{task_signature, Reconciler},
+    reconcile::{managed_task_run_signature, task_signature, Reconciler},
     AppError,
 };
 use serde_json::json;
@@ -213,6 +213,10 @@ impl Harness {
     }
 
     fn accepted_campaign_experiment(&self, task_id: i64) -> String {
+        self.accepted_campaign_experiment_at(task_id, "100")
+    }
+
+    fn accepted_campaign_experiment_at(&self, task_id: i64, enqueued_at: &str) -> String {
         let intent = self.campaign_intent();
         let experiment_id = intent.experiment.experiment_id;
         let experiments = ExperimentRepository::new(&self.db);
@@ -221,9 +225,12 @@ impl Harness {
             .mark_accepted(
                 &experiment_id,
                 task_id,
-                &format!(
-                    "provisional-submit:v1:group=pa-project:task-id={task_id}:intent=campaign-submission-baseline"
-                ),
+                &managed_task_run_signature(&terminal_task(
+                    task_id,
+                    enqueued_at,
+                    json!("Success"),
+                ))
+                .unwrap(),
                 102,
             )
             .unwrap();
@@ -286,6 +293,13 @@ fn terminal_task(id: i64, enqueue: &str, result: serde_json::Value) -> PueueTask
     }
 }
 
+#[test]
+fn managed_run_identity_requires_a_valid_enqueue_timestamp() {
+    for enqueue in ["", "not-a-timestamp"] {
+        assert!(managed_task_run_signature(&terminal_task(41, enqueue, json!("Success"))).is_none());
+    }
+}
+
 #[tokio::test]
 async fn campaign_experiment_terminal_success_is_projected_and_consumes_reservation() {
     let harness = Harness::new();
@@ -331,6 +345,176 @@ async fn campaign_experiment_terminal_failure_is_projected_idempotently() {
     assert!(experiment.failure_code.is_some());
     assert!(experiment.failure_fingerprint.is_some());
     assert_eq!(experiment.finished_at, Some(200));
+}
+
+#[tokio::test]
+async fn campaign_task_id_reuse_quarantines_the_managed_identity_without_consuming_budget() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let fake = FakePueue::with_tasks(vec![terminal_task(
+        41,
+        "200",
+        json!({"Failed": 17}),
+    )]);
+
+    Reconciler::new(&harness.db, fake)
+        .run_once_at(300)
+        .await
+        .unwrap();
+
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    let submission = SubmissionRepository::new(&harness.db)
+        .find_by_id(&experiment.submission_id)
+        .unwrap()
+        .unwrap();
+    let reservation: BudgetReservationStatus = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE experiment_id = ?1",
+            [&experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+    assert_eq!(submission.status, SubmissionStatus::Unreconciled);
+    assert_eq!(reservation, BudgetReservationStatus::Reserved);
+}
+
+#[tokio::test]
+async fn equivalent_managed_failures_share_one_bounded_cause_fingerprint() {
+    let first = Harness::new();
+    let first_experiment_id = first.accepted_campaign_experiment(41);
+    Reconciler::new(
+        &first.db,
+        FakePueue::with_tasks(vec![terminal_task(
+            41,
+            "100",
+            json!({"Failed": 17, "message": "worker-a volatile detail"}),
+        )]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let second = Harness::new();
+    let second_experiment_id = second.accepted_campaign_experiment_at(99, "900");
+    Reconciler::new(
+        &second.db,
+        FakePueue::with_tasks(vec![terminal_task(
+            99,
+            "900",
+            json!({"Failed": 17, "message": "worker-b volatile detail"}),
+        )]),
+    )
+    .run_once_at(1_000)
+    .await
+    .unwrap();
+
+    let first_fingerprint = ExperimentRepository::new(&first.db)
+        .find_by_id(&first_experiment_id)
+        .unwrap()
+        .unwrap()
+        .failure_fingerprint
+        .unwrap();
+    let second_fingerprint = ExperimentRepository::new(&second.db)
+        .find_by_id(&second_experiment_id)
+        .unwrap()
+        .unwrap()
+        .failure_fingerprint
+        .unwrap();
+
+    assert_eq!(first_fingerprint, second_fingerprint);
+}
+
+#[tokio::test]
+async fn managed_terminal_event_carries_campaign_and_experiment_lineage() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let lineage: (Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT campaign_id, experiment_id FROM events
+             WHERE project_id = ?1 AND kind = 'task_finished'",
+            ["project-a"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(lineage.0.as_deref(), Some("campaign-reconciliation"));
+    assert_eq!(lineage.1.as_deref(), Some(experiment_id.as_str()));
+}
+
+#[tokio::test]
+async fn accepted_managed_identity_upgrades_an_existing_unlineaged_terminal_event() {
+    let harness = Harness::new();
+    let intent = harness.campaign_intent();
+    let experiment_id = intent.experiment.experiment_id;
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments.mark_submitting(&experiment_id, 101).unwrap();
+    let task = terminal_task(41, "100", json!({"Failed": 17}));
+    let fake = FakePueue::with_tasks(vec![task.clone()]);
+    let mut reconciler = Reconciler::new(&harness.db, fake);
+
+    reconciler.run_once_at(200).await.unwrap();
+    let before: (Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT campaign_id, experiment_id FROM events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(before, (None, None));
+
+    experiments
+        .mark_accepted(
+            &experiment_id,
+            task.id,
+            &managed_task_run_signature(&task).unwrap(),
+            201,
+        )
+        .unwrap();
+    reconciler.run_once_at(202).await.unwrap();
+
+    let after: (Option<String>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT campaign_id, experiment_id FROM events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after.0.as_deref(), Some("campaign-reconciliation"));
+    assert_eq!(after.1.as_deref(), Some(experiment_id.as_str()));
+    assert_eq!(harness.event_count(), 1);
+    assert_eq!(
+        experiments
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Failed
+    );
 }
 
 #[tokio::test]
@@ -390,7 +574,7 @@ async fn campaign_unreconciled_accepted_identity_rejects_command_only_task_match
             .unwrap()
             .unwrap()
             .status,
-        ExperimentStatus::Accepted
+        ExperimentStatus::Unreconciled
     );
 }
 
@@ -412,7 +596,7 @@ async fn campaign_unreconciled_accepted_identity_requires_one_unique_status_task
             .unwrap()
             .unwrap()
             .status,
-        ExperimentStatus::Accepted
+        ExperimentStatus::Unreconciled
     );
 }
 

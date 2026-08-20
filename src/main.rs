@@ -100,7 +100,7 @@ mod commands {
             UpgradeArgs, VersionArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
-        db::{Db, InterventionRepository, ProjectRepository},
+        db::{CampaignRepository, Db, InterventionRepository, ProjectRepository},
         diagnostics::{
             build_doctor_report_with_policy_and_roots, render_doctor_report_value,
             render_events, render_incident_explanation, render_project_status_json,
@@ -366,20 +366,33 @@ mod commands {
         let project_root = project::find_root(&current_dir)?;
         let (db, registered, _service_paths, policy) =
             resolve_project(Some(project_root.clone()), None)?;
+        if CampaignRepository::new(&db)
+            .find_live_by_project(&registered.project_id)?
+            .is_some()
+        {
+            return Err(AppError::Validation {
+                field: "submit",
+                message: "a managed campaign is active; use pueue-agent steer",
+            });
+        }
         let limits = policy.campaign_limits;
-        let pueue = configured_pueue(policy)?;
+        let root_anchor = policy
+            .project_root_anchor(&registered.root_path)
+            .map_err(AppError::from)?;
+        let pueue = configured_pueue(Arc::clone(&policy))?;
         let options = submit_command::SubmitOptions::new(
             kind,
             submit_command::load_metadata(metadata.as_deref(), metadata_json.as_deref())?,
             submit_command::origin_from_environment(&registered.project_id)?,
         );
-        let submission = submit_command::run_with_options(
+        let submission = submit_command::run_with_options_with_root_anchor(
             &db,
             &project_root,
             &command,
             &options,
             &limits,
             &pueue,
+            root_anchor,
         )
         .await?;
         println!(
@@ -391,14 +404,18 @@ mod commands {
 
     pub async fn submit_batch(args: SubmitBatchArgs) -> Result<(), AppError> {
         let (db, project, _service_paths, policy) = resolve_project(args.project_root, None)?;
-        let pueue = configured_pueue(policy)?;
-        let batch = pueue_agent::batches::run_with(
+        let root_anchor = policy
+            .project_root_anchor(&project.root_path)
+            .map_err(AppError::from)?;
+        let pueue = configured_pueue(Arc::clone(&policy))?;
+        let batch = pueue_agent::batches::run_with_root_anchor(
             &db,
             &project.root_path,
             &args.request_id.to_string(),
             &args.manifest,
             args.group.as_deref(),
             &pueue,
+            root_anchor,
         )
         .await?;
         println!(

@@ -14,6 +14,8 @@ use uuid::Uuid;
 use crate::{
     config,
     db::{BatchRepository, CampaignRepository, Db, ProjectRepository, SubmissionRepository},
+    environment::ProjectAdmissionLock,
+    execution_policy::{ProjectRootAnchor, VerifiedProjectRoot},
     models::{
         BatchJob, BatchJobStatus, BatchRequest, BatchStatus, NewBatchJob, NewBatchRequest,
         NewSubmission,
@@ -34,6 +36,11 @@ pub const MAX_BATCH_METADATA_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_BATCH_JOBS: usize = 128;
 pub const MAX_BATCH_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const BATCH_DISPATCH_LEASE_SECONDS: i64 = 300;
+
+struct BatchAdmission {
+    _verified_root: VerifiedProjectRoot,
+    _lock: ProjectAdmissionLock,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchManifest {
@@ -173,6 +180,48 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     requested_group: Option<&str>,
     pueue: &P,
 ) -> Result<BatchRequest, AppError> {
+    run_with_inner(
+        db,
+        project_root,
+        request_id,
+        manifest_path,
+        requested_group,
+        pueue,
+        None,
+    )
+    .await
+}
+
+pub async fn run_with_root_anchor<P: PueueApi + ?Sized>(
+    db: &Db,
+    project_root: &Path,
+    request_id: &str,
+    manifest_path: &Path,
+    requested_group: Option<&str>,
+    pueue: &P,
+    root_anchor: ProjectRootAnchor,
+) -> Result<BatchRequest, AppError> {
+    run_with_inner(
+        db,
+        project_root,
+        request_id,
+        manifest_path,
+        requested_group,
+        pueue,
+        Some(root_anchor),
+    )
+    .await
+}
+
+async fn run_with_inner<P: PueueApi + ?Sized>(
+    db: &Db,
+    project_root: &Path,
+    request_id: &str,
+    manifest_path: &Path,
+    requested_group: Option<&str>,
+    pueue: &P,
+    root_anchor: Option<ProjectRootAnchor>,
+) -> Result<BatchRequest, AppError> {
     Uuid::parse_str(request_id).map_err(|_| AppError::Validation {
         field: "request_id",
         message: "must be a valid UUID",
@@ -220,6 +269,26 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     let manifest = load_manifest(manifest_path)?;
     for job in &manifest.jobs {
         validate_add_argv(&pueue_add_args(group, &job.argv))?;
+    }
+    let root_anchor = match root_anchor {
+        Some(root_anchor) => root_anchor,
+        None => ProjectRootAnchor::resolve(&registered.root_path).map_err(AppError::from)?,
+    };
+    if root_anchor.canonical_path != registered.root_path {
+        return Err(AppError::Validation {
+            field: "submit-batch.project_root",
+            message: "must match the startup-pinned project root",
+        });
+    }
+    let _admission = acquire_batch_admission(&root_anchor)?;
+    if CampaignRepository::new(db)
+        .find_live_by_project(&registered.project_id)?
+        .is_some()
+    {
+        return Err(AppError::Validation {
+            field: "submit-batch",
+            message: "a managed campaign is active; use pueue-agent steer",
+        });
     }
     let now = unix_timestamp()?;
     let request = NewBatchRequest::new(
@@ -312,6 +381,20 @@ pub async fn run_with<P: PueueApi + ?Sized>(
     }
 
     Ok(result)
+}
+
+fn acquire_batch_admission(root_anchor: &ProjectRootAnchor) -> Result<BatchAdmission, AppError> {
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    let project_lock = ProjectAdmissionLock::try_acquire(&verified_root)
+        .map_err(AppError::from)?
+        .ok_or(AppError::Runtime {
+            operation: "acquire project batch admission lock",
+        })?;
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    Ok(BatchAdmission {
+        _verified_root: verified_root,
+        _lock: project_lock,
+    })
 }
 
 fn pueue_add_args(group: &str, argv: &[String]) -> Vec<OsString> {

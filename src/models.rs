@@ -327,6 +327,8 @@ impl NewProject {
 pub struct Event {
     pub event_id: i64,
     pub project_id: String,
+    pub campaign_id: Option<String>,
+    pub experiment_id: Option<String>,
     pub kind: EventKind,
     pub dedup_key: String,
     pub payload: Value,
@@ -342,6 +344,8 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     pub project_id: String,
+    pub campaign_id: Option<String>,
+    pub experiment_id: Option<String>,
     pub kind: EventKind,
     pub dedup_key: String,
     pub payload: Value,
@@ -360,12 +364,24 @@ impl NewEvent {
     ) -> Self {
         Self {
             project_id: project_id.into(),
+            campaign_id: None,
+            experiment_id: None,
             kind,
             dedup_key: dedup_key.into(),
             payload,
             not_before,
             created_at,
         }
+    }
+
+    pub fn with_campaign_lineage(
+        mut self,
+        campaign_id: impl Into<String>,
+        experiment_id: Option<impl Into<String>>,
+    ) -> Self {
+        self.campaign_id = Some(campaign_id.into());
+        self.experiment_id = experiment_id.map(Into::into);
+        self
     }
 }
 

@@ -55,6 +55,23 @@ pub struct ManagedSubmissionIntent {
 pub enum AgentDecisionReservation {
     Reserved(BudgetReservation),
     BudgetWaiting { next_eligible_at: i64 },
+    Deferred { state: CampaignState },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalAcceptance {
+    Accepted(ManagedSubmissionIntent),
+    PendingCodeChange,
+    BudgetWaiting { next_eligible_at: i64 },
+}
+
+impl ProposalAcceptance {
+    pub fn accepted(self) -> Option<ManagedSubmissionIntent> {
+        match self {
+            Self::Accepted(intent) => Some(intent),
+            Self::PendingCodeChange | Self::BudgetWaiting { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +296,7 @@ impl<'db> CampaignRepository<'db> {
         proposal: &ValidatedProposal,
         limits: &CampaignLimits,
         now: i64,
-    ) -> Result<Option<ManagedSubmissionIntent>, AppError> {
+    ) -> Result<ProposalAcceptance, AppError> {
         let argv_json = serialize_strings(
             proposal.argv(),
             "serialize campaign proposal arguments",
@@ -297,6 +314,15 @@ impl<'db> CampaignRepository<'db> {
             .map_err(database_error("begin campaign proposal acceptance"))?;
 
         let campaign = read_campaign(&transaction, campaign_id)?;
+        if campaign.state == CampaignState::BudgetWaiting {
+            let next_eligible_at = campaign.next_eligible_at.ok_or_else(|| {
+                validation_error(
+                    "campaign.next_eligible_at",
+                    "budget-waiting campaign must have a finite wake time",
+                )
+            })?;
+            return Ok(ProposalAcceptance::BudgetWaiting { next_eligible_at });
+        }
         if campaign.state != CampaignState::Active {
             return Err(validation_error(
                 "campaign",
@@ -318,9 +344,12 @@ impl<'db> CampaignRepository<'db> {
         )? {
             return match existing.status {
                 ProposalStatus::Accepted => {
-                    read_intent_by_proposal(&transaction, &existing.proposal_id).map(Some)
+                    read_intent_by_proposal(&transaction, &existing.proposal_id)
+                        .map(ProposalAcceptance::Accepted)
                 }
-                ProposalStatus::Pending if existing.kind == ProposalKind::CodeChange => Ok(None),
+                ProposalStatus::Pending if existing.kind == ProposalKind::CodeChange => {
+                    Ok(ProposalAcceptance::PendingCodeChange)
+                }
                 ProposalStatus::Pending | ProposalStatus::Rejected => Err(validation_error(
                     "proposal.canonical_digest",
                     "matches a proposal that has no accepted experiment",
@@ -364,6 +393,12 @@ impl<'db> CampaignRepository<'db> {
         }
 
         if proposal.kind() == ProposalKind::CodeChange {
+            if limits.max_code_change_proposals_per_24h == 0 {
+                return Err(validation_error(
+                    "campaign_limits.max_code_change_proposals_per_24h",
+                    "does not permit code-change proposals",
+                ));
+            }
             let code_change_count = count_live_reservations(
                 &transaction,
                 campaign_id,
@@ -371,10 +406,13 @@ impl<'db> CampaignRepository<'db> {
                 now,
             )?;
             if code_change_count >= i64::from(limits.max_code_change_proposals_per_24h) {
-                return Err(validation_error(
-                    "campaign_limits.max_code_change_proposals_per_24h",
-                    "the rolling code-change proposal budget is exhausted",
-                ));
+                return enter_proposal_budget_wait(
+                    transaction,
+                    campaign_id,
+                    BudgetDimension::CodeChange,
+                    "code_change_budget_exhausted",
+                    now,
+                );
             }
             insert_proposal(
                 &transaction,
@@ -396,7 +434,7 @@ impl<'db> CampaignRepository<'db> {
             transaction
                 .commit()
                 .map_err(database_error("commit pending code-change proposal"))?;
-            return Ok(None);
+            return Ok(ProposalAcceptance::PendingCodeChange);
         }
 
         let parallel_count: i64 = transaction
@@ -421,18 +459,23 @@ impl<'db> CampaignRepository<'db> {
             now,
         )?;
         if rolling_count >= i64::from(limits.max_new_experiments_per_24h) {
-            return Err(validation_error(
-                "campaign_limits.max_new_experiments_per_24h",
-                "the rolling experiment budget is exhausted",
-            ));
+            return enter_proposal_budget_wait(
+                transaction,
+                campaign_id,
+                BudgetDimension::Experiment,
+                "experiment_budget_exhausted",
+                now,
+            );
         }
         let same_spec_count: i64 = transaction
             .query_row(
                 "SELECT COUNT(*)
                  FROM experiments AS experiment
                  JOIN proposals AS candidate ON candidate.proposal_id = experiment.proposal_id
-                 WHERE experiment.campaign_id = ?1 AND candidate.argv_json = ?2",
-                params![campaign_id, argv_json],
+                 WHERE experiment.campaign_id = ?1
+                   AND candidate.argv_json = ?2
+                   AND candidate.working_directory = ?3",
+                params![campaign_id, argv_json, proposal.working_directory()],
                 |row| row.get(0),
             )
             .map_err(database_error("count same-spec campaign experiments"))?;
@@ -515,7 +558,7 @@ impl<'db> CampaignRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit campaign proposal acceptance"))?;
-        Ok(Some(intent))
+        Ok(ProposalAcceptance::Accepted(intent))
     }
 
     pub fn find_by_id(&self, campaign_id: &str) -> Result<Option<Campaign>, AppError> {
@@ -613,9 +656,16 @@ impl<'db> CampaignRepository<'db> {
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT experiment_id FROM experiments
-                 WHERE status = 'reserved'
-                 ORDER BY experiment_id
+                "SELECT experiment.experiment_id
+                 FROM experiments AS experiment
+                 JOIN campaigns AS campaign USING (campaign_id)
+                 JOIN projects AS project USING (project_id)
+                 WHERE experiment.status = 'reserved'
+                   AND campaign.state = 'active'
+                   AND project.enabled = 1
+                   AND project.paused = 0
+                   AND project.halted_reason IS NULL
+                 ORDER BY experiment.experiment_id
                  LIMIT ?1",
             )
             .map_err(database_error(
@@ -665,17 +715,6 @@ impl<'db> CampaignRepository<'db> {
             .map_err(database_error("begin campaign agent decision reservation"))?;
         let campaign = read_campaign(&transaction, campaign_id)?;
 
-        if let Some(existing) = find_agent_decision_reservation(
-            &transaction,
-            campaign_id,
-            decision_key,
-        )? {
-            transaction
-                .commit()
-                .map_err(database_error("commit existing campaign agent decision"))?;
-            return Ok(AgentDecisionReservation::Reserved(existing));
-        }
-
         if campaign.state == CampaignState::BudgetWaiting {
             let next_eligible_at = campaign.next_eligible_at.ok_or_else(|| {
                 validation_error(
@@ -689,10 +728,22 @@ impl<'db> CampaignRepository<'db> {
             return Ok(AgentDecisionReservation::BudgetWaiting { next_eligible_at });
         }
         if campaign.state != CampaignState::Active {
-            return Err(validation_error(
-                "campaign",
-                "must be active to reserve an agent decision",
-            ));
+            let state = campaign.state;
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred campaign agent decision"))?;
+            return Ok(AgentDecisionReservation::Deferred { state });
+        }
+
+        if let Some(existing) = find_agent_decision_reservation(
+            &transaction,
+            campaign_id,
+            decision_key,
+        )? {
+            transaction
+                .commit()
+                .map_err(database_error("commit existing campaign agent decision"))?;
+            return Ok(AgentDecisionReservation::Reserved(existing));
         }
 
         let live_count = count_live_reservations(
@@ -1089,6 +1140,11 @@ impl<'db> CampaignRepository<'db> {
     }
 
     pub fn pause(&self, project_id: &str, now: i64) -> Result<Campaign, AppError> {
+        let _admission = super::repositories::acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire campaign pause admission lock",
+        )?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1175,6 +1231,11 @@ impl<'db> CampaignRepository<'db> {
     }
 
     pub fn retire(&self, project_id: &str, now: i64) -> Result<Campaign, AppError> {
+        let _admission = super::repositories::acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire campaign retire admission lock",
+        )?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1384,6 +1445,14 @@ impl<'db> ExperimentRepository<'db> {
                 "only a reserved experiment can begin submission",
             ));
         }
+        let campaign = read_campaign(&transaction, &experiment.campaign_id)?;
+        if campaign.state != CampaignState::Active {
+            return Err(validation_error(
+                "campaign",
+                "must be active to begin a reserved submission",
+            ));
+        }
+        validate_project_available(&transaction, &campaign.project_id)?;
         let submission = read_submission(&transaction, &experiment.submission_id)?;
         if submission.status != SubmissionStatus::Pending
             || submission.pueue_task_id.is_some()
@@ -1552,6 +1621,63 @@ impl<'db> ExperimentRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit experiment unreconciled transition"))?;
+        Ok(stored)
+    }
+
+    pub fn quarantine_accepted_identity(
+        &self,
+        experiment_id: &str,
+        reason_code: &'static str,
+        now: i64,
+    ) -> Result<Experiment, AppError> {
+        validate_failure_field("reason_code", reason_code)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin accepted identity quarantine"))?;
+        let experiment = read_experiment(&transaction, experiment_id)?;
+        let submission = read_submission(&transaction, &experiment.submission_id)?;
+        if experiment.status == ExperimentStatus::Unreconciled
+            && experiment.failure_code.as_deref() == Some(reason_code)
+            && submission.status == SubmissionStatus::Unreconciled
+        {
+            return Ok(experiment);
+        }
+        if experiment.status != ExperimentStatus::Accepted
+            || submission.status != SubmissionStatus::Accepted
+            || experiment.pueue_task_id.is_none()
+            || experiment.task_signature.is_none()
+            || submission.pueue_task_id != experiment.pueue_task_id
+            || submission.task_signature != experiment.task_signature
+        {
+            return Err(validation_error(
+                "experiment",
+                "only a consistently accepted identity can be quarantined",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE submissions SET status = ?1 WHERE submission_id = ?2",
+                params![SubmissionStatus::Unreconciled, submission.submission_id],
+            )
+            .map_err(database_error("quarantine accepted campaign submission"))?;
+        transaction
+            .execute(
+                "UPDATE experiments
+                 SET status = ?1, failure_code = ?2, updated_at = ?3
+                 WHERE experiment_id = ?4",
+                params![
+                    ExperimentStatus::Unreconciled,
+                    reason_code,
+                    now,
+                    experiment_id,
+                ],
+            )
+            .map_err(database_error("quarantine accepted experiment identity"))?;
+        let stored = read_experiment(&transaction, experiment_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit accepted identity quarantine"))?;
         Ok(stored)
     }
 
@@ -1872,6 +1998,46 @@ fn earliest_live_reservation_expiry(
         .map_err(database_error(
             "find earliest live rolling budget reservation expiry",
         ))
+}
+
+fn enter_proposal_budget_wait(
+    transaction: Transaction<'_>,
+    campaign_id: &str,
+    dimension: BudgetDimension,
+    reason: &'static str,
+    now: i64,
+) -> Result<ProposalAcceptance, AppError> {
+    let next_eligible_at = earliest_live_reservation_expiry(
+        &transaction,
+        campaign_id,
+        dimension,
+        now,
+    )?
+    .ok_or_else(|| {
+        validation_error(
+            "campaign.budget",
+            "exhausted rolling budget has no finite reservation expiry",
+        )
+    })?;
+    let updated = transaction
+        .execute(
+            "UPDATE campaigns
+             SET state = 'budget_waiting', state_reason = ?1,
+                 next_eligible_at = ?2, updated_at = ?3
+             WHERE campaign_id = ?4 AND state = 'active'",
+            params![reason, next_eligible_at, now, campaign_id],
+        )
+        .map_err(database_error("wait for campaign proposal budget"))?;
+    if updated != 1 {
+        return Err(validation_error(
+            "campaign",
+            "state changed while waiting for proposal budget",
+        ));
+    }
+    transaction
+        .commit()
+        .map_err(database_error("commit campaign proposal budget wait"))?;
+    Ok(ProposalAcceptance::BudgetWaiting { next_eligible_at })
 }
 
 fn find_agent_decision_reservation(

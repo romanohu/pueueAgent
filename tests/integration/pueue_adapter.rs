@@ -38,7 +38,7 @@ use pueue_agent::{
         BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
         ManagedSubmissionIntent, ProjectRepository, StartCampaignRequest, SubmissionRepository,
     },
-    execution_policy::CampaignLimits,
+    execution_policy::{CampaignLimits, ProjectRootAnchor},
     models::{
         AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
         ExperimentStatus, ProposalKind, Submission, SubmissionKind, SubmissionStatus,
@@ -819,6 +819,18 @@ impl CountingFakePueue {
     fn add_calls(&self) -> usize {
         self.add_calls.load(Ordering::SeqCst)
     }
+
+    fn pause_add(&self) {
+        self.inner.pause_add();
+    }
+
+    async fn wait_for_add(&self) {
+        self.inner.wait_for_add().await;
+    }
+
+    fn release_add(&self) {
+        self.inner.release_add();
+    }
 }
 
 #[async_trait]
@@ -1245,6 +1257,127 @@ async fn campaign_submit_active_campaign_rejects_batch_before_manifest_persisten
 }
 
 #[tokio::test]
+async fn campaign_baseline_holds_admission_through_add_against_control_and_batch() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    harness.fake.pause_add();
+    let db = harness.db.clone();
+    let root = harness.root.clone();
+    let fake = harness.fake.clone();
+    let baseline = tokio::spawn(async move {
+        let args = vec![OsString::from("python"), OsString::from("train.py")];
+        submit::run_with_options(
+            &db,
+            &root,
+            &args,
+            &submit::SubmitOptions::default(),
+            &CampaignLimits::default(),
+            &fake,
+        )
+        .await
+    });
+    harness.fake.wait_for_add().await;
+
+    let control = submit_legacy_control(
+        &harness.db,
+        &harness.root,
+        &[OsString::from("python"), OsString::from("control.py")],
+        &harness.fake,
+    )
+    .await
+    .unwrap_err();
+    let manifest = harness.root.join("admission-race-batch.json");
+    fs::write(
+        &manifest,
+        r#"{"jobs":[{"id":"job-a","argv":["python","batch.py"]}]}"#,
+    )
+    .unwrap();
+    let batch = batches::run_with(
+        &harness.db,
+        &harness.root,
+        &uuid::Uuid::new_v4().to_string(),
+        &manifest,
+        None,
+        &harness.fake,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(control, AppError::Validation { field: "submit", .. }));
+    assert!(matches!(
+        batch,
+        AppError::Validation {
+            field: "submit-batch",
+            ..
+        }
+    ));
+    assert_eq!(harness.table_count("batch_requests"), 0);
+    assert_eq!(harness.table_count("campaigns"), 1);
+    assert_eq!(harness.table_count("submissions"), 1);
+    assert_eq!(harness.pueue_add_calls(), 1);
+
+    harness.fake.release_add();
+    baseline.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn control_admission_blocks_a_racing_campaign_baseline_before_persistence() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    harness.fake.pause_add();
+    let db = harness.db.clone();
+    let root = harness.root.clone();
+    let fake = harness.fake.clone();
+    let control = tokio::spawn(async move {
+        submit_legacy_control(
+            &db,
+            &root,
+            &[OsString::from("python"), OsString::from("control.py")],
+            &fake,
+        )
+        .await
+    });
+    harness.fake.wait_for_add().await;
+
+    let campaign = harness.submit(&["python", "train.py"]).await.unwrap_err();
+
+    assert!(matches!(campaign, AppError::Runtime { .. }));
+    assert_eq!(harness.table_count("campaigns"), 0);
+    assert_eq!(harness.table_count("submissions"), 1);
+    assert_eq!(harness.pueue_add_calls(), 1);
+    harness.fake.release_add();
+    control.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn batch_admission_blocks_a_racing_campaign_baseline_before_persistence() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let manifest = harness.root.join("blocking-batch.json");
+    fs::write(
+        &manifest,
+        r#"{"jobs":[{"id":"job-a","argv":["python","batch.py"]}]}"#,
+    )
+    .unwrap();
+    harness.fake.pause_add();
+    let db = harness.db.clone();
+    let root = harness.root.clone();
+    let fake = harness.fake.clone();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let batch = tokio::spawn(async move {
+        batches::run_with(&db, &root, &request_id, &manifest, None, &fake).await
+    });
+    harness.fake.wait_for_add().await;
+
+    let campaign = harness.submit(&["python", "train.py"]).await.unwrap_err();
+
+    assert!(matches!(campaign, AppError::Runtime { .. }));
+    assert_eq!(harness.table_count("campaigns"), 0);
+    assert_eq!(harness.table_count("batch_requests"), 1);
+    assert_eq!(harness.table_count("submissions"), 1);
+    assert_eq!(harness.pueue_add_calls(), 1);
+    harness.fake.release_add();
+    batch.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn campaign_submit_control_remains_a_legacy_one_off_without_a_live_campaign() {
     let harness = SubmitHarness::new();
     let args = vec![OsString::from("python"), OsString::from("control.py")];
@@ -1290,6 +1423,79 @@ async fn campaign_submit_reserved_intent_resumes_with_exactly_one_add() {
             .unwrap()
             .status,
         ExperimentStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_reserved_intent_stays_reserved_after_campaign_pause() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    CampaignRepository::new(&harness.db)
+        .pause("project-a", 101)
+        .unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    );
+
+    assert!(coordinator
+        .submit_accepted_intent(&intent, &harness.project(), 102)
+        .await
+        .is_err());
+
+    assert_eq!(harness.pueue_add_calls(), 0);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn campaign_submit_rejects_a_replaced_startup_pinned_root_before_add() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    let project = harness.project();
+    let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+    let replaced_root = project
+        .root_path
+        .with_file_name("project-before-replacement");
+    fs::rename(&project.root_path, &replaced_root).unwrap();
+    fs::create_dir(&project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &harness.db,
+        &harness.fake,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor);
+
+    let error = coordinator
+        .submit_accepted_intent(&intent, &project, 101)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AppError::PolicyViolation {
+            violation: pueue_agent::execution_policy::PolicyViolation {
+                code: PolicyViolationCode::RootChanged,
+                ..
+            }
+        }
+    ));
+    assert_eq!(harness.pueue_add_calls(), 0);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
     );
 }
 

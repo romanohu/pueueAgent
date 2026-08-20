@@ -87,6 +87,32 @@ impl PueueApi for FakePueue {
 
     async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
         self.add_calls.lock().unwrap().push(args.to_vec());
+        let group = args
+            .windows(2)
+            .find(|pair| pair[0] == "-g")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let command = args
+            .iter()
+            .position(|argument| argument == "--")
+            .map(|separator| {
+                args[separator + 1..]
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        self.tasks.lock().unwrap().push(PueueTask {
+            id: 42,
+            group,
+            command,
+            state: "Queued".to_owned(),
+            enqueued_at: Some("200".to_owned()),
+            started_at: None,
+            ended_at: None,
+            result: None,
+        });
         Ok(42)
     }
 
@@ -603,6 +629,42 @@ async fn campaign_recovery_resumes_only_reserved_intents_with_the_stored_working
             OsString::from("python"),
             OsString::from("train.py"),
         ]
+    );
+}
+
+#[tokio::test]
+async fn campaign_recovery_defers_paused_intent_then_dispatches_once_after_resume() {
+    let harness = DaemonHarness::new();
+    let experiment_id = harness.campaign_experiment();
+    CampaignRepository::new(&harness.db)
+        .pause("project-a", 150)
+        .unwrap();
+
+    harness.restart_at(200).await.unwrap();
+
+    assert!(harness.fake_pueue.add_calls().is_empty());
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
+    );
+
+    CampaignRepository::new(&harness.db)
+        .resume("project-a", 201)
+        .unwrap();
+    harness.restart_at(202).await.unwrap();
+
+    assert_eq!(harness.fake_pueue.add_calls().len(), 1);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
     );
 }
 

@@ -149,26 +149,6 @@ where
                 )?;
             let campaigns = CampaignRepository::new(&self.db);
             campaigns.recover_submission_boundaries(now)?;
-            loop {
-                let intents = campaigns.list_reserved_submission_intents(100)?;
-                if intents.is_empty() {
-                    break;
-                }
-                for intent in intents {
-                    let project = ProjectRepository::new(&self.db)
-                        .find_by_id(&intent.campaign.project_id)?
-                        .ok_or(AppError::Runtime {
-                            operation: "read campaign project during startup recovery",
-                        })?;
-                    CampaignCoordinator::new(
-                        &self.db,
-                        &self.pueue,
-                        self.policy.campaign_limits,
-                    )
-                    .submit_accepted_intent(&intent, &project, now)
-                    .await?;
-                }
-            }
             self.startup_recovery_pending = false;
             report.recovered_agent_runs = recovery.failed_runs;
             report.requeued_agent_events = recovery.requeued_events;
@@ -177,6 +157,7 @@ where
 
         CampaignRepository::new(&self.db)
             .wake_eligible_campaigns_with_limits(&self.policy.campaign_limits, now)?;
+        self.dispatch_reserved_campaign_submissions(now).await?;
 
         report.finished_agents += self.poll_retained_ownership_at(now).await?;
 
@@ -245,6 +226,38 @@ where
         report.finished_agents += self.poll_retained_ownership_at(now).await?;
         report.reconciliation = reconciliation;
         Ok(report)
+    }
+
+    async fn dispatch_reserved_campaign_submissions(&self, now: i64) -> Result<(), AppError> {
+        let campaigns = CampaignRepository::new(&self.db);
+        let intents = campaigns.list_reserved_submission_intents(100)?;
+        for intent in intents {
+            let project = ProjectRepository::new(&self.db)
+                .find_by_id(&intent.campaign.project_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "read campaign project during reserved submission dispatch",
+                })?;
+            let root_anchor = self
+                .policy
+                .project_root_anchor(&project.root_path)
+                .map_err(AppError::from)?;
+            let result = CampaignCoordinator::new(
+                &self.db,
+                &self.pueue,
+                self.policy.campaign_limits,
+            )
+            .with_root_anchor(root_anchor)
+            .submit_accepted_intent(&intent, &project, now)
+            .await;
+            match result {
+                Ok(_) => {}
+                Err(AppError::Runtime {
+                    operation: "acquire project submission admission lock",
+                }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     pub fn load_startup_retry_policies(&self) -> Result<BTreeMap<String, RetryPolicy>, AppError> {

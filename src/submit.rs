@@ -14,7 +14,8 @@ use crate::{
     campaign::CampaignCoordinator,
     config,
     db::{AgentRunRepository, CampaignRepository, Db, ProjectRepository, SubmissionRepository},
-    execution_policy::{load_existing_policy, CampaignLimits},
+    environment::ProjectAdmissionLock,
+    execution_policy::{load_existing_policy, CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
     models::{NewSubmission, Submission, SubmissionKind},
     output::{bounded_redacted_text, format_state, human_header, human_summary},
     paths, project,
@@ -32,6 +33,11 @@ const MAX_METADATA_OBJECT_KEYS: usize = 32;
 const MAX_METADATA_KEY_BYTES: usize = 64;
 const MAX_METADATA_STRING_BYTES: usize = 1024;
 const MAX_METADATA_ARRAY_ITEMS: usize = 64;
+
+struct SubmissionAdmission {
+    _verified_root: VerifiedProjectRoot,
+    _lock: ProjectAdmissionLock,
+}
 
 #[derive(Debug, Clone)]
 pub struct SubmitOptions {
@@ -84,7 +90,10 @@ pub async fn run(project_root: &Path, args: &[OsString]) -> Result<Submission, A
         launcher_path,
     ))?);
     let limits = policy.campaign_limits;
-    let pueue = configured_pueue(policy)?;
+    let root_anchor = policy
+        .project_root_anchor(&registered.root_path)
+        .map_err(AppError::from)?;
+    let pueue = configured_pueue(Arc::clone(&policy))?;
     drop(read_db);
     let db = Db::open(&state_db)?;
     let options = SubmitOptions::new(
@@ -92,7 +101,16 @@ pub async fn run(project_root: &Path, args: &[OsString]) -> Result<Submission, A
         Value::Object(Default::default()),
         origin_from_environment(&registered.project_id)?,
     );
-    run_with_options(&db, project_root, args, &options, &limits, &pueue).await
+    run_with_options_with_root_anchor(
+        &db,
+        project_root,
+        args,
+        &options,
+        &limits,
+        &pueue,
+        root_anchor,
+    )
+    .await
 }
 
 pub async fn run_with<P: PueueApi + ?Sized>(
@@ -120,6 +138,39 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     options: &SubmitOptions,
     limits: &CampaignLimits,
     pueue: &P,
+) -> Result<Submission, AppError> {
+    run_with_options_inner(db, project_root, args, options, limits, pueue, None).await
+}
+
+pub async fn run_with_options_with_root_anchor<P: PueueApi + ?Sized>(
+    db: &Db,
+    project_root: &Path,
+    args: &[OsString],
+    options: &SubmitOptions,
+    limits: &CampaignLimits,
+    pueue: &P,
+    root_anchor: ProjectRootAnchor,
+) -> Result<Submission, AppError> {
+    run_with_options_inner(
+        db,
+        project_root,
+        args,
+        options,
+        limits,
+        pueue,
+        Some(root_anchor),
+    )
+    .await
+}
+
+async fn run_with_options_inner<P: PueueApi + ?Sized>(
+    db: &Db,
+    project_root: &Path,
+    args: &[OsString],
+    options: &SubmitOptions,
+    limits: &CampaignLimits,
+    pueue: &P,
+    root_anchor: Option<ProjectRootAnchor>,
 ) -> Result<Submission, AppError> {
     if args.is_empty() {
         return Err(AppError::Configuration {
@@ -150,8 +201,6 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
             field: "pueue_group registration",
         });
     }
-    validate_metadata(&options.metadata)?;
-    validate_active_origin(db, &registered.project_id, options.origin_agent_run_id)?;
     if CampaignRepository::new(db)
         .find_live_by_project(&registered.project_id)?
         .is_some()
@@ -159,6 +208,19 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
         return Err(AppError::Validation {
             field: "submit",
             message: "a managed campaign is active; use pueue-agent steer",
+        });
+    }
+    validate_metadata(&options.metadata)?;
+    validate_active_origin(db, &registered.project_id, options.origin_agent_run_id)?;
+
+    let root_anchor = match root_anchor {
+        Some(root_anchor) => root_anchor,
+        None => ProjectRootAnchor::resolve(&registered.root_path).map_err(AppError::from)?,
+    };
+    if root_anchor.canonical_path != registered.root_path {
+        return Err(AppError::Validation {
+            field: "submit.project_root",
+            message: "must match the startup-pinned project root",
         });
     }
 
@@ -177,6 +239,7 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     if options.kind == SubmissionKind::Experiment {
         let objective = state::load_objective(&root)?;
         return CampaignCoordinator::new(db, pueue, *limits)
+            .with_root_anchor(root_anchor)
             .start_baseline(
                 &registered,
                 &objective,
@@ -186,6 +249,17 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
                 created_at,
             )
             .await;
+    }
+
+    let _admission = acquire_submission_admission(&root_anchor)?;
+    if CampaignRepository::new(db)
+        .find_live_by_project(&registered.project_id)?
+        .is_some()
+    {
+        return Err(AppError::Validation {
+            field: "submit",
+            message: "a managed campaign is active; use pueue-agent steer",
+        });
     }
 
     let mut add_args = Vec::with_capacity(args.len() + 3);
@@ -212,6 +286,22 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     let task_signature =
         provisional_task_signature(&registered.pueue_group, task_id, &submission_id);
     repository.mark_accepted(&submission_id, task_id, &task_signature)
+}
+
+fn acquire_submission_admission(
+    root_anchor: &ProjectRootAnchor,
+) -> Result<SubmissionAdmission, AppError> {
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    let project_lock = ProjectAdmissionLock::try_acquire(&verified_root)
+        .map_err(AppError::from)?
+        .ok_or(AppError::Runtime {
+            operation: "acquire project submission admission lock",
+        })?;
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    Ok(SubmissionAdmission {
+        _verified_root: verified_root,
+        _lock: project_lock,
+    })
 }
 
 pub fn load_metadata(

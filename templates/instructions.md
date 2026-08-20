@@ -4,7 +4,7 @@
 
 ## 必須の手順
 
-1. `.pueue-agent/instructions.md`、次に人間が定める目的の `.pueue-agent/STATE.md`、最後に bounded agent scratch projection の `.pueue-agent/state.json` を読む。
+1. `.pueue-agent/instructions.md`、次に起動 prompt の SQLite-backed objective snapshot、最後に bounded agent scratch projection の `.pueue-agent/state.json` を読む。`.pueue-agent/STATE.md` は人間向け context として参照できるが、起動 prompt の immutable objective と異なる場合は上書きしない。
 2. このプロジェクトに関係する task、log、metric、artifact だけを調査する。
 3. 終了する前に、確認できた現在の事実と次の計画だけを `.pueue-agent/state.json` に記録する。`STATE.md` の人間が定めた目的は変更しない。
 4. Git を使っている場合は、意図した source change を「何を、なぜ変更したか」が分かる commit message で commit する。
@@ -28,7 +28,7 @@ SQLite は campaign、objective、budget、lineage の正本です。`.pueue-age
 
 ## Dispatch mode
 
-- `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、設定された制約が許す場合だけ replacement experiment を投入する。
+- `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、bounded な replacement recommendation/proposal を `state.json` に記録する。`Phase 1` では replacement experiment を投入しない。
 - `deep_check`: metric と artifact を調べ、実験が意味のある進行をしているか判断する。正常なら、実際にプロジェクトで確認できた事実だけを使い、短い health record を `state.json` に記録する。存在しない metric、値、進捗を作らない。異常なら crash と同じ手順で対応する。
 - `completion`: 結果を要約し、次の実験に根拠があるか判断する。目的を達成した、または有効な次の手がかりがない場合は停止する。
 - `operator_wake`: reason は人間からの追加指示として扱う。既存の STATE、guardrail、experiment budget を尊重し、迂回しない。
@@ -40,6 +40,6 @@ SQLite は campaign、objective、budget、lineage の正本です。`.pueue-age
 - `stop` は active agent の graceful shutdown を開始する。Pueue task は kill しないが、active agent は drain 対象で、shutdown timeout 後に process tree を終了して timed_out と記録され得る。
 - supervisor は `.pueue-agent/config.toml` に従って fresh Codex session を起動するか、明示的に既存 session を resume します。context mode や session ID を勝手に変更しない。
 - `state.json` は fresh run と resumed run の両方で使う bounded agent scratch projection です。`STATE.md` は人間が定める objective であり、会話 transcript の代替とはみなしません。
-- detector の `action = "kill"` が設定されている場合、supervisor が失敗した task の終了を Pueue に依頼している可能性があります。replacement を提案・投入する前に、現在の Pueue state を確認する。
+- detector の `action = "kill"` が設定されている場合、supervisor が失敗した task の終了を Pueue に依頼している可能性があります。replacement recommendation を提案する前に、現在の Pueue state を確認する。
 - Pueue group を変更したり、別 group に干渉したり、`.pueue-agent/config.toml` を変更したりしない。
-- `STATE.md` に記録された目的や、SQLite と project configuration が定める制約を超えない。
+- 起動 prompt の SQLite-backed objective snapshot と project configuration が定める制約を超えない。`STATE.md` は active campaign の authority として扱わない。

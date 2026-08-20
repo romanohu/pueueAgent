@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 16;
+pub const LATEST_SCHEMA_VERSION: i64 = 17;
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -162,6 +162,9 @@ const EXPERIMENTS_PUEUE_TASK_LOOKUP_INDEX_SQL: &str =
 const BUDGET_RESERVATIONS_CAMPAIGN_DIMENSION_WINDOW_INDEX_SQL: &str =
     "CREATE INDEX budget_reservations_campaign_dimension_window_idx
     ON budget_reservations(campaign_id, dimension, window_started_at, window_ends_at, reservation_id);";
+const EVENTS_CAMPAIGN_STATUS_NOT_BEFORE_INDEX_SQL: &str =
+    "CREATE INDEX events_campaign_status_not_before_idx
+    ON events(campaign_id, status, not_before, event_id);";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -202,6 +205,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             && has_canonical_event_status_not_before_index
         {
             verify_campaign_schema_v16(connection)?;
+            verify_campaign_event_lineage_v17(connection)?;
             return Ok(());
         }
     }
@@ -584,6 +588,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_campaign_schema_to_v16(&transaction)?;
     } else {
         verify_campaign_schema_v16(&transaction)?;
+    }
+    if version <= 16 {
+        migrate_campaign_event_lineage_to_v17(&transaction)?;
+    } else {
+        verify_campaign_event_lineage_v17(&transaction)?;
     }
     transaction
         .commit()
@@ -1387,6 +1396,149 @@ fn migrate_campaign_schema_to_v16(
     transaction
         .execute_batch("PRAGMA user_version = 16;")
         .map_err(database_error("set SQLite v16 schema version"))
+}
+
+fn migrate_campaign_event_lineage_to_v17(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let has_campaign_id: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('events') WHERE name = 'campaign_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check event campaign lineage column"))?;
+    if !has_campaign_id {
+        transaction
+            .execute_batch(
+                "ALTER TABLE events ADD COLUMN campaign_id TEXT
+                     REFERENCES campaigns(campaign_id) ON DELETE CASCADE;",
+            )
+            .map_err(database_error("add event campaign lineage column"))?;
+    }
+    let has_experiment_id: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('events') WHERE name = 'experiment_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check event experiment lineage column"))?;
+    if !has_experiment_id {
+        transaction
+            .execute_batch(
+                "ALTER TABLE events ADD COLUMN experiment_id TEXT
+                     REFERENCES experiments(experiment_id) ON DELETE SET NULL;",
+            )
+            .map_err(database_error("add event experiment lineage column"))?;
+    }
+    ensure_index_definition(
+        transaction,
+        "events_campaign_status_not_before_idx",
+        EVENTS_CAMPAIGN_STATUS_NOT_BEFORE_INDEX_SQL,
+    )?;
+
+    transaction
+        .execute(
+            "UPDATE submissions
+             SET status = 'unreconciled'
+             WHERE status = 'accepted'
+               AND task_signature LIKE 'provisional-submit:v1:%'",
+            [],
+        )
+        .map_err(database_error("quarantine provisional managed submissions"))?;
+    transaction
+        .execute(
+            "UPDATE experiments
+             SET status = 'unreconciled',
+                 failure_code = 'legacy_provisional_task_identity',
+                 failure_fingerprint = NULL
+             WHERE task_signature LIKE 'provisional-submit:v1:%'
+               AND status != 'unreconciled'",
+            [],
+        )
+        .map_err(database_error("quarantine provisional managed experiments"))?;
+
+    verify_campaign_event_lineage_v17(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 17;")
+        .map_err(database_error("set SQLite v17 schema version"))
+}
+
+fn verify_campaign_event_lineage_v17(connection: &Connection) -> Result<(), AppError> {
+    let columns = connection
+        .prepare("SELECT name, type FROM pragma_table_info('events')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(database_error("verify SQLite v17 event lineage columns"))?;
+    if !columns.iter().any(|column| column == &("campaign_id".to_owned(), "TEXT".to_owned()))
+        || !columns
+            .iter()
+            .any(|column| column == &("experiment_id".to_owned(), "TEXT".to_owned()))
+    {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v17 event lineage schema",
+        });
+    }
+    let index_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'events_campaign_status_not_before_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("verify SQLite v17 event lineage index"))?;
+    if !index_sql.as_deref().is_some_and(|sql| {
+        compact_sql(sql) == compact_sql(EVENTS_CAMPAIGN_STATUS_NOT_BEFORE_INDEX_SQL)
+    }) {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v17 event lineage schema",
+        });
+    }
+    if !campaign_foreign_keys_match(
+        connection,
+        "events",
+        &[
+            ("projects", "project_id", "project_id", "CASCADE"),
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("experiments", "experiment_id", "experiment_id", "SET NULL"),
+        ],
+    )
+    .unwrap_or(false)
+    {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v17 event lineage schema",
+        });
+    }
+    let provisional_accepted: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM submissions
+                 WHERE status = 'accepted'
+                   AND kind = 'campaign'
+                   AND task_signature LIKE 'provisional-submit:v1:%'
+                 UNION ALL
+                 SELECT 1 FROM experiments
+                 WHERE status != 'unreconciled'
+                   AND task_signature LIKE 'provisional-submit:v1:%'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("verify provisional managed identity quarantine"))?;
+    if provisional_accepted {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v17 managed task identity quarantine",
+        });
+    }
+    Ok(())
 }
 
 fn verify_campaign_schema_v16(connection: &Connection) -> Result<(), AppError> {

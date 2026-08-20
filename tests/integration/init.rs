@@ -245,6 +245,25 @@ fn init_instructions_preserve_the_state_md_objective() {
 }
 
 #[test]
+fn init_instructions_keep_phase_one_replacements_advisory_only() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    fs::create_dir(&root).unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    let instructions = fs::read_to_string(root.join(".pueue-agent/instructions.md")).unwrap();
+    assert!(instructions.contains("起動 prompt の SQLite-backed objective snapshot"));
+    assert!(instructions.contains(
+        "bounded な replacement recommendation/proposal を `state.json` に記録する"
+    ));
+    assert!(instructions.contains("`Phase 1` では replacement experiment を投入しない"));
+    assert!(!instructions.contains("replacement experiment を投入する"));
+    assert!(!instructions.contains("replacement を提案・投入"));
+}
+
+#[test]
 fn objective_template_and_getting_started_pin_the_snapshot_contract() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("experiment");

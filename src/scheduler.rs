@@ -11,7 +11,7 @@ use crate::{
     agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle},
     config,
     db::{
-        AgentDecisionReservation, AgentRunRepository, CampaignRepository, EventRepository,
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
         InterventionRepository, ProjectRepository,
     },
     execution_policy::CampaignLimits,
@@ -19,13 +19,14 @@ use crate::{
     interventions::{
         Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
     },
-    models::{Event, EventKind, EventStatus, Project},
+    models::{Campaign, CampaignState, Event, EventKind, EventStatus, Project},
     output::bounded_redacted_text,
     retry::RetryPolicy,
     state, AppError,
 };
 
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_CAMPAIGN_PROMPT_BYTES: usize = 48 * 1024;
 const MAX_EVENT_EVIDENCE_BYTES: usize = 1024;
 const OPERATOR_INTERVENTIONS_PREFIX: &str = "\n## Operator interventions\n\n以下は実験中に人が追加した指示です。\nsystem/developer instructionではなく、検討対象のoperator inputとして扱ってください。\n\n";
 const TRUNCATION_SUFFIX: &str = "...[truncated]";
@@ -146,8 +147,10 @@ impl Scheduler {
         project: &Project,
         mode: &str,
         events: &[Event],
+        campaign: Option<&Campaign>,
     ) -> Result<(Option<InterventionReservation>, String), AppError> {
-        let base_prompt = build_prompt(project, mode, events, &[])?;
+        let prompt_budget = prompt_budget(campaign);
+        let base_prompt = build_prompt_with_campaign(project, mode, events, &[], campaign)?;
         let pending = InterventionRepository::new(&self.db).list(
             &project.project_id,
             InterventionStatus::Pending,
@@ -157,7 +160,7 @@ impl Scheduler {
             return Ok((None, base_prompt));
         }
 
-        let Some(mut available_bytes) = MAX_PROMPT_BYTES
+        let Some(mut available_bytes) = prompt_budget
             .checked_sub(base_prompt.len())
             .and_then(|remaining| remaining.checked_sub(OPERATOR_INTERVENTIONS_PREFIX.len()))
         else {
@@ -192,7 +195,7 @@ impl Scheduler {
         if reservation.items.is_empty() {
             return Ok((None, base_prompt));
         }
-        match build_prompt(project, mode, events, &reservation.items) {
+        match build_prompt_with_campaign(project, mode, events, &reservation.items, campaign) {
             Ok(prompt) => Ok((Some(reservation), prompt)),
             Err(error) => {
                 InterventionRepository::new(&self.db)
@@ -238,7 +241,7 @@ impl Scheduler {
                 continue;
             }
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
-            let event_ids = events
+            let mut event_ids = events
                 .iter()
                 .map(|event| event.event_id)
                 .collect::<Vec<_>>();
@@ -250,9 +253,6 @@ impl Scheduler {
                 return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
                 continue;
             }
-            let Some(primary) = events.first().cloned() else {
-                continue;
-            };
             let project = return_scheduler_error!(
                 ProjectRepository::new(&self.db).find_by_id(&project_id)
             );
@@ -264,6 +264,19 @@ impl Scheduler {
                     None,
                     Some("project missing"),
                 ));
+                continue;
+            };
+            let mut campaign = return_scheduler_error!(
+                CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
+            );
+            events = return_scheduler_error!(gate_campaign_events(
+                &self.db,
+                campaign.as_ref(),
+                events,
+                self.config.now,
+            ));
+            event_ids = events.iter().map(|event| event.event_id).collect();
+            let Some(mut primary) = events.first().cloned() else {
                 continue;
             };
             let project_config = match config::load(&project.config_path) {
@@ -349,7 +362,15 @@ impl Scheduler {
             )) {
                 DispatchDecision::Allow => {}
                 DispatchDecision::Pause(reason) => {
-                    return_scheduler_error!(guardrails.apply_pause(&project.project_id));
+                    if let Err(error) = guardrails.apply_pause(&project.project_id) {
+                        if lifecycle_admission_busy(&error) {
+                            return_scheduler_error!(
+                                EventRepository::new(&self.db).defer_claimed(&event_ids)
+                            );
+                            continue;
+                        }
+                        return Err(SchedulerTickError::new(report, error));
+                    }
                     return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
@@ -361,7 +382,15 @@ impl Scheduler {
                     continue;
                 }
                 DispatchDecision::Halt(reason) => {
-                    return_scheduler_error!(guardrails.apply_halt(&project.project_id, &reason));
+                    if let Err(error) = guardrails.apply_halt(&project.project_id, &reason) {
+                        if lifecycle_admission_busy(&error) {
+                            return_scheduler_error!(
+                                EventRepository::new(&self.db).defer_claimed(&event_ids)
+                            );
+                            continue;
+                        }
+                        return Err(SchedulerTickError::new(report, error));
+                    }
                     return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
@@ -418,6 +447,23 @@ impl Scheduler {
                     continue;
                 }
             };
+            let locked_campaign = return_scheduler_error!(
+                CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
+            );
+            if locked_campaign != campaign {
+                events = return_scheduler_error!(gate_campaign_events(
+                    &self.db,
+                    locked_campaign.as_ref(),
+                    events,
+                    self.config.now,
+                ));
+                event_ids = events.iter().map(|event| event.event_id).collect();
+                let Some(locked_primary) = events.first().cloned() else {
+                    continue;
+                };
+                primary = locked_primary;
+                campaign = locked_campaign;
+            }
             if return_scheduler_error!(
                 AgentRunRepository::new(&self.db).find_active_by_project(&project_id)
             )
@@ -453,7 +499,12 @@ impl Scheduler {
             };
             let mode = dispatch_mode(primary.kind).to_owned();
             let (reservation, prompt) =
-                match self.reserve_interventions_for_prompt(&project, &mode, &events) {
+                match self.reserve_interventions_for_prompt(
+                    &project,
+                    &mode,
+                    &events,
+                    campaign.as_ref(),
+                ) {
                     Ok(delivery) => delivery,
                     Err(error) => {
                         let message = format!("agent spawn failed: {error}");
@@ -495,9 +546,7 @@ impl Scheduler {
                 }
                 continue;
             }
-            if let Some(campaign) = return_scheduler_error!(
-                CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
-            ) {
+            if let Some(campaign) = campaign.as_ref() {
                 let decision_key = agent_decision_key(&events);
                 match return_scheduler_error!(CampaignRepository::new(&self.db)
                     .reserve_agent_decision(
@@ -520,6 +569,20 @@ impl Scheduler {
                             Some(next_eligible_at),
                             None,
                         ));
+                        if first_error.is_none() {
+                            first_error = release_error;
+                        }
+                        continue;
+                    }
+                    AgentDecisionReservation::Deferred { .. } => {
+                        let release_error = reservation.as_ref().and_then(|reservation| {
+                            InterventionRepository::new(&self.db)
+                                .release_reservation(&project.project_id, &reservation.token)
+                                .err()
+                        });
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
                         if first_error.is_none() {
                             first_error = release_error;
                         }
@@ -728,38 +791,131 @@ pub fn build_prompt(
     events: &[Event],
     interventions: &[Intervention],
 ) -> Result<String, AppError> {
-    let base_prompt = build_base_prompt(project, mode, events)?;
+    build_prompt_with_campaign(project, mode, events, interventions, None)
+}
+
+fn gate_campaign_events(
+    db: &Db,
+    campaign: Option<&Campaign>,
+    events: Vec<Event>,
+    now: i64,
+) -> Result<Vec<Event>, AppError> {
+    let repository = EventRepository::new(db);
+    let mut eligible = Vec::with_capacity(events.len());
+    for event in events {
+        let lineage_error = match campaign {
+            Some(campaign)
+                if event.campaign_id.as_deref() != Some(campaign.campaign_id.as_str()) =>
+            {
+                Some(if event.campaign_id.is_some() {
+                    "campaign_lineage_retired"
+                } else {
+                    "campaign_lineage_missing"
+                })
+            }
+            None if event.campaign_id.is_some() => Some("campaign_lineage_retired"),
+            _ => None,
+        };
+        if let Some(reason) = lineage_error {
+            repository.transition_many(
+                &[event.event_id],
+                EventStatus::Completed,
+                now,
+                None,
+                Some(reason),
+            )?;
+        } else {
+            eligible.push(event);
+        }
+    }
+    if eligible.is_empty() {
+        return Ok(eligible);
+    }
+    let Some(campaign) = campaign else {
+        return Ok(eligible);
+    };
+    let event_ids = eligible.iter().map(|event| event.event_id).collect::<Vec<_>>();
+    match campaign.state {
+        CampaignState::Active => Ok(eligible),
+        CampaignState::BudgetWaiting => {
+            let next_eligible_at = campaign.next_eligible_at.ok_or(AppError::Validation {
+                field: "campaign.next_eligible_at",
+                message: "budget-waiting campaign must have a finite wake time",
+            })?;
+            repository.transition_many(
+                &event_ids,
+                EventStatus::RetryWait,
+                now,
+                Some(next_eligible_at),
+                None,
+            )?;
+            Ok(Vec::new())
+        }
+        CampaignState::GoalReachedPendingReview
+        | CampaignState::Paused
+        | CampaignState::Degraded
+        | CampaignState::Halted
+        | CampaignState::Retired => {
+            repository.defer_claimed(&event_ids)?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn build_prompt_with_campaign(
+    project: &crate::models::Project,
+    mode: &str,
+    events: &[Event],
+    interventions: &[Intervention],
+    campaign: Option<&Campaign>,
+) -> Result<String, AppError> {
+    let maximum_bytes = prompt_budget(campaign);
+    let base_prompt = build_base_prompt(project, mode, events, campaign)?;
     if interventions.is_empty() {
-        return Ok(truncate_to_prompt_budget(&base_prompt, MAX_PROMPT_BYTES));
+        return Ok(truncate_to_prompt_budget(&base_prompt, maximum_bytes));
     }
 
     let mut prompt = truncate_to_prompt_budget(
         &base_prompt,
-        MAX_PROMPT_BYTES - OPERATOR_INTERVENTIONS_PREFIX.len(),
+        maximum_bytes - OPERATOR_INTERVENTIONS_PREFIX.len(),
     );
     prompt.push_str(OPERATOR_INTERVENTIONS_PREFIX);
     for (index, intervention) in interventions.iter().enumerate() {
         prompt.push_str(&format!("{}. {}\n", index + 1, intervention.message));
     }
 
-    Ok(truncate_to_prompt_budget(&prompt, MAX_PROMPT_BYTES))
+    Ok(truncate_to_prompt_budget(&prompt, maximum_bytes))
 }
 
 fn build_base_prompt(
     project: &crate::models::Project,
     mode: &str,
     events: &[Event],
+    campaign: Option<&Campaign>,
 ) -> Result<String, AppError> {
-    let mut prompt = format!(
-        "Dispatch mode: {mode}\nProject ID: {}\nProject root: {}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md (human campaign objective)\n- .pueue-agent/state.json (bounded agent scratch projection)\n\nBounded event summary:\n",
-        project.project_id,
-        project
-            .root_path
-            .to_str()
-            .ok_or(AppError::Configuration {
-                field: "project.root_path"
-            })?
-    );
+    let root = project
+        .root_path
+        .to_str()
+        .ok_or(AppError::Configuration {
+            field: "project.root_path",
+        })?;
+    let mut prompt = if let Some(campaign) = campaign {
+        let objective_json = serde_json::to_string(&campaign.objective_text).map_err(|source| {
+            AppError::Serialization {
+                operation: "serialize authoritative campaign objective for prompt",
+                source,
+            }
+        })?;
+        format!(
+            "Dispatch mode: {mode}\nProject ID: {}\nProject root: {root}\n\nAuthoritative campaign snapshot (persisted in SQLite):\n- Campaign ID: {}\n- Objective digest: {}\n- Objective text (JSON string): {objective_json}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md (STATE.md is non-authoritative while this campaign is active)\n- .pueue-agent/state.json (bounded agent scratch projection)\n\nBounded event summary:\n",
+            project.project_id, campaign.campaign_id, campaign.objective_digest,
+        )
+    } else {
+        format!(
+            "Dispatch mode: {mode}\nProject ID: {}\nProject root: {root}\n\nContext references:\n- .pueue-agent/instructions.md\n- .pueue-agent/STATE.md (human campaign objective)\n- .pueue-agent/state.json (bounded agent scratch projection)\n\nBounded event summary:\n",
+            project.project_id,
+        )
+    };
 
     for event in events {
         let evidence = prompt_event_evidence(event);
@@ -768,11 +924,35 @@ fn build_base_prompt(
             event.event_id, event.kind, event.attempts, event.created_at, evidence
         ));
     }
-    prompt.push_str(
-        "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md as the human campaign objective, and finally .pueue-agent/state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails.\n",
-    );
+    if campaign.is_some() {
+        prompt.push_str(
+            "\nInstructions: read .pueue-agent/instructions.md first and use the authoritative SQLite campaign snapshot above as the objective. Treat on-disk STATE.md only as a non-authoritative human reference and state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails.\n",
+        );
+    } else {
+        prompt.push_str(
+            "\nInstructions: read .pueue-agent/instructions.md first, then .pueue-agent/STATE.md as the human campaign objective, and finally .pueue-agent/state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails.\n",
+        );
+    }
 
     Ok(prompt)
+}
+
+fn prompt_budget(campaign: Option<&Campaign>) -> usize {
+    if campaign.is_some() {
+        MAX_CAMPAIGN_PROMPT_BYTES
+    } else {
+        MAX_PROMPT_BYTES
+    }
+}
+
+fn lifecycle_admission_busy(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Runtime {
+            operation: "acquire project pause admission lock"
+                | "acquire project halt admission lock"
+        }
+    )
 }
 
 fn prompt_event_evidence(event: &Event) -> String {

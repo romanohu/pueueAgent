@@ -289,6 +289,24 @@ impl fmt::Debug for ResolvedExecutionPolicy {
     }
 }
 
+impl ResolvedExecutionPolicy {
+    pub fn project_root_anchor(
+        &self,
+        root: &Path,
+    ) -> Result<ProjectRootAnchor, PolicyViolation> {
+        self.project_root_anchors
+            .iter()
+            .find(|anchor| anchor.canonical_path == root)
+            .cloned()
+            .ok_or_else(|| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::PreBinding,
+                )
+            })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedProjectExecutionPolicy {
     pub project_id: String,

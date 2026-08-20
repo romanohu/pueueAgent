@@ -111,7 +111,34 @@ impl PueueApi for FakePueue {
             }
             .into());
         }
-        Ok(*self.state.add_task_id.lock().unwrap())
+        let task_id = *self.state.add_task_id.lock().unwrap();
+        let group = args
+            .windows(2)
+            .find(|pair| pair[0] == "-g")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let command = args
+            .iter()
+            .position(|argument| argument == "--")
+            .map(|separator| {
+                args[separator + 1..]
+                    .iter()
+                    .map(|argument| shell_quote(&argument.to_string_lossy()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        self.state.tasks.lock().unwrap().push(PueueTask {
+            id: task_id,
+            group,
+            command,
+            state: "Queued".to_owned(),
+            enqueued_at: Some("100".to_owned()),
+            started_at: None,
+            ended_at: None,
+            result: None,
+        });
+        Ok(task_id)
     }
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
@@ -131,6 +158,32 @@ impl PueueApi for FakePueue {
             .push(group.to_owned());
         Ok(())
     }
+}
+
+fn shell_quote(argument: &str) -> String {
+    if !argument.is_empty()
+        && argument.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'@'
+                    | b'%'
+                    | b'_'
+                    | b'+'
+                    | b'='
+                    | b':'
+                    | b','
+                    | b'.'
+                    | b'/'
+                    | b'-'
+            )
+        })
+    {
+        return argument.to_owned();
+    }
+    format!("'{}'", argument.replace('\'', r"'\''"))
 }
 
 pub struct FakePueueCommand {

@@ -240,6 +240,28 @@ max_agent_runs = 10
             .event_id
     }
 
+    fn enqueue_for_campaign(
+        &self,
+        kind: EventKind,
+        dedup_key: &str,
+        campaign_id: &str,
+    ) -> i64 {
+        EventRepository::new(&self.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    "project-a",
+                    kind,
+                    dedup_key,
+                    json!({"task_id": 41}),
+                    self.now,
+                    self.now,
+                )
+                .with_campaign_lineage(campaign_id, None::<String>),
+            )
+            .unwrap()
+            .event_id
+    }
+
     fn enqueue_with_reason(
         &self,
         kind: EventKind,
@@ -312,9 +334,24 @@ max_agent_runs = 10
     }
 
     fn start_campaign(&self) -> String {
+        self.start_campaign_with_ids(
+            "scheduler-campaign",
+            "scheduler-campaign",
+            "Reach validation loss below 0.20\n",
+            "scheduler-campaign-objective-digest",
+        )
+    }
+
+    fn start_campaign_with_ids(
+        &self,
+        campaign_id: &str,
+        id_prefix: &str,
+        objective_text: &str,
+        objective_digest: &str,
+    ) -> String {
         let objective = ObjectiveSnapshot {
-            text: "Reach validation loss below 0.20\n".to_owned(),
-            digest: "scheduler-campaign-objective-digest".to_owned(),
+            text: objective_text.to_owned(),
+            digest: objective_digest.to_owned(),
         };
         let argv = vec!["python".to_owned(), "train.py".to_owned()];
         let proposal = proposals::validate_initial_baseline(
@@ -332,14 +369,14 @@ max_agent_runs = 10
         CampaignRepository::new(&self.db)
             .start_with_baseline(
                 StartCampaignRequest {
-                    campaign_id: "scheduler-campaign",
+                    campaign_id,
                     project_id: "project-a",
                     objective: &objective,
                     initial_argv: &argv,
                     baseline: &proposal,
-                    submission_id: "scheduler-campaign-submission",
-                    experiment_id: "scheduler-campaign-experiment",
-                    proposal_id: "scheduler-campaign-proposal",
+                    submission_id: &format!("{id_prefix}-submission"),
+                    experiment_id: &format!("{id_prefix}-experiment"),
+                    proposal_id: &format!("{id_prefix}-proposal"),
                     metadata: &json!({}),
                     origin_agent_run_id: None,
                     now: self.now,
@@ -539,6 +576,7 @@ fn campaign_agent_budget_two_connection_race_allows_six_and_waits_the_seventh() 
                     Some(*next_eligible_at)
                 }
                 AgentDecisionReservation::Reserved(_) => None,
+                AgentDecisionReservation::Deferred { .. } => None,
             })
             .collect::<Vec<_>>(),
         vec![3_700]
@@ -662,10 +700,10 @@ async fn campaign_agent_budget_scheduler_defers_without_creating_an_agent_run() 
             )
             .unwrap();
     }
-    let event_id = harness.enqueue(
+    let event_id = harness.enqueue_for_campaign(
         EventKind::TaskFailed,
-        "project-a",
         "campaign-agent-budget-scheduler",
+        &campaign_id,
     );
 
     harness.scheduler().tick().await.unwrap();
@@ -677,6 +715,152 @@ async fn campaign_agent_budget_scheduler_defers_without_creating_an_agent_run() 
     assert_eq!(
         AgentRunRepository::new(&harness.db)
             .count_by_project("project-a")
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn campaign_prompt_embeds_the_authoritative_persisted_objective_snapshot() {
+    let harness = SchedulerHarness::new();
+    harness.start_campaign();
+    fs::write(
+        harness.root("project-a").join(".pueue-agent/STATE.md"),
+        "FORGED MUTABLE OBJECTIVE",
+    )
+    .unwrap();
+    harness.enqueue_for_campaign(
+        EventKind::TaskFailed,
+        "campaign-objective-authority",
+        "scheduler-campaign",
+    );
+
+    let mut report = harness.scheduler().tick().await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    let prompt = &report.started[0].prompt;
+    assert!(prompt.contains("Reach validation loss below 0.20"));
+    assert!(prompt.contains("scheduler-campaign-objective-digest"));
+    assert!(prompt.contains("STATE.md is non-authoritative"));
+    assert!(!prompt.contains("FORGED MUTABLE OBJECTIVE"));
+
+    let mut started = report.started.pop().unwrap();
+    started
+        .handle
+        .wait(&harness.db, harness.now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn campaign_prompt_preserves_the_tail_of_a_maximum_escaped_objective() {
+    let harness = SchedulerHarness::new();
+    let tail = "OBJECTIVE_TAIL_SENTINEL";
+    let objective = format!(
+        "{}{}",
+        "\"".repeat(pueue_agent::state::MAX_OBJECTIVE_BYTES - tail.len()),
+        tail
+    );
+    let campaign_id = harness.start_campaign_with_ids(
+        "scheduler-max-objective-campaign",
+        "scheduler-max-objective",
+        &objective,
+        "scheduler-max-objective-digest",
+    );
+    harness.enqueue_for_campaign(
+        EventKind::TaskFailed,
+        "campaign-max-objective-authority",
+        &campaign_id,
+    );
+
+    let mut report = harness.scheduler().tick().await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    assert!(report.started[0].prompt.contains(tail));
+    assert!(report.started[0].prompt.len() <= 48 * 1024);
+
+    let mut started = report.started.pop().unwrap();
+    started
+        .handle
+        .wait(&harness.db, harness.now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn paused_campaign_defers_lineaged_events_without_failing_the_scheduler_tick() {
+    let harness = SchedulerHarness::new();
+    let campaign_id = harness.start_campaign();
+    let event_id = harness.enqueue_for_campaign(
+        EventKind::TaskFailed,
+        "paused-campaign-event",
+        &campaign_id,
+    );
+    CampaignRepository::new(&harness.db)
+        .pause("project-a", harness.now + 1)
+        .unwrap();
+
+    let report = harness.scheduler().tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.attempts, 0);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn retired_campaign_event_is_never_rebound_to_the_current_campaign() {
+    let harness = SchedulerHarness::new();
+    let retired_campaign_id = harness.start_campaign_with_ids(
+        "retired-campaign",
+        "retired-campaign",
+        "Retired objective\n",
+        "retired-objective-digest",
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "UPDATE experiments
+             SET status = 'succeeded', finished_at = 101
+             WHERE campaign_id = 'retired-campaign';
+             UPDATE budget_reservations
+             SET status = 'consumed'
+             WHERE campaign_id = 'retired-campaign';
+             UPDATE campaigns
+             SET state = 'retired', state_reason = 'operator_retired', updated_at = 101
+             WHERE campaign_id = 'retired-campaign';",
+        )
+        .unwrap();
+    let current_campaign_id = harness.start_campaign_with_ids(
+        "current-campaign",
+        "current-campaign",
+        "Current objective\n",
+        "current-objective-digest",
+    );
+    let event_id = harness.enqueue_for_campaign(
+        EventKind::TaskFinished,
+        "retired-campaign-terminal-event",
+        &retired_campaign_id,
+    );
+
+    let report = harness.scheduler().tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::Completed);
+    assert_eq!(event.last_error.as_deref(), Some("campaign_lineage_retired"));
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND dimension = 'agent_run'",
+                [&current_campaign_id],
+                |row| row.get::<_, i64>(0),
+            )
             .unwrap(),
         0
     );
@@ -1159,6 +1343,8 @@ fn scheduler_prompt_projects_only_allowlisted_event_payload_fields() {
     let event = Event {
         event_id: 901,
         project_id: "project-a".to_owned(),
+        campaign_id: None,
+        experiment_id: None,
         kind: EventKind::TaskFailed,
         dedup_key: "safe-payload-projection".to_owned(),
         payload: json!({

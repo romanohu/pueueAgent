@@ -22,7 +22,10 @@ use crate::{
     environment::{
         MAX_PRIVATE_TEMP_RUN_ID, PrivateRunTemp, ProjectAdmissionLock, RunIdAdmissionGuard,
     },
-    execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage, ProjectRootAnchor},
+    execution_policy::{
+        PolicyViolation, PolicyViolationCode, PolicyViolationStage, ProjectRootAnchor,
+        VerifiedProjectRoot,
+    },
     interventions::{
         validate_message, Intervention, InterventionCounts, InterventionReservation,
         MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES_PER_RUN,
@@ -54,6 +57,33 @@ fn acquire_run_id_admission_guard(db: &Db) -> Result<RunIdAdmissionGuard, AppErr
             operation: "acquire agent run ID admission guard",
         }),
     }
+}
+
+pub(super) struct ProjectLifecycleAdmission {
+    _verified_root: VerifiedProjectRoot,
+    _lock: ProjectAdmissionLock,
+}
+
+pub(super) fn acquire_project_lifecycle_admission(
+    db: &Db,
+    project_id: &str,
+    operation: &'static str,
+) -> Result<ProjectLifecycleAdmission, AppError> {
+    let project = ProjectRepository::new(db)
+        .find_by_id(project_id)?
+        .ok_or(AppError::Runtime {
+            operation: "read project for lifecycle admission",
+        })?;
+    let root_anchor = ProjectRootAnchor::resolve(&project.root_path).map_err(AppError::from)?;
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    let project_lock = ProjectAdmissionLock::try_acquire(&verified_root)
+        .map_err(AppError::from)?
+        .ok_or(AppError::Runtime { operation })?;
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    Ok(ProjectLifecycleAdmission {
+        _verified_root: verified_root,
+        _lock: project_lock,
+    })
 }
 
 impl<'db> ProjectRepository<'db> {
@@ -234,6 +264,11 @@ impl<'db> ProjectRepository<'db> {
     }
 
     pub fn pause(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
+        let _admission = acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire project pause admission lock",
+        )?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -315,6 +350,11 @@ impl<'db> ProjectRepository<'db> {
     }
 
     pub fn halt(&self, project_id: &str, reason: &str, now: i64) -> Result<Project, AppError> {
+        let _admission = acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire project halt admission lock",
+        )?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -358,6 +398,11 @@ impl<'db> ProjectRepository<'db> {
         now: i64,
         unresolved_task_ids: &[i64],
     ) -> Result<Project, AppError> {
+        let _admission = acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire project disable admission lock",
+        )?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -605,15 +650,18 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin idempotent event insert"))?;
+        validate_event_lineage(&transaction, event)?;
         let inserted = transaction
             .execute(
                 "INSERT INTO events (
-                    project_id, kind, dedup_key, payload_json, status, attempts,
+                    project_id, campaign_id, experiment_id, kind, dedup_key, payload_json, status, attempts,
                     not_before, lease_until, created_at, completed_at, last_error
-                 ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?6, NULL, NULL)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, ?8, NULL, NULL)
                  ON CONFLICT(project_id, dedup_key) DO NOTHING",
                 params![
                     event.project_id,
+                    event.campaign_id,
+                    event.experiment_id,
                     event.kind,
                     event.dedup_key,
                     payload_json,
@@ -629,6 +677,12 @@ impl<'db> EventRepository<'db> {
                 event_from_row,
             )
             .map_err(database_error("read idempotent event"))?;
+        if stored.campaign_id != event.campaign_id || stored.experiment_id != event.experiment_id {
+            return Err(AppError::Validation {
+                field: "event.lineage",
+                message: "conflicts with the existing event lineage",
+            });
+        }
         transaction
             .commit()
             .map_err(database_error("commit idempotent event insert"))?;
@@ -650,6 +704,7 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin periodic deep check scheduling"))?;
+        validate_event_lineage(&transaction, event)?;
 
         let has_open_event = transaction
             .query_row(
@@ -742,12 +797,14 @@ impl<'db> EventRepository<'db> {
         let inserted = transaction
             .execute(
                 "INSERT INTO events (
-                    project_id, kind, dedup_key, payload_json, status, attempts,
+                    project_id, campaign_id, experiment_id, kind, dedup_key, payload_json, status, attempts,
                     not_before, lease_until, created_at, completed_at, last_error
-                 ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?6, NULL, NULL)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, ?8, NULL, NULL)
                  ON CONFLICT(project_id, dedup_key) DO NOTHING",
                 params![
                     event.project_id,
+                    event.campaign_id,
+                    event.experiment_id,
                     event.kind,
                     event.dedup_key,
                     payload_json,
@@ -867,13 +924,17 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin pending event replacement"))?;
+        validate_event_lineage(&transaction, event)?;
         let changed = transaction
             .execute(
                 "UPDATE events
-                 SET kind = ?1, dedup_key = ?2, payload_json = ?3,
-                     not_before = ?4, created_at = ?5
-                 WHERE event_id = ?6 AND status = 'pending'",
+                 SET campaign_id = ?1, experiment_id = ?2,
+                     kind = ?3, dedup_key = ?4, payload_json = ?5,
+                     not_before = ?6, created_at = ?7
+                 WHERE event_id = ?8 AND status = 'pending'",
                 params![
+                    event.campaign_id,
+                    event.experiment_id,
                     event.kind,
                     event.dedup_key,
                     payload_json,
@@ -916,13 +977,17 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin callback terminal replacement"))?;
+        validate_event_lineage(&transaction, event)?;
         let changed = transaction
             .execute(
                 "UPDATE events
-                 SET kind = ?1, dedup_key = ?2, payload_json = ?3,
-                     not_before = ?4, created_at = ?5
-                 WHERE event_id = ?6",
+                 SET campaign_id = ?1, experiment_id = ?2,
+                     kind = ?3, dedup_key = ?4, payload_json = ?5,
+                     not_before = ?6, created_at = ?7
+                 WHERE event_id = ?8",
                 params![
+                    event.campaign_id,
+                    event.experiment_id,
                     event.kind,
                     event.dedup_key,
                     payload_json,
@@ -1027,6 +1092,12 @@ impl<'db> EventRepository<'db> {
                            SELECT 1 FROM agent_runs
                            WHERE agent_runs.project_id = events.project_id
                              AND status IN ('starting', 'running')
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM campaigns
+                           WHERE campaigns.project_id = events.project_id
+                             AND campaigns.state <> 'retired'
+                             AND campaigns.state <> 'active'
                        )
                        {blocked_filter}
                      ORDER BY created_at, event_id
@@ -5876,7 +5947,7 @@ impl<'db> TaskObservationRepository<'db> {
 }
 
 const EVENT_SELECT: &str =
-    "SELECT event_id, project_id, kind, dedup_key, payload_json, status, attempts,
+    "SELECT event_id, project_id, campaign_id, experiment_id, kind, dedup_key, payload_json, status, attempts,
             not_before, lease_until, created_at, completed_at, last_error
      FROM events";
 
@@ -5962,6 +6033,72 @@ fn exists(
         .map_err(database_error("check database uniqueness"))
 }
 
+fn validate_event_lineage(
+    transaction: &Transaction<'_>,
+    event: &NewEvent,
+) -> Result<(), AppError> {
+    if event.experiment_id.is_some() && event.campaign_id.is_none() {
+        return Err(AppError::Validation {
+            field: "event.experiment_id",
+            message: "requires campaign lineage",
+        });
+    }
+    let Some(campaign_id) = event.campaign_id.as_deref() else {
+        return Ok(());
+    };
+    if campaign_id.is_empty() {
+        return Err(AppError::Validation {
+            field: "event.campaign_id",
+            message: "must be non-empty",
+        });
+    }
+    let campaign_project_id = transaction
+        .query_row(
+            "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
+            [campaign_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error("validate event campaign lineage"))?
+        .ok_or(AppError::Validation {
+            field: "event.campaign_id",
+            message: "does not identify a campaign",
+        })?;
+    if campaign_project_id != event.project_id {
+        return Err(AppError::Validation {
+            field: "event.campaign_id",
+            message: "must belong to the event project",
+        });
+    }
+    if let Some(experiment_id) = event.experiment_id.as_deref() {
+        if experiment_id.is_empty() {
+            return Err(AppError::Validation {
+                field: "event.experiment_id",
+                message: "must be non-empty",
+            });
+        }
+        let experiment_campaign_id = transaction
+            .query_row(
+                "SELECT campaign_id FROM experiments WHERE experiment_id = ?1",
+                [experiment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error("validate event experiment lineage"))?
+            .ok_or(AppError::Validation {
+                field: "event.experiment_id",
+                message: "does not identify an experiment",
+            })?;
+        if experiment_campaign_id != campaign_id {
+            return Err(AppError::Validation {
+                field: "event.experiment_id",
+                message: "must belong to the event campaign",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         project_id: row.get(0)?,
@@ -5977,23 +6114,25 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
 }
 
 fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
-    let payload_json: String = row.get(4)?;
+    let payload_json: String = row.get(6)?;
     let payload = serde_json::from_str(&payload_json).map_err(|source| {
-        rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(source))
+        rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(source))
     })?;
     Ok(Event {
         event_id: row.get(0)?,
         project_id: row.get(1)?,
-        kind: row.get(2)?,
-        dedup_key: row.get(3)?,
+        campaign_id: row.get(2)?,
+        experiment_id: row.get(3)?,
+        kind: row.get(4)?,
+        dedup_key: row.get(5)?,
         payload,
-        status: row.get(5)?,
-        attempts: row.get(6)?,
-        not_before: row.get(7)?,
-        lease_until: row.get(8)?,
-        created_at: row.get(9)?,
-        completed_at: row.get(10)?,
-        last_error: row.get(11)?,
+        status: row.get(7)?,
+        attempts: row.get(8)?,
+        not_before: row.get(9)?,
+        lease_until: row.get(10)?,
+        created_at: row.get(11)?,
+        completed_at: row.get(12)?,
+        last_error: row.get(13)?,
     })
 }
 

@@ -13,7 +13,7 @@ const MAX_HYPOTHESIS_BYTES: usize = 4 * 1024;
 const MAX_EXPECTED_EVIDENCE_ITEMS: usize = 16;
 const MAX_EXPECTED_EVIDENCE_BYTES: usize = 512;
 const MAX_SOURCE_EXPERIMENT_ID_BYTES: usize = 128;
-const PUEUE_ADD_FIXED_ARGV_ITEMS: usize = 9;
+const PUEUE_ADD_FIXED_ARGV_ITEMS: usize = 11;
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -362,6 +362,20 @@ mod tests {
         proposal.argv = vec!["x".repeat(crate::process::MAX_FIELD_SIZE + 1)];
 
         assert!(proposals::validate(proposal, "objective-digest").is_err());
+    }
+
+    #[test]
+    fn managed_native_frame_accepts_245_arguments_and_rejects_246() {
+        let mut maximum = input(ProposalKind::Experiment);
+        maximum.argv = (0..245).map(|index| format!("arg-{index}")).collect();
+        assert!(proposals::validate(maximum, "objective-digest").is_ok());
+
+        let mut overflow = input(ProposalKind::Experiment);
+        overflow.argv = (0..246).map(|index| format!("arg-{index}")).collect();
+        assert!(matches!(
+            proposals::validate(overflow, "objective-digest"),
+            Err(crate::AppError::Validation { field: "argv", .. })
+        ));
     }
 
     #[test]

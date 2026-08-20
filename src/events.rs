@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
-    db::{Db, EventRepository, IntegrationEventRepository, ProjectRepository},
+    db::{CampaignRepository, Db, EventRepository, IntegrationEventRepository, ProjectRepository},
     models::{EventKind, IntegrationEventKind, NewEvent, NewIntegrationEvent},
     paths,
     pueue::PueueTask,
@@ -27,14 +27,18 @@ pub fn record_operator_wake_with(
         });
     }
     let reason = crate::output::bounded_redacted_text(reason);
-    let event = EventRepository::new(db).insert_idempotent(&NewEvent::new(
+    let mut event = NewEvent::new(
         project_id,
         EventKind::OperatorWake,
         format!("operator-wake:v1:{}", Uuid::new_v4()),
         json!({"source": "operator", "reason": reason}),
         now,
         now,
-    ))?;
+    );
+    if let Some(campaign) = CampaignRepository::new(db).find_live_by_project(project_id)? {
+        event = event.with_campaign_lineage(campaign.campaign_id, None::<String>);
+    }
+    let event = EventRepository::new(db).insert_idempotent(&event)?;
     Ok(event.event_id)
 }
 
