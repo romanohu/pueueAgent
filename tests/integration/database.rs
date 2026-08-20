@@ -2765,6 +2765,36 @@ fn v16_migration_quarantines_accepted_managed_provisional_identities() {
             102,
         )
         .unwrap();
+    let submissions = SubmissionRepository::new(&harness.test.db);
+    for (submission_id, kind, task_id, task_signature) in [
+        (
+            "standalone-control",
+            SubmissionKind::Control,
+            42,
+            "provisional-submit:v1:standalone-control",
+        ),
+        (
+            "standalone-batch-job",
+            SubmissionKind::Experiment,
+            43,
+            "provisional-submit:v1:standalone-batch-job",
+        ),
+    ] {
+        submissions
+            .insert_idempotent(&NewSubmission::with_kind_metadata(
+                submission_id,
+                CampaignDbHarness::PROJECT_ID,
+                vec!["python".to_owned(), "ordinary.py".to_owned()],
+                103,
+                kind,
+                json!({"source": "ordinary"}),
+                None,
+            ))
+            .unwrap();
+        submissions
+            .mark_accepted(submission_id, task_id, task_signature)
+            .unwrap();
+    }
     harness
         .test
         .db
@@ -2789,6 +2819,138 @@ fn v16_migration_quarantines_accepted_managed_provisional_identities() {
         Some("legacy_provisional_task_identity")
     );
     assert_eq!(submission.status, SubmissionStatus::Unreconciled);
+    let reservation_status: BudgetReservationStatus = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE experiment_id = ?1",
+            [CampaignDbHarness::BASELINE_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_status, BudgetReservationStatus::Reserved);
+    for (submission_id, task_id, task_signature) in [
+        (
+            "standalone-control",
+            42,
+            "provisional-submit:v1:standalone-control",
+        ),
+        (
+            "standalone-batch-job",
+            43,
+            "provisional-submit:v1:standalone-batch-job",
+        ),
+    ] {
+        let ordinary = submissions.find_by_id(submission_id).unwrap().unwrap();
+        assert_eq!(ordinary.status, SubmissionStatus::Accepted);
+        assert_eq!(ordinary.pueue_task_id, Some(task_id));
+        assert_eq!(ordinary.task_signature.as_deref(), Some(task_signature));
+    }
+}
+
+#[test]
+fn v16_migration_quarantines_terminal_managed_provisional_identity_fail_closed() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 101)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "provisional-submit:v1:legacy-terminal",
+            102,
+        )
+        .unwrap();
+    experiments
+        .project_terminal_submission(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            ExperimentTerminalOutcome::Failed {
+                failure_code: "exit_nonzero",
+                failure_fingerprint: "legacy-fingerprint",
+            },
+            103,
+        )
+        .unwrap();
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 16;")
+        .unwrap();
+
+    Db::open(&harness.test.path).unwrap();
+
+    let experiment = experiments
+        .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+    assert_eq!(
+        experiment.failure_code.as_deref(),
+        Some("legacy_provisional_task_identity")
+    );
+    assert_eq!(experiment.failure_fingerprint, None);
+    let submission = SubmissionRepository::new(&harness.test.db)
+        .find_by_id("submission-baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(submission.status, SubmissionStatus::Unreconciled);
+    let reservation_status: BudgetReservationStatus = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE experiment_id = ?1",
+            [CampaignDbHarness::BASELINE_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_status, BudgetReservationStatus::Consumed);
+}
+
+#[test]
+fn current_schema_verifier_rejects_a_linked_accepted_provisional_submission() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments
+        .mark_submitting(CampaignDbHarness::BASELINE_EXPERIMENT_ID, 101)
+        .unwrap();
+    experiments
+        .mark_accepted(
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            41,
+            "provisional-submit:v1:linked-verifier-gap",
+            102,
+        )
+        .unwrap();
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE experiments
+             SET status = 'unreconciled', failure_code = 'fixture'
+             WHERE experiment_id = ?1",
+            [CampaignDbHarness::BASELINE_EXPERIMENT_ID],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        Db::open(&harness.test.path),
+        Err(AppError::Runtime {
+            operation: "verify SQLite v17 managed task identity quarantine",
+        })
+    ));
 }
 
 #[test]

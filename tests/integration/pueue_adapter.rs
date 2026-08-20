@@ -1,5 +1,8 @@
 #[path = "../support/fake_pueue.rs"]
 mod fake_pueue;
+#[cfg(unix)]
+#[path = "../support/config_read_barrier.rs"]
+mod config_read_barrier;
 #[cfg(all(unix, debug_assertions))]
 #[path = "../support/native_process_fixture.rs"]
 mod native_process_fixture;
@@ -26,6 +29,8 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 use fake_pueue::{FakePueue, FakePueueCommand};
+#[cfg(unix)]
+use config_read_barrier::ConfigReadBarrier;
 #[cfg(all(unix, debug_assertions))]
 use native_process_fixture::{
     NativeBehavior, NativeFakePueue, OUTPUT_SENTINEL, OVERFLOW_SENTINEL_REPETITIONS,
@@ -1375,6 +1380,76 @@ async fn batch_admission_blocks_a_racing_campaign_baseline_before_persistence() 
     assert_eq!(harness.pueue_add_calls(), 1);
     harness.fake.release_add();
     batch.await.unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_pause_winning_before_control_admission_prevents_persistence_and_add() {
+    let harness = SubmitHarness::new();
+    let config_path = harness.root.join(".pueue-agent/config.toml");
+    let barrier_path = harness.root.join(".pueue-agent/control-read-barrier.toml");
+    fs::copy(config_path, &barrier_path).unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE projects SET config_path = ?1 WHERE project_id = 'project-a'",
+            [barrier_path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    let barrier = ConfigReadBarrier::install(&barrier_path);
+    let db = harness.db.clone();
+    let root = harness.root.clone();
+    let fake = harness.fake.clone();
+    let control = tokio::spawn(async move {
+        submit_legacy_control(
+            &db,
+            &root,
+            &[OsString::from("python"), OsString::from("control.py")],
+            &fake,
+        )
+        .await
+    });
+    barrier.wait_until_reader_opened().await;
+    ProjectRepository::new(&harness.db)
+        .pause("project-a", 101)
+        .unwrap();
+    barrier.release();
+
+    assert!(control.await.unwrap().is_err());
+    assert_eq!(harness.table_count("submissions"), 0);
+    assert_eq!(harness.pueue_add_calls(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_disable_winning_before_batch_admission_prevents_persistence_and_add() {
+    let harness = SubmitHarness::new();
+    let manifest = harness.root.join("lifecycle-before-batch.json");
+    fs::write(
+        &manifest,
+        r#"{"jobs":[{"id":"job-a","argv":["python","batch.py"]}]}"#,
+    )
+    .unwrap();
+    let barrier = ConfigReadBarrier::install(&manifest);
+    let db = harness.db.clone();
+    let root = harness.root.clone();
+    let fake = harness.fake.clone();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let batch = tokio::spawn(async move {
+        batches::run_with(&db, &root, &request_id, &manifest, None, &fake).await
+    });
+    barrier.wait_until_reader_opened().await;
+    ProjectRepository::new(&harness.db)
+        .disable("project-a", 101, &[])
+        .unwrap();
+    barrier.release();
+
+    assert!(batch.await.unwrap().is_err());
+    assert_eq!(harness.table_count("batch_requests"), 0);
+    assert_eq!(harness.table_count("submissions"), 0);
+    assert_eq!(harness.pueue_add_calls(), 0);
 }
 
 #[tokio::test]

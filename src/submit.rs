@@ -252,6 +252,11 @@ async fn run_with_options_inner<P: PueueApi + ?Sized>(
     }
 
     let _admission = acquire_submission_admission(&root_anchor)?;
+    let registered = ProjectRepository::new(db)
+        .refresh_admission_authority(&registered)?
+        .ok_or(AppError::Runtime {
+            operation: "submit after project authority was lost",
+        })?;
     if CampaignRepository::new(db)
         .find_live_by_project(&registered.project_id)?
         .is_some()

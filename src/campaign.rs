@@ -32,6 +32,12 @@ const ADD_UNKNOWN_REASON: &str = "pueue_add_unknown";
 const ADD_INTERRUPTED_REASON: &str = "pueue_add_interrupted";
 const ADD_IDENTITY_REASON: &str = "pueue_identity_unresolved";
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum CampaignSubmission {
+    Submitted(Submission),
+    Deferred,
+}
+
 pub fn render_status_for_project(
     db: &Db,
     project: &Project,
@@ -231,8 +237,15 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             },
             &self.limits,
         )?;
-        self.submit_accepted_intent_inner(&intent, project, now, Some(admission))
-            .await
+        match self
+            .submit_accepted_intent_inner(&intent, project, now, Some(admission))
+            .await?
+        {
+            CampaignSubmission::Submitted(submission) => Ok(submission),
+            CampaignSubmission::Deferred => Err(AppError::Runtime {
+                operation: "submit admitted campaign baseline",
+            }),
+        }
     }
 
     pub async fn submit_accepted_intent(
@@ -241,6 +254,24 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         now: i64,
     ) -> Result<Submission, AppError> {
+        match self
+            .submit_accepted_intent_inner(intent, project, now, None)
+            .await?
+        {
+            CampaignSubmission::Submitted(submission) => Ok(submission),
+            CampaignSubmission::Deferred => Err(AppError::Validation {
+                field: "campaign",
+                message: "campaign and project authority must permit reserved submission",
+            }),
+        }
+    }
+
+    pub async fn submit_reserved_intent(
+        &self,
+        intent: &ManagedSubmissionIntent,
+        project: &Project,
+        now: i64,
+    ) -> Result<CampaignSubmission, AppError> {
         self.submit_accepted_intent_inner(intent, project, now, None)
             .await
     }
@@ -251,7 +282,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         now: i64,
         admission: Option<CampaignAdmission>,
-    ) -> Result<Submission, AppError> {
+    ) -> Result<CampaignSubmission, AppError> {
         let experiments = ExperimentRepository::new(self.db);
         let current = experiments
             .find_by_id(&intent.experiment.experiment_id)?
@@ -309,7 +340,12 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
 
         match current.status {
             ExperimentStatus::Reserved => {
-                experiments.mark_submitting(&current.experiment_id, now)?;
+                if experiments
+                    .begin_submitting_or_defer(&current.experiment_id, now)?
+                    .is_none()
+                {
+                    return Ok(CampaignSubmission::Deferred);
+                }
                 admission
                     .verified_root
                     .anchor
@@ -333,7 +369,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                     .find_by_id(&current.submission_id)?
                     .ok_or(AppError::Runtime {
                         operation: "read accepted campaign submission",
-                    });
+                    })
+                    .map(CampaignSubmission::Submitted);
             }
         }
 
@@ -393,6 +430,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             .ok_or(AppError::Runtime {
                 operation: "read accepted campaign submission",
             })
+            .map(CampaignSubmission::Submitted)
     }
 
     fn acquire_admission(&self, project: &Project) -> Result<CampaignAdmission, AppError> {

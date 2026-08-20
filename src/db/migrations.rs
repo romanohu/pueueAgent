@@ -1446,7 +1446,11 @@ fn migrate_campaign_event_lineage_to_v17(
             "UPDATE submissions
              SET status = 'unreconciled'
              WHERE status = 'accepted'
-               AND task_signature LIKE 'provisional-submit:v1:%'",
+               AND task_signature LIKE 'provisional-submit:v1:%'
+               AND EXISTS (
+                   SELECT 1 FROM experiments
+                   WHERE experiments.submission_id = submissions.submission_id
+               )",
             [],
         )
         .map_err(database_error("quarantine provisional managed submissions"))?;
@@ -1522,8 +1526,11 @@ fn verify_campaign_event_lineage_v17(connection: &Connection) -> Result<(), AppE
             "SELECT EXISTS(
                  SELECT 1 FROM submissions
                  WHERE status = 'accepted'
-                   AND kind = 'campaign'
                    AND task_signature LIKE 'provisional-submit:v1:%'
+                   AND EXISTS (
+                       SELECT 1 FROM experiments
+                       WHERE experiments.submission_id = submissions.submission_id
+                   )
                  UNION ALL
                  SELECT 1 FROM experiments
                  WHERE status != 'unreconciled'

@@ -263,6 +263,27 @@ impl<'db> ProjectRepository<'db> {
         Ok(projects)
     }
 
+    pub fn refresh_admission_authority(
+        &self,
+        expected: &Project,
+    ) -> Result<Option<Project>, AppError> {
+        let current = self
+            .find_by_id(&expected.project_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read project during admission revalidation",
+            })?;
+        if current.root_path != expected.root_path || current.pueue_group != expected.pueue_group {
+            return Err(AppError::Validation {
+                field: "project",
+                message: "root and group identity must remain stable during admission",
+            });
+        }
+        if !current.enabled || current.paused || current.halted_reason.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(current))
+    }
+
     pub fn pause(&self, project_id: &str, now: i64) -> Result<Project, AppError> {
         let _admission = acquire_project_lifecycle_admission(
             self.db,
@@ -1002,6 +1023,24 @@ impl<'db> EventRepository<'db> {
                 operation: "replace callback with terminal event",
             });
         }
+        transaction
+            .execute(
+                "UPDATE events
+                 SET status = 'pending', attempts = 0, lease_until = NULL,
+                     completed_at = NULL, last_error = NULL
+                 WHERE event_id = ?1
+                   AND status = 'completed'
+                   AND last_error = 'campaign_lineage_missing'
+                   AND campaign_id IS NOT NULL
+                   AND experiment_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_run_events
+                       WHERE agent_run_events.project_id = events.project_id
+                         AND agent_run_events.event_id = events.event_id
+                   )",
+                [event_id],
+            )
+            .map_err(database_error("requeue trusted terminal event"))?;
         let stored = transaction
             .query_row(
                 &format!("{} WHERE event_id = ?1", EVENT_SELECT),

@@ -12,11 +12,13 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     db::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
-        InterventionRepository, ProjectRepository, StartCampaignRequest, SubmissionRepository,
+        ExperimentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
+        SubmissionRepository,
     },
     models::{
         AgentContextMode, AgentRunStatus, CampaignState, Event, EventKind, EventStatus,
@@ -27,8 +29,11 @@ use pueue_agent::{
         StartupEnvironment, TempUnsafeReason,
     },
     proposals::{self, ProposalInput},
+    pueue::{PueueApi, PueueTask},
+    reconcile::{managed_task_run_signature, Reconciler},
     scheduler::{build_prompt, Scheduler, SchedulerConfig},
     state::ObjectiveSnapshot,
+    AppError,
 };
 use rusqlite::params;
 use serde_json::json;
@@ -39,6 +44,40 @@ use tokio::time::{sleep, Duration, Instant};
 #[cfg(unix)]
 #[path = "../support/execution_policy_fixture.rs"]
 mod execution_policy_fixture;
+#[cfg(unix)]
+#[path = "../support/config_read_barrier.rs"]
+mod config_read_barrier;
+
+#[cfg(unix)]
+use config_read_barrier::ConfigReadBarrier;
+
+#[derive(Clone)]
+struct TerminalStatusPueue {
+    task: PueueTask,
+}
+
+#[async_trait]
+impl PueueApi for TerminalStatusPueue {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        Ok(vec![self.task.clone()])
+    }
+
+    async fn add(&self, _args: &[std::ffi::OsString]) -> Result<i64, AppError> {
+        panic!("terminal status fixture must not add tasks")
+    }
+
+    async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("terminal status fixture must not kill tasks")
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("terminal status fixture must not remove tasks")
+    }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        panic!("terminal status fixture must not provision groups")
+    }
+}
 
 #[cfg(unix)]
 struct NativeSchedulerFixture {
@@ -805,6 +844,108 @@ async fn paused_campaign_defers_lineaged_events_without_failing_the_scheduler_ti
     assert_eq!(event.status, EventStatus::Pending);
     assert_eq!(event.attempts, 0);
     assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_pause_winning_before_scheduler_admission_prevents_a_durable_run() {
+    let harness = SchedulerHarness::new();
+    let event_id = harness.enqueue(
+        EventKind::TaskFailed,
+        "project-a",
+        "project-lifecycle-before-scheduler-admission",
+    );
+    let mut scheduler = harness.scheduler();
+    let barrier = ConfigReadBarrier::install(
+        &harness.root("project-a").join(".pueue-agent/config.toml"),
+    );
+    let tick = tokio::spawn(async move { scheduler.tick().await });
+    barrier.wait_until_reader_opened().await;
+    ProjectRepository::new(&harness.db)
+        .pause("project-a", harness.now + 1)
+        .unwrap();
+    barrier.release();
+
+    let mut report = tick.await.unwrap().unwrap();
+    let started_count = report.started.len();
+    for mut started in report.started.drain(..) {
+        started
+            .handle
+            .wait(&harness.db, harness.now + 1)
+            .await
+            .unwrap();
+    }
+    assert_eq!(started_count, 0);
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.attempts, 0);
+    assert_eq!(harness.active_runs("project-a"), 0);
+}
+
+#[tokio::test]
+async fn trusted_terminal_lineage_requeues_the_scheduler_drained_event_once() {
+    let harness = SchedulerHarness::new();
+    harness.start_campaign();
+    let experiment_id = "scheduler-campaign-experiment";
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments.mark_submitting(experiment_id, 101).unwrap();
+    let task = PueueTask {
+        id: 41,
+        group: "pa-project-a".to_owned(),
+        command: "python train.py".to_owned(),
+        state: "Done".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("100".to_owned()),
+        ended_at: Some("100".to_owned()),
+        result: Some(json!("Success")),
+    };
+    let fake = TerminalStatusPueue { task: task.clone() };
+    let mut reconciler = Reconciler::new(&harness.db, fake);
+
+    reconciler.run_once_at(harness.now).await.unwrap();
+    let report = harness.scheduler().tick().await.unwrap();
+    assert!(report.started.is_empty());
+    let drained = EventRepository::new(&harness.db)
+        .recent_events("project-a", 10)
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].status, EventStatus::Completed);
+    assert_eq!(
+        drained[0].last_error.as_deref(),
+        Some("campaign_lineage_missing")
+    );
+    let drained_event_id = drained[0].event_id;
+
+    experiments
+        .mark_accepted(
+            experiment_id,
+            task.id,
+            &managed_task_run_signature(&task).unwrap(),
+            102,
+        )
+        .unwrap();
+    reconciler.run_once_at(103).await.unwrap();
+
+    let events = EventRepository::new(&harness.db)
+        .recent_events("project-a", 10)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_id, drained_event_id);
+    assert_eq!(events[0].status, EventStatus::Pending);
+    assert_eq!(events[0].attempts, 0);
+    assert_eq!(events[0].lease_until, None);
+    assert_eq!(events[0].completed_at, None);
+    assert_eq!(events[0].last_error, None);
+    assert_eq!(
+        events[0].campaign_id.as_deref(),
+        Some("scheduler-campaign")
+    );
+    assert_eq!(events[0].experiment_id.as_deref(), Some(experiment_id));
+    let dispatchable = EventRepository::new(&harness.db)
+        .claim_batch(103, 163, 10)
+        .unwrap();
+    assert_eq!(dispatchable.len(), 1);
+    assert_eq!(dispatchable[0].event_id, events[0].event_id);
 }
 
 #[tokio::test]

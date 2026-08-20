@@ -447,6 +447,17 @@ impl Scheduler {
                     continue;
                 }
             };
+            let project = match return_scheduler_error!(
+                ProjectRepository::new(&self.db).refresh_admission_authority(&project)
+            ) {
+                Some(project) => project,
+                None => {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).defer_claimed(&event_ids)
+                    );
+                    continue;
+                }
+            };
             let locked_campaign = return_scheduler_error!(
                 CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
             );

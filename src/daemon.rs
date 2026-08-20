@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{AgentHandle, AgentRunner, BoundCleanupHandle},
-    campaign::CampaignCoordinator,
+    campaign::{CampaignCoordinator, CampaignSubmission},
     config,
     db::{
         AgentRunRepository, CampaignRepository, Db, ProjectRepository,
@@ -247,10 +247,10 @@ where
                 self.policy.campaign_limits,
             )
             .with_root_anchor(root_anchor)
-            .submit_accepted_intent(&intent, &project, now)
+            .submit_reserved_intent(&intent, &project, now)
             .await;
             match result {
-                Ok(_) => {}
+                Ok(CampaignSubmission::Submitted(_)) | Ok(CampaignSubmission::Deferred) => {}
                 Err(AppError::Runtime {
                     operation: "acquire project submission admission lock",
                 }) => continue,

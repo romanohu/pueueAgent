@@ -2,7 +2,10 @@ use std::{
     ffi::OsString,
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -43,6 +46,9 @@ struct FakePueue {
     add_calls: Arc<Mutex<Vec<Vec<OsString>>>>,
     kill_calls: Arc<Mutex<Vec<i64>>>,
     status_observed: Arc<Notify>,
+    pause_next_add: Arc<AtomicBool>,
+    add_observed: Arc<Notify>,
+    add_release: Arc<Notify>,
 }
 
 impl FakePueue {
@@ -53,6 +59,9 @@ impl FakePueue {
             add_calls: Arc::new(Mutex::new(Vec::new())),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
             status_observed: Arc::new(Notify::new()),
+            pause_next_add: Arc::new(AtomicBool::new(false)),
+            add_observed: Arc::new(Notify::new()),
+            add_release: Arc::new(Notify::new()),
         }
     }
 
@@ -75,6 +84,18 @@ impl FakePueue {
     async fn wait_for_status(&self) {
         self.status_observed.notified().await;
     }
+
+    fn pause_next_add(&self) {
+        self.pause_next_add.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_add(&self) {
+        self.add_observed.notified().await;
+    }
+
+    fn release_add(&self) {
+        self.add_release.notify_one();
+    }
 }
 
 #[async_trait]
@@ -87,6 +108,10 @@ impl PueueApi for FakePueue {
 
     async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
         self.add_calls.lock().unwrap().push(args.to_vec());
+        if self.pause_next_add.swap(false, Ordering::SeqCst) {
+            self.add_observed.notify_one();
+            self.add_release.notified().await;
+        }
         let group = args
             .windows(2)
             .find(|pair| pair[0] == "-g")
@@ -322,9 +347,22 @@ max_agent_runs = 10
     }
 
     fn campaign_experiment(&self) -> String {
+        self.campaign_experiment_for(
+            "project-a",
+            "daemon-campaign",
+            "daemon-campaign-experiment",
+        )
+    }
+
+    fn campaign_experiment_for(
+        &self,
+        project_id: &str,
+        campaign_id: &str,
+        experiment_id: &str,
+    ) -> String {
         let objective = pueue_agent::state::ObjectiveSnapshot {
             text: "Reach validation loss below 0.20\n".to_owned(),
-            digest: "daemon-campaign-objective-digest".to_owned(),
+            digest: format!("{campaign_id}-objective-digest"),
         };
         let argv = vec!["python".to_owned(), "train.py".to_owned()];
         let proposal = proposals::validate_initial_baseline(
@@ -339,18 +377,18 @@ max_agent_runs = 10
             &objective.digest,
         )
         .unwrap();
-        fs::create_dir_all(self.root("project-a").join("nested")).unwrap();
+        fs::create_dir_all(self.root(project_id).join("nested")).unwrap();
         CampaignRepository::new(&self.db)
             .start_with_baseline(
                 StartCampaignRequest {
-                    campaign_id: "daemon-campaign",
-                    project_id: "project-a",
+                    campaign_id,
+                    project_id,
                     objective: &objective,
                     initial_argv: &argv,
                     baseline: &proposal,
-                    submission_id: "daemon-campaign-submission",
-                    experiment_id: "daemon-campaign-experiment",
-                    proposal_id: "daemon-campaign-proposal",
+                    submission_id: &format!("{campaign_id}-submission"),
+                    experiment_id,
+                    proposal_id: &format!("{campaign_id}-proposal"),
                     metadata: &json!({}),
                     origin_agent_run_id: None,
                     now: 100,
@@ -666,6 +704,96 @@ async fn campaign_recovery_defers_paused_intent_then_dispatches_once_after_resum
             .status,
         ExperimentStatus::Accepted
     );
+}
+
+async fn assert_campaign_recovery_defers_post_snapshot_authority_loss(authority_loss: &str) {
+    let harness = DaemonHarness::new();
+    harness.register_project("project-b", "pa-project-b", "/bin/echo");
+    harness.campaign_experiment();
+    let deferred_experiment = harness.campaign_experiment_for(
+        "project-b",
+        "zz-daemon-campaign",
+        "zz-daemon-campaign-experiment",
+    );
+    harness.fake_pueue.pause_next_add();
+    let mut daemon = harness.daemon_at(200);
+    let first_tick = tokio::spawn(async move {
+        let result = daemon.run_once().await;
+        (daemon, result)
+    });
+    harness.fake_pueue.wait_for_add().await;
+
+    match authority_loss {
+        "pause" => {
+            ProjectRepository::new(&harness.db)
+                .pause("project-b", 201)
+                .unwrap();
+        }
+        "disable" => {
+            ProjectRepository::new(&harness.db)
+                .disable("project-b", 201, &[])
+                .unwrap();
+        }
+        "budget_waiting" => {
+            let campaigns = CampaignRepository::new(&harness.db);
+            for index in 0..=6 {
+                campaigns
+                    .reserve_agent_decision(
+                        "zz-daemon-campaign",
+                        &format!("post-snapshot-decision-{index}"),
+                        &CampaignLimits::default(),
+                        201,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                campaigns
+                    .find_by_id("zz-daemon-campaign")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                CampaignState::BudgetWaiting
+            );
+        }
+        _ => unreachable!(),
+    }
+    harness.fake_pueue.release_add();
+
+    let (mut daemon, result) = first_tick.await.unwrap();
+    result.unwrap();
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&deferred_experiment)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved,
+    );
+    assert_eq!(
+        harness
+            .fake_pueue
+            .add_calls()
+            .iter()
+            .filter(|args| args.get(1).is_some_and(|group| group == "pa-project-b"))
+            .count(),
+        0,
+    );
+    daemon.run_once().await.unwrap();
+}
+
+#[tokio::test]
+async fn campaign_recovery_defers_post_snapshot_pause_without_stopping_the_daemon() {
+    assert_campaign_recovery_defers_post_snapshot_authority_loss("pause").await;
+}
+
+#[tokio::test]
+async fn campaign_recovery_defers_post_snapshot_disable_without_stopping_the_daemon() {
+    assert_campaign_recovery_defers_post_snapshot_authority_loss("disable").await;
+}
+
+#[tokio::test]
+async fn campaign_recovery_defers_post_snapshot_budget_wait_without_stopping_the_daemon() {
+    assert_campaign_recovery_defers_post_snapshot_authority_loss("budget_waiting").await;
 }
 
 #[tokio::test]

@@ -265,10 +265,10 @@ async fn run_with_inner<P: PueueApi + ?Sized>(
             message: "a managed campaign is active; use pueue-agent steer",
         });
     }
-    let group = requested_group.unwrap_or(&registered.pueue_group);
+    let preflight_group = requested_group.unwrap_or(&registered.pueue_group);
     let manifest = load_manifest(manifest_path)?;
     for job in &manifest.jobs {
-        validate_add_argv(&pueue_add_args(group, &job.argv))?;
+        validate_add_argv(&pueue_add_args(preflight_group, &job.argv))?;
     }
     let root_anchor = match root_anchor {
         Some(root_anchor) => root_anchor,
@@ -281,6 +281,12 @@ async fn run_with_inner<P: PueueApi + ?Sized>(
         });
     }
     let _admission = acquire_batch_admission(&root_anchor)?;
+    let registered = ProjectRepository::new(db)
+        .refresh_admission_authority(&registered)?
+        .ok_or(AppError::Runtime {
+            operation: "submit batch after project authority was lost",
+        })?;
+    let group = requested_group.unwrap_or(&registered.pueue_group);
     if CampaignRepository::new(db)
         .find_live_by_project(&registered.project_id)?
         .is_some()

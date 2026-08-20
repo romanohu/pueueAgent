@@ -188,3 +188,95 @@ future campaign-scoped intervention schema change, not by adding an autonomous l
 The implementation and this report are committed together with subject
 `fix: close managed campaign safety gaps`. The exact commit hash is reported in the final handoff
 because a commit cannot contain its own content hash.
+
+## Additional human-authorized residual fix wave
+
+This additional wave was explicitly authorized after the final-wave cap. It reviewed the four
+load-bearing residual Important findings against `56c59fa21a27cc17eb992bc55d66c86f860de80c` and
+found all four valid.
+
+### Residual verdicts and RED/GREEN evidence
+
+1. **Schema v17 quarantined ordinary provisional submissions — valid, fixed.** The migration RED
+   left accepted standalone control and batch-style rows `unreconciled`; a separate current-schema
+   RED showed the verifier accepted a linked managed provisional submission because it tested the
+   nonexistent `kind = 'campaign'` value. Migration and verification now classify managed
+   submissions solely by `experiments.submission_id` linkage. Accepted unlinked control and batch
+   rows retain status and identity. Linked accepted and terminal managed rows fail closed; failure
+   fingerprints are cleared, while Reserved and Consumed reservation states are retained as
+   appropriate.
+
+2. **Trusted terminal lineage could not revive a scheduler-drained event — valid, fixed.** The RED
+   reconciled a terminal task while its experiment was Submitting, let the scheduler complete the
+   unlineaged event as `campaign_lineage_missing`, accepted the task, and reconciled again; the only
+   event remained Completed. Terminal replacement now atomically requeues that same row only when
+   it has newly trusted campaign and experiment lineage and no `agent_run_events` binding. GREEN
+   coverage proves one row, the same event ID, Pending status, zero attempts, cleared lease,
+   completion, and error fields, and exactly one dispatchable lineaged event.
+
+3. **Reserved recovery treated ordinary authority loss as daemon-fatal — valid, fixed.** Three
+   deterministic post-snapshot REDs let project pause, project disable, or finite BudgetWaiting win
+   before the second reserved intent acquired admission. Each propagated validation out of the
+   daemon tick. The coordinator now returns a typed `Submitted` or `Deferred` result. Its
+   transactional Reserved transition first rejects experiment/submission invariant corruption,
+   then defers ordinary campaign or project authority loss without changing the experiment or
+   calling Pueue. GREEN coverage proves the affected intent remains Reserved, the affected group
+   receives zero adds, and the daemon remains usable on the next tick for all three lifecycle
+   states.
+
+4. **Scheduler, direct control, and batch trusted stale project authority — valid, fixed.** The
+   direct-control RED accepted a pre-paused project, while FIFO scheduler and batch RED barriers let
+   pause or disable commit after the initial Project snapshot but before project admission; the
+   scheduler started a run and the batch persisted/added using stale state. All three paths now
+   reread Project while holding admission, require enabled, unpaused, unhalted authority, reject
+   root/group identity drift, and use the refreshed Project. Final GREEN coverage uses exact
+   lifecycle-before-admission barriers for all three paths and proves scheduler deferral with zero
+   attempts/runs and direct/batch rejection with zero durable rows and zero Pueue adds.
+
+### Additional-wave changed files
+
+- `src/batches.rs`
+- `src/campaign.rs`
+- `src/daemon.rs`
+- `src/db/campaigns.rs`
+- `src/db/migrations.rs`
+- `src/db/repositories.rs`
+- `src/scheduler.rs`
+- `src/submit.rs`
+- `tests/integration/daemon.rs`
+- `tests/integration/database.rs`
+- `tests/integration/pueue_adapter.rs`
+- `tests/integration/scheduler.rs`
+- `tests/support/config_read_barrier.rs`
+- `.superpowers/sdd/2026-08-17-zero-adapter-campaign-safety-core/final-fix-report.md`
+
+### Additional-wave verification
+
+Focused REDs were observed before the corresponding production edits. After implementation:
+
+- `cargo test --test database` — 165 passed, 0 failed.
+- `cargo test --test reconciliation` — 27 passed, 0 failed.
+- `cargo test --test scheduler` — 71 passed, 0 failed.
+- The three focused daemon post-snapshot authority-loss tests — 3 passed, 0 failed.
+- The focused direct-control and batch lifecycle-before-admission tests — 2 passed, 0 failed.
+- The focused terminal-lineage requeue test — 1 passed, 0 failed.
+- `cargo check --all-targets` — passed.
+- `cargo check --release --all-targets` — passed.
+- `git diff --check` — passed.
+
+The full daemon integration binary had 51 passes and the pre-existing shutdown/RetryWait failure;
+the full Pueue-adapter binary had 71 passes and the pre-existing Darwin native-deadline failure.
+The single requested broad run stopped in the untouched library binary with 182 passes, two Darwin
+platform failures, and 12 ignored tests: the existing execution-policy `ENOTDIR` case and an
+`EPERM` process-group probe case in untouched code. Cargo therefore did not proceed to the
+integration binaries in that broad invocation. No production code implicated by either library
+failure was changed in this wave. The repository-wide formatter check also continues to report
+broad pre-existing formatting drift, so no unrelated formatting rewrite was applied.
+
+### Remaining concerns
+
+Supported-Linux real-Pueue verification remains the same external pending gate. This wave adds no
+Phase 2 proposal loop, observer, evaluator, autonomous code-change path, or worktree execution.
+The user-owned untracked `docs/report/` tree was not read, modified, or staged. The additional wave
+is committed with subject `fix: close residual campaign races`; the exact commit hash is reported
+in the handoff.

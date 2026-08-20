@@ -1434,6 +1434,20 @@ impl<'db> ExperimentRepository<'db> {
     }
 
     pub fn mark_submitting(&self, experiment_id: &str, now: i64) -> Result<Experiment, AppError> {
+        self.begin_submitting_or_defer(experiment_id, now)?
+            .ok_or_else(|| {
+                validation_error(
+                    "campaign",
+                    "campaign and project authority must permit reserved submission",
+                )
+            })
+    }
+
+    pub(crate) fn begin_submitting_or_defer(
+        &self,
+        experiment_id: &str,
+        now: i64,
+    ) -> Result<Option<Experiment>, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1446,13 +1460,6 @@ impl<'db> ExperimentRepository<'db> {
             ));
         }
         let campaign = read_campaign(&transaction, &experiment.campaign_id)?;
-        if campaign.state != CampaignState::Active {
-            return Err(validation_error(
-                "campaign",
-                "must be active to begin a reserved submission",
-            ));
-        }
-        validate_project_available(&transaction, &campaign.project_id)?;
         let submission = read_submission(&transaction, &experiment.submission_id)?;
         if submission.status != SubmissionStatus::Pending
             || submission.pueue_task_id.is_some()
@@ -1462,6 +1469,19 @@ impl<'db> ExperimentRepository<'db> {
                 "submission",
                 "reserved experiment submission identity is inconsistent",
             ));
+        }
+        let project_available = project_is_available(&transaction, &campaign.project_id)?;
+        if campaign.state == CampaignState::BudgetWaiting && campaign.next_eligible_at.is_none() {
+            return Err(validation_error(
+                "campaign.next_eligible_at",
+                "budget-waiting campaign must have a finite wake time",
+            ));
+        }
+        if campaign.state != CampaignState::Active || !project_available {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred experiment submission"))?;
+            return Ok(None);
         }
         transaction
             .execute(
@@ -1473,7 +1493,7 @@ impl<'db> ExperimentRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit experiment submitting transition"))?;
-        Ok(stored)
+        Ok(Some(stored))
     }
 
     pub fn mark_accepted(
@@ -1788,6 +1808,19 @@ fn validate_project_available(
     transaction: &Transaction<'_>,
     project_id: &str,
 ) -> Result<(), AppError> {
+    if !project_is_available(transaction, project_id)? {
+        return Err(validation_error(
+            "project",
+            "must be enabled, unpaused, and not halted",
+        ));
+    }
+    Ok(())
+}
+
+fn project_is_available(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<bool, AppError> {
     let state = transaction
         .query_row(
             "SELECT enabled, paused, halted_reason FROM projects WHERE project_id = ?1",
@@ -1803,13 +1836,7 @@ fn validate_project_available(
         .optional()
         .map_err(database_error("read project state for campaign admission"))?
         .ok_or_else(|| validation_error("project_id", "does not identify a registered project"))?;
-    if !state.0 || state.1 || state.2.is_some() {
-        return Err(validation_error(
-            "project",
-            "must be enabled, unpaused, and not halted",
-        ));
-    }
-    Ok(())
+    Ok(state.0 && !state.1 && state.2.is_none())
 }
 
 fn insert_proposal(
