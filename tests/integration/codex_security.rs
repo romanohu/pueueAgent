@@ -17,7 +17,10 @@ use pueue_agent::{
         PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor, ResolvedProjectExecutionPolicy,
         StartupEnvironment,
     },
-    environment::{PrivateRunTemp, SanitizedEnvironment},
+    decision_evidence::{
+        MAX_ARTIFACT_HINT_DEPTH, MAX_ARTIFACT_HINT_FIELD_BYTES, MAX_ARTIFACT_HINTS,
+    },
+    environment::{collect_decision_artifact_hints, PrivateRunTemp, SanitizedEnvironment},
     models::AgentContextMode,
 };
 use tempfile::TempDir;
@@ -168,6 +171,90 @@ fn fixture_policy_environment_keeps_network_enabled_without_unlisted_credentials
             assert_eq!(environment.get(name), None, "{name}");
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn decision_artifact_hints_do_not_follow_symlinks_or_escape_the_pinned_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let project_root = fixture.path().join("project");
+    let external_root = fixture.path().join("external");
+    fs::create_dir_all(project_root.join("metrics")).unwrap();
+    fs::create_dir_all(&external_root).unwrap();
+    fs::write(
+        project_root.join("metrics/epoch.json"),
+        "{\"loss\":1.0}\n",
+    )
+    .unwrap();
+    fs::write(external_root.join("secret.txt"), "EVIDENCE_SECRET").unwrap();
+    std::os::unix::fs::symlink(
+        external_root.join("secret.txt"),
+        project_root.join("metrics/external"),
+    )
+    .unwrap();
+    let project_root = fs::canonicalize(project_root).unwrap();
+    let anchor = ProjectRootAnchor::resolve(&project_root).unwrap();
+
+    let hints = collect_decision_artifact_hints(
+        &anchor,
+        MAX_ARTIFACT_HINTS,
+        MAX_ARTIFACT_HINT_DEPTH,
+        MAX_ARTIFACT_HINT_FIELD_BYTES,
+    )
+    .unwrap();
+    let json = serde_json::to_string(&serde_json::json!({ "artifact_hints": hints })).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let hints = value["artifact_hints"].as_array().unwrap();
+    assert!(hints
+        .iter()
+        .any(|hint| hint["path"] == "metrics/epoch.json"));
+    assert!(!hints
+        .iter()
+        .any(|hint| hint["path"] == "metrics/external"));
+    assert!(!json.contains("EVIDENCE_SECRET"));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn decision_artifact_hints_are_deterministic_and_enforce_count_and_depth_bounds() {
+    let fixture = tempfile::tempdir().unwrap();
+    let project_root = fixture.path().join("project");
+    fs::create_dir_all(project_root.join("one/two/three/four/five")).unwrap();
+    fs::write(
+        project_root.join("one/two/three/four/visible.json"),
+        "visible",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("one/two/three/four/five/too-deep.json"),
+        "too deep",
+    )
+    .unwrap();
+    for index in 0..70 {
+        fs::write(project_root.join(format!("metric-{index:02}.json")), "x").unwrap();
+    }
+    let project_root = fs::canonicalize(project_root).unwrap();
+    let anchor = ProjectRootAnchor::resolve(&project_root).unwrap();
+
+    let first = collect_decision_artifact_hints(
+        &anchor,
+        MAX_ARTIFACT_HINTS,
+        MAX_ARTIFACT_HINT_DEPTH,
+        MAX_ARTIFACT_HINT_FIELD_BYTES,
+    )
+    .unwrap();
+    let second = collect_decision_artifact_hints(
+        &anchor,
+        MAX_ARTIFACT_HINTS,
+        MAX_ARTIFACT_HINT_DEPTH,
+        MAX_ARTIFACT_HINT_FIELD_BYTES,
+    )
+    .unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.len(), MAX_ARTIFACT_HINTS);
+    assert!(first.iter().all(|hint| hint.path.split('/').count() <= 4));
+    assert!(!first.iter().any(|hint| hint.path.contains("too-deep")));
 }
 
 #[test]

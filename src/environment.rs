@@ -17,6 +17,8 @@ use std::{
     time::Instant,
 };
 
+use serde::Serialize;
+
 use crate::execution_policy::{
     ExecutableIdentity, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
     PolicyViolationDetail, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
@@ -42,6 +44,66 @@ pub const MAX_PRIVATE_TEMP_CLEANUP_ENTRIES: usize = 4096;
 pub const MAX_PRIVATE_TEMP_ALLOCATED_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_PRIVATE_TEMP_GENERATIONS: usize = 4096;
 pub const MAX_PRIVATE_TEMP_RUN_ID: i64 = i64::MAX - 1;
+const MAX_DECISION_ARTIFACT_SCAN_ENTRIES: usize = 4096;
+
+/// Metadata-only evidence discovered relative to a retained project-root
+/// descriptor. File contents are deliberately outside this projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DecisionArtifactHint {
+    pub path: String,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// Discover bounded regular-file metadata without reopening the project by
+/// pathname or following symlinks, special files, or mount changes.
+pub fn collect_decision_artifact_hints(
+    root_anchor: &crate::execution_policy::ProjectRootAnchor,
+    max_hints: usize,
+    max_depth: usize,
+    max_field_bytes: usize,
+) -> Result<Vec<DecisionArtifactHint>, crate::AppError> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root_anchor, max_hints, max_depth, max_field_bytes);
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .into());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if max_hints == 0 || max_depth == 0 || max_field_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let verified = root_anchor.verify_identity()?;
+        let root_mount = directory_mount_identity_at(
+            &verified.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let mut state = ArtifactHintScan {
+            entries: 0,
+            hints: Vec::with_capacity(max_hints.min(64)),
+            max_hints,
+            max_depth,
+            max_field_bytes,
+            root_owner: root_anchor.identity.owner,
+            root_mount,
+        };
+        let result = scan_artifact_hints(&verified.directory, "", 0, &mut state);
+        root_anchor.verify_identity()?;
+        result?;
+        state.hints.sort_unstable_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.size.cmp(&right.size))
+                .then_with(|| left.mtime.cmp(&right.mtime))
+        });
+        state.hints.truncate(max_hints);
+        Ok(state.hints)
+    }
+}
 
 const BASELINE_NAMES: &[&str] = &[
     "HOME",
@@ -1831,6 +1893,208 @@ impl Drop for OwnedDirectoryStream {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ArtifactHintScan {
+    entries: usize,
+    hints: Vec<DecisionArtifactHint>,
+    max_hints: usize,
+    max_depth: usize,
+    max_field_bytes: usize,
+    root_owner: u32,
+    root_mount: MountIdentity,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ArtifactListedEntry {
+    name: OsString,
+    identity: (u64, u64),
+    mount_identity: MountIdentity,
+    owner: u32,
+    mode: libc::mode_t,
+    size: u64,
+    mtime: i64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ArtifactEntryMetadata {
+    identity: (u64, u64),
+    mount_identity: MountIdentity,
+    owner: u32,
+    mode: libc::mode_t,
+    size: u64,
+    mtime: i64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn scan_artifact_hints(
+    directory: &File,
+    prefix: &str,
+    directory_depth: usize,
+    state: &mut ArtifactHintScan,
+) -> Result<(), PolicyViolation> {
+    let mut entries = artifact_directory_entries(directory, state)?;
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    for entry in entries {
+        if entry.mount_identity != state.root_mount {
+            return Err(temp_violation(TempUnsafeReason::MountBoundary));
+        }
+        if entry.owner != state.root_owner {
+            continue;
+        }
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
+        let entry_depth = directory_depth
+            .checked_add(1)
+            .ok_or_else(|| temp_violation(TempUnsafeReason::DepthLimit))?;
+        if entry_depth > state.max_depth {
+            continue;
+        }
+        let separator_bytes = usize::from(!prefix.is_empty());
+        let path_bytes = prefix
+            .len()
+            .checked_add(separator_bytes)
+            .and_then(|bytes| bytes.checked_add(name.len()))
+            .ok_or_else(|| temp_violation(TempUnsafeReason::ByteLimit))?;
+        if path_bytes > state.max_field_bytes {
+            continue;
+        }
+        let is_directory = entry.mode & libc::S_IFMT == libc::S_IFDIR;
+        let is_regular = entry.mode & libc::S_IFMT == libc::S_IFREG;
+        if is_directory {
+            if entry_depth == state.max_depth {
+                continue;
+            }
+            let child = open_directory_on_mount(
+                directory,
+                &entry.name,
+                state.root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if directory_identity_at(&child, PolicyViolationStage::RunBoundPreMarker)?
+                != entry.identity
+            {
+                return Err(temp_violation(TempUnsafeReason::IdentityChanged));
+            }
+            let path = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            scan_artifact_hints(&child, &path, entry_depth, state)?;
+        } else if is_regular && state.hints.len() < state.max_hints {
+            let path = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            state.hints.push(DecisionArtifactHint {
+                path,
+                size: entry.size,
+                mtime: entry.mtime,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn artifact_directory_entries(
+    directory: &File,
+    state: &mut ArtifactHintScan,
+) -> Result<Vec<ArtifactListedEntry>, PolicyViolation> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+
+    let duplicate = duplicate_directory_fd(directory, PolicyViolationStage::RunBoundPreMarker)?;
+    if unsafe { libc::lseek(duplicate, 0, libc::SEEK_SET) } < 0 {
+        unsafe { libc::close(duplicate) };
+        return Err(temp_violation(TempUnsafeReason::IoFailure));
+    }
+    let stream = OwnedDirectoryStream::open(
+        duplicate,
+        PolicyViolationStage::RunBoundPreMarker,
+        #[cfg(all(test, unix))]
+        None,
+    )?;
+    let remaining = MAX_DECISION_ARTIFACT_SCAN_ENTRIES.saturating_sub(state.entries);
+    let mut entries = Vec::with_capacity(remaining.min(64));
+    loop {
+        clear_errno(PolicyViolationStage::RunBoundPreMarker)?;
+        let entry = unsafe { libc::readdir(stream.as_ptr()) };
+        if entry.is_null() {
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno != 0 {
+                return Err(temp_violation(TempUnsafeReason::IoFailure));
+            }
+            break;
+        }
+        let dirent = unsafe { &*entry };
+        let name_bytes = unsafe { CStr::from_ptr(dirent.d_name.as_ptr()) }.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." || name_bytes.is_empty() {
+            continue;
+        }
+        state.entries = state
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| temp_violation(TempUnsafeReason::EntryLimit))?;
+        if state.entries > MAX_DECISION_ARTIFACT_SCAN_ENTRIES {
+            return Err(temp_violation(TempUnsafeReason::EntryLimit));
+        }
+        if name_bytes.len() > state.max_field_bytes {
+            continue;
+        }
+        let name = OsStr::from_bytes(name_bytes);
+        let metadata = artifact_entry_metadata_at(directory, name)?;
+        entries.push(ArtifactListedEntry {
+            name: name.to_os_string(),
+            identity: metadata.identity,
+            mount_identity: metadata.mount_identity,
+            owner: metadata.owner,
+            mode: metadata.mode,
+            size: metadata.size,
+            mtime: metadata.mtime,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn artifact_entry_metadata_at(
+    directory: &File,
+    name: &OsStr,
+) -> Result<ArtifactEntryMetadata, PolicyViolation> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+
+    let mount_identity = entry_mount_identity_at(
+        directory,
+        name,
+        PolicyViolationStage::RunBoundPreMarker,
+    )?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| temp_violation(TempUnsafeReason::InvalidEntry))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(temp_violation(TempUnsafeReason::IoFailure));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(ArtifactEntryMetadata {
+        identity: (stat.st_dev as u64, stat.st_ino as u64),
+        mount_identity,
+        owner: stat.st_uid,
+        mode: stat.st_mode,
+        size: u64::try_from(stat.st_size).unwrap_or(0),
+        mtime: stat.st_mtime,
+    })
 }
 
 #[cfg(unix)]

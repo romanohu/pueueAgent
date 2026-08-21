@@ -8,6 +8,10 @@ use std::{
 
 use pueue_agent::{
     batches::BatchJobResult,
+    decision_evidence::{
+        DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
+        MAX_DECISION_CONTEXT_BYTES,
+    },
     db::{
         inferred_pre_binding_policy_code, AgentDecisionReservation, AgentRunRepository,
         BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
@@ -18,6 +22,7 @@ use pueue_agent::{
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
         CampaignLimits, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
+        ProjectRootAnchor,
     },
     interventions::{
         InterventionStatus, MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES,
@@ -687,6 +692,103 @@ mod decision_cycle {
             resumed.state_reason.as_deref(),
             Some("decision_attempts_exhausted")
         );
+    }
+}
+
+mod decision_context {
+    use super::*;
+
+    #[test]
+    fn decision_context_is_deterministic_bounded_and_uses_persisted_objective() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let project = ProjectRepository::new(&harness.db)
+            .find_by_id(&harness.project_id)
+            .unwrap()
+            .unwrap();
+        fs::write(
+            project.root_path.join("STATE.md"),
+            "edited STATE objective\nRAW_FULL_LOG_SECRET\n",
+        )
+        .unwrap();
+        fs::create_dir_all(project.root_path.join("metrics")).unwrap();
+        fs::write(
+            project.root_path.join("metrics/full.log"),
+            "RAW_FULL_LOG_SECRET\n",
+        )
+        .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaigns SET objective_text = 'persisted objective' WHERE campaign_id = ?1",
+                [&harness.campaign_id],
+            )
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE submissions SET metadata_json = ?1 WHERE submission_id = (
+                     SELECT submission_id FROM experiments WHERE experiment_id = ?2
+                 )",
+                params![
+                    r#"{"proposal_raw_metadata":"PROPOSAL_RAW_METADATA_SECRET"}"#,
+                    harness.experiment_id,
+                ],
+            )
+            .unwrap();
+        InterventionRepository::new(&harness.db)
+            .insert_pending(
+                &harness.project_id,
+                "continue carefully OPENAI_API_KEY=CREDENTIAL_ENV_SECRET",
+                180,
+            )
+            .unwrap();
+
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let pueue_tasks = [DecisionPueueTaskProjection {
+            task_id: 41,
+            task_signature: "pueue-task:v1:decision-fixture".to_owned(),
+            group: "pa-campaign-project".to_owned(),
+            state: "done".to_owned(),
+            enqueued_at: Some(100),
+            started_at: Some(101),
+            ended_at: Some(103),
+            exit_code: Some(0),
+        }];
+        let request = DecisionEvidenceRequest {
+            reservation: &reservation,
+            root_anchor: &root_anchor,
+            pueue_tasks: &pueue_tasks,
+            observed_at: 200,
+        };
+        let builder = DecisionEvidenceBuilder::new(&harness.db);
+
+        let first = builder.build(&request).unwrap();
+        let second = builder.build(&request).unwrap();
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.json, second.json);
+        assert_eq!(
+            first.digest,
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(first.json.as_bytes())
+            )
+        );
+        assert!(first.json.len() <= MAX_DECISION_CONTEXT_BYTES);
+        assert!(first.json.contains("persisted objective"));
+        assert!(!first.json.contains("edited STATE objective"));
+        assert!(!first.json.contains("CREDENTIAL_ENV_SECRET"));
+        assert!(!first.json.contains("RAW_FULL_LOG_SECRET"));
+        assert!(!first.json.contains("PROPOSAL_RAW_METADATA_SECRET"));
+
+        DecisionRepository::new(&harness.db)
+            .store_evidence(&reservation, &first.json, &first.digest, 201)
+            .unwrap();
     }
 }
 
