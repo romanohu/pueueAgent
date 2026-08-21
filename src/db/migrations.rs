@@ -4,7 +4,11 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 17;
+pub const LATEST_SCHEMA_VERSION: i64 = 18;
+const EVENTS_V18_KIND_LIST: &str =
+    "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
+const EVENTS_V17_KIND_LIST: &str =
+    "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake'";
 const ACTIVE_AGENT_INDEX_SQL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_one_active_per_project_idx
         ON agent_runs(project_id)
@@ -165,6 +169,49 @@ const BUDGET_RESERVATIONS_CAMPAIGN_DIMENSION_WINDOW_INDEX_SQL: &str =
 const EVENTS_CAMPAIGN_STATUS_NOT_BEFORE_INDEX_SQL: &str =
     "CREATE INDEX events_campaign_status_not_before_idx
     ON events(campaign_id, status, not_before, event_id);";
+const DECISION_CYCLES_V18_TABLE_SQL: &str = r#"
+CREATE TABLE decision_cycles (
+  cycle_id TEXT PRIMARY KEY,
+  campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+  source_experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+  state TEXT NOT NULL CHECK (state IN ('pending','analyzing','waiting','completed','degraded')),
+  next_wake_at INTEGER,
+  consecutive_failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failed_attempts >= 0),
+  last_decision_kind TEXT,
+  last_failure_code TEXT,
+  last_failure_summary TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(campaign_id, source_experiment_id)
+);
+"#;
+const DECISION_ATTEMPTS_V18_TABLE_SQL: &str = r#"
+CREATE TABLE decision_attempts (
+  cycle_id TEXT NOT NULL REFERENCES decision_cycles(cycle_id),
+  attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+  state TEXT NOT NULL CHECK (state IN ('reserved','evidence_ready','running','decided','failed')),
+  context_schema_version INTEGER,
+  context_json TEXT,
+  context_digest TEXT,
+  agent_run_id INTEGER REFERENCES agent_runs(run_id),
+  decision_json TEXT,
+  decision_digest TEXT,
+  decision_kind TEXT,
+  failure_code TEXT,
+  failure_summary TEXT,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER,
+  PRIMARY KEY(cycle_id, attempt_number),
+  UNIQUE(agent_run_id)
+);
+"#;
+const DECISION_CYCLES_DUE_INDEX_SQL: &str = "CREATE INDEX decision_cycles_state_wake_updated_idx
+    ON decision_cycles(state, next_wake_at, updated_at);";
+const DECISION_CYCLES_CAMPAIGN_INDEX_SQL: &str = "CREATE INDEX decision_cycles_campaign_state_updated_idx
+    ON decision_cycles(campaign_id, state, updated_at);";
+const DECISION_ATTEMPTS_STATE_INDEX_SQL: &str = "CREATE INDEX decision_attempts_state_created_idx
+    ON decision_attempts(state, created_at);";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -181,6 +228,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
         && missing_execution_projection_columns(connection)?.is_empty();
     if version == LATEST_SCHEMA_VERSION {
+        verify_decision_schema_v18(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -594,6 +642,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_campaign_event_lineage_v17(&transaction)?;
     }
+    if version <= 17 {
+        migrate_decision_schema_to_v18(&transaction)?;
+    } else {
+        verify_decision_schema_v18(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -770,6 +823,18 @@ fn ensure_agent_run_id_sequence(
 }
 
 fn migrate_events_to_v8(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite events schema for v8 migration"))?;
+    if event_kind_list(&event_sql).is_some_and(|list| list.contains("'operator_wake'")) {
+        return transaction
+            .execute_batch("PRAGMA user_version = 8;")
+            .map_err(database_error("set existing SQLite v8 event version"));
+    }
     transaction.execute_batch(r#"
         PRAGMA writable_schema = ON;
         UPDATE sqlite_master
@@ -1546,6 +1611,255 @@ fn verify_campaign_event_lineage_v17(connection: &Connection) -> Result<(), AppE
         });
     }
     Ok(())
+}
+
+fn migrate_decision_schema_to_v18(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    if decision_schema_v18_is_canonical(transaction).unwrap_or(false) {
+        return transaction
+            .execute_batch("PRAGMA user_version = 18;")
+            .map_err(database_error("set existing SQLite v18 schema version"));
+    }
+    let any_decision_schema: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE name IN (
+                    'decision_cycles', 'decision_attempts',
+                    'decision_cycles_state_wake_updated_idx',
+                    'decision_cycles_campaign_state_updated_idx',
+                    'decision_attempts_state_created_idx'
+                )
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check partial SQLite v18 decision schema"))?;
+    if any_decision_schema && !decision_objects_v18_are_canonical(transaction).unwrap_or(false) {
+        return Err(AppError::Runtime {
+            operation: "verify partial SQLite v18 decision schema before migration",
+        });
+    }
+    let event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite events schema for v18 migration"))?;
+    if !event_kind_list_matches(&event_sql, EVENTS_V18_KIND_LIST) {
+        if !event_kind_list_matches(&event_sql, EVENTS_V17_KIND_LIST) {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite event kinds before v18 migration",
+            });
+        }
+        let old_kind_list = event_kind_list(&event_sql).ok_or(AppError::Runtime {
+            operation: "read SQLite events kind list for v18 migration",
+        })?;
+        transaction
+            .execute_batch("PRAGMA writable_schema = ON;")
+            .map_err(database_error("enable SQLite writable schema for v18 event migration"))?;
+        let replaced = transaction.execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'
+                AND sql LIKE '%' || ?1 || '%'",
+            params![
+                old_kind_list,
+                EVENTS_V18_KIND_LIST
+            ],
+        );
+        let writable_schema_disabled = transaction
+            .execute_batch("PRAGMA writable_schema = OFF;")
+            .map_err(database_error(
+                "disable SQLite writable schema after v18 event migration",
+            ));
+        let replaced = replaced.map_err(database_error("add campaign decision event kind"))?;
+        writable_schema_disabled?;
+        if replaced != 1 {
+            return Err(AppError::Runtime {
+                operation: "migrate exactly one SQLite events kind list to v18",
+            });
+        }
+    }
+
+    if !any_decision_schema {
+        for sql in [
+            DECISION_CYCLES_V18_TABLE_SQL,
+            DECISION_ATTEMPTS_V18_TABLE_SQL,
+            DECISION_CYCLES_DUE_INDEX_SQL,
+            DECISION_CYCLES_CAMPAIGN_INDEX_SQL,
+            DECISION_ATTEMPTS_STATE_INDEX_SQL,
+        ] {
+            transaction
+                .execute_batch(sql)
+                .map_err(database_error("apply SQLite v18 decision migration"))?;
+        }
+    }
+    verify_decision_schema_v18(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 18;")
+        .map_err(database_error("set SQLite v18 schema version"))
+}
+
+fn verify_decision_schema_v18(connection: &Connection) -> Result<(), AppError> {
+    if decision_schema_v18_is_canonical(connection).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v18 decision schema",
+        })
+    }
+}
+
+fn decision_schema_v18_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+    let event_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !event_sql
+        .as_deref()
+        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V18_KIND_LIST))
+    {
+        return Ok(false);
+    }
+
+    decision_objects_v18_are_canonical(connection)
+}
+
+fn decision_objects_v18_are_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+
+    for (table, expected_sql) in [
+        ("decision_cycles", DECISION_CYCLES_V18_TABLE_SQL),
+        ("decision_attempts", DECISION_ATTEMPTS_V18_TABLE_SQL),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+
+    if !campaign_table_info_matches(
+        connection,
+        "decision_cycles",
+        &[
+            ("cycle_id", "TEXT", 0, 1),
+            ("campaign_id", "TEXT", 1, 0),
+            ("source_experiment_id", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("next_wake_at", "INTEGER", 0, 0),
+            ("consecutive_failed_attempts", "INTEGER", 1, 0),
+            ("last_decision_kind", "TEXT", 0, 0),
+            ("last_failure_code", "TEXT", 0, 0),
+            ("last_failure_summary", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+        ],
+    )? || !campaign_table_info_matches(
+        connection,
+        "decision_attempts",
+        &[
+            ("cycle_id", "TEXT", 1, 1),
+            ("attempt_number", "INTEGER", 1, 2),
+            ("state", "TEXT", 1, 0),
+            ("context_schema_version", "INTEGER", 0, 0),
+            ("context_json", "TEXT", 0, 0),
+            ("context_digest", "TEXT", 0, 0),
+            ("agent_run_id", "INTEGER", 0, 0),
+            ("decision_json", "TEXT", 0, 0),
+            ("decision_digest", "TEXT", 0, 0),
+            ("decision_kind", "TEXT", 0, 0),
+            ("failure_code", "TEXT", 0, 0),
+            ("failure_summary", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("started_at", "INTEGER", 0, 0),
+            ("finished_at", "INTEGER", 0, 0),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    if !campaign_foreign_keys_match(
+        connection,
+        "decision_cycles",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "NO ACTION"),
+            (
+                "experiments",
+                "source_experiment_id",
+                "experiment_id",
+                "NO ACTION",
+            ),
+        ],
+    )? || !campaign_foreign_keys_match(
+        connection,
+        "decision_attempts",
+        &[
+            ("decision_cycles", "cycle_id", "cycle_id", "NO ACTION"),
+            ("agent_runs", "agent_run_id", "run_id", "NO ACTION"),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    for (name, expected_sql) in [
+        (
+            "decision_cycles_state_wake_updated_idx",
+            DECISION_CYCLES_DUE_INDEX_SQL,
+        ),
+        (
+            "decision_cycles_campaign_state_updated_idx",
+            DECISION_CYCLES_CAMPAIGN_INDEX_SQL,
+        ),
+        (
+            "decision_attempts_state_created_idx",
+            DECISION_ATTEMPTS_STATE_INDEX_SQL,
+        ),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn event_kind_list_matches(event_sql: &str, canonical_kind_list: &str) -> bool {
+    let canonical_kind_list = canonical_kind_list
+        .split_whitespace()
+        .collect::<String>();
+    event_kind_list(event_sql)
+        .map(|list| list.split_whitespace().collect::<String>())
+        .as_deref()
+        == Some(canonical_kind_list.as_str())
+}
+
+fn event_kind_list(event_sql: &str) -> Option<&str> {
+    event_sql
+        .split_once("kind TEXT NOT NULL CHECK (kind IN (")
+        .and_then(|(_, remainder)| remainder.split_once(')').map(|(list, _)| list))
 }
 
 fn verify_campaign_schema_v16(connection: &Connection) -> Result<(), AppError> {

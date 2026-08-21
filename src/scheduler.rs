@@ -240,6 +240,16 @@ impl Scheduler {
                 return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
                 continue;
             }
+            let (legacy_events, decision_event_ids) = partition_legacy_events(events);
+            events = legacy_events;
+            if !decision_event_ids.is_empty() {
+                return_scheduler_error!(
+                    EventRepository::new(&self.db).defer_claimed(&decision_event_ids)
+                );
+            }
+            if events.is_empty() {
+                continue;
+            }
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
             let mut event_ids = events
                 .iter()
@@ -508,7 +518,10 @@ impl Scheduler {
                     continue;
                 }
             };
-            let mode = dispatch_mode(primary.kind).to_owned();
+            let Some(mode) = legacy_dispatch_mode(primary.kind).map(str::to_owned) else {
+                return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                continue;
+            };
             let (reservation, prompt) =
                 match self.reserve_interventions_for_prompt(
                     &project,
@@ -772,6 +785,19 @@ fn group_by_project(events: Vec<Event>) -> BTreeMap<String, Vec<Event>> {
     grouped
 }
 
+fn partition_legacy_events(events: Vec<Event>) -> (Vec<Event>, Vec<i64>) {
+    let mut legacy = Vec::with_capacity(events.len());
+    let mut campaign_decisions = Vec::new();
+    for event in events {
+        if event.kind == EventKind::CampaignDecision {
+            campaign_decisions.push(event.event_id);
+        } else {
+            legacy.push(event);
+        }
+    }
+    (legacy, campaign_decisions)
+}
+
 fn event_priority(kind: EventKind) -> u8 {
     match kind {
         EventKind::Crash
@@ -781,18 +807,20 @@ fn event_priority(kind: EventKind) -> u8 {
         EventKind::Stalled => 1,
         EventKind::TaskFinished => 2,
         EventKind::OperatorWake => 2,
+        EventKind::CampaignDecision => 2,
         EventKind::DeepCheck => 3,
     }
 }
 
-fn dispatch_mode(kind: EventKind) -> &'static str {
+fn legacy_dispatch_mode(kind: EventKind) -> Option<&'static str> {
     match kind {
-        EventKind::Crash | EventKind::AutoKilled | EventKind::TerminationFailed => "crash",
-        EventKind::TaskFailed => "failure",
-        EventKind::Stalled => "stalled",
-        EventKind::TaskFinished => "completion",
-        EventKind::OperatorWake => "operator_wake",
-        EventKind::DeepCheck => "deep_check",
+        EventKind::Crash | EventKind::AutoKilled | EventKind::TerminationFailed => Some("crash"),
+        EventKind::TaskFailed => Some("failure"),
+        EventKind::Stalled => Some("stalled"),
+        EventKind::TaskFinished => Some("completion"),
+        EventKind::OperatorWake => Some("operator_wake"),
+        EventKind::CampaignDecision => None,
+        EventKind::DeepCheck => Some("deep_check"),
     }
 }
 
@@ -1020,8 +1048,46 @@ fn truncate_to_prompt_budget(value: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unresolved_spawn_error;
-    use crate::{agent::AgentSpawnStage, AppError};
+    use super::{partition_legacy_events, legacy_dispatch_mode, unresolved_spawn_error};
+    use crate::{
+        agent::AgentSpawnStage,
+        models::{Event, EventKind, EventStatus},
+        AppError,
+    };
+
+    fn event(event_id: i64, kind: EventKind) -> Event {
+        Event {
+            event_id,
+            project_id: "project-a".to_owned(),
+            campaign_id: None,
+            experiment_id: None,
+            kind,
+            dedup_key: format!("event-{event_id}"),
+            payload: serde_json::json!({}),
+            status: EventStatus::Claimed,
+            attempts: 0,
+            not_before: 100,
+            lease_until: Some(200),
+            created_at: 100,
+            completed_at: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn mixed_batch_partitions_campaign_decisions_out_of_legacy_dispatch() {
+        let (legacy, deferred) = partition_legacy_events(vec![
+            event(1, EventKind::TaskFinished),
+            event(2, EventKind::CampaignDecision),
+        ]);
+        assert_eq!(legacy.iter().map(|event| event.event_id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(deferred, vec![2]);
+    }
+
+    #[test]
+    fn campaign_decision_is_not_a_legacy_agent_dispatch_mode() {
+        assert_eq!(legacy_dispatch_mode(EventKind::CampaignDecision), None);
+    }
 
     #[test]
     fn unresolved_error_signal_wraps_only_unresolved_stages() {

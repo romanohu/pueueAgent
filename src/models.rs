@@ -93,6 +93,7 @@ database_enum!(EventKind {
     AutoKilled => "auto_killed",
     TerminationFailed => "termination_failed",
     OperatorWake => "operator_wake",
+    CampaignDecision => "campaign_decision",
 });
 
 database_enum!(EventStatus {
@@ -200,6 +201,22 @@ database_enum!(ExperimentStatus {
     Succeeded => "succeeded",
     Failed => "failed",
     Cancelled => "cancelled",
+});
+
+database_enum!(DecisionCycleState {
+    Pending => "pending",
+    Analyzing => "analyzing",
+    Waiting => "waiting",
+    Completed => "completed",
+    Degraded => "degraded",
+});
+
+database_enum!(DecisionAttemptState {
+    Reserved => "reserved",
+    EvidenceReady => "evidence_ready",
+    Running => "running",
+    Decided => "decided",
+    Failed => "failed",
 });
 
 database_enum!(BudgetDimension {
@@ -526,6 +543,40 @@ pub struct Experiment {
     pub failure_fingerprint: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionCycle {
+    pub cycle_id: String,
+    pub campaign_id: String,
+    pub source_experiment_id: String,
+    pub state: DecisionCycleState,
+    pub next_wake_at: Option<i64>,
+    pub consecutive_failed_attempts: i64,
+    pub last_decision_kind: Option<String>,
+    pub last_failure_code: Option<String>,
+    pub last_failure_summary: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionAttempt {
+    pub cycle_id: String,
+    pub attempt_number: i64,
+    pub state: DecisionAttemptState,
+    pub context_schema_version: Option<i64>,
+    pub context_json: Option<String>,
+    pub context_digest: Option<String>,
+    pub agent_run_id: Option<i64>,
+    pub decision_json: Option<String>,
+    pub decision_digest: Option<String>,
+    pub decision_kind: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_summary: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
 }
 

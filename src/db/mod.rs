@@ -1,4 +1,5 @@
 mod campaigns;
+mod decisions;
 mod migrations;
 mod repositories;
 
@@ -6,6 +7,9 @@ pub use campaigns::{
     AgentDecisionReservation, CampaignDoctorProjection, CampaignRepository,
     CampaignStatusProjection, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
     ProposalAcceptance, StartCampaignRequest,
+};
+pub use decisions::{
+    DecisionDoctorProjection, DecisionRecovery, DecisionRepository, DecisionReservation,
 };
 pub use migrations::LATEST_SCHEMA_VERSION;
 

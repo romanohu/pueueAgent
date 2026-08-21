@@ -11,9 +11,9 @@ use pueue_agent::{
     db::{
         inferred_pre_binding_policy_code, AgentDecisionReservation, AgentRunRepository,
         BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        IncidentRepository, InterventionRepository, ProjectRepository, RunLineageRepository,
-        ProposalAcceptance, StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
-        TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+        DecisionRepository, IncidentRepository, InterventionRepository, ProjectRepository,
+        RunLineageRepository, ProposalAcceptance, StartCampaignRequest, SubmissionRepository,
+        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
@@ -26,7 +26,8 @@ use pueue_agent::{
     models::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
         BudgetReservationStatus, Campaign, CampaignState, EventKind, EventStatus,
-        ExecutionProjection, Experiment, ExperimentStatus, ExperimentTerminalOutcome,
+        DecisionCycleState, ExecutionProjection, Experiment, ExperimentStatus,
+        ExperimentTerminalOutcome,
         IncidentStatus, IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent,
         NewIncident, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
         ProposalKind, ProposalStatus, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
@@ -69,6 +70,10 @@ impl TestDatabase {
 
 struct CampaignDbHarness {
     test: TestDatabase,
+    db: Db,
+    project_id: String,
+    campaign_id: String,
+    experiment_id: String,
 }
 
 impl CampaignDbHarness {
@@ -80,7 +85,13 @@ impl CampaignDbHarness {
         let test = TestDatabase::new();
         let root = test.project_root("campaign-project");
         register_project(&test.db, Self::PROJECT_ID, &root, "pa-campaign-project");
-        Self { test }
+        Self {
+            db: test.db.clone(),
+            test,
+            project_id: Self::PROJECT_ID.to_owned(),
+            campaign_id: Self::CAMPAIGN_ID.to_owned(),
+            experiment_id: Self::BASELINE_EXPERIMENT_ID.to_owned(),
+        }
     }
 
     fn objective() -> ObjectiveSnapshot {
@@ -236,6 +247,88 @@ impl CampaignDbHarness {
             .unwrap();
     }
 
+    fn with_experiment(status: ExperimentStatus) -> Self {
+        let harness = Self::new();
+        harness.start(&CampaignLimits::default(), 100);
+        let repository = ExperimentRepository::new(&harness.db);
+        match status {
+            ExperimentStatus::Reserved => {}
+            ExperimentStatus::Submitting => {
+                repository
+                    .mark_submitting(&harness.experiment_id, 101)
+                    .unwrap();
+            }
+            ExperimentStatus::Accepted
+            | ExperimentStatus::Succeeded
+            | ExperimentStatus::Failed
+            | ExperimentStatus::Cancelled => {
+                repository
+                    .mark_submitting(&harness.experiment_id, 101)
+                    .unwrap();
+                repository
+                    .mark_accepted(
+                        &harness.experiment_id,
+                        41,
+                        "pueue-task:v1:decision-fixture",
+                        102,
+                    )
+                    .unwrap();
+                let outcome = match status {
+                    ExperimentStatus::Succeeded => Some(ExperimentTerminalOutcome::Succeeded),
+                    ExperimentStatus::Failed => Some(ExperimentTerminalOutcome::Failed {
+                        failure_code: "exit_nonzero",
+                        failure_fingerprint: "decision-fixture-fingerprint",
+                    }),
+                    ExperimentStatus::Cancelled => Some(ExperimentTerminalOutcome::Cancelled),
+                    ExperimentStatus::Accepted => None,
+                    _ => unreachable!(),
+                };
+                if let Some(outcome) = outcome {
+                    repository
+                        .project_terminal_submission(&harness.experiment_id, 41, outcome, 103)
+                        .unwrap();
+                }
+            }
+            ExperimentStatus::Unreconciled => {
+                panic!("decision fixture does not create unreconciled experiments")
+            }
+        }
+        harness
+    }
+
+    fn with_terminal_experiment(status: ExperimentStatus) -> Self {
+        assert!(matches!(
+            status,
+            ExperimentStatus::Succeeded | ExperimentStatus::Failed | ExperimentStatus::Cancelled
+        ));
+        Self::with_experiment(status)
+    }
+
+    fn reserved_decision_attempt(
+        &self,
+    ) -> (
+        pueue_agent::models::DecisionCycle,
+        pueue_agent::db::DecisionReservation,
+    ) {
+        let repository = DecisionRepository::new(&self.db);
+        let cycle = repository
+            .ensure_cycle_for_terminal(&self.campaign_id, &self.experiment_id, 190)
+            .unwrap();
+        let reservation = repository
+            .reserve_next_attempt(&self.project_id, &cycle.cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        (cycle, reservation)
+    }
+
+    fn scalar(&self, sql: &str) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
     fn count(&self, table: &str) -> i64 {
         assert!(matches!(
             table,
@@ -275,6 +368,287 @@ impl CampaignDbHarness {
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect()
+    }
+}
+
+fn canonical_v17_campaign_fixture() -> (TempDir, PathBuf) {
+    let fixture = V15Fixture::with_submission("legacy-v17-submission");
+    let V15Fixture { _temp, path } = fixture;
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!(
+            r#"
+            {CAMPAIGNS_V16_SQL};
+            {PROPOSALS_V16_SQL};
+            {EXPERIMENTS_V16_SQL};
+            {BUDGET_RESERVATIONS_V16_SQL};
+            CREATE UNIQUE INDEX campaigns_one_live_project_idx
+                ON campaigns(project_id) WHERE state <> 'retired';
+            CREATE INDEX campaigns_state_next_eligible_idx
+                ON campaigns(state, next_eligible_at, campaign_id);
+            CREATE INDEX proposals_campaign_status_created_idx
+                ON proposals(campaign_id, status, created_at, proposal_id);
+            CREATE INDEX experiments_campaign_status_created_idx
+                ON experiments(campaign_id, status, created_at, experiment_id);
+            CREATE INDEX experiments_pueue_task_lookup_idx
+                ON experiments(pueue_task_id, task_signature);
+            CREATE INDEX budget_reservations_campaign_dimension_window_idx
+                ON budget_reservations(campaign_id, dimension, window_started_at, window_ends_at, reservation_id);
+            ALTER TABLE events ADD COLUMN campaign_id TEXT
+                REFERENCES campaigns(campaign_id) ON DELETE CASCADE;
+            ALTER TABLE events ADD COLUMN experiment_id TEXT
+                REFERENCES experiments(experiment_id) ON DELETE SET NULL;
+            CREATE INDEX events_campaign_status_not_before_idx
+                ON events(campaign_id, status, not_before, event_id);
+            PRAGMA user_version = 17;
+            "#
+        ))
+        .unwrap();
+    drop(connection);
+    (_temp, path)
+}
+
+mod decision_schema {
+    use super::*;
+
+    #[test]
+    fn v17_migrates_decision_cycles_and_attempts_atomically() {
+        let (_temp, path) = canonical_v17_campaign_fixture();
+        let db = Db::open(&path).unwrap();
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            18
+        );
+        assert_eq!(
+            table_columns(&connection, "decision_cycles")
+                .iter()
+                .map(|column| column.0.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "cycle_id",
+                "campaign_id",
+                "source_experiment_id",
+                "state",
+                "next_wake_at",
+                "consecutive_failed_attempts",
+                "last_decision_kind",
+                "last_failure_code",
+                "last_failure_summary",
+                "created_at",
+                "updated_at"
+            ]
+        );
+        assert_eq!(table_foreign_keys(&connection, "decision_attempts").len(), 2);
+    }
+
+    #[test]
+    fn current_v18_rejects_extra_event_kind_without_repair() {
+        let test = TestDatabase::new();
+        test.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                r#"
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master
+                   SET sql = replace(
+                       sql,
+                       '''campaign_decision''',
+                       '''campaign_decision'', ''rogue_kind'''
+                   )
+                 WHERE type = 'table' AND name = 'events';
+                PRAGMA writable_schema = OFF;
+                "#,
+            )
+            .unwrap();
+
+        let error = Db::open(&test.path).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "verify SQLite v18 decision schema"
+            }
+        ));
+        let sql: String = Connection::open(&test.path)
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("'rogue_kind'"));
+    }
+
+    #[test]
+    fn malformed_v17_event_kind_is_rejected_without_repair() {
+        let (_temp, path) = canonical_v17_campaign_fixture();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                r#"
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master
+                   SET sql = replace(
+                       sql,
+                       '''operator_wake''',
+                       '''operator_wake'', ''rogue_kind'''
+                   )
+                 WHERE type = 'table' AND name = 'events';
+                PRAGMA writable_schema = OFF;
+                "#,
+            )
+            .unwrap();
+
+        assert!(Db::open(&path).is_err());
+        let sql: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("'rogue_kind'"));
+    }
+}
+
+mod decision_cycle {
+    use super::*;
+
+    #[test]
+    fn terminal_experiment_creates_one_cycle_and_one_active_attempt() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let first = Db::open(harness.db.path()).unwrap();
+        let second = Db::open(harness.db.path()).unwrap();
+        let cycle = DecisionRepository::new(&first)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 200)
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            [&first, &second]
+                .into_iter()
+                .map(|db| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let project_id = harness.project_id.clone();
+                    let cycle_id = cycle.cycle_id.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        DecisionRepository::new(db)
+                            .reserve_next_attempt(&project_id, &cycle_id, 201)
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+        assert_eq!(
+            harness.scalar("SELECT COUNT(*) FROM decision_attempts"),
+            1
+        );
+    }
+
+    #[test]
+    fn cross_campaign_or_nonterminal_decision_lineage_rolls_back() {
+        let harness = CampaignDbHarness::with_experiment(ExperimentStatus::Accepted);
+        let error = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 200)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "source_experiment_id",
+                ..
+            }
+        ));
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM decision_cycles"), 0);
+    }
+
+    #[test]
+    fn valid_wait_resets_failed_attempts_and_requires_finite_wake() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let (cycle, attempt) = harness.reserved_decision_attempt();
+        let waiting = DecisionRepository::new(&harness.db)
+            .mark_waiting(&cycle.cycle_id, attempt.attempt_number, 260, 200)
+            .unwrap();
+        assert_eq!(waiting.state, DecisionCycleState::Waiting);
+        assert_eq!(waiting.next_wake_at, Some(260));
+        assert_eq!(waiting.consecutive_failed_attempts, 0);
+    }
+
+    #[test]
+    fn stale_attempt_cannot_overwrite_a_newer_active_attempt() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let repository = DecisionRepository::new(&harness.db);
+        let (cycle, first_attempt) = harness.reserved_decision_attempt();
+        repository
+            .mark_waiting(&cycle.cycle_id, first_attempt.attempt_number, 260, 200)
+            .unwrap();
+        assert_eq!(repository.due_cycles(260, 10).unwrap().len(), 1);
+        let second_attempt = repository
+            .reserve_next_attempt(&harness.project_id, &cycle.cycle_id, 261)
+            .unwrap()
+            .unwrap();
+
+        let error = repository
+            .mark_waiting(&cycle.cycle_id, first_attempt.attempt_number, 300, 262)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "decision_attempt",
+                ..
+            }
+        ));
+        let state: DecisionCycleState = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM decision_cycles WHERE cycle_id = ?1",
+                [&cycle.cycle_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, DecisionCycleState::Analyzing);
+        assert_eq!(second_attempt.attempt_number, 2);
+    }
+
+    #[test]
+    fn reserved_attempt_cannot_complete_without_a_proposal_decision() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let (cycle, attempt) = harness.reserved_decision_attempt();
+
+        let error = DecisionRepository::new(&harness.db)
+            .mark_completed(&cycle.cycle_id, attempt.attempt_number, 200)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "decision_attempt",
+                ..
+            }
+        ));
+        let state: DecisionCycleState = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM decision_cycles WHERE cycle_id = ?1",
+                [&cycle.cycle_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, DecisionCycleState::Analyzing);
     }
 }
 
@@ -10337,6 +10711,8 @@ fn all_event_kind_and_status_values_round_trip_through_sqlite() {
         EventKind::DeepCheck,
         EventKind::AutoKilled,
         EventKind::TerminationFailed,
+        EventKind::OperatorWake,
+        EventKind::CampaignDecision,
     ] {
         let value: EventKind = connection
             .query_row("SELECT ?1", [kind], |row| row.get(0))
