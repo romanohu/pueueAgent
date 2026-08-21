@@ -1451,6 +1451,89 @@ impl DiagnosticsCliHarness {
             .current_dir(&self.root);
         command
     }
+
+    fn downgrade_decision_schema_to_v18(&self) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX IF EXISTS decision_cycles_state_source_order_idx;
+                 DROP INDEX IF EXISTS decision_cycles_campaign_state_source_order_idx;
+                 DROP INDEX IF EXISTS decision_cycles_campaign_state_wake_source_order_idx;
+                 DROP INDEX IF EXISTS decision_cycles_campaign_state_wake_updated_idx;
+                 DROP INDEX IF EXISTS experiments_campaign_terminal_order_idx;
+                 ALTER TABLE decision_cycles DROP COLUMN source_terminal_at;
+                 CREATE INDEX IF NOT EXISTS decision_cycles_state_wake_updated_idx
+                     ON decision_cycles(state, next_wake_at, updated_at);
+                 CREATE INDEX IF NOT EXISTS decision_cycles_campaign_state_updated_idx
+                     ON decision_cycles(campaign_id, state, updated_at);
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn v18_status_campaign_status_and_doctor_require_writable_migration_without_mutation() {
+    let harness = DiagnosticsCliHarness::new();
+    harness.downgrade_decision_schema_to_v18();
+    let before_schema_version: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .pragma_query_value(None, "schema_version", |row| row.get(0))
+        .unwrap();
+
+    for arguments in [
+        vec!["status", "--json"],
+        vec!["campaign", "status", "--json"],
+        vec!["doctor", "--json"],
+    ] {
+        let output = harness.command().args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("SQLite schema v18"), "{stderr}");
+        assert!(stderr.contains("writable pueue-agent command"), "{stderr}");
+        assert!(!stderr.contains("no such index"), "{stderr}");
+        assert!(!stderr.contains("source_terminal_at"), "{stderr}");
+    }
+
+    let connection = harness.db.connect().unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        18
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        before_schema_version
+    );
+}
+
+#[test]
+fn writable_project_command_migrates_v18_after_its_read_only_project_preflight() {
+    let harness = DiagnosticsCliHarness::new();
+    harness.downgrade_decision_schema_to_v18();
+
+    let output = harness.command().arg("pause").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        19
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::SystemTime};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::OptionalExtension;
 
 use crate::{
     config,
@@ -335,25 +335,65 @@ fn campaign_status_line(campaign: &CampaignStatusProjection) -> String {
     )
 }
 
-const CURRENT_DUE_DECISION_SOURCE_SQL: &str =
-    // (campaign_id, source_experiment_id) is unique on decision_cycles, so the
-    // scheduler's final cycle_id tie-break cannot distinguish rows after the
-    // source experiment ID tie-break. Keeping the indexed experiment order
-    // here is therefore equivalent without a temporary sort.
-    "SELECT e.experiment_id
-     FROM experiments e INDEXED BY experiments_campaign_terminal_order_idx
-     WHERE e.campaign_id = ?1
-       AND e.status IN ('succeeded','failed','cancelled')
-       AND EXISTS (
-           SELECT 1
-           FROM decision_cycles dc
-           WHERE dc.campaign_id = e.campaign_id
-             AND dc.source_experiment_id = e.experiment_id
-             AND (dc.state = 'pending'
-                  OR (dc.state = 'waiting' AND dc.next_wake_at <= ?2))
-       )
-     ORDER BY COALESCE(e.finished_at, e.updated_at), e.experiment_id
+const DECISION_STATUS_SOURCE_ASC_SQL: &str =
+    "SELECT cycle_id, source_terminal_at, source_experiment_id
+     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
+     WHERE campaign_id = ?1 AND state = ?2
+     ORDER BY source_terminal_at, source_experiment_id, cycle_id
      LIMIT 1";
+const DECISION_STATUS_DUE_WAIT_SQL: &str =
+    "SELECT cycle_id, source_terminal_at, source_experiment_id
+     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
+     WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at <= ?2
+     ORDER BY source_terminal_at, source_experiment_id, cycle_id
+     LIMIT 1";
+const DECISION_STATUS_FUTURE_WAIT_SQL: &str =
+    "SELECT cycle_id, source_terminal_at, source_experiment_id
+     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_wake_source_order_idx
+     WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at > ?2
+     ORDER BY next_wake_at, source_terminal_at, source_experiment_id, cycle_id
+     LIMIT 1";
+const DECISION_STATUS_SOURCE_DESC_SQL: &str =
+    "SELECT cycle_id, source_terminal_at, source_experiment_id
+     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
+     WHERE campaign_id = ?1 AND state = ?2
+     ORDER BY source_terminal_at DESC, source_experiment_id DESC, cycle_id DESC
+     LIMIT 1";
+
+#[derive(Debug)]
+struct DecisionStatusCandidate {
+    cycle_id: String,
+    source_terminal_at: i64,
+    source_experiment_id: String,
+}
+
+impl DecisionStatusCandidate {
+    fn source_order(&self) -> (i64, &str, &str) {
+        (
+            self.source_terminal_at,
+            &self.source_experiment_id,
+            &self.cycle_id,
+        )
+    }
+}
+
+fn decision_status_candidate(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+    operation: &'static str,
+) -> Result<Option<DecisionStatusCandidate>, AppError> {
+    connection
+        .query_row(sql, rusqlite::params_from_iter(parameters.iter()), |row| {
+            Ok(DecisionStatusCandidate {
+                cycle_id: row.get(0)?,
+                source_terminal_at: row.get(1)?,
+                source_experiment_id: row.get(2)?,
+            })
+        })
+        .optional()
+        .map_err(|source| AppError::Database { operation, source })
+}
 
 pub(crate) fn current_decision_projection(
     db: &Db,
@@ -361,118 +401,74 @@ pub(crate) fn current_decision_projection(
     now: i64,
 ) -> Result<Option<DecisionDoctorProjection>, AppError> {
     let connection = db.connect()?;
-    let analyzing_cycle_id = connection
-        .query_row(
-            "SELECT cycle_id
-             FROM decision_cycles INDEXED BY decision_cycles_campaign_state_updated_idx
-             WHERE campaign_id = ?1 AND state = 'analyzing'
-             ORDER BY updated_at, cycle_id
-             LIMIT 1",
-            [campaign_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|source| AppError::Database {
-            operation: "read active decision status candidate",
-            source,
-        })?;
-    let due_source_experiment_id = if analyzing_cycle_id.is_none() {
-        connection
-            .query_row(
-                CURRENT_DUE_DECISION_SOURCE_SQL,
-                params![campaign_id, now],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|source| AppError::Database {
-                operation: "read due decision status candidate",
-                source,
-            })?
-    } else {
-        None
-    };
-    let due_cycle_id = due_source_experiment_id
-        .as_deref()
-        .map(|source_experiment_id| {
-            connection
-                .query_row(
-                    "SELECT cycle_id
-                     FROM decision_cycles
-                     WHERE campaign_id = ?1 AND source_experiment_id = ?2
-                     LIMIT 1",
-                    params![campaign_id, source_experiment_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|source| AppError::Database {
-                    operation: "read due decision cycle identity",
-                    source,
-                })
+    let analyzing = decision_status_candidate(
+        &connection,
+        DECISION_STATUS_SOURCE_ASC_SQL,
+        &[&campaign_id, &"analyzing"],
+        "read active decision status candidate",
+    )?;
+    let due = if analyzing.is_none() {
+        let pending = decision_status_candidate(
+            &connection,
+            DECISION_STATUS_SOURCE_ASC_SQL,
+            &[&campaign_id, &"pending"],
+            "read pending decision status candidate",
+        )?;
+        let waiting = decision_status_candidate(
+            &connection,
+            DECISION_STATUS_DUE_WAIT_SQL,
+            &[&campaign_id, &now],
+            "read due waiting decision status candidate",
+        )?;
+        pending.into_iter().chain(waiting).min_by(|left, right| {
+            left.source_order().cmp(&right.source_order())
         })
-        .transpose()?
-        .flatten();
-    let future_wait_cycle_id = if analyzing_cycle_id.is_none() && due_cycle_id.is_none() {
-        connection
-            .query_row(
-                "SELECT cycle_id
-                 FROM decision_cycles INDEXED BY decision_cycles_campaign_state_wake_updated_idx
-                 WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at > ?2
-                 ORDER BY next_wake_at, updated_at, cycle_id
-                 LIMIT 1",
-                params![campaign_id, now],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|source| AppError::Database {
-                operation: "read waiting decision status candidate",
-                source,
-            })?
     } else {
         None
     };
-    let terminal_cycle_id = if analyzing_cycle_id.is_none()
-        && due_cycle_id.is_none()
-        && future_wait_cycle_id.is_none()
+    let future_wait = if analyzing.is_none() && due.is_none() {
+        decision_status_candidate(
+            &connection,
+            DECISION_STATUS_FUTURE_WAIT_SQL,
+            &[&campaign_id, &now],
+            "read waiting decision status candidate",
+        )?
+    } else {
+        None
+    };
+    let terminal = if analyzing.is_none() && due.is_none() && future_wait.is_none()
     {
         let mut candidates = Vec::with_capacity(2);
         for state in ["completed", "degraded"] {
-            if let Some(candidate) = connection
-                .query_row(
-                    "SELECT cycle_id, updated_at
-                     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_updated_idx
-                     WHERE campaign_id = ?1 AND state = ?2
-                     ORDER BY updated_at DESC, cycle_id DESC
-                     LIMIT 1",
-                    params![campaign_id, state],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .map_err(|source| AppError::Database {
-                    operation: "read terminal decision status candidate",
-                    source,
-                })?
+            if let Some(candidate) = decision_status_candidate(
+                &connection,
+                DECISION_STATUS_SOURCE_DESC_SQL,
+                &[&campaign_id, &state],
+                "read terminal decision status candidate",
+            )?
             {
                 candidates.push(candidate);
             }
         }
         candidates
             .into_iter()
-            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)))
-            .map(|candidate| candidate.0)
+            .max_by(|left, right| left.source_order().cmp(&right.source_order()))
     } else {
         None
     };
-    let Some(cycle_id) = analyzing_cycle_id
-        .or(due_cycle_id)
-        .or(future_wait_cycle_id)
-        .or(terminal_cycle_id)
+    let Some(cycle_id) = analyzing
+        .or(due)
+        .or(future_wait)
+        .or(terminal)
+        .map(|candidate| candidate.cycle_id)
     else {
         return Ok(None);
     };
 
     let cycle = connection
         .query_row(
-            "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id, dc.state,
+            "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id,
+                    dc.source_terminal_at, dc.state,
                     dc.next_wake_at, dc.consecutive_failed_attempts,
                     dc.last_decision_kind, dc.last_failure_code, dc.last_failure_summary,
                     dc.created_at, dc.updated_at
@@ -484,14 +480,15 @@ pub(crate) fn current_decision_projection(
                     cycle_id: row.get(0)?,
                     campaign_id: row.get(1)?,
                     source_experiment_id: row.get(2)?,
-                    state: row.get(3)?,
-                    next_wake_at: row.get(4)?,
-                    consecutive_failed_attempts: row.get(5)?,
-                    last_decision_kind: row.get(6)?,
-                    last_failure_code: row.get(7)?,
-                    last_failure_summary: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    source_terminal_at: row.get(3)?,
+                    state: row.get(4)?,
+                    next_wake_at: row.get(5)?,
+                    consecutive_failed_attempts: row.get(6)?,
+                    last_decision_kind: row.get(7)?,
+                    last_failure_code: row.get(8)?,
+                    last_failure_summary: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
                 })
             },
         )
@@ -646,7 +643,10 @@ fn project_lifecycle_line(project: &Project) -> String {
 mod decision_query_plan_tests {
     use tempfile::TempDir;
 
-    use super::CURRENT_DUE_DECISION_SOURCE_SQL;
+    use super::{
+        DECISION_STATUS_DUE_WAIT_SQL, DECISION_STATUS_FUTURE_WAIT_SQL,
+        DECISION_STATUS_SOURCE_ASC_SQL, DECISION_STATUS_SOURCE_DESC_SQL,
+    };
     use crate::db::Db;
 
     fn explain(db: &Db, sql: &str, parameters: &[&dyn rusqlite::ToSql]) -> Vec<String> {
@@ -663,39 +663,76 @@ mod decision_query_plan_tests {
     fn decision_status_and_doctor_probes_use_bounded_index_plans() {
         let temp = TempDir::new().unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
-        let due_query = format!("EXPLAIN QUERY PLAN {CURRENT_DUE_DECISION_SOURCE_SQL}");
-        let due_plan = explain(
-            &db,
-            &due_query,
-            &[&"campaign-a", &100_i64],
-        );
-        assert!(
-            due_plan
-                .iter()
-                .any(|detail| detail.contains("experiments_campaign_terminal_order_idx")),
-            "{due_plan:?}"
-        );
-        assert!(
-            due_plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
-            "{due_plan:?}"
-        );
-
-        let cycle_plan = explain(
-            &db,
-            "EXPLAIN QUERY PLAN
-             SELECT cycle_id
-             FROM decision_cycles INDEXED BY decision_cycles_campaign_state_updated_idx
-             WHERE campaign_id = ?1 AND state <> 'completed'
-             ORDER BY state, updated_at
-             LIMIT ?2",
-            &[&"campaign-a", &2_i64],
-        );
-        assert!(
-            cycle_plan
-                .iter()
-                .any(|detail| detail.contains("decision_cycles_campaign_state_updated_idx")),
-            "{cycle_plan:?}"
-        );
+        for (name, sql, parameters, expected_index) in [
+            (
+                "analyzing",
+                DECISION_STATUS_SOURCE_ASC_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &"analyzing" as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+            (
+                "pending",
+                DECISION_STATUS_SOURCE_ASC_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &"pending" as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+            (
+                "due waiting",
+                DECISION_STATUS_DUE_WAIT_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &100_i64 as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+            (
+                "future waiting",
+                DECISION_STATUS_FUTURE_WAIT_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &100_i64 as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_wake_source_order_idx",
+            ),
+            (
+                "completed",
+                DECISION_STATUS_SOURCE_DESC_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &"completed" as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+            (
+                "degraded",
+                DECISION_STATUS_SOURCE_DESC_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &"degraded" as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+        ] {
+            assert!(!sql.contains("state <>"), "{name}: {sql}");
+            assert!(!sql.contains("experiments"), "{name}: {sql}");
+            let plan = explain(&db, &format!("EXPLAIN QUERY PLAN {sql}"), &parameters);
+            assert!(
+                plan.iter().any(|detail| detail.contains(expected_index)),
+                "{name}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("TEMP B-TREE") && !detail.starts_with("SCAN decision_cycles")
+                }),
+                "{name}: {plan:?}"
+            );
+        }
 
         let attempt_plan = explain(
             &db,

@@ -86,6 +86,25 @@ impl Db {
         }
     }
 
+    pub fn require_latest_schema(&self) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        let current = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(database_error("read SQLite schema version"))?;
+        if current == LATEST_SCHEMA_VERSION {
+            Ok(())
+        } else if current < LATEST_SCHEMA_VERSION {
+            Err(AppError::SchemaMigrationRequired {
+                current,
+                required: LATEST_SCHEMA_VERSION,
+            })
+        } else {
+            Err(AppError::Runtime {
+                operation: "open a database created by a newer pueue-agent",
+            })
+        }
+    }
+
     pub(crate) fn with_busy_timeout(&self, busy_timeout: Duration) -> Self {
         Self {
             path: self.path.clone(),

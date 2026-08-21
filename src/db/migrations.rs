@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 18;
+pub const LATEST_SCHEMA_VERSION: i64 = 19;
 const EVENTS_V18_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
 const EVENTS_V17_KIND_LIST: &str =
@@ -160,10 +160,6 @@ const PROPOSALS_CAMPAIGN_STATUS_CREATED_INDEX_SQL: &str =
 const EXPERIMENTS_CAMPAIGN_STATUS_CREATED_INDEX_SQL: &str =
     "CREATE INDEX experiments_campaign_status_created_idx
     ON experiments(campaign_id, status, created_at, experiment_id);";
-const EXPERIMENTS_CAMPAIGN_TERMINAL_ORDER_INDEX_SQL: &str =
-    "CREATE INDEX experiments_campaign_terminal_order_idx
-    ON experiments(campaign_id, COALESCE(finished_at, updated_at), experiment_id)
-    WHERE status IN ('succeeded','failed','cancelled');";
 const EXPERIMENTS_PUEUE_TASK_LOOKUP_INDEX_SQL: &str =
     "CREATE INDEX experiments_pueue_task_lookup_idx
     ON experiments(pueue_task_id, task_signature);";
@@ -186,6 +182,23 @@ CREATE TABLE decision_cycles (
   last_failure_summary TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  UNIQUE(campaign_id, source_experiment_id)
+);
+"#;
+const DECISION_CYCLES_V19_TABLE_SQL: &str = r#"
+CREATE TABLE decision_cycles (
+  cycle_id TEXT PRIMARY KEY,
+  campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+  source_experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+  state TEXT NOT NULL CHECK (state IN ('pending','analyzing','waiting','completed','degraded')),
+  next_wake_at INTEGER,
+  consecutive_failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failed_attempts >= 0),
+  last_decision_kind TEXT,
+  last_failure_code TEXT,
+  last_failure_summary TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  source_terminal_at INTEGER NOT NULL DEFAULT 1 CHECK(source_terminal_at > 0),
   UNIQUE(campaign_id, source_experiment_id)
 );
 "#;
@@ -214,9 +227,15 @@ const DECISION_CYCLES_DUE_INDEX_SQL: &str = "CREATE INDEX decision_cycles_state_
     ON decision_cycles(state, next_wake_at, updated_at);";
 const DECISION_CYCLES_CAMPAIGN_INDEX_SQL: &str = "CREATE INDEX decision_cycles_campaign_state_updated_idx
     ON decision_cycles(campaign_id, state, updated_at);";
-const DECISION_CYCLES_CAMPAIGN_WAKE_INDEX_SQL: &str =
-    "CREATE INDEX decision_cycles_campaign_state_wake_updated_idx
-    ON decision_cycles(campaign_id, state, next_wake_at, updated_at, cycle_id);";
+const DECISION_CYCLES_STATE_SOURCE_INDEX_SQL: &str =
+    "CREATE INDEX decision_cycles_state_source_order_idx
+    ON decision_cycles(state, source_terminal_at, source_experiment_id, cycle_id);";
+const DECISION_CYCLES_CAMPAIGN_STATE_SOURCE_INDEX_SQL: &str =
+    "CREATE INDEX decision_cycles_campaign_state_source_order_idx
+    ON decision_cycles(campaign_id, state, source_terminal_at, source_experiment_id, cycle_id);";
+const DECISION_CYCLES_CAMPAIGN_WAKE_SOURCE_INDEX_SQL: &str =
+    "CREATE INDEX decision_cycles_campaign_state_wake_source_order_idx
+    ON decision_cycles(campaign_id, state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id);";
 const DECISION_ATTEMPTS_STATE_INDEX_SQL: &str = "CREATE INDEX decision_attempts_state_created_idx
     ON decision_attempts(state, created_at);";
 
@@ -234,19 +253,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             && submissions_have_composite_origin_foreign_key(connection)?;
     let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
         && missing_execution_projection_columns(connection)?.is_empty();
-    let current_schema_has_decision_projection_indexes = version == LATEST_SCHEMA_VERSION
-        && index_definition_matches(
-            connection,
-            "experiments_campaign_terminal_order_idx",
-            EXPERIMENTS_CAMPAIGN_TERMINAL_ORDER_INDEX_SQL,
-        )?
-        && index_definition_matches(
-            connection,
-            "decision_cycles_campaign_state_wake_updated_idx",
-            DECISION_CYCLES_CAMPAIGN_WAKE_INDEX_SQL,
-        )?;
     if version == LATEST_SCHEMA_VERSION {
-        verify_decision_schema_v18(connection)?;
+        verify_decision_schema_v19(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -268,7 +276,6 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             });
         if current_schema_has_composite_origin_foreign_key
             && current_schema_has_execution_projection
-            && current_schema_has_decision_projection_indexes
             && has_canonical_event_status_not_before_index
         {
             verify_campaign_schema_v16(connection)?;
@@ -656,11 +663,6 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_campaign_schema_v16(&transaction)?;
     }
-    ensure_index_definition(
-        &transaction,
-        "experiments_campaign_terminal_order_idx",
-        EXPERIMENTS_CAMPAIGN_TERMINAL_ORDER_INDEX_SQL,
-    )?;
     if version <= 16 {
         migrate_campaign_event_lineage_to_v17(&transaction)?;
     } else {
@@ -668,14 +670,14 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     }
     if version <= 17 {
         migrate_decision_schema_to_v18(&transaction)?;
-    } else {
+    } else if version == 18 {
         verify_decision_schema_v18(&transaction)?;
     }
-    ensure_index_definition(
-        &transaction,
-        "decision_cycles_campaign_state_wake_updated_idx",
-        DECISION_CYCLES_CAMPAIGN_WAKE_INDEX_SQL,
-    )?;
+    if version <= 18 {
+        migrate_decision_schema_to_v19(&transaction)?;
+    } else {
+        verify_decision_schema_v19(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -1453,25 +1455,6 @@ fn ensure_index_definition(
         .map_err(database_error("create intervention FIFO index"))
 }
 
-fn index_definition_matches(
-    connection: &Connection,
-    name: &str,
-    expected_sql: &str,
-) -> Result<bool, AppError> {
-    let actual_sql = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
-            [name],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(database_error("read index definition"))?
-        .flatten();
-    Ok(actual_sql
-        .as_deref()
-        .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql)))
-}
-
 fn compact_sql(sql: &str) -> String {
     compact_sql_exact(sql).to_ascii_lowercase()
 }
@@ -1664,6 +1647,11 @@ fn verify_campaign_event_lineage_v17(connection: &Connection) -> Result<(), AppE
 fn migrate_decision_schema_to_v18(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<(), AppError> {
+    if decision_schema_v19_is_canonical(transaction).unwrap_or(false) {
+        return transaction
+            .execute_batch("PRAGMA user_version = 18;")
+            .map_err(database_error("retain existing SQLite v19 decision schema"));
+    }
     if decision_schema_v18_is_canonical(transaction).unwrap_or(false) {
         return transaction
             .execute_batch("PRAGMA user_version = 18;")
@@ -1780,7 +1768,6 @@ fn decision_schema_v18_is_canonical(connection: &Connection) -> rusqlite::Result
 }
 
 fn decision_objects_v18_are_canonical(connection: &Connection) -> rusqlite::Result<bool> {
-
     for (table, expected_sql) in [
         ("decision_cycles", DECISION_CYCLES_V18_TABLE_SQL),
         ("decision_attempts", DECISION_ATTEMPTS_V18_TABLE_SQL),
@@ -1892,6 +1879,212 @@ fn decision_objects_v18_are_canonical(connection: &Connection) -> rusqlite::Resu
         }
     }
     Ok(true)
+}
+
+fn migrate_decision_schema_to_v19(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    if decision_schema_v19_is_canonical(transaction).unwrap_or(false) {
+        return transaction
+            .execute_batch("PRAGMA user_version = 19;")
+            .map_err(database_error("set existing SQLite v19 schema version"));
+    }
+    verify_decision_schema_v18(transaction)?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE decision_cycles
+                 ADD COLUMN source_terminal_at INTEGER NOT NULL DEFAULT 1
+                     CHECK(source_terminal_at > 0);
+             UPDATE decision_cycles
+                SET source_terminal_at = (
+                    SELECT CASE
+                        WHEN typeof(COALESCE(e.finished_at, e.updated_at)) = 'integer'
+                         AND e.status IN ('succeeded','failed','cancelled')
+                        THEN COALESCE(e.finished_at, e.updated_at)
+                    END
+                    FROM experiments e
+                    WHERE e.experiment_id = decision_cycles.source_experiment_id
+                      AND e.campaign_id = decision_cycles.campaign_id
+                );
+             DROP INDEX decision_cycles_state_wake_updated_idx;
+             DROP INDEX decision_cycles_campaign_state_updated_idx;
+             DROP INDEX IF EXISTS decision_cycles_campaign_state_wake_updated_idx;
+             DROP INDEX IF EXISTS experiments_campaign_terminal_order_idx;",
+        )
+        .map_err(database_error("backfill SQLite v19 decision source order"))?;
+    for sql in [
+        DECISION_CYCLES_STATE_SOURCE_INDEX_SQL,
+        DECISION_CYCLES_CAMPAIGN_STATE_SOURCE_INDEX_SQL,
+        DECISION_CYCLES_CAMPAIGN_WAKE_SOURCE_INDEX_SQL,
+    ] {
+        transaction
+            .execute_batch(sql)
+            .map_err(database_error("create SQLite v19 decision order index"))?;
+    }
+    verify_decision_schema_v19(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 19;")
+        .map_err(database_error("set SQLite v19 schema version"))
+}
+
+fn verify_decision_schema_v19(connection: &Connection) -> Result<(), AppError> {
+    if decision_schema_v19_is_canonical(connection).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v19 decision schema",
+        })
+    }
+}
+
+fn decision_schema_v19_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+    let event_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !event_sql
+        .as_deref()
+        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V18_KIND_LIST))
+    {
+        return Ok(false);
+    }
+
+    for (table, expected_sql) in [
+        ("decision_cycles", DECISION_CYCLES_V19_TABLE_SQL),
+        ("decision_attempts", DECISION_ATTEMPTS_V18_TABLE_SQL),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+
+    if !campaign_table_info_matches(
+        connection,
+        "decision_cycles",
+        &[
+            ("cycle_id", "TEXT", 0, 1),
+            ("campaign_id", "TEXT", 1, 0),
+            ("source_experiment_id", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("next_wake_at", "INTEGER", 0, 0),
+            ("consecutive_failed_attempts", "INTEGER", 1, 0),
+            ("last_decision_kind", "TEXT", 0, 0),
+            ("last_failure_code", "TEXT", 0, 0),
+            ("last_failure_summary", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("source_terminal_at", "INTEGER", 1, 0),
+        ],
+    )? || !campaign_table_info_matches(
+        connection,
+        "decision_attempts",
+        &[
+            ("cycle_id", "TEXT", 1, 1),
+            ("attempt_number", "INTEGER", 1, 2),
+            ("state", "TEXT", 1, 0),
+            ("context_schema_version", "INTEGER", 0, 0),
+            ("context_json", "TEXT", 0, 0),
+            ("context_digest", "TEXT", 0, 0),
+            ("agent_run_id", "INTEGER", 0, 0),
+            ("decision_json", "TEXT", 0, 0),
+            ("decision_digest", "TEXT", 0, 0),
+            ("decision_kind", "TEXT", 0, 0),
+            ("failure_code", "TEXT", 0, 0),
+            ("failure_summary", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("started_at", "INTEGER", 0, 0),
+            ("finished_at", "INTEGER", 0, 0),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    if !campaign_foreign_keys_match(
+        connection,
+        "decision_cycles",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "NO ACTION"),
+            (
+                "experiments",
+                "source_experiment_id",
+                "experiment_id",
+                "NO ACTION",
+            ),
+        ],
+    )? || !campaign_foreign_keys_match(
+        connection,
+        "decision_attempts",
+        &[
+            ("decision_cycles", "cycle_id", "cycle_id", "NO ACTION"),
+            ("agent_runs", "agent_run_id", "run_id", "NO ACTION"),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    for (name, expected_sql) in [
+        (
+            "decision_cycles_state_source_order_idx",
+            DECISION_CYCLES_STATE_SOURCE_INDEX_SQL,
+        ),
+        (
+            "decision_cycles_campaign_state_source_order_idx",
+            DECISION_CYCLES_CAMPAIGN_STATE_SOURCE_INDEX_SQL,
+        ),
+        (
+            "decision_cycles_campaign_state_wake_source_order_idx",
+            DECISION_CYCLES_CAMPAIGN_WAKE_SOURCE_INDEX_SQL,
+        ),
+        (
+            "decision_attempts_state_created_idx",
+            DECISION_ATTEMPTS_STATE_INDEX_SQL,
+        ),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+
+    let invalid_projection: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM decision_cycles dc
+             LEFT JOIN experiments e ON e.experiment_id = dc.source_experiment_id
+             WHERE typeof(dc.source_terminal_at) != 'integer'
+                OR dc.source_terminal_at <= 0
+                OR e.experiment_id IS NULL
+                OR e.campaign_id != dc.campaign_id
+                OR e.status NOT IN ('succeeded','failed','cancelled')
+                OR typeof(COALESCE(e.finished_at, e.updated_at)) != 'integer'
+                OR dc.source_terminal_at != COALESCE(e.finished_at, e.updated_at)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid_projection)
 }
 
 fn event_kind_list_matches(event_sql: &str, canonical_kind_list: &str) -> bool {

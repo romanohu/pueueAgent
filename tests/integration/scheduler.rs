@@ -1042,13 +1042,17 @@ async fn campaign_decision_claim_limit_still_admits_the_oldest_terminal_cycle_fi
         .db
         .connect()
         .unwrap()
-        .execute(
+        .execute_batch(
             "UPDATE experiments
              SET finished_at = CASE experiment_id
                  WHEN 'scheduler-campaign-experiment' THEN 90
                  WHEN 'scheduler-campaign-second-experiment' THEN 80
-                 ELSE finished_at END",
-            [],
+                 ELSE finished_at END;
+             UPDATE decision_cycles
+             SET source_terminal_at = (
+                 SELECT finished_at FROM experiments
+                 WHERE experiments.experiment_id = decision_cycles.source_experiment_id
+             );",
         )
         .unwrap();
     let newer_event_id = harness.campaign_decision_event_id();

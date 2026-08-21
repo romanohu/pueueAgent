@@ -560,6 +560,7 @@ pub struct DecisionCycle {
     pub cycle_id: String,
     pub campaign_id: String,
     pub source_experiment_id: String,
+    pub source_terminal_at: i64,
     pub state: DecisionCycleState,
     pub next_wake_at: Option<i64>,
     pub consecutive_failed_attempts: i64,

@@ -250,6 +250,7 @@ mod commands {
         } = args;
         let (db, project, _service_paths, policy) =
             resolve_project_read_only(project_root, pueue_config)?;
+        db.require_latest_schema()?;
         let pueue = configured_pueue(policy)?;
         let pueue = match pueue.status_json().await {
             Ok(tasks) => PueueSnapshot::Tasks(tasks),
@@ -316,6 +317,7 @@ mod commands {
     pub async fn doctor(args: DoctorArgs) -> Result<(), AppError> {
         let (db, project, service_paths, project_roots) =
             resolve_project_doctor_read_only(args.project_root, args.pueue_config)?;
+        db.require_latest_schema()?;
         let policy = load_existing_policy(&service_paths.policy_load_input(
             project_roots.clone(),
             current_launcher_path()?,
@@ -484,6 +486,7 @@ mod commands {
             CampaignAction::Status(args) => {
                 let (db, project, _, _) =
                     resolve_project_read_only(args.project_root, args.pueue_config)?;
+                db.require_latest_schema()?;
                 println!(
                     "{}",
                     pueue_agent::campaign::render_status_for_project(&db, &project, args.json)?

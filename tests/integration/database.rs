@@ -413,6 +413,101 @@ fn canonical_v17_campaign_fixture() -> (TempDir, PathBuf) {
     (_temp, path)
 }
 
+fn bc74e297_v18_decision_fixture() -> (TempDir, PathBuf) {
+    let (_temp, path) = canonical_v17_campaign_fixture();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA writable_schema = ON;
+            UPDATE sqlite_master
+               SET sql = replace(
+                   sql,
+                   '''operator_wake''',
+                   '''operator_wake'', ''campaign_decision'''
+               )
+             WHERE type = 'table' AND name = 'events';
+            PRAGMA writable_schema = OFF;
+
+            CREATE TABLE decision_cycles (
+              cycle_id TEXT PRIMARY KEY,
+              campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+              source_experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+              state TEXT NOT NULL CHECK (state IN ('pending','analyzing','waiting','completed','degraded')),
+              next_wake_at INTEGER,
+              consecutive_failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failed_attempts >= 0),
+              last_decision_kind TEXT,
+              last_failure_code TEXT,
+              last_failure_summary TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              UNIQUE(campaign_id, source_experiment_id)
+            );
+            CREATE TABLE decision_attempts (
+              cycle_id TEXT NOT NULL REFERENCES decision_cycles(cycle_id),
+              attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+              state TEXT NOT NULL CHECK (state IN ('reserved','evidence_ready','running','decided','failed')),
+              context_schema_version INTEGER,
+              context_json TEXT,
+              context_digest TEXT,
+              agent_run_id INTEGER REFERENCES agent_runs(run_id),
+              decision_json TEXT,
+              decision_digest TEXT,
+              decision_kind TEXT,
+              failure_code TEXT,
+              failure_summary TEXT,
+              created_at INTEGER NOT NULL,
+              started_at INTEGER,
+              finished_at INTEGER,
+              PRIMARY KEY(cycle_id, attempt_number),
+              UNIQUE(agent_run_id)
+            );
+            CREATE INDEX decision_cycles_state_wake_updated_idx
+                ON decision_cycles(state, next_wake_at, updated_at);
+            CREATE INDEX decision_cycles_campaign_state_updated_idx
+                ON decision_cycles(campaign_id, state, updated_at);
+            CREATE INDEX decision_attempts_state_created_idx
+                ON decision_attempts(state, created_at);
+
+            INSERT INTO campaigns (
+                campaign_id, project_id, objective_text, objective_digest,
+                initial_argv_json, state, created_at, updated_at
+            ) VALUES (
+                'legacy-v18-campaign', 'legacy-project', 'legacy objective',
+                'legacy-objective-digest', '["python","train.py"]', 'active', 110, 110
+            );
+            INSERT INTO proposals (
+                proposal_id, campaign_id, kind, status, hypothesis, argv_json,
+                working_directory, expected_evidence_json, canonical_digest,
+                created_at, updated_at
+            ) VALUES (
+                'legacy-v18-proposal', 'legacy-v18-campaign', 'experiment', 'accepted',
+                'legacy hypothesis', '["python","train.py"]', '/tmp/legacy-project',
+                '{}', 'legacy-proposal-digest', 111, 111
+            );
+            INSERT INTO experiments (
+                experiment_id, campaign_id, proposal_id, submission_id, attempt,
+                status, failure_code, failure_fingerprint, created_at, updated_at, finished_at
+            ) VALUES (
+                'legacy-v18-experiment', 'legacy-v18-campaign', 'legacy-v18-proposal',
+                'legacy-v17-submission', 0, 'failed', 'fixture_failure',
+                'fixture-fingerprint', 112, 333, 222
+            );
+            INSERT INTO decision_cycles (
+                cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
+                consecutive_failed_attempts, created_at, updated_at
+            ) VALUES (
+                'legacy-v18-cycle', 'legacy-v18-campaign', 'legacy-v18-experiment',
+                'waiting', 500, 0, 444, 444
+            );
+            PRAGMA user_version = 18;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+    (_temp, path)
+}
+
 mod decision_schema {
     use super::*;
 
@@ -425,7 +520,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
         assert_eq!(
             table_columns(&connection, "decision_cycles")
@@ -443,14 +538,249 @@ mod decision_schema {
                 "last_failure_code",
                 "last_failure_summary",
                 "created_at",
-                "updated_at"
+                "updated_at",
+                "source_terminal_at"
             ]
         );
         assert_eq!(table_foreign_keys(&connection, "decision_attempts").len(), 2);
     }
 
     #[test]
-    fn current_v18_rejects_extra_event_kind_without_repair() {
+    fn bc74e297_v18_read_only_requires_an_actionable_migration_without_mutation() {
+        let (_temp, path) = bc74e297_v18_decision_fixture();
+        let before = Connection::open(&path).unwrap();
+        let before_schema_version: i64 = before
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        drop(before);
+
+        let readonly = Db::open_read_only(&path).unwrap();
+        let error = readonly.require_latest_schema().unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::SchemaMigrationRequired {
+                current: 18,
+                required: 19
+            }
+        ));
+        let rendered = error.render();
+        assert!(rendered.contains("writable pueue-agent command"), "{rendered}");
+        assert!(!rendered.contains("no such index"), "{rendered}");
+
+        let after = Connection::open(&path).unwrap();
+        assert_eq!(
+            after
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            18
+        );
+        assert_eq!(
+            after
+                .pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before_schema_version
+        );
+        assert!(!table_columns(&after, "decision_cycles")
+            .iter()
+            .any(|column| column.0 == "source_terminal_at"));
+    }
+
+    #[test]
+    fn writable_open_atomically_migrates_v18_ordering_projection_and_indexes() {
+        let (_temp, path) = bc74e297_v18_decision_fixture();
+        let preflight = Db::open_read_only(&path).unwrap();
+        assert!(ProjectRepository::new(&preflight)
+            .find_by_id("legacy-project")
+            .unwrap()
+            .is_some());
+        drop(preflight);
+
+        let migrated = Db::open(&path).unwrap();
+        let connection = migrated.connect().unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            19
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_terminal_at FROM decision_cycles
+                     WHERE cycle_id = 'legacy-v18-cycle'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            222
+        );
+        for (name, ordered_columns) in [
+            (
+                "decision_cycles_state_source_order_idx",
+                "state, source_terminal_at, source_experiment_id, cycle_id",
+            ),
+            (
+                "decision_cycles_campaign_state_source_order_idx",
+                "campaign_id, state, source_terminal_at, source_experiment_id, cycle_id",
+            ),
+            (
+                "decision_cycles_campaign_state_wake_source_order_idx",
+                "campaign_id, state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id",
+            ),
+        ] {
+            let sql: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(compact_schema_sql(&sql).contains(ordered_columns), "{sql}");
+        }
+    }
+
+    #[test]
+    fn v19_rejects_zero_source_terminal_projection_without_repair() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_000)
+            .unwrap();
+        let connection = harness.db.connect().unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE decision_cycles SET source_terminal_at = 0",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = Db::open(&harness.test.path).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "verify SQLite v19 decision schema"
+            }
+        ));
+    }
+
+    #[test]
+    fn v19_rejects_noncanonical_source_terminal_projection_without_repair() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_000)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_cycles
+                 SET source_terminal_at = source_terminal_at + 1
+                 WHERE cycle_id = ?1",
+                [&cycle.cycle_id],
+            )
+            .unwrap();
+
+        let error = Db::open(&harness.test.path).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "verify SQLite v19 decision schema"
+            }
+        ));
+        assert_eq!(
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT source_terminal_at FROM decision_cycles WHERE cycle_id = ?1",
+                    [&cycle.cycle_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            cycle.source_terminal_at + 1
+        );
+    }
+
+    #[test]
+    fn current_v19_rejects_wrong_source_order_index_without_repair() {
+        let test = TestDatabase::new();
+        test.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX decision_cycles_campaign_state_source_order_idx;
+                 CREATE INDEX decision_cycles_campaign_state_source_order_idx
+                 ON decision_cycles(campaign_id, state, source_terminal_at);",
+            )
+            .unwrap();
+
+        let error = Db::open(&test.path).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "verify SQLite v19 decision schema"
+            }
+        ));
+        let sql: String = test
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'decision_cycles_campaign_state_source_order_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("source_experiment_id"), "{sql}");
+    }
+
+    #[test]
+    fn failed_v18_projection_backfill_rolls_back_column_indexes_and_version() {
+        let (_temp, path) = bc74e297_v18_decision_fixture();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE decision_cycles
+                 SET source_experiment_id = 'missing-terminal-experiment'
+                 WHERE cycle_id = 'legacy-v18-cycle';",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(Db::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            18
+        );
+        assert!(!table_columns(&connection, "decision_cycles")
+            .iter()
+            .any(|column| column.0 == "source_terminal_at"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'decision_cycles_%_source_order_idx'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn current_v19_rejects_extra_event_kind_without_repair() {
         let test = TestDatabase::new();
         test.db
             .connect()
@@ -474,7 +804,7 @@ mod decision_schema {
         assert!(matches!(
             error,
             AppError::Runtime {
-                operation: "verify SQLite v18 decision schema"
+                operation: "verify SQLite v19 decision schema"
             }
         ));
         let sql: String = Connection::open(&test.path)

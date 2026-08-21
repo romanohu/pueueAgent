@@ -1388,30 +1388,34 @@ fn decision_doctor_checks(
         .unwrap_or_else(|_| CampaignLimits::default());
     let cycle_policy_limit = limits.max_parallel_experiments as usize;
     let attempt_policy_limit = limits.max_decision_attempts_per_cycle as usize;
-    let mut cycles = if let Some(campaign_id) = current_campaign_id.as_deref() {
-        decision_doctor_cycle_probe(
-            connection,
-            campaign_id,
-            false,
-            i64::from(limits.max_parallel_experiments) + 1,
-        )?
-    } else {
-        Vec::new()
-    };
+    let mut cycles = Vec::new();
+    let mut unknown_cycle_state = false;
+    if let Some(campaign_id) = current_campaign_id.as_deref() {
+        for state in ["pending", "analyzing", "waiting", "degraded"] {
+            cycles.extend(decision_doctor_cycle_probe(
+                connection,
+                campaign_id,
+                state,
+                i64::from(limits.max_parallel_experiments) + 1,
+            )?);
+        }
+        unknown_cycle_state = decision_doctor_unknown_state_exists(connection, campaign_id)?;
+    }
     let cycle_overflow = cycles.len() > cycle_policy_limit;
+    cycles.truncate(cycle_policy_limit.saturating_add(1));
     if !cycle_overflow {
         if let Some(campaign_id) = current_campaign_id.as_deref() {
             cycles.extend(decision_doctor_cycle_probe(
                 connection,
                 campaign_id,
-                true,
+                "completed",
                 1,
             )?);
         }
     }
 
     let decision_cycle_count = cycles.len();
-    let mut malformed_rows = i64::from(cycle_overflow);
+    let mut malformed_rows = i64::from(cycle_overflow) + i64::from(unknown_cycle_state);
     let mut lineage_errors = 0_i64;
     let mut active_attempt_count = 0_i64;
     let mut duplicate_agent_bindings = 0_i64;
@@ -1646,6 +1650,8 @@ const DECISION_DOCTOR_CYCLE_PROBE_SELECT: &str =
             typeof(dc.cycle_id) = 'text'
               AND typeof(dc.campaign_id) = 'text'
               AND typeof(dc.source_experiment_id) = 'text'
+              AND typeof(dc.source_terminal_at) = 'integer'
+              AND dc.source_terminal_at > 0
               AND typeof(dc.state) = 'text'
               AND dc.state IN ('pending','analyzing','waiting','completed','degraded')
               AND typeof(dc.next_wake_at) IN ('null','integer')
@@ -1666,22 +1672,24 @@ const DECISION_DOCTOR_CYCLE_PROBE_SELECT: &str =
               AND typeof(e.campaign_id) = 'text'
               AND e.campaign_id = dc.campaign_id
               AND typeof(e.status) = 'text'
-              AND e.status IN ('succeeded','failed','cancelled'),
-            dc.state <> 'degraded'
+              AND e.status IN ('succeeded','failed','cancelled')
+              AND typeof(COALESCE(e.finished_at, e.updated_at)) = 'integer'
+              AND dc.source_terminal_at = COALESCE(e.finished_at, e.updated_at),
+            dc.state IN ('pending','analyzing','waiting','completed')
               OR (typeof(dc.last_failure_code) = 'text'
                   AND length(CAST(dc.last_failure_code AS BLOB)) BETWEEN 1 AND 128
                   AND typeof(dc.last_failure_summary) = 'text'
                   AND length(CAST(dc.last_failure_summary AS BLOB)) BETWEEN 1 AND 2048)
-     FROM decision_cycles dc
+     FROM decision_cycles dc INDEXED BY decision_cycles_campaign_state_source_order_idx
      LEFT JOIN experiments e ON e.experiment_id = dc.source_experiment_id";
 
 fn decision_doctor_cycle_probe(
     connection: &rusqlite::Connection,
     campaign_id: &str,
-    completed: bool,
+    state: &'static str,
     limit: i64,
 ) -> Result<Vec<DecisionDoctorCycleProbe>, AppError> {
-    let sql = decision_doctor_cycle_probe_sql(completed);
+    let sql = decision_doctor_cycle_probe_sql(state);
     let mut statement = connection
         .prepare(&sql)
         .map_err(|source| AppError::Database {
@@ -1711,17 +1719,58 @@ fn decision_doctor_cycle_probe(
     Ok(rows)
 }
 
-fn decision_doctor_cycle_probe_sql(completed: bool) -> String {
-    let predicate = if completed {
-        "dc.state = 'completed' ORDER BY dc.updated_at DESC, dc.cycle_id DESC"
-    } else {
-        "dc.state <> 'completed' ORDER BY dc.state, dc.updated_at"
-    };
+fn decision_doctor_cycle_probe_sql(state: &'static str) -> String {
+    assert!(matches!(
+        state,
+        "pending" | "analyzing" | "waiting" | "completed" | "degraded"
+    ));
+    let direction = if state == "completed" { "DESC" } else { "ASC" };
     format!(
         "{DECISION_DOCTOR_CYCLE_PROBE_SELECT}
-         WHERE dc.campaign_id = ?1 AND {predicate}
+         WHERE dc.campaign_id = ?1 AND dc.state = '{state}'
+         ORDER BY dc.source_terminal_at {direction},
+                  dc.source_experiment_id {direction}, dc.cycle_id {direction}
          LIMIT ?2"
     )
+}
+
+const DECISION_UNKNOWN_STATE_RANGES: [&str; 6] = [
+    "dc.state < 'analyzing'",
+    "dc.state > 'analyzing' AND dc.state < 'completed'",
+    "dc.state > 'completed' AND dc.state < 'degraded'",
+    "dc.state > 'degraded' AND dc.state < 'pending'",
+    "dc.state > 'pending' AND dc.state < 'waiting'",
+    "dc.state > 'waiting'",
+];
+
+fn decision_doctor_unknown_state_exists(
+    connection: &rusqlite::Connection,
+    campaign_id: &str,
+) -> Result<bool, AppError> {
+    for predicate in DECISION_UNKNOWN_STATE_RANGES {
+        let exists = connection
+            .query_row(
+                &format!(
+                    "SELECT 1
+                     FROM decision_cycles dc
+                          INDEXED BY decision_cycles_campaign_state_source_order_idx
+                     WHERE dc.campaign_id = ?1 AND ({predicate})
+                     LIMIT 1"
+                ),
+                [campaign_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|source| AppError::Database {
+                operation: "probe malformed decision cycle state",
+                source,
+            })?
+            .unwrap_or(false);
+        if exists {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 struct DecisionDoctorAttemptProbe {
@@ -1897,38 +1946,69 @@ mod decision_doctor_query_plan_tests {
     use rusqlite::params;
     use tempfile::TempDir;
 
-    use super::decision_doctor_cycle_probe_sql;
+    use super::{decision_doctor_cycle_probe_sql, DECISION_UNKNOWN_STATE_RANGES};
     use crate::db::Db;
 
     #[test]
-    fn live_cycle_probe_uses_the_campaign_state_index_without_a_table_scan() {
+    fn every_cycle_state_probe_uses_the_canonical_index_without_a_scan_or_sort() {
         let temp = TempDir::new().unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
-        let connection = db.connect().unwrap();
-        let sql = format!(
-            "EXPLAIN QUERY PLAN {}",
-            decision_doctor_cycle_probe_sql(false)
-        );
-        let mut statement = connection.prepare(&sql).unwrap();
-        let details = statement
-            .query_map(params!["campaign-a", 2_i64], |row| {
-                row.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("decision_cycles_campaign_state_updated_idx")),
-            "{details:?}"
-        );
-        assert!(
-            details
-                .iter()
-                .all(|detail| !detail.starts_with("SCAN dc")),
-            "{details:?}"
-        );
+        for state in ["pending", "analyzing", "waiting", "completed", "degraded"] {
+            let sql = decision_doctor_cycle_probe_sql(state);
+            assert!(!sql.contains("state <>"), "{state}: {sql}");
+            let connection = db.connect().unwrap();
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let details = statement
+                .query_map(params!["campaign-a", 2_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("decision_cycles_campaign_state_source_order_idx")
+                }),
+                "{state}: {details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| {
+                    !detail.starts_with("SCAN dc") && !detail.contains("TEMP B-TREE")
+                }),
+                "{state}: {details:?}"
+            );
+        }
+        for predicate in DECISION_UNKNOWN_STATE_RANGES {
+            let connection = db.connect().unwrap();
+            let sql = format!(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1
+                 FROM decision_cycles dc
+                      INDEXED BY decision_cycles_campaign_state_source_order_idx
+                 WHERE dc.campaign_id = ?1 AND ({predicate})
+                 LIMIT 1"
+            );
+            let mut statement = connection.prepare(&sql).unwrap();
+            let details = statement
+                .query_map(["campaign-a"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("decision_cycles_campaign_state_source_order_idx")
+                }),
+                "{predicate}: {details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| {
+                    !detail.starts_with("SCAN dc") && !detail.contains("TEMP B-TREE")
+                }),
+                "{predicate}: {details:?}"
+            );
+        }
     }
 }
 

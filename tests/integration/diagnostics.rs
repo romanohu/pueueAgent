@@ -1146,6 +1146,109 @@ fn decision_status_uses_scheduler_due_and_source_terminal_order() {
 }
 
 #[test]
+fn decision_status_and_doctor_ignore_large_completed_history_when_future_wait_is_current() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (campaign_id, future_wait_cycle_id) = harness.start_terminal_decision(now - 2_000);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles
+             SET state = 'waiting', next_wake_at = ?1, updated_at = ?2
+             WHERE cycle_id = ?3",
+            params![now + 600, now - 1_999, future_wait_cycle_id],
+        )
+        .unwrap();
+    for ordinal in 1..=64 {
+        harness.add_terminal_decision_cycle(
+            &campaign_id,
+            &format!("completed-history-{ordinal:03}"),
+            ordinal,
+            now - 1_900 + ordinal,
+            "completed",
+            None,
+            now + ordinal,
+        );
+    }
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(
+        value["campaign"]["decision"]["cycle_id"],
+        future_wait_cycle_id
+    );
+    assert_eq!(value["campaign"]["decision"]["state"], "waiting");
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.rows")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Ok
+    );
+}
+
+#[test]
+fn decision_status_uses_latest_source_order_with_only_large_completed_history() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (campaign_id, first_cycle_id) = harness.start_terminal_decision(now - 2_000);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles SET state = 'completed', updated_at = ?1
+             WHERE cycle_id = ?2",
+            params![now + 10_000, first_cycle_id],
+        )
+        .unwrap();
+    let mut expected_cycle_id = String::new();
+    for ordinal in 1..=64 {
+        let (_, cycle_id) = harness.add_terminal_decision_cycle(
+            &campaign_id,
+            &format!("completed-only-{ordinal:03}"),
+            ordinal,
+            now - 1_900 + ordinal,
+            "completed",
+            None,
+            now - ordinal,
+        );
+        expected_cycle_id = cycle_id;
+    }
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(
+        value["campaign"]["decision"]["cycle_id"],
+        expected_cycle_id
+    );
+    assert_eq!(value["campaign"]["decision"]["state"], "completed");
+}
+
+#[test]
 fn decision_status_projects_active_cycle_without_raw_evidence() {
     let harness = DiagnosticsHarness::new();
     let now = unix_now();
@@ -1764,6 +1867,55 @@ fn decision_doctor_reports_blob_in_text_payload_as_typed_checks_without_repair()
     assert!(!render_doctor_report_value(&report, true)
         .unwrap()
         .contains("SECRET_PAYLOAD"));
+}
+
+#[test]
+fn decision_doctor_reports_blob_source_order_as_typed_row_error_without_repair() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles
+             SET source_terminal_at = CAST(x'ff00534543524554' AS BLOB)
+             WHERE cycle_id = ?1",
+            [&cycle_id],
+        )
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.rows")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Error
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT typeof(source_terminal_at) FROM decision_cycles WHERE cycle_id = ?1",
+                [&cycle_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "blob"
+    );
 }
 
 #[test]

@@ -38,6 +38,11 @@ pub enum AppError {
     #[error("database conflict on {field}; the value is already registered")]
     DatabaseConflict { field: &'static str },
 
+    #[error(
+        "SQLite schema v{current} requires migration to v{required}; run a writable pueue-agent command to migrate it before retrying"
+    )]
+    SchemaMigrationRequired { current: i64, required: i64 },
+
     #[error("invalid {field}: {message}")]
     Validation {
         field: &'static str,

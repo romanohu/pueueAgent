@@ -21,7 +21,7 @@ const MAX_TERMINAL_DECISION_BACKFILL: i64 = 128;
 const MAX_FINALIZED_UNBOUND_REPAIRS: i64 = 128;
 
 const DECISION_CYCLE_SELECT: &str = "SELECT
-    cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
+    cycle_id, campaign_id, source_experiment_id, source_terminal_at, state, next_wake_at,
     consecutive_failed_attempts, last_decision_kind, last_failure_code,
     last_failure_summary, created_at, updated_at
     FROM decision_cycles";
@@ -30,6 +30,76 @@ const DECISION_ATTEMPT_SELECT: &str = "SELECT
     agent_run_id, decision_json, decision_digest, decision_kind, failure_code,
     failure_summary, created_at, started_at, finished_at
     FROM decision_attempts";
+const GLOBAL_PENDING_DECISION_SQL: &str =
+    "SELECT dc.cycle_id, dc.source_terminal_at, dc.source_experiment_id
+     FROM decision_cycles dc INDEXED BY decision_cycles_state_source_order_idx
+     JOIN campaigns c ON c.campaign_id = dc.campaign_id
+     JOIN projects p ON p.project_id = c.project_id
+     WHERE dc.state = 'pending' AND c.state = 'active'
+       AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
+     ORDER BY dc.source_terminal_at, dc.source_experiment_id, dc.cycle_id
+     LIMIT ?1";
+const GLOBAL_DUE_WAIT_DECISION_SQL: &str =
+    "SELECT dc.cycle_id, dc.source_terminal_at, dc.source_experiment_id
+     FROM decision_cycles dc INDEXED BY decision_cycles_state_source_order_idx
+     JOIN campaigns c ON c.campaign_id = dc.campaign_id
+     JOIN projects p ON p.project_id = c.project_id
+     WHERE dc.state = 'waiting' AND dc.next_wake_at <= ?1 AND c.state = 'active'
+       AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
+     ORDER BY dc.source_terminal_at, dc.source_experiment_id, dc.cycle_id
+     LIMIT ?2";
+const CAMPAIGN_PENDING_DECISION_SQL: &str =
+    "SELECT cycle_id, source_terminal_at, source_experiment_id
+     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
+     WHERE campaign_id = ?1 AND state = 'pending'
+     ORDER BY source_terminal_at, source_experiment_id, cycle_id
+     LIMIT 1";
+const CAMPAIGN_DUE_WAIT_DECISION_SQL: &str =
+    "SELECT cycle_id, source_terminal_at, source_experiment_id
+     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
+     WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at <= ?2
+     ORDER BY source_terminal_at, source_experiment_id, cycle_id
+     LIMIT 1";
+
+#[derive(Debug)]
+struct DecisionOrderCandidate {
+    cycle_id: String,
+    source_terminal_at: i64,
+    source_experiment_id: String,
+}
+
+impl DecisionOrderCandidate {
+    fn source_order(&self) -> (i64, &str, &str) {
+        (
+            self.source_terminal_at,
+            &self.source_experiment_id,
+            &self.cycle_id,
+        )
+    }
+}
+
+fn query_decision_order_candidates(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+    operation: &'static str,
+) -> Result<Vec<DecisionOrderCandidate>, AppError> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(database_error(operation))?;
+    let candidates = statement
+        .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+            Ok(DecisionOrderCandidate {
+                cycle_id: row.get(0)?,
+                source_terminal_at: row.get(1)?,
+                source_experiment_id: row.get(2)?,
+            })
+        })
+        .map_err(database_error(operation))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error(operation))?;
+    Ok(candidates)
+}
 
 pub struct DecisionRepository<'db> {
     db: &'db Db,
@@ -1232,31 +1302,25 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin due decision cycle query"))?;
-        let cycle_ids = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT dc.cycle_id
-                     FROM decision_cycles dc
-                     JOIN campaigns c ON c.campaign_id = dc.campaign_id
-                     JOIN projects p ON p.project_id = c.project_id
-                     JOIN experiments e ON e.experiment_id = dc.source_experiment_id
-                     WHERE (dc.state = 'pending'
-                            OR (dc.state = 'waiting' AND dc.next_wake_at <= ?1))
-                       AND c.state = 'active'
-                       AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
-                       AND e.campaign_id = dc.campaign_id
-                       AND e.status IN ('succeeded','failed','cancelled')
-                     ORDER BY COALESCE(e.finished_at, e.updated_at), e.experiment_id, dc.cycle_id
-                     LIMIT ?2",
-                )
-                .map_err(database_error("prepare due decision cycle query"))?;
-            let rows = statement
-                .query_map(params![now, limit], |row| row.get::<_, String>(0))
-                .map_err(database_error("query due decision cycles"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(database_error("read due decision cycles"))?;
-            rows
-        };
+        let pending = query_decision_order_candidates(
+            &transaction,
+            GLOBAL_PENDING_DECISION_SQL,
+            &[&limit],
+            "query pending decision cycles",
+        )?;
+        let waiting = query_decision_order_candidates(
+            &transaction,
+            GLOBAL_DUE_WAIT_DECISION_SQL,
+            &[&now, &limit],
+            "query due waiting decision cycles",
+        )?;
+        let mut candidates = pending.into_iter().chain(waiting).collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| left.source_order().cmp(&right.source_order()));
+        let cycle_ids = candidates
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|candidate| candidate.cycle_id)
+            .collect::<Vec<_>>();
         let mut cycles = Vec::with_capacity(cycle_ids.len());
         for cycle_id in cycle_ids {
             let authority = read_authority(&transaction, &cycle_id)?;
@@ -1309,27 +1373,40 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin oldest due decision cycle query"))?;
-        let cycle_id = transaction
+        let campaign_active: bool = transaction
             .query_row(
-                "SELECT dc.cycle_id
-                 FROM decision_cycles dc
-                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                "SELECT c.state = 'active'
+                        AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
+                 FROM campaigns c
                  JOIN projects p ON p.project_id = c.project_id
-                 JOIN experiments e ON e.experiment_id = dc.source_experiment_id
-                 WHERE c.campaign_id = ?1 AND c.project_id = ?2
-                   AND (dc.state = 'pending'
-                        OR (dc.state = 'waiting' AND dc.next_wake_at <= ?3))
-                   AND c.state = 'active'
-                   AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
-                   AND e.campaign_id = dc.campaign_id
-                   AND e.status IN ('succeeded','failed','cancelled')
-                 ORDER BY COALESCE(e.finished_at, e.updated_at), e.experiment_id, dc.cycle_id
-                 LIMIT 1",
-                params![campaign_id, project_id, now],
-                |row| row.get::<_, String>(0),
+                 WHERE c.campaign_id = ?1 AND c.project_id = ?2",
+                params![campaign_id, project_id],
+                |row| row.get(0),
             )
             .optional()
-            .map_err(database_error("query oldest due decision cycle"))?;
+            .map_err(database_error("query decision campaign authority"))?
+            .unwrap_or(false);
+        let cycle_id = if campaign_active {
+            let pending = query_decision_order_candidates(
+                &transaction,
+                CAMPAIGN_PENDING_DECISION_SQL,
+                &[&campaign_id],
+                "query oldest pending campaign decision",
+            )?;
+            let waiting = query_decision_order_candidates(
+                &transaction,
+                CAMPAIGN_DUE_WAIT_DECISION_SQL,
+                &[&campaign_id, &now],
+                "query oldest waiting campaign decision",
+            )?;
+            pending
+                .into_iter()
+                .chain(waiting)
+                .min_by(|left, right| left.source_order().cmp(&right.source_order()))
+                .map(|candidate| candidate.cycle_id)
+        } else {
+            None
+        };
         let Some(cycle_id) = cycle_id else {
             transaction
                 .commit()
@@ -1567,7 +1644,8 @@ fn read_authority(
     connection
         .query_row(
             &format!(
-                "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id, dc.state,
+                "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id,
+                        dc.source_terminal_at, dc.state,
                         dc.next_wake_at, dc.consecutive_failed_attempts, dc.last_decision_kind,
                         dc.last_failure_code, dc.last_failure_summary, dc.created_at, dc.updated_at,
                         c.project_id, c.state, p.enabled, p.paused,
@@ -1583,14 +1661,14 @@ fn read_authority(
             |row| {
                 Ok(DecisionAuthority {
                     cycle: decision_cycle_from_row(row)?,
-                    project_id: row.get(11)?,
-                    campaign_state: row.get(12)?,
-                    project_enabled: row.get(13)?,
-                    project_paused: row.get(14)?,
-                    project_halted: row.get(15)?,
-                    experiment_campaign_id: row.get(16)?,
-                    experiment_status: row.get(17)?,
-                    objective_digest: row.get(18)?,
+                    project_id: row.get(12)?,
+                    campaign_state: row.get(13)?,
+                    project_enabled: row.get(14)?,
+                    project_paused: row.get(15)?,
+                    project_halted: row.get(16)?,
+                    experiment_campaign_id: row.get(17)?,
+                    experiment_status: row.get(18)?,
+                    objective_digest: row.get(19)?,
                 })
             },
         )
@@ -1612,7 +1690,8 @@ fn ensure_terminal_cycle_in_transaction(
 ) -> Result<DecisionCycle, AppError> {
     let lineage = transaction
         .query_row(
-            "SELECT c.project_id, e.campaign_id, e.status
+            "SELECT c.project_id, e.campaign_id, e.status,
+                    COALESCE(e.finished_at, e.updated_at)
              FROM campaigns c
              JOIN projects p ON p.project_id = c.project_id
              JOIN experiments e ON e.experiment_id = ?2
@@ -1623,18 +1702,28 @@ fn ensure_terminal_cycle_in_transaction(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, ExperimentStatus>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(database_error("read terminal decision lineage"))?;
-    let Some((_project_id, experiment_campaign_id, experiment_status)) = lineage else {
+    let Some((
+        _project_id,
+        experiment_campaign_id,
+        experiment_status,
+        source_terminal_at,
+    )) = lineage
+    else {
         return Err(validation_error(
             "source_experiment_id",
             "must identify an experiment linked to an existing campaign and project",
         ));
     };
-    if experiment_campaign_id != campaign_id || !is_terminal(experiment_status) {
+    if experiment_campaign_id != campaign_id
+        || !is_terminal(experiment_status)
+        || source_terminal_at <= 0
+    {
         return Err(validation_error(
             "source_experiment_id",
             "must identify a terminal experiment in the same campaign",
@@ -1647,10 +1736,10 @@ fn ensure_terminal_cycle_in_transaction(
             "INSERT INTO decision_cycles (
                 cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
                 consecutive_failed_attempts, last_decision_kind, last_failure_code,
-                last_failure_summary, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, ?4, ?4)
+                last_failure_summary, created_at, updated_at, source_terminal_at
+             ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, ?4, ?4, ?5)
              ON CONFLICT(campaign_id, source_experiment_id) DO NOTHING",
-            params![cycle_id, campaign_id, experiment_id, now],
+            params![cycle_id, campaign_id, experiment_id, now, source_terminal_at],
         )
         .map_err(database_error("insert terminal decision cycle"))?;
     read_cycle_for_source(transaction, campaign_id, experiment_id)
@@ -1777,14 +1866,15 @@ fn decision_cycle_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision
         cycle_id: row.get(0)?,
         campaign_id: row.get(1)?,
         source_experiment_id: row.get(2)?,
-        state: row.get(3)?,
-        next_wake_at: row.get(4)?,
-        consecutive_failed_attempts: row.get(5)?,
-        last_decision_kind: row.get(6)?,
-        last_failure_code: row.get(7)?,
-        last_failure_summary: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        source_terminal_at: row.get(3)?,
+        state: row.get(4)?,
+        next_wake_at: row.get(5)?,
+        consecutive_failed_attempts: row.get(6)?,
+        last_decision_kind: row.get(7)?,
+        last_failure_code: row.get(8)?,
+        last_failure_summary: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -1891,4 +1981,78 @@ fn validation_error(
     message: &'static str,
 ) -> AppError {
     AppError::Validation { field, message }
+}
+
+#[cfg(test)]
+mod due_query_plan_tests {
+    use tempfile::TempDir;
+
+    use super::{
+        CAMPAIGN_DUE_WAIT_DECISION_SQL, CAMPAIGN_PENDING_DECISION_SQL,
+        GLOBAL_DUE_WAIT_DECISION_SQL, GLOBAL_PENDING_DECISION_SQL,
+    };
+    use crate::db::Db;
+
+    #[test]
+    fn every_due_state_probe_is_direct_bounded_and_index_ordered() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        for (name, sql, parameters, expected_index) in [
+            (
+                "global pending",
+                GLOBAL_PENDING_DECISION_SQL,
+                vec![&4_i64 as &dyn rusqlite::ToSql],
+                "decision_cycles_state_source_order_idx",
+            ),
+            (
+                "global due waiting",
+                GLOBAL_DUE_WAIT_DECISION_SQL,
+                vec![
+                    &100_i64 as &dyn rusqlite::ToSql,
+                    &4_i64 as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_state_source_order_idx",
+            ),
+            (
+                "campaign pending",
+                CAMPAIGN_PENDING_DECISION_SQL,
+                vec![&"campaign-a" as &dyn rusqlite::ToSql],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+            (
+                "campaign due waiting",
+                CAMPAIGN_DUE_WAIT_DECISION_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &100_i64 as &dyn rusqlite::ToSql,
+                ],
+                "decision_cycles_campaign_state_source_order_idx",
+            ),
+        ] {
+            assert!(!sql.contains(" OR "), "{name}: {sql}");
+            assert!(!sql.contains("experiments"), "{name}: {sql}");
+            let connection = db.connect().unwrap();
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let details = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "{name}: {details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| {
+                    !detail.starts_with("SCAN decision_cycles")
+                        && !detail.contains("TEMP B-TREE")
+                }),
+                "{name}: {details:?}"
+            );
+        }
+    }
 }
