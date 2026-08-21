@@ -419,7 +419,7 @@ async fn terminal_success_and_failure_each_create_one_decision_cycle_event() {
 }
 
 #[tokio::test]
-async fn terminal_cycle_and_decision_event_publication_rolls_back_and_republishes_on_restart() {
+async fn persisted_terminal_experiment_backfills_decision_publication_after_task_pruning() {
     let harness = Harness::new();
     let experiment_id = harness.accepted_campaign_experiment(41);
     let task = terminal_task(41, "100", json!("Success"));
@@ -444,6 +444,14 @@ async fn terminal_cycle_and_decision_event_publication_rolls_back_and_republishe
 
     assert_eq!(harness.decision_cycle_count(&experiment_id), 0);
     assert_eq!(harness.decision_event_count(&experiment_id), 0);
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Succeeded
+    );
     harness
         .db
         .connect()
@@ -451,13 +459,62 @@ async fn terminal_cycle_and_decision_event_publication_rolls_back_and_republishe
         .execute_batch("DROP TRIGGER reject_campaign_decision_publication;")
         .unwrap();
 
-    Reconciler::new(&harness.db, FakePueue::with_tasks(vec![task]))
+    Reconciler::new(&harness.db, FakePueue::with_tasks(Vec::new()))
         .run_once_at(201)
         .await
         .unwrap();
 
     assert_eq!(harness.decision_cycle_count(&experiment_id), 1);
     assert_eq!(harness.decision_event_count(&experiment_id), 1);
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    let payload_json: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT payload_json FROM events
+             WHERE experiment_id = ?1 AND kind = 'campaign_decision'",
+            [&experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+    assert_eq!(
+        payload["terminal_observation"]["task_signature"],
+        json!(experiment.task_signature.unwrap())
+    );
+    assert_eq!(payload["terminal_observation"]["enqueued_at"], json!(100));
+    Reconciler::new(&harness.db, FakePueue::with_tasks(Vec::new()))
+        .run_once_at(202)
+        .await
+        .unwrap();
+    assert_eq!(harness.decision_cycle_count(&experiment_id), 1);
+    assert_eq!(harness.decision_event_count(&experiment_id), 1);
+}
+
+#[tokio::test]
+async fn persisted_terminal_without_lineaged_terminal_event_is_not_backfilled() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    ExperimentRepository::new(&harness.db)
+        .project_terminal_submission(
+            &experiment_id,
+            41,
+            pueue_agent::models::ExperimentTerminalOutcome::Succeeded,
+            200,
+        )
+        .unwrap();
+
+    Reconciler::new(&harness.db, FakePueue::with_tasks(Vec::new()))
+        .run_once_at(201)
+        .await
+        .unwrap();
+
+    assert_eq!(harness.decision_cycle_count(&experiment_id), 0);
+    assert_eq!(harness.decision_event_count(&experiment_id), 0);
 }
 
 #[tokio::test]

@@ -191,6 +191,7 @@ where
         }
 
         recover_submissions(self.db, &projects, &tasks, &mut report)?;
+        DecisionRepository::new(self.db).backfill_terminal_cycle_events(now)?;
         Ok(report)
     }
 }

@@ -843,28 +843,34 @@ impl Scheduler {
                             report.cleanup.push(cleanup);
                         }
                         let decisions = DecisionRepository::new(&self.db);
-                        let requeued = if matches!(stage, AgentSpawnStage::PreBinding) {
-                            Some(return_scheduler_error!(decisions.requeue_unbound_attempt(
+                        let recovery_resolved = matches!(
+                            stage,
+                            AgentSpawnStage::PreBinding
+                                | AgentSpawnStage::RunBoundPreMarker { resolved: true, .. }
+                                | AgentSpawnStage::PostMarker { resolved: true, .. }
+                        );
+                        let requeued = if recovery_resolved {
+                            return_scheduler_error!(decisions.recover_unbound_attempt_event(
                                 &decision_reservation,
+                                primary.event_id,
                                 self.config.now,
-                            )))
+                                self.config.now + self.config.lease_seconds,
+                            ))
                         } else {
                             return_scheduler_error!(decisions.try_requeue_unbound_attempt(
                                 &decision_reservation,
                                 self.config.now,
                             ))
                         };
-                        if requeued.is_some()
-                            && return_scheduler_error!(
-                                EventRepository::new(&self.db).find_by_id(primary.event_id)
-                            )
-                            .is_some_and(|event| event.status == EventStatus::Claimed)
-                        {
-                            return_scheduler_error!(
-                                EventRepository::new(&self.db).defer_claimed(&event_ids)
-                            );
-                        }
                         if matches!(stage, AgentSpawnStage::PreBinding) && !retained_cleanup {
+                            if requeued.is_none() {
+                                return Err(SchedulerTickError::new(
+                                    report,
+                                    AppError::Runtime {
+                                        operation: "recover unbound decision pre-binding failure",
+                                    },
+                                ));
+                            }
                             continue;
                         }
                         let unresolved_error = unresolved_spawn_error(stage, source);

@@ -640,6 +640,225 @@ mod decision_cycle {
     }
 
     #[test]
+    fn max_retry_zero_unowned_bind_failure_recovers_the_exact_decision_event() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let decisions = DecisionRepository::new(&harness.db);
+        let cycle_id = decisions
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 190)
+            .unwrap()
+            .cycle_id;
+        let (_, event) = decisions
+            .publish_terminal_cycle_event(
+                &harness.campaign_id,
+                &harness.experiment_id,
+                &NewEvent::new(
+                    &harness.project_id,
+                    EventKind::CampaignDecision,
+                    format!("campaign-decision:v1:{cycle_id}"),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle_id,
+                        "source_experiment_id": harness.experiment_id,
+                    }),
+                    190,
+                    190,
+                )
+                .with_campaign_lineage(
+                    harness.campaign_id.clone(),
+                    Some(harness.experiment_id.clone()),
+                ),
+                190,
+            )
+            .unwrap();
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .unwrap();
+        let budget_key = format!(
+            "campaign-decision-attempt:v1:{}:{}",
+            reservation.cycle_id, reservation.attempt_number
+        );
+        CampaignRepository::new(&harness.db)
+            .reserve_agent_decision(
+                &harness.campaign_id,
+                &budget_key,
+                &CampaignLimits::default(),
+                192,
+            )
+            .unwrap();
+        EventRepository::new(&harness.db)
+            .claim_batch(192, 252, 1)
+            .unwrap();
+        let runs = AgentRunRepository::new(&harness.db);
+        let run = runs
+            .insert_with_events(
+                &NewAgentRun::new(
+                    &harness.project_id,
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    193,
+                    harness.test.project_root("campaign-project").join("bind-failure.log"),
+                ),
+                &[event.event_id],
+            )
+            .unwrap();
+        runs.fail_before_gate_release_with_policy(
+            &harness.project_id,
+            run.run_id,
+            194,
+            "injected decision bind failure",
+            RetryPolicy { max_retries: 0 },
+        )
+        .unwrap();
+        let unrelated = EventRepository::new(&harness.db)
+            .insert_idempotent(&NewEvent::new(
+                &harness.project_id,
+                EventKind::DeepCheck,
+                "unrelated-dead-letter",
+                json!({}),
+                195,
+                195,
+            ))
+            .unwrap();
+        EventRepository::new(&harness.db)
+            .claim_batch(195, 255, 1)
+            .unwrap();
+        EventRepository::new(&harness.db)
+            .resolve_claimed_without_run(
+                &harness.project_id,
+                &[unrelated.event_id],
+                195,
+                "unrelated failure",
+                RetryPolicy { max_retries: 0 },
+            )
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_unbound_decision_event_recovery
+                 BEFORE UPDATE OF status ON events
+                 WHEN OLD.event_id = {} AND NEW.status = 'retry_wait'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected unbound decision event recovery failure');
+                 END;",
+                event.event_id
+            ))
+            .unwrap();
+
+        assert!(decisions
+            .recover_unbound_attempt_event(&reservation, event.event_id, 196, 256)
+            .is_err());
+        let interrupted: (DecisionCycleState, DecisionAttemptState, EventStatus) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.state, da.state, ev.status
+                 FROM decision_cycles dc
+                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                 JOIN events ev ON ev.event_id = ?3
+                 WHERE dc.cycle_id = ?1 AND da.attempt_number = ?2",
+                params![
+                    reservation.cycle_id,
+                    reservation.attempt_number,
+                    event.event_id,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            interrupted,
+            (
+                DecisionCycleState::Analyzing,
+                DecisionAttemptState::EvidenceReady,
+                EventStatus::DeadLetter,
+            )
+        );
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_unbound_decision_event_recovery;")
+            .unwrap();
+
+        decisions
+            .recover_unbound_attempt_event(&reservation, event.event_id, 196, 256)
+            .unwrap();
+
+        let recovered = EventRepository::new(&harness.db)
+            .find_by_id(event.event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, EventStatus::RetryWait);
+        assert_eq!(recovered.not_before, 256);
+        assert_eq!(recovered.completed_at, None);
+        assert_eq!(
+            EventRepository::new(&harness.db)
+                .find_by_id(unrelated.event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            EventStatus::DeadLetter
+        );
+        let recovered_attempt: (DecisionCycleState, DecisionAttemptState, Option<i64>) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.state, da.state, da.agent_run_id
+                 FROM decision_cycles dc
+                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                 WHERE dc.cycle_id = ?1 AND da.attempt_number = ?2",
+                params![reservation.cycle_id, reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_attempt,
+            (
+                DecisionCycleState::Pending,
+                DecisionAttemptState::Reserved,
+                None,
+            )
+        );
+        let retried = decisions
+            .reserve_next_attempt(&harness.project_id, &reservation.cycle_id, 197)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried, reservation);
+        CampaignRepository::new(&harness.db)
+            .reserve_agent_decision(
+                &harness.campaign_id,
+                &budget_key,
+                &CampaignLimits::default(),
+                197,
+            )
+            .unwrap();
+        assert_eq!(
+            harness.scalar("SELECT COUNT(*) FROM decision_attempts"),
+            1
+        );
+        assert_eq!(
+            harness.scalar(
+                "SELECT COUNT(*) FROM budget_reservations WHERE dimension = 'agent_run'"
+            ),
+            1
+        );
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 1);
+        assert_eq!(
+            harness.scalar("SELECT COUNT(*) FROM events WHERE kind = 'campaign_decision'"),
+            1
+        );
+    }
+
+    #[test]
     fn stale_attempt_cannot_overwrite_a_newer_active_attempt() {
         let harness =
             CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);

@@ -17,6 +17,7 @@ const MAX_DECISION_PAYLOAD_BYTES: usize = 128 * 1024;
 const MAX_DECISION_DIGEST_BYTES: usize = 256;
 const MAX_DECISION_CODE_BYTES: usize = 128;
 const MAX_DECISION_SUMMARY_BYTES: usize = 2_048;
+const MAX_TERMINAL_DECISION_BACKFILL: i64 = 128;
 
 const DECISION_CYCLE_SELECT: &str = "SELECT
     cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
@@ -56,6 +57,20 @@ pub struct DecisionDoctorProjection {
     pub active_attempt_number: Option<i64>,
     pub active_attempt_state: Option<DecisionAttemptState>,
     pub active_agent_run_id: Option<i64>,
+}
+
+struct TerminalDecisionBackfill {
+    project_id: String,
+    campaign_id: String,
+    experiment_id: String,
+    pueue_task_id: i64,
+    managed_task_signature: String,
+    pueue_group: String,
+    state: String,
+    enqueued_at: Option<i64>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    terminal_payload_json: String,
 }
 
 struct DecisionAuthority {
@@ -214,6 +229,128 @@ impl<'db> DecisionRepository<'db> {
             .commit()
             .map_err(database_error("commit terminal decision publication"))?;
         Ok((cycle, event))
+    }
+
+    pub fn backfill_terminal_cycle_events(&self, now: i64) -> Result<usize, AppError> {
+        let connection = self.db.connect()?;
+        let backfills = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT p.project_id, e.campaign_id, e.experiment_id,
+                            e.pueue_task_id, e.task_signature, observation.pueue_group,
+                            observation.state, observation.enqueued_at,
+                            observation.started_at, observation.ended_at,
+                            terminal.payload_json
+                     FROM experiments e
+                     JOIN campaigns c ON c.campaign_id = e.campaign_id
+                     JOIN projects p ON p.project_id = c.project_id
+                     JOIN events terminal
+                       ON terminal.event_id = (
+                            SELECT source.event_id
+                            FROM events source
+                            WHERE source.project_id = p.project_id
+                              AND source.campaign_id = e.campaign_id
+                              AND source.experiment_id = e.experiment_id
+                              AND source.kind IN ('task_finished','task_failed','auto_killed')
+                              AND json_extract(source.payload_json, '$.source') = 'pueue_reconciliation'
+                              AND json_extract(source.payload_json, '$.task_id') = e.pueue_task_id
+                            ORDER BY source.event_id
+                            LIMIT 1
+                       )
+                     JOIN task_observations observation
+                       ON observation.project_id = p.project_id
+                      AND observation.pueue_task_id = e.pueue_task_id
+                      AND observation.task_signature =
+                          json_extract(terminal.payload_json, '$.task_signature')
+                     LEFT JOIN decision_cycles dc
+                       ON dc.campaign_id = e.campaign_id
+                      AND dc.source_experiment_id = e.experiment_id
+                     LEFT JOIN events ev
+                       ON ev.project_id = p.project_id
+                      AND ev.campaign_id = e.campaign_id
+                      AND ev.experiment_id = e.experiment_id
+                      AND ev.kind = 'campaign_decision'
+                      AND ev.dedup_key = 'campaign-decision:v1:' || dc.cycle_id
+                      AND json_extract(ev.payload_json, '$.source') = 'terminal_experiment'
+                      AND json_extract(ev.payload_json, '$.cycle_id') = dc.cycle_id
+                      AND json_extract(ev.payload_json, '$.source_experiment_id') = e.experiment_id
+                     WHERE p.enabled = 1
+                       AND e.status IN ('succeeded','failed','cancelled')
+                       AND ev.event_id IS NULL
+                     ORDER BY e.finished_at, e.experiment_id
+                     LIMIT ?1",
+                )
+                .map_err(database_error("prepare terminal decision backfill"))?;
+            let rows = statement
+                .query_map([MAX_TERMINAL_DECISION_BACKFILL], |row| {
+                    Ok(TerminalDecisionBackfill {
+                        project_id: row.get(0)?,
+                        campaign_id: row.get(1)?,
+                        experiment_id: row.get(2)?,
+                        pueue_task_id: row.get(3)?,
+                        managed_task_signature: row.get(4)?,
+                        pueue_group: row.get(5)?,
+                        state: row.get(6)?,
+                        enqueued_at: row.get(7)?,
+                        started_at: row.get(8)?,
+                        ended_at: row.get(9)?,
+                        terminal_payload_json: row.get(10)?,
+                    })
+                })
+                .map_err(database_error("query terminal decision backfill"))?;
+            rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read terminal decision backfill"))?
+        };
+        drop(connection);
+
+        let count = backfills.len();
+        for backfill in backfills {
+            let cycle_id = decision_cycle_id(&backfill.campaign_id, &backfill.experiment_id);
+            let terminal_payload = serde_json::from_str::<serde_json::Value>(
+                &backfill.terminal_payload_json,
+            )
+            .map_err(|source| AppError::Serialization {
+                operation: "deserialize persisted terminal event payload",
+                source,
+            })?;
+            let exit_code = terminal_payload
+                .get("result")
+                .and_then(stored_terminal_exit_code);
+            let event = NewEvent::new(
+                &backfill.project_id,
+                EventKind::CampaignDecision,
+                format!("campaign-decision:v1:{cycle_id}"),
+                serde_json::json!({
+                    "source": "terminal_experiment",
+                    "cycle_id": cycle_id,
+                    "source_experiment_id": backfill.experiment_id,
+                    "terminal_observation": {
+                        "task_id": backfill.pueue_task_id,
+                        "task_signature": backfill.managed_task_signature,
+                        "group": backfill.pueue_group,
+                        "state": backfill.state,
+                        "enqueued_at": backfill.enqueued_at,
+                        "started_at": backfill.started_at,
+                        "ended_at": backfill.ended_at,
+                        "exit_code": exit_code,
+                    },
+                }),
+                now,
+                now,
+            )
+            .with_campaign_lineage(
+                backfill.campaign_id.clone(),
+                Some(backfill.experiment_id.clone()),
+            );
+            self.publish_terminal_cycle_event(
+                &backfill.campaign_id,
+                &backfill.experiment_id,
+                &event,
+                now,
+            )?;
+        }
+        Ok(count)
     }
 
     pub fn reserve_next_attempt(
@@ -389,10 +526,121 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin unbound decision attempt requeue"))?;
-        let authority = read_authority(&transaction, &reservation.cycle_id)?;
+        let cycle = Self::try_requeue_unbound_attempt_in_transaction(
+            &transaction,
+            reservation,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit unbound decision attempt requeue"))?;
+        Ok(cycle)
+    }
+
+    pub fn recover_unbound_attempt_event(
+        &self,
+        reservation: &DecisionReservation,
+        event_id: i64,
+        now: i64,
+        retry_at: i64,
+    ) -> Result<Option<DecisionCycle>, AppError> {
+        if retry_at <= now {
+            return Err(validation_error(
+                "retry_at",
+                "must be later than the recovery timestamp",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin unbound decision event recovery"))?;
+        let cycle = Self::try_requeue_unbound_attempt_in_transaction(
+            &transaction,
+            reservation,
+            now,
+        )?;
+        let Some(cycle) = cycle else {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped bound decision event recovery"))?;
+            return Ok(None);
+        };
+        let event_status = transaction
+            .query_row(
+                "SELECT ev.status
+                 FROM events ev
+                 JOIN campaigns c ON c.campaign_id = ?2
+                 WHERE ev.event_id = ?1
+                   AND ev.project_id = c.project_id
+                   AND ev.campaign_id = ?2
+                   AND ev.experiment_id = ?3
+                   AND ev.kind = 'campaign_decision'
+                   AND json_extract(ev.payload_json, '$.source') = 'terminal_experiment'
+                   AND json_extract(ev.payload_json, '$.cycle_id') = ?4
+                   AND json_extract(ev.payload_json, '$.source_experiment_id') = ?3",
+                params![
+                    event_id,
+                    reservation.campaign_id,
+                    reservation.source_experiment_id,
+                    reservation.cycle_id,
+                ],
+                |row| row.get::<_, crate::models::EventStatus>(0),
+            )
+            .optional()
+            .map_err(database_error("validate unbound decision recovery event"))?
+            .ok_or_else(|| {
+                validation_error(
+                    "campaign_decision_event",
+                    "must carry the exact unbound decision reservation lineage",
+                )
+            })?;
+        let changed = match event_status {
+            crate::models::EventStatus::Claimed => transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'pending', lease_until = NULL, completed_at = NULL
+                     WHERE event_id = ?1 AND status = 'claimed'",
+                    [event_id],
+                )
+                .map_err(database_error("defer recovered claimed decision event"))?,
+            crate::models::EventStatus::RetryWait => 1,
+            crate::models::EventStatus::DeadLetter => transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'retry_wait', not_before = ?1, lease_until = NULL,
+                         completed_at = NULL
+                     WHERE event_id = ?2 AND status = 'dead_letter'",
+                    params![retry_at, event_id],
+                )
+                .map_err(database_error("revive unowned decision bind event"))?,
+            _ => {
+                return Err(validation_error(
+                    "campaign_decision_event",
+                    "unbound decision recovery requires a claimed, retry-wait, or dead-letter event",
+                ));
+            }
+        };
+        if changed != 1 {
+            return Err(validation_error(
+                "campaign_decision_event",
+                "status changed during unbound decision event recovery",
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit unbound decision event recovery"))?;
+        Ok(Some(cycle))
+    }
+
+    fn try_requeue_unbound_attempt_in_transaction(
+        transaction: &Transaction<'_>,
+        reservation: &DecisionReservation,
+        now: i64,
+    ) -> Result<Option<DecisionCycle>, AppError> {
+        let authority = read_authority(transaction, &reservation.cycle_id)?;
         validate_reservation_lineage(&authority, reservation)?;
         let attempt = read_attempt(
-            &transaction,
+            transaction,
             &reservation.cycle_id,
             reservation.attempt_number,
         )?;
@@ -422,9 +670,6 @@ impl<'db> DecisionRepository<'db> {
             }
         }
         if authority.cycle.state == DecisionCycleState::Pending {
-            transaction
-                .commit()
-                .map_err(database_error("commit existing unbound decision attempt requeue"))?;
             return Ok(Some(authority.cycle));
         }
         if authority.cycle.state != DecisionCycleState::Analyzing {
@@ -444,10 +689,7 @@ impl<'db> DecisionRepository<'db> {
                 "state changed while requeuing an unbound attempt",
             ));
         }
-        let cycle = read_cycle(&transaction, &reservation.cycle_id)?;
-        transaction
-            .commit()
-            .map_err(database_error("commit unbound decision attempt requeue"))?;
+        let cycle = read_cycle(transaction, &reservation.cycle_id)?;
         Ok(Some(cycle))
     }
 
@@ -1315,6 +1557,17 @@ fn decision_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decisi
 fn decision_cycle_id(campaign_id: &str, experiment_id: &str) -> String {
     let digest = Sha256::digest(format!("{campaign_id}\0{experiment_id}").as_bytes());
     format!("decision-cycle:{digest:x}")
+}
+
+fn stored_terminal_exit_code(result: &serde_json::Value) -> Option<i32> {
+    match result {
+        serde_json::Value::Object(object) => object
+            .get("Failed")
+            .or_else(|| object.get("Success"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        _ => None,
+    }
 }
 
 fn validate_payload(field: &'static str, value: &str) -> Result<(), AppError> {
