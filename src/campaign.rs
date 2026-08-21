@@ -48,7 +48,11 @@ pub fn render_status_for_project(
 ) -> Result<String, AppError> {
     let (campaign, proposal_count, experiment_counts, budget_usage, task_ids) =
         CampaignRepository::new(db).status_for_project(&project.project_id)?;
-    let decision = current_decision_projection(db, &campaign.campaign_id)?
+    let decision = current_decision_projection(
+        db,
+        &campaign.campaign_id,
+        crate::status::status_timestamp()?,
+    )?
         .as_ref()
         .map(DecisionStatusProjection::from);
     render_campaign_status_with_decision(

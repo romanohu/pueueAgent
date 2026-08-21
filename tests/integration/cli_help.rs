@@ -325,6 +325,44 @@ fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_bo
     assert!(troubleshooting.contains("decision.digests"));
     assert!(troubleshooting.contains("campaign pause"));
 
+    assert!(commands.contains("`status --json` の `campaign.decision`"));
+    assert!(commands.contains("`campaign status --json` の `decision`"));
+    for field in [
+        "cycle_id",
+        "source_experiment_id",
+        "state",
+        "attempt_count",
+        "last_decision_kind",
+        "next_wake_at",
+        "failure_code",
+        "failure_summary",
+    ] {
+        assert!(
+            commands.contains(&format!("`{field}`")),
+            "command reference is missing campaign decision field {field}"
+        );
+    }
+    for check in [
+        "decision.rows",
+        "decision.lineage",
+        "decision.active_attempts",
+        "decision.running_attempts",
+        "decision.wait_wake",
+        "decision.digests",
+        "decision.degraded_diagnostics",
+    ] {
+        assert!(
+            commands.contains(&format!("`{check}`")),
+            "command reference is missing doctor check {check}"
+        );
+    }
+
+    for document in [&readme, &getting_started, &architecture, &workflows] {
+        assert!(document.contains("Phase 3") && document.contains("running OOM/stall observer"));
+        assert!(document.contains("後続 phase") && document.contains("goal review"));
+        assert!(document.contains("Phase 5") && document.contains("code worktree"));
+    }
+
     let instructions = std::fs::read_to_string(root.join("templates/instructions.md")).unwrap();
     assert!(instructions.contains("Phase 2 decision agent"));
     assert!(instructions.contains("exactly one structured decision"));

@@ -153,7 +153,7 @@ live campaign 中の追加 `submit` と `submit-batch` は、別 campaign や別
 
 decision analysis も agent-run hourly budget を消費します。1 cycle の連続失敗は service-owned `max_decision_attempts_per_cycle`（既定 3）、wait は `max_decision_wait_minutes`（既定 1,440 分）で制限されます。上限まで失敗すると cycle と campaign は `degraded` になり、自動 proposal は止まります。`status --json` の `campaign.decision` で `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、bounded な failure code/summary を確認し、raw evidence や decision body を期待しないでください。
 
-Phase 3 の `running OOM/stall observer`、実行中 experiment の `periodic observer` による campaign health-decision loop、`goal review`、隔離された `code worktree` はまだ利用できません。既存 detector/Periodic DeepCheck は別機能であり、running health を継続評価して自動的に campaign を打ち切る observer ではありません。
+Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop はまだ利用できません。`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。既存 detector/Periodic DeepCheck は別機能であり、running health を継続評価して自動的に campaign を打ち切る observer ではありません。
 
 service-owned execution policy では network が既定で enabled です。ただし network access と credential access は別の権限であり、明示 allowlist にない credential/environment value は agent や agent task に継承されません。
 

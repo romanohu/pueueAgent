@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, time::SystemTime};
 
-use rusqlite::OptionalExtension;
+use rusqlite::{params, OptionalExtension};
 
 use crate::{
     config,
@@ -193,11 +193,12 @@ pub fn render_project_status(
         ));
     }
 
+    let now = status_timestamp()?;
     if let Some(campaign) = CampaignRepository::new(db)
-        .status_projection_for_project(&project.project_id, status_timestamp()?)?
+        .status_projection_for_project(&project.project_id, now)?
     {
         lines.push(campaign_status_line(&campaign));
-        if let Some(decision) = current_decision_projection(db, &campaign.campaign_id)? {
+        if let Some(decision) = current_decision_projection(db, &campaign.campaign_id, now)? {
             lines.push(render_decision_status_line(
                 &DecisionStatusProjection::from(&decision),
             ));
@@ -291,11 +292,12 @@ pub fn render_project_status_compact(
         }
     }
 
+    let now = status_timestamp()?;
     if let Some(campaign) = CampaignRepository::new(db)
-        .status_projection_for_project(&project.project_id, status_timestamp()?)?
+        .status_projection_for_project(&project.project_id, now)?
     {
         lines.push(campaign_status_line(&campaign));
-        if let Some(decision) = current_decision_projection(db, &campaign.campaign_id)? {
+        if let Some(decision) = current_decision_projection(db, &campaign.campaign_id, now)? {
             lines.push(render_decision_status_line(
                 &DecisionStatusProjection::from(&decision),
             ));
@@ -333,69 +335,219 @@ fn campaign_status_line(campaign: &CampaignStatusProjection) -> String {
     )
 }
 
+const CURRENT_DUE_DECISION_SOURCE_SQL: &str =
+    // (campaign_id, source_experiment_id) is unique on decision_cycles, so the
+    // scheduler's final cycle_id tie-break cannot distinguish rows after the
+    // source experiment ID tie-break. Keeping the indexed experiment order
+    // here is therefore equivalent without a temporary sort.
+    "SELECT e.experiment_id
+     FROM experiments e INDEXED BY experiments_campaign_terminal_order_idx
+     WHERE e.campaign_id = ?1
+       AND e.status IN ('succeeded','failed','cancelled')
+       AND EXISTS (
+           SELECT 1
+           FROM decision_cycles dc
+           WHERE dc.campaign_id = e.campaign_id
+             AND dc.source_experiment_id = e.experiment_id
+             AND (dc.state = 'pending'
+                  OR (dc.state = 'waiting' AND dc.next_wake_at <= ?2))
+       )
+     ORDER BY COALESCE(e.finished_at, e.updated_at), e.experiment_id
+     LIMIT 1";
+
 pub(crate) fn current_decision_projection(
     db: &Db,
     campaign_id: &str,
+    now: i64,
 ) -> Result<Option<DecisionDoctorProjection>, AppError> {
     let connection = db.connect()?;
-    connection
+    let analyzing_cycle_id = connection
+        .query_row(
+            "SELECT cycle_id
+             FROM decision_cycles INDEXED BY decision_cycles_campaign_state_updated_idx
+             WHERE campaign_id = ?1 AND state = 'analyzing'
+             ORDER BY updated_at, cycle_id
+             LIMIT 1",
+            [campaign_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|source| AppError::Database {
+            operation: "read active decision status candidate",
+            source,
+        })?;
+    let due_source_experiment_id = if analyzing_cycle_id.is_none() {
+        connection
+            .query_row(
+                CURRENT_DUE_DECISION_SOURCE_SQL,
+                params![campaign_id, now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| AppError::Database {
+                operation: "read due decision status candidate",
+                source,
+            })?
+    } else {
+        None
+    };
+    let due_cycle_id = due_source_experiment_id
+        .as_deref()
+        .map(|source_experiment_id| {
+            connection
+                .query_row(
+                    "SELECT cycle_id
+                     FROM decision_cycles
+                     WHERE campaign_id = ?1 AND source_experiment_id = ?2
+                     LIMIT 1",
+                    params![campaign_id, source_experiment_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|source| AppError::Database {
+                    operation: "read due decision cycle identity",
+                    source,
+                })
+        })
+        .transpose()?
+        .flatten();
+    let future_wait_cycle_id = if analyzing_cycle_id.is_none() && due_cycle_id.is_none() {
+        connection
+            .query_row(
+                "SELECT cycle_id
+                 FROM decision_cycles INDEXED BY decision_cycles_campaign_state_wake_updated_idx
+                 WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at > ?2
+                 ORDER BY next_wake_at, updated_at, cycle_id
+                 LIMIT 1",
+                params![campaign_id, now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| AppError::Database {
+                operation: "read waiting decision status candidate",
+                source,
+            })?
+    } else {
+        None
+    };
+    let terminal_cycle_id = if analyzing_cycle_id.is_none()
+        && due_cycle_id.is_none()
+        && future_wait_cycle_id.is_none()
+    {
+        let mut candidates = Vec::with_capacity(2);
+        for state in ["completed", "degraded"] {
+            if let Some(candidate) = connection
+                .query_row(
+                    "SELECT cycle_id, updated_at
+                     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_updated_idx
+                     WHERE campaign_id = ?1 AND state = ?2
+                     ORDER BY updated_at DESC, cycle_id DESC
+                     LIMIT 1",
+                    params![campaign_id, state],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|source| AppError::Database {
+                    operation: "read terminal decision status candidate",
+                    source,
+                })?
+            {
+                candidates.push(candidate);
+            }
+        }
+        candidates
+            .into_iter()
+            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)))
+            .map(|candidate| candidate.0)
+    } else {
+        None
+    };
+    let Some(cycle_id) = analyzing_cycle_id
+        .or(due_cycle_id)
+        .or(future_wait_cycle_id)
+        .or(terminal_cycle_id)
+    else {
+        return Ok(None);
+    };
+
+    let cycle = connection
         .query_row(
             "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id, dc.state,
                     dc.next_wake_at, dc.consecutive_failed_attempts,
                     dc.last_decision_kind, dc.last_failure_code, dc.last_failure_summary,
-                    dc.created_at, dc.updated_at,
-                    (SELECT COUNT(*) FROM decision_attempts count_attempt
-                     WHERE count_attempt.cycle_id = dc.cycle_id),
-                    (SELECT active_attempt.attempt_number
-                     FROM decision_attempts active_attempt
-                     WHERE active_attempt.cycle_id = dc.cycle_id
-                       AND dc.state = 'analyzing'
-                       AND active_attempt.state IN ('reserved','evidence_ready','running','decided')
-                     ORDER BY active_attempt.attempt_number DESC LIMIT 1),
-                    (SELECT active_attempt.state
-                     FROM decision_attempts active_attempt
-                     WHERE active_attempt.cycle_id = dc.cycle_id
-                       AND dc.state = 'analyzing'
-                       AND active_attempt.state IN ('reserved','evidence_ready','running','decided')
-                     ORDER BY active_attempt.attempt_number DESC LIMIT 1),
-                    (SELECT active_attempt.agent_run_id
-                     FROM decision_attempts active_attempt
-                     WHERE active_attempt.cycle_id = dc.cycle_id
-                       AND dc.state = 'analyzing'
-                       AND active_attempt.state IN ('reserved','evidence_ready','running','decided')
-                     ORDER BY active_attempt.attempt_number DESC LIMIT 1)
+                    dc.created_at, dc.updated_at
              FROM decision_cycles dc
-             WHERE dc.campaign_id = ?1
-             ORDER BY dc.updated_at DESC, dc.cycle_id DESC
-             LIMIT 1",
-            [campaign_id],
+             WHERE dc.cycle_id = ?1",
+            [&cycle_id],
             |row| {
-                Ok(DecisionDoctorProjection {
-                    cycle: DecisionCycle {
-                        cycle_id: row.get(0)?,
-                        campaign_id: row.get(1)?,
-                        source_experiment_id: row.get(2)?,
-                        state: row.get(3)?,
-                        next_wake_at: row.get(4)?,
-                        consecutive_failed_attempts: row.get(5)?,
-                        last_decision_kind: row.get(6)?,
-                        last_failure_code: row.get(7)?,
-                        last_failure_summary: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                    },
-                    attempt_count: row.get(11)?,
-                    active_attempt_number: row.get(12)?,
-                    active_attempt_state: row.get::<_, Option<DecisionAttemptState>>(13)?,
-                    active_agent_run_id: row.get(14)?,
+                Ok(DecisionCycle {
+                    cycle_id: row.get(0)?,
+                    campaign_id: row.get(1)?,
+                    source_experiment_id: row.get(2)?,
+                    state: row.get(3)?,
+                    next_wake_at: row.get(4)?,
+                    consecutive_failed_attempts: row.get(5)?,
+                    last_decision_kind: row.get(6)?,
+                    last_failure_code: row.get(7)?,
+                    last_failure_summary: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         )
-        .optional()
         .map_err(|source| AppError::Database {
             operation: "read bounded current decision status projection",
             source,
-        })
+        })?;
+    let attempt_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1
+                 FROM decision_attempts
+                 WHERE cycle_id = ?1
+                 ORDER BY attempt_number
+                 LIMIT 11
+             )",
+            [&cycle_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|source| AppError::Database {
+            operation: "read bounded decision status attempt count",
+            source,
+        })?;
+    let active_attempt = if cycle.state == crate::models::DecisionCycleState::Analyzing {
+        connection
+            .query_row(
+                "SELECT attempt_number, state, agent_run_id
+                 FROM decision_attempts
+                 WHERE cycle_id = ?1
+                   AND state IN ('reserved','evidence_ready','running','decided')
+                 ORDER BY attempt_number DESC
+                 LIMIT 1",
+                [&cycle_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, DecisionAttemptState>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| AppError::Database {
+                operation: "read bounded active decision status attempt",
+                source,
+            })?
+    } else {
+        None
+    };
+    Ok(Some(DecisionDoctorProjection {
+        cycle,
+        attempt_count,
+        active_attempt_number: active_attempt.as_ref().map(|attempt| attempt.0),
+        active_attempt_state: active_attempt.as_ref().map(|attempt| attempt.1),
+        active_agent_run_id: active_attempt.and_then(|attempt| attempt.2),
+    }))
 }
 
 fn render_counts(counts: &BTreeMap<String, i64>) -> String {
@@ -488,6 +640,81 @@ fn project_lifecycle_line(project: &Project) -> String {
         project.paused,
         project.halted_reason.is_some()
     )
+}
+
+#[cfg(test)]
+mod decision_query_plan_tests {
+    use tempfile::TempDir;
+
+    use super::CURRENT_DUE_DECISION_SOURCE_SQL;
+    use crate::db::Db;
+
+    fn explain(db: &Db, sql: &str, parameters: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+        let connection = db.connect().unwrap();
+        let mut statement = connection.prepare(sql).unwrap();
+        statement
+            .query_map(parameters, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn decision_status_and_doctor_probes_use_bounded_index_plans() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let due_query = format!("EXPLAIN QUERY PLAN {CURRENT_DUE_DECISION_SOURCE_SQL}");
+        let due_plan = explain(
+            &db,
+            &due_query,
+            &[&"campaign-a", &100_i64],
+        );
+        assert!(
+            due_plan
+                .iter()
+                .any(|detail| detail.contains("experiments_campaign_terminal_order_idx")),
+            "{due_plan:?}"
+        );
+        assert!(
+            due_plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "{due_plan:?}"
+        );
+
+        let cycle_plan = explain(
+            &db,
+            "EXPLAIN QUERY PLAN
+             SELECT cycle_id
+             FROM decision_cycles INDEXED BY decision_cycles_campaign_state_updated_idx
+             WHERE campaign_id = ?1 AND state <> 'completed'
+             ORDER BY state, updated_at
+             LIMIT ?2",
+            &[&"campaign-a", &2_i64],
+        );
+        assert!(
+            cycle_plan
+                .iter()
+                .any(|detail| detail.contains("decision_cycles_campaign_state_updated_idx")),
+            "{cycle_plan:?}"
+        );
+
+        let attempt_plan = explain(
+            &db,
+            "EXPLAIN QUERY PLAN
+             SELECT attempt_number
+             FROM decision_attempts
+             WHERE cycle_id = ?1
+             ORDER BY attempt_number
+             LIMIT ?2",
+            &[&"cycle-a", &4_i64],
+        );
+        assert!(
+            attempt_plan.iter().any(|detail| {
+                detail.contains("sqlite_autoindex_decision_attempts_1")
+                    || detail.contains("PRIMARY KEY")
+            }),
+            "{attempt_plan:?}"
+        );
+    }
 }
 
 fn event_status_counts(db: &Db, project_id: &str) -> Result<BTreeMap<String, i64>, AppError> {

@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
@@ -14,7 +17,11 @@ use crate::{
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
-    execution_policy::{inspect_pueue_config_path, load_existing_policy, resolve_project_policy, LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail, ResolvedExecutionPolicy},
+    execution_policy::{
+        inspect_pueue_config_path, load_existing_policy, resolve_project_policy, CampaignLimits,
+        LogUnsafeReason, PolicyViolation, PolicyViolationCode, PolicyViolationDetail,
+        ResolvedExecutionPolicy,
+    },
     environment::MAX_PRIVATE_TEMP_RUN_ID,
     models::{
         AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
@@ -41,7 +48,6 @@ pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 
 const MAX_TASK_AGENT_RUNS: usize = 64;
 const MAX_RESTART_UNCERTAIN_SAMPLES: i64 = 3;
-const MAX_DECISION_DOCTOR_ATTEMPTS: i64 = 10;
 const MAX_DECISION_DOCTOR_PAYLOAD_BYTES: i64 = 128 * 1024;
 const MAX_DECISION_DOCTOR_DIGEST_BYTES: i64 = 256;
 
@@ -774,7 +780,7 @@ pub fn build_doctor_report_with_policy_and_roots(
             ),
         });
     }
-    checks.extend(decision_doctor_checks(db, project, &connection, now)?);
+    checks.extend(decision_doctor_checks(db, project, &connection, now, policy)?);
 
     let required_tables = [
         "projects",
@@ -1360,135 +1366,138 @@ fn decision_doctor_checks(
     project: &Project,
     connection: &rusqlite::Connection,
     now: i64,
+    policy: &Result<ResolvedExecutionPolicy, PolicyViolation>,
 ) -> Result<Vec<DoctorCheck>, AppError> {
-    let decision_cycle_count: i64 = connection
+    let current_campaign_id = connection
         .query_row(
-            "SELECT COUNT(*)
-             FROM decision_cycles dc
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             WHERE c.project_id = ?1",
+            "SELECT campaign_id
+             FROM campaigns
+             WHERE project_id = ?1 AND state <> 'retired'
+             LIMIT 1",
             [&project.project_id],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
+        .optional()
         .map_err(|source| AppError::Database {
-            operation: "count project decision cycles for doctor",
+            operation: "read live decision campaign for doctor",
             source,
         })?;
-    let malformed_cycles: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_cycles dc
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             WHERE c.project_id = ?1
-               AND (dc.state NOT IN ('pending','analyzing','waiting','completed','degraded')
-                    OR dc.consecutive_failed_attempts < 0
-                    OR (dc.last_decision_kind IS NOT NULL
-                        AND dc.last_decision_kind NOT IN ('proposal','wait'))
-                    OR length(CAST(dc.last_decision_kind AS BLOB)) > 128
-                    OR length(CAST(dc.last_failure_code AS BLOB)) > 128
-                    OR length(CAST(dc.last_failure_summary AS BLOB)) > 2048)",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check malformed decision cycles for doctor",
-            source,
-        })?;
-    let malformed_attempts: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_attempts da
-             JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             WHERE c.project_id = ?1
-               AND (da.attempt_number <= 0
-                    OR da.state NOT IN ('reserved','evidence_ready','running','decided','failed')
-                    OR (da.context_json IS NULL) <> (da.context_digest IS NULL)
-                    OR (da.context_json IS NULL) <> (da.context_schema_version IS NULL)
-                    OR (da.context_json IS NOT NULL AND da.context_schema_version IS NOT 1)
-                    OR length(CAST(da.context_json AS BLOB)) > ?2
-                    OR length(CAST(da.context_digest AS BLOB)) > ?3
-                    OR (da.decision_json IS NULL) <> (da.decision_digest IS NULL)
-                    OR (da.decision_json IS NULL) <> (da.decision_kind IS NULL)
-                    OR length(CAST(da.decision_json AS BLOB)) > ?2
-                    OR length(CAST(da.decision_digest AS BLOB)) > ?3
-                    OR (da.decision_kind IS NOT NULL
-                        AND da.decision_kind NOT IN ('proposal','wait'))
-                    OR length(CAST(da.failure_code AS BLOB)) > 128
-                    OR length(CAST(da.failure_summary AS BLOB)) > 2048)",
-            params![
-                &project.project_id,
-                MAX_DECISION_DOCTOR_PAYLOAD_BYTES,
-                MAX_DECISION_DOCTOR_DIGEST_BYTES,
-            ],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check malformed decision attempts for doctor",
-            source,
-        })?;
-    let over_attempt_limit: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM (
-                 SELECT da.cycle_id
-                 FROM decision_attempts da
-                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
-                 WHERE c.project_id = ?1
-                 GROUP BY da.cycle_id
-                 HAVING COUNT(*) > ?2
-             )",
-            params![&project.project_id, MAX_DECISION_DOCTOR_ATTEMPTS],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check bounded decision attempt counts for doctor",
-            source,
-        })?;
-    let malformed_rows = malformed_cycles + malformed_attempts + over_attempt_limit;
+    let limits = policy
+        .as_ref()
+        .map(|policy| policy.campaign_limits)
+        .unwrap_or_else(|_| CampaignLimits::default());
+    let cycle_policy_limit = limits.max_parallel_experiments as usize;
+    let attempt_policy_limit = limits.max_decision_attempts_per_cycle as usize;
+    let mut cycles = if let Some(campaign_id) = current_campaign_id.as_deref() {
+        decision_doctor_cycle_probe(
+            connection,
+            campaign_id,
+            false,
+            i64::from(limits.max_parallel_experiments) + 1,
+        )?
+    } else {
+        Vec::new()
+    };
+    let cycle_overflow = cycles.len() > cycle_policy_limit;
+    if !cycle_overflow {
+        if let Some(campaign_id) = current_campaign_id.as_deref() {
+            cycles.extend(decision_doctor_cycle_probe(
+                connection,
+                campaign_id,
+                true,
+                1,
+            )?);
+        }
+    }
 
+    let decision_cycle_count = cycles.len();
+    let mut malformed_rows = i64::from(cycle_overflow);
+    let mut lineage_errors = 0_i64;
+    let mut active_attempt_count = 0_i64;
+    let mut duplicate_agent_bindings = 0_i64;
+    let mut agent_run_ids = BTreeSet::new();
+    let mut active_running_attempts = 0_i64;
+    let mut running_errors = 0_i64;
+    let mut waiting_without_wake = 0_i64;
+    let mut degraded_without_diagnostics = 0_i64;
+    let timeout_seconds = config::load(&project.config_path)
+        .ok()
+        .map(|config| i64::from(config.agent.timeout_minutes) * 60);
+
+    for cycle in &cycles {
+        malformed_rows += i64::from(!cycle.row_valid);
+        lineage_errors += i64::from(!cycle.lineage_valid);
+        waiting_without_wake +=
+            i64::from(cycle.state.as_deref() == Some("waiting") && cycle.next_wake_at.is_none());
+        degraded_without_diagnostics += i64::from(
+            cycle.state.as_deref() == Some("degraded") && !cycle.degraded_diagnostics_valid,
+        );
+        let Some(cycle_id) = cycle.cycle_id.as_deref() else {
+            continue;
+        };
+        let attempts = decision_doctor_attempt_probe(
+            connection,
+            cycle_id,
+            &project.project_id,
+            i64::from(limits.max_decision_attempts_per_cycle) + 1,
+        )?;
+        malformed_rows += i64::from(attempts.len() > attempt_policy_limit);
+        for attempt in attempts {
+            malformed_rows += i64::from(!attempt.row_valid);
+            if let Some(agent_run_id) = attempt.agent_run_id {
+                if !agent_run_ids.insert(agent_run_id) {
+                    duplicate_agent_bindings += 1;
+                }
+            }
+            let active = cycle.state.as_deref() == Some("analyzing")
+                && matches!(
+                    attempt.state.as_deref(),
+                    Some("reserved" | "evidence_ready" | "running" | "decided")
+                );
+            active_attempt_count += i64::from(active);
+            if attempt.state.as_deref() == Some("running") {
+                active_running_attempts += i64::from(active);
+                let structurally_valid = active
+                    && attempt.started_at.is_some()
+                    && attempt.agent_run_id.is_some()
+                    && attempt.agent_run_exists
+                    && attempt.agent_run_project_matches
+                    && attempt.agent_run_active;
+                let overdue = timeout_seconds.is_some_and(|timeout| {
+                    attempt
+                        .started_at
+                        .is_some_and(|started_at| started_at <= now - timeout)
+                });
+                running_errors += i64::from(!structurally_valid || overdue);
+            }
+        }
+    }
+
+    let active_conflicts = i64::from(active_attempt_count > 1) + duplicate_agent_bindings;
     let mut checks = vec![if malformed_rows == 0 {
         doctor_ok(
             "decision.rows",
             if decision_cycle_count == 0 {
-                "no managed decision rows are present"
+                "no live managed decision rows are present"
             } else {
-                "decision rows satisfy bounded typed field constraints"
+                "bounded live decision rows satisfy policy and typed field constraints"
             },
             "none",
         )
     } else {
         doctor_error(
             "decision.rows",
-            &format!("{malformed_rows} malformed or unbounded decision row set(s)"),
+            &format!("{malformed_rows} malformed or policy-unbounded decision row set(s)"),
             "inspect decision rows without migrating, deleting, or repairing them from doctor",
         )
     }];
-
-    let lineage_errors: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_cycles dc
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             LEFT JOIN experiments e ON e.experiment_id = dc.source_experiment_id
-             WHERE c.project_id = ?1
-               AND (e.experiment_id IS NULL
-                    OR e.campaign_id <> dc.campaign_id
-                    OR e.status NOT IN ('succeeded','failed','cancelled'))",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check decision cycle lineage for doctor",
-            source,
-        })?;
     checks.push(if lineage_errors == 0 {
         doctor_ok(
             "decision.lineage",
             if decision_cycle_count == 0 {
-                "no managed decision cycle lineage is present"
+                "no live managed decision cycle lineage is present"
             } else {
-                "decision cycles have terminal same-campaign source lineage"
+                "bounded live decision cycles have terminal same-campaign source lineage"
             },
             "none",
         )
@@ -1499,45 +1508,6 @@ fn decision_doctor_checks(
             "inspect campaign and terminal experiment lineage without doctor repair",
         )
     });
-
-    let active_attempt_conflicts: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM (
-                 SELECT dc.campaign_id
-                 FROM decision_attempts da
-                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
-                 WHERE c.project_id = ?1 AND dc.state = 'analyzing'
-                   AND da.state IN ('reserved','evidence_ready','running','decided')
-                 GROUP BY dc.campaign_id
-                 HAVING COUNT(*) > 1
-             )",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check duplicate active decision attempts for doctor",
-            source,
-        })?;
-    let duplicate_agent_bindings: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM (
-                 SELECT da.agent_run_id
-                 FROM decision_attempts da
-                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
-                 WHERE c.project_id = ?1 AND da.agent_run_id IS NOT NULL
-                 GROUP BY da.agent_run_id
-                 HAVING COUNT(*) > 1
-             )",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check duplicate decision agent bindings for doctor",
-            source,
-        })?;
-    let active_conflicts = active_attempt_conflicts + duplicate_agent_bindings;
     checks.push(if active_conflicts == 0 {
         doctor_ok(
             "decision.active_attempts",
@@ -1555,67 +1525,6 @@ fn decision_doctor_checks(
             "pause the campaign and inspect attempt/run ownership without doctor repair",
         )
     });
-
-    let active_running_attempts: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_attempts da
-             JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             WHERE c.project_id = ?1 AND dc.state = 'analyzing' AND da.state = 'running'",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "count running decision attempts for doctor",
-            source,
-        })?;
-    let structurally_stale_runs: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_attempts da
-             JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             LEFT JOIN agent_runs ar ON ar.run_id = da.agent_run_id
-             WHERE c.project_id = ?1 AND da.state = 'running'
-               AND (dc.state <> 'analyzing' OR da.started_at IS NULL
-                    OR da.agent_run_id IS NULL OR ar.run_id IS NULL
-                    OR ar.project_id <> c.project_id
-                    OR ar.status NOT IN ('starting','running'))",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check stale running decision attempts for doctor",
-            source,
-        })?;
-    let timeout_seconds = config::load(&project.config_path)
-        .ok()
-        .map(|config| i64::from(config.agent.timeout_minutes) * 60);
-    let overdue_runs = if let Some(timeout_seconds) = timeout_seconds {
-        connection
-            .query_row(
-                "SELECT COUNT(*)
-                 FROM decision_attempts da
-                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
-                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
-                 JOIN agent_runs ar ON ar.run_id = da.agent_run_id
-                 WHERE c.project_id = ?1 AND dc.state = 'analyzing'
-                   AND da.state = 'running' AND da.started_at IS NOT NULL
-                   AND ar.project_id = c.project_id
-                   AND ar.status IN ('starting','running')
-                   AND da.started_at <= ?2 - ?3",
-                params![&project.project_id, now, timeout_seconds],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|source| AppError::Database {
-                operation: "check overdue running decision attempts for doctor",
-                source,
-            })?
-    } else {
-        0
-    };
-    let running_errors = structurally_stale_runs + overdue_runs;
     checks.push(if running_errors != 0 {
         doctor_error(
             "decision.running_attempts",
@@ -1639,28 +1548,13 @@ fn decision_doctor_checks(
             "none",
         )
     });
-
-    let waiting_without_wake: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_cycles dc
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             WHERE c.project_id = ?1 AND dc.state = 'waiting'
-               AND dc.next_wake_at IS NULL",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check decision wait wake timestamps for doctor",
-            source,
-        })?;
     checks.push(if waiting_without_wake == 0 {
         doctor_ok(
             "decision.wait_wake",
             if decision_cycle_count == 0 {
                 "no managed decision wait is present"
             } else {
-                "every waiting decision cycle has a finite wake timestamp"
+                "every bounded waiting decision cycle has a finite wake timestamp"
             },
             "none",
         )
@@ -1672,87 +1566,21 @@ fn decision_doctor_checks(
         )
     });
 
-    let current_campaign_id = connection
-        .query_row(
-            "SELECT campaign_id FROM campaigns
-             WHERE project_id = ?1
-             ORDER BY (state = 'retired') ASC, created_at DESC, campaign_id DESC
-             LIMIT 1",
-            [&project.project_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|source| AppError::Database {
-            operation: "read current decision campaign for doctor",
-            source,
-        })?;
     let current_decision = if malformed_rows == 0 {
         current_campaign_id
             .as_deref()
-            .map(|campaign_id| current_decision_projection(db, campaign_id))
+            .map(|campaign_id| current_decision_projection(db, campaign_id, now))
             .transpose()?
             .flatten()
     } else {
         None
     };
     let digest_errors = if let Some(current_decision) = current_decision.as_ref() {
-        let mut statement = connection
-            .prepare(
-                "SELECT context_json, context_digest, decision_json, decision_digest
-                 FROM decision_attempts
-                 WHERE cycle_id = ?1
-                 ORDER BY attempt_number DESC
-                 LIMIT ?2",
-            )
-            .map_err(|source| AppError::Database {
-                operation: "prepare bounded decision digest inspection",
-                source,
-            })?;
-        let rows = statement
-            .query_map(
-                params![
-                    &current_decision.cycle.cycle_id,
-                    MAX_DECISION_DOCTOR_ATTEMPTS,
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            )
-            .map_err(|source| AppError::Database {
-                operation: "query bounded decision digest inspection",
-                source,
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| AppError::Database {
-                operation: "read bounded decision digest inspection",
-                source,
-            })?;
-        rows.into_iter()
-            .map(
-                |(context_json, context_digest, decision_json, decision_digest)| {
-                    let context_error = match (context_json, context_digest) {
-                        (None, None) => false,
-                        (Some(json), Some(digest)) => {
-                            format!("{:x}", Sha256::digest(json.as_bytes())) != digest
-                        }
-                        _ => true,
-                    };
-                    let decision_error = match (decision_json, decision_digest) {
-                        (None, None) => false,
-                        (Some(json), Some(digest)) => {
-                            format!("{:x}", Sha256::digest(json.as_bytes())) != digest
-                        }
-                        _ => true,
-                    };
-                    i64::from(context_error) + i64::from(decision_error)
-                },
-            )
-            .sum::<i64>()
+        decision_doctor_digest_errors(
+            connection,
+            &current_decision.cycle.cycle_id,
+            i64::from(limits.max_decision_attempts_per_cycle) + 1,
+        )?
     } else {
         0
     };
@@ -1779,22 +1607,6 @@ fn decision_doctor_checks(
             "pause the campaign and inspect bounded digest facts without printing or repairing payloads",
         )
     });
-
-    let degraded_without_diagnostics: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM decision_cycles dc
-             JOIN campaigns c ON c.campaign_id = dc.campaign_id
-             WHERE c.project_id = ?1 AND dc.state = 'degraded'
-               AND (dc.last_failure_code IS NULL OR dc.last_failure_code = ''
-                    OR dc.last_failure_summary IS NULL OR dc.last_failure_summary = '')",
-            [&project.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| AppError::Database {
-            operation: "check degraded decision diagnostics for doctor",
-            source,
-        })?;
     checks.push(if degraded_without_diagnostics == 0 {
         doctor_ok(
             "decision.degraded_diagnostics",
@@ -1816,6 +1628,308 @@ fn decision_doctor_checks(
     });
 
     Ok(checks)
+}
+
+struct DecisionDoctorCycleProbe {
+    cycle_id: Option<String>,
+    state: Option<String>,
+    next_wake_at: Option<i64>,
+    row_valid: bool,
+    lineage_valid: bool,
+    degraded_diagnostics_valid: bool,
+}
+
+const DECISION_DOCTOR_CYCLE_PROBE_SELECT: &str =
+    "SELECT CASE WHEN typeof(dc.cycle_id) = 'text' THEN dc.cycle_id END,
+            CASE WHEN typeof(dc.state) = 'text' THEN dc.state END,
+            CASE WHEN typeof(dc.next_wake_at) = 'integer' THEN dc.next_wake_at END,
+            typeof(dc.cycle_id) = 'text'
+              AND typeof(dc.campaign_id) = 'text'
+              AND typeof(dc.source_experiment_id) = 'text'
+              AND typeof(dc.state) = 'text'
+              AND dc.state IN ('pending','analyzing','waiting','completed','degraded')
+              AND typeof(dc.next_wake_at) IN ('null','integer')
+              AND typeof(dc.consecutive_failed_attempts) = 'integer'
+              AND dc.consecutive_failed_attempts >= 0
+              AND typeof(dc.last_decision_kind) IN ('null','text')
+              AND (dc.last_decision_kind IS NULL
+                   OR dc.last_decision_kind IN ('proposal','wait'))
+              AND COALESCE(length(CAST(dc.last_decision_kind AS BLOB)), 0) <= 128
+              AND typeof(dc.last_failure_code) IN ('null','text')
+              AND COALESCE(length(CAST(dc.last_failure_code AS BLOB)), 0) <= 128
+              AND typeof(dc.last_failure_summary) IN ('null','text')
+              AND COALESCE(length(CAST(dc.last_failure_summary AS BLOB)), 0) <= 2048
+              AND typeof(dc.created_at) = 'integer'
+              AND typeof(dc.updated_at) = 'integer',
+            e.experiment_id IS NOT NULL
+              AND typeof(e.experiment_id) = 'text'
+              AND typeof(e.campaign_id) = 'text'
+              AND e.campaign_id = dc.campaign_id
+              AND typeof(e.status) = 'text'
+              AND e.status IN ('succeeded','failed','cancelled'),
+            dc.state <> 'degraded'
+              OR (typeof(dc.last_failure_code) = 'text'
+                  AND length(CAST(dc.last_failure_code AS BLOB)) BETWEEN 1 AND 128
+                  AND typeof(dc.last_failure_summary) = 'text'
+                  AND length(CAST(dc.last_failure_summary AS BLOB)) BETWEEN 1 AND 2048)
+     FROM decision_cycles dc
+     LEFT JOIN experiments e ON e.experiment_id = dc.source_experiment_id";
+
+fn decision_doctor_cycle_probe(
+    connection: &rusqlite::Connection,
+    campaign_id: &str,
+    completed: bool,
+    limit: i64,
+) -> Result<Vec<DecisionDoctorCycleProbe>, AppError> {
+    let sql = decision_doctor_cycle_probe_sql(completed);
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|source| AppError::Database {
+            operation: "prepare bounded live decision cycle probe",
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![campaign_id, limit], |row| {
+            Ok(DecisionDoctorCycleProbe {
+                cycle_id: row.get(0)?,
+                state: row.get(1)?,
+                next_wake_at: row.get(2)?,
+                row_valid: row.get(3)?,
+                lineage_valid: row.get(4)?,
+                degraded_diagnostics_valid: row.get(5)?,
+            })
+        })
+        .map_err(|source| AppError::Database {
+            operation: "query bounded live decision cycle probe",
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::Database {
+            operation: "read bounded live decision cycle probe",
+            source,
+        })?;
+    Ok(rows)
+}
+
+fn decision_doctor_cycle_probe_sql(completed: bool) -> String {
+    let predicate = if completed {
+        "dc.state = 'completed' ORDER BY dc.updated_at DESC, dc.cycle_id DESC"
+    } else {
+        "dc.state <> 'completed' ORDER BY dc.state, dc.updated_at"
+    };
+    format!(
+        "{DECISION_DOCTOR_CYCLE_PROBE_SELECT}
+         WHERE dc.campaign_id = ?1 AND {predicate}
+         LIMIT ?2"
+    )
+}
+
+struct DecisionDoctorAttemptProbe {
+    state: Option<String>,
+    agent_run_id: Option<i64>,
+    started_at: Option<i64>,
+    row_valid: bool,
+    agent_run_exists: bool,
+    agent_run_project_matches: bool,
+    agent_run_active: bool,
+}
+
+fn decision_doctor_attempt_probe(
+    connection: &rusqlite::Connection,
+    cycle_id: &str,
+    project_id: &str,
+    limit: i64,
+) -> Result<Vec<DecisionDoctorAttemptProbe>, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT CASE WHEN typeof(da.state) = 'text' THEN da.state END,
+                    CASE WHEN typeof(da.agent_run_id) = 'integer' THEN da.agent_run_id END,
+                    CASE WHEN typeof(da.started_at) = 'integer' THEN da.started_at END,
+                    typeof(da.cycle_id) = 'text'
+                      AND typeof(da.attempt_number) = 'integer' AND da.attempt_number > 0
+                      AND typeof(da.state) = 'text'
+                      AND da.state IN ('reserved','evidence_ready','running','decided','failed')
+                      AND typeof(da.context_json) IN ('null','text')
+                      AND typeof(da.context_digest) IN ('null','text')
+                      AND (da.context_json IS NULL) = (da.context_digest IS NULL)
+                      AND typeof(da.context_schema_version) IN ('null','integer')
+                      AND (da.context_json IS NULL) = (da.context_schema_version IS NULL)
+                      AND (da.context_json IS NULL OR da.context_schema_version = 1)
+                      AND COALESCE(length(CAST(da.context_json AS BLOB)), 0) <= ?2
+                      AND COALESCE(length(CAST(da.context_digest AS BLOB)), 0) <= ?3
+                      AND typeof(da.decision_json) IN ('null','text')
+                      AND typeof(da.decision_digest) IN ('null','text')
+                      AND typeof(da.decision_kind) IN ('null','text')
+                      AND (da.decision_json IS NULL) = (da.decision_digest IS NULL)
+                      AND (da.decision_json IS NULL) = (da.decision_kind IS NULL)
+                      AND (da.decision_kind IS NULL OR da.decision_kind IN ('proposal','wait'))
+                      AND COALESCE(length(CAST(da.decision_json AS BLOB)), 0) <= ?2
+                      AND COALESCE(length(CAST(da.decision_digest AS BLOB)), 0) <= ?3
+                      AND typeof(da.failure_code) IN ('null','text')
+                      AND COALESCE(length(CAST(da.failure_code AS BLOB)), 0) <= 128
+                      AND typeof(da.failure_summary) IN ('null','text')
+                      AND COALESCE(length(CAST(da.failure_summary AS BLOB)), 0) <= 2048
+                      AND typeof(da.agent_run_id) IN ('null','integer')
+                      AND typeof(da.created_at) = 'integer'
+                      AND typeof(da.started_at) IN ('null','integer')
+                      AND typeof(da.finished_at) IN ('null','integer'),
+                    ar.run_id IS NOT NULL,
+                    typeof(ar.project_id) = 'text' AND ar.project_id = ?4,
+                    typeof(ar.status) = 'text' AND ar.status IN ('starting','running')
+             FROM decision_attempts da
+             LEFT JOIN agent_runs ar ON ar.run_id = da.agent_run_id
+             WHERE da.cycle_id = ?1
+             ORDER BY da.attempt_number
+             LIMIT ?5",
+        )
+        .map_err(|source| AppError::Database {
+            operation: "prepare bounded live decision attempt probe",
+            source,
+        })?;
+    let rows = statement
+        .query_map(
+            params![
+                cycle_id,
+                MAX_DECISION_DOCTOR_PAYLOAD_BYTES,
+                MAX_DECISION_DOCTOR_DIGEST_BYTES,
+                project_id,
+                limit,
+            ],
+            |row| {
+                Ok(DecisionDoctorAttemptProbe {
+                    state: row.get(0)?,
+                    agent_run_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    row_valid: row.get(3)?,
+                    agent_run_exists: row.get(4)?,
+                    agent_run_project_matches: row.get(5)?,
+                    agent_run_active: row.get(6)?,
+                })
+            },
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query bounded live decision attempt probe",
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::Database {
+            operation: "read bounded live decision attempt probe",
+            source,
+        })?;
+    Ok(rows)
+}
+
+fn decision_doctor_digest_errors(
+    connection: &rusqlite::Connection,
+    cycle_id: &str,
+    limit: i64,
+) -> Result<i64, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT typeof(context_json),
+                    CASE WHEN typeof(context_json) = 'text' THEN context_json END,
+                    typeof(context_digest),
+                    CASE WHEN typeof(context_digest) = 'text' THEN context_digest END,
+                    typeof(decision_json),
+                    CASE WHEN typeof(decision_json) = 'text' THEN decision_json END,
+                    typeof(decision_digest),
+                    CASE WHEN typeof(decision_digest) = 'text' THEN decision_digest END
+             FROM decision_attempts
+             WHERE cycle_id = ?1
+             ORDER BY attempt_number DESC
+             LIMIT ?2",
+        )
+        .map_err(|source| AppError::Database {
+            operation: "prepare bounded decision digest inspection",
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![cycle_id, limit], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?),
+                (row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?),
+                (row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?),
+                (row.get::<_, String>(6)?, row.get::<_, Option<String>>(7)?),
+            ))
+        })
+        .map_err(|source| AppError::Database {
+            operation: "query bounded decision digest inspection",
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::Database {
+            operation: "read bounded decision digest inspection",
+            source,
+        })?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(context_json, context_digest, decision_json, decision_digest)| {
+                let context_error = digest_pair_is_invalid(context_json, context_digest);
+                let decision_error = digest_pair_is_invalid(decision_json, decision_digest);
+                i64::from(context_error) + i64::from(decision_error)
+            },
+        )
+        .sum())
+}
+
+fn digest_pair_is_invalid(
+    payload: (String, Option<String>),
+    digest: (String, Option<String>),
+) -> bool {
+    match (payload, digest) {
+        ((payload_type, None), (digest_type, None))
+            if payload_type == "null" && digest_type == "null" =>
+        {
+            false
+        }
+        ((payload_type, Some(payload)), (digest_type, Some(digest)))
+            if payload_type == "text" && digest_type == "text" =>
+        {
+            format!("{:x}", Sha256::digest(payload.as_bytes())) != digest
+        }
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod decision_doctor_query_plan_tests {
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    use super::decision_doctor_cycle_probe_sql;
+    use crate::db::Db;
+
+    #[test]
+    fn live_cycle_probe_uses_the_campaign_state_index_without_a_table_scan() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let connection = db.connect().unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            decision_doctor_cycle_probe_sql(false)
+        );
+        let mut statement = connection.prepare(&sql).unwrap();
+        let details = statement
+            .query_map(params!["campaign-a", 2_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("decision_cycles_campaign_state_updated_idx")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.starts_with("SCAN dc")),
+            "{details:?}"
+        );
+    }
 }
 
 fn registered_project_roots(db: &Db) -> Result<Vec<std::path::PathBuf>, AppError> {
@@ -2066,7 +2180,11 @@ pub fn render_project_status_json(
         .status_projection_for_project(&project.project_id, crate::status::status_timestamp()?)?;
     let campaign = match campaign {
         Some(campaign) => {
-            let decision = current_decision_projection(db, &campaign.campaign_id)?
+            let decision = current_decision_projection(
+                db,
+                &campaign.campaign_id,
+                crate::status::status_timestamp()?,
+            )?
                 .as_ref()
                 .map(DecisionStatusProjection::from);
             Some(CampaignStatusSummary::new(campaign, decision))
@@ -2426,7 +2544,6 @@ struct CampaignStatusSummary {
     experiment_counts: BTreeMap<String, i64>,
     rolling_usage: BTreeMap<String, i64>,
     unreconciled_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     decision: Option<DecisionStatusProjection>,
 }
 

@@ -97,6 +97,8 @@ manifest は未知の field を許さない JSON object で、次の形式です
 
 `pueue-agent status --json` には submission の一覧を含めません。submission と task の lineage は `pueue-agent runs --json`、特定 task の詳細は `inspect <TASK_ID>` で確認します。
 
+`status --json` の `campaign.decision` は、実行中の analysis があればその cycle、なければ scheduler と同じ due 条件と source terminal 順で次の cycle を bounded に投影します。field は `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、`failure_code`、`failure_summary` です。raw prompt、objective、decision JSON、environment、argv、log excerpt は含めません。live campaign に decision cycle がなければ `campaign.decision` は明示的な `null` です。
+
 ### `pueue-agent campaign`
 
 - **構文:** `pueue-agent campaign <status|pause|resume|retire> [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
@@ -106,7 +108,7 @@ manifest は未知の field を許さない JSON object で、次の形式です
 - **例:** `pueue-agent campaign status --json .`、`pueue-agent campaign pause .`
 - **失敗時の確認:** project に campaign があることを確認します。`resume` は project が有効で pause/halt されておらず、未照合または termination 状態不明の experiment がない場合だけ実行できます。`retire` はすべての experiment が終端かつ照合済みの場合だけ実行できます。
 
-`status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。objective 本文や raw argv は既定出力と JSON に含めません。
+`status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。`campaign status --json` の `decision` も project status と同じ current cycle と 8 field を投影し、cycle がなければ `null` です。objective 本文、raw argv、raw decision evidence は既定出力と JSON に含めません。
 
 公開 action は次のとおりです。
 
@@ -195,6 +197,8 @@ pueue-agent experiment inspect <experiment-id>
 - **主なオプション:** `--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
 - **例:** `pueue-agent doctor --json .`
 - **失敗時の確認:** 出力の各チェックの remediation を実行し、実行ポリシーとサービス状態を再確認します。
+
+decision 診断は live campaign に限定した policy 上限 + 1 の read-only probe です。`decision.rows` は cycle / attempt の件数上限、SQLite storage class、payload byte 上限を、`decision.lineage` は terminal source experiment との同一 campaign lineage を確認します。`decision.active_attempts` は active attempt と agent binding の単一 owner、`decision.running_attempts` は run ownership と timeout、`decision.wait_wake` は有限 wake、`decision.digests` は current cycle の bounded payload digest、`decision.degraded_diagnostics` は degraded cycle の bounded failure facts を確認します。doctor は row を移行、削除、修復せず、raw prompt、objective、decision body を出力しません。
 
 ## 運用制御
 

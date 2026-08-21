@@ -17,7 +17,7 @@ pueue-agent status
 
 監視対象の job は raw の `pueue add` ではなく `pueue-agent submit` で投入します。最初の通常 `submit` は Pueue へ追加する前に campaign、baseline proposal、experiment、budget reservation、submission intent を SQLite に一度だけ記録します。live campaign 中の二回目の `submit` と `submit-batch` は副作用前に拒否されるため、追加指示には `steer` を使います。
 
-Phase 2 はこの baseline/control plane と安全な復旧に加え、terminal experiment 後の `terminal completion loop` を提供します。Linux の decision agent は bounded evidence から `proposal` または `finite wait` を一つ返し、proposal は既存 coordinator から次の非 code experiment へ進みます。Phase 3 の `running OOM/stall observer`、実行中の `periodic observer` による campaign health-decision loop、`goal review`、`code worktree` は範囲外です。
+Phase 2 はこの baseline/control plane と安全な復旧に加え、terminal experiment 後の `terminal completion loop` を提供します。Linux の decision agent は bounded evidence から `proposal` または `finite wait` を一つ返し、proposal は既存 coordinator から次の非 code experiment へ進みます。Phase 3 の `running OOM/stall observer` と実行中の `periodic observer` による campaign health-decision loop は範囲外です。`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。
 
 ## Campaign を retire して新しい目的を開始する
 

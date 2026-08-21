@@ -160,6 +160,10 @@ const PROPOSALS_CAMPAIGN_STATUS_CREATED_INDEX_SQL: &str =
 const EXPERIMENTS_CAMPAIGN_STATUS_CREATED_INDEX_SQL: &str =
     "CREATE INDEX experiments_campaign_status_created_idx
     ON experiments(campaign_id, status, created_at, experiment_id);";
+const EXPERIMENTS_CAMPAIGN_TERMINAL_ORDER_INDEX_SQL: &str =
+    "CREATE INDEX experiments_campaign_terminal_order_idx
+    ON experiments(campaign_id, COALESCE(finished_at, updated_at), experiment_id)
+    WHERE status IN ('succeeded','failed','cancelled');";
 const EXPERIMENTS_PUEUE_TASK_LOOKUP_INDEX_SQL: &str =
     "CREATE INDEX experiments_pueue_task_lookup_idx
     ON experiments(pueue_task_id, task_signature);";
@@ -210,6 +214,9 @@ const DECISION_CYCLES_DUE_INDEX_SQL: &str = "CREATE INDEX decision_cycles_state_
     ON decision_cycles(state, next_wake_at, updated_at);";
 const DECISION_CYCLES_CAMPAIGN_INDEX_SQL: &str = "CREATE INDEX decision_cycles_campaign_state_updated_idx
     ON decision_cycles(campaign_id, state, updated_at);";
+const DECISION_CYCLES_CAMPAIGN_WAKE_INDEX_SQL: &str =
+    "CREATE INDEX decision_cycles_campaign_state_wake_updated_idx
+    ON decision_cycles(campaign_id, state, next_wake_at, updated_at, cycle_id);";
 const DECISION_ATTEMPTS_STATE_INDEX_SQL: &str = "CREATE INDEX decision_attempts_state_created_idx
     ON decision_attempts(state, created_at);";
 
@@ -227,6 +234,17 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             && submissions_have_composite_origin_foreign_key(connection)?;
     let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
         && missing_execution_projection_columns(connection)?.is_empty();
+    let current_schema_has_decision_projection_indexes = version == LATEST_SCHEMA_VERSION
+        && index_definition_matches(
+            connection,
+            "experiments_campaign_terminal_order_idx",
+            EXPERIMENTS_CAMPAIGN_TERMINAL_ORDER_INDEX_SQL,
+        )?
+        && index_definition_matches(
+            connection,
+            "decision_cycles_campaign_state_wake_updated_idx",
+            DECISION_CYCLES_CAMPAIGN_WAKE_INDEX_SQL,
+        )?;
     if version == LATEST_SCHEMA_VERSION {
         verify_decision_schema_v18(connection)?;
         validate_agent_run_id_sequence(connection)?;
@@ -250,6 +268,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             });
         if current_schema_has_composite_origin_foreign_key
             && current_schema_has_execution_projection
+            && current_schema_has_decision_projection_indexes
             && has_canonical_event_status_not_before_index
         {
             verify_campaign_schema_v16(connection)?;
@@ -637,6 +656,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_campaign_schema_v16(&transaction)?;
     }
+    ensure_index_definition(
+        &transaction,
+        "experiments_campaign_terminal_order_idx",
+        EXPERIMENTS_CAMPAIGN_TERMINAL_ORDER_INDEX_SQL,
+    )?;
     if version <= 16 {
         migrate_campaign_event_lineage_to_v17(&transaction)?;
     } else {
@@ -647,6 +671,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_decision_schema_v18(&transaction)?;
     }
+    ensure_index_definition(
+        &transaction,
+        "decision_cycles_campaign_state_wake_updated_idx",
+        DECISION_CYCLES_CAMPAIGN_WAKE_INDEX_SQL,
+    )?;
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -1422,6 +1451,25 @@ fn ensure_index_definition(
     transaction
         .execute_batch(expected_sql)
         .map_err(database_error("create intervention FIFO index"))
+}
+
+fn index_definition_matches(
+    connection: &Connection,
+    name: &str,
+    expected_sql: &str,
+) -> Result<bool, AppError> {
+    let actual_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(database_error("read index definition"))?
+        .flatten();
+    Ok(actual_sql
+        .as_deref()
+        .is_some_and(|sql| compact_sql(sql) == compact_sql(expected_sql)))
 }
 
 fn compact_sql(sql: &str) -> String {

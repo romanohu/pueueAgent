@@ -80,7 +80,7 @@ decision runner は startup-pinned built-in Codex だけを使い、project root
 
 proposal は supervisor-owned ID と idempotency key で既存 coordinator に渡され、SQLite の accepted intent が外部 add より先です。finite wait は Pueue task を作らず、service-owned 上限内の絶対 `next_wake_at` だけを保存します。analysis は hourly agent-run budget、proposal は rolling experiment budget を消費します。連続失敗が `max_decision_attempts_per_cycle` に達すると cycle/campaign は `degraded` になり、自動 replay しません。
 
-Phase 3 の `running OOM/stall observer`、実行中 experiment の `periodic observer` による campaign health-decision loop、`goal review`、`code worktree` はこの terminal loop に含まれません。
+Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop はこの terminal loop に含まれません。`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。
 
 service policy の network default は `enabled` ですが、sanitized environment は別の allowlist 境界です。network を利用可能にしても、allowlist 外の credential/environment value を agent または agent task に継承しません。
 

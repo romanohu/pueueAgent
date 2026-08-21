@@ -31,7 +31,7 @@ SQLite は project、campaign、proposal、experiment、budget reservation、sub
 
 現在の Phase 2 は、campaign、baseline、hard budget、外部投入の復旧境界に加え、実験の成功・失敗を起点にする `terminal completion loop` を持ちます。Linux では supervisor が SQLite の bounded evidence だけを read-only の built-in Codex decision agent に渡し、返された exactly one structured decision を `proposal` または `finite wait` として検証します。proposal は既存の campaign coordinator から次の非 code experiment を投入し、wait は Pueue task を追加せず有限の `next_wake_at` まで待ちます。
 
-Phase 3 の `running OOM/stall observer`、実行中 experiment の `periodic observer` による campaign health-decision loop、`goal review`、隔離された `code worktree` はまだ実装範囲外です。既存の pattern/stall detector と Periodic DeepCheck はありますが、これらを Phase 3 の running health 判断と同一視しないでください。
+Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop はまだ実装範囲外です。`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。既存の pattern/stall detector と Periodic DeepCheck はありますが、これらを Phase 3 の running health 判断と同一視しないでください。
 
 ## 対応環境
 
