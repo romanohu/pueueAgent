@@ -15,6 +15,7 @@ use std::os::unix::io::AsRawFd;
 use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
+    codex_command::CodexCapabilities,
     db::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
         ExperimentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
@@ -40,6 +41,22 @@ use serde_json::json;
 use tempfile::TempDir;
 #[cfg(unix)]
 use tokio::time::{sleep, Duration, Instant};
+
+#[test]
+fn decision_agent_requires_read_only_and_structured_output_capabilities() {
+    for disable in [
+        |capabilities: &mut CodexCapabilities| capabilities.read_only = false,
+        |capabilities: &mut CodexCapabilities| capabilities.approval_never = false,
+        |capabilities: &mut CodexCapabilities| capabilities.network_mode = false,
+        |capabilities: &mut CodexCapabilities| capabilities.project_config_isolation = false,
+        |capabilities: &mut CodexCapabilities| capabilities.json_output_schema = false,
+        |capabilities: &mut CodexCapabilities| capabilities.output_last_message = false,
+    ] {
+        let mut capabilities = CodexCapabilities::all();
+        disable(&mut capabilities);
+        assert!(!capabilities.supports_decision_policy());
+    }
+}
 
 #[cfg(unix)]
 #[path = "../support/execution_policy_fixture.rs"]

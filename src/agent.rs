@@ -7,23 +7,27 @@ use std::{
 };
 
 use tokio::time::Instant;
+use sha2::{Digest, Sha256};
 
 use crate::{
     codex_command::{CodexArgvBuilder, CodexCapabilities},
     config::{AgentConfig, ProjectConfig},
-    db::{AgentRunRepository, GateFailurePolicy},
+    db::{AgentRunRepository, DecisionRepository, DecisionReservation, GateFailurePolicy},
+    decision_evidence::DecisionContextBundle,
+    decision_protocol::{parse_and_validate_decision, ValidatedDecision},
     environment::{
         PrivateRunTemp, ProjectAdmissionLock, RunIdAdmissionGuard, SanitizedEnvironment,
         TempInventoryReport, VerifiedPrivateTemp,
     },
     execution_policy::{
-        resolve_project_policy, AgentKind, PolicyViolation, PolicyViolationCode,
-        PolicyViolationStage, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
+        resolve_decision_project_policy, resolve_project_policy, AgentKind, PolicyViolation,
+        CampaignLimits, PolicyViolationCode, PolicyViolationStage, ResolvedExecutionPolicy,
+        ResolvedProjectExecutionPolicy,
     },
     interventions::InterventionReservation,
     models::{
-        launch_gate_marker_path, AgentContextMode, AgentRunStatus, ExecutionProjection,
-        NewAgentRun, Project,
+        launch_gate_marker_path, AgentContextMode, AgentRunRole, AgentRunStatus,
+        ExecutionProjection, NewAgentRun, Project,
     },
     native_launcher::{NativeAgentChild, NativeLaunchSpec, NativeLauncher},
     output::bounded_redacted_text,
@@ -35,6 +39,46 @@ use crate::{
     upgrade::AgentStartUpgradeGuard,
     AppError,
 };
+
+const DECISION_OUTPUT_SCHEMA: &[u8] = br#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "decision", "proposal"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "decision": {"const": "proposal"},
+        "proposal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "hypothesis", "source_experiment_id", "argv", "working_directory", "expected_evidence"],
+          "properties": {
+            "kind": {"enum": ["experiment", "repair", "broader_search", "recipe", "data_evaluation"]},
+            "hypothesis": {"type": "string"},
+            "source_experiment_id": {"type": ["string", "null"]},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "working_directory": {"type": "string"},
+            "expected_evidence": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "decision", "reason", "requested_wait_minutes", "expected_evidence"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "decision": {"const": "wait"},
+        "reason": {"type": "string"},
+        "requested_wait_minutes": {"type": "integer", "minimum": 1},
+        "expected_evidence": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  ]
+}"#;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunnerConfig {
@@ -102,6 +146,8 @@ pub struct AgentHandle {
     terminal_outcome: Option<TerminalOutcome>,
     terminal_persistence: TerminalPersistence,
     process_proof: ProcessProof,
+    role: AgentRunRole,
+    decision_persistence: Option<DecisionPersistence>,
 }
 
 enum RetainedLaunchAuthority {
@@ -196,6 +242,11 @@ impl BoundFinalizationIntent {
                 )?;
             }
             Self::PendingMarkerPolicy { violation } => {
+                repository.record_pending_marker_policy_evidence(
+                    project_id,
+                    run_id,
+                    violation,
+                )?;
                 repository.finish_pending_marker_policy_failure(
                     project_id,
                     run_id,
@@ -213,6 +264,7 @@ pub struct BoundCleanupHandle {
     run_id: i64,
     intent: BoundFinalizationIntent,
     kind: BoundCleanupKind,
+    decision_failure: Option<DecisionFailureContext>,
 }
 
 enum BoundCleanupKind {
@@ -220,6 +272,10 @@ enum BoundCleanupKind {
         child: NativeAgentChild,
         retained_authority: RetainedLaunchAuthority,
         terminated: bool,
+        finalized: bool,
+    },
+    RetainedTemp {
+        retained_authority: RetainedLaunchAuthority,
         finalized: bool,
     },
     PendingMarker,
@@ -247,6 +303,10 @@ impl BoundCleanupHandle {
                 retained_authority: RetainedLaunchAuthority::Retained { .. },
                 ..
             }
+                | BoundCleanupKind::RetainedTemp {
+                    finalized: true,
+                    retained_authority: RetainedLaunchAuthority::Retained { .. },
+                }
         )
     }
 
@@ -288,17 +348,36 @@ impl BoundCleanupHandle {
                 *terminated = true;
             }
         }
+        self.retry_finalization_and_cleanup(db, finished_at, deadline)
+    }
+
+    fn retry_finalization_and_cleanup(
+        &mut self,
+        db: &crate::db::Db,
+        finished_at: i64,
+        deadline: Option<Instant>,
+    ) -> Result<(), AppError> {
         let needs_finalization = matches!(
             &self.kind,
             BoundCleanupKind::LiveChild {
                 finalized: false,
                 ..
             }
+        ) || matches!(
+            &self.kind,
+            BoundCleanupKind::RetainedTemp {
+                finalized: false,
+                ..
+            }
         ) || matches!(&self.kind, BoundCleanupKind::PendingMarker);
         if needs_finalization {
             let scoped_db = deadline_scoped_db(db, deadline)?;
+            let db = scoped_db.as_ref().unwrap_or(db);
+            if let Some(decision_failure) = &self.decision_failure {
+                decision_failure.persist(db, self.run_id, finished_at)?;
+            }
             self.intent.finalize(
-                scoped_db.as_ref().unwrap_or(db),
+                db,
                 &self.project_id,
                 self.run_id,
                 finished_at,
@@ -306,21 +385,36 @@ impl BoundCleanupHandle {
             if let BoundCleanupKind::LiveChild { finalized, .. } = &mut self.kind {
                 *finalized = true;
             }
+            if let BoundCleanupKind::RetainedTemp { finalized, .. } = &mut self.kind {
+                *finalized = true;
+            }
         }
-        if let BoundCleanupKind::LiveChild {
-            retained_authority: RetainedLaunchAuthority::Retained { temp, .. },
-            ..
-        } = &mut self.kind
-        {
-            temp.cleanup_contents_before(deadline.map(Instant::into_std))
-                .map_err(AppError::from)?;
+        match &mut self.kind {
+            BoundCleanupKind::LiveChild {
+                retained_authority: RetainedLaunchAuthority::Retained { temp, .. },
+                ..
+            }
+            | BoundCleanupKind::RetainedTemp {
+                retained_authority: RetainedLaunchAuthority::Retained { temp, .. },
+                ..
+            } => {
+                temp.cleanup_contents_before(deadline.map(Instant::into_std))
+                    .map_err(AppError::from)?;
+            }
+            BoundCleanupKind::LiveChild { .. }
+            | BoundCleanupKind::RetainedTemp { .. }
+            | BoundCleanupKind::PendingMarker => {}
         }
-        if let BoundCleanupKind::LiveChild {
-            retained_authority,
-            ..
-        } = &mut self.kind
-        {
-            *retained_authority = RetainedLaunchAuthority::Released;
+        match &mut self.kind {
+            BoundCleanupKind::LiveChild {
+                retained_authority,
+                ..
+            }
+            | BoundCleanupKind::RetainedTemp {
+                retained_authority,
+                ..
+            } => *retained_authority = RetainedLaunchAuthority::Released,
+            BoundCleanupKind::PendingMarker => {}
         }
         Ok(())
     }
@@ -330,6 +424,44 @@ impl BoundCleanupHandle {
 enum TerminalPersistence {
     Pending,
     Persisted(AgentRunStatus),
+}
+
+enum DecisionPersistence {
+    Pending { objective_digest: String },
+    Ready(PreparedDecision),
+    Persisted,
+}
+
+enum PreparedDecision {
+    Valid {
+        json: String,
+        digest: String,
+        kind: &'static str,
+    },
+    Invalid,
+}
+
+#[derive(Clone)]
+struct DecisionFailureContext {
+    cycle_id: String,
+    attempt_number: i64,
+    limits: CampaignLimits,
+    bound_to_run: bool,
+}
+
+impl DecisionFailureContext {
+    fn persist(&self, db: &crate::db::Db, run_id: i64, now: i64) -> Result<(), AppError> {
+        DecisionRepository::new(db).fail_attempt(
+            self.bound_to_run.then_some(run_id),
+            &self.cycle_id,
+            self.attempt_number,
+            "decision_launch",
+            "decision agent launch did not complete",
+            self.limits,
+            now,
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,7 +487,7 @@ impl AgentRunner {
         Self { config, policy }
     }
 
-    pub(crate) fn try_acquire_run_id_admission_guard(
+    pub fn try_acquire_run_id_admission_guard(
         &self,
         db: &crate::db::Db,
     ) -> Result<Option<RunIdAdmissionGuard>, PolicyViolation> {
@@ -387,7 +519,7 @@ impl AgentRunner {
         Ok(report)
     }
 
-    pub(crate) fn try_acquire_project_admission_lock(
+    pub fn try_acquire_project_admission_lock(
         &self,
         policy: &ResolvedProjectExecutionPolicy,
     ) -> Result<Option<ProjectAdmissionLock>, PolicyViolation> {
@@ -506,6 +638,34 @@ impl AgentRunner {
         Ok(AgentCommand { program, args })
     }
 
+    fn decision_command_for(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+    ) -> Result<AgentCommand, AppError> {
+        let program = policy
+            .agent_anchor
+            .canonical_path
+            .to_str()
+            .ok_or(AppError::Configuration {
+                field: "agent.program",
+            })?
+            .to_owned();
+        let args = CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
+            .build_decision_with_private_temp(config, prompt, private_tmp)
+            .map_err(AppError::from)?
+            .into_iter()
+            .map(|argument| {
+                argument
+                    .into_string()
+                    .map_err(|_| AppError::Configuration { field: "agent.args" })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AgentCommand { program, args })
+    }
+
     fn execution_projection(
         policy: &ResolvedProjectExecutionPolicy,
     ) -> Result<ExecutionProjection, AppError> {
@@ -545,6 +705,18 @@ impl AgentRunner {
         }
     }
 
+    fn decision_environment_for(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+        run_id: i64,
+    ) -> Result<SanitizedEnvironment, PolicyViolation> {
+        SanitizedEnvironment::for_codex_decision(
+            &self.policy.startup_environment,
+            policy,
+            run_id,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn(
         &self,
@@ -561,9 +733,97 @@ impl AgentRunner {
         run_id_guard: RunIdAdmissionGuard,
         project_lock: ProjectAdmissionLock,
     ) -> Result<AgentHandle, AgentSpawnError> {
-        let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
-        self.preflight_project_launch(project_policy, config, prompt)
+        self.spawn_with_role(
+            db,
+            project,
+            project_policy,
+            config,
+            retry_policy,
+            primary_event_id,
+            event_ids,
+            reservation,
+            None,
+            AgentRunRole::Standard,
+            None,
+            prompt,
+            now,
+            run_id_guard,
+            project_lock,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_decision(
+        &self,
+        db: &crate::db::Db,
+        project: &Project,
+        project_policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        retry_policy: RetryPolicy,
+        primary_event_id: i64,
+        event_ids: &[i64],
+        reservation: &DecisionReservation,
+        context: &DecisionContextBundle,
+        now: i64,
+        run_id_guard: RunIdAdmissionGuard,
+        project_lock: ProjectAdmissionLock,
+    ) -> Result<AgentHandle, AgentSpawnError> {
+        let decision_policy = resolve_decision_project_policy(&self.policy, project_policy)
             .map_err(|error| pre_binding_error(error.into()))?;
+        let (prompt, objective_digest) = decision_launch_prompt(context)
+            .map_err(pre_binding_error)?;
+        self.spawn_with_role(
+            db,
+            project,
+            &decision_policy,
+            config,
+            retry_policy,
+            primary_event_id,
+            event_ids,
+            None,
+            Some(reservation),
+            AgentRunRole::Decision {
+                cycle_id: reservation.cycle_id.clone(),
+                attempt_number: reservation.attempt_number,
+            },
+            Some(objective_digest),
+            &prompt,
+            now,
+            run_id_guard,
+            project_lock,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_role(
+        &self,
+        db: &crate::db::Db,
+        project: &Project,
+        project_policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        retry_policy: RetryPolicy,
+        primary_event_id: i64,
+        event_ids: &[i64],
+        reservation: Option<&InterventionReservation>,
+        decision_reservation: Option<&DecisionReservation>,
+        role: AgentRunRole,
+        objective_digest: Option<String>,
+        prompt: &str,
+        now: i64,
+        run_id_guard: RunIdAdmissionGuard,
+        project_lock: ProjectAdmissionLock,
+    ) -> Result<AgentHandle, AgentSpawnError> {
+        let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
+        match &role {
+            AgentRunRole::Standard => self.preflight_project_launch(project_policy, config, prompt),
+            AgentRunRole::Decision { .. } => {
+                CodexArgvBuilder::new(project_policy.clone(), self.config.codex_capabilities)
+                    .preflight_decision(config, prompt)
+            }
+        }
+        .map_err(|error| pre_binding_error(error.into()))?;
         let relative_log_path = relative_log_path(primary_event_id, now);
         let relative_marker_path = launch_gate_marker_path(&relative_log_path);
         let log_path = project_policy
@@ -572,6 +832,10 @@ impl AgentRunner {
             .join(&relative_log_path);
         let execution = Self::execution_projection(project_policy).map_err(pre_binding_error)?;
         let repository = AgentRunRepository::new(db);
+        let run_context = match &role {
+            AgentRunRole::Standard => config.context.clone(),
+            AgentRunRole::Decision { .. } => AgentContextMode::Fresh,
+        };
         let run = repository
             .insert_with_events_and_reservation_with_guard(
                 &NewAgentRun::with_context(
@@ -581,8 +845,8 @@ impl AgentRunner {
                     AgentRunStatus::Starting,
                     now,
                     &log_path,
-                    config.context.clone(),
-                    config.context.session_id().map(str::to_owned),
+                    run_context.clone(),
+                    run_context.session_id().map(str::to_owned),
                     event_ids.iter().map(i64::to_string).collect(),
                 )
                 .with_execution(execution.clone()),
@@ -591,12 +855,49 @@ impl AgentRunner {
                 &run_id_guard,
             )
             .map_err(pre_binding_error)?;
+        if let Some(decision_reservation) = decision_reservation {
+            if let Err(error) =
+                DecisionRepository::new(db).bind_agent_run(decision_reservation, run.run_id, now)
+            {
+                let decision_failure = DecisionFailureContext {
+                    cycle_id: decision_reservation.cycle_id.clone(),
+                    attempt_number: decision_reservation.attempt_number,
+                    limits: self.policy.campaign_limits,
+                    bound_to_run: false,
+                };
+                if let Err(failure_error) = decision_failure.persist(db, run.run_id, now) {
+                    return Err(pending_decision_finalization_error(
+                        project,
+                        run.run_id,
+                        decision_failure,
+                        BoundFinalizationIntent::from_failure(&error, retry_policy),
+                        failure_error,
+                    ));
+                }
+                return Err(resolve_bound_failure(
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    error,
+                ));
+            }
+        }
+        let decision_failure = decision_reservation.map(|reservation| DecisionFailureContext {
+            cycle_id: reservation.cycle_id.clone(),
+            attempt_number: reservation.attempt_number,
+            limits: self.policy.campaign_limits,
+            bound_to_run: true,
+        });
         drop(agent_start_guard);
         let verified_root = project_policy
             .root_anchor
             .verify_identity()
             .map_err(|error| {
-                resolve_bound_failure(
+                resolve_bound_role_failure(
+                    db,
+                    decision_failure.as_ref(),
                     &repository,
                     project,
                     run.run_id,
@@ -607,7 +908,9 @@ impl AgentRunner {
             })?;
         let temp = PrivateRunTemp::create(&verified_root, run.run_id)
             .map_err(|error| {
-                resolve_bound_failure(
+                resolve_bound_role_failure(
+                    db,
+                    decision_failure.as_ref(),
                     &repository,
                     project,
                     run.run_id,
@@ -616,46 +919,109 @@ impl AgentRunner {
                     error.into(),
                 )
             })?;
-        let private_temp_target = temp.verified_target().map_err(|error| {
-            resolve_bound_failure(
-                &repository,
-                project,
-                run.run_id,
-                now,
-                retry_policy,
-                error.into(),
-            )
-        })?;
+        if matches!(&role, AgentRunRole::Decision { .. }) {
+            if let Err(error) = temp.prepare_decision_schema(DECISION_OUTPUT_SCHEMA) {
+                let error = AppError::from(error);
+                return Err(resolve_retained_temp_failure(
+                    db,
+                    project,
+                    run.run_id,
+                    now,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    error,
+                ));
+            }
+        }
+        let private_temp_target = match temp.verified_target() {
+            Ok(target) => target,
+            Err(error) => {
+                let error = AppError::from(error);
+                return Err(resolve_retained_temp_failure(
+                    db,
+                    project,
+                    run.run_id,
+                    now,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    error,
+                ));
+            }
+        };
         drop(run_id_guard);
         drop(project_lock);
-        let command = self
-            .command_for(project_policy, config, prompt, &private_temp_target)
-            .map_err(|error| {
-                resolve_bound_failure(
-                    &repository,
+        let command = match match &role {
+            AgentRunRole::Standard => {
+                self.command_for(project_policy, config, prompt, &private_temp_target)
+            }
+            AgentRunRole::Decision { .. } => self.decision_command_for(
+                project_policy,
+                config,
+                prompt,
+                &private_temp_target,
+            ),
+        } {
+            Ok(command) => command,
+            Err(error) => {
+                return Err(resolve_retained_temp_failure(
+                    db,
                     project,
                     run.run_id,
                     now,
-                    retry_policy,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
                     error,
-                )
-            })?;
-        let environment = self
-            .environment_for(project_policy, run.run_id)
-            .map_err(|error| {
-                resolve_bound_failure(
-                    &repository,
+                ));
+            }
+        };
+        let environment = match match &role {
+            AgentRunRole::Standard => self.environment_for(project_policy, run.run_id),
+            AgentRunRole::Decision { .. } => {
+                self.decision_environment_for(project_policy, run.run_id)
+            }
+        } {
+            Ok(environment) => environment,
+            Err(error) => {
+                let error = AppError::from(error);
+                return Err(resolve_retained_temp_failure(
+                    db,
                     project,
                     run.run_id,
                     now,
-                    retry_policy,
-                    error.into(),
-                )
-            })?;
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    error,
+                ));
+            }
+        };
         let mut argv = Vec::with_capacity(command.args.len() + 1);
         argv.push(OsString::from(&command.program));
         argv.extend(command.args.into_iter().map(OsString::from));
-        let mut child = NativeLauncher::spawn_verified(
+        let mut child = match NativeLauncher::spawn_verified(
             NativeLaunchSpec {
                 launcher: self.policy.launcher_anchor.clone(),
                 executable: project_policy.agent_anchor.clone(),
@@ -667,17 +1033,27 @@ impl AgentRunner {
                 relative_marker_path,
             },
             private_temp_target,
-        )
-        .map_err(|error| {
-            resolve_native_spawn_failure(
-                &repository,
-                project,
-                run.run_id,
-                now,
-                retry_policy,
-                error,
-            )
-        })?;
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                let intent = native_spawn_finalization_intent(&error, retry_policy);
+                return Err(resolve_retained_temp_failure(
+                    db,
+                    project,
+                    run.run_id,
+                    now,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    intent,
+                    error,
+                ));
+            }
+        };
         let pid = child.id();
         if let Err(error) = repository.mark_running_and_apply_interventions(
             &project.project_id,
@@ -697,6 +1073,7 @@ impl AgentRunner {
                     temp,
                     execution,
                 },
+                decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 error,
             )
@@ -717,6 +1094,7 @@ impl AgentRunner {
                     temp,
                     execution,
                 },
+                decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 error,
             )
@@ -736,6 +1114,7 @@ impl AgentRunner {
                     temp,
                     execution,
                 },
+                decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 error,
             )
@@ -755,6 +1134,7 @@ impl AgentRunner {
                 now,
                 child,
                 retained_authority,
+                decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 error,
             )
@@ -768,6 +1148,7 @@ impl AgentRunner {
                 now,
                 child,
                 retained_authority,
+                decision_failure.clone(),
                 BoundFinalizationIntent::PostMarkerExecutionUnknown {
                     reason: "post_marker_dispatch_ack".to_owned(),
                 },
@@ -789,6 +1170,10 @@ impl AgentRunner {
             terminal_outcome: None,
             terminal_persistence: TerminalPersistence::Pending,
             process_proof: ProcessProof::Owned,
+            decision_persistence: objective_digest.map(|objective_digest| {
+                DecisionPersistence::Pending { objective_digest }
+            }),
+            role,
         })
     }
 }
@@ -802,6 +1187,36 @@ pub(crate) struct StartupGateMarkerEvidence {
 fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
     PathBuf::from(format!(
         ".pueue-agent/logs/agent-{now}-{primary_event_id}.log"
+    ))
+}
+
+fn decision_launch_prompt(context: &DecisionContextBundle) -> Result<(String, String), AppError> {
+    if format!("{:x}", Sha256::digest(context.json.as_bytes())) != context.digest {
+        return Err(AppError::Validation {
+            field: "decision_context",
+            message: "digest does not match the supplied decision context",
+        });
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&context.json).map_err(|source| AppError::Serialization {
+            operation: "parse decision launch context",
+            source,
+        })?;
+    let objective_digest = value
+        .pointer("/objective/digest")
+        .and_then(serde_json::Value::as_str)
+        .filter(|digest| !digest.is_empty())
+        .ok_or(AppError::Validation {
+            field: "decision_context.objective.digest",
+            message: "must contain the campaign objective digest",
+        })?
+        .to_owned();
+    Ok((
+        format!(
+            "Analyze this supervisor-owned campaign context without modifying the project. Return exactly one JSON decision matching the supplied schema.\n{}",
+            context.json
+        ),
+        objective_digest,
     ))
 }
 
@@ -922,6 +1337,148 @@ fn resolve_bound_failure(
     }
 }
 
+fn pending_decision_finalization_error(
+    project: &Project,
+    run_id: i64,
+    decision_failure: DecisionFailureContext,
+    intent: BoundFinalizationIntent,
+    source: AppError,
+) -> AgentSpawnError {
+    let stage = if intent.is_post_marker() {
+        AgentSpawnStage::PostMarker {
+            run_id,
+            resolved: false,
+        }
+    } else {
+        AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: false,
+        }
+    };
+    AgentSpawnError {
+        stage,
+        policy: policy_from_error(&source),
+        source,
+        cleanup: Some(BoundCleanupHandle {
+            project_id: project.project_id.clone(),
+            run_id,
+            intent,
+            decision_failure: Some(decision_failure),
+            kind: BoundCleanupKind::PendingMarker,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_retained_temp_failure(
+    db: &crate::db::Db,
+    project: &Project,
+    run_id: i64,
+    finished_at: i64,
+    retained_authority: RetainedLaunchAuthority,
+    decision_failure: Option<DecisionFailureContext>,
+    intent: BoundFinalizationIntent,
+    source: AppError,
+) -> AgentSpawnError {
+    let post_marker = intent.is_post_marker();
+    let policy = policy_from_error(&source);
+    let mut cleanup = BoundCleanupHandle {
+        project_id: project.project_id.clone(),
+        run_id,
+        intent,
+        decision_failure,
+        kind: BoundCleanupKind::RetainedTemp {
+            retained_authority,
+            finalized: false,
+        },
+    };
+    match cleanup.retry_finalization_and_cleanup(db, finished_at, None) {
+        Ok(()) => AgentSpawnError {
+            stage: if post_marker {
+                AgentSpawnStage::PostMarker {
+                    run_id,
+                    resolved: true,
+                }
+            } else {
+                AgentSpawnStage::RunBoundPreMarker {
+                    run_id,
+                    resolved: true,
+                }
+            },
+            source,
+            policy,
+            cleanup: None,
+        },
+        Err(error) => AgentSpawnError {
+            stage: if post_marker {
+                AgentSpawnStage::PostMarker {
+                    run_id,
+                    resolved: false,
+                }
+            } else {
+                AgentSpawnStage::RunBoundPreMarker {
+                    run_id,
+                    resolved: false,
+                }
+            },
+            source: error,
+            policy,
+            cleanup: Some(cleanup),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_bound_role_failure(
+    db: &crate::db::Db,
+    decision_failure: Option<&DecisionFailureContext>,
+    repository: &AgentRunRepository<'_>,
+    project: &Project,
+    run_id: i64,
+    finished_at: i64,
+    policy: RetryPolicy,
+    source: AppError,
+) -> AgentSpawnError {
+    if let Some(decision_failure) = decision_failure {
+        if let Err(error) = decision_failure.persist(db, run_id, finished_at) {
+            return pending_decision_finalization_error(
+                project,
+                run_id,
+                decision_failure.clone(),
+                BoundFinalizationIntent::from_failure(&source, policy),
+                error,
+            );
+        }
+    }
+    resolve_bound_failure(
+        repository,
+        project,
+        run_id,
+        finished_at,
+        policy,
+        source,
+    )
+}
+
+fn native_spawn_finalization_intent(
+    source: &AppError,
+    retry_policy: RetryPolicy,
+) -> BoundFinalizationIntent {
+    policy_from_error(source)
+        .filter(|violation| {
+            matches!(
+                violation.stage,
+                PolicyViolationStage::PostMarker
+                    | PolicyViolationStage::Dispatched
+                    | PolicyViolationStage::Finalized
+            )
+        })
+        .map_or_else(
+            || BoundFinalizationIntent::from_failure(source, retry_policy),
+            |violation| BoundFinalizationIntent::PendingMarkerPolicy { violation },
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_live_child_failure(
     db: &crate::db::Db,
@@ -930,6 +1487,7 @@ async fn resolve_live_child_failure(
     finished_at: i64,
     child: NativeAgentChild,
     retained_authority: RetainedLaunchAuthority,
+    decision_failure: Option<DecisionFailureContext>,
     intent: BoundFinalizationIntent,
     source: AppError,
 ) -> AgentSpawnError {
@@ -950,6 +1508,7 @@ async fn resolve_live_child_failure(
         project_id: project_id.to_owned(),
         run_id,
         intent,
+        decision_failure,
         kind: BoundCleanupKind::LiveChild {
             child,
             retained_authority,
@@ -960,7 +1519,7 @@ async fn resolve_live_child_failure(
 
     let termination_uncertain = match &cleanup.kind {
         BoundCleanupKind::LiveChild { child, .. } => child.termination_uncertain(),
-        BoundCleanupKind::PendingMarker => false,
+        BoundCleanupKind::RetainedTemp { .. } | BoundCleanupKind::PendingMarker => false,
     };
     if !termination_uncertain {
         match cleanup.retry(db, finished_at).await {
@@ -1001,80 +1560,6 @@ async fn resolve_live_child_failure(
         policy,
         cleanup: Some(cleanup),
     }
-}
-
-fn resolve_native_spawn_failure(
-    repository: &AgentRunRepository<'_>,
-    project: &Project,
-    run_id: i64,
-    finished_at: i64,
-    retry_policy: RetryPolicy,
-    source: AppError,
-) -> AgentSpawnError {
-    let violation = policy_from_error(&source);
-    if let Some(violation) = violation.filter(|violation| {
-        matches!(
-            violation.stage,
-            PolicyViolationStage::PostMarker
-                | PolicyViolationStage::Dispatched
-                | PolicyViolationStage::Finalized
-        )
-    }) {
-        let cleanup = || BoundCleanupHandle {
-            project_id: project.project_id.clone(),
-            run_id,
-            intent: BoundFinalizationIntent::PendingMarkerPolicy { violation },
-            kind: BoundCleanupKind::PendingMarker,
-        };
-        if let Err(evidence_error) = repository.record_pending_marker_policy_evidence(
-            &project.project_id,
-            run_id,
-            &violation,
-        ) {
-            return AgentSpawnError {
-                stage: AgentSpawnStage::PostMarker {
-                    run_id,
-                    resolved: false,
-                },
-                source: evidence_error,
-                policy: Some(violation),
-                cleanup: Some(cleanup()),
-            };
-        }
-        return match repository.finish_pending_marker_policy_failure(
-            &project.project_id,
-            run_id,
-            finished_at,
-            &violation,
-        ) {
-            Ok(_) => AgentSpawnError {
-                stage: AgentSpawnStage::PostMarker {
-                    run_id,
-                    resolved: true,
-                },
-                source,
-                policy: Some(violation),
-                cleanup: None,
-            },
-            Err(finalizer_error) => AgentSpawnError {
-                stage: AgentSpawnStage::PostMarker {
-                    run_id,
-                    resolved: false,
-                },
-                source: finalizer_error,
-                policy: Some(violation),
-                cleanup: Some(cleanup()),
-            },
-        };
-    }
-    resolve_bound_failure(
-        repository,
-        project,
-        run_id,
-        finished_at,
-        retry_policy,
-        source,
-    )
 }
 
 fn resolve_pre_marker_failure(
@@ -1222,6 +1707,121 @@ impl AgentHandle {
         Ok(outcome.status)
     }
 
+    fn prepare_decision_outcome(&mut self) -> Result<(), AppError> {
+        let objective_digest = match self.decision_persistence.as_ref() {
+            Some(DecisionPersistence::Pending { objective_digest }) => objective_digest.clone(),
+            Some(DecisionPersistence::Ready(_) | DecisionPersistence::Persisted) | None => {
+                return Ok(())
+            }
+        };
+        if !self
+            .terminal_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.status == AgentRunStatus::Completed)
+        {
+            self.decision_persistence =
+                Some(DecisionPersistence::Ready(PreparedDecision::Invalid));
+            return Ok(());
+        }
+        let (temp, limits) = match &self.retained_authority {
+            RetainedLaunchAuthority::Retained {
+                global_policy,
+                temp,
+                ..
+            } => (temp, global_policy.campaign_limits),
+            RetainedLaunchAuthority::Released => {
+                return Err(AppError::Runtime {
+                    operation: "read decision output after releasing private temp",
+                })
+            }
+            #[cfg(test)]
+            RetainedLaunchAuthority::Test => {
+                return Err(AppError::Runtime {
+                    operation: "test decision handle has no private temp",
+                })
+            }
+        };
+        let prepared = match temp.read_decision_output() {
+            Ok(bytes) => match parse_and_validate_decision(&bytes, &objective_digest, limits) {
+                Ok(decision) => PreparedDecision::Valid {
+                    json: String::from_utf8(bytes).expect("validated JSON is UTF-8"),
+                    digest: decision.canonical_digest().to_owned(),
+                    kind: match decision {
+                        ValidatedDecision::Proposal(_) => "proposal",
+                        ValidatedDecision::Wait(_) => "wait",
+                    },
+                },
+                Err(_) => PreparedDecision::Invalid,
+            },
+            Err(_) => PreparedDecision::Invalid,
+        };
+        self.decision_persistence = Some(DecisionPersistence::Ready(prepared));
+        Ok(())
+    }
+
+    fn persist_decision_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let (cycle_id, attempt_number) = match &self.role {
+            AgentRunRole::Standard => return Ok(()),
+            AgentRunRole::Decision {
+                cycle_id,
+                attempt_number,
+            } => (cycle_id.clone(), *attempt_number),
+        };
+        if matches!(self.decision_persistence, Some(DecisionPersistence::Persisted)) {
+            return Ok(());
+        }
+        self.prepare_decision_outcome()?;
+        let limits = match &self.retained_authority {
+            RetainedLaunchAuthority::Retained { global_policy, .. } => {
+                global_policy.campaign_limits
+            }
+            RetainedLaunchAuthority::Released => {
+                return Err(AppError::Runtime {
+                    operation: "persist decision after releasing private temp",
+                })
+            }
+            #[cfg(test)]
+            RetainedLaunchAuthority::Test => {
+                return Err(AppError::Runtime {
+                    operation: "test decision handle has no persistence authority",
+                })
+            }
+        };
+        let repository = DecisionRepository::new(db);
+        match self.decision_persistence.as_ref() {
+            Some(DecisionPersistence::Ready(PreparedDecision::Valid {
+                json,
+                digest,
+                kind,
+            })) => {
+                repository.store_decision(self.run_id, json, digest, kind, now)?;
+            }
+            Some(DecisionPersistence::Ready(PreparedDecision::Invalid)) => {
+                repository.fail_attempt(
+                    Some(self.run_id),
+                    &cycle_id,
+                    attempt_number,
+                    "decision_missing",
+                    "decision output was missing or failed secure validation",
+                    limits,
+                    now,
+                )?;
+            }
+            Some(DecisionPersistence::Persisted) => return Ok(()),
+            Some(DecisionPersistence::Pending { .. }) | None => {
+                return Err(AppError::Runtime {
+                    operation: "prepare decision outcome before persistence",
+                })
+            }
+        }
+        self.decision_persistence = Some(DecisionPersistence::Persisted);
+        Ok(())
+    }
+
     fn persist_terminal_outcome(
         &mut self,
         db: &crate::db::Db,
@@ -1230,11 +1830,16 @@ impl AgentHandle {
         if let TerminalPersistence::Persisted(status) = &self.terminal_persistence {
             return Ok(*status);
         }
-        let Some(outcome) = self.terminal_outcome.as_ref() else {
+        if self.terminal_outcome.is_none() {
             return Err(AppError::Runtime {
                 operation: "finalize missing agent process outcome",
             });
-        };
+        }
+        self.persist_decision_outcome(db, now)?;
+        let outcome = self
+            .terminal_outcome
+            .as_ref()
+            .expect("terminal outcome checked before decision persistence");
         let status = self.finalize_terminal_outcome(db, now, outcome)?;
         self.terminal_persistence = TerminalPersistence::Persisted(status);
         Ok(status)
@@ -1599,6 +2204,8 @@ mod tests {
                 "agent::tests::timeout_retry_subprocess",
             );
         let mut handle = AgentHandle {
+            role: AgentRunRole::Standard,
+            decision_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid: child.id(),
@@ -1692,6 +2299,8 @@ mod tests {
             );
         let pid = child.id();
         let mut handle = AgentHandle {
+            role: AgentRunRole::Standard,
+            decision_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid,
@@ -1838,6 +2447,8 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let handle = AgentHandle {
+            role: AgentRunRole::Standard,
+            decision_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid,
@@ -2025,6 +2636,7 @@ mod tests {
             intent: BoundFinalizationIntent::PostMarkerExecutionUnknown {
                 reason: "original_post_marker_failure".to_owned(),
             },
+            decision_failure: None,
             kind: BoundCleanupKind::LiveChild {
                 child,
                 retained_authority: RetainedLaunchAuthority::Test,
@@ -2134,6 +2746,8 @@ mod tests {
                 "agent::tests::terminal_retry_subprocess",
             );
         let mut handle = AgentHandle {
+            role: AgentRunRole::Standard,
+            decision_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid: child.id(),

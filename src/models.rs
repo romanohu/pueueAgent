@@ -11,6 +11,15 @@ use serde_json::Value;
 
 use crate::AppError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentRunRole {
+    Standard,
+    Decision {
+        cycle_id: String,
+        attempt_number: i64,
+    },
+}
+
 #[derive(Debug)]
 pub struct ModelEnumParseError {
     enum_name: &'static str,

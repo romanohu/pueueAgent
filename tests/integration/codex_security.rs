@@ -25,6 +25,36 @@ use pueue_agent::{
 };
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+use std::{
+    os::unix::fs::PermissionsExt,
+    process::Command,
+    sync::Arc,
+};
+#[cfg(target_os = "linux")]
+use pueue_agent::{
+    agent::{AgentRunner, AgentRunnerConfig},
+    config::{self, ProjectConfig},
+    db::{
+        CampaignRepository, Db, DecisionRepository, EventRepository, ExperimentRepository,
+        ProjectRepository, StartCampaignRequest,
+    },
+    decision_evidence::DecisionContextBundle,
+    execution_policy::{load_existing_policy, CampaignLimits},
+    models::{
+        EventKind, ExperimentTerminalOutcome, NewEvent, NewProject, ProposalKind,
+    },
+    proposals::{self, ProposalInput},
+    retry::RetryPolicy,
+    state::ObjectiveSnapshot,
+};
+#[cfg(target_os = "linux")]
+use rusqlite::params;
+#[cfg(target_os = "linux")]
+use serde_json::json;
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
+
 #[path = "../support/execution_policy_fixture.rs"]
 mod execution_policy_fixture;
 
@@ -34,6 +64,62 @@ use std::time::Instant;
 use pueue_agent::{
     execution_policy::{PolicyViolationDetail, TempUnsafeReason},
 };
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn decision_runner_is_read_only_network_enabled_and_persists_output_before_cleanup() {
+    let mut harness = DecisionRunnerHarness::new(OutputMutation::Valid);
+    harness.run_to_terminal().await.unwrap();
+    assert!(!harness.project_root.join("forbidden-write").exists());
+    assert_eq!(harness.capture("network_access"), "true");
+    assert!(!harness.captured_environment_names().iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "OPENAI_API_KEY" | "AWS_SECRET_ACCESS_KEY" | "SSH_AUTH_SOCK"
+        )
+    }));
+    assert_eq!(harness.stored_decision_kind(), Some("proposal".to_owned()));
+    assert_eq!(
+        harness.cleanup_order(),
+        vec!["decision_commit", "agent_terminal", "temp_cleanup"]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn replaced_symlinked_or_weak_decision_output_is_rejected_without_project_mutation() {
+    for mutation in [
+        OutputMutation::Replaced,
+        OutputMutation::Symlink,
+        OutputMutation::Mode0644,
+        OutputMutation::SecondHardLink,
+        OutputMutation::Oversize,
+    ] {
+        let mut harness = DecisionRunnerHarness::new(mutation);
+        harness.run_to_terminal().await.unwrap();
+        assert_eq!(harness.stored_decision_kind(), None, "{mutation:?}");
+        assert_eq!(
+            harness.attempt_failure_code(),
+            Some("decision_missing".to_owned()),
+            "{mutation:?}"
+        );
+        assert!(!harness.project_root.join("forbidden-write").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn decision_runner_rejects_valid_output_from_an_unsuccessful_process() {
+    let mut harness = DecisionRunnerHarness::new(OutputMutation::ExitNonzeroValid);
+    harness.run_to_terminal().await.unwrap();
+
+    assert_eq!(harness.stored_decision_kind(), None);
+    assert_eq!(
+        harness.attempt_failure_code(),
+        Some("decision_missing".to_owned())
+    );
+    assert!(!harness.project_root.join("forbidden-write").exists());
+}
 
 #[test]
 fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
@@ -1142,6 +1228,492 @@ fn config_with_args(args: Vec<&str>) -> AgentConfig {
             reasoning_effort: None,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+enum OutputMutation {
+    Valid,
+    ExitNonzeroValid,
+    Replaced,
+    Symlink,
+    Mode0644,
+    SecondHardLink,
+    Oversize,
+}
+
+#[cfg(target_os = "linux")]
+struct DecisionRunnerHarness {
+    _temp: TempDir,
+    db: Db,
+    project_root: PathBuf,
+    project: pueue_agent::models::Project,
+    config: ProjectConfig,
+    policy: Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+    reservation: pueue_agent::db::DecisionReservation,
+    context: DecisionContextBundle,
+    event_id: i64,
+    capture_path: PathBuf,
+    run_temp_path: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl DecisionRunnerHarness {
+    fn new(mutation: OutputMutation) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture_root = fs::canonicalize(temp.path()).unwrap();
+        let project_root = fixture_root.join("project");
+        let service_dir = project_root.join(".pueue-agent");
+        let trusted_bin = fixture_root.join("trusted-bin");
+        let policy_state = fixture_root.join("policy-state");
+        let codex_home = fixture_root.join("codex-home");
+        for directory in [
+            &project_root,
+            &service_dir,
+            &trusted_bin,
+            &policy_state,
+            &codex_home,
+        ] {
+            fs::create_dir_all(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir_all(service_dir.join("logs")).unwrap();
+        fs::set_permissions(
+            service_dir.join("logs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(service_dir.join("STATE.md"), "fixture state\n").unwrap();
+        fs::write(service_dir.join("instructions.md"), "fixture instructions\n").unwrap();
+
+        let capture_path = fixture_root.join("decision-capture.txt");
+        let external_decision_path = fixture_root.join("external-decision.json");
+        let codex = trusted_bin.join("codex");
+        compile_decision_codex(
+            &trusted_bin,
+            &codex,
+            &capture_path,
+            &external_decision_path,
+            mutation,
+        );
+        let custom = trusted_bin.join("custom-experiment-agent");
+        fs::copy(&codex, &custom).unwrap();
+        fs::set_permissions(&custom, fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = trusted_bin.join("pueue-agent-launcher");
+        fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let pueue = trusted_bin.join("pueue");
+        fs::copy(&codex, &pueue).unwrap();
+        fs::set_permissions(&pueue, fs::Permissions::from_mode(0o700)).unwrap();
+        let pueue_config = fixture_root.join("pueue.yml");
+        fs::write(&pueue_config, "fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let config_path = service_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"project_id = "decision-project"
+pueue_group = "decision-project"
+
+[agent]
+program = {:?}
+args = ["--custom-project-agent-must-not-run"]
+timeout_minutes = 1
+max_retries = 0
+
+[agent.execution]
+network = "enabled"
+
+[check]
+interval_minutes = 10
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+                custom.display().to_string()
+            ),
+        )
+        .unwrap();
+        let config = config::load(&config_path).unwrap();
+
+        fs::write(
+            policy_state.join("execution-policy.toml"),
+            format!(
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n\n[projects.\"decision-project\"]\ncustom_agent = {:?}\n",
+                trusted_bin.display().to_string(),
+                codex.display().to_string(),
+                pueue.display().to_string(),
+                custom.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            policy_state.join("execution-policy.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let policy = Arc::new(
+            load_existing_policy(&PolicyLoadInput {
+                state_dir: policy_state,
+                project_roots: vec![fs::canonicalize(&project_root).unwrap()],
+                inherited_path: trusted_bin.clone().into_os_string(),
+                startup_environment: StartupEnvironment::from_pairs([
+                    ("HOME", "/fixture"),
+                    ("OPENAI_API_KEY", "fixture-openai-secret"),
+                    ("AWS_SECRET_ACCESS_KEY", "fixture-aws-secret"),
+                    ("SSH_AUTH_SOCK", "/fixture/ssh-agent.sock"),
+                ]),
+                codex_home,
+                pueue_config,
+                launcher_path: launcher,
+            })
+            .unwrap(),
+        );
+
+        let db = Db::open(&fixture_root.join("state.sqlite3")).unwrap();
+        let project = ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "decision-project",
+                fs::canonicalize(&project_root).unwrap(),
+                "decision-project",
+                config_path,
+                100,
+            ))
+            .unwrap();
+        let objective = ObjectiveSnapshot {
+            text: "Improve the validation result safely.\n".to_owned(),
+            digest: "decision-objective-digest".to_owned(),
+        };
+        let initial_argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish a baseline".to_owned(),
+                source_experiment_id: None,
+                argv: initial_argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        let campaign = CampaignRepository::new(&db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "decision-campaign",
+                    project_id: &project.project_id,
+                    objective: &objective,
+                    initial_argv: &initial_argv,
+                    baseline: &baseline,
+                    submission_id: "decision-submission",
+                    experiment_id: "decision-experiment",
+                    proposal_id: "decision-proposal",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap()
+            .campaign;
+        let experiments = ExperimentRepository::new(&db);
+        experiments.mark_submitting("decision-experiment", 101).unwrap();
+        experiments
+            .mark_accepted("decision-experiment", 41, "decision-task-signature", 102)
+            .unwrap();
+        experiments
+            .project_terminal_submission(
+                "decision-experiment",
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                103,
+            )
+            .unwrap();
+        let decisions = DecisionRepository::new(&db);
+        let cycle = decisions
+            .ensure_cycle_for_terminal(&campaign.campaign_id, "decision-experiment", 104)
+            .unwrap();
+        let reservation = decisions
+            .reserve_next_attempt(&project.project_id, &cycle.cycle_id, 105)
+            .unwrap()
+            .unwrap();
+        let context_json = json!({
+            "schema_version": 1,
+            "objective": {
+                "text": objective.text,
+                "digest": objective.digest,
+            },
+            "source_experiment": {
+                "experiment_id": "decision-experiment",
+            },
+        })
+        .to_string();
+        let context = DecisionContextBundle {
+            digest: format!("{:x}", Sha256::digest(context_json.as_bytes())),
+            json: context_json,
+        };
+        decisions
+            .store_evidence(&reservation, &context.json, &context.digest, 106)
+            .unwrap();
+        let event_id = EventRepository::new(&db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    &project.project_id,
+                    EventKind::CampaignDecision,
+                    "decision-runner-fixture",
+                    json!({"cycle_id": cycle.cycle_id}),
+                    106,
+                    106,
+                )
+                .with_campaign_lineage(&campaign.campaign_id, Some("decision-experiment")),
+            )
+            .unwrap()
+            .event_id;
+        let claimed = EventRepository::new(&db)
+            .claim_batch(106, 166, 1)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].event_id, event_id);
+
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE decision_runner_order (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL
+                 );
+                 CREATE TRIGGER decision_runner_decision_commit
+                 AFTER UPDATE OF state ON decision_attempts
+                 WHEN NEW.state IN ('decided','failed') AND OLD.state <> NEW.state
+                 BEGIN
+                     INSERT INTO decision_runner_order(label) VALUES ('decision_commit');
+                 END;
+                 CREATE TRIGGER decision_runner_agent_terminal
+                 AFTER UPDATE OF status ON agent_runs
+                 WHEN NEW.status IN ('completed','failed','timed_out','cancelled')
+                      AND OLD.status <> NEW.status
+                 BEGIN
+                     INSERT INTO decision_runner_order(label) VALUES ('agent_terminal');
+                 END;",
+            )
+            .unwrap();
+
+        Self {
+            _temp: temp,
+            db,
+            project_root: fs::canonicalize(project_root).unwrap(),
+            project,
+            config,
+            policy,
+            reservation,
+            context,
+            event_id,
+            capture_path,
+            run_temp_path: None,
+        }
+    }
+
+    async fn run_to_terminal(&mut self) -> Result<(), pueue_agent::AppError> {
+        let runner = AgentRunner::new(AgentRunnerConfig::production(), Arc::clone(&self.policy));
+        let project_policy = runner.resolve_project_policy(&self.project, &self.config)?;
+        let run_id_guard = runner
+            .try_acquire_run_id_admission_guard(&self.db)?
+            .expect("run ID admission guard");
+        let project_lock = runner
+            .try_acquire_project_admission_lock(&project_policy)?
+            .expect("project admission lock");
+        let mut handle = runner
+            .spawn_decision(
+                &self.db,
+                &self.project,
+                &project_policy,
+                &self.config.agent,
+                RetryPolicy { max_retries: 0 },
+                self.event_id,
+                &[self.event_id],
+                &self.reservation,
+                &self.context,
+                107,
+                run_id_guard,
+                project_lock,
+            )
+            .await
+            .map_err(|error| error.source)?;
+        self.run_temp_path = Some(
+            self.project_root
+                .join(".pueue-agent/tmp")
+                .join(handle.run_id.to_string()),
+        );
+        handle.wait(&self.db, 108).await?;
+        Ok(())
+    }
+
+    fn capture(&self, field: &str) -> String {
+        fs::read_to_string(&self.capture_path)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.split_once('=').filter(|(name, _)| *name == field))
+            .map(|(_, value)| value.to_owned())
+            .unwrap()
+    }
+
+    fn captured_environment_names(&self) -> Vec<String> {
+        fs::read_to_string(&self.capture_path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("environment_name=")
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn stored_decision_kind(&self) -> Option<String> {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT decision_kind FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![self.reservation.cycle_id, self.reservation.attempt_number],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn attempt_failure_code(&self) -> Option<String> {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT failure_code FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![self.reservation.cycle_id, self.reservation.attempt_number],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn cleanup_order(&self) -> Vec<&'static str> {
+        let connection = self.db.connect().unwrap();
+        let mut statement = connection
+            .prepare("SELECT label FROM decision_runner_order ORDER BY sequence")
+            .unwrap();
+        let labels = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut order = labels
+            .into_iter()
+            .map(|label| match label.as_str() {
+                "decision_commit" => "decision_commit",
+                "agent_terminal" => "agent_terminal",
+                _ => panic!("unexpected order label"),
+            })
+            .collect::<Vec<_>>();
+        let run_temp = self.run_temp_path.as_ref().unwrap();
+        if fs::read_dir(run_temp).unwrap().next().is_none() {
+            order.push("temp_cleanup");
+        }
+        order
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compile_decision_codex(
+    trusted_bin: &Path,
+    target: &Path,
+    capture_path: &Path,
+    external_decision_path: &Path,
+    mutation: OutputMutation,
+) {
+    let source = trusted_bin.join(format!("codex-{mutation:?}.rs"));
+    fs::write(
+        &source,
+        format!(
+            r##"use std::{{env, fs, io::Write, os::unix::fs::{{OpenOptionsExt, PermissionsExt}}, path::Path, process::exit}};
+
+fn pair<'a>(args: &'a [String], name: &str) -> Option<&'a str> {{
+    args.windows(2).find(|pair| pair[0] == name).map(|pair| pair[1].as_str())
+}}
+
+fn main() {{
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if pair(&args, "--sandbox") != Some("read-only") {{
+        fs::write("forbidden-write", b"unsafe").unwrap();
+    }}
+    let network = args.windows(2).find_map(|pair| {{
+        (pair[0] == "-c").then_some(pair[1].as_str())
+    }}).and_then(|value| value.strip_prefix("sandbox_workspace_write.network_access=")).unwrap_or("missing");
+    let mut names = env::vars_os().filter_map(|(name, _)| name.into_string().ok()).collect::<Vec<_>>();
+    names.sort();
+    let mut capture = format!("network_access={{network}}\n");
+    for name in names {{ capture.push_str(&format!("environment_name={{name}}\n")); }}
+    fs::write({capture_path:?}, capture).unwrap();
+
+    let schema = pair(&args, "--output-schema").unwrap();
+    let output = pair(&args, "--output-last-message").unwrap();
+    if !Path::new(schema).is_file() || !Path::new(output).is_file() {{ exit(71); }}
+    let decision = br#"{{"schema_version":1,"decision":"proposal","proposal":{{"kind":"experiment","hypothesis":"lower learning rate","source_experiment_id":"decision-experiment","argv":["python","train.py","--lr","0.001"],"working_directory":".","expected_evidence":["validation loss"]}}}}"#;
+    match {mutation:?} {{
+        "Valid" => fs::write(output, decision).unwrap(),
+        "ExitNonzeroValid" => {{
+            fs::write(output, decision).unwrap();
+            exit(73);
+        }}
+        "Replaced" => {{
+            fs::remove_file(output).unwrap();
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output).unwrap();
+            file.write_all(decision).unwrap();
+        }}
+        "Symlink" => {{
+            fs::write({external_decision_path:?}, decision).unwrap();
+            fs::remove_file(output).unwrap();
+            std::os::unix::fs::symlink({external_decision_path:?}, output).unwrap();
+        }}
+        "Mode0644" => {{
+            fs::write(output, decision).unwrap();
+            fs::set_permissions(output, fs::Permissions::from_mode(0o644)).unwrap();
+        }}
+        "SecondHardLink" => {{
+            fs::write(output, decision).unwrap();
+            std::fs::hard_link(output, "/dev/fd/11/decision-hard-link").unwrap();
+        }}
+        "Oversize" => fs::write(output, vec![b'x'; 128 * 1024 + 1]).unwrap(),
+        _ => exit(72),
+    }}
+}}
+"##,
+            capture_path = capture_path,
+            external_decision_path = external_decision_path,
+            mutation = format!("{mutation:?}"),
+        ),
+    )
+    .unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(target)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated decision Codex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 struct Harness {

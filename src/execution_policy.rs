@@ -483,6 +483,20 @@ const fn unsupported_platform() -> PolicyViolation {
     )
 }
 
+pub fn preflight_decision_runtime() -> Result<(), PolicyViolation> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::PreBinding,
+        ))
+    }
+}
+
 struct OpenedPath {
     canonical_path: PathBuf,
     file: File,
@@ -1137,6 +1151,32 @@ pub fn resolve_project_policy(
         },
         agent_environment_allow,
         task_environment_allow,
+        codex_home: global.codex_home.clone(),
+        trusted_path: global.trusted_path.clone(),
+        private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
+    })
+}
+
+pub(crate) fn resolve_decision_project_policy(
+    global: &ResolvedExecutionPolicy,
+    project: &ResolvedProjectExecutionPolicy,
+) -> Result<ResolvedProjectExecutionPolicy, PolicyViolation> {
+    preflight_decision_runtime()?;
+    let root_anchor = global.project_root_anchor(&project.root_anchor.canonical_path)?;
+    if root_anchor.identity != project.root_anchor.identity {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    Ok(ResolvedProjectExecutionPolicy {
+        project_id: project.project_id.clone(),
+        root_anchor,
+        agent_anchor: global.codex_anchor.clone(),
+        agent_kind: AgentKind::BuiltInCodex,
+        network: project.network,
+        agent_environment_allow: BTreeSet::new(),
+        task_environment_allow: BTreeSet::new(),
         codex_home: global.codex_home.clone(),
         trusted_path: global.trusted_path.clone(),
         private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),

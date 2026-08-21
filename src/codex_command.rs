@@ -19,8 +19,8 @@ use crate::{
         VerifiedPrivateTemp,
     },
     execution_policy::{
-        AgentKind, NetworkMode, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
-        ResolvedProjectExecutionPolicy,
+        preflight_decision_runtime, AgentKind, NetworkMode, PolicyViolation,
+        PolicyViolationCode, PolicyViolationStage, ResolvedProjectExecutionPolicy,
     },
     models::AgentContextMode,
     AppError,
@@ -34,27 +34,36 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodexCapabilities {
     pub workspace_write: bool,
+    pub read_only: bool,
     pub approval_never: bool,
     pub network_mode: bool,
     pub project_config_isolation: bool,
+    pub json_output_schema: bool,
+    pub output_last_message: bool,
 }
 
 impl CodexCapabilities {
     pub const fn all() -> Self {
         Self {
             workspace_write: true,
+            read_only: true,
             approval_never: true,
             network_mode: true,
             project_config_isolation: true,
+            json_output_schema: true,
+            output_last_message: true,
         }
     }
 
     pub const fn none() -> Self {
         Self {
             workspace_write: false,
+            read_only: false,
             approval_never: false,
             network_mode: false,
             project_config_isolation: false,
+            json_output_schema: false,
+            output_last_message: false,
         }
     }
 
@@ -63,6 +72,15 @@ impl CodexCapabilities {
             && self.approval_never
             && self.network_mode
             && self.project_config_isolation
+    }
+
+    pub const fn supports_decision_policy(self) -> bool {
+        self.read_only
+            && self.approval_never
+            && self.network_mode
+            && self.project_config_isolation
+            && self.json_output_schema
+            && self.output_last_message
     }
 }
 
@@ -111,6 +129,62 @@ impl CodexArgvBuilder {
         self.build_for_private_temp_path(config, prompt, private_tmp.target_path())
     }
 
+    pub(crate) fn build_decision_with_private_temp(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.preflight_decision(config, prompt)?;
+
+        let root = path_text(&self.policy.root_anchor.canonical_path)?;
+        let schema = path_text(&private_tmp.target_path().join("decision-schema.json"))?;
+        let output = path_text(&private_tmp.target_path().join("decision.json"))?;
+        let mut argv = vec![
+            OsString::from("--ask-for-approval"),
+            OsString::from("never"),
+            OsString::from("exec"),
+            OsString::from("--ignore-user-config"),
+            OsString::from("--ignore-rules"),
+            OsString::from("--strict-config"),
+            OsString::from("--sandbox"),
+            OsString::from("read-only"),
+            OsString::from("-C"),
+            OsString::from(root.clone()),
+            OsString::from("--output-schema"),
+            OsString::from(schema),
+            OsString::from("--output-last-message"),
+            OsString::from(output),
+        ];
+
+        push_codex_overrides(&mut argv, config)?;
+        push_config(
+            &mut argv,
+            format!(
+                "sandbox_workspace_write.network_access={}",
+                network_mode(self.policy.network)
+            ),
+        );
+        push_config(
+            &mut argv,
+            format!(
+                "projects={{{}={{trust_level=\"untrusted\"}}}}",
+                toml_quote(&root)
+            ),
+        );
+        push_config(&mut argv, "allow_login_shell=false".to_owned());
+        push_config(
+            &mut argv,
+            format!(
+                "shell_environment_policy={{inherit=\"all\",ignore_default_excludes=false,experimental_use_profile=false,filters={{{}}}}}",
+                environment_filters(&BTreeSet::new())?
+            ),
+        );
+        argv.push(OsString::from("--"));
+        argv.push(OsString::from(prompt));
+        Ok(argv)
+    }
+
     fn build_for_private_temp_path(
         &self,
         config: &AgentConfig,
@@ -134,13 +208,7 @@ impl CodexArgvBuilder {
             OsString::from(root.clone()),
         ];
 
-        if let Some(model) = config.codex.model.as_deref() {
-            if model.is_empty() || model.contains('\0') {
-                return Err(unsafe_argument());
-            }
-            argv.push(OsString::from("--model"));
-            argv.push(OsString::from(model));
-        }
+        push_codex_overrides(&mut argv, config)?;
 
         push_config(
             &mut argv,
@@ -176,16 +244,6 @@ impl CodexArgvBuilder {
                 environment_filters(&self.policy.task_environment_allow)?
             ),
         );
-
-        if let Some(reasoning_effort) = config.codex.reasoning_effort {
-            push_config(
-                &mut argv,
-                format!(
-                    "model_reasoning_effort=\"{}\"",
-                    reasoning_effort.as_str()
-                ),
-            );
-        }
 
         match &config.context {
             AgentContextMode::Fresh => {}
@@ -250,12 +308,55 @@ impl CodexArgvBuilder {
         Ok(())
     }
 
+    pub(crate) fn preflight_decision(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+    ) -> Result<(), PolicyViolation> {
+        preflight_decision_runtime()?;
+        if self.policy.agent_kind != AgentKind::BuiltInCodex
+            || !self.capabilities.supports_decision_policy()
+            || prompt.contains('\0')
+            || config
+                .codex
+                .model
+                .as_deref()
+                .is_some_and(|model| model.is_empty() || model.contains('\0'))
+        {
+            return Err(unsafe_argument());
+        }
+        Ok(())
+    }
+
     fn validate_capabilities(&self) -> Result<(), PolicyViolation> {
         self.capabilities
             .supports_forced_policy()
             .then_some(())
             .ok_or_else(unsafe_argument)
     }
+}
+
+fn push_codex_overrides(
+    argv: &mut Vec<OsString>,
+    config: &AgentConfig,
+) -> Result<(), PolicyViolation> {
+    if let Some(model) = config.codex.model.as_deref() {
+        if model.is_empty() || model.contains('\0') {
+            return Err(unsafe_argument());
+        }
+        argv.push(OsString::from("--model"));
+        argv.push(OsString::from(model));
+    }
+    if let Some(reasoning_effort) = config.codex.reasoning_effort {
+        push_config(
+            argv,
+            format!(
+                "model_reasoning_effort=\"{}\"",
+                reasoning_effort.as_str()
+            ),
+        );
+    }
+    Ok(())
 }
 
 fn validate_compatibility_args(args: &[String]) -> Result<(), PolicyViolation> {

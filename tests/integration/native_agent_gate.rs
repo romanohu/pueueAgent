@@ -19,10 +19,31 @@ use pueue_agent::{
     native_launcher::{NativeLaunchSpec, NativeLauncher},
     project_logs::{create_gate_marker, ensure_agent_log_dir, ProjectRootLogReader},
 };
+#[cfg(not(target_os = "linux"))]
+use pueue_agent::{
+    db::{AgentRunRepository, Db},
+    execution_policy::preflight_decision_runtime,
+};
 use tempfile::tempdir;
 
 const LOG: &str = ".pueue-agent/logs/fixture.log";
 const MARKER: &str = ".pueue-agent/logs/fixture.authorized";
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn decision_output_capability_fails_before_agent_run_allocation() {
+    let temporary = tempdir().expect("temporary database root");
+    let db = Db::open(&temporary.path().join("state.sqlite3")).expect("open database");
+
+    let error = preflight_decision_runtime().expect_err("non-Linux decision runtime must fail");
+
+    assert_eq!(error.code, PolicyViolationCode::UnsupportedPlatform);
+    assert_eq!(error.stage, PolicyViolationStage::PreBinding);
+    assert!(AgentRunRepository::new(&db)
+        .find_active_by_project("unallocated-project")
+        .expect("query agent runs")
+        .is_none());
+}
 
 struct Harness {
     temporary: tempfile::TempDir,

@@ -24,6 +24,10 @@ use crate::execution_policy::{
     PolicyViolationDetail, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
     TempUnsafeReason, VerifiedProjectRoot,
 };
+#[cfg(target_os = "linux")]
+use std::{io::{Read, Write}, sync::Mutex};
+#[cfg(target_os = "linux")]
+use crate::decision_protocol::MAX_DECISION_BYTES;
 
 pub use crate::execution_policy::StartupEnvironment;
 
@@ -319,6 +323,16 @@ impl SanitizedEnvironment {
         Ok(environment)
     }
 
+    pub(crate) fn for_codex_decision(
+        startup: &StartupEnvironment,
+        policy: &ResolvedProjectExecutionPolicy,
+        run_id: i64,
+    ) -> Result<Self, PolicyViolation> {
+        let mut environment = Self::project_baseline(startup, policy, run_id, true)?;
+        environment.insert_generated("CODEX_HOME", policy.codex_home.as_os_str());
+        Ok(environment)
+    }
+
     pub fn for_custom_agent(
         startup: &StartupEnvironment,
         policy: &ResolvedProjectExecutionPolicy,
@@ -511,7 +525,7 @@ fn temp_error() -> PolicyViolation {
     )
 }
 
-pub(crate) struct ProjectAdmissionLock {
+pub struct ProjectAdmissionLock {
     directory: File,
 }
 
@@ -519,7 +533,7 @@ pub(crate) struct ProjectAdmissionLock {
 /// The guard flocks a fresh descriptor opened relative to the retained
 /// database-parent capability, so no replaceable lock-file leaf is trusted.
 /// The descriptor is close-on-exec and never held across native launch.
-pub(crate) struct RunIdAdmissionGuard {
+pub struct RunIdAdmissionGuard {
     file: File,
 }
 
@@ -650,6 +664,8 @@ pub struct PrivateRunTemp {
     parent: File,
     directory: File,
     identity: (u64, u64),
+    #[cfg(target_os = "linux")]
+    decision_output_identity: Mutex<Option<(u64, u64)>>,
 }
 
 /// An opaque, verified directory capability for the native target's private
@@ -879,12 +895,134 @@ impl PrivateRunTemp {
                 parent: tmp,
                 directory,
                 identity,
+                #[cfg(target_os = "linux")]
+                decision_output_identity: Mutex::new(None),
             })
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn prepare_decision_schema(
+        &self,
+        schema: &[u8],
+    ) -> Result<(), PolicyViolation> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = schema;
+            Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate_current()?;
+            create_private_decision_file(&self.directory, OsStr::new("decision-schema.json"), schema)?;
+            let output = create_private_decision_file(
+                &self.directory,
+                OsStr::new("decision.json"),
+                &[],
+            )?;
+            *self
+                .decision_output_identity
+                .lock()
+                .map_err(|_| temp_error())? = Some(output);
+            self.directory.sync_all().map_err(|_| temp_error())?;
+            self.revalidate_current()
+        }
+    }
+
+    pub(crate) fn read_decision_output(&self) -> Result<Vec<u8>, PolicyViolation> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::Finalized,
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+
+            self.revalidate_current()?;
+            let expected = self
+                .decision_output_identity
+                .lock()
+                .map_err(|_| temp_error())?
+                .as_ref()
+                .copied()
+                .ok_or_else(temp_error)?;
+            let name = OsStr::new("decision.json");
+            let parent_mount = directory_mount_identity_at(
+                &self.directory,
+                PolicyViolationStage::Finalized,
+            )?;
+            if entry_mount_identity_at(&self.directory, name, PolicyViolationStage::Finalized)?
+                != parent_mount
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::MountBoundary,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let name = std::ffi::CString::new(name.as_bytes()).expect("literal contains no NUL");
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::InvalidEntry,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let before = validate_decision_output_file(&file, expected, parent_mount)?;
+            let size = usize::try_from(before.size).map_err(|_| {
+                temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
+            })?;
+            let mut bytes = Vec::with_capacity(size);
+            Read::by_ref(&mut file)
+                .take((MAX_DECISION_BYTES as u64) + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| {
+                    temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
+                })?;
+            if bytes.len() > MAX_DECISION_BYTES {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::ByteLimit,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let after = validate_decision_output_file(&file, expected, parent_mount)?;
+            if before != after {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let visible = artifact_entry_metadata_at(&self.directory, OsStr::new("decision.json"))?;
+            if visible.identity != expected
+                || visible.mount_identity != parent_mount
+                || visible.owner != unsafe { libc::geteuid() as u32 }
+                || visible.mode & 0o7777 != 0o600
+                || visible.size != before.size
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            self.revalidate_current()?;
+            Ok(bytes)
+        }
     }
 
     /// Clone and revalidate the retained directory capability for target use.
@@ -1324,6 +1462,91 @@ impl PrivateRunTemp {
 
 impl Drop for PrivateRunTemp {
     fn drop(&mut self) {}
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DecisionFileSnapshot {
+    identity: (u64, u64),
+    owner: u32,
+    mode: u32,
+    links: u64,
+    size: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_decision_file(
+    directory: &File,
+    name: &OsStr,
+    contents: &[u8],
+) -> Result<(u64, u64), PolicyViolation> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| temp_violation(TempUnsafeReason::InvalidEntry))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(temp_violation(TempUnsafeReason::InvalidEntry));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| temp_error())?;
+    let metadata = file.metadata().map_err(|_| temp_error())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() as u32 }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(temp_violation(TempUnsafeReason::InvalidEntry));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_decision_output_file(
+    file: &File,
+    expected: (u64, u64),
+    expected_mount: MountIdentity,
+) -> Result<DecisionFileSnapshot, PolicyViolation> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().map_err(|_| {
+        temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
+    })?;
+    let snapshot = DecisionFileSnapshot {
+        identity: (metadata.dev(), metadata.ino()),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        links: metadata.nlink(),
+        size: metadata.size(),
+    };
+    if !metadata.is_file()
+        || snapshot.identity != expected
+        || snapshot.owner != unsafe { libc::geteuid() as u32 }
+        || snapshot.mode != 0o600
+        || snapshot.links != 1
+        || snapshot.size > MAX_DECISION_BYTES as u64
+        || directory_mount_identity_at(file, PolicyViolationStage::Finalized)? != expected_mount
+    {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::Finalized,
+        ));
+    }
+    Ok(snapshot)
 }
 
 #[cfg(unix)]
