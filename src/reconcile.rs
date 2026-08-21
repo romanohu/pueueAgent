@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     db::{
-        Db, EventRepository, ExperimentRepository, ProjectRepository, SubmissionRepository,
-        TaskObservationRepository,
+        Db, DecisionRepository, EventRepository, ExperimentRepository, ProjectRepository,
+        SubmissionRepository, TaskObservationRepository,
     },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
@@ -135,6 +135,41 @@ where
                     experiment.as_ref(),
                     now,
                 )?;
+                if let Some(experiment) = experiment.as_ref() {
+                    let cycle = DecisionRepository::new(self.db).ensure_cycle_for_terminal(
+                        &experiment.campaign_id,
+                        &experiment.experiment_id,
+                        now,
+                    )?;
+                    EventRepository::new(self.db).insert_idempotent(
+                        &NewEvent::new(
+                            &project.project_id,
+                            EventKind::CampaignDecision,
+                            format!("campaign-decision:v1:{}", cycle.cycle_id),
+                            json!({
+                                "source": "terminal_experiment",
+                                "cycle_id": cycle.cycle_id,
+                                "source_experiment_id": cycle.source_experiment_id,
+                                "terminal_observation": {
+                                    "task_id": task.id,
+                                    "task_signature": experiment.task_signature,
+                                    "group": task.group,
+                                    "state": task.state,
+                                    "enqueued_at": task.enqueued_at.as_deref().and_then(parse_timestamp),
+                                    "started_at": task.started_at.as_deref().and_then(parse_timestamp),
+                                    "ended_at": task.ended_at.as_deref().and_then(parse_timestamp),
+                                    "exit_code": task.result.as_ref().and_then(terminal_exit_code),
+                                },
+                            }),
+                            now,
+                            now,
+                        )
+                        .with_campaign_lineage(
+                            cycle.campaign_id,
+                            Some(experiment.experiment_id.clone()),
+                        ),
+                    )?;
+                }
                 match event_kind {
                     EventKind::TaskFinished => report.task_finished_events += 1,
                     EventKind::TaskFailed => report.task_failed_events += 1,
@@ -340,6 +375,17 @@ fn normalized_failure_evidence(result: Option<&Value>) -> Value {
             json!({"class": "failed"})
         }
         _ => json!({"class": "unclassified"}),
+    }
+}
+
+fn terminal_exit_code(result: &Value) -> Option<i32> {
+    match result {
+        Value::Object(object) => object
+            .get("Failed")
+            .or_else(|| object.get("Success"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        _ => None,
     }
 }
 

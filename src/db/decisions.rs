@@ -635,6 +635,26 @@ impl<'db> DecisionRepository<'db> {
         self.finish_attempt(cycle_id, attempt_number, None, now)
     }
 
+    pub fn find_cycle_for_source(
+        &self,
+        campaign_id: &str,
+        source_experiment_id: &str,
+    ) -> Result<Option<DecisionCycle>, AppError> {
+        let connection = self.db.connect()?;
+        let cycle_id = connection
+            .query_row(
+                "SELECT cycle_id FROM decision_cycles
+                 WHERE campaign_id = ?1 AND source_experiment_id = ?2",
+                params![campaign_id, source_experiment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error("find decision cycle by source experiment"))?;
+        cycle_id
+            .map(|cycle_id| read_cycle(&connection, &cycle_id))
+            .transpose()
+    }
+
     pub fn due_cycles(&self, now: i64, limit: usize) -> Result<Vec<DecisionCycle>, AppError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -689,6 +709,62 @@ impl<'db> DecisionRepository<'db> {
             .commit()
             .map_err(database_error("commit due decision cycle query"))?;
         Ok(cycles)
+    }
+
+    pub fn oldest_due_cycle_for_campaign(
+        &self,
+        project_id: &str,
+        campaign_id: &str,
+        now: i64,
+    ) -> Result<Option<DecisionCycle>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin oldest due decision cycle query"))?;
+        let cycle_id = transaction
+            .query_row(
+                "SELECT dc.cycle_id
+                 FROM decision_cycles dc
+                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                 JOIN projects p ON p.project_id = c.project_id
+                 JOIN experiments e ON e.experiment_id = dc.source_experiment_id
+                 WHERE c.campaign_id = ?1 AND c.project_id = ?2
+                   AND (dc.state = 'pending'
+                        OR (dc.state = 'waiting' AND dc.next_wake_at <= ?3))
+                   AND c.state = 'active'
+                   AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
+                   AND e.campaign_id = dc.campaign_id
+                   AND e.status IN ('succeeded','failed','cancelled')
+                 ORDER BY COALESCE(e.finished_at, e.updated_at), e.experiment_id, dc.cycle_id
+                 LIMIT 1",
+                params![campaign_id, project_id, now],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error("query oldest due decision cycle"))?;
+        let Some(cycle_id) = cycle_id else {
+            transaction
+                .commit()
+                .map_err(database_error("commit empty oldest due decision cycle query"))?;
+            return Ok(None);
+        };
+        let authority = read_authority(&transaction, &cycle_id)?;
+        validate_active_authority(&authority, Some(project_id))?;
+        if authority.cycle.state == DecisionCycleState::Waiting {
+            transaction
+                .execute(
+                    "UPDATE decision_cycles
+                     SET state = 'pending', next_wake_at = NULL, updated_at = ?1
+                     WHERE cycle_id = ?2 AND state = 'waiting' AND next_wake_at <= ?1",
+                    params![now, cycle_id],
+                )
+                .map_err(database_error("wake oldest due decision cycle"))?;
+        }
+        let cycle = read_cycle(&transaction, &cycle_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit oldest due decision cycle query"))?;
+        Ok(Some(cycle))
     }
 
     pub fn recoverable_attempts(&self, limit: usize) -> Result<Vec<DecisionRecovery>, AppError> {

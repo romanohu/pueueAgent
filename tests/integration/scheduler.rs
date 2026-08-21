@@ -17,13 +17,14 @@ use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     codex_command::CodexCapabilities,
     db::{
-        AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
-        ExperimentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
-        SubmissionRepository,
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, DecisionRepository,
+        EventRepository, ExperimentRepository, InterventionRepository, ProjectRepository,
+        StartCampaignRequest, SubmissionRepository,
     },
     models::{
         AgentContextMode, AgentRunStatus, CampaignState, Event, EventKind, EventStatus,
-        NewAgentRun, NewEvent, NewProject, NewSubmission, ProposalKind, SubmissionStatus,
+        ExperimentTerminalOutcome, NewAgentRun, NewEvent, NewProject, NewSubmission, ProposalKind,
+        SubmissionStatus,
     },
     execution_policy::{
         load_existing_policy, CampaignLimits, PolicyLoadInput, PolicyViolationDetail,
@@ -39,6 +40,8 @@ use pueue_agent::{
 use rusqlite::params;
 use serde_json::json;
 use tempfile::TempDir;
+#[cfg(target_os = "linux")]
+use pueue_agent::models::{DecisionAttemptState, DecisionCycleState};
 #[cfg(unix)]
 use tokio::time::{sleep, Duration, Instant};
 
@@ -444,6 +447,262 @@ max_agent_runs = 10
             .campaign_id
     }
 
+    fn terminalize_campaign_experiment(
+        &self,
+        campaign_id: &str,
+        experiment_id: &str,
+        task_id: i64,
+        task_signature: &str,
+        finished_at: i64,
+    ) -> i64 {
+        let experiments = ExperimentRepository::new(&self.db);
+        experiments
+            .mark_submitting(experiment_id, finished_at - 2)
+            .unwrap();
+        experiments
+            .mark_accepted(
+                experiment_id,
+                task_id,
+                task_signature,
+                finished_at - 1,
+            )
+            .unwrap();
+        experiments
+            .project_terminal_submission(
+                experiment_id,
+                task_id,
+                ExperimentTerminalOutcome::Succeeded,
+                finished_at,
+            )
+            .unwrap();
+        let cycle = DecisionRepository::new(&self.db)
+            .ensure_cycle_for_terminal(campaign_id, experiment_id, finished_at)
+            .unwrap();
+        EventRepository::new(&self.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    "project-a",
+                    EventKind::CampaignDecision,
+                    format!("campaign-decision:v1:{}", cycle.cycle_id),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle.cycle_id,
+                        "source_experiment_id": experiment_id,
+                        "terminal_observation": {
+                            "task_id": task_id,
+                            "task_signature": task_signature,
+                            "group": "pa-project-a",
+                            "state": "Done",
+                            "enqueued_at": finished_at - 2,
+                            "started_at": finished_at - 1,
+                            "ended_at": finished_at,
+                            "exit_code": 0,
+                        },
+                    }),
+                    finished_at,
+                    finished_at,
+                )
+                .with_campaign_lineage(campaign_id, Some(experiment_id)),
+            )
+            .unwrap()
+            .event_id
+    }
+
+    fn with_due_decision(state: CampaignState) -> Self {
+        let harness = Self::new();
+        let campaign_id = harness.start_campaign();
+        harness.terminalize_campaign_experiment(
+            &campaign_id,
+            "scheduler-campaign-experiment",
+            41,
+            "scheduler-campaign-task-signature",
+            90,
+        );
+        let campaigns = CampaignRepository::new(&harness.db);
+        match state {
+            CampaignState::Active => {}
+            CampaignState::Paused => {
+                campaigns.pause("project-a", 91).unwrap();
+            }
+            CampaignState::Retired => {
+                campaigns.retire("project-a", 91).unwrap();
+            }
+            CampaignState::BudgetWaiting => {
+                for index in 0..6 {
+                    campaigns
+                        .reserve_agent_decision(
+                            &campaign_id,
+                            &format!("preexisting-decision-{index}"),
+                            &CampaignLimits::default(),
+                            harness.now,
+                        )
+                        .unwrap();
+                }
+                assert!(matches!(
+                    campaigns
+                        .reserve_agent_decision(
+                            &campaign_id,
+                            "budget-waiting-decision",
+                            &CampaignLimits::default(),
+                            harness.now,
+                        )
+                        .unwrap(),
+                    AgentDecisionReservation::BudgetWaiting { .. }
+                ));
+            }
+            state => panic!("unsupported due-decision fixture state: {state:?}"),
+        }
+        harness
+    }
+
+    fn with_two_terminal_campaign_experiments() -> Self {
+        let harness = Self::new();
+        let campaign_id = harness.start_campaign();
+        let oldest_experiment_id = harness.oldest_experiment_id();
+        harness.terminalize_campaign_experiment(
+            &campaign_id,
+            &oldest_experiment_id,
+            41,
+            "scheduler-campaign-oldest-task-signature",
+            80,
+        );
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Run a second terminal experiment".to_owned(),
+                source_experiment_id: Some(oldest_experiment_id),
+                argv: vec!["python".to_owned(), "train.py".to_owned(), "--second".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            "scheduler-campaign-objective-digest",
+        )
+        .unwrap();
+        let intent = CampaignRepository::new(&harness.db)
+            .accept_proposal(
+                &campaign_id,
+                "scheduler-campaign-second-proposal",
+                "scheduler-campaign-second-experiment",
+                "scheduler-campaign-second-submission",
+                &proposal,
+                &CampaignLimits::default(),
+                85,
+            )
+            .unwrap()
+            .accepted()
+            .unwrap();
+        harness.terminalize_campaign_experiment(
+            &campaign_id,
+            &intent.experiment.experiment_id,
+            42,
+            "scheduler-campaign-second-task-signature",
+            90,
+        );
+        harness
+    }
+
+    #[cfg(target_os = "linux")]
+    fn running_decision_attempts(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM decision_attempts WHERE state = ?1",
+                [DecisionAttemptState::Running],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pending_decision_cycles(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM decision_cycles WHERE state = ?1",
+                [DecisionCycleState::Pending],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn started_source_experiment_id(&self) -> String {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.source_experiment_id
+                 FROM decision_attempts da
+                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
+                 WHERE da.agent_run_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn agent_run_budget_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = 'scheduler-campaign' AND dimension = 'agent_run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn oldest_experiment_id(&self) -> String {
+        "scheduler-campaign-experiment".to_owned()
+    }
+
+    fn decision_attempt_source_experiment_id(&self) -> String {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.source_experiment_id
+                 FROM decision_attempts da
+                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
+                 ORDER BY da.created_at, da.cycle_id, da.attempt_number
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn agent_run_count(&self) -> u32 {
+        AgentRunRepository::new(&self.db)
+            .count_by_project("project-a")
+            .unwrap()
+    }
+
+    fn campaign_decision_event_id(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT event_id FROM events
+                 WHERE project_id = 'project-a' AND kind = 'campaign_decision'
+                 ORDER BY created_at, event_id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn disable_project(&self) {
+        ProjectRepository::new(&self.db)
+            .disable("project-a", self.now, &[])
+            .unwrap();
+    }
+
     fn queue_intervention(&self, message: &str) -> String {
         InterventionRepository::new(&self.db)
             .insert_pending("project-a", message, self.now)
@@ -590,6 +849,149 @@ max_agent_runs = 10
             )
             .unwrap()
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn scheduler_runs_only_the_oldest_campaign_decision_and_binds_one_attempt() {
+    let harness = SchedulerHarness::with_two_terminal_campaign_experiments();
+    let mut scheduler = harness.scheduler();
+
+    let report = scheduler.tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(harness.running_decision_attempts(), 1);
+    assert_eq!(harness.pending_decision_cycles(), 1);
+    assert_eq!(harness.agent_run_budget_count(), 1);
+    assert_eq!(
+        harness.started_source_experiment_id(),
+        harness.oldest_experiment_id()
+    );
+}
+
+#[tokio::test]
+async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decision_agent() {
+    for state in [
+        CampaignState::Paused,
+        CampaignState::Retired,
+        CampaignState::BudgetWaiting,
+    ] {
+        let harness = SchedulerHarness::with_due_decision(state);
+        let event_id = harness.campaign_decision_event_id();
+        let mut scheduler = harness.scheduler();
+        let report = scheduler.tick().await.unwrap();
+        assert!(report.started.is_empty());
+        assert_eq!(harness.agent_run_count(), 0);
+        assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    }
+    let disabled = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let event_id = disabled.campaign_decision_event_id();
+    disabled.disable_project();
+    let mut scheduler = disabled.scheduler();
+    assert!(scheduler.tick().await.unwrap().started.is_empty());
+    assert_eq!(disabled.agent_run_count(), 0);
+    assert_eq!(disabled.event_status(event_id), EventStatus::Pending);
+}
+
+#[tokio::test]
+async fn campaign_decision_precedes_generic_idle_work() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let idle_event_id = harness.enqueue_for_campaign(
+        EventKind::DeepCheck,
+        "idle-after-decision",
+        "scheduler-campaign",
+    );
+    let mut scheduler = harness.scheduler();
+
+    let report = scheduler.tick().await.unwrap();
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(report.started[0].mode, "campaign_decision");
+    #[cfg(not(target_os = "linux"))]
+    assert!(report.started.is_empty());
+    assert_eq!(harness.event_status(idle_event_id), EventStatus::Pending);
+}
+
+#[tokio::test]
+async fn campaign_agent_budget_decision_defers_until_the_absolute_wake_without_an_agent_run() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let campaign_id = "scheduler-campaign".to_owned();
+    let campaigns = CampaignRepository::new(&harness.db);
+    for index in 0..6 {
+        campaigns
+            .reserve_agent_decision(
+                &campaign_id,
+                &format!("occupied-agent-budget-{index}"),
+                &CampaignLimits::default(),
+                harness.now,
+            )
+            .unwrap();
+    }
+    let event_id = harness.campaign_decision_event_id();
+    let mut scheduler = harness.scheduler();
+
+    assert!(scheduler.tick().await.unwrap().started.is_empty());
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 3_700);
+    assert_eq!(harness.agent_run_count(), 0);
+}
+
+#[tokio::test]
+async fn campaign_decision_wait_is_not_due_before_its_absolute_wake() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let event_id = harness.campaign_decision_event_id();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles
+             SET state = 'waiting', next_wake_at = 500, updated_at = 91",
+            [],
+        )
+        .unwrap();
+    let mut scheduler = harness.scheduler();
+
+    assert!(scheduler.tick().await.unwrap().started.is_empty());
+
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 500);
+    assert_eq!(harness.agent_run_count(), 0);
+}
+
+#[tokio::test]
+async fn campaign_decision_claim_limit_still_admits_the_oldest_terminal_cycle_first() {
+    let harness = SchedulerHarness::with_two_terminal_campaign_experiments();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE experiments
+             SET finished_at = CASE experiment_id
+                 WHEN 'scheduler-campaign-experiment' THEN 90
+                 WHEN 'scheduler-campaign-second-experiment' THEN 80
+                 ELSE finished_at END",
+            [],
+        )
+        .unwrap();
+    let newer_event_id = harness.campaign_decision_event_id();
+    let mut first_scheduler = harness.scheduler_with_claim_limit(1);
+
+    assert!(first_scheduler.tick().await.unwrap().started.is_empty());
+
+    let deferred = harness.event(newer_event_id);
+    assert_eq!(deferred.status, EventStatus::RetryWait);
+    assert_eq!(deferred.not_before, 160);
+    let mut second_scheduler = harness.scheduler_with_claim_limit(1);
+    let _report = second_scheduler.tick().await.unwrap();
+    assert_eq!(
+        harness.decision_attempt_source_experiment_id(),
+        "scheduler-campaign-second-experiment"
+    );
 }
 
 #[test]
@@ -945,7 +1347,10 @@ async fn trusted_terminal_lineage_requeues_the_scheduler_drained_event_once() {
 
     let events = EventRepository::new(&harness.db)
         .recent_events("project-a", 10)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == EventKind::TaskFinished)
+        .collect::<Vec<_>>();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_id, drained_event_id);
     assert_eq!(events[0].status, EventStatus::Pending);
@@ -960,7 +1365,10 @@ async fn trusted_terminal_lineage_requeues_the_scheduler_drained_event_once() {
     assert_eq!(events[0].experiment_id.as_deref(), Some(experiment_id));
     let dispatchable = EventRepository::new(&harness.db)
         .claim_batch(103, 163, 10)
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == EventKind::TaskFinished)
+        .collect::<Vec<_>>();
     assert_eq!(dispatchable.len(), 1);
     assert_eq!(dispatchable[0].event_id, events[0].event_id);
 }

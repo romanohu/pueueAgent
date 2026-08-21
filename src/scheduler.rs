@@ -3,6 +3,7 @@ use std::{
     fmt,
 };
 
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -12,14 +13,19 @@ use crate::{
     config,
     db::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
-        InterventionRepository, ProjectRepository,
+        DecisionRepository, InterventionRepository, ProjectRepository,
+    },
+    decision_evidence::{
+        DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
     },
     execution_policy::CampaignLimits,
     guardrails::{DispatchDecision, Guardrails},
     interventions::{
         Intervention, InterventionReservation, InterventionStatus, MAX_INTERVENTIONS_PER_RUN,
     },
-    models::{Campaign, CampaignState, Event, EventKind, EventStatus, Project},
+    models::{
+        Campaign, CampaignState, DecisionCycleState, Event, EventKind, EventStatus, Project,
+    },
     output::bounded_redacted_text,
     retry::RetryPolicy,
     state, AppError,
@@ -240,17 +246,25 @@ impl Scheduler {
                 return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
                 continue;
             }
-            let (legacy_events, decision_event_ids) = partition_legacy_events(events);
-            events = legacy_events;
-            if !decision_event_ids.is_empty() {
-                return_scheduler_error!(
-                    EventRepository::new(&self.db).defer_claimed(&decision_event_ids)
-                );
-            }
             if events.is_empty() {
                 continue;
             }
             events.sort_by_key(|event| (event_priority(event.kind), event.event_id));
+            let dispatch_decision = events
+                .first()
+                .is_some_and(|event| event.kind == EventKind::CampaignDecision);
+            if !dispatch_decision {
+                let (legacy_events, decision_event_ids) = partition_legacy_events(events);
+                events = legacy_events;
+                if !decision_event_ids.is_empty() {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).defer_claimed(&decision_event_ids)
+                    );
+                }
+            }
+            if events.is_empty() {
+                continue;
+            }
             let mut event_ids = events
                 .iter()
                 .map(|event| event.event_id)
@@ -312,6 +326,12 @@ impl Scheduler {
             let project_policy = match self.runner.resolve_project_policy(&project, &project_config) {
                 Ok(policy) => policy,
                 Err(violation) => {
+                    if dispatch_decision {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
                     return_scheduler_error!(
                         EventRepository::new(&self.db).dead_letter_claimed_without_run(
                             &project.project_id,
@@ -326,23 +346,25 @@ impl Scheduler {
                     continue;
                 }
             };
-            if let Err(violation) = self.runner.preflight_project_launch(
-                &project_policy,
-                &project_config.agent,
-                "",
-            ) {
-                return_scheduler_error!(
-                    EventRepository::new(&self.db).dead_letter_claimed_without_run(
-                        &project.project_id,
-                        &event_ids,
-                        self.config.now,
-                        &violation,
-                    )
-                );
-                if first_error.is_none() {
-                    first_error = Some(violation.into());
+            if !dispatch_decision {
+                if let Err(violation) = self.runner.preflight_project_launch(
+                    &project_policy,
+                    &project_config.agent,
+                    "",
+                ) {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).dead_letter_claimed_without_run(
+                            &project.project_id,
+                            &event_ids,
+                            self.config.now,
+                            &violation,
+                        )
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(violation.into());
+                    }
+                    continue;
                 }
-                continue;
             }
             let effective_guardrails = match state::load_effective_guardrails(
                 &state::path(&project.root_path),
@@ -381,6 +403,13 @@ impl Scheduler {
                         }
                         return Err(SchedulerTickError::new(report, error));
                     }
+                    if dispatch_decision {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        report.paused.push(project.project_id);
+                        continue;
+                    }
                     return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
@@ -401,6 +430,13 @@ impl Scheduler {
                         }
                         return Err(SchedulerTickError::new(report, error));
                     }
+                    if dispatch_decision {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        report.halted.push(project.project_id);
+                        continue;
+                    }
                     return_scheduler_error!(EventRepository::new(&self.db).transition_many(
                         &event_ids,
                         EventStatus::Failed,
@@ -420,6 +456,12 @@ impl Scheduler {
                     continue;
                 }
                 Err(violation) => {
+                    if dispatch_decision {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
                     return_scheduler_error!(
                         EventRepository::new(&self.db).dead_letter_claimed_without_run(
                             &project.project_id,
@@ -441,6 +483,12 @@ impl Scheduler {
                     continue;
                 }
                 Err(violation) => {
+                    if dispatch_decision {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
                     return_scheduler_error!(
                         EventRepository::new(&self.db).dead_letter_claimed_without_run(
                             &project.project_id,
@@ -457,16 +505,25 @@ impl Scheduler {
                     continue;
                 }
             };
-            let project = match return_scheduler_error!(
-                ProjectRepository::new(&self.db).refresh_admission_authority(&project)
-            ) {
-                Some(project) => project,
-                None => {
+            let refreshed_project = ProjectRepository::new(&self.db)
+                .refresh_admission_authority(&project);
+            let project = match refreshed_project {
+                Err(AppError::Validation { .. }) if dispatch_decision => {
                     return_scheduler_error!(
                         EventRepository::new(&self.db).defer_claimed(&event_ids)
                     );
                     continue;
                 }
+                Err(error) => return Err(SchedulerTickError::new(report, error)),
+                Ok(project) => match project {
+                    Some(project) => project,
+                    None => {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
+                },
             };
             let locked_campaign = return_scheduler_error!(
                 CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
@@ -502,6 +559,12 @@ impl Scheduler {
             ) {
                 Ok(report) => report,
                 Err(violation) => {
+                    if dispatch_decision {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
                     return_scheduler_error!(
                         EventRepository::new(&self.db).dead_letter_claimed_without_run(
                             &project.project_id,
@@ -518,6 +581,227 @@ impl Scheduler {
                     continue;
                 }
             };
+            if dispatch_decision {
+                let Some(campaign) = campaign.as_ref() else {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).defer_claimed(&event_ids)
+                    );
+                    continue;
+                };
+                let due_cycle = return_scheduler_error!(
+                    DecisionRepository::new(&self.db).oldest_due_cycle_for_campaign(
+                        &project.project_id,
+                        &campaign.campaign_id,
+                        self.config.now,
+                    )
+                );
+                let Some(due_cycle) = due_cycle else {
+                    return_scheduler_error!(
+                        defer_unready_campaign_decisions(&self.db, &events, self.config.now)
+                    );
+                    continue;
+                };
+                let selected = events.iter().find(|event| {
+                    event.kind == EventKind::CampaignDecision
+                        && event.campaign_id.as_deref()
+                            == Some(due_cycle.campaign_id.as_str())
+                        && event.experiment_id.as_deref()
+                            == Some(due_cycle.source_experiment_id.as_str())
+                        && campaign_decision_cycle_id(event)
+                            == Some(due_cycle.cycle_id.as_str())
+                });
+                let Some(selected) = selected.cloned() else {
+                    let decision_event_ids = events
+                        .iter()
+                        .filter(|event| event.kind == EventKind::CampaignDecision)
+                        .map(|event| event.event_id)
+                        .collect::<Vec<_>>();
+                    let other_event_ids = events
+                        .iter()
+                        .filter(|event| event.kind != EventKind::CampaignDecision)
+                        .map(|event| event.event_id)
+                        .collect::<Vec<_>>();
+                    if !decision_event_ids.is_empty() {
+                        return_scheduler_error!(EventRepository::new(&self.db).transition_many(
+                            &decision_event_ids,
+                            EventStatus::RetryWait,
+                            self.config.now,
+                            Some(self.config.now + self.config.lease_seconds),
+                            None,
+                        ));
+                    }
+                    if !other_event_ids.is_empty() {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&other_event_ids)
+                        );
+                    }
+                    continue;
+                };
+                let reloaded = return_scheduler_error!(
+                    EventRepository::new(&self.db).find_by_id(selected.event_id)
+                );
+                let Some(selected) = reloaded.filter(|event| {
+                    event.status == EventStatus::Claimed
+                        && event.project_id == project.project_id
+                        && event.campaign_id.as_deref()
+                            == Some(due_cycle.campaign_id.as_str())
+                        && event.experiment_id.as_deref()
+                            == Some(due_cycle.source_experiment_id.as_str())
+                        && campaign_decision_cycle_id(event)
+                            == Some(due_cycle.cycle_id.as_str())
+                }) else {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).defer_claimed(&event_ids)
+                    );
+                    continue;
+                };
+                let deferred_event_ids = event_ids
+                    .iter()
+                    .copied()
+                    .filter(|event_id| *event_id != selected.event_id)
+                    .collect::<Vec<_>>();
+                if !deferred_event_ids.is_empty() {
+                    return_scheduler_error!(
+                        EventRepository::new(&self.db).defer_claimed(&deferred_event_ids)
+                    );
+                }
+                primary = selected;
+                event_ids = vec![primary.event_id];
+                let pueue_tasks = match campaign_decision_projection(&primary, &due_cycle.cycle_id) {
+                    Ok(projection) => [projection],
+                    Err(error) => {
+                        let message = bounded_redacted_text(&error.to_string());
+                        return_scheduler_error!(EventRepository::new(&self.db).transition_many(
+                            &event_ids,
+                            EventStatus::Failed,
+                            self.config.now,
+                            None,
+                            Some(&message),
+                        ));
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        continue;
+                    }
+                };
+                let decision_reservation = match DecisionRepository::new(&self.db)
+                    .reserve_next_attempt(
+                        &project.project_id,
+                        &due_cycle.cycle_id,
+                        self.config.now,
+                    )
+                {
+                    Ok(Some(reservation)) => reservation,
+                    Ok(None) | Err(AppError::Validation { .. }) => {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(SchedulerTickError::new(report, error)),
+                };
+                let context = return_scheduler_error!(DecisionEvidenceBuilder::new(&self.db).build(
+                    &DecisionEvidenceRequest {
+                        reservation: &decision_reservation,
+                        root_anchor: &project_policy.root_anchor,
+                        pueue_tasks: &pueue_tasks,
+                        observed_at: self.config.now,
+                    },
+                ));
+                match DecisionRepository::new(&self.db).store_evidence(
+                    &decision_reservation,
+                    &context.json,
+                    &context.digest,
+                    self.config.now,
+                ) {
+                    Ok(()) => {}
+                    Err(AppError::Validation { .. }) => {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(SchedulerTickError::new(report, error)),
+                }
+                let decision_key = decision_attempt_budget_key(&decision_reservation);
+                match return_scheduler_error!(CampaignRepository::new(&self.db)
+                    .reserve_agent_decision(
+                        &campaign.campaign_id,
+                        &decision_key,
+                        &self.campaign_limits,
+                        self.config.now,
+                    )) {
+                    AgentDecisionReservation::Reserved(_) => {}
+                    AgentDecisionReservation::BudgetWaiting { next_eligible_at } => {
+                        return_scheduler_error!(EventRepository::new(&self.db).transition_many(
+                            &event_ids,
+                            EventStatus::RetryWait,
+                            self.config.now,
+                            Some(next_eligible_at),
+                            None,
+                        ));
+                        continue;
+                    }
+                    AgentDecisionReservation::Deferred { .. } => {
+                        return_scheduler_error!(
+                            EventRepository::new(&self.db).defer_claimed(&event_ids)
+                        );
+                        continue;
+                    }
+                }
+                match self
+                    .runner
+                    .spawn_decision(
+                        &self.db,
+                        &project,
+                        &project_policy,
+                        &project_config.agent,
+                        retry_policy,
+                        primary.event_id,
+                        &event_ids,
+                        &decision_reservation,
+                        &context,
+                        self.config.now,
+                        run_id_guard,
+                        project_lock,
+                    )
+                    .await
+                {
+                    Ok(handle) => {
+                        report.started.push(StartedAgent {
+                            run_id: handle.run_id,
+                            primary_event_id: primary.event_id,
+                            mode: "campaign_decision".to_owned(),
+                            event_ids,
+                            prompt: String::new(),
+                            handle,
+                        });
+                    }
+                    Err(error) => {
+                        let AgentSpawnError {
+                            stage,
+                            source,
+                            cleanup,
+                            ..
+                        } = error;
+                        let retained_cleanup = cleanup.is_some();
+                        if let Some(cleanup) = cleanup {
+                            report.cleanup.push(cleanup);
+                        }
+                        if matches!(stage, AgentSpawnStage::PreBinding) && !retained_cleanup {
+                            return_scheduler_error!(
+                                EventRepository::new(&self.db).defer_claimed(&event_ids)
+                            );
+                            continue;
+                        }
+                        let unresolved_error = unresolved_spawn_error(stage, source);
+                        if first_error.is_none() {
+                            first_error = Some(unresolved_error);
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(mode) = legacy_dispatch_mode(primary.kind).map(str::to_owned) else {
                 return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
                 continue;
@@ -745,6 +1029,70 @@ fn agent_decision_key(events: &[Event]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn decision_attempt_budget_key(reservation: &crate::db::DecisionReservation) -> String {
+    format!(
+        "campaign-decision-attempt:v1:{}:{}",
+        reservation.cycle_id, reservation.attempt_number
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignDecisionPayload {
+    source: String,
+    cycle_id: String,
+    source_experiment_id: String,
+    terminal_observation: CampaignDecisionTerminalObservation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignDecisionTerminalObservation {
+    task_id: i64,
+    task_signature: String,
+    group: String,
+    state: String,
+    enqueued_at: Option<i64>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    exit_code: Option<i32>,
+}
+
+fn campaign_decision_cycle_id(event: &Event) -> Option<&str> {
+    event.payload.get("cycle_id")?.as_str()
+}
+
+fn campaign_decision_projection(
+    event: &Event,
+    expected_cycle_id: &str,
+) -> Result<DecisionPueueTaskProjection, AppError> {
+    let payload: CampaignDecisionPayload = serde_json::from_value(event.payload.clone()).map_err(
+        |source| AppError::Serialization {
+            operation: "parse campaign decision event projection",
+            source,
+        },
+    )?;
+    if payload.source != "terminal_experiment"
+        || Some(payload.source_experiment_id.as_str()) != event.experiment_id.as_deref()
+        || payload.cycle_id != expected_cycle_id
+    {
+        return Err(AppError::Validation {
+            field: "campaign_decision",
+            message: "must carry the exact terminal experiment and decision cycle projection",
+        });
+    }
+    Ok(DecisionPueueTaskProjection {
+        task_id: payload.terminal_observation.task_id,
+        task_signature: payload.terminal_observation.task_signature,
+        group: payload.terminal_observation.group,
+        state: payload.terminal_observation.state,
+        enqueued_at: payload.terminal_observation.enqueued_at,
+        started_at: payload.terminal_observation.started_at,
+        ended_at: payload.terminal_observation.ended_at,
+        exit_code: payload.terminal_observation.exit_code,
+    })
+}
+
 fn unresolved_spawn_error(stage: AgentSpawnStage, source: AppError) -> AppError {
     let signal = match stage {
         AgentSpawnStage::RunBoundPreMarker {
@@ -785,6 +1133,56 @@ fn group_by_project(events: Vec<Event>) -> BTreeMap<String, Vec<Event>> {
     grouped
 }
 
+fn defer_unready_campaign_decisions(
+    db: &Db,
+    events: &[Event],
+    now: i64,
+) -> Result<(), AppError> {
+    let event_repository = EventRepository::new(db);
+    let decisions = DecisionRepository::new(db);
+    let mut deferred = Vec::new();
+    for event in events {
+        if event.kind != EventKind::CampaignDecision {
+            deferred.push(event.event_id);
+            continue;
+        }
+        let Some(event) = event_repository.find_by_id(event.event_id)? else {
+            continue;
+        };
+        let Some(campaign_id) = event.campaign_id.as_deref() else {
+            deferred.push(event.event_id);
+            continue;
+        };
+        let Some(experiment_id) = event.experiment_id.as_deref() else {
+            deferred.push(event.event_id);
+            continue;
+        };
+        let cycle = decisions.find_cycle_for_source(campaign_id, experiment_id)?;
+        let wake = cycle.as_ref().and_then(|cycle| {
+            (cycle.state == DecisionCycleState::Waiting
+                && campaign_decision_cycle_id(&event) == Some(cycle.cycle_id.as_str()))
+            .then_some(cycle.next_wake_at)
+            .flatten()
+            .filter(|next_wake_at| *next_wake_at > now)
+        });
+        if let Some(next_wake_at) = wake {
+            event_repository.transition_many(
+                &[event.event_id],
+                EventStatus::RetryWait,
+                now,
+                Some(next_wake_at),
+                None,
+            )?;
+        } else {
+            deferred.push(event.event_id);
+        }
+    }
+    if !deferred.is_empty() {
+        event_repository.defer_claimed(&deferred)?;
+    }
+    Ok(())
+}
+
 fn partition_legacy_events(events: Vec<Event>) -> (Vec<Event>, Vec<i64>) {
     let mut legacy = Vec::with_capacity(events.len());
     let mut campaign_decisions = Vec::new();
@@ -805,10 +1203,9 @@ fn event_priority(kind: EventKind) -> u8 {
         | EventKind::AutoKilled
         | EventKind::TerminationFailed => 0,
         EventKind::Stalled => 1,
-        EventKind::TaskFinished => 2,
-        EventKind::OperatorWake => 2,
         EventKind::CampaignDecision => 2,
-        EventKind::DeepCheck => 3,
+        EventKind::TaskFinished | EventKind::OperatorWake => 3,
+        EventKind::DeepCheck => 4,
     }
 }
 
@@ -856,13 +1253,17 @@ fn gate_campaign_events(
             _ => None,
         };
         if let Some(reason) = lineage_error {
-            repository.transition_many(
-                &[event.event_id],
-                EventStatus::Completed,
-                now,
-                None,
-                Some(reason),
-            )?;
+            if event.kind == EventKind::CampaignDecision {
+                repository.defer_claimed(&[event.event_id])?;
+            } else {
+                repository.transition_many(
+                    &[event.event_id],
+                    EventStatus::Completed,
+                    now,
+                    None,
+                    Some(reason),
+                )?;
+            }
         } else {
             eligible.push(event);
         }

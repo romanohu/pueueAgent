@@ -237,6 +237,70 @@ impl Harness {
         experiment_id
     }
 
+    async fn reconcile_task(&self, task: PueueTask) {
+        Reconciler::new(&self.db, FakePueue::with_tasks(vec![task]))
+            .run_once_at(200)
+            .await
+            .unwrap();
+    }
+
+    fn decision_cycle_count(&self, experiment_id: &str) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM decision_cycles dc
+                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                 JOIN experiments e
+                   ON e.experiment_id = dc.source_experiment_id
+                  AND e.campaign_id = dc.campaign_id
+                 WHERE c.project_id = ?1 AND e.experiment_id = ?2",
+                rusqlite::params!["project-a", experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn decision_event_count(&self, experiment_id: &str) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM events ev
+                 JOIN experiments e
+                   ON e.experiment_id = ev.experiment_id
+                  AND e.campaign_id = ev.campaign_id
+                 JOIN campaigns c ON c.campaign_id = e.campaign_id
+                 WHERE c.project_id = ?1
+                   AND e.experiment_id = ?2
+                   AND ev.kind = 'campaign_decision'",
+                rusqlite::params!["project-a", experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn terminal_event_precedes_decision(&self, experiment_id: &str) -> bool {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT terminal.event_id < decision.event_id
+                 FROM events terminal
+                 JOIN events decision
+                   ON decision.campaign_id = terminal.campaign_id
+                  AND decision.experiment_id = terminal.experiment_id
+                  AND decision.kind = 'campaign_decision'
+                 WHERE terminal.experiment_id = ?1
+                   AND terminal.kind IN ('task_finished','task_failed')",
+                [experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn set_event_status(&self, event_id: i64, status: EventStatus) {
         let lease_until = if status == EventStatus::Claimed {
             Some(10_000)
@@ -291,6 +355,68 @@ fn terminal_task(id: i64, enqueue: &str, result: serde_json::Value) -> PueueTask
         ended_at: Some(enqueue.to_owned()),
         result: Some(result),
     }
+}
+
+#[tokio::test]
+async fn terminal_success_and_failure_each_create_one_decision_cycle_event() {
+    for terminal in ["Done", "Failed"] {
+        let harness = Harness::new();
+        let experiment_id =
+            harness.accepted_campaign_experiment_at(41, "2026-08-21T00:00:00Z");
+        let task = terminal_task(
+            41,
+            "2026-08-21T00:00:00Z",
+            serde_json::json!(terminal),
+        );
+
+        harness.reconcile_task(task.clone()).await;
+        harness.reconcile_task(task).await;
+
+        assert_eq!(harness.decision_cycle_count(&experiment_id), 1);
+        assert_eq!(harness.decision_event_count(&experiment_id), 1);
+        assert!(harness.terminal_event_precedes_decision(&experiment_id));
+    }
+}
+
+#[tokio::test]
+async fn unlineaged_terminal_task_does_not_create_a_decision_cycle() {
+    let harness = Harness::new();
+
+    harness
+        .reconcile_task(terminal_task(41, "100", json!("Success")))
+        .await;
+
+    assert_eq!(harness.pending_event_count(EventKind::CampaignDecision), 0);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM decision_cycles", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unreconciled_campaign_experiment_does_not_create_a_decision_cycle() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+
+    harness
+        .reconcile_task(terminal_task(41, "200", json!({"Failed": 17})))
+        .await;
+
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
+    assert_eq!(harness.decision_cycle_count(&experiment_id), 0);
+    assert_eq!(harness.decision_event_count(&experiment_id), 0);
 }
 
 #[test]
@@ -500,7 +626,7 @@ async fn accepted_managed_identity_upgrades_an_existing_unlineaged_terminal_even
         .connect()
         .unwrap()
         .query_row(
-            "SELECT campaign_id, experiment_id FROM events",
+            "SELECT campaign_id, experiment_id FROM events WHERE kind = 'task_failed'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -522,14 +648,14 @@ async fn accepted_managed_identity_upgrades_an_existing_unlineaged_terminal_even
         .connect()
         .unwrap()
         .query_row(
-            "SELECT campaign_id, experiment_id FROM events",
+            "SELECT campaign_id, experiment_id FROM events WHERE kind = 'task_failed'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(after.0.as_deref(), Some("campaign-reconciliation"));
     assert_eq!(after.1.as_deref(), Some(experiment_id.as_str()));
-    assert_eq!(harness.event_count(), 1);
+    assert_eq!(harness.pending_event_count(EventKind::TaskFailed), 1);
     assert_eq!(
         experiments
             .find_by_id(&experiment_id)
