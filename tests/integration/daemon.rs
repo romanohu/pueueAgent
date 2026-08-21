@@ -28,6 +28,7 @@ use pueue_agent::{
     pueue::{PueueApi, PueueTask},
     AppError,
 };
+use sha2::{Digest, Sha256};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -672,29 +673,113 @@ async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_
         .reserve_next_attempt("project-a", &cycle.cycle_id, 170)
         .unwrap()
         .unwrap();
-    decisions
-        .store_evidence(&reservation, "{}", "context-digest", 171)
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_by_id("daemon-campaign")
+        .unwrap()
         .unwrap();
-    let event_id = harness.enqueue(
-        EventKind::CampaignDecision,
+    let source = experiments.find_by_id(&experiment_id).unwrap().unwrap();
+    let context_json = json!({
+        "schema_version": 1,
+        "objective": {
+            "text": campaign.objective_text,
+            "digest": campaign.objective_digest,
+        },
+        "source_experiment": {
+            "experiment_id": source.experiment_id,
+            "proposal_id": source.proposal_id,
+            "proposal_kind": "experiment",
+            "status": source.status,
+            "attempt": source.attempt,
+            "command_digest": "daemon-decision-command-digest",
+            "failure_code": source.failure_code,
+            "failure_fingerprint": source.failure_fingerprint,
+            "created_at": source.created_at,
+            "updated_at": source.updated_at,
+            "finished_at": source.finished_at,
+        },
+        "terminal_observation": {
+            "task_id": source.pueue_task_id,
+            "task_signature": source.task_signature,
+            "state": "succeeded",
+            "enqueued_at": 110,
+            "started_at": 120,
+            "ended_at": 150,
+            "exit_code": 0,
+        },
+        "recent_outcomes": {"proposals": [], "experiments": []},
+        "budgets": {
+            "campaign_state": campaign.state,
+            "next_eligible_at": null,
+            "rolling_usage": {},
+            "experiment_counts": {},
+        },
+        "intervention": {"pending": []},
+        "artifact_hints": [],
+    })
+    .to_string();
+    let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+    decisions
+        .store_evidence(&reservation, &context_json, &context_digest, 171)
+        .unwrap();
+    let event = NewEvent::new(
         "project-a",
-        "decision-recovery-terminal-agent",
-    );
+        EventKind::CampaignDecision,
+        format!("campaign-decision:v1:{}", cycle.cycle_id),
+        json!({
+            "source": "terminal_experiment",
+            "cycle_id": cycle.cycle_id,
+            "source_experiment_id": experiment_id,
+        }),
+        172,
+        172,
+    )
+    .with_campaign_lineage("daemon-campaign", Some(experiment_id.clone()));
+    let (_, event) = decisions
+        .publish_terminal_cycle_event("daemon-campaign", &experiment_id, &event, 172)
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .claim_batch(172, 232, 1)
+        .unwrap()
+        .into_iter()
+        .find(|claimed| claimed.event_id == event.event_id)
+        .expect("exact campaign decision event must be claimed");
+    let run_id = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::with_context(
+                "project-a",
+                event.event_id,
+                Some(42_424),
+                AgentRunStatus::Running,
+                173,
+                harness.registered_root("project-a").join(format!(
+                    ".pueue-agent/logs/agent-173-{}.log",
+                    event.event_id
+                )),
+                AgentContextMode::Fresh,
+                None,
+                vec![cycle.cycle_id.clone()],
+            ),
+            &[event.event_id],
+        )
+        .unwrap()
+        .run_id;
+    decisions
+        .bind_agent_run(&reservation, run_id, 173)
+        .unwrap();
     harness
         .db
         .connect()
         .unwrap()
-        .execute(
-            "UPDATE events SET status = 'completed', completed_at = 172 WHERE event_id = ?1",
-            [event_id],
-        )
-        .unwrap();
-    let run_id = harness.insert_active_run("project-a", event_id, AgentRunStatus::Running);
-    decisions
-        .bind_agent_run(&reservation, run_id, 173)
+        .execute_batch(&format!(
+            "CREATE TRIGGER keep_recovered_decision_pending
+             BEFORE UPDATE OF status ON events
+             WHEN OLD.event_id = {} AND OLD.status = 'pending' AND NEW.status = 'claimed'
+             BEGIN SELECT RAISE(IGNORE); END;",
+            event.event_id
+        ))
         .unwrap();
 
-    harness.restart_at(200).await.unwrap();
+    let report = harness.restart_at(200).await.unwrap();
 
     let (attempt_state, failure_code): (DecisionAttemptState, Option<String>) = harness
         .db
@@ -709,6 +794,7 @@ async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_
         .unwrap();
     assert_eq!(attempt_state, DecisionAttemptState::Failed);
     assert_eq!(failure_code.as_deref(), Some("decision_missing"));
+    assert_eq!(report.decision_recovery.missing, 1);
     assert_eq!(
         DecisionRepository::new(&harness.db)
             .find_cycle_for_source("daemon-campaign", &experiment_id)
@@ -716,6 +802,19 @@ async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_
             .unwrap()
             .state,
         DecisionCycleState::Pending
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, attempts FROM events WHERE event_id = ?1",
+                [event.event_id],
+                |row| Ok((row.get::<_, EventStatus>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        (EventStatus::Pending, 0)
     );
     assert_eq!(harness.agent_run_count(), 1);
 }

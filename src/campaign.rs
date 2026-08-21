@@ -177,7 +177,7 @@ pub(crate) struct CampaignAdmission {
 
 pub(crate) struct AdmittedCampaignProposal {
     pub(crate) intent: ManagedSubmissionIntent,
-    pub(crate) newly_accepted: bool,
+    pub(crate) matches_requested_intent: bool,
     admission: CampaignAdmission,
 }
 
@@ -305,10 +305,10 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             now,
         )? {
             ProposalAcceptance::Accepted(intent) => {
-                let newly_accepted = intent.proposal.proposal_id == proposal_id;
+                let matches_requested_intent = intent.proposal.proposal_id == proposal_id;
                 Ok(Some(AdmittedCampaignProposal {
                     intent,
-                    newly_accepted,
+                    matches_requested_intent,
                     admission,
                 }))
             }

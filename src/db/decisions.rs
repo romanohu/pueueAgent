@@ -56,6 +56,9 @@ pub struct DecisionRecovery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadyDecision {
     pub(crate) reservation: DecisionReservation,
+    pub(crate) context_schema_version: Option<i64>,
+    pub(crate) context_json: Option<String>,
+    pub(crate) context_digest: Option<String>,
     pub(crate) decision_json: String,
     pub(crate) decision_digest: String,
     pub(crate) decision_kind: String,
@@ -1360,7 +1363,8 @@ impl<'db> DecisionRepository<'db> {
         let mut statement = connection
             .prepare(
                 "SELECT da.cycle_id, dc.campaign_id, dc.source_experiment_id,
-                        da.attempt_number, da.created_at, da.decision_json,
+                        da.attempt_number, da.created_at, da.context_schema_version,
+                        da.context_json, da.context_digest, da.decision_json,
                         da.decision_digest, da.decision_kind
                  FROM decision_attempts da
                  JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
@@ -1384,9 +1388,12 @@ impl<'db> DecisionRepository<'db> {
                         attempt_number: row.get(3)?,
                         created_at: row.get(4)?,
                     },
-                    decision_json: row.get(5)?,
-                    decision_digest: row.get(6)?,
-                    decision_kind: row.get(7)?,
+                    context_schema_version: row.get(5)?,
+                    context_json: row.get(6)?,
+                    context_digest: row.get(7)?,
+                    decision_json: row.get(8)?,
+                    decision_digest: row.get(9)?,
+                    decision_kind: row.get(10)?,
                 })
             })
             .map_err(database_error("query ready decisions"))?

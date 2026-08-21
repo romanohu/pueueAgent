@@ -46,6 +46,7 @@ use pueue_agent::{
     campaign::CampaignCoordinator,
     daemon::{Daemon, DaemonConfig},
     decision::DecisionCoordinator,
+    decision_evidence::MAX_DECISION_CONTEXT_BYTES,
     decision_protocol::parse_and_validate_decision,
     db::{
         AgentRunRepository, BatchRepository, CampaignRepository, Db, DecisionRepository,
@@ -54,9 +55,10 @@ use pueue_agent::{
     },
     execution_policy::{CampaignLimits, ProjectRootAnchor},
     models::{
-        AgentRunStatus, CampaignState, EventKind, EventStatus, ExperimentStatus,
-        ExperimentTerminalOutcome, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
-        ProposalKind, Submission, SubmissionKind, SubmissionStatus,
+        AgentRunStatus, CampaignState, DecisionAttemptState, DecisionCycleState, EventKind,
+        EventStatus, ExperimentStatus, ExperimentTerminalOutcome, NewAgentRun, NewBatchJob,
+        NewBatchRequest, NewEvent, NewProject, ProposalKind, Submission, SubmissionKind,
+        SubmissionStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{configured_pueue, validate_add_argv, PueueApi, PueueError, PueueTask, PUEUE_TIMEOUT},
@@ -72,6 +74,7 @@ use pueue_agent::execution_policy::{
     load_or_create_policy, PolicyLoadInput, PolicyViolation, PolicyViolationCode,
     PolicyViolationStage, StartupEnvironment,
 };
+use sha2::{Digest, Sha256};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -1130,6 +1133,7 @@ fn expected_provisional_signature(group: &str, task_id: i64, submission_id: &str
 
 #[derive(Clone, Copy)]
 enum DecisionFailpoint {
+    AfterIntentAcceptBeforeDecisionComplete,
     AfterDecisionCommit,
     AfterPueueAdd,
 }
@@ -1167,7 +1171,14 @@ impl DecisionHarness {
     }
 
     fn with_ready_repair(fingerprint: Option<&str>) -> Self {
-        let mut harness = Self::with_terminal_source(ExperimentStatus::Failed, fingerprint);
+        Self::with_ready_repair_source(ExperimentStatus::Failed, fingerprint)
+    }
+
+    fn with_ready_repair_source(
+        status: ExperimentStatus,
+        fingerprint: Option<&str>,
+    ) -> Self {
+        let mut harness = Self::with_terminal_source(status, fingerprint);
         let decision = json!({
             "schema_version": 1,
             "decision": "proposal",
@@ -1317,15 +1328,13 @@ max_experiments = 20
         experiments
             .project_terminal_submission(&source_experiment_id, 40, outcome, 150)
             .unwrap();
-        if status == ExperimentStatus::Failed && trusted_failure_fingerprint.is_none() {
-            db.connect()
-                .unwrap()
-                .execute(
-                    "UPDATE experiments SET failure_fingerprint = NULL WHERE experiment_id = ?1",
-                    [&source_experiment_id],
-                )
-                .unwrap();
-        }
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET failure_fingerprint = ?1 WHERE experiment_id = ?2",
+                rusqlite::params![trusted_failure_fingerprint, source_experiment_id],
+            )
+            .unwrap();
         let cycle_id = DecisionRepository::new(&db)
             .ensure_cycle_for_terminal(&campaign_id, &source_experiment_id, 160)
             .unwrap()
@@ -1348,8 +1357,10 @@ max_experiments = 20
             .reserve_next_attempt("decision-project", &self.cycle_id, now)
             .unwrap()
             .unwrap();
+        let context_json = self.valid_decision_context_json();
+        let context_digest = digest_text(&context_json);
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", now + 1)
+            .store_evidence(&reservation, &context_json, &context_digest, now + 1)
             .unwrap();
         let event = EventRepository::new(&self.db)
             .insert_idempotent(&NewEvent::new(
@@ -1402,6 +1413,97 @@ max_experiments = 20
             .unwrap()
             .unwrap()
             .objective_digest
+    }
+
+    fn valid_decision_context_json(&self) -> String {
+        let campaign = CampaignRepository::new(&self.db)
+            .find_by_id(&self.campaign_id)
+            .unwrap()
+            .unwrap();
+        let source = ExperimentRepository::new(&self.db)
+            .find_by_id(&self.source_experiment_id)
+            .unwrap()
+            .unwrap();
+        json!({
+            "schema_version": 1,
+            "objective": {
+                "text": campaign.objective_text,
+                "digest": campaign.objective_digest,
+            },
+            "source_experiment": {
+                "experiment_id": source.experiment_id,
+                "proposal_id": source.proposal_id,
+                "proposal_kind": "experiment",
+                "status": source.status,
+                "attempt": source.attempt,
+                "command_digest": "decision-source-command-digest",
+                "failure_code": source.failure_code,
+                "failure_fingerprint": source.failure_fingerprint,
+                "created_at": source.created_at,
+                "updated_at": source.updated_at,
+                "finished_at": source.finished_at,
+            },
+            "terminal_observation": {
+                "task_id": source.pueue_task_id,
+                "task_signature": source.task_signature,
+                "state": source.status.as_str(),
+                "enqueued_at": 110,
+                "started_at": 120,
+                "ended_at": 150,
+                "exit_code": 0,
+            },
+            "recent_outcomes": {"proposals": [], "experiments": []},
+            "budgets": {
+                "campaign_state": campaign.state,
+                "next_eligible_at": null,
+                "rolling_usage": {},
+                "experiment_counts": {},
+            },
+            "intervention": {"pending": []},
+            "artifact_hints": [],
+        })
+        .to_string()
+    }
+
+    fn overwrite_decision_context(
+        &self,
+        context_schema_version: i64,
+        context_json: &str,
+        context_digest: &str,
+    ) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET context_schema_version = ?1, context_json = ?2, context_digest = ?3
+                 WHERE cycle_id = ?4 AND attempt_number = (
+                     SELECT MAX(attempt_number) FROM decision_attempts WHERE cycle_id = ?4
+                 )",
+                rusqlite::params![
+                    context_schema_version,
+                    context_json,
+                    context_digest,
+                    self.cycle_id,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn decision_states(&self) -> (DecisionCycleState, DecisionAttemptState) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.state, da.state
+                 FROM decision_cycles dc
+                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                 WHERE dc.cycle_id = ?1
+                 ORDER BY da.attempt_number DESC LIMIT 1",
+                [&self.cycle_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
     }
 
     fn coordinator(&self) -> DecisionCoordinator<'_, CountingFakePueue> {
@@ -1480,6 +1582,12 @@ max_experiments = 20
 
     fn enable_failpoint(&self, failpoint: DecisionFailpoint) {
         let sql = match failpoint {
+            DecisionFailpoint::AfterIntentAcceptBeforeDecisionComplete => {
+                "CREATE TRIGGER decision_fail_before_cycle_completion
+                 BEFORE UPDATE OF state ON decision_cycles
+                 WHEN OLD.state = 'analyzing' AND NEW.state = 'completed'
+                 BEGIN SELECT RAISE(ABORT, 'injected before decision cycle completion'); END;"
+            }
             DecisionFailpoint::AfterDecisionCommit => {
                 "CREATE TRIGGER decision_fail_after_commit
                  BEFORE UPDATE OF status ON experiments
@@ -1501,7 +1609,8 @@ max_experiments = 20
             .connect()
             .unwrap()
             .execute_batch(
-                "DROP TRIGGER IF EXISTS decision_fail_after_commit;
+                "DROP TRIGGER IF EXISTS decision_fail_before_cycle_completion;
+                 DROP TRIGGER IF EXISTS decision_fail_after_commit;
                  DROP TRIGGER IF EXISTS decision_fail_after_pueue_add;",
             )
             .unwrap();
@@ -1603,6 +1712,10 @@ max_experiments = 20
     }
 }
 
+fn digest_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 #[tokio::test]
 async fn successful_terminal_decision_adds_exactly_one_next_experiment() {
     let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
@@ -1631,18 +1744,114 @@ async fn failed_terminal_decision_allows_trusted_repair_and_rejects_untrusted_re
     assert_eq!(trusted.pueue.add_calls(), 1);
 
     let untrusted = DecisionHarness::with_ready_repair(None);
-    assert!(matches!(
-        untrusted
-            .coordinator()
-            .apply_ready(300, 10)
-            .await
-            .unwrap_err(),
-        AppError::Validation {
-            field: "source_experiment_id",
-            ..
-        }
-    ));
+    let report = untrusted.coordinator().apply_ready(300, 10).await.unwrap();
+    assert_eq!(report.proposals_applied, 0);
     assert_eq!(untrusted.pueue.add_calls(), 0);
+    assert_eq!(
+        untrusted.decision_states(),
+        (DecisionCycleState::Pending, DecisionAttemptState::Failed)
+    );
+}
+
+#[tokio::test]
+async fn repair_decision_rejects_nonfailed_sources_even_with_a_stale_fingerprint() {
+    for status in [ExperimentStatus::Succeeded, ExperimentStatus::Cancelled] {
+        let harness =
+            DecisionHarness::with_ready_repair_source(status, Some("stale-fingerprint"));
+
+        let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
+
+        assert_eq!(report.proposals_applied, 0);
+        assert_eq!(harness.pueue.add_calls(), 0);
+        assert_eq!(harness.child_experiment_count(), 0);
+        assert_eq!(
+            harness.decision_states(),
+            (DecisionCycleState::Pending, DecisionAttemptState::Failed)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn decision_application_rejects_tampered_context_before_project_admission() {
+    let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
+    let original = harness.valid_decision_context_json();
+    harness.overwrite_decision_context(1, &format!("{original} "), &digest_text(&original));
+    let guard = fs::File::open(&harness.root).unwrap();
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    assert_eq!(unsafe { flock(guard.as_raw_fd(), 2) }, 0);
+
+    let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
+
+    assert_eq!(report.deferred, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+    assert_eq!(harness.child_experiment_count(), 0);
+    assert_eq!(
+        harness.decision_states(),
+        (DecisionCycleState::Pending, DecisionAttemptState::Failed)
+    );
+}
+
+#[tokio::test]
+async fn decision_application_rejects_context_schema_bound_and_lineage_mutations() {
+    for mutation in [
+        "attempt-schema",
+        "embedded-schema",
+        "objective",
+        "source",
+        "unknown-field",
+        "oversize",
+    ] {
+        let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
+        let mut context: serde_json::Value =
+            serde_json::from_str(&harness.valid_decision_context_json()).unwrap();
+        let attempt_schema = match mutation {
+            "attempt-schema" => 2,
+            "embedded-schema" => {
+                context["schema_version"] = json!(2);
+                1
+            }
+            "objective" => {
+                context["objective"]["digest"] = json!("stale-objective-digest");
+                1
+            }
+            "source" => {
+                context["source_experiment"]["experiment_id"] =
+                    json!("different-source-experiment");
+                1
+            }
+            "unknown-field" => {
+                context["unknown"] = json!(true);
+                1
+            }
+            "oversize" => 1,
+            _ => unreachable!(),
+        };
+        let context_json = if mutation == "oversize" {
+            "x".repeat(MAX_DECISION_CONTEXT_BYTES + 1)
+        } else {
+            context.to_string()
+        };
+        harness.overwrite_decision_context(
+            attempt_schema,
+            &context_json,
+            &digest_text(&context_json),
+        );
+
+        let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
+
+        assert_eq!(report.proposals_applied, 0, "mutation={mutation}");
+        assert_eq!(harness.pueue.add_calls(), 0, "mutation={mutation}");
+        assert_eq!(harness.child_experiment_count(), 0, "mutation={mutation}");
+        assert_eq!(
+            harness.decision_states(),
+            (DecisionCycleState::Pending, DecisionAttemptState::Failed),
+            "mutation={mutation}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1721,17 +1930,47 @@ async fn restart_after_decision_or_pueue_add_never_duplicates_the_external_add()
 }
 
 #[tokio::test]
-async fn code_change_decision_is_rejected_before_submission() {
-    let harness = DecisionHarness::with_ready_code_change();
+async fn same_decision_attempt_replays_its_exact_accepted_intent_after_interruption() {
+    let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
+    harness.enable_failpoint(DecisionFailpoint::AfterIntentAcceptBeforeDecisionComplete);
 
     assert!(harness.coordinator().apply_ready(300, 10).await.is_err());
-
+    assert_eq!(
+        harness.decision_states(),
+        (DecisionCycleState::Analyzing, DecisionAttemptState::Decided)
+    );
+    assert_eq!(harness.child_experiment_count(), 1);
     assert_eq!(harness.pueue.add_calls(), 0);
-    assert_eq!(harness.child_experiment_count(), 0);
+    harness.disable_failpoints();
+
+    let replay = harness.coordinator().apply_ready(301, 10).await.unwrap();
+
+    assert_eq!(replay.proposals_applied, 1);
+    assert_eq!(
+        harness.decision_states(),
+        (DecisionCycleState::Completed, DecisionAttemptState::Decided)
+    );
+    assert_eq!(harness.child_experiment_count(), 1);
+    assert_eq!(harness.pueue.add_calls(), 1);
 }
 
 #[tokio::test]
-async fn duplicate_proposal_decision_digest_does_not_add_another_task() {
+async fn code_change_decision_is_rejected_before_submission() {
+    let harness = DecisionHarness::with_ready_code_change();
+
+    let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
+
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+    assert_eq!(harness.child_experiment_count(), 0);
+    assert_eq!(
+        harness.decision_states(),
+        (DecisionCycleState::Pending, DecisionAttemptState::Failed)
+    );
+}
+
+#[tokio::test]
+async fn duplicate_proposal_from_a_different_decision_attempt_is_rejected_for_fresh_context() {
     let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
     harness.persist_duplicate_as_terminal();
 
@@ -1740,6 +1979,10 @@ async fn duplicate_proposal_decision_digest_does_not_add_another_task() {
     assert_eq!(report.proposals_applied, 0);
     assert_eq!(harness.pueue.add_calls(), 0);
     assert_eq!(harness.child_experiment_count(), 1);
+    assert_eq!(
+        harness.decision_states(),
+        (DecisionCycleState::Pending, DecisionAttemptState::Failed)
+    );
 }
 
 #[tokio::test]
@@ -1747,7 +1990,8 @@ async fn three_consecutive_invalid_decision_attempts_degrade_the_campaign() {
     let harness = DecisionHarness::with_ready_code_change();
 
     for now in [300, 400, 500] {
-        assert!(harness.coordinator().apply_ready(now, 10).await.is_err());
+        let report = harness.coordinator().apply_ready(now, 10).await.unwrap();
+        assert_eq!(report.degraded, usize::from(now == 500));
         if now != 500 {
             harness.persist_ready_decision(&harness.code_change_decision(), "proposal", now + 10);
         }

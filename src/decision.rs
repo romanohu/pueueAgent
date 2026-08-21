@@ -1,14 +1,18 @@
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
 use crate::{
     campaign::{CampaignCoordinator, CampaignSubmission},
     db::{
-        CampaignRepository, DecisionRepository, ExperimentRepository, ProjectRepository,
-        ReadyDecision,
+        CampaignRepository, DecisionRepository, DecisionReservation, ExperimentRepository,
+        ProjectRepository, ReadyDecision,
     },
+    decision_evidence::{validate_stored_decision_context, DECISION_CONTEXT_SCHEMA_VERSION},
     decision_protocol::{ValidatedDecision, parse_and_validate_decision},
     execution_policy::{CampaignLimits, ResolvedExecutionPolicy},
-    models::{AgentRunStatus, CampaignState, DecisionAttemptState, ExperimentStatus},
+    models::{
+        AgentRunStatus, CampaignState, DecisionAttemptState, DecisionCycleState, ExperimentStatus,
+        ProposalKind,
+    },
     pueue::PueueApi,
     AppError,
 };
@@ -162,16 +166,17 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                 self.limits,
             ) {
                 Ok(decision) => decision,
-                Err(error) => {
-                    repository.reject_decision(
+                Err(_) => {
+                    record_rejection(
+                        &mut report,
+                        &repository,
                         &stored.reservation.cycle_id,
                         stored.reservation.attempt_number,
-                        "decision_rejected",
                         "persisted decision failed application validation",
                         self.limits,
                         now,
                     )?;
-                    return Err(error);
+                    continue;
                 }
             };
             let coordinator = match self.policy {
@@ -220,9 +225,9 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                     report.waits_scheduled += 1;
                 }
                 ValidatedDecision::Proposal(proposal) => {
-                    let proposal_id = Uuid::new_v4().to_string();
-                    let experiment_id = Uuid::new_v4().to_string();
-                    let submission_id = Uuid::new_v4().to_string();
+                    let proposal_id = decision_resource_id("proposal", &stored.reservation);
+                    let experiment_id = decision_resource_id("experiment", &stored.reservation);
+                    let submission_id = decision_resource_id("submission", &stored.reservation);
                     let admitted = match coordinator.admit_proposal(
                         &project,
                         &campaign.campaign_id,
@@ -243,19 +248,32 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                             report.deferred += 1;
                             continue;
                         }
-                        Err(error) => {
-                            repository.reject_decision(
+                        Err(AppError::Validation { .. }) => {
+                            record_rejection(
+                                &mut report,
+                                &repository,
                                 &stored.reservation.cycle_id,
                                 stored.reservation.attempt_number,
-                                "decision_rejected",
                                 "persisted proposal failed campaign validation",
                                 self.limits,
                                 now,
                             )?;
-                            return Err(error);
+                            continue;
                         }
+                        Err(error) => return Err(error),
                     };
-                    let newly_accepted = admitted.newly_accepted;
+                    if !admitted.matches_requested_intent {
+                        record_rejection(
+                            &mut report,
+                            &repository,
+                            &stored.reservation.cycle_id,
+                            stored.reservation.attempt_number,
+                            "persisted proposal duplicates another decision attempt",
+                            self.limits,
+                            now,
+                        )?;
+                        continue;
+                    }
                     repository.mark_completed(
                         &stored.reservation.cycle_id,
                         stored.reservation.attempt_number,
@@ -266,7 +284,7 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                         .await?
                     {
                         CampaignSubmission::Submitted(_) => {
-                            report.proposals_applied += usize::from(newly_accepted);
+                            report.proposals_applied += 1;
                         }
                         CampaignSubmission::Deferred => report.deferred += 1,
                     }
@@ -275,6 +293,39 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
         }
         Ok(report)
     }
+}
+
+fn decision_resource_id(kind: &str, reservation: &DecisionReservation) -> String {
+    let digest = Sha256::digest(
+        format!(
+            "campaign-decision-intent:v1\0{}\0{}\0{kind}",
+            reservation.cycle_id, reservation.attempt_number
+        )
+        .as_bytes(),
+    );
+    format!("decision-{kind}:{digest:x}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_rejection(
+    report: &mut DecisionLoopReport,
+    repository: &DecisionRepository<'_>,
+    cycle_id: &str,
+    attempt_number: i64,
+    summary: &str,
+    limits: CampaignLimits,
+    now: i64,
+) -> Result<(), AppError> {
+    let cycle = repository.reject_decision(
+        cycle_id,
+        attempt_number,
+        "decision_rejected",
+        summary,
+        limits,
+        now,
+    )?;
+    report.degraded += usize::from(cycle.state == DecisionCycleState::Degraded);
+    Ok(())
 }
 
 fn validate_ready_decision(
@@ -295,6 +346,7 @@ fn validate_ready_decision(
             message: "must identify the exact terminal decision source experiment",
         });
     }
+    validate_ready_context(stored, objective_digest, &source.experiment_id)?;
     let decision = parse_and_validate_decision(
         stored.decision_json.as_bytes(),
         objective_digest,
@@ -306,6 +358,18 @@ fn validate_ready_decision(
                 return Err(AppError::Validation {
                     field: "source_experiment_id",
                     message: "must match the exact decision cycle source experiment",
+                });
+            }
+            if proposal.kind() == ProposalKind::Repair
+                && (source.status != ExperimentStatus::Failed
+                    || source
+                        .failure_fingerprint
+                        .as_deref()
+                        .is_none_or(str::is_empty))
+            {
+                return Err(AppError::Validation {
+                    field: "source_experiment_id",
+                    message: "repair decisions require a failed source with a trusted fingerprint",
                 });
             }
             "proposal"
@@ -327,4 +391,33 @@ fn validate_ready_decision(
         });
     }
     Ok(decision)
+}
+
+fn validate_ready_context(
+    stored: &ReadyDecision,
+    objective_digest: &str,
+    source_experiment_id: &str,
+) -> Result<(), AppError> {
+    if stored.context_schema_version != Some(i64::from(DECISION_CONTEXT_SCHEMA_VERSION)) {
+        return Err(AppError::Validation {
+            field: "decision_context.schema_version",
+            message: "does not match the persisted decision attempt schema version",
+        });
+    }
+    let context_json = stored.context_json.as_deref().ok_or(AppError::Validation {
+        field: "decision_context",
+        message: "must be persisted on the decided attempt",
+    })?;
+    let context_digest = stored.context_digest.as_deref().ok_or(AppError::Validation {
+        field: "context_digest",
+        message: "must be persisted on the decided attempt",
+    })?;
+    if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+        return Err(AppError::Validation {
+            field: "context_digest",
+            message: "does not match the exact persisted decision context",
+        });
+    }
+    validate_stored_decision_context(context_json, objective_digest, source_experiment_id)?;
+    Ok(())
 }
