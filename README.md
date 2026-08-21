@@ -29,13 +29,15 @@ SQLite campaign / proposal / experiment
 
 SQLite は project、campaign、proposal、experiment、budget reservation、submission、event、incident、agent run の durable な関連を保持します。Pueue task の実行と agent の判断は分離され、1つの supervisor は1つの Pueue daemon または profile を担当します。
 
-現在の Phase 1 は campaign、baseline、hard budget、外部投入の復旧境界を持つ control plane までです。実験完了後の自律的な次 proposal の生成、実行中の periodic observer とそれに基づく campaign health-decision loop、goal evaluation、隔離された code worktree は後続 Phase であり、まだ自動実行されません。
+現在の Phase 2 は、campaign、baseline、hard budget、外部投入の復旧境界に加え、実験の成功・失敗を起点にする `terminal completion loop` を持ちます。Linux では supervisor が SQLite の bounded evidence だけを read-only の built-in Codex decision agent に渡し、返された exactly one structured decision を `proposal` または `finite wait` として検証します。proposal は既存の campaign coordinator から次の非 code experiment を投入し、wait は Pueue task を追加せず有限の `next_wake_at` まで待ちます。
+
+Phase 3 の `running OOM/stall observer`、実行中 experiment の `periodic observer` による campaign health-decision loop、`goal review`、隔離された `code worktree` はまだ実装範囲外です。既存の pattern/stall detector と Periodic DeepCheck はありますが、これらを Phase 3 の running health 判断と同一視しないでください。
 
 ## 対応環境
 
 | 環境 | 対応状況 |
 | --- | --- |
-| Linux | 正式な対応対象です。Ubuntu の検証に加え、Phase 1 の完了判定では隔離した real `pueued` による `tests/e2e/run.sh` の成功が必要です。private temp の mount 境界確認には kernel 5.8 以降が必要です。 |
+| Linux | 正式な対応対象です。Ubuntu の検証に加え、Phase 2 の完了判定では隔離した real `pueued` による `tests/e2e/run.sh` の成功が必要です。private temp の mount 境界確認には kernel 5.8 以降が必要です。 |
 | macOS | launchd 経路はありますが、private temp を `/dev/fd/11` の子パスとして利用できない既知制約があり、Linux と同等の agent 実行対応は主張しません。 |
 | その他 | 安全側に停止します。対応済み環境ではありません。 |
 
@@ -59,6 +61,7 @@ pueue-agent submit -- python train.py
 | 目的 | コマンド |
 | --- | --- |
 | 短い状態確認 | `pueue-agent status --compact` |
+| campaign と decision の確認 | `pueue-agent status --json` |
 | 総合診断 | `pueue-agent doctor` |
 | 単発実験の投入 | `pueue-agent submit -- <command...>` |
 | automation の停止・再開 | `pueue-agent pause` / `pueue-agent resume` |

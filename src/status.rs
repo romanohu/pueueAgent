@@ -6,12 +6,14 @@ use crate::{
     config,
     db::{
         inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
-        CampaignStatusProjection, Db, EventRepository, ProjectRepository, SubmissionRepository,
+        CampaignStatusProjection, Db, DecisionDoctorProjection, EventRepository,
+        ProjectRepository, SubmissionRepository,
     },
-    models::{Event, Project},
+    models::{DecisionAttemptState, DecisionCycle, Event, Project},
     output::{
         bounded_execution_path, bounded_redacted_text, bounded_typed_text, format_state,
-        human_header, human_summary, render_id,
+        human_header, human_summary, render_decision_status_line, render_id,
+        DecisionStatusProjection,
     },
     pueue::PueueTask,
     service::ServiceStatus,
@@ -195,6 +197,11 @@ pub fn render_project_status(
         .status_projection_for_project(&project.project_id, status_timestamp()?)?
     {
         lines.push(campaign_status_line(&campaign));
+        if let Some(decision) = current_decision_projection(db, &campaign.campaign_id)? {
+            lines.push(render_decision_status_line(
+                &DecisionStatusProjection::from(&decision),
+            ));
+        }
     }
 
     lines.extend(guardrail_lines(db, project)?);
@@ -288,6 +295,11 @@ pub fn render_project_status_compact(
         .status_projection_for_project(&project.project_id, status_timestamp()?)?
     {
         lines.push(campaign_status_line(&campaign));
+        if let Some(decision) = current_decision_projection(db, &campaign.campaign_id)? {
+            lines.push(render_decision_status_line(
+                &DecisionStatusProjection::from(&decision),
+            ));
+        }
     }
 
     let event_counts = event_status_counts(db, &project.project_id)?;
@@ -319,6 +331,71 @@ fn campaign_status_line(campaign: &CampaignStatusProjection) -> String {
         campaign.unreconciled_count,
         bounded_redacted_text(&campaign.objective_digest),
     )
+}
+
+pub(crate) fn current_decision_projection(
+    db: &Db,
+    campaign_id: &str,
+) -> Result<Option<DecisionDoctorProjection>, AppError> {
+    let connection = db.connect()?;
+    connection
+        .query_row(
+            "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id, dc.state,
+                    dc.next_wake_at, dc.consecutive_failed_attempts,
+                    dc.last_decision_kind, dc.last_failure_code, dc.last_failure_summary,
+                    dc.created_at, dc.updated_at,
+                    (SELECT COUNT(*) FROM decision_attempts count_attempt
+                     WHERE count_attempt.cycle_id = dc.cycle_id),
+                    (SELECT active_attempt.attempt_number
+                     FROM decision_attempts active_attempt
+                     WHERE active_attempt.cycle_id = dc.cycle_id
+                       AND dc.state = 'analyzing'
+                       AND active_attempt.state IN ('reserved','evidence_ready','running','decided')
+                     ORDER BY active_attempt.attempt_number DESC LIMIT 1),
+                    (SELECT active_attempt.state
+                     FROM decision_attempts active_attempt
+                     WHERE active_attempt.cycle_id = dc.cycle_id
+                       AND dc.state = 'analyzing'
+                       AND active_attempt.state IN ('reserved','evidence_ready','running','decided')
+                     ORDER BY active_attempt.attempt_number DESC LIMIT 1),
+                    (SELECT active_attempt.agent_run_id
+                     FROM decision_attempts active_attempt
+                     WHERE active_attempt.cycle_id = dc.cycle_id
+                       AND dc.state = 'analyzing'
+                       AND active_attempt.state IN ('reserved','evidence_ready','running','decided')
+                     ORDER BY active_attempt.attempt_number DESC LIMIT 1)
+             FROM decision_cycles dc
+             WHERE dc.campaign_id = ?1
+             ORDER BY dc.updated_at DESC, dc.cycle_id DESC
+             LIMIT 1",
+            [campaign_id],
+            |row| {
+                Ok(DecisionDoctorProjection {
+                    cycle: DecisionCycle {
+                        cycle_id: row.get(0)?,
+                        campaign_id: row.get(1)?,
+                        source_experiment_id: row.get(2)?,
+                        state: row.get(3)?,
+                        next_wake_at: row.get(4)?,
+                        consecutive_failed_attempts: row.get(5)?,
+                        last_decision_kind: row.get(6)?,
+                        last_failure_code: row.get(7)?,
+                        last_failure_summary: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    },
+                    attempt_count: row.get(11)?,
+                    active_attempt_number: row.get(12)?,
+                    active_attempt_state: row.get::<_, Option<DecisionAttemptState>>(13)?,
+                    active_agent_run_id: row.get(14)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|source| AppError::Database {
+            operation: "read bounded current decision status projection",
+            source,
+        })
 }
 
 fn render_counts(counts: &BTreeMap<String, i64>) -> String {

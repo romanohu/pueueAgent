@@ -239,7 +239,7 @@ fn readme_links_every_user_and_developer_guide() {
 }
 
 #[test]
-fn campaign_documentation_covers_managed_start_and_phase_boundary() {
+fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_boundary() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
     let getting_started =
@@ -297,13 +297,41 @@ fn campaign_documentation_covers_managed_start_and_phase_boundary() {
     assert!(!troubleshooting.to_ascii_lowercase().contains("retry submit"));
 
     for document in [&readme, &getting_started] {
-        assert!(document.contains("Phase 1"));
-        assert!(document.contains("自律的な次 proposal の生成"));
+        assert!(document.contains("Phase 2"));
+        assert!(document.contains("terminal completion loop"));
+        assert!(document.contains("proposal"));
+        assert!(document.contains("finite wait"));
+        assert!(document.contains("Phase 3"));
+        assert!(document.contains("running OOM/stall observer"));
         assert!(document.contains("periodic observer"));
-        assert!(document.contains("campaign health-decision loop"));
-        assert!(document.contains("goal evaluation"));
+        assert!(document.contains("goal review"));
         assert!(document.contains("code worktree"));
+        assert!(!document.contains("現時点では自動で次の学習を投入しません"));
     }
+
+    for document in [&architecture, &workflows] {
+        assert!(document.contains("decision cycle"));
+        assert!(document.contains("pending"));
+        assert!(document.contains("analyzing"));
+        assert!(document.contains("waiting"));
+        assert!(document.contains("completed"));
+        assert!(document.contains("degraded"));
+        assert!(document.contains("next_wake_at"));
+        assert!(document.contains("attempt_count"));
+        assert!(document.contains("last_decision_kind"));
+    }
+
+    assert!(troubleshooting.contains("decision_attempts_exhausted"));
+    assert!(troubleshooting.contains("decision.digests"));
+    assert!(troubleshooting.contains("campaign pause"));
+
+    let instructions = std::fs::read_to_string(root.join("templates/instructions.md")).unwrap();
+    assert!(instructions.contains("Phase 2 decision agent"));
+    assert!(instructions.contains("exactly one structured decision"));
+    assert!(instructions.contains("proposal"));
+    assert!(instructions.contains("wait"));
+    assert!(instructions.contains("Pueue を直接呼び出さない"));
+    assert!(instructions.contains("source を編集しない"));
 }
 
 #[test]

@@ -6,9 +6,10 @@ use std::os::unix::fs::symlink;
 use pueue_agent::{
     cli::Cli,
     db::{
-        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        IncidentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
-        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+        AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
+        ExperimentRepository, IncidentRepository, InterventionRepository, ProjectRepository,
+        StartCampaignRequest, TaskObservationRepository, TerminationRequestRepository,
+        LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
         build_doctor_report, build_doctor_report_with_policy, render_doctor_report,
@@ -35,6 +36,7 @@ use pueue_agent::{
 use clap::Parser;
 use rusqlite::params;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
@@ -897,6 +899,38 @@ impl DiagnosticsHarness {
             .campaign
             .campaign_id
     }
+
+    fn start_terminal_decision(&self, now: i64) -> (String, String) {
+        let campaign_id = self.start_campaign();
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments
+                 SET status = 'failed', failure_code = 'fixture_failure',
+                     failure_fingerprint = 'fixture-fingerprint', finished_at = ?1,
+                     updated_at = ?1
+                 WHERE experiment_id = 'diagnostics-campaign-experiment'",
+                [now],
+            )
+            .unwrap();
+        let cycle_id = DecisionRepository::new(&self.db)
+            .ensure_cycle_for_terminal(&campaign_id, "diagnostics-campaign-experiment", now)
+            .unwrap()
+            .cycle_id;
+        (campaign_id, cycle_id)
+    }
+
+    fn write_project_config(&self, timeout_minutes: u32) {
+        let config = include_str!("../../templates/config.toml")
+            .replace("{{PROJECT_ID}}", "project-a")
+            .replace("{{PUEUE_GROUP}}", "pa-project")
+            .replace(
+                "timeout_minutes = 60",
+                &format!("timeout_minutes = {timeout_minutes}"),
+            );
+        fs::write(self.project().config_path, config).unwrap();
+    }
 }
 
 fn unix_now() -> i64 {
@@ -949,6 +983,539 @@ fn campaign_status_human_compact_and_json_project_bounded_campaign_state() {
     assert_eq!(value["campaign"]["experiment_counts"]["unreconciled"], 1);
     assert_eq!(value["campaign"]["rolling_usage"]["agent_run"], 1);
     assert_eq!(value["campaign"]["unreconciled_count"], 1);
+}
+
+#[test]
+fn decision_status_projects_active_cycle_without_raw_evidence() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (campaign_id, cycle_id) = harness.start_terminal_decision(now);
+    let decisions = DecisionRepository::new(&harness.db);
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle_id, now + 1)
+        .unwrap()
+        .unwrap();
+    let next_wake_at = now + 600;
+    decisions
+        .mark_waiting(&cycle_id, reservation.attempt_number, next_wake_at, now + 2)
+        .unwrap();
+
+    let context_json = r#"{"prompt":"raw-prompt-secret","log":"raw-log-secret","objective":"raw-objective-secret"}"#;
+    let decision_json = r#"{"decision":"wait","reason":"raw-decision-secret"}"#;
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_attempts
+             SET context_schema_version = 1, context_json = ?1, context_digest = ?2,
+                 decision_json = ?3, decision_digest = ?4
+             WHERE cycle_id = ?5 AND attempt_number = ?6",
+            params![
+                context_json,
+                format!("{:x}", Sha256::digest(context_json.as_bytes())),
+                decision_json,
+                format!("{:x}", Sha256::digest(decision_json.as_bytes())),
+                cycle_id,
+                reservation.attempt_number,
+            ],
+        )
+        .unwrap();
+
+    let input = harness.input(PueueSnapshot::Tasks(Vec::new()));
+    let human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    let compact = render_project_status_compact(&harness.db, &harness.project(), &input).unwrap();
+    let json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+    let campaign_human =
+        pueue_agent::campaign::render_status_for_project(&harness.db, &harness.project(), false)
+            .unwrap();
+    let campaign_json =
+        pueue_agent::campaign::render_status_for_project(&harness.db, &harness.project(), true)
+            .unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let decision = &value["campaign"]["decision"];
+    let campaign_value: Value = serde_json::from_str(&campaign_json).unwrap();
+
+    assert_eq!(value["campaign"]["campaign_id"], campaign_id);
+    assert_eq!(decision["cycle_id"], cycle_id);
+    assert_eq!(
+        decision["source_experiment_id"],
+        "diagnostics-campaign-experiment"
+    );
+    assert_eq!(decision["state"], "waiting");
+    assert_eq!(decision["attempt_count"], 1);
+    assert_eq!(decision["last_decision_kind"], "wait");
+    assert_eq!(decision["next_wake_at"], next_wake_at);
+    assert_eq!(campaign_value["decision"]["state"], "waiting");
+    assert_eq!(campaign_value["decision"]["attempt_count"], 1);
+    for absent in [
+        "context_json",
+        "context_digest",
+        "decision_json",
+        "decision_digest",
+        "prompt",
+        "transcript",
+        "environment",
+        "argv",
+        "log",
+        "objective",
+    ] {
+        assert!(
+            decision.get(absent).is_none(),
+            "unexpected {absent}: {json}"
+        );
+    }
+    for rendered in [&human, &compact, &json, &campaign_human, &campaign_json] {
+        assert!(rendered.contains("decision"), "{rendered}");
+        for secret in [
+            "raw-prompt-secret",
+            "raw-log-secret",
+            "raw-objective-secret",
+            "raw-decision-secret",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+    }
+}
+
+#[test]
+fn decision_status_bounds_and_redacts_failure_facts() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    let decisions = DecisionRepository::new(&harness.db);
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle_id, now + 1)
+        .unwrap()
+        .unwrap();
+    let mut limits = CampaignLimits::default();
+    limits.max_decision_attempts_per_cycle = 1;
+    decisions
+        .fail_attempt(
+            None,
+            &cycle_id,
+            reservation.attempt_number,
+            "decision_invalid",
+            "OPENAI_API_KEY=decision-failure-secret ",
+            limits,
+            now + 2,
+        )
+        .unwrap();
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(Vec::new())),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+    let decision = &value["campaign"]["decision"];
+    assert_eq!(decision["state"], "degraded");
+    assert_eq!(decision["failure_code"], "decision_invalid");
+    assert!(decision["failure_summary"]
+        .as_str()
+        .unwrap()
+        .contains("[REDACTED]"));
+    assert!(!rendered.contains("decision-failure-secret"));
+}
+
+#[test]
+fn decision_doctor_is_healthy_without_cycles_for_legacy_project() {
+    let harness = DiagnosticsHarness::new();
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        unix_now(),
+    )
+    .unwrap();
+    let checks = report
+        .checks
+        .iter()
+        .filter(|check| check.name.starts_with("decision."))
+        .collect::<Vec<_>>();
+
+    assert!(!checks.is_empty());
+    assert!(
+        checks
+            .iter()
+            .all(|check| check.status == DoctorCheckStatus::Ok),
+        "{checks:?}"
+    );
+}
+
+#[test]
+fn decision_doctor_reports_orphan_cycle_lineage_without_repair() {
+    let harness = DiagnosticsHarness::new();
+    let campaign_id = harness.start_campaign();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA foreign_keys = OFF;")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO decision_cycles (
+                cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
+                consecutive_failed_attempts, created_at, updated_at
+             ) VALUES ('orphan-decision-cycle', ?1, 'missing-experiment', 'pending',
+                       NULL, 0, 100, 100)",
+            [&campaign_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        unix_now(),
+    )
+    .unwrap();
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "decision.lineage")
+        .unwrap();
+    assert_eq!(check.status, DoctorCheckStatus::Error);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM decision_cycles WHERE cycle_id = 'orphan-decision-cycle'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn decision_doctor_reports_duplicate_active_attempts() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    DecisionRepository::new(&harness.db)
+        .reserve_next_attempt("project-a", &cycle_id, now + 1)
+        .unwrap()
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO decision_attempts (
+                cycle_id, attempt_number, state, created_at
+             ) VALUES (?1, 2, 'reserved', ?2)",
+            params![cycle_id, now + 2],
+        )
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now + 3,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.active_attempts")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Error
+    );
+}
+
+#[test]
+fn decision_doctor_reports_overdue_running_analysis() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now - 180);
+    harness.write_project_config(1);
+    let decisions = DecisionRepository::new(&harness.db);
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle_id, now - 179)
+        .unwrap()
+        .unwrap();
+    let context_json = "{}";
+    decisions
+        .store_evidence(
+            &reservation,
+            context_json,
+            &format!("{:x}", Sha256::digest(context_json.as_bytes())),
+            now - 178,
+        )
+        .unwrap();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::CampaignDecision,
+            "overdue-decision-run",
+            json!({}),
+            now - 180,
+            now - 180,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .claim_batch(now - 179, now + 60, 1)
+        .unwrap();
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event.event_id,
+                Some(1234),
+                AgentRunStatus::Running,
+                now - 178,
+                "/tmp/overdue-decision.log",
+            ),
+            &[event.event_id],
+        )
+        .unwrap();
+    decisions
+        .bind_agent_run(&reservation, run.run_id, now - 178)
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.running_attempts")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Error
+    );
+}
+
+#[test]
+fn decision_doctor_reports_waiting_cycle_without_wake() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    let decisions = DecisionRepository::new(&harness.db);
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle_id, now + 1)
+        .unwrap()
+        .unwrap();
+    decisions
+        .mark_waiting(&cycle_id, reservation.attempt_number, now + 600, now + 2)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles SET next_wake_at = NULL WHERE cycle_id = ?1",
+            [&cycle_id],
+        )
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now + 3,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.wait_wake")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Error
+    );
+}
+
+#[test]
+fn decision_doctor_reports_digest_mismatch_without_payload_or_repair() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    let decisions = DecisionRepository::new(&harness.db);
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle_id, now + 1)
+        .unwrap()
+        .unwrap();
+    let context_json = r#"{"prompt":"digest-raw-prompt-secret"}"#;
+    decisions
+        .store_evidence(&reservation, context_json, &"0".repeat(64), now + 2)
+        .unwrap();
+    let decision_json = r#"{"decision":"wait","reason":"digest-raw-decision-secret"}"#;
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_attempts
+             SET decision_json = ?1, decision_digest = ?2
+             WHERE cycle_id = ?3 AND attempt_number = ?4",
+            params![
+                decision_json,
+                "1".repeat(64),
+                cycle_id,
+                reservation.attempt_number,
+            ],
+        )
+        .unwrap();
+    let before = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT context_digest, decision_digest FROM decision_attempts
+             WHERE cycle_id = ?1 AND attempt_number = ?2",
+            params![cycle_id, reservation.attempt_number],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now + 3,
+    )
+    .unwrap();
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "decision.digests")
+        .unwrap();
+    assert_eq!(check.status, DoctorCheckStatus::Error);
+    let rendered = render_doctor_report_value(&report, true).unwrap();
+    assert!(!rendered.contains("digest-raw-prompt-secret"));
+    assert!(!rendered.contains("digest-raw-decision-secret"));
+    let after = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT context_digest, decision_digest FROM decision_attempts
+             WHERE cycle_id = ?1 AND attempt_number = ?2",
+            params![cycle_id, reservation.attempt_number],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn decision_doctor_reports_malformed_rows_as_typed_check_without_repair() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE decision_cycles SET state = 'malformed-state' WHERE cycle_id = ?1",
+            [&cycle_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now + 1,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.rows")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Error
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM decision_cycles WHERE cycle_id = ?1",
+                [&cycle_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "malformed-state"
+    );
+}
+
+#[test]
+fn decision_doctor_applies_payload_bounds_in_bytes() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (_, cycle_id) = harness.start_terminal_decision(now);
+    let reservation = DecisionRepository::new(&harness.db)
+        .reserve_next_attempt("project-a", &cycle_id, now + 1)
+        .unwrap()
+        .unwrap();
+    let oversized_multibyte_context = "あ".repeat(50_000);
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(oversized_multibyte_context.as_bytes())
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_attempts
+             SET context_schema_version = 1, context_json = ?1, context_digest = ?2
+             WHERE cycle_id = ?3 AND attempt_number = ?4",
+            params![
+                oversized_multibyte_context,
+                digest,
+                cycle_id,
+                reservation.attempt_number,
+            ],
+        )
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        now + 2,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "decision.rows")
+            .unwrap()
+            .status,
+        DoctorCheckStatus::Error
+    );
 }
 
 #[test]

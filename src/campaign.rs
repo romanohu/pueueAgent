@@ -15,13 +15,15 @@ use crate::{
         Campaign, Experiment, ExperimentStatus, Project, Proposal, ProposalKind, Submission,
     },
     output::{
-        render_campaign_mutation, render_campaign_status, render_experiment_inspection,
-        render_experiment_list, render_proposal_inspection, render_proposal_list,
+        render_campaign_mutation, render_campaign_status_with_decision,
+        render_experiment_inspection, render_experiment_list, render_proposal_inspection,
+        render_proposal_list, DecisionStatusProjection,
     },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
     reconcile::{canonical_command_display, managed_task_run_signature},
     state::ObjectiveSnapshot,
+    status::current_decision_projection,
     AppError,
 };
 
@@ -46,12 +48,16 @@ pub fn render_status_for_project(
 ) -> Result<String, AppError> {
     let (campaign, proposal_count, experiment_counts, budget_usage, task_ids) =
         CampaignRepository::new(db).status_for_project(&project.project_id)?;
-    render_campaign_status(
+    let decision = current_decision_projection(db, &campaign.campaign_id)?
+        .as_ref()
+        .map(DecisionStatusProjection::from);
+    render_campaign_status_with_decision(
         &campaign,
         proposal_count,
         &experiment_counts,
         &budget_usage,
         &task_ids,
+        decision.as_ref(),
         json,
     )
 }

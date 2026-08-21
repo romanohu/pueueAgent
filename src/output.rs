@@ -1,6 +1,9 @@
 use std::{io::IsTerminal, path::Path};
 
+use serde::Serialize;
+
 use crate::{
+    db::DecisionDoctorProjection,
     models::{Campaign, Experiment, Proposal},
     AppError,
 };
@@ -53,12 +56,75 @@ pub fn human_summary(summary: impl AsRef<str>) -> String {
     format!("summary: {}", bounded_redacted_text(summary.as_ref()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DecisionStatusProjection {
+    cycle_id: String,
+    source_experiment_id: String,
+    state: crate::models::DecisionCycleState,
+    attempt_count: i64,
+    last_decision_kind: Option<String>,
+    next_wake_at: Option<i64>,
+    failure_code: Option<String>,
+    failure_summary: Option<String>,
+}
+
+impl From<&DecisionDoctorProjection> for DecisionStatusProjection {
+    fn from(decision: &DecisionDoctorProjection) -> Self {
+        Self {
+            cycle_id: bounded_redacted_text(&decision.cycle.cycle_id),
+            source_experiment_id: bounded_redacted_text(&decision.cycle.source_experiment_id),
+            state: decision.cycle.state,
+            attempt_count: decision.attempt_count,
+            last_decision_kind: safe_optional_text(decision.cycle.last_decision_kind.as_deref()),
+            next_wake_at: decision.cycle.next_wake_at,
+            failure_code: safe_optional_text(decision.cycle.last_failure_code.as_deref()),
+            failure_summary: safe_optional_text(decision.cycle.last_failure_summary.as_deref()),
+        }
+    }
+}
+
+pub(crate) fn render_decision_status_line(decision: &DecisionStatusProjection) -> String {
+    format!(
+        "decision: cycle_id={} source_experiment_id={} state={} attempt_count={} last_decision_kind={} next_wake_at={} failure_code={} failure_summary={}",
+        decision.cycle_id,
+        decision.source_experiment_id,
+        decision.state,
+        decision.attempt_count,
+        decision.last_decision_kind.as_deref().unwrap_or("none"),
+        decision
+            .next_wake_at
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        decision.failure_code.as_deref().unwrap_or("none"),
+        decision.failure_summary.as_deref().unwrap_or("none"),
+    )
+}
+
 pub fn render_campaign_status(
     campaign: &Campaign,
     proposal_count: i64,
     experiment_counts: &std::collections::BTreeMap<String, i64>,
     budget_usage: &std::collections::BTreeMap<String, i64>,
     task_ids: &[i64],
+    json: bool,
+) -> Result<String, AppError> {
+    render_campaign_status_with_decision(
+        campaign,
+        proposal_count,
+        experiment_counts,
+        budget_usage,
+        task_ids,
+        None,
+        json,
+    )
+}
+
+pub(crate) fn render_campaign_status_with_decision(
+    campaign: &Campaign,
+    proposal_count: i64,
+    experiment_counts: &std::collections::BTreeMap<String, i64>,
+    budget_usage: &std::collections::BTreeMap<String, i64>,
+    task_ids: &[i64],
+    decision: Option<&DecisionStatusProjection>,
     json: bool,
 ) -> Result<String, AppError> {
     let experiment_count = experiment_counts.values().sum::<i64>();
@@ -81,6 +147,7 @@ pub fn render_campaign_status(
             },
             "budget_usage": budget_usage,
             "task_ids": task_ids,
+            "decision": decision,
         }))
         .map_err(|source| AppError::Serialization {
             operation: "serialize campaign status",
@@ -88,10 +155,15 @@ pub fn render_campaign_status(
         });
     }
 
-    Ok([
+    let mut lines = vec![
         human_header("campaign status", &campaign.project_id),
         format!("campaign: {}", bounded_redacted_text(&campaign.campaign_id)),
         format!("state: {}", format_state(campaign.state.as_str())),
+    ];
+    if let Some(decision) = decision {
+        lines.push(render_decision_status_line(decision));
+    }
+    lines.extend([
         format!(
             "state_reason: {}",
             safe_optional_text(campaign.state_reason.as_deref())
@@ -135,8 +207,8 @@ pub fn render_campaign_status(
                 .unwrap_or_else(|| "none".to_owned())
         ),
         human_summary("campaign state inspected"),
-    ]
-    .join("\n"))
+    ]);
+    Ok(lines.join("\n"))
 }
 
 pub fn render_campaign_mutation(

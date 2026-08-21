@@ -42,6 +42,17 @@ CLI ごとに別の profile を混在させないでください。profile の�
 
 `unreconciled` は「失敗したので同じ task をもう一度追加してよい」という意味ではありません。外部 Pueue add が成功した可能性を保持する安全状態です。`campaign resume`、service restart、`wake` は、この experiment を自動的に再 add しません。
 
+## Campaign decision が waiting または degraded になった
+
+| 症状 | まず確認 | 想定原因 | 安全な復旧 |
+| --- | --- | --- | --- |
+| `campaign.decision.state` が `waiting` | `pueue-agent status --json` の `next_wake_at` と `pueue-agent doctor --json` の `decision.wait_wake` | decision agent が bounded な `finite wait` を返し、追加 evidence の時刻を待っている | daemon を running のまま保ち、期限まで待つ。Pueue task や decision event を手動で追加しない |
+| `analyzing` が timeout を越えて残る | `doctor` の `decision.running_attempts` と `runs --json` の linked run | decision AgentRun の終了または再起動復旧が未完了 | daemon の bounded recovery に任せる。attempt、run、event を SQL で再結合しない |
+| campaign が `degraded`、reason が `decision_attempts_exhausted` | `status --json` の bounded `failure_code` / `failure_summary` と `doctor --json` | malformed output、launch/output policy failure、または proposal 適用拒否が連続上限に達した | `pueue-agent campaign pause` を実行して原因を確認する。`campaign resume` は exhausted cycle を消去しない。安全に終了できる場合だけ paused campaign を retire し、新しい objective/baseline を開始する |
+| `decision.digests`、`decision.lineage`、`decision.active_attempts` が error | 該当する doctor check 名と件数だけを確認 | stored payload digest、terminal lineage、single-owner attempt の durable invariant が壊れている | campaign を pause し、raw context/decision body を表示・共有・書換えしない。bounded report を管理者へ渡し、doctor から migration/repair を試みない |
+
+decision の status/doctor projection は `cycle_id`、source experiment、state、attempt count、wake、bounded failure facts に限定されます。raw prompt、objective、decision JSON、environment、argv、log excerpt が表示されないことは意図した安全境界です。Phase 3 の running OOM/stall observer は未実装なので、terminal loop の状態だけから実行中 experiment の健康性を推測しないでください。
+
 ## Execution policy を読み込めない
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |

@@ -10,6 +10,16 @@
 4. Git を使っている場合は、意図した source change を「何を、なぜ変更したか」が分かる commit message で commit する。
 5. managed campaign 中は job を直接投入しない。SQLite の campaign authority と configured guardrails に従う管理済みの経路だけを使う。
 
+## Phase 2 decision agent
+
+起動 prompt が decision role を指定した場合は、通常の実験 agent として source や `state.json` を変更しない。渡された bounded evidence と immutable objective snapshot だけを読み、output schema に一致する `exactly one structured decision` を返す。
+
+- decision は `proposal` または有限の `wait` のどちらか一つだけにする。Markdown、説明文、複数 JSON、未知 field を追加しない。
+- Pueue を直接呼び出さない。`pueue-agent submit` / `submit-batch` も実行しない。proposal の検証、budget reservation、Pueue add は supervisor が所有する。
+- source を編集しない。`.pueue-agent/STATE.md`、`.pueue-agent/state.json`、config、Git、artifact も変更しない。
+- prompt、credential、environment value、raw log、transcript を decision に複製しない。必要な根拠は schema の bounded field だけで表す。
+- code change を提案しない。失敗した experiment の repair は、evidence に trusted failure fingerprint がある場合だけ schema に従って提案する。
+
 ## 人間からの介入
 
 人間の自然言語による追加指示は、次の agent run に渡すキューへ登録する。
@@ -28,7 +38,7 @@ SQLite は campaign、objective、budget、lineage の正本です。`.pueue-age
 
 ## Dispatch mode
 
-- `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、bounded な replacement recommendation/proposal を `state.json` に記録する。`Phase 1` では replacement experiment を投入しない。
+- `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、bounded な replacement recommendation/proposal を `state.json` に記録する。通常の実験 agent は replacement experiment を直接投入しない。
 - `deep_check`: metric と artifact を調べ、実験が意味のある進行をしているか判断する。正常なら、実際にプロジェクトで確認できた事実だけを使い、短い health record を `state.json` に記録する。存在しない metric、値、進捗を作らない。異常なら crash と同じ手順で対応する。
 - `completion`: 結果を要約し、次の実験に根拠があるか判断する。目的を達成した、または有効な次の手がかりがない場合は停止する。
 - `operator_wake`: reason は人間からの追加指示として扱う。既存の STATE、guardrail、experiment budget を尊重し、迂回しない。

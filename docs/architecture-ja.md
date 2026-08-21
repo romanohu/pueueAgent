@@ -7,7 +7,8 @@
 | コンポーネント | 所有する責務 | 所有しないもの | 主な実装 |
 | --- | --- | --- | --- |
 | submit 経路 | project と argv の検証、submission intent の先行永続化、Pueue add 結果の記録 | Pueue の task 実行 | [`submit.rs`](../src/submit.rs), [`pueue.rs`](../src/pueue.rs) |
-| campaign coordinator | 最初の submit を campaign/baseline に変換し、durable intent commit 後の Pueue add と accepted/unreconciled 遷移を調停 | 完了結果の解釈や次 proposal の自律生成 | [`campaign.rs`](../src/campaign.rs), [`db/campaigns.rs`](../src/db/campaigns.rs) |
+| campaign coordinator | 最初の submit と accepted decision proposal を durable intent に変換し、commit 後の Pueue add と accepted/unreconciled 遷移を調停 | decision evidence の構築や agent 実行 | [`campaign.rs`](../src/campaign.rs), [`db/campaigns.rs`](../src/db/campaigns.rs) |
+| decision coordinator | terminal experiment の decision cycle、bounded evidence、read-only analysis、proposal/finite wait の適用と再起動復旧 | running health/OOM の継続観測、code change | [`decision.rs`](../src/decision.rs), [`decision_evidence.rs`](../src/decision_evidence.rs), [`db/decisions.rs`](../src/db/decisions.rs) |
 | Pueue adapter | 許可済み operation の argv 組み立て、検証済み Pueue/config の利用、timeout と stdout/stderr 上限 | event の永続化や retry 判定 | [`pueue.rs`](../src/pueue.rs), [`pueue_process.rs`](../src/pueue_process.rs) |
 | callback / reconciliation | callback の idempotent 取り込み、Pueue status の観測、terminal event の正規化、submission の突合 | agent dispatch | [`events.rs`](../src/events.rs), [`reconcile.rs`](../src/reconcile.rs) |
 | repository 層 | SQLite の制約、lease、状態遷移、run/event 結合、終端処理の transaction | OS process の生死 | [`db/repositories.rs`](../src/db/repositories.rs), [`models.rs`](../src/models.rs) |
@@ -16,7 +17,7 @@
 | native launcher | project-root descriptor 相対の log/marker、marker の永続化後の release | event や retry policy | [`native_launcher.rs`](../src/native_launcher.rs), [`project_logs.rs`](../src/project_logs.rs) |
 | process core | fixed descriptor ABI、bounded control frame、ヘルパー、blocked target、exec proof、exact ack、process-group 所有 | marker を作るかどうかの上位判断 | [`process.rs`](../src/process.rs) |
 | environment / private temp | 既定拒否の child environment、run ごとの directory capability、descriptor-relative な inventory/cleanup | 隠した環境変数の自動継承 | [`environment.rs`](../src/environment.rs) |
-| daemon | startup recovery、reconciliation → detection → termination → periodic → scheduler の tick 順序、所有 handle の poll/drain | Pueue daemon 自体の lifecycle | [`daemon.rs`](../src/daemon.rs) |
+| daemon | startup/decision recovery、reconciliation、persisted decision 適用、due wake、scheduler の tick 順序、所有 handle の poll/drain | Pueue daemon 自体の lifecycle | [`daemon.rs`](../src/daemon.rs) |
 
 ## 所有する状態と設定
 
@@ -25,6 +26,7 @@
 | project 登録、submission、event、task observation、incident、termination request、intervention、agent run | service state directory の SQLite `state.sqlite3` | repository 層のみが状態遷移を書き込む。運用時に直接 SQL で編集しない |
 | agent、check、guardrail、Pueue group | project の `.pueue-agent/config.toml` | submit と daemon startup recovery は DB 登録の project ID/group と一致を検証する |
 | campaign、immutable objective snapshot、proposal、experiment、rolling budget reservation、submission/task lineage | service state directory の SQLite `state.sqlite3` | repository と coordinator が transaction 内で状態遷移する |
+| decision cycle、attempt、bounded context/output digest、finite wake | service state directory の SQLite `state.sqlite3` | decision repository/coordinator だけが遷移し、raw payload は status/doctor に投影しない |
 | current/historical facts、active lineage の bounded scratch projection | `.pueue-agent/state.json` | agent の補助 context。objective/budget/lineage の authority にはしない |
 | 人間が定める campaign objective と制約 | `.pueue-agent/STATE.md` | 最初の submit で bounded snapshot 化する。active campaign 中の編集で SQLite objective を上書きしない |
 | 起動時の executable、trusted path、Pueue config、network/environment policy | service state directory の `execution-policy.toml` を検証して作る immutable anchor/capability | daemon 起動後は ambient `PATH` で実行ファイルを再解決せず、使用直前に identity を再検証する |
@@ -53,7 +55,32 @@ flowchart TD
 
 submit は、native control frame に収まらない argv を永続化前に拒否します。検証後の順序は、(1) `pending` submission intent を immediate transaction で commit、(2) 外部の `pueue add`、(3) 返却された task ID と provisional signature を別 transaction で `accepted` として commit、です。SQLite と Pueue を跨ぐ transaction はないため、この間の中断は意図的に reconciliation の対象です。
 
-Phase 1 の daemon recovery は stale `submitting` を `unreconciled` へ進め、`unreconciled` と `accepted` を再 add せず、`reserved` だけを durable argv/working directory から再開します。rolling budget は有限の `next_eligible_at` を持ち、window expiry 後に `active` へ戻します。完了 event から次 proposal を生成するループ、periodic observer と campaign health-decision loop、goal evaluation、code worktree はこの Phase には含まれません。
+Phase 2 の daemon recovery は stale `submitting` を `unreconciled` へ進め、`unreconciled` と `accepted` を再 add せず、`reserved` だけを durable argv/working directory から再開します。rolling budget は有限の `next_eligible_at` を持ち、window expiry 後に `active` へ戻します。加えて terminal experiment の decision state を復旧し、persisted decision を再検証してから existing coordinator へ適用します。
+
+## Terminal completion decision loop
+
+一意に reconciliation された terminal experiment は、同じ transaction で lineage-exact な `campaign_decision` event と一つの `decision cycle` を作ります。cycle state は `pending`、`analyzing`、`waiting`、`completed`、`degraded` です。campaign では active attempt と decision AgentRun を同時に一つだけ許可します。
+
+```mermaid
+flowchart TD
+    A["terminal experiment を commit"] --> B["decision cycle/event を atomic publish"]
+    B --> C["pending: attempt と agent-run budget を reserve"]
+    C --> D["SQLite + metadata から bounded evidence"]
+    D --> E["Linux built-in Codex / read-only project"]
+    E --> F{"strict decision JSON"}
+    F -->|"proposal"| G["existing campaign coordinator へ durable intent"]
+    G --> H["verified Pueue add"]
+    H --> I["completed"]
+    F -->|"finite wait"| J["waiting + next_wake_at"]
+    J -->|"deadline"| C
+    E -->|"bounded failures exhausted"| K["degraded"]
+```
+
+decision runner は startup-pinned built-in Codex だけを使い、project root を read-only、verified private temp を唯一の output capability とします。network は service policy に従いますが credential/auth environment は除外します。context JSON と decision JSON は各 128 KiB 以下で、output は schema 検証と digest 照合の後にだけ永続化されます。decision agent 自身は Pueue を呼ばず、source を編集しません。
+
+proposal は supervisor-owned ID と idempotency key で既存 coordinator に渡され、SQLite の accepted intent が外部 add より先です。finite wait は Pueue task を作らず、service-owned 上限内の絶対 `next_wake_at` だけを保存します。analysis は hourly agent-run budget、proposal は rolling experiment budget を消費します。連続失敗が `max_decision_attempts_per_cycle` に達すると cycle/campaign は `degraded` になり、自動 replay しません。
+
+Phase 3 の `running OOM/stall observer`、実行中 experiment の `periodic observer` による campaign health-decision loop、`goal review`、`code worktree` はこの terminal loop に含まれません。
 
 service policy の network default は `enabled` ですが、sanitized environment は別の allowlist 境界です。network を利用可能にしても、allowlist 外の credential/environment value を agent または agent task に継承しません。
 
@@ -216,6 +243,8 @@ active run と linked event は project ごとの immediate transaction で回�
 
 診断は、運用上必要な ID、状態、時刻、policy code/stage、有界な execution audit facts を表示する一方、実行入力の展開を避けます。agent-run の診断投影は execution kind、絶対 executable path、identity に限定し、prompt、argv、environment、credential、log output を含めません。Pueue task の command は実行ファイル名の安全な要約だけを表示し、shell wrapper、environment assignment、不正な token は `unknown` とします。
 
+現在の decision status は cycle を最大1件だけ投影し、`cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、bounded failure code/summary を含みます。doctor は project/campaign scoped の indexed query で lineage、single-owner attempt/binding、overdue run、finite wake、digest、degraded diagnostics を読み取り専用で検査します。malformed row は typed error check であり、migration/repair を起こしません。context/decision JSON、digest 自体、prompt、transcript、environment、完全な argv、log excerpt、raw objective はどちらにも出しません。
+
 user-facing な error/reason は control/ANSI 文字を除去し、パス、credential 形式、機密に見える token を redaction して 240 bytes に制限します。native control frame の `Debug` は argv/environment の個数だけ、sanitized environment の `Debug` は変数名だけを出します。Pueue の captured stdout/stderr は上限付きで回収しますが、error の `Debug` は内容ではなく byte 数を出します。
 
 ただし、redaction は access control の代わりではありません。submission の argv、Pueue observation/event payload、agent log など、実行と監査に必要な情報を所有する保存先には、service/project の filesystem 権限が必要です。
@@ -245,6 +274,7 @@ Linux private temp の mount 境界検証は `openat2(RESOLVE_NO_XDEV)` と `sta
 - bounded Pueue process と cleanup: [`pueue_process.rs`](../src/pueue_process.rs)
 - callback の idempotency: [`events.rs`](../src/events.rs)
 - status reconciliation、terminal event、submission recovery: [`reconcile.rs`](../src/reconcile.rs)
+- terminal decision evidence、適用、復旧: [`decision_evidence.rs`](../src/decision_evidence.rs), [`decision.rs`](../src/decision.rs), [`db/decisions.rs`](../src/db/decisions.rs)
 - claim、policy preflight、project 単位 dispatch: [`scheduler.rs`](../src/scheduler.rs)
 - agent run bind 後の起動と terminal/private-temp 順序: [`agent.rs`](../src/agent.rs)
 - marker/release adapter: [`native_launcher.rs`](../src/native_launcher.rs)

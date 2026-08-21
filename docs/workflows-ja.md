@@ -17,7 +17,7 @@ pueue-agent status
 
 監視対象の job は raw の `pueue add` ではなく `pueue-agent submit` で投入します。最初の通常 `submit` は Pueue へ追加する前に campaign、baseline proposal、experiment、budget reservation、submission intent を SQLite に一度だけ記録します。live campaign 中の二回目の `submit` と `submit-batch` は副作用前に拒否されるため、追加指示には `steer` を使います。
 
-Phase 1 はこの baseline/control plane と安全な復旧までを提供します。完了後の自律 proposal、実行中の periodic observer とそれに基づく campaign health-decision loop、goal evaluation、code worktree は後続 Phase の範囲です。
+Phase 2 はこの baseline/control plane と安全な復旧に加え、terminal experiment 後の `terminal completion loop` を提供します。Linux の decision agent は bounded evidence から `proposal` または `finite wait` を一つ返し、proposal は既存 coordinator から次の非 code experiment へ進みます。Phase 3 の `running OOM/stall observer`、実行中の `periodic observer` による campaign health-decision loop、`goal review`、`code worktree` は範囲外です。
 
 ## Campaign を retire して新しい目的を開始する
 
@@ -71,6 +71,22 @@ pueue-agent doctor --json
 
 `status --json` は service、automation、project、Pueue snapshot、agent run などをまとめますが、submission の一覧は含みません。submission と task の lineage は `runs --json`、特定 task は `inspect <TASK_ID>`、incident の判断根拠は `explain <INCIDENT_ID>` で確認します。低レベル調査で raw Pueue data が必要な場合だけ `pueue status --json` を使い、supervisor の accounting と guardrail の確認には `pueue-agent` の出力を使います。
 
+## Terminal decision loop を確認する
+
+terminal experiment が reconciliation されると、supervisor は一意な `decision cycle` を作ります。通常の遷移は `pending` → `analyzing` → `completed` または `waiting` です。bounded failure が service-owned 上限に達した場合は `degraded` になります。
+
+```bash
+pueue-agent status --json
+pueue-agent campaign status --json
+pueue-agent doctor --json
+```
+
+`status --json` の `campaign.decision` は現在の cycle を最大1件だけ表示します。運用上の field は `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、`failure_code`、`failure_summary` です。context/decision JSON、prompt、transcript、environment、完全な argv、log excerpt は表示されません。
+
+`waiting` の `next_wake_at` までは Pueue task を追加せず、daemon が期限後に同じ cycle の新しい analysis を起動します。decision analysis は hourly agent-run budget、proposal は rolling experiment budget を消費します。budget 待ちは `next_eligible_at` まで自動で保持されるため、同じ task を手動投入しないでください。
+
+`degraded` と `decision_attempts_exhausted` が表示された場合、`pueue-agent campaign pause` で自律動作を保持し、`status --json` と `doctor --json` の bounded failure facts を確認します。`campaign resume` は exhausted decision cycle を消去せず、SQLite を直接編集して retry してはいけません。継続を断念する場合は nonterminal/unreconciled experiment と reservation がないことを確認し、paused campaign を `campaign retire` してから、新しい objective と baseline を開始します。
+
 ## Periodic DeepCheck を有効化する
 
 `.pueue-agent/config.toml` で明示的に opt-in します。
@@ -82,7 +98,7 @@ deep_check_interval_minutes = 60
 
 `0`（既定値）は無効です。正の値では、通常の reconciliation が周期条件を確認し、必要なときだけ設定済みの `agent.context.mode` を使う新しい agent run を起動します。`fresh` は既定値ですが、明示的に設定した `resume` / `resume_latest` もそのまま適用されます。正常な tick の確認や異常検知だけでは agent token を消費しません。Periodic DeepCheck event が dispatch されたときだけ token を消費します。
 
-この既存 Periodic DeepCheck は project 単位の event を起こす機能であり、実行中 experiment を継続観測して改善見込みや棄却を判断する campaign health-decision loop ではありません。後者は Phase 1 には含まれません。
+この既存 Periodic DeepCheck は project 単位の event を起こす機能であり、実行中 experiment を継続観測して改善見込みや棄却を判断する campaign health-decision loop ではありません。Phase 3 の running health/OOM observer はまだ含まれません。
 
 同じ project では pending、claimed、retry 待ちの periodic DeepCheck がある間、新しい event は追加されません。複数の長時間 task があっても project ごとに coalesce されます。`STATE.md` には確認できた task、metric、短い判断だけを記録し、値を補完しません。
 

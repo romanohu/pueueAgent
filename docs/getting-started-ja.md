@@ -4,7 +4,7 @@
 
 ## 対応環境
 
-- Linux: 正式な対応対象。Phase 1 の完了判定では、通常の build/test に加えて隔離した real `pueued` を使う `tests/e2e/run.sh` の成功を要求する。private temp の mount 境界確認には kernel 5.8 以降を要求する。
+- Linux: 正式な対応対象。Phase 2 の完了判定では、通常の build/test に加えて隔離した real `pueued` を使う `tests/e2e/run.sh` の成功を要求する。private temp の mount 境界確認には kernel 5.8 以降を要求する。
 - macOS: launchd 経路は存在するが、private temp を `/dev/fd/11` の子パスとして利用できない既知制約があるため、Linux と同等の agent 実行対応を主張しない。
 - その他: fail closed とし、対応済みとは記載しない。
 
@@ -147,9 +147,13 @@ pueue-agent submit -- python train.py --lr 0.001
 
 live campaign 中の追加 `submit` と `submit-batch` は、別 campaign や別 task の重複作成を防ぐため副作用前に拒否されます。現在の目的への追加指示は `pueue-agent steer -- "<MESSAGE>"` を使います。
 
-## Phase 1 で自動化される範囲
+## Phase 2 で自動化される範囲
 
-Phase 1 が提供するのは、最初の baseline を managed campaign として安全に開始し、hard policy、予算予約、Pueue task identity、再起動復旧、診断を supervisor が所有する control plane です。実験完了後の自律的な次 proposal の生成、実行中の periodic observer とそれに基づく campaign health-decision loop、goal evaluation、隔離された code worktree は後続 Phase で実装する範囲であり、現時点では自動で次の学習を投入しません。
+上の4コマンド以外に controller script や project 固有 adapter は不要です。Phase 2 は baseline/control plane と安全な復旧に加え、terminal experiment から次の非 code experiment へ進む `terminal completion loop` を提供します。成功・失敗が一意に reconciliation されると decision cycle が作られ、Linux の read-only decision agent が bounded evidence から exactly one structured decision を返します。`proposal` は既存 coordinator と rolling experiment budget を通して投入され、`finite wait` は task を追加せず有限の `next_wake_at` を保存します。
+
+decision analysis も agent-run hourly budget を消費します。1 cycle の連続失敗は service-owned `max_decision_attempts_per_cycle`（既定 3）、wait は `max_decision_wait_minutes`（既定 1,440 分）で制限されます。上限まで失敗すると cycle と campaign は `degraded` になり、自動 proposal は止まります。`status --json` の `campaign.decision` で `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、bounded な failure code/summary を確認し、raw evidence や decision body を期待しないでください。
+
+Phase 3 の `running OOM/stall observer`、実行中 experiment の `periodic observer` による campaign health-decision loop、`goal review`、隔離された `code worktree` はまだ利用できません。既存 detector/Periodic DeepCheck は別機能であり、running health を継続評価して自動的に campaign を打ち切る observer ではありません。
 
 service-owned execution policy では network が既定で enabled です。ただし network access と credential access は別の権限であり、明示 allowlist にない credential/environment value は agent や agent task に継承されません。
 
