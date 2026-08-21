@@ -294,6 +294,7 @@ enum BoundCleanupKind {
         retained_authority: RetainedLaunchAuthority,
         finalized: bool,
     },
+    PendingFinalization,
     PendingMarker,
 }
 
@@ -385,7 +386,10 @@ impl BoundCleanupHandle {
                 finalized: false,
                 ..
             }
-        ) || matches!(&self.kind, BoundCleanupKind::PendingMarker);
+        ) || matches!(
+            &self.kind,
+            BoundCleanupKind::PendingFinalization | BoundCleanupKind::PendingMarker
+        );
         if needs_finalization {
             let scoped_db = deadline_scoped_db(db, deadline)?;
             let db = scoped_db.as_ref().unwrap_or(db);
@@ -419,6 +423,7 @@ impl BoundCleanupHandle {
             }
             BoundCleanupKind::LiveChild { .. }
             | BoundCleanupKind::RetainedTemp { .. }
+            | BoundCleanupKind::PendingFinalization
             | BoundCleanupKind::PendingMarker => {}
         }
         match &mut self.kind {
@@ -430,7 +435,7 @@ impl BoundCleanupHandle {
                 retained_authority,
                 ..
             } => *retained_authority = RetainedLaunchAuthority::Released,
-            BoundCleanupKind::PendingMarker => {}
+            BoundCleanupKind::PendingFinalization | BoundCleanupKind::PendingMarker => {}
         }
         Ok(())
     }
@@ -1369,14 +1374,34 @@ fn resolve_unowned_decision_bind_failure(
     source: AppError,
 ) -> AgentSpawnError {
     // A failed bind never transferred decision-attempt ownership to this run.
-    resolve_bound_failure(
+    let intent = BoundFinalizationIntent::from_failure(&source, policy);
+    let mut error = resolve_bound_failure(
         repository,
         project,
         run_id,
         finished_at,
         policy,
         source,
-    )
+    );
+    if matches!(
+        error.stage,
+        AgentSpawnStage::RunBoundPreMarker {
+            resolved: false,
+            ..
+        } | AgentSpawnStage::PostMarker {
+            resolved: false,
+            ..
+        }
+    ) {
+        error.cleanup = Some(BoundCleanupHandle {
+            project_id: project.project_id.clone(),
+            run_id,
+            intent,
+            kind: BoundCleanupKind::PendingFinalization,
+            decision_failure: None,
+        });
+    }
+    error
 }
 
 fn pending_decision_finalization_error(
@@ -1561,7 +1586,9 @@ async fn resolve_live_child_failure(
 
     let termination_uncertain = match &cleanup.kind {
         BoundCleanupKind::LiveChild { child, .. } => child.termination_uncertain(),
-        BoundCleanupKind::RetainedTemp { .. } | BoundCleanupKind::PendingMarker => false,
+        BoundCleanupKind::RetainedTemp { .. }
+        | BoundCleanupKind::PendingFinalization
+        | BoundCleanupKind::PendingMarker => false,
     };
     if !termination_uncertain {
         match cleanup.retry(db, finished_at).await {
@@ -2248,6 +2275,183 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM decision_attempts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn unowned_decision_bind_finalization_failure_retains_db_retry_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        let project = crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
+                "project-a",
+                &root,
+                "pa-project-a",
+                root.join(".pueue-agent/config.toml"),
+                1,
+            ))
+            .unwrap();
+        let objective = crate::state::ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "objective-digest".to_owned(),
+        };
+        let baseline = crate::proposals::validate_initial_baseline(
+            crate::proposals::ProposalInput {
+                kind: crate::models::ProposalKind::Experiment,
+                hypothesis: "Measure the initial command".to_owned(),
+                source_experiment_id: None,
+                argv: vec!["python".to_owned(), "train.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        crate::db::CampaignRepository::new(&db)
+            .start_with_baseline(
+                crate::db::StartCampaignRequest {
+                    campaign_id: "campaign-a",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: baseline.argv(),
+                    baseline: &baseline,
+                    submission_id: "submission-a",
+                    experiment_id: "experiment-a",
+                    proposal_id: "proposal-a",
+                    metadata: &serde_json::json!({}),
+                    origin_agent_run_id: None,
+                    now: 2,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        let experiments = crate::db::ExperimentRepository::new(&db);
+        experiments.mark_submitting("experiment-a", 3).unwrap();
+        experiments
+            .mark_accepted("experiment-a", 41, "pueue-task:v1:bind-failure", 4)
+            .unwrap();
+        experiments
+            .project_terminal_submission(
+                "experiment-a",
+                41,
+                crate::models::ExperimentTerminalOutcome::Succeeded,
+                5,
+            )
+            .unwrap();
+        let decisions = DecisionRepository::new(&db);
+        let cycle = decisions
+            .ensure_cycle_for_terminal("campaign-a", "experiment-a", 6)
+            .unwrap();
+        let reservation = decisions
+            .reserve_next_attempt("project-a", &cycle.cycle_id, 7)
+            .unwrap()
+            .unwrap();
+
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
+                "project-a",
+                crate::models::EventKind::CampaignDecision,
+                "bind-finalization-failure",
+                serde_json::json!({}),
+                8,
+                8,
+            ))
+            .unwrap();
+        crate::db::EventRepository::new(&db)
+            .claim_batch(8, 100, 1)
+            .unwrap();
+        let repository = AgentRunRepository::new(&db);
+        let run = repository
+            .insert_with_events(
+                &NewAgentRun::new(
+                    "project-a",
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    9,
+                    root.join(".pueue-agent/logs/bind-finalization-failure.log"),
+                ),
+                &[event.event_id],
+            )
+            .unwrap();
+        let bind_error = decisions.bind_agent_run(&reservation, run.run_id, 10).unwrap_err();
+        db.connect()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_unowned_bind_finalization
+                 BEFORE UPDATE OF status ON agent_runs
+                 WHEN OLD.run_id = {} AND NEW.status = 'failed'
+                 BEGIN SELECT RAISE(ABORT, 'injected agent-run finalizer failure'); END;",
+                run.run_id
+            ))
+            .unwrap();
+
+        let mut error = resolve_unowned_decision_bind_failure(
+            &repository,
+            &project,
+            run.run_id,
+            11,
+            RetryPolicy { max_retries: 1 },
+            bind_error,
+        );
+        assert_eq!(
+            error.stage,
+            AgentSpawnStage::RunBoundPreMarker {
+                run_id: run.run_id,
+                resolved: false,
+            }
+        );
+        let mut cleanup = error.cleanup.take().expect("DB retry authority retained");
+        let read_attempt_state = || {
+            db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT state, agent_run_id, started_at, finished_at
+                     FROM decision_attempts
+                     WHERE cycle_id = ?1 AND attempt_number = ?2",
+                    rusqlite::params![reservation.cycle_id, reservation.attempt_number],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let attempt_before_retry = read_attempt_state();
+        assert_eq!(attempt_before_retry.0, "reserved");
+        assert_eq!(attempt_before_retry.1, None);
+        assert_eq!(
+            repository.list_by_project("project-a", 10).unwrap()[0].status,
+            AgentRunStatus::Starting
+        );
+
+        db.connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_unowned_bind_finalization")
+            .unwrap();
+        cleanup.retry(&db, 12).await.unwrap();
+
+        let attempt_after_retry = read_attempt_state();
+        assert_eq!(attempt_after_retry, attempt_before_retry);
+        assert_eq!(
+            repository.list_by_project("project-a", 10).unwrap()[0].status,
+            AgentRunStatus::Failed
+        );
+        let event_status: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM events WHERE event_id = ?1",
+                [event.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_status, "retry_wait");
     }
 
     #[tokio::test]
