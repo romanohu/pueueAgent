@@ -790,6 +790,108 @@ mod decision_context {
             .store_evidence(&reservation, &first.json, &first.digest, 201)
             .unwrap();
     }
+
+    #[test]
+    fn decision_context_uses_the_newest_finished_terminal_experiments() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let connection = harness.db.connect().unwrap();
+        for index in 0..97_i64 {
+            let submission_id = format!("submission-history-{index:03}");
+            let experiment_id = format!("experiment-history-{index:03}");
+            let created_at = 1_000 + index;
+            let finished_at = 2_000 + index;
+            connection
+                .execute(
+                    "INSERT INTO submissions (
+                         submission_id, project_id, argv_json, created_at, pueue_task_id,
+                         task_signature, status, kind, metadata_json, origin_agent_run_id
+                     ) VALUES (?1, ?2, '[\"true\"]', ?3, NULL, NULL,
+                               'accepted', 'experiment', '{}', NULL)",
+                    params![submission_id, harness.project_id, created_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO experiments (
+                         experiment_id, campaign_id, proposal_id, submission_id,
+                         parent_experiment_id, attempt, status, pueue_task_id,
+                         task_signature, failure_code, failure_fingerprint,
+                         created_at, updated_at, finished_at
+                     ) VALUES (?1, ?2, 'proposal-baseline', ?3, ?4, ?5,
+                               'succeeded', NULL, NULL, NULL, NULL, ?6, ?7, ?7)",
+                    params![
+                        experiment_id,
+                        harness.campaign_id,
+                        submission_id,
+                        harness.experiment_id,
+                        index + 1,
+                        created_at,
+                        finished_at,
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                     submission_id, project_id, argv_json, created_at, pueue_task_id,
+                     task_signature, status, kind, metadata_json, origin_agent_run_id
+                 ) VALUES ('submission-old-created-newest-finished', ?1, '[\"true\"]', 1,
+                           NULL, NULL, 'accepted', 'experiment', '{}', NULL)",
+                [&harness.project_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO experiments (
+                     experiment_id, campaign_id, proposal_id, submission_id,
+                     parent_experiment_id, attempt, status, pueue_task_id,
+                     task_signature, failure_code, failure_fingerprint,
+                     created_at, updated_at, finished_at
+                 ) VALUES ('experiment-old-created-newest-finished', ?1, 'proposal-baseline',
+                           'submission-old-created-newest-finished', ?2, 500, 'succeeded',
+                           NULL, NULL, NULL, NULL, 1, 100000, 100000)",
+                params![harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let project = ProjectRepository::new(&harness.db)
+            .find_by_id(&harness.project_id)
+            .unwrap()
+            .unwrap();
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let pueue_tasks = [DecisionPueueTaskProjection {
+            task_id: 41,
+            task_signature: "pueue-task:v1:decision-fixture".to_owned(),
+            group: "pa-campaign-project".to_owned(),
+            state: "done".to_owned(),
+            enqueued_at: Some(100),
+            started_at: Some(101),
+            ended_at: Some(103),
+            exit_code: Some(0),
+        }];
+        let bundle = DecisionEvidenceBuilder::new(&harness.db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &pueue_tasks,
+                observed_at: 100_001,
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&bundle.json).unwrap();
+        let outcomes = value["recent_outcomes"]["experiments"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 32);
+        assert_eq!(
+            outcomes[0]["experiment_id"],
+            "experiment-old-created-newest-finished"
+        );
+    }
 }
 
 struct V15Fixture {

@@ -107,11 +107,8 @@ impl<'db> DecisionEvidenceBuilder<'db> {
         });
         proposals.sort_unstable_by(compare_proposals);
         proposals.truncate(MAX_RECENT_OUTCOMES);
-        let mut experiments = ExperimentRepository::new(self.db)
-            .list_for_campaign(&campaign.campaign_id, MAX_RECENT_OUTCOMES * 3)?;
-        experiments.retain(|experiment| is_terminal(experiment.status));
-        experiments.sort_unstable_by(compare_experiments);
-        experiments.truncate(MAX_RECENT_OUTCOMES);
+        let experiments = ExperimentRepository::new(self.db)
+            .list_terminal_for_campaign(&campaign.campaign_id, MAX_RECENT_OUTCOMES)?;
         let status = CampaignRepository::new(self.db)
             .status_projection_for_project(&campaign.project_id, request.observed_at)?
             .ok_or_else(|| validation_error("campaign", "has no status projection"))?;
@@ -386,13 +383,6 @@ fn compare_proposals(left: &Proposal, right: &Proposal) -> std::cmp::Ordering {
         .created_at
         .cmp(&left.created_at)
         .then_with(|| right.proposal_id.cmp(&left.proposal_id))
-}
-
-fn compare_experiments(left: &Experiment, right: &Experiment) -> std::cmp::Ordering {
-    right
-        .finished_at
-        .cmp(&left.finished_at)
-        .then_with(|| right.experiment_id.cmp(&left.experiment_id))
 }
 
 fn compare_interventions(left: &Intervention, right: &Intervention) -> std::cmp::Ordering {

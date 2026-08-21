@@ -1414,6 +1414,30 @@ impl<'db> ExperimentRepository<'db> {
         Ok(experiments)
     }
 
+    pub fn list_terminal_for_campaign(
+        &self,
+        campaign_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Experiment>, AppError> {
+        validate_inspection_limit(limit)?;
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{EXPERIMENT_SELECT} WHERE campaign_id = ?1
+                   AND status IN ('succeeded','failed','cancelled')
+                 ORDER BY finished_at DESC, experiment_id DESC LIMIT ?2"
+            ))
+            .map_err(database_error(
+                "prepare terminal campaign experiment list",
+            ))?;
+        let experiments = statement
+            .query_map(params![campaign_id, limit as i64], experiment_from_row)
+            .map_err(database_error("query terminal campaign experiment list"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read terminal campaign experiment list"))?;
+        Ok(experiments)
+    }
+
     pub fn inspect_for_campaign(
         &self,
         campaign_id: &str,

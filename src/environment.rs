@@ -92,8 +92,17 @@ pub fn collect_decision_artifact_hints(
             root_mount,
         };
         let result = scan_artifact_hints(&verified.directory, "", 0, &mut state);
-        root_anchor.verify_identity()?;
-        result?;
+        finish_artifact_scan_with_mount_reader(
+            root_anchor,
+            root_mount,
+            result,
+            |directory| {
+                directory_mount_identity_at(
+                    directory,
+                    PolicyViolationStage::RunBoundPreMarker,
+                )
+            },
+        )?;
         state.hints.sort_unstable_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -103,6 +112,23 @@ pub fn collect_decision_artifact_hints(
         state.hints.truncate(max_hints);
         Ok(state.hints)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_artifact_scan_with_mount_reader<F>(
+    root_anchor: &crate::execution_policy::ProjectRootAnchor,
+    captured_mount: MountIdentity,
+    scan_result: Result<(), PolicyViolation>,
+    mount_reader: F,
+) -> Result<(), PolicyViolation>
+where
+    F: FnOnce(&File) -> Result<MountIdentity, PolicyViolation>,
+{
+    let verified = root_anchor.verify_identity()?;
+    if mount_reader(&verified.directory)? != captured_mount {
+        return Err(temp_violation(TempUnsafeReason::MountBoundary));
+    }
+    scan_result
 }
 
 const BASELINE_NAMES: &[&str] = &[
@@ -3544,6 +3570,44 @@ mod tests {
         temp.cleanup_contents_before_with_test_state(None, &mut test_state)
             .unwrap();
         assert_eq!(test_state.sync_attempts, 3);
+    }
+
+    #[test]
+    fn decision_artifact_root_mount_revalidation_precedes_success_and_saved_scan_error() {
+        let holder = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(holder.path()).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root).unwrap();
+        let captured = MountIdentity([41, 0]);
+        let changed = MountIdentity([42, 0]);
+
+        for scan_result in [
+            Ok(()),
+            Err(temp_violation(TempUnsafeReason::EntryLimit)),
+        ] {
+            let error = finish_artifact_scan_with_mount_reader(
+                &anchor,
+                captured,
+                scan_result,
+                |_| Ok(changed),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.detail,
+                PolicyViolationDetail::TempUnsafe(TempUnsafeReason::MountBoundary)
+            );
+        }
+
+        let error = finish_artifact_scan_with_mount_reader(
+            &anchor,
+            captured,
+            Err(temp_violation(TempUnsafeReason::EntryLimit)),
+            |_| Ok(captured),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::EntryLimit)
+        );
     }
 }
 
