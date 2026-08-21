@@ -2037,7 +2037,20 @@ async fn daemon_shutdown_attempts_later_agent_after_first_finalizer_persists() {
     );
     assert!(result.is_err());
     assert_eq!(harness.event_status(event_a), EventStatus::Dispatched);
-    assert_eq!(harness.event_status(event_b), EventStatus::Dispatched);
+    assert_eq!(harness.event_status(event_b), EventStatus::RetryWait);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM agent_runs WHERE project_id = 'project-b'",
+                [],
+                |row| row.get::<_, AgentRunStatus>(0),
+            )
+            .unwrap(),
+        AgentRunStatus::TimedOut
+    );
     assert_eq!(
         harness
             .db
@@ -2049,7 +2062,7 @@ async fn daemon_shutdown_attempts_later_agent_after_first_finalizer_persists() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        2,
+        1,
     );
 }
 
@@ -2710,7 +2723,7 @@ async fn injected_shutdown_signal_cancels_daemon_token() {
 }
 
 #[tokio::test]
-async fn daemon_restart_recovers_expired_claims_without_requiring_a_new_callback() {
+async fn daemon_restart_recovers_expired_claims_into_a_finite_paused_wait() {
     let harness = DaemonHarness::new();
     harness.pause_project("project-a");
     let event_id = harness.enqueue(
@@ -2727,7 +2740,9 @@ async fn daemon_restart_recovers_expired_claims_without_requiring_a_new_callback
         .find_by_id(event_id)
         .unwrap()
         .unwrap();
-    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, harness.now + 60);
+    assert_eq!(event.attempts, 0);
     assert_eq!(event.lease_until, None);
 }
 

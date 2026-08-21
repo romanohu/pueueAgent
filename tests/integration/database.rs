@@ -1793,9 +1793,18 @@ mod decision_cycle {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum FinalizerProjectAuthority {
+        Active,
+        Disabled,
+        Paused,
+        Halted,
+    }
+
     fn finalize_failed_decision_with_terminal_resolution(
         resolution: EventResolution,
         campaign_state_before_finalization: Option<CampaignState>,
+        project_authority: FinalizerProjectAuthority,
         limits: CampaignLimits,
     ) -> (CampaignDbHarness, String, i64) {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
@@ -1865,6 +1874,26 @@ mod decision_cycle {
                 )
                 .unwrap();
         }
+        let project_update = match project_authority {
+            FinalizerProjectAuthority::Active => None,
+            FinalizerProjectAuthority::Disabled => Some("enabled = 0"),
+            FinalizerProjectAuthority::Paused => Some("paused = 1"),
+            FinalizerProjectAuthority::Halted => Some("halted_reason = 'test_halt'"),
+        };
+        if let Some(project_update) = project_update {
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .execute(
+                    &format!(
+                        "UPDATE projects SET {project_update}, updated_at = 196
+                         WHERE project_id = ?1"
+                    ),
+                    [&harness.project_id],
+                )
+                .unwrap();
+        }
         runs.finish_and_resolve_events(
             &harness.project_id,
             run.run_id,
@@ -1893,6 +1922,7 @@ mod decision_cycle {
                 finalize_failed_decision_with_terminal_resolution(
                     resolution,
                     None,
+                    FinalizerProjectAuthority::Active,
                     CampaignLimits::default(),
                 );
             let event = EventRepository::new(&harness.db)
@@ -1928,6 +1958,7 @@ mod decision_cycle {
                 reason: "execution result unavailable".to_owned(),
             },
             Some(CampaignState::Retired),
+            FinalizerProjectAuthority::Active,
             CampaignLimits::default(),
         );
 
@@ -1954,6 +1985,7 @@ mod decision_cycle {
         let (harness, cycle_id, event_id) = finalize_failed_decision_with_terminal_resolution(
             EventResolution::RetryPolicy(RetryPolicy { max_retries: 2 }),
             None,
+            FinalizerProjectAuthority::Active,
             CampaignLimits {
                 max_decision_attempts_per_cycle: 1,
                 ..CampaignLimits::default()
@@ -1974,6 +2006,78 @@ mod decision_cycle {
                 .state,
             DecisionCycleState::Degraded,
             "exhausted cycle {cycle_id} must remain terminal"
+        );
+    }
+
+    #[test]
+    fn retryable_decision_finalizer_keeps_temporarily_gated_authority_finite() {
+        for (campaign_state, project_authority) in [
+            (
+                Some(CampaignState::Paused),
+                FinalizerProjectAuthority::Active,
+            ),
+            (None, FinalizerProjectAuthority::Disabled),
+            (None, FinalizerProjectAuthority::Paused),
+            (None, FinalizerProjectAuthority::Halted),
+        ] {
+            let (harness, cycle_id, event_id) =
+                finalize_failed_decision_with_terminal_resolution(
+                    EventResolution::RetryPolicy(RetryPolicy { max_retries: 2 }),
+                    campaign_state,
+                    project_authority,
+                    CampaignLimits::default(),
+                );
+            let event = EventRepository::new(&harness.db)
+                .find_by_id(event_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.status, EventStatus::RetryWait);
+            assert_eq!(event.not_before, 257);
+            assert_eq!(event.completed_at, None);
+            assert_eq!(event.attempts, 0);
+            assert_eq!(
+                DecisionRepository::new(&harness.db)
+                    .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                DecisionCycleState::Pending,
+                "temporarily gated cycle {cycle_id} must remain resumable"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_policy_deadletters_and_degrades_a_retired_decision_without_reactivation() {
+        let (harness, cycle_id, event_id) = finalize_failed_decision_with_terminal_resolution(
+            EventResolution::RetryPolicy(RetryPolicy { max_retries: 2 }),
+            Some(CampaignState::Retired),
+            FinalizerProjectAuthority::Active,
+            CampaignLimits::default(),
+        );
+
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::DeadLetter);
+        assert_eq!(event.completed_at, Some(197));
+        assert_eq!(
+            DecisionRepository::new(&harness.db)
+                .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DecisionCycleState::Degraded,
+            "retired cycle {cycle_id} must be terminal"
+        );
+        assert_eq!(
+            CampaignRepository::new(&harness.db)
+                .find_by_id(&harness.campaign_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            CampaignState::Retired
         );
     }
 
@@ -2126,67 +2230,13 @@ mod decision_cycle {
                 RetryPolicy { max_retries: 0 },
             )
             .unwrap();
-        harness
-            .db
-            .connect()
-            .unwrap()
-            .execute_batch(&format!(
-                "CREATE TRIGGER reject_unbound_decision_event_recovery
-                 BEFORE UPDATE OF status ON events
-                 WHEN OLD.event_id = {} AND NEW.status = 'retry_wait'
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected unbound decision event recovery failure');
-                 END;",
-                event.event_id
-            ))
-            .unwrap();
-
-        assert!(decisions
-            .recover_unbound_attempt_event(&reservation, event.event_id, 196, 256)
-            .is_err());
-        let interrupted: (DecisionCycleState, DecisionAttemptState, EventStatus) = harness
-            .db
-            .connect()
-            .unwrap()
-            .query_row(
-                "SELECT dc.state, da.state, ev.status
-                 FROM decision_cycles dc
-                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
-                 JOIN events ev ON ev.event_id = ?3
-                 WHERE dc.cycle_id = ?1 AND da.attempt_number = ?2",
-                params![
-                    reservation.cycle_id,
-                    reservation.attempt_number,
-                    event.event_id,
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            interrupted,
-            (
-                DecisionCycleState::Analyzing,
-                DecisionAttemptState::EvidenceReady,
-                EventStatus::DeadLetter,
-            )
-        );
-        harness
-            .db
-            .connect()
-            .unwrap()
-            .execute_batch("DROP TRIGGER reject_unbound_decision_event_recovery;")
-            .unwrap();
-
-        decisions
-            .recover_unbound_attempt_event(&reservation, event.event_id, 196, 256)
-            .unwrap();
 
         let recovered = EventRepository::new(&harness.db)
             .find_by_id(event.event_id)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.status, EventStatus::RetryWait);
-        assert_eq!(recovered.not_before, 256);
+        assert_eq!(recovered.not_before, 254);
         assert_eq!(recovered.completed_at, None);
         assert_eq!(
             EventRepository::new(&harness.db)
@@ -2248,7 +2298,7 @@ mod decision_cycle {
     }
 
     #[test]
-    fn finalized_unowned_bind_cleanup_repairs_the_exact_dead_letter_once() {
+    fn retained_unowned_bind_cleanup_atomically_recovers_run_attempt_cycle_and_event() {
         let harness =
             CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let decisions = DecisionRepository::new(&harness.db);
@@ -2286,11 +2336,12 @@ mod decision_cycle {
             .unwrap()
             .execute_batch(&format!(
                 "CREATE TRIGGER interrupt_retained_decision_cleanup
-                 BEFORE UPDATE OF status ON events
-                 WHEN OLD.event_id = {event_id} AND NEW.status = 'dead_letter'
+                 BEFORE UPDATE OF status ON agent_runs
+                 WHEN OLD.run_id = {} AND NEW.status = 'failed'
                  BEGIN
                      SELECT RAISE(ABORT, 'injected retained cleanup interruption');
-                 END;"
+                 END;",
+                run.run_id,
             ))
             .unwrap();
 
@@ -2303,23 +2354,38 @@ mod decision_cycle {
                 RetryPolicy { max_retries: 0 },
             )
             .is_err());
-        decisions
-            .try_requeue_unbound_attempt(&reservation, 194)
+        let rolled_back: (
+            AgentRunStatus,
+            DecisionCycleState,
+            DecisionAttemptState,
+            EventStatus,
+        ) = harness
+            .db
+            .connect()
             .unwrap()
+            .query_row(
+                "SELECT run.status, dc.state, da.state, ev.status
+                 FROM agent_runs run
+                 JOIN agent_run_events linked
+                   ON linked.project_id = run.project_id AND linked.run_id = run.run_id
+                 JOIN events ev
+                   ON ev.project_id = linked.project_id AND ev.event_id = linked.event_id
+                 JOIN decision_cycles dc ON dc.cycle_id = ?2
+                 JOIN decision_attempts da
+                   ON da.cycle_id = dc.cycle_id AND da.attempt_number = ?3
+                 WHERE run.run_id = ?1 AND ev.event_id = ?4",
+                params![run.run_id, reservation.cycle_id, reservation.attempt_number, event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
             .unwrap();
         assert_eq!(
-            decisions
-                .repair_finalized_unbound_attempt_events(195, 255)
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            EventRepository::new(&harness.db)
-                .find_by_id(event_id)
-                .unwrap()
-                .unwrap()
-                .status,
-            EventStatus::InFlight
+            rolled_back,
+            (
+                AgentRunStatus::Starting,
+                DecisionCycleState::Analyzing,
+                DecisionAttemptState::EvidenceReady,
+                EventStatus::InFlight,
+            )
         );
 
         harness
@@ -2336,34 +2402,42 @@ mod decision_cycle {
             RetryPolicy { max_retries: 0 },
         )
         .unwrap();
-        assert_eq!(
-            EventRepository::new(&harness.db)
-                .find_by_id(event_id)
-                .unwrap()
-                .unwrap()
-                .status,
-            EventStatus::DeadLetter
-        );
-
-        assert_eq!(
-            decisions
-                .repair_finalized_unbound_attempt_events(197, 257)
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            decisions
-                .repair_finalized_unbound_attempt_events(198, 258)
-                .unwrap(),
-            0
-        );
         let recovered = EventRepository::new(&harness.db)
             .find_by_id(event_id)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.status, EventStatus::RetryWait);
-        assert_eq!(recovered.not_before, 257);
+        assert_eq!(recovered.not_before, 256);
         assert_eq!(recovered.attempts, 0);
+        let recovered_lineage: (
+            AgentRunStatus,
+            DecisionCycleState,
+            DecisionAttemptState,
+            Option<i64>,
+        ) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT run.status, dc.state, da.state, da.agent_run_id
+                 FROM agent_runs run
+                 JOIN decision_cycles dc ON dc.cycle_id = ?2
+                 JOIN decision_attempts da
+                   ON da.cycle_id = dc.cycle_id AND da.attempt_number = ?3
+                 WHERE run.run_id = ?1",
+                params![run.run_id, reservation.cycle_id, reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_lineage,
+            (
+                AgentRunStatus::Failed,
+                DecisionCycleState::Pending,
+                DecisionAttemptState::Reserved,
+                None,
+            )
+        );
         assert_eq!(harness.scalar("SELECT COUNT(*) FROM decision_attempts"), 1);
         assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 1);
     }
@@ -2455,12 +2529,6 @@ mod decision_cycle {
         assert_eq!(failed.status, EventStatus::DeadLetter);
         assert_eq!(failed.attempts, 1);
         assert_eq!(
-            decisions
-                .repair_finalized_unbound_attempt_events(200, 260)
-                .unwrap(),
-            0
-        );
-        assert_eq!(
             EventRepository::new(&harness.db)
                 .find_by_id(event_id)
                 .unwrap()
@@ -2474,6 +2542,76 @@ mod decision_cycle {
                 "SELECT COUNT(*) FROM budget_reservations WHERE dimension = 'agent_run'"
             ),
             1
+        );
+    }
+
+    #[test]
+    fn replayed_no_run_recovery_rolls_back_the_event_attempt_exactly_once() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = 'retry_wait', attempts = 2, not_before = 252
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+
+        decisions
+            .recover_unbound_attempt_event(&reservation, event_id, 193, 253)
+            .unwrap()
+            .unwrap();
+        decisions
+            .recover_unbound_attempt_event(&reservation, event_id, 194, 254)
+            .unwrap()
+            .unwrap();
+
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::RetryWait);
+        assert_eq!(event.attempts, 1);
+        assert_eq!(event.not_before, 252);
+        let lineage = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.state, da.state, da.agent_run_id
+                 FROM decision_cycles dc
+                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                 WHERE dc.cycle_id = ?1 AND da.attempt_number = ?2",
+                params![cycle_id, reservation.attempt_number],
+                |row| {
+                    Ok((
+                        row.get::<_, DecisionCycleState>(0)?,
+                        row.get::<_, DecisionAttemptState>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            lineage,
+            (
+                DecisionCycleState::Pending,
+                DecisionAttemptState::Reserved,
+                None,
+            )
         );
     }
 
@@ -10431,6 +10569,40 @@ fn expired_claim_is_recovered_after_restart_and_can_be_reclaimed() {
 
     let reclaimed = repository.claim_batch(111, 150, 1).unwrap();
     assert_eq!(reclaimed[0].event_id, event_id);
+    assert_eq!(reclaimed[0].attempts, 1);
+}
+
+#[test]
+fn generic_no_run_defer_rotates_to_the_lease_boundary_without_consuming_an_attempt() {
+    let test = TestDatabase::new();
+    let root = test.project_root("generic-defer-project");
+    register_project(&test.db, "project-a", &root, "pa-project-a");
+    let repository = EventRepository::new(&test.db);
+    let event = repository
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::DeepCheck,
+            "generic-finite-defer",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+
+    let claimed = repository.claim_batch(100, 160, 1).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].attempts, 1);
+    repository.defer_claimed(&[event.event_id]).unwrap();
+
+    let deferred = repository.find_by_id(event.event_id).unwrap().unwrap();
+    assert_eq!(deferred.status, EventStatus::RetryWait);
+    assert_eq!(deferred.not_before, 160);
+    assert_eq!(deferred.lease_until, None);
+    assert_eq!(deferred.attempts, 0);
+    assert!(repository.claim_batch(159, 219, 1).unwrap().is_empty());
+    let reclaimed = repository.claim_batch(160, 220, 1).unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].event_id, event.event_id);
     assert_eq!(reclaimed[0].attempts, 1);
 }
 

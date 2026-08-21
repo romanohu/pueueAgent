@@ -1098,6 +1098,168 @@ async fn claim_cap_rotates_ineligible_decisions_and_reaches_event_1002_on_the_ne
 }
 
 #[tokio::test]
+async fn generic_claim_cap_rotates_authority_deferrals_and_reaches_event_1001_on_tick_two() {
+    let harness = SchedulerHarness::new();
+    for (project_id, group) in [
+        ("project-b", "pb-project-b"),
+        ("project-c", "pc-project-c"),
+        ("project-d", "pd-project-d"),
+    ] {
+        harness.register_project(project_id, group, "/bin/echo", "");
+    }
+    let active_run_event = harness.enqueue(EventKind::DeepCheck, "project-d", "active-run-owner");
+    AgentRunRepository::new(&harness.db)
+        .insert(&NewAgentRun::new(
+            "project-d",
+            active_run_event,
+            None,
+            AgentRunStatus::Running,
+            1,
+            harness
+                .root("project-d")
+                .join(".pueue-agent/logs/generic-prefix-active-run.log"),
+        ))
+        .unwrap();
+    let mut connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "UPDATE projects SET enabled = 0 WHERE project_id = 'project-b';
+             UPDATE projects SET paused = 1 WHERE project_id = 'project-c';",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE events SET status = 'completed', completed_at = 1
+             WHERE event_id = ?1",
+            [active_run_event],
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    for ordinal in 1..=1_000_i64 {
+        let project_id = match ordinal % 3 {
+            0 => "project-b",
+            1 => "project-c",
+            _ => "project-d",
+        };
+        transaction
+            .execute(
+                "INSERT INTO events (
+                     project_id, kind, dedup_key, payload_json, status,
+                     attempts, not_before, created_at
+                 ) VALUES (?1, 'deep_check', ?2, '{}', 'pending', 0, 1, ?3)",
+                params![project_id, format!("generic-prefix-{ordinal:04}"), ordinal],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+    let eligible_event = harness.enqueue(EventKind::DeepCheck, "project-a", "generic-after-cap");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET created_at = 2_000 WHERE event_id = ?1",
+            [eligible_event],
+        )
+        .unwrap();
+
+    let first = harness.scheduler_with_claim_limit(1_000).tick().await.unwrap();
+    assert!(first.started.is_empty());
+    assert_eq!(harness.agent_run_count(), 0);
+    assert_eq!(harness.active_runs("project-d"), 1);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE dedup_key LIKE 'generic-prefix-%'
+                   AND status = 'retry_wait' AND attempts = 0 AND not_before = 160",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1_000
+    );
+
+    let mut second = harness.scheduler_with_claim_limit(1_000).tick().await.unwrap();
+    assert_eq!(second.started.len(), 1);
+    assert_eq!(second.started[0].primary_event_id, eligible_event);
+    assert_eq!(harness.agent_run_count(), 1);
+    assert_eq!(harness.active_runs("project-d"), 1);
+    second.started[0]
+        .handle
+        .wait(&harness.db, harness.now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_never_crosses_a_newer_unresolved_run_to_repair_old_decision_history() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let event_id = harness.campaign_decision_event_id();
+    let decisions = DecisionRepository::new(&harness.db);
+    let cycle = decisions
+        .find_cycle_for_source(
+            "scheduler-campaign",
+            "scheduler-campaign-experiment",
+        )
+        .unwrap()
+        .unwrap();
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle.cycle_id, 91)
+        .unwrap()
+        .unwrap();
+    decisions
+        .try_requeue_unbound_attempt(&reservation, 92)
+        .unwrap()
+        .unwrap();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE events
+             SET status = 'dead_letter', attempts = 1, completed_at = 93
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO agent_runs (
+                 run_id, project_id, primary_event_id, status, started_at,
+                 finished_at, log_path, launch_gate_state
+             ) VALUES
+                 (9001, 'project-a', {event_id}, 'failed', 93, 94,
+                  '/tmp/older-terminal-decision.log', 'failed'),
+                 (9002, 'project-a', {event_id}, 'starting', 95, NULL,
+                  '/tmp/newer-unresolved-decision.log', 'pending');
+             INSERT INTO agent_run_events (project_id, run_id, event_id) VALUES
+                 ('project-a', 9001, {event_id}),
+                 ('project-a', 9002, {event_id});"
+        ))
+        .unwrap();
+    drop(connection);
+
+    let report = harness.scheduler_with_claim_limit(1).tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.attempts, 1);
+    assert_eq!(
+        harness.decision_cycle_attempt_projection(),
+        (
+            DecisionCycleState::Pending,
+            DecisionAttemptState::Reserved,
+            None,
+            1,
+        )
+    );
+}
+
+#[tokio::test]
 async fn campaign_decision_precedes_generic_idle_work() {
     let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
     let idle_event_id = harness.enqueue_for_campaign(
@@ -1113,7 +1275,10 @@ async fn campaign_decision_precedes_generic_idle_work() {
     assert_eq!(report.started[0].mode, "campaign_decision");
     #[cfg(not(target_os = "linux"))]
     assert!(report.started.is_empty());
-    assert_eq!(harness.event_status(idle_event_id), EventStatus::Pending);
+    let idle_event = harness.event(idle_event_id);
+    assert_eq!(idle_event.status, EventStatus::RetryWait);
+    assert_eq!(idle_event.not_before, harness.now + 60);
+    assert_eq!(idle_event.attempts, 0);
 }
 
 #[tokio::test]
@@ -1548,7 +1713,8 @@ async fn paused_campaign_defers_lineaged_events_without_failing_the_scheduler_ti
 
     assert!(report.started.is_empty());
     let event = harness.event(event_id);
-    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, harness.now + 60);
     assert_eq!(event.attempts, 0);
     assert_eq!(harness.active_runs("project-a"), 0);
 }
@@ -1584,7 +1750,8 @@ async fn project_pause_winning_before_scheduler_admission_prevents_a_durable_run
     }
     assert_eq!(started_count, 0);
     let event = harness.event(event_id);
-    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, harness.now + 60);
     assert_eq!(event.attempts, 0);
     assert_eq!(harness.active_runs("project-a"), 0);
 }
@@ -2094,8 +2261,10 @@ async fn active_agent_temp_is_deferred_not_classified_as_crash_retained() {
     let result = scheduler.tick().await;
 
     assert!(result.is_ok(), "active project should be deferred, not failed");
-    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
-    assert_eq!(harness.event(event_id).attempts, 0);
+    let deferred = harness.event(event_id);
+    assert_eq!(deferred.status, EventStatus::RetryWait);
+    assert_eq!(deferred.not_before, harness.now + 60);
+    assert_eq!(deferred.attempts, 0);
     assert!(harness.agent_run_states().iter().all(|(status, _, _)| {
         *status == AgentRunStatus::Running
     }));
@@ -2351,9 +2520,10 @@ async fn upgrade_contention_defers_claim_without_consuming_event_retry() {
 
     assert!(report.started.is_empty());
     let event = harness.event(event_id);
-    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.status, EventStatus::RetryWait);
     assert_eq!(event.attempts, 0);
     assert_eq!(event.lease_until, None);
+    assert_eq!(event.not_before, harness.now + 60);
     assert_eq!(event.last_error, None);
     assert_eq!(harness.intervention_state(&intervention_id).0,
         pueue_agent::interventions::InterventionStatus::Pending);
@@ -2404,9 +2574,10 @@ async fn upgrade_contention_defers_claim_when_reservation_release_fails() {
         .to_string()
         .contains("injected upgrade reservation release failure"));
     let event = harness.event(event_id);
-    assert_eq!(event.status, EventStatus::Pending);
+    assert_eq!(event.status, EventStatus::RetryWait);
     assert_eq!(event.attempts, 0);
     assert_eq!(event.lease_until, None);
+    assert_eq!(event.not_before, harness.now + 60);
     assert_eq!(event.last_error, None);
     assert_eq!(
         harness.intervention_state(&intervention_id),
@@ -3329,8 +3500,8 @@ async fn post_marker_finalizer_failure_reports_unresolved_stage_for_recovery() {
 }
 
 #[tokio::test]
-async fn recorded_operator_wake_stays_pending_while_paused_then_dispatches_after_resume() {
-    let harness = SchedulerHarness::new();
+async fn recorded_operator_wake_waits_finitely_while_paused_then_dispatches_after_resume() {
+    let mut harness = SchedulerHarness::new();
     let wake = pueue_agent::events::record_operator_wake_with(
         &harness.db,
         "project-a",
@@ -3343,10 +3514,15 @@ async fn recorded_operator_wake_stays_pending_while_paused_then_dispatches_after
         .unwrap();
     let mut scheduler = harness.scheduler();
     assert!(scheduler.tick().await.unwrap().started.is_empty());
-    assert_eq!(harness.event_status(wake), EventStatus::Pending);
+    let deferred = harness.event(wake);
+    assert_eq!(deferred.status, EventStatus::RetryWait);
+    assert_eq!(deferred.not_before, harness.now + 60);
+    assert_eq!(deferred.attempts, 0);
     ProjectRepository::new(&harness.db)
         .resume("project-a", harness.now + 1)
         .unwrap();
+    harness.now += 60;
+    let mut scheduler = harness.scheduler();
     let report = scheduler.tick().await.unwrap();
     assert_eq!(report.started.len(), 1);
     assert_eq!(report.started[0].mode, "operator_wake");
@@ -3375,7 +3551,10 @@ async fn active_agent_prevents_new_claim_for_same_project() {
 
     assert!(report.started.is_empty());
     assert_eq!(harness.active_runs("project-a"), 1);
-    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    let deferred = harness.event(event_id);
+    assert_eq!(deferred.status, EventStatus::RetryWait);
+    assert_eq!(deferred.not_before, harness.now + 60);
+    assert_eq!(deferred.attempts, 0);
 }
 
 #[tokio::test]

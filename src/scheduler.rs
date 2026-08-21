@@ -215,12 +215,6 @@ impl Scheduler {
         let recovered_leases = self
             .recover_expired_leases()
             .map_err(SchedulerTickError::from_source)?;
-        DecisionRepository::new(&self.db)
-            .repair_finalized_unbound_attempt_events(
-                self.config.now,
-                self.config.now + self.config.lease_seconds,
-            )
-            .map_err(SchedulerTickError::from_source)?;
         let claimed = EventRepository::new(&self.db)
             .claim_batch_excluding_projects(
                 self.config.now,
@@ -852,13 +846,7 @@ impl Scheduler {
                             report.cleanup.push(cleanup);
                         }
                         let decisions = DecisionRepository::new(&self.db);
-                        let recovery_resolved = matches!(
-                            stage,
-                            AgentSpawnStage::PreBinding
-                                | AgentSpawnStage::RunBoundPreMarker { resolved: true, .. }
-                                | AgentSpawnStage::PostMarker { resolved: true, .. }
-                        );
-                        let requeued = if recovery_resolved {
+                        let requeued = if matches!(stage, AgentSpawnStage::PreBinding) {
                             return_scheduler_error!(decisions.recover_unbound_attempt_event(
                                 &decision_reservation,
                                 primary.event_id,
@@ -866,10 +854,7 @@ impl Scheduler {
                                 self.config.now + self.config.lease_seconds,
                             ))
                         } else {
-                            return_scheduler_error!(decisions.try_requeue_unbound_attempt(
-                                &decision_reservation,
-                                self.config.now,
-                            ))
+                            None
                         };
                         if matches!(stage, AgentSpawnStage::PreBinding) && !retained_cleanup {
                             if requeued.is_none() {

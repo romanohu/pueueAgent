@@ -32,19 +32,23 @@ use crate::{
     },
     models::{
         path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, BatchJob,
-        BatchJobStatus, BatchRequest, BatchStatus, Event, EventKind,
-        EventStatus, ExecutionProjection, Incident, IncidentTransition, IncidentUpdate,
+        BatchJobStatus, BatchRequest, BatchStatus, CampaignState, DecisionCycleState, Event,
+        EventKind, EventStatus, ExecutionProjection, Incident, IncidentTransition, IncidentUpdate,
         IntegrationEvent, InterventionStatus, NewAgentRun, NewBatchRequest, NewEvent, NewIncident,
         NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
         Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
         TerminationRequestStatus,
     },
     output::bounded_redacted_text,
-    retry::{retry_decision, EventResolution, RetryDecision, RetryPolicy},
+    retry::{retry_backoff_seconds, retry_decision, EventResolution, RetryDecision, RetryPolicy},
     AppError,
 };
 
-use super::{database_error, decisions::campaign_decision_dedup_key, Db};
+use super::{
+    database_error,
+    decisions::{campaign_decision_dedup_key, DecisionRepository, DecisionReservation},
+    Db,
+};
 
 const EVENT_CLAIM_WORK_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 const EVENT_CLAIM_PROBE_PASSES: usize = 2;
@@ -1460,14 +1464,8 @@ impl<'db> EventRepository<'db> {
             changed += transaction
                 .execute(
                     "UPDATE events
-                     SET status = CASE
-                             WHEN kind = 'campaign_decision' THEN 'retry_wait'
-                             ELSE 'pending'
-                         END,
-                         not_before = CASE
-                             WHEN kind = 'campaign_decision' THEN lease_until
-                             ELSE not_before
-                         END,
+                     SET status = 'retry_wait',
+                         not_before = lease_until,
                          lease_until = NULL,
                          attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
                      WHERE event_id = ?1 AND status = 'claimed'",
@@ -4848,10 +4846,11 @@ impl<'db> AgentRunRepository<'db> {
                 let failed_lineage = transaction
                     .query_row(
                         "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id,
-                                dc.state
+                                dc.state, c.state, p.enabled, p.paused, p.halted_reason
                          FROM decision_attempts da
                          JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
                          JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                         JOIN projects p ON p.project_id = c.project_id
                          WHERE da.agent_run_id = ?1 AND da.state = 'failed'
                            AND c.project_id = ?2",
                         params![run_id, project_id],
@@ -4860,14 +4859,167 @@ impl<'db> AgentRunRepository<'db> {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
                                 row.get::<_, String>(2)?,
-                                row.get::<_, crate::models::DecisionCycleState>(3)?,
+                                row.get::<_, DecisionCycleState>(3)?,
+                                row.get::<_, CampaignState>(4)?,
+                                row.get::<_, bool>(5)?,
+                                row.get::<_, bool>(6)?,
+                                row.get::<_, Option<String>>(7)?,
                             ))
                         },
                     )
                     .optional()
                     .map_err(database_error("read linked failed decision lineage"))?;
-                if let Some((cycle_id, campaign_id, source_experiment_id, cycle_state)) =
-                    failed_lineage
+                if failed_lineage.is_none()
+                    && status != AgentRunStatus::Completed
+                    && matches!(&resolution, EventResolution::RetryPolicy(_))
+                {
+                    let unbound_lineage = match (
+                        event_campaign_id.as_deref(),
+                        event_experiment_id.as_deref(),
+                    ) {
+                        (Some(campaign_id), Some(source_experiment_id)) => transaction
+                            .query_row(
+                                "SELECT da.cycle_id, dc.campaign_id,
+                                        dc.source_experiment_id, da.attempt_number,
+                                        da.created_at, c.state
+                                 FROM decision_cycles dc
+                                 JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                                 WHERE c.project_id = ?1 AND dc.campaign_id = ?2
+                                   AND dc.source_experiment_id = ?3
+                                   AND dc.state IN ('analyzing','pending')
+                                   AND da.agent_run_id IS NULL
+                                   AND da.state IN ('reserved','evidence_ready')
+                                 ORDER BY da.attempt_number DESC
+                                 LIMIT 1",
+                                params![project_id, campaign_id, source_experiment_id],
+                                |row| {
+                                    Ok((
+                                        DecisionReservation {
+                                            cycle_id: row.get(0)?,
+                                            campaign_id: row.get(1)?,
+                                            source_experiment_id: row.get(2)?,
+                                            attempt_number: row.get(3)?,
+                                            created_at: row.get(4)?,
+                                        },
+                                        row.get::<_, CampaignState>(5)?,
+                                    ))
+                                },
+                            )
+                            .optional()
+                            .map_err(database_error(
+                                "read linked unbound decision lineage",
+                            ))?,
+                        _ => None,
+                    };
+                    if let Some((reservation, campaign_state)) = unbound_lineage {
+                        let canonical_dedup_key =
+                            campaign_decision_dedup_key(&reservation.cycle_id);
+                        if event_dedup_key != canonical_dedup_key {
+                            return Err(AppError::Validation {
+                                field: "campaign_decision_event",
+                                message: "linked decision event does not match the unbound attempt lineage",
+                            });
+                        }
+                        if campaign_state == CampaignState::Retired {
+                            let failed_attempt = transaction
+                                .execute(
+                                    "UPDATE decision_attempts
+                                     SET state = 'failed', failure_code = 'campaign_retired',
+                                         failure_summary = 'campaign retired before decision bind cleanup',
+                                         finished_at = ?1
+                                     WHERE cycle_id = ?2 AND attempt_number = ?3
+                                       AND agent_run_id IS NULL
+                                       AND state IN ('reserved','evidence_ready')",
+                                    params![
+                                        finished_at,
+                                        reservation.cycle_id,
+                                        reservation.attempt_number,
+                                    ],
+                                )
+                                .map_err(database_error(
+                                    "fail retired unbound decision attempt",
+                                ))?;
+                            let degraded_cycle = transaction
+                                .execute(
+                                    "UPDATE decision_cycles
+                                     SET state = 'degraded', next_wake_at = NULL,
+                                         last_failure_code = 'campaign_retired',
+                                         last_failure_summary =
+                                             'campaign retired before decision bind cleanup',
+                                         updated_at = ?1
+                                     WHERE cycle_id = ?2 AND campaign_id = ?3
+                                       AND source_experiment_id = ?4
+                                       AND state IN ('analyzing','pending')",
+                                    params![
+                                        finished_at,
+                                        reservation.cycle_id,
+                                        reservation.campaign_id,
+                                        reservation.source_experiment_id,
+                                    ],
+                                )
+                                .map_err(database_error(
+                                    "degrade retired unbound decision cycle",
+                                ))?;
+                            let dead_lettered = transaction
+                                .execute(
+                                    "UPDATE events
+                                     SET status = 'dead_letter', lease_until = NULL,
+                                         completed_at = ?1,
+                                         attempts = CASE
+                                             WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
+                                     WHERE project_id = ?2 AND dedup_key = ?3
+                                       AND campaign_id = ?4 AND experiment_id = ?5
+                                       AND kind = 'campaign_decision' AND status = ?6",
+                                    params![
+                                        finished_at,
+                                        project_id,
+                                        canonical_dedup_key,
+                                        reservation.campaign_id,
+                                        reservation.source_experiment_id,
+                                        event_status,
+                                    ],
+                                )
+                                .map_err(database_error(
+                                    "dead-letter retired unbound decision event",
+                                ))?;
+                            if failed_attempt != 1 || degraded_cycle != 1 || dead_lettered != 1 {
+                                return Err(AppError::Validation {
+                                    field: "campaign_decision_event",
+                                    message: "retired unbound decision lineage changed during finalization",
+                                });
+                            }
+                        } else {
+                            let retry_at = finished_at
+                                .saturating_add(retry_backoff_seconds(attempts.max(1)));
+                            if DecisionRepository::recover_unbound_attempt_event_in_transaction(
+                                &transaction,
+                                &reservation,
+                                event_id,
+                                finished_at,
+                                retry_at,
+                            )?
+                            .is_none()
+                            {
+                                return Err(AppError::Validation {
+                                    field: "campaign_decision_event",
+                                    message: "unbound decision lineage changed during finalization",
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if let Some((
+                    cycle_id,
+                    campaign_id,
+                    source_experiment_id,
+                    cycle_state,
+                    campaign_state,
+                    project_enabled,
+                    project_paused,
+                    project_halted_reason,
+                )) = failed_lineage
                 {
                     let canonical_dedup_key = campaign_decision_dedup_key(&cycle_id);
                     if event_dedup_key != canonical_dedup_key
@@ -4882,7 +5034,49 @@ impl<'db> AgentRunRepository<'db> {
                     }
                     match &resolution {
                         EventResolution::RetryPolicy(_) => {
-                            if cycle_state == crate::models::DecisionCycleState::Degraded {
+                            if !matches!(
+                                cycle_state,
+                                DecisionCycleState::Pending | DecisionCycleState::Degraded
+                            ) {
+                                return Err(AppError::Validation {
+                                    field: "decision_cycle",
+                                    message: "retryable failed decision must be pending or degraded",
+                                });
+                            }
+                            if campaign_state == CampaignState::Retired
+                                && cycle_state == DecisionCycleState::Pending
+                            {
+                                let degraded = transaction
+                                    .execute(
+                                        "UPDATE decision_cycles
+                                         SET state = 'degraded', next_wake_at = NULL,
+                                             last_failure_code = 'campaign_retired',
+                                             last_failure_summary =
+                                                 'campaign retired before decision retry',
+                                             updated_at = ?1
+                                         WHERE cycle_id = ?2 AND campaign_id = ?3
+                                           AND source_experiment_id = ?4
+                                           AND state = 'pending'",
+                                        params![
+                                            finished_at,
+                                            cycle_id,
+                                            campaign_id,
+                                            source_experiment_id,
+                                        ],
+                                    )
+                                    .map_err(database_error(
+                                        "degrade retired retryable decision cycle",
+                                    ))?;
+                                if degraded != 1 {
+                                    return Err(AppError::Validation {
+                                        field: "decision_cycle",
+                                        message: "retired decision cycle changed during finalization",
+                                    });
+                                }
+                            }
+                            if cycle_state == DecisionCycleState::Degraded
+                                || campaign_state == CampaignState::Retired
+                            {
                                 let dead_lettered = transaction
                                     .execute(
                                         "UPDATE events
@@ -4911,33 +5105,57 @@ impl<'db> AgentRunRepository<'db> {
                                 }
                                 continue;
                             }
-                            if cycle_state != crate::models::DecisionCycleState::Pending {
-                                return Err(AppError::Validation {
-                                    field: "decision_cycle",
-                                    message: "retryable failed decision must be pending",
-                                });
-                            }
-                            let requeued = transaction
-                                .execute(
-                                    "UPDATE events
-                                     SET status = 'pending', not_before = ?1,
-                                         lease_until = NULL, completed_at = NULL,
-                                         attempts = 0, last_error = NULL
-                                     WHERE project_id = ?2 AND dedup_key = ?3
-                                       AND campaign_id = ?4 AND experiment_id = ?5
-                                       AND kind = 'campaign_decision' AND status = ?6",
-                                    params![
-                                        finished_at,
-                                        project_id,
-                                        canonical_dedup_key,
-                                        campaign_id,
-                                        source_experiment_id,
-                                        event_status,
-                                    ],
-                                )
-                                .map_err(database_error(
-                                    "requeue linked retryable decision event",
-                                ))?;
+                            let immediately_eligible = campaign_state == CampaignState::Active
+                                && project_enabled
+                                && !project_paused
+                                && project_halted_reason.is_none();
+                            let retry_at = finished_at
+                                .saturating_add(retry_backoff_seconds(attempts.max(1)));
+                            let requeued = if immediately_eligible {
+                                transaction
+                                    .execute(
+                                        "UPDATE events
+                                         SET status = 'pending', not_before = ?1,
+                                             lease_until = NULL, completed_at = NULL,
+                                             attempts = 0, last_error = NULL
+                                         WHERE project_id = ?2 AND dedup_key = ?3
+                                           AND campaign_id = ?4 AND experiment_id = ?5
+                                           AND kind = 'campaign_decision' AND status = ?6",
+                                        params![
+                                            finished_at,
+                                            project_id,
+                                            canonical_dedup_key,
+                                            campaign_id,
+                                            source_experiment_id,
+                                            event_status,
+                                        ],
+                                    )
+                                    .map_err(database_error(
+                                        "requeue linked retryable decision event",
+                                    ))?
+                            } else {
+                                transaction
+                                    .execute(
+                                        "UPDATE events
+                                         SET status = 'retry_wait', not_before = ?1,
+                                             lease_until = NULL, completed_at = NULL,
+                                             attempts = 0, last_error = NULL
+                                         WHERE project_id = ?2 AND dedup_key = ?3
+                                           AND campaign_id = ?4 AND experiment_id = ?5
+                                           AND kind = 'campaign_decision' AND status = ?6",
+                                        params![
+                                            retry_at,
+                                            project_id,
+                                            canonical_dedup_key,
+                                            campaign_id,
+                                            source_experiment_id,
+                                            event_status,
+                                        ],
+                                    )
+                                    .map_err(database_error(
+                                        "defer authority-gated retryable decision event",
+                                    ))?
+                            };
                             if requeued != 1 {
                                 return Err(AppError::Validation {
                                     field: "campaign_decision_event",
