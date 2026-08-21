@@ -10607,6 +10607,52 @@ fn generic_no_run_defer_rotates_to_the_lease_boundary_without_consuming_an_attem
 }
 
 #[test]
+fn generic_no_run_explicit_wake_rolls_back_the_claim_attempt_exactly_once() {
+    let test = TestDatabase::new();
+    let root = test.project_root("generic-explicit-wake-project");
+    register_project(&test.db, "project-a", &root, "pa-project-a");
+    let repository = EventRepository::new(&test.db);
+    let event = repository
+        .insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFailed,
+            "generic-explicit-wake",
+            json!({}),
+            100,
+            100,
+        ))
+        .unwrap();
+    test.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET attempts = 2 WHERE event_id = ?1",
+            [event.event_id],
+        )
+        .unwrap();
+
+    let claimed = repository.claim_batch(100, 160, 1).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].attempts, 3);
+    for _ in 0..2 {
+        repository
+            .transition_many(
+                &[event.event_id],
+                EventStatus::RetryWait,
+                100,
+                Some(3_700),
+                None,
+            )
+            .unwrap();
+        let deferred = repository.find_by_id(event.event_id).unwrap().unwrap();
+        assert_eq!(deferred.status, EventStatus::RetryWait);
+        assert_eq!(deferred.not_before, 3_700);
+        assert_eq!(deferred.lease_until, None);
+        assert_eq!(deferred.attempts, 2);
+    }
+}
+
+#[test]
 fn expired_unbound_claim_is_requeued_without_consuming_an_attempt() {
     let test = TestDatabase::new();
     let root = test.project_root("project");

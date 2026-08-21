@@ -1597,7 +1597,7 @@ fn campaign_agent_budget_wake_uses_the_exact_window_boundary() {
 }
 
 #[tokio::test]
-async fn campaign_agent_budget_scheduler_defers_without_creating_an_agent_run() {
+async fn campaign_agent_budget_scheduler_defers_generic_event_without_consuming_an_attempt() {
     let harness = SchedulerHarness::new();
     let campaign_id = harness.start_campaign();
     let repository = CampaignRepository::new(&harness.db);
@@ -1622,6 +1622,7 @@ async fn campaign_agent_budget_scheduler_defers_without_creating_an_agent_run() 
     let event = harness.event(event_id);
     assert_eq!(event.status, EventStatus::RetryWait);
     assert_eq!(event.not_before, 3_700);
+    assert_eq!(event.attempts, 0);
     assert_eq!(harness.active_runs("project-a"), 0);
     assert_eq!(
         AgentRunRepository::new(&harness.db)

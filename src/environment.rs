@@ -25,7 +25,7 @@ use crate::execution_policy::{
     TempUnsafeReason, VerifiedProjectRoot,
 };
 #[cfg(target_os = "linux")]
-use std::{io::{Read, Write}, sync::Mutex};
+use std::{io::Write, sync::Mutex};
 #[cfg(target_os = "linux")]
 use crate::decision_protocol::MAX_DECISION_BYTES;
 
@@ -665,7 +665,7 @@ pub struct PrivateRunTemp {
     directory: File,
     identity: (u64, u64),
     #[cfg(target_os = "linux")]
-    decision_output_identity: Mutex<Option<(u64, u64)>>,
+    decision_output_anchor: Mutex<Option<DecisionOutputAnchor>>,
 }
 
 /// An opaque, verified directory capability for the native target's private
@@ -896,7 +896,7 @@ impl PrivateRunTemp {
                 directory,
                 identity,
                 #[cfg(target_os = "linux")]
-                decision_output_identity: Mutex::new(None),
+                decision_output_anchor: Mutex::new(None),
             })
         }
     }
@@ -920,14 +920,18 @@ impl PrivateRunTemp {
         #[cfg(target_os = "linux")]
         {
             self.revalidate_current()?;
-            create_private_decision_file(&self.directory, OsStr::new("decision-schema.json"), schema)?;
+            drop(create_private_decision_file(
+                &self.directory,
+                OsStr::new("decision-schema.json"),
+                schema,
+            )?);
             let output = create_private_decision_file(
                 &self.directory,
                 OsStr::new("decision.json"),
                 &[],
             )?;
             *self
-                .decision_output_identity
+                .decision_output_anchor
                 .lock()
                 .map_err(|_| temp_error())? = Some(output);
             self.directory.sync_all().map_err(|_| temp_error())?;
@@ -945,17 +949,15 @@ impl PrivateRunTemp {
         }
         #[cfg(target_os = "linux")]
         {
-            use std::os::fd::{AsRawFd, FromRawFd};
-            use std::os::unix::ffi::OsStrExt;
-
             self.revalidate_current()?;
-            let expected = self
-                .decision_output_identity
+            let anchor = self
+                .decision_output_anchor
                 .lock()
-                .map_err(|_| temp_error())?
+                .map_err(|_| temp_error())?;
+            let anchor = anchor
                 .as_ref()
-                .copied()
                 .ok_or_else(temp_error)?;
+            let expected = anchor.identity;
             let name = OsStr::new("decision.json");
             let parent_mount = directory_mount_identity_at(
                 &self.directory,
@@ -969,39 +971,12 @@ impl PrivateRunTemp {
                     PolicyViolationStage::Finalized,
                 ));
             }
-            let name = std::ffi::CString::new(name.as_bytes()).expect("literal contains no NUL");
-            let fd = unsafe {
-                libc::openat(
-                    self.directory.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                )
-            };
-            if fd < 0 {
-                return Err(temp_violation_at(
-                    TempUnsafeReason::InvalidEntry,
-                    PolicyViolationStage::Finalized,
-                ));
-            }
-            let mut file = unsafe { File::from_raw_fd(fd) };
-            let before = validate_decision_output_file(&file, expected, parent_mount)?;
+            let before = validate_decision_output_file(&anchor.file, expected, parent_mount)?;
             let size = usize::try_from(before.size).map_err(|_| {
                 temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
             })?;
-            let mut bytes = Vec::with_capacity(size);
-            Read::by_ref(&mut file)
-                .take((MAX_DECISION_BYTES as u64) + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| {
-                    temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
-                })?;
-            if bytes.len() > MAX_DECISION_BYTES {
-                return Err(temp_violation_at(
-                    TempUnsafeReason::ByteLimit,
-                    PolicyViolationStage::Finalized,
-                ));
-            }
-            let after = validate_decision_output_file(&file, expected, parent_mount)?;
+            let bytes = read_decision_output_file(&anchor.file, size)?;
+            let after = validate_decision_output_file(&anchor.file, expected, parent_mount)?;
             if before != after {
                 return Err(temp_violation_at(
                     TempUnsafeReason::IdentityChanged,
@@ -1465,6 +1440,12 @@ impl Drop for PrivateRunTemp {
 }
 
 #[cfg(target_os = "linux")]
+struct DecisionOutputAnchor {
+    file: File,
+    identity: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DecisionFileSnapshot {
     identity: (u64, u64),
@@ -1479,7 +1460,7 @@ fn create_private_decision_file(
     directory: &File,
     name: &OsStr,
     contents: &[u8],
-) -> Result<(u64, u64), PolicyViolation> {
+) -> Result<DecisionOutputAnchor, PolicyViolation> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
@@ -1489,7 +1470,7 @@ fn create_private_decision_file(
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_WRONLY
+            libc::O_RDWR
                 | libc::O_CREAT
                 | libc::O_EXCL
                 | libc::O_CLOEXEC
@@ -1512,7 +1493,35 @@ fn create_private_decision_file(
     {
         return Err(temp_violation(TempUnsafeReason::InvalidEntry));
     }
-    Ok((metadata.dev(), metadata.ino()))
+    Ok(DecisionOutputAnchor {
+        file,
+        identity: (metadata.dev(), metadata.ino()),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_decision_output_file(file: &File, size: usize) -> Result<Vec<u8>, PolicyViolation> {
+    use std::os::unix::fs::FileExt;
+
+    let mut bytes = vec![0; size];
+    let mut offset = 0;
+    while offset < size {
+        let read = file
+            .read_at(&mut bytes[offset..], offset as u64)
+            .map_err(|_| {
+                temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
+            })?;
+        if read == 0 {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        offset = offset.checked_add(read).ok_or_else(|| {
+            temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
+        })?;
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
@@ -3244,6 +3253,46 @@ mod tests {
         assert_eq!(identity.inode, metadata.ino());
         assert_eq!(identity.owner, metadata.uid());
         assert_eq!(identity.mode, metadata.mode() & 0o7777);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_decision_output_anchor_prevents_inode_reuse_and_rejects_replacement() {
+        use std::{
+            io::Write as _,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+
+        let (_holder, temp) = test_temp(704);
+        temp.prepare_decision_schema(b"{}").unwrap();
+        let original_identity = temp
+            .decision_output_anchor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|anchor| anchor.identity)
+            .unwrap();
+        let output = temp.path().join("decision.json");
+        fs::remove_file(&output).unwrap();
+        let mut replacement = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&output)
+            .unwrap();
+        replacement.write_all(b"replacement").unwrap();
+        replacement.sync_all().unwrap();
+        let metadata = replacement.metadata().unwrap();
+
+        assert_ne!(original_identity, (metadata.dev(), metadata.ino()));
+        let error = temp.read_decision_output().unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+        assert!(matches!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(
+                TempUnsafeReason::InvalidEntry | TempUnsafeReason::IdentityChanged
+            )
+        ));
     }
 
     #[test]

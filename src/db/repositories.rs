@@ -1513,8 +1513,8 @@ impl<'db> EventRepository<'db> {
                          lease_until = NULL,
                          not_before = COALESCE(?2, not_before),
                          attempts = CASE
-                             WHEN kind = 'campaign_decision' AND status = 'claimed'
-                                  AND ?1 = 'retry_wait' AND attempts > 0
+                             WHEN status = 'claimed' AND ?1 = 'retry_wait'
+                                  AND attempts > 0
                                  THEN attempts - 1
                              ELSE attempts
                          END,

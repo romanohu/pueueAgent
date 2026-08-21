@@ -188,6 +188,33 @@ pueue_group_task_count() {
       '[.tasks | to_entries[] | select(.value.group == $group)] | length'
 }
 
+pueue_add_call_count() {
+  if [ ! -f "$WORK/pueue-add-argv.log" ]; then
+    printf '%s\n' 0
+    return
+  fi
+  grep -c '^ADD_BEGIN$' "$WORK/pueue-add-argv.log" || true
+}
+
+record_task_id() {
+  role="$1"
+  task_id="$2"
+  case "$task_id" in
+    ''|*[!0-9]*) fail "$role did not resolve to one numeric task ID" ;;
+  esac
+  printf 'TASK_ID role=%s id=%s\n' "$role" "$task_id" >> "$WORK/task-ids.log"
+}
+
+decision_call_count() {
+  source_experiment_id="$1"
+  if [ ! -f "$PUEUE_AGENT_TEST_CODEX_LOG" ]; then
+    printf '%s\n' 0
+    return
+  fi
+  grep -Fc "DECISION_INVOCATION source_experiment_id=$source_experiment_id " \
+    "$PUEUE_AGENT_TEST_CODEX_LOG" || true
+}
+
 insert_campaign_boundary() {
   project_id="$1"
   campaign_id="$2"
@@ -309,6 +336,8 @@ export PUEUE_CONFIG_PATH="$WORK/pueue.yml"
 export PUEUE_AGENT_TEST_AGENT_LOG="$WORK/agent-calls.log"
 export PUEUE_AGENT_TEST_AGENT_STATE="$WORK/agent-state"
 export PUEUE_AGENT_TEST_CODEX_LOG="$WORK/codex-calls.log"
+export PUEUE_AGENT_TEST_CODEX_ENV_NAMES="$WORK/codex-env-names.log"
+export OPENAI_API_KEY="campaign-openai-key-must-not-reach-decision"
 export AWS_SECRET_ACCESS_KEY="campaign-credential-must-not-reach-agent"
 export WANDB_API_KEY="campaign-wandb-key-must-not-reach-agent"
 export SSH_AUTH_SOCK="campaign-ssh-socket-must-not-reach-agent"
@@ -341,6 +370,18 @@ fn main() {
             return;
         }
     }
+    if operation == "add" {
+        let mut capture = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("__PUEUE_AGENT_E2E_WORK__/pueue-add-argv.log")
+            .unwrap();
+        writeln!(capture, "ADD_BEGIN").unwrap();
+        for (index, argument) in arguments.iter().enumerate() {
+            writeln!(capture, "ADD_ARG_{}={}", index + 1, argument.to_string_lossy()).unwrap();
+        }
+        writeln!(capture, "ADD_END").unwrap();
+    }
     let status = Command::new("__PUEUE_AGENT_E2E_REAL_PUEUE__")
         .args(&arguments)
         .status()
@@ -370,27 +411,9 @@ fi
 printf '%s\n' "${PUEUE_AGENT_RUN_ID:?missing run ID}:${PUEUE_AGENT_PROJECT_ID:?missing project ID}" \
   >> "$capture"
 EOF
-cat > "$WORK/bin/codex.sh" <<'EOF'
-#!/usr/bin/env bash
-set -eu
-capture="${HOME:?HOME is required}/../codex-calls.log"
-{
-  if [ -n "${CODEX_HOME+x}" ]; then
-    printf 'ENV_NAME=CODEX_HOME\n'
-  fi
-  if [ -n "${AWS_SECRET_ACCESS_KEY+x}" ] || [ -n "${WANDB_API_KEY+x}" ] \
-    || [ -n "${SSH_AUTH_SOCK+x}" ]; then
-    printf 'credential-value-present\n'
-  fi
-  printf 'ARGC=%s\n' "$#"
-  index=1
-  for argument in "$@"; do
-    printf 'ARG_%s=%s\n' "$index" "$argument"
-    index=$((index + 1))
-  done
-} >> "$capture"
-EOF
 cp "$REPO_ROOT/tests/support/fake_agent.sh" "$WORK/bin/fake-agent.sh"
+cp "$REPO_ROOT/tests/support/fake_codex.sh" "$WORK/bin/codex.sh"
+cp "$(command -v jq)" "$WORK/bin/jq"
 cat > "$WORK/bin/native-script-runner.rs" <<'EOF'
 use std::{env, os::unix::process::CommandExt, path::PathBuf, process::Command};
 
@@ -429,7 +452,7 @@ esac
 exit 0
 EOF
 chmod +x "$WORK/bin/pueue" "$WORK/bin/bash" "$WORK/bin/cat" "$WORK/bin/sleep" \
-  "$WORK/bin/fake-agent" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
+  "$WORK/bin/jq" "$WORK/bin/fake-agent" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
   "$WORK/bin/launchctl" "$WORK/bin/systemctl"
 export PATH="$WORK/bin:$PATH"
 
@@ -466,27 +489,49 @@ PROJECT_A="$WORK/a/shared"
 PROJECT_B="$WORK/b/shared"
 PROJECT_C="$WORK/c/campaign"
 PROJECT_D="$WORK/d/campaign"
-mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D"
+PROJECT_E="$WORK/e/trusted-failure"
+PROJECT_F="$WORK/f/untrusted-failure"
+PROJECT_G="$WORK/g/wait-once"
+PROJECT_H="$WORK/h/invalid-three"
+mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D" \
+  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H"
 PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_A"
 "$PA_BIN" init "$PROJECT_B"
 "$PA_BIN" init "$PROJECT_C"
 "$PA_BIN" init "$PROJECT_D"
+"$PA_BIN" init "$PROJECT_E"
+"$PA_BIN" init "$PROJECT_F"
+"$PA_BIN" init "$PROJECT_G"
+"$PA_BIN" init "$PROJECT_H"
 
 CONFIG_A="$PROJECT_A/.pueue-agent/config.toml"
 CONFIG_B="$PROJECT_B/.pueue-agent/config.toml"
 CONFIG_C="$PROJECT_C/.pueue-agent/config.toml"
 CONFIG_D="$PROJECT_D/.pueue-agent/config.toml"
+CONFIG_E="$PROJECT_E/.pueue-agent/config.toml"
+CONFIG_F="$PROJECT_F/.pueue-agent/config.toml"
+CONFIG_G="$PROJECT_G/.pueue-agent/config.toml"
+CONFIG_H="$PROJECT_H/.pueue-agent/config.toml"
 [ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] && [ -f "$CONFIG_C" ] && [ -f "$CONFIG_D" ] \
+  && [ -f "$CONFIG_E" ] && [ -f "$CONFIG_F" ] && [ -f "$CONFIG_G" ] && [ -f "$CONFIG_H" ] \
   || fail "init did not create TOML configuration"
 PROJECT_ID_A="$(toml_value project_id "$CONFIG_A")"
 PROJECT_ID_B="$(toml_value project_id "$CONFIG_B")"
 PROJECT_ID_C="$(toml_value project_id "$CONFIG_C")"
 PROJECT_ID_D="$(toml_value project_id "$CONFIG_D")"
+PROJECT_ID_E="$(toml_value project_id "$CONFIG_E")"
+PROJECT_ID_F="$(toml_value project_id "$CONFIG_F")"
+PROJECT_ID_G="$(toml_value project_id "$CONFIG_G")"
+PROJECT_ID_H="$(toml_value project_id "$CONFIG_H")"
 GROUP_A="$(toml_value pueue_group "$CONFIG_A")"
 GROUP_B="$(toml_value pueue_group "$CONFIG_B")"
 GROUP_C="$(toml_value pueue_group "$CONFIG_C")"
 GROUP_D="$(toml_value pueue_group "$CONFIG_D")"
+GROUP_E="$(toml_value pueue_group "$CONFIG_E")"
+GROUP_F="$(toml_value pueue_group "$CONFIG_F")"
+GROUP_G="$(toml_value pueue_group "$CONFIG_G")"
+GROUP_H="$(toml_value pueue_group "$CONFIG_H")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
@@ -494,6 +539,10 @@ write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_B" "$PROJECT_ID_B" "$GROUP_B" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_C" "$PROJECT_ID_C" "$GROUP_C" "$WORK/bin/capture-agent-environment" 20
 write_config "$PROJECT_D" "$PROJECT_ID_D" "$GROUP_D" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_E" "$PROJECT_ID_E" "$GROUP_E" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_F" "$PROJECT_ID_F" "$GROUP_F" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_G" "$PROJECT_ID_G" "$GROUP_G" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_H" "$PROJECT_ID_H" "$GROUP_H" "$WORK/bin/fake-agent" 20
 printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
   > "$PROJECT_A/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
@@ -502,6 +551,12 @@ printf '%s\n' 'Reach validation loss below 0.20 without changing the dataset.' \
   > "$PROJECT_C/.pueue-agent/STATE.md"
 printf '%s\n' 'Reach validation loss below 0.25 without changing the dataset.' \
   > "$PROJECT_D/.pueue-agent/STATE.md"
+printf '%s\n' 'Recover one trusted terminal failure with a bounded repair.' \
+  > "$PROJECT_E/.pueue-agent/STATE.md"
+printf '%s\n' 'Choose a non-repair experiment when failure trust is absent.' \
+  > "$PROJECT_F/.pueue-agent/STATE.md"
+printf '%s\n' 'PUEUE_AGENT_E2E_WAIT_ONCE' > "$PROJECT_G/.pueue-agent/STATE.md"
+printf '%s\n' 'PUEUE_AGENT_E2E_INVALID_THREE' > "$PROJECT_H/.pueue-agent/STATE.md"
 
 mkdir -p "$XDG_STATE_HOME"
 chmod 700 "$XDG_STATE_HOME"
@@ -522,6 +577,8 @@ max_same_spec_retries = 2
 max_repairs_per_failure_fingerprint = 2
 max_proposals_per_cycle = 1
 observer_interval_minutes = 30
+max_decision_attempts_per_cycle = 3
+max_decision_wait_minutes = 1440
 
 [executables]
 codex = "codex"
@@ -541,6 +598,22 @@ custom_agent = "$WORK/bin/capture-agent-environment"
 [projects."$PROJECT_ID_D"]
 custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_E"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_F"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_G"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_H"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 EOF
 chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 
@@ -548,8 +621,12 @@ chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_B"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_C"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_D"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_E"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_F"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_G"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_H"
 STATE_DB="$XDG_STATE_HOME/pueue-agent/state.sqlite3"
-[ "$(sql 'SELECT COUNT(*) FROM projects')" = "4" ] || fail "projects were not registered"
+[ "$(sql 'SELECT COUNT(*) FROM projects')" = "8" ] || fail "projects were not registered"
 
 # Healthy monitoring performs reconciliation without spending agent tokens.
 start_daemon
@@ -560,6 +637,7 @@ stop_daemon
 # One default submit creates exactly one durable campaign baseline and one real Pueue task.
 campaign_summary="$(cd "$PROJECT_C" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
 campaign_task="$(submission_task_id "$campaign_summary")"
+record_task_id "success-source" "$campaign_task"
 CAMPAIGN_C="$(sql "SELECT campaign_id FROM campaigns WHERE project_id = '$PROJECT_ID_C' AND state <> 'retired'")"
 [ -n "$CAMPAIGN_C" ] || fail "default submit did not create a live campaign"
 for table in campaigns proposals experiments budget_reservations submissions; do
@@ -617,6 +695,7 @@ done
   || fail "rejected submit created a Pueue task"
 
 # Restarting an accepted intent never performs a second external add.
+"$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_C" >/dev/null
 start_daemon
 sleep 0.2
 stop_daemon
@@ -625,18 +704,49 @@ stop_daemon
 [ "$(sql "SELECT COUNT(DISTINCT pueue_task_id) FROM experiments WHERE campaign_id = '$CAMPAIGN_C'")" = "1" ] \
   || fail "accepted campaign restart changed its stable task identity"
 
-# Terminal reconciliation launches a sanitized fake agent without ambient credentials.
+# Terminal success creates one decision cycle and one accepted experiment proposal.
 wait_for_task_terminal "$campaign_task"
+"$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_C" >/dev/null
+success_add_before="$(pueue_add_call_count)"
+SUCCESS_SOURCE="$(sql "SELECT baseline_experiment_id FROM campaigns WHERE campaign_id = '$CAMPAIGN_C'")"
 start_daemon
-wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$CAMPAIGN_C'" "succeeded" \
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$SUCCESS_SOURCE'" "succeeded" \
   "campaign baseline was not projected terminal"
-wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_C' AND status = 'completed'" "1" \
-  "campaign terminal event did not complete the capture agent"
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_C' AND source_experiment_id = '$SUCCESS_SOURCE' AND state = 'completed'" "1" \
+  "terminal success decision did not complete"
+wait_for_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_C' AND parent_experiment_id = '$SUCCESS_SOURCE' AND status = 'accepted'" "1" \
+  "terminal success decision did not accept one child experiment"
+wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_C' AND status = 'completed'" "2" \
+  "campaign decision and terminal event agents did not complete"
 stop_daemon
 [ -s "$WORK/captured-agent-environment" ] || fail "fake agent did not capture its sanitized environment"
 ! grep -Eq 'credential-value-present|campaign-credential-must-not-reach-agent|campaign-wandb-key-must-not-reach-agent|campaign-ssh-socket-must-not-reach-agent' \
   "$WORK/captured-agent-environment" \
   || fail "network-enabled agent inherited an unlisted credential value"
+SUCCESS_CHILD_TASK="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$CAMPAIGN_C' AND parent_experiment_id = '$SUCCESS_SOURCE'")"
+record_task_id "success-child" "$SUCCESS_CHILD_TASK"
+[ "$(sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_C' AND source_experiment_id = '$SUCCESS_SOURCE'")" = "1" ] \
+  || fail "terminal success created more than one decision cycle"
+[ "$(sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$CAMPAIGN_C' AND source_experiment_id = '$SUCCESS_SOURCE' AND kind = 'experiment' AND status = 'accepted'")" = "1" ] \
+  || fail "terminal success did not accept exactly one experiment proposal"
+[ "$(decision_call_count "$SUCCESS_SOURCE")" = "1" ] \
+  || fail "terminal success did not invoke exactly one decision agent"
+[ "$(pueue_add_call_count)" = "$((success_add_before + 1))" ] \
+  || fail "terminal success did not perform exactly one child Pueue add"
+start_daemon
+sleep 0.2
+stop_daemon
+[ "$(pueue_add_call_count)" = "$((success_add_before + 1))" ] \
+  || fail "terminal success restart duplicated the child Pueue add"
+grep -F 'sandbox_read_only=true' "$PUEUE_AGENT_TEST_CODEX_LOG" >/dev/null \
+  || fail "decision Codex did not use the read-only permission profile"
+grep -F 'network_access=true' "$PUEUE_AGENT_TEST_CODEX_LOG" >/dev/null \
+  || fail "decision Codex did not retain enabled network policy"
+! grep -Eq 'OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|SSH_AUTH_SOCK' \
+  "$PUEUE_AGENT_TEST_CODEX_ENV_NAMES" \
+  || fail "decision Codex inherited a credential environment name"
+grep -Eq '^ADD_ARG_[0-9]+=/bin/sleep$' "$WORK/pueue-add-argv.log" \
+  || fail "decision proposal did not pass literal child argv to Pueue"
 
 # A due rolling budget wait keeps a finite wake and becomes active after expiry advances.
 budget_now="$(date +%s)"
@@ -670,24 +780,25 @@ stop_daemon
 # Reserved restart recovery adds once; a second accepted restart adds nothing.
 RESERVED_CAMPAIGN="e2e-reserved-boundary"
 insert_campaign_boundary "$PROJECT_ID_C" "$RESERVED_CAMPAIGN" "reserved"
+RESERVED_SOURCE="$RESERVED_CAMPAIGN-experiment"
 reserved_before="$(pueue_group_task_count "$GROUP_C")"
 start_daemon
-wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'" "accepted" \
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$RESERVED_SOURCE'" "accepted" \
   "reserved restart did not resume its durable intent"
 stop_daemon
 [ "$(pueue_group_task_count "$GROUP_C")" = "$((reserved_before + 1))" ] \
   || fail "reserved restart did not perform exactly one Pueue add"
-reserved_task="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'")"
+reserved_task="$(sql "SELECT pueue_task_id FROM experiments WHERE experiment_id = '$RESERVED_SOURCE'")"
 start_daemon
 sleep 0.2
 stop_daemon
 [ "$(pueue_group_task_count "$GROUP_C")" = "$((reserved_before + 1))" ] \
   || fail "accepted restart repeated the recovered Pueue add"
-[ "$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'")" = "$reserved_task" ] \
+[ "$(sql "SELECT pueue_task_id FROM experiments WHERE experiment_id = '$RESERVED_SOURCE'")" = "$reserved_task" ] \
   || fail "accepted restart changed recovered task identity"
 wait_for_task_terminal "$reserved_task"
 start_daemon
-wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$RESERVED_CAMPAIGN'" "succeeded" \
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$RESERVED_SOURCE'" "succeeded" \
   "recovered reserved experiment was not projected terminal"
 stop_daemon
 "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_C" >/dev/null
@@ -695,9 +806,10 @@ stop_daemon
 # A submitting restart is quarantined and never reaches Pueue again.
 SUBMITTING_CAMPAIGN="e2e-submitting-boundary"
 insert_campaign_boundary "$PROJECT_ID_C" "$SUBMITTING_CAMPAIGN" "submitting"
+SUBMITTING_SOURCE="$SUBMITTING_CAMPAIGN-experiment"
 submitting_before="$(pueue_group_task_count "$GROUP_C")"
 start_daemon
-wait_for_sql "SELECT status FROM experiments WHERE campaign_id = '$SUBMITTING_CAMPAIGN'" "unreconciled" \
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$SUBMITTING_SOURCE'" "unreconciled" \
   "submitting restart was not quarantined"
 stop_daemon
 [ "$(pueue_group_task_count "$GROUP_C")" = "$submitting_before" ] \
@@ -712,17 +824,145 @@ if (cd "$PROJECT_D" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_ex
 fi
 rm -f "$WORK/add-uncertain"
 UNCERTAIN_CAMPAIGN="$(sql "SELECT campaign_id FROM campaigns WHERE project_id = '$PROJECT_ID_D' AND state <> 'retired'")"
-[ "$(sql "SELECT status FROM experiments WHERE campaign_id = '$UNCERTAIN_CAMPAIGN'")" = "unreconciled" ] \
+UNCERTAIN_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE campaign_id = '$UNCERTAIN_CAMPAIGN' AND parent_experiment_id IS NULL")"
+[ "$(sql "SELECT status FROM experiments WHERE experiment_id = '$UNCERTAIN_SOURCE'")" = "unreconciled" ] \
   || fail "uncertain Pueue add did not persist unreconciled"
 [ "$(pueue_group_task_count "$GROUP_D")" = "$((uncertain_before + 1))" ] \
   || fail "uncertain fixture did not create exactly one external Pueue task"
 start_daemon
 sleep 0.2
 stop_daemon
-[ "$(sql "SELECT status FROM experiments WHERE campaign_id = '$UNCERTAIN_CAMPAIGN'")" = "unreconciled" ] \
+[ "$(sql "SELECT status FROM experiments WHERE experiment_id = '$UNCERTAIN_SOURCE'")" = "unreconciled" ] \
   || fail "restart changed the unreconciled quarantine"
 [ "$(pueue_group_task_count "$GROUP_D")" = "$((uncertain_before + 1))" ] \
   || fail "restart re-added an unreconciled Pueue task"
+
+# A trusted terminal failure emits one repair proposal and one child task.
+trusted_summary="$(cd "$PROJECT_E" && "$PA_BIN" submit -- /bin/sh -c 'exit 17')"
+trusted_task="$(submission_task_id "$trusted_summary")"
+record_task_id "trusted-failure-source" "$trusted_task"
+wait_for_task_terminal "$trusted_task"
+trusted_add_before="$(pueue_add_call_count)"
+CAMPAIGN_E="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $trusted_task")"
+TRUSTED_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $trusted_task")"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$TRUSTED_SOURCE'" "failed" \
+  "trusted failure was not projected terminal"
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_E' AND source_experiment_id = '$TRUSTED_SOURCE' AND state = 'completed'" "1" \
+  "trusted failure decision did not complete"
+wait_for_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_E' AND parent_experiment_id = '$TRUSTED_SOURCE' AND status = 'accepted'" "1" \
+  "trusted failure decision did not accept one child"
+stop_daemon
+[ "$(sql "SELECT CASE WHEN failure_fingerprint IS NULL THEN 0 ELSE 1 END FROM experiments WHERE experiment_id = '$TRUSTED_SOURCE'")" = "1" ] \
+  || fail "trusted failure did not retain a fingerprint"
+[ "$(sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_E' AND source_experiment_id = '$TRUSTED_SOURCE'")" = "1" ] \
+  || fail "trusted failure created more than one decision cycle"
+[ "$(sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$CAMPAIGN_E' AND source_experiment_id = '$TRUSTED_SOURCE' AND kind = 'repair' AND status = 'accepted'")" = "1" ] \
+  || fail "trusted failure did not accept exactly one repair proposal"
+[ "$(decision_call_count "$TRUSTED_SOURCE")" = "1" ] \
+  || fail "trusted failure did not invoke exactly one decision agent"
+[ "$(pueue_add_call_count)" = "$((trusted_add_before + 1))" ] \
+  || fail "trusted repair did not perform exactly one child Pueue add"
+TRUSTED_CHILD_TASK="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$CAMPAIGN_E' AND parent_experiment_id = '$TRUSTED_SOURCE'")"
+record_task_id "trusted-repair-child" "$TRUSTED_CHILD_TASK"
+
+# A failed source without a trusted fingerprint emits a non-repair experiment.
+untrusted_summary="$(cd "$PROJECT_F" && "$PA_BIN" submit -- /bin/sh -c 'exit 19')"
+untrusted_task="$(submission_task_id "$untrusted_summary")"
+record_task_id "untrusted-failure-source" "$untrusted_task"
+"$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_F" >/dev/null
+wait_for_task_terminal "$untrusted_task"
+CAMPAIGN_F="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $untrusted_task")"
+UNTRUSTED_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $untrusted_task")"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$UNTRUSTED_SOURCE'" "failed" \
+  "untrusted failure was not projected terminal while paused"
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_F' AND source_experiment_id = '$UNTRUSTED_SOURCE'" "1" \
+  "untrusted failure did not create one deferred cycle"
+stop_daemon
+sql "UPDATE experiments SET failure_fingerprint = NULL WHERE experiment_id = '$UNTRUSTED_SOURCE'"
+"$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_F" >/dev/null
+untrusted_add_before="$(pueue_add_call_count)"
+start_daemon
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_F' AND source_experiment_id = '$UNTRUSTED_SOURCE' AND state = 'completed'" "1" \
+  "untrusted failure decision did not complete"
+wait_for_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_F' AND parent_experiment_id = '$UNTRUSTED_SOURCE' AND status = 'accepted'" "1" \
+  "untrusted failure decision did not accept one child"
+stop_daemon
+[ "$(sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$CAMPAIGN_F' AND source_experiment_id = '$UNTRUSTED_SOURCE' AND kind = 'experiment' AND status = 'accepted'")" = "1" ] \
+  || fail "untrusted failure did not accept exactly one non-repair experiment"
+[ "$(sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$CAMPAIGN_F' AND source_experiment_id = '$UNTRUSTED_SOURCE' AND kind = 'repair'")" = "0" ] \
+  || fail "untrusted failure incorrectly accepted a repair"
+[ "$(decision_call_count "$UNTRUSTED_SOURCE")" = "1" ] \
+  || fail "untrusted failure did not invoke exactly one decision agent"
+[ "$(pueue_add_call_count)" = "$((untrusted_add_before + 1))" ] \
+  || fail "untrusted failure proposal did not perform exactly one child Pueue add"
+UNTRUSTED_CHILD_TASK="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$CAMPAIGN_F' AND parent_experiment_id = '$UNTRUSTED_SOURCE'")"
+record_task_id "untrusted-experiment-child" "$UNTRUSTED_CHILD_TASK"
+
+# A one-minute wait adds no task, survives restart, and later proposes once.
+wait_summary="$(cd "$PROJECT_G" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+wait_task="$(submission_task_id "$wait_summary")"
+record_task_id "wait-source" "$wait_task"
+wait_for_task_terminal "$wait_task"
+CAMPAIGN_G="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $wait_task")"
+WAIT_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $wait_task")"
+wait_add_before="$(pueue_add_call_count)"
+wait_started_at="$(date +%s)"
+start_daemon
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_G' AND source_experiment_id = '$WAIT_SOURCE' AND state = 'waiting'" "1" \
+  "wait decision did not enter waiting"
+stop_daemon
+[ "$(sql "SELECT CASE WHEN next_wake_at > $wait_started_at THEN 1 ELSE 0 END FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_G' AND source_experiment_id = '$WAIT_SOURCE'")" = "1" ] \
+  || fail "wait decision did not persist a finite future wake"
+[ "$(sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_G' AND parent_experiment_id = '$WAIT_SOURCE'")" = "0" ] \
+  || fail "wait decision created a child experiment"
+[ "$(pueue_add_call_count)" = "$wait_add_before" ] \
+  || fail "wait decision performed a Pueue add"
+[ "$(decision_call_count "$WAIT_SOURCE")" = "1" ] \
+  || fail "wait decision did not invoke exactly one first attempt"
+sql "UPDATE decision_cycles SET next_wake_at = 0 WHERE campaign_id = '$CAMPAIGN_G' AND source_experiment_id = '$WAIT_SOURCE' AND state = 'waiting'"
+start_daemon
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_G' AND source_experiment_id = '$WAIT_SOURCE' AND state = 'completed'" "1" \
+  "due wait did not complete with a later proposal"
+wait_for_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_G' AND parent_experiment_id = '$WAIT_SOURCE' AND status = 'accepted'" "1" \
+  "due wait did not accept one child experiment"
+stop_daemon
+[ "$(sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_G' AND source_experiment_id = '$WAIT_SOURCE'")" = "1" ] \
+  || fail "wait retry created a second decision cycle"
+[ "$(sql "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = (SELECT cycle_id FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_G' AND source_experiment_id = '$WAIT_SOURCE')")" = "2" ] \
+  || fail "wait retry did not use exactly two decision attempts"
+[ "$(decision_call_count "$WAIT_SOURCE")" = "2" ] \
+  || fail "wait retry did not invoke exactly two decision agents"
+[ "$(pueue_add_call_count)" = "$((wait_add_before + 1))" ] \
+  || fail "later wait proposal did not perform exactly one Pueue add"
+WAIT_CHILD_TASK="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$CAMPAIGN_G' AND parent_experiment_id = '$WAIT_SOURCE'")"
+record_task_id "wait-proposal-child" "$WAIT_CHILD_TASK"
+
+# Exactly three malformed outputs degrade the cycle and create no task.
+invalid_summary="$(cd "$PROJECT_H" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
+invalid_task="$(submission_task_id "$invalid_summary")"
+record_task_id "invalid-source" "$invalid_task"
+wait_for_task_terminal "$invalid_task"
+CAMPAIGN_H="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $invalid_task")"
+INVALID_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $invalid_task")"
+invalid_add_before="$(pueue_add_call_count)"
+start_daemon
+wait_for_sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_H'" "degraded" \
+  "three malformed decisions did not degrade the campaign"
+wait_for_sql "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = (SELECT cycle_id FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_H' AND source_experiment_id = '$INVALID_SOURCE')" "3" \
+  "malformed decision retries were not bounded at three"
+stop_daemon
+[ "$(sql "SELECT state FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_H' AND source_experiment_id = '$INVALID_SOURCE'")" = "degraded" ] \
+  || fail "malformed decision cycle was not degraded"
+[ "$(sql "SELECT last_failure_code FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_H' AND source_experiment_id = '$INVALID_SOURCE'")" = "decision_missing" ] \
+  || fail "malformed decision cycle lacks bounded diagnostics"
+[ "$(sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_H' AND parent_experiment_id = '$INVALID_SOURCE'")" = "0" ] \
+  || fail "malformed decisions created a child experiment"
+[ "$(decision_call_count "$INVALID_SOURCE")" = "3" ] \
+  || fail "malformed decision retries did not stop after three invocations"
+[ "$(pueue_add_call_count)" = "$invalid_add_before" ] \
+  || fail "malformed decisions performed a Pueue add"
 
 # Callback + reconciliation deduplicate, and a missed callback remains durable while paused.
 submit_summary="$(cd "$PROJECT_B" && "$PA_BIN" submit -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh")"
@@ -861,6 +1101,7 @@ wait_for_sql "SELECT status FROM events WHERE dedup_key = '$restart_key'" "pendi
 stop_daemon
 
 # Explicit Codex continuation exposes the production-derived network argument and no credentials.
+: > "$PUEUE_AGENT_TEST_CODEX_LOG"
 context_session_id="019f9f30-5f31-7a40-8e28-bd95e1f6c537"
 context_session_store="$CODEX_HOME/sessions/2026/08/09"
 mkdir -p "$context_session_store"

@@ -1499,8 +1499,12 @@ max_agent_runs = 10
                 &NewEvent::new(
                     &project.project_id,
                     EventKind::CampaignDecision,
-                    "decision-runner-fixture",
-                    json!({"cycle_id": cycle.cycle_id}),
+                    format!("campaign-decision:v1:{}", cycle.cycle_id),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle.cycle_id,
+                        "source_experiment_id": "decision-experiment",
+                    }),
                     106,
                     106,
                 )

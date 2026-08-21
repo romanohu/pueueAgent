@@ -22,6 +22,13 @@ setup() {
   ' "$REPO_ROOT/tests/e2e/rust_supervisor.sh"
 }
 
+@test "real Pueue harness scopes experiment status polls to one source" {
+  run grep -F 'SELECT status FROM experiments WHERE campaign_id =' \
+    "$REPO_ROOT/tests/e2e/rust_supervisor.sh"
+
+  [ "$status" -ne 0 ]
+}
+
 @test "development launcher explains how to build a missing Rust binary" {
   fake_repo="$BATS_TEST_TMPDIR/repository"
   mkdir -p "$fake_repo/bin"
@@ -102,12 +109,14 @@ setup() {
   ! grep -q 'OPENAI_API_KEY\|never-record-this\|/fixture/home' "$log"
 }
 
-@test "fake Codex records literal selected argv and no environment values" {
+@test "fake Codex records safe argv only and no environment values or prompt" {
   log="$BATS_TEST_TMPDIR/fake-codex.log"
+  env_names="$BATS_TEST_TMPDIR/fake-codex-env-names.log"
 
   if env PUEUE_AGENT_TEST_CODEX_LOG="$log" CODEX_HOME="/fixture/codex-home" \
+    PUEUE_AGENT_TEST_CODEX_ENV_NAMES="$env_names" \
     OPENAI_API_KEY="never-record-this" "$REPO_ROOT/tests/support/fake_codex.sh" \
-    exec -- "literal; no shell"; then
+    exec -- "PROMPT_MUST_NOT_BE_RECORDED literal; no shell"; then
     status=0
   else
     status=$?
@@ -118,8 +127,104 @@ setup() {
   grep -Fx 'ARGC=3' "$log"
   grep -Fx 'ARG_1=exec' "$log"
   grep -Fx 'ARG_2=--' "$log"
-  grep -Fx 'ARG_3=literal; no shell' "$log"
-  ! grep -q 'OPENAI_API_KEY\|never-record-this\|/fixture/codex-home' "$log"
+  ! grep -q 'ARG_3=\|PROMPT_MUST_NOT_BE_RECORDED\|OPENAI_API_KEY\|never-record-this\|/fixture/codex-home' "$log"
+}
+
+@test "fake Codex decision captures security fields and environment names without payloads" {
+  capture="$BATS_TEST_TMPDIR/decision-capture.log"
+  captured_env_names="$BATS_TEST_TMPDIR/decision-env-names.log"
+  codex_home="$BATS_TEST_TMPDIR/codex-home"
+  schema="$BATS_TEST_TMPDIR/decision-schema.json"
+  decision_output="$BATS_TEST_TMPDIR/decision.json"
+  mkdir -p "$codex_home"
+  printf '%s\n' '{}' > "$schema"
+  : > "$decision_output"
+  chmod 600 "$schema" "$decision_output"
+  prompt='PROMPT_MUST_NOT_BE_CAPTURED
+{"schema_version":1,"objective":{"text":"fixture objective","digest":"objective-digest"},"source_experiment":{"experiment_id":"experiment-1","status":"succeeded","failure_fingerprint":null}}'
+
+  run env -u OPENAI_API_KEY -u AWS_SECRET_ACCESS_KEY -u SSH_AUTH_SOCK \
+    PUEUE_AGENT_TEST_CODEX_LOG="$capture" \
+    PUEUE_AGENT_TEST_CODEX_ENV_NAMES="$captured_env_names" \
+    CODEX_HOME="$codex_home" \
+    "$REPO_ROOT/tests/support/fake_codex.sh" \
+    --ask-for-approval never exec --ignore-user-config --ignore-rules --strict-config \
+    --output-schema "$schema" --output-last-message "$decision_output" \
+    -c 'permissions.pueue_agent_decision.extends=":read-only"' \
+    -c 'permissions.pueue_agent_decision.network.enabled=true' \
+    -c 'default_permissions="pueue_agent_decision"' -- "$prompt"
+
+  [ "$status" -eq 0 ]
+  run grep -F 'sandbox_read_only=true' "$capture"
+  [ "$status" -eq 0 ]
+  run grep -F 'network_access=true' "$capture"
+  [ "$status" -eq 0 ]
+  run grep -E 'OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY|SSH_AUTH_SOCK' "$captured_env_names"
+  [ "$status" -ne 0 ]
+  jq -e '.decision == "proposal" and .proposal.kind == "experiment" and .proposal.source_experiment_id == "experiment-1"' "$decision_output"
+  ! grep -q 'PROMPT_MUST_NOT_BE_CAPTURED\|fixture objective\|"decision"' "$capture" "$captured_env_names"
+}
+
+@test "fake Codex decision modes are deterministic and bounded" {
+  capture="$BATS_TEST_TMPDIR/decision-modes-capture.log"
+  captured_env_names="$BATS_TEST_TMPDIR/decision-modes-env-names.log"
+  codex_home="$BATS_TEST_TMPDIR/decision-modes-codex-home"
+  schema="$BATS_TEST_TMPDIR/decision-modes-schema.json"
+  decision_output="$BATS_TEST_TMPDIR/decision-modes-output.json"
+  mkdir -p "$codex_home"
+  printf '%s\n' '{}' > "$schema"
+  : > "$decision_output"
+  chmod 600 "$schema" "$decision_output"
+
+  invoke_decision() {
+    source_experiment_id="$1"
+    source_status="$2"
+    failure_fingerprint="$3"
+    objective="$4"
+    context="$(jq -cn \
+      --arg source_experiment_id "$source_experiment_id" \
+      --arg source_status "$source_status" \
+      --arg failure_fingerprint "$failure_fingerprint" \
+      --arg objective "$objective" \
+      '{schema_version:1,objective:{text:$objective,digest:"objective-digest"},source_experiment:{experiment_id:$source_experiment_id,status:$source_status,failure_fingerprint:(if $failure_fingerprint == "" then null else $failure_fingerprint end)}}')"
+    prompt="DECISION_PROMPT_MUST_NOT_BE_CAPTURED
+$context"
+    env -u OPENAI_API_KEY -u AWS_SECRET_ACCESS_KEY -u SSH_AUTH_SOCK \
+      PUEUE_AGENT_TEST_CODEX_LOG="$capture" \
+      PUEUE_AGENT_TEST_CODEX_ENV_NAMES="$captured_env_names" \
+      CODEX_HOME="$codex_home" \
+      "$REPO_ROOT/tests/support/fake_codex.sh" \
+      --ask-for-approval never exec --ignore-user-config --ignore-rules --strict-config \
+      --output-schema "$schema" --output-last-message "$decision_output" \
+      -c 'permissions.pueue_agent_decision.extends=":read-only"' \
+      -c 'permissions.pueue_agent_decision.network.enabled=true' \
+      -c 'default_permissions="pueue_agent_decision"' -- "$prompt"
+  }
+
+  invoke_decision "trusted-failure" "failed" "trusted-fingerprint" "repair fixture"
+  jq -e '.decision == "proposal" and .proposal.kind == "repair"' "$decision_output"
+
+  invoke_decision "untrusted-failure" "failed" "" "non-repair fixture"
+  jq -e '.decision == "proposal" and .proposal.kind == "experiment"' "$decision_output"
+
+  invoke_decision "wait-source" "succeeded" "" "PUEUE_AGENT_E2E_WAIT_ONCE"
+  jq -e '.decision == "wait" and .requested_wait_minutes == 1' "$decision_output"
+  invoke_decision "wait-source" "succeeded" "" "PUEUE_AGENT_E2E_WAIT_ONCE"
+  jq -e '.decision == "proposal" and .proposal.kind == "experiment"' "$decision_output"
+
+  for attempt in 1 2 3; do
+    invoke_decision "invalid-source" "succeeded" "" "PUEUE_AGENT_E2E_INVALID_THREE"
+    if jq -e . "$decision_output" >/dev/null 2>&1; then
+      false
+    fi
+  done
+  invoke_decision "invalid-source" "succeeded" "" "PUEUE_AGENT_E2E_INVALID_THREE"
+  jq -e '.decision == "proposal"' "$decision_output"
+
+  [ "$(grep -Fc 'DECISION_INVOCATION source_experiment_id=wait-source' "$capture")" -eq 2 ]
+  [ "$(grep -Fc 'DECISION_INVOCATION source_experiment_id=invalid-source' "$capture")" -eq 4 ]
+  ! grep -q 'DECISION_PROMPT_MUST_NOT_BE_CAPTURED\|trusted-fingerprint\|"decision"' \
+    "$capture" "$captured_env_names"
 }
 
 @test "fake agent failure sleep and exit fixtures are bounded" {
