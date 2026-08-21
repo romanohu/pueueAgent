@@ -18,6 +18,7 @@ const MAX_DECISION_DIGEST_BYTES: usize = 256;
 const MAX_DECISION_CODE_BYTES: usize = 128;
 const MAX_DECISION_SUMMARY_BYTES: usize = 2_048;
 const MAX_TERMINAL_DECISION_BACKFILL: i64 = 128;
+const MAX_FINALIZED_UNBOUND_REPAIRS: i64 = 128;
 
 const DECISION_CYCLE_SELECT: &str = "SELECT
     cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
@@ -63,6 +64,7 @@ struct TerminalDecisionBackfill {
     project_id: String,
     campaign_id: String,
     experiment_id: String,
+    experiment_status: ExperimentStatus,
     pueue_task_id: i64,
     managed_task_signature: String,
     pueue_group: String,
@@ -70,7 +72,7 @@ struct TerminalDecisionBackfill {
     enqueued_at: Option<i64>,
     started_at: Option<i64>,
     ended_at: Option<i64>,
-    terminal_payload_json: String,
+    terminal_result_json: Option<String>,
 }
 
 struct DecisionAuthority {
@@ -83,6 +85,11 @@ struct DecisionAuthority {
     experiment_campaign_id: String,
     experiment_status: ExperimentStatus,
     objective_digest: String,
+}
+
+struct RequeuedDecisionAttempt {
+    cycle: DecisionCycle,
+    transitioned: bool,
 }
 
 impl<'db> DecisionRepository<'db> {
@@ -236,32 +243,30 @@ impl<'db> DecisionRepository<'db> {
         let backfills = {
             let mut statement = connection
                 .prepare(
-                    "SELECT p.project_id, e.campaign_id, e.experiment_id,
+                    "SELECT p.project_id, e.campaign_id, e.experiment_id, e.status,
                             e.pueue_task_id, e.task_signature, observation.pueue_group,
                             observation.state, observation.enqueued_at,
                             observation.started_at, observation.ended_at,
-                            terminal.payload_json
+                            observation.result
                      FROM experiments e
                      JOIN campaigns c ON c.campaign_id = e.campaign_id
                      JOIN projects p ON p.project_id = c.project_id
-                     JOIN events terminal
-                       ON terminal.event_id = (
-                            SELECT source.event_id
-                            FROM events source
-                            WHERE source.project_id = p.project_id
-                              AND source.campaign_id = e.campaign_id
-                              AND source.experiment_id = e.experiment_id
-                              AND source.kind IN ('task_finished','task_failed','auto_killed')
-                              AND json_extract(source.payload_json, '$.source') = 'pueue_reconciliation'
-                              AND json_extract(source.payload_json, '$.task_id') = e.pueue_task_id
-                            ORDER BY source.event_id
-                            LIMIT 1
-                       )
                      JOIN task_observations observation
                        ON observation.project_id = p.project_id
                       AND observation.pueue_task_id = e.pueue_task_id
-                      AND observation.task_signature =
-                          json_extract(terminal.payload_json, '$.task_signature')
+                      AND observation.pueue_group = p.pueue_group
+                      AND lower(observation.state) IN
+                          ('done','failed','killed','finished','success')
+                      AND observation.task_signature = (
+                          SELECT MIN(candidate.task_signature)
+                          FROM task_observations candidate
+                          WHERE candidate.project_id = p.project_id
+                            AND candidate.pueue_task_id = e.pueue_task_id
+                            AND candidate.pueue_group = p.pueue_group
+                            AND lower(candidate.state) IN
+                                ('done','failed','killed','finished','success')
+                          HAVING COUNT(*) = 1
+                      )
                      LEFT JOIN decision_cycles dc
                        ON dc.campaign_id = e.campaign_id
                       AND dc.source_experiment_id = e.experiment_id
@@ -287,14 +292,15 @@ impl<'db> DecisionRepository<'db> {
                         project_id: row.get(0)?,
                         campaign_id: row.get(1)?,
                         experiment_id: row.get(2)?,
-                        pueue_task_id: row.get(3)?,
-                        managed_task_signature: row.get(4)?,
-                        pueue_group: row.get(5)?,
-                        state: row.get(6)?,
-                        enqueued_at: row.get(7)?,
-                        started_at: row.get(8)?,
-                        ended_at: row.get(9)?,
-                        terminal_payload_json: row.get(10)?,
+                        experiment_status: row.get(3)?,
+                        pueue_task_id: row.get(4)?,
+                        managed_task_signature: row.get(5)?,
+                        pueue_group: row.get(6)?,
+                        state: row.get(7)?,
+                        enqueued_at: row.get(8)?,
+                        started_at: row.get(9)?,
+                        ended_at: row.get(10)?,
+                        terminal_result_json: row.get(11)?,
                     })
                 })
                 .map_err(database_error("query terminal decision backfill"))?;
@@ -304,19 +310,26 @@ impl<'db> DecisionRepository<'db> {
         };
         drop(connection);
 
-        let count = backfills.len();
+        let mut count = 0;
         for backfill in backfills {
             let cycle_id = decision_cycle_id(&backfill.campaign_id, &backfill.experiment_id);
-            let terminal_payload = serde_json::from_str::<serde_json::Value>(
-                &backfill.terminal_payload_json,
-            )
-            .map_err(|source| AppError::Serialization {
-                operation: "deserialize persisted terminal event payload",
-                source,
-            })?;
-            let exit_code = terminal_payload
-                .get("result")
-                .and_then(stored_terminal_exit_code);
+            let terminal_result = match backfill
+                .terminal_result_json
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()
+            {
+                Ok(result) => result,
+                Err(_) => continue,
+            };
+            if !terminal_observation_matches_experiment(
+                backfill.experiment_status,
+                &backfill.state,
+                terminal_result.as_ref(),
+            ) {
+                continue;
+            }
+            let exit_code = terminal_result.as_ref().and_then(stored_terminal_exit_code);
             let event = NewEvent::new(
                 &backfill.project_id,
                 EventKind::CampaignDecision,
@@ -349,6 +362,7 @@ impl<'db> DecisionRepository<'db> {
                 &event,
                 now,
             )?;
+            count += 1;
         }
         Ok(count)
     }
@@ -526,7 +540,7 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin unbound decision attempt requeue"))?;
-        let cycle = Self::try_requeue_unbound_attempt_in_transaction(
+        let requeued = Self::try_requeue_unbound_attempt_in_transaction(
             &transaction,
             reservation,
             now,
@@ -534,7 +548,7 @@ impl<'db> DecisionRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit unbound decision attempt requeue"))?;
-        Ok(cycle)
+        Ok(requeued.map(|requeued| requeued.cycle))
     }
 
     pub fn recover_unbound_attempt_event(
@@ -554,12 +568,12 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin unbound decision event recovery"))?;
-        let cycle = Self::try_requeue_unbound_attempt_in_transaction(
+        let requeued = Self::try_requeue_unbound_attempt_in_transaction(
             &transaction,
             reservation,
             now,
         )?;
-        let Some(cycle) = cycle else {
+        let Some(requeued) = requeued else {
             transaction
                 .commit()
                 .map_err(database_error("commit skipped bound decision event recovery"))?;
@@ -598,18 +612,26 @@ impl<'db> DecisionRepository<'db> {
             crate::models::EventStatus::Claimed => transaction
                 .execute(
                     "UPDATE events
-                     SET status = 'pending', lease_until = NULL, completed_at = NULL
-                     WHERE event_id = ?1 AND status = 'claimed'",
+                     SET status = 'pending', lease_until = NULL, completed_at = NULL,
+                         attempts = attempts - 1
+                     WHERE event_id = ?1 AND status = 'claimed' AND attempts > 0",
                     [event_id],
                 )
                 .map_err(database_error("defer recovered claimed decision event"))?,
+            crate::models::EventStatus::RetryWait if requeued.transitioned => transaction
+                .execute(
+                    "UPDATE events SET attempts = attempts - 1
+                     WHERE event_id = ?1 AND status = 'retry_wait' AND attempts > 0",
+                    [event_id],
+                )
+                .map_err(database_error("restore recovered decision event retry count"))?,
             crate::models::EventStatus::RetryWait => 1,
             crate::models::EventStatus::DeadLetter => transaction
                 .execute(
                     "UPDATE events
                      SET status = 'retry_wait', not_before = ?1, lease_until = NULL,
-                         completed_at = NULL
-                     WHERE event_id = ?2 AND status = 'dead_letter'",
+                         completed_at = NULL, attempts = attempts - 1
+                     WHERE event_id = ?2 AND status = 'dead_letter' AND attempts > 0",
                     params![retry_at, event_id],
                 )
                 .map_err(database_error("revive unowned decision bind event"))?,
@@ -629,14 +651,100 @@ impl<'db> DecisionRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit unbound decision event recovery"))?;
-        Ok(Some(cycle))
+        Ok(Some(requeued.cycle))
+    }
+
+    pub fn repair_finalized_unbound_attempt_events(
+        &self,
+        now: i64,
+        retry_at: i64,
+    ) -> Result<usize, AppError> {
+        if retry_at <= now {
+            return Err(validation_error(
+                "retry_at",
+                "must be later than the repair timestamp",
+            ));
+        }
+        let connection = self.db.connect()?;
+        let repairs = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id,
+                            da.attempt_number, da.created_at, ev.event_id
+                     FROM events ev
+                     JOIN decision_cycles dc
+                       ON dc.campaign_id = ev.campaign_id
+                      AND dc.source_experiment_id = ev.experiment_id
+                     JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                     JOIN agent_run_events linked
+                       ON linked.project_id = ev.project_id
+                      AND linked.event_id = ev.event_id
+                     JOIN agent_runs run
+                       ON run.project_id = linked.project_id
+                      AND run.run_id = linked.run_id
+                     WHERE ev.status = 'dead_letter'
+                       AND ev.kind = 'campaign_decision'
+                       AND json_extract(ev.payload_json, '$.source') = 'terminal_experiment'
+                       AND json_extract(ev.payload_json, '$.cycle_id') = dc.cycle_id
+                       AND json_extract(ev.payload_json, '$.source_experiment_id') =
+                           dc.source_experiment_id
+                       AND da.state IN ('reserved','evidence_ready')
+                       AND da.agent_run_id IS NULL
+                       AND run.status IN ('completed','failed','timed_out','cancelled')
+                       AND run.run_id = (
+                           SELECT MAX(newest.run_id)
+                           FROM agent_run_events newest
+                           WHERE newest.project_id = ev.project_id
+                             AND newest.event_id = ev.event_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM decision_attempts owner
+                           WHERE owner.agent_run_id = run.run_id
+                       )
+                     ORDER BY ev.completed_at, ev.event_id
+                     LIMIT ?1",
+                )
+                .map_err(database_error(
+                    "prepare finalized unbound decision event repair",
+                ))?;
+            let rows = statement
+                .query_map([MAX_FINALIZED_UNBOUND_REPAIRS], |row| {
+                    Ok((
+                        DecisionReservation {
+                            cycle_id: row.get(0)?,
+                            campaign_id: row.get(1)?,
+                            source_experiment_id: row.get(2)?,
+                            attempt_number: row.get(3)?,
+                            created_at: row.get(4)?,
+                        },
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .map_err(database_error(
+                    "query finalized unbound decision event repair",
+                ))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(database_error("read finalized unbound decision event repair"))?
+        };
+        drop(connection);
+
+        let mut repaired = 0;
+        for (reservation, event_id) in repairs {
+            if self
+                .recover_unbound_attempt_event(&reservation, event_id, now, retry_at)?
+                .is_some()
+            {
+                repaired += 1;
+            }
+        }
+        Ok(repaired)
     }
 
     fn try_requeue_unbound_attempt_in_transaction(
         transaction: &Transaction<'_>,
         reservation: &DecisionReservation,
         now: i64,
-    ) -> Result<Option<DecisionCycle>, AppError> {
+    ) -> Result<Option<RequeuedDecisionAttempt>, AppError> {
         let authority = read_authority(transaction, &reservation.cycle_id)?;
         validate_reservation_lineage(&authority, reservation)?;
         let attempt = read_attempt(
@@ -651,7 +759,8 @@ impl<'db> DecisionRepository<'db> {
         {
             return Ok(None);
         }
-        if attempt.state == DecisionAttemptState::EvidenceReady {
+        let evidence_discarded = attempt.state == DecisionAttemptState::EvidenceReady;
+        if evidence_discarded {
             let updated = transaction
                 .execute(
                     "UPDATE decision_attempts
@@ -670,7 +779,10 @@ impl<'db> DecisionRepository<'db> {
             }
         }
         if authority.cycle.state == DecisionCycleState::Pending {
-            return Ok(Some(authority.cycle));
+            return Ok(Some(RequeuedDecisionAttempt {
+                cycle: authority.cycle,
+                transitioned: evidence_discarded,
+            }));
         }
         if authority.cycle.state != DecisionCycleState::Analyzing {
             return Ok(None);
@@ -690,7 +802,10 @@ impl<'db> DecisionRepository<'db> {
             ));
         }
         let cycle = read_cycle(transaction, &reservation.cycle_id)?;
-        Ok(Some(cycle))
+        Ok(Some(RequeuedDecisionAttempt {
+            cycle,
+            transitioned: true,
+        }))
     }
 
     pub fn store_evidence(
@@ -1568,6 +1683,23 @@ fn stored_terminal_exit_code(result: &serde_json::Value) -> Option<i32> {
             .and_then(|code| i32::try_from(code).ok()),
         _ => None,
     }
+}
+
+fn terminal_observation_matches_experiment(
+    status: ExperimentStatus,
+    state: &str,
+    result: Option<&serde_json::Value>,
+) -> bool {
+    let observed_status = if state.eq_ignore_ascii_case("killed") {
+        ExperimentStatus::Cancelled
+    } else if state.eq_ignore_ascii_case("failed")
+        || result.is_some_and(crate::events::result_is_failure)
+    {
+        ExperimentStatus::Failed
+    } else {
+        ExperimentStatus::Succeeded
+    };
+    status == observed_status
 }
 
 fn validate_payload(field: &'static str, value: &str) -> Result<(), AppError> {

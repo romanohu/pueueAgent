@@ -6,16 +6,16 @@ use std::{
 use async_trait::async_trait;
 use pueue_agent::{
     db::{
-        CampaignRepository, Db, EventRepository, ExperimentRepository, ProjectRepository,
-        ManagedSubmissionIntent, StartCampaignRequest, SubmissionRepository,
+        CampaignRepository, Db, EventRepository, ExperimentRepository, ManagedSubmissionIntent,
+        ProjectRepository, StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
     },
-    execution_policy::CampaignLimits,
     events::{
         callback_group_for_task, record_callback_with, CallbackMetadata, CallbackRecordResult,
     },
+    execution_policy::CampaignLimits,
     models::{
         BudgetReservationStatus, EventKind, EventStatus, ExperimentStatus, NewProject,
-        NewSubmission, ProposalKind, SubmissionStatus,
+        NewSubmission, NewTaskObservation, ProposalKind, SubmissionStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueError, PueueTask},
@@ -419,7 +419,7 @@ async fn terminal_success_and_failure_each_create_one_decision_cycle_event() {
 }
 
 #[tokio::test]
-async fn persisted_terminal_experiment_backfills_decision_publication_after_task_pruning() {
+async fn persisted_terminal_observation_backfills_decision_after_terminal_event_interruption() {
     let harness = Harness::new();
     let experiment_id = harness.accepted_campaign_experiment(41);
     let task = terminal_task(41, "100", json!("Success"));
@@ -428,11 +428,11 @@ async fn persisted_terminal_experiment_backfills_decision_publication_after_task
         .connect()
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER reject_campaign_decision_publication
+            "CREATE TRIGGER reject_terminal_event_publication
              BEFORE INSERT ON events
-             WHEN NEW.kind = 'campaign_decision'
+             WHEN NEW.kind = 'task_finished'
              BEGIN
-                 SELECT RAISE(ABORT, 'injected campaign decision publication failure');
+                 SELECT RAISE(ABORT, 'injected terminal event publication failure');
              END;",
         )
         .unwrap();
@@ -456,7 +456,7 @@ async fn persisted_terminal_experiment_backfills_decision_publication_after_task
         .db
         .connect()
         .unwrap()
-        .execute_batch("DROP TRIGGER reject_campaign_decision_publication;")
+        .execute_batch("DROP TRIGGER reject_terminal_event_publication;")
         .unwrap();
 
     Reconciler::new(&harness.db, FakePueue::with_tasks(Vec::new()))
@@ -496,7 +496,7 @@ async fn persisted_terminal_experiment_backfills_decision_publication_after_task
 }
 
 #[tokio::test]
-async fn persisted_terminal_without_lineaged_terminal_event_is_not_backfilled() {
+async fn persisted_terminal_without_terminal_observation_is_not_backfilled() {
     let harness = Harness::new();
     let experiment_id = harness.accepted_campaign_experiment(41);
     ExperimentRepository::new(&harness.db)
@@ -515,6 +515,54 @@ async fn persisted_terminal_without_lineaged_terminal_event_is_not_backfilled() 
 
     assert_eq!(harness.decision_cycle_count(&experiment_id), 0);
     assert_eq!(harness.decision_event_count(&experiment_id), 0);
+}
+
+#[tokio::test]
+async fn terminal_backfill_rejects_ambiguous_or_mismatched_persisted_observations() {
+    for observations in [
+        vec![("observation-group-mismatch", "other-group", "Done", "Success")],
+        vec![("observation-outcome-mismatch", "pa-project", "Done", "Failed")],
+        vec![
+            ("observation-first", "pa-project", "Done", "Success"),
+            ("observation-second", "pa-project", "Done", "Success"),
+        ],
+    ] {
+        let harness = Harness::new();
+        let experiment_id = harness.accepted_campaign_experiment(41);
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &experiment_id,
+                41,
+                pueue_agent::models::ExperimentTerminalOutcome::Succeeded,
+                200,
+            )
+            .unwrap();
+        for (signature, group, state, result) in observations {
+            TaskObservationRepository::new(&harness.db)
+                .upsert(&NewTaskObservation::new(
+                    "project-a",
+                    signature,
+                    41,
+                    group,
+                    vec!["python train.py --name experiment".to_owned()],
+                    state,
+                    Some(100),
+                    Some(100),
+                    Some(100),
+                    Some(json!(result).to_string()),
+                    200,
+                ))
+                .unwrap();
+        }
+
+        Reconciler::new(&harness.db, FakePueue::with_tasks(Vec::new()))
+            .run_once_at(201)
+            .await
+            .unwrap();
+
+        assert_eq!(harness.decision_cycle_count(&experiment_id), 0);
+        assert_eq!(harness.decision_event_count(&experiment_id), 0);
+    }
 }
 
 #[tokio::test]

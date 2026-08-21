@@ -215,6 +215,12 @@ impl Scheduler {
         let recovered_leases = self
             .recover_expired_leases()
             .map_err(SchedulerTickError::from_source)?;
+        DecisionRepository::new(&self.db)
+            .repair_finalized_unbound_attempt_events(
+                self.config.now,
+                self.config.now + self.config.lease_seconds,
+            )
+            .map_err(SchedulerTickError::from_source)?;
         let claimed = EventRepository::new(&self.db)
             .claim_batch_excluding_projects(
                 self.config.now,
