@@ -906,7 +906,9 @@ async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decis
             assert_eq!(event.status, EventStatus::RetryWait);
             assert_eq!(event.not_before, 3_700);
         } else {
-            assert_eq!(event.status, EventStatus::Pending);
+            assert_eq!(event.status, EventStatus::RetryWait);
+            assert_eq!(event.not_before, 160);
+            assert_eq!(event.attempts, 0);
         }
     }
     let disabled = SchedulerHarness::with_due_decision(CampaignState::Active);
@@ -915,11 +917,41 @@ async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decis
     let mut scheduler = disabled.scheduler();
     assert!(scheduler.tick().await.unwrap().started.is_empty());
     assert_eq!(disabled.agent_run_count(), 0);
-    assert_eq!(disabled.event_status(event_id), EventStatus::Pending);
+    let event = disabled.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 160);
+    assert_eq!(event.attempts, 0);
 }
 
 #[tokio::test]
-async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without_starvation() {
+async fn active_run_authority_defers_a_decision_with_finite_retry_and_rolls_back_attempt() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let event_id = harness.campaign_decision_event_id();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO agent_runs (
+                 run_id, project_id, primary_event_id, status, started_at,
+                 log_path, launch_gate_state
+             ) VALUES (9001, 'project-a', ?1, 'running', 99,
+                       '/tmp/existing-agent-run.log', 'released')",
+            [event_id],
+        )
+        .unwrap();
+
+    let report = harness.scheduler_with_claim_limit(1).tick().await.unwrap();
+
+    assert!(report.started.is_empty());
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 160);
+    assert_eq!(event.attempts, 0);
+}
+
+#[tokio::test]
+async fn claim_cap_rotates_ineligible_decisions_and_reaches_event_1002_on_the_next_tick() {
     let harness = SchedulerHarness::new();
     for (project_id, group) in [
         ("project-b", "pb-project-b"),
@@ -955,7 +987,7 @@ async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without
         )
         .unwrap();
     let transaction = connection.transaction().unwrap();
-    for ordinal in 1..=996_i64 {
+    for ordinal in 1..=1_001_i64 {
         let (project_id, campaign_id) = match ordinal % 3 {
             0 => ("project-b", "disabled-campaign"),
             1 => ("project-c", "paused-project-campaign"),
@@ -975,14 +1007,15 @@ async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without
         transaction
             .execute(
                 "INSERT INTO events (
-                     project_id, campaign_id, kind, dedup_key, payload_json,
+                     project_id, campaign_id, experiment_id, kind, dedup_key, payload_json,
                      status, attempts, not_before, created_at
-                 ) VALUES (?1, ?2, 'campaign_decision', ?3, ?4,
-                           'pending', 0, 1, ?5)",
+                 ) VALUES (?1, ?2, ?3, 'campaign_decision', ?4, ?5,
+                           'pending', 0, 1, ?6)",
                 params![
                     project_id,
                     campaign_id,
-                    format!("ineligible-decision-{ordinal:04}"),
+                    experiment_id,
+                    format!("campaign-decision:v1:{cycle_id}"),
                     json!({
                         "source": "terminal_experiment",
                         "cycle_id": cycle_id,
@@ -997,7 +1030,34 @@ async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without
     transaction.commit().unwrap();
     connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     drop(connection);
-    let eligible_event = harness.enqueue(EventKind::DeepCheck, "project-a", "eligible-after-996");
+    let eligible_event = harness.enqueue(EventKind::DeepCheck, "project-a", "eligible-after-cap");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET created_at = 2_000 WHERE event_id = ?1",
+            [eligible_event],
+        )
+        .unwrap();
+
+    let first = harness.scheduler_with_claim_limit(1_000).tick().await.unwrap();
+    assert!(first.started.is_empty());
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE project_id IN ('project-b', 'project-c', 'project-d')
+                   AND status = 'retry_wait' AND attempts = 0 AND not_before = 160",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1_000
+    );
 
     let mut report = harness.scheduler_with_claim_limit(1_000).tick().await.unwrap();
 
@@ -1013,7 +1073,7 @@ async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        996
+        1_001
     );
     assert_eq!(
         harness
@@ -1023,12 +1083,12 @@ async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without
             .query_row(
                 "SELECT COUNT(*) FROM events
                  WHERE project_id IN ('project-b', 'project-c', 'project-d')
-                   AND status = 'pending' AND attempts = 0",
+                   AND status = 'retry_wait' AND attempts = 0",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        996
+        1_001
     );
     report.started[0]
         .handle
@@ -1121,7 +1181,10 @@ async fn campaign_decision_evidence_storage_failure_requeues_the_unbound_attempt
     assert!(scheduler.tick().await.is_err());
 
     assert_eq!(harness.agent_run_count(), 0);
-    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 160);
+    assert_eq!(event.attempts, 0);
     assert_eq!(
         harness.decision_cycle_attempt_projection(),
         (
@@ -1669,8 +1732,10 @@ async fn cleanup_blocked_scheduler_builder_defers_claimed_events_before_project_
     let report = scheduler.tick().await.unwrap();
 
     assert!(report.started.is_empty());
-    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
-    assert_eq!(harness.event(event_id).attempts, 0);
+    let event = harness.event(event_id);
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(event.not_before, 160);
+    assert_eq!(event.attempts, 0);
     assert_eq!(harness.active_runs("project-a"), 0);
     assert_eq!(harness.pending_intervention_count(), 1);
     assert_eq!(harness.intervention_state(&intervention_id).0,
@@ -1681,19 +1746,52 @@ async fn cleanup_blocked_scheduler_builder_defers_claimed_events_before_project_
 async fn blocked_projects_do_not_starve_unblocked_events_at_claim_limit() {
     let harness = SchedulerHarness::new();
     harness.register_project("project-b", "pb-project-b", "/bin/echo", "");
-    let blocked_first = harness.enqueue(EventKind::TaskFailed, "project-a", "claim-fairness-a-first");
-    let blocked_second = harness.enqueue(EventKind::TaskFailed, "project-a", "claim-fairness-a-second");
+    let mut connection = harness.db.connect().unwrap();
+    let transaction = connection.transaction().unwrap();
+    for ordinal in 1..=1_000_i64 {
+        transaction
+            .execute(
+                "INSERT INTO events (
+                     project_id, kind, dedup_key, payload_json, status,
+                     attempts, not_before, created_at
+                 ) VALUES ('project-a', 'task_failed', ?1, '{}', 'pending', 0, 1, ?2)",
+                params![format!("claim-fairness-blocked-{ordinal:04}"), ordinal],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    drop(connection);
     let other_event = harness.enqueue(EventKind::TaskFailed, "project-b", "claim-fairness-b");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET created_at = 2_000 WHERE event_id = ?1",
+            [other_event],
+        )
+        .unwrap();
 
     let mut scheduler = harness
-        .scheduler_with_claim_limit(2)
+        .scheduler_with_claim_limit(1)
         .with_cleanup_blocked_projects(BTreeSet::from(["project-a".to_owned()]));
     let report = scheduler.tick().await.unwrap();
 
-    assert_eq!(harness.event_status(blocked_first), EventStatus::Pending);
-    assert_eq!(harness.event(blocked_first).attempts, 0);
-    assert_eq!(harness.event_status(blocked_second), EventStatus::Pending);
-    assert_eq!(harness.event(blocked_second).attempts, 0);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE project_id = 'project-a' AND status = 'retry_wait'
+                   AND not_before = 160 AND attempts = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1_000
+    );
     assert_eq!(harness.event_status(other_event), EventStatus::Dispatched);
     assert_eq!(harness.active_runs("project-a"), 0);
     assert_eq!(report.started.len(), 1);

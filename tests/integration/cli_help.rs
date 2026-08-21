@@ -1458,6 +1458,8 @@ impl DiagnosticsCliHarness {
             .unwrap()
             .execute_batch(
                 "DROP INDEX IF EXISTS decision_cycles_state_source_order_idx;
+                 DROP INDEX IF EXISTS decision_attempts_unbound_state_created_idx;
+                 DROP INDEX IF EXISTS agent_run_events_project_event_run_idx;
                  DROP INDEX IF EXISTS decision_cycles_state_wake_source_order_idx;
                  DROP INDEX IF EXISTS decision_cycles_campaign_state_source_order_idx;
                  DROP INDEX IF EXISTS decision_cycles_campaign_state_wake_source_order_idx;
@@ -1469,6 +1471,31 @@ impl DiagnosticsCliHarness {
                  CREATE INDEX IF NOT EXISTS decision_cycles_campaign_state_updated_idx
                      ON decision_cycles(campaign_id, state, updated_at);
                  PRAGMA user_version = 18;",
+            )
+            .unwrap();
+    }
+
+    fn downgrade_decision_schema_to_v19(&self) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX decision_attempts_unbound_state_created_idx;
+                 DROP INDEX agent_run_events_project_event_run_idx;
+                 DROP INDEX decision_cycles_state_wake_source_order_idx;
+                 PRAGMA user_version = 19;",
+            )
+            .unwrap();
+    }
+
+    fn downgrade_decision_schema_to_v20(&self) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX decision_attempts_unbound_state_created_idx;
+                 DROP INDEX agent_run_events_project_event_run_idx;
+                 PRAGMA user_version = 20;",
             )
             .unwrap();
     }
@@ -1516,6 +1543,55 @@ fn v18_status_campaign_status_and_doctor_require_writable_migration_without_muta
 }
 
 #[test]
+fn v19_and_v20_status_campaign_status_and_doctor_require_migration_without_mutation() {
+    for version in [19_i64, 20_i64] {
+        let harness = DiagnosticsCliHarness::new();
+        if version == 19 {
+            harness.downgrade_decision_schema_to_v19();
+        } else {
+            harness.downgrade_decision_schema_to_v20();
+        }
+        let before_schema_version: i64 = harness
+            .db
+            .connect()
+            .unwrap()
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+
+        for arguments in [
+            vec!["status", "--json"],
+            vec!["campaign", "status", "--json"],
+            vec!["doctor", "--json"],
+        ] {
+            let output = harness.command().args(arguments).output().unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!("SQLite schema v{version}")),
+                "{stderr}"
+            );
+            assert!(stderr.contains("writable pueue-agent command"), "{stderr}");
+            assert!(!stderr.contains("no such index"), "{stderr}");
+        }
+
+        let connection = harness.db.connect().unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before_schema_version
+        );
+    }
+}
+
+#[test]
 fn writable_project_command_migrates_v18_after_its_read_only_project_preflight() {
     let harness = DiagnosticsCliHarness::new();
     harness.downgrade_decision_schema_to_v18();
@@ -1533,7 +1609,7 @@ fn writable_project_command_migrates_v18_after_its_read_only_project_preflight()
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        20
+        21
     );
 }
 

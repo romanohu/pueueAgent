@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 20;
+pub const LATEST_SCHEMA_VERSION: i64 = 21;
 const EVENTS_V18_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
 const EVENTS_V17_KIND_LIST: &str =
@@ -241,6 +241,13 @@ const DECISION_CYCLES_CAMPAIGN_WAKE_SOURCE_INDEX_SQL: &str =
     ON decision_cycles(campaign_id, state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id);";
 const DECISION_ATTEMPTS_STATE_INDEX_SQL: &str = "CREATE INDEX decision_attempts_state_created_idx
     ON decision_attempts(state, created_at);";
+const DECISION_ATTEMPTS_UNBOUND_STATE_INDEX_SQL: &str =
+    "CREATE INDEX decision_attempts_unbound_state_created_idx
+    ON decision_attempts(state, created_at, cycle_id, attempt_number)
+    WHERE agent_run_id IS NULL AND state IN ('reserved','evidence_ready');";
+const AGENT_RUN_EVENTS_PROJECT_EVENT_RUN_INDEX_SQL: &str =
+    "CREATE INDEX agent_run_events_project_event_run_idx
+    ON agent_run_events(project_id, event_id, run_id DESC);";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -257,7 +264,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
         && missing_execution_projection_columns(connection)?.is_empty();
     if version == LATEST_SCHEMA_VERSION {
-        verify_decision_schema_v20(connection)?;
+        verify_decision_schema_v21(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -685,6 +692,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_decision_schema_to_v20(&transaction)?;
     } else {
         verify_decision_schema_v20(&transaction)?;
+    }
+    if version <= 20 {
+        migrate_decision_schema_to_v21(&transaction)?;
+    } else {
+        verify_decision_schema_v21(&transaction)?;
     }
     transaction
         .commit()
@@ -2000,6 +2012,87 @@ fn decision_schema_v20_is_canonical(connection: &Connection) -> rusqlite::Result
     Ok(actual_sql.as_deref().is_some_and(|sql| {
         compact_sql_exact(sql) == compact_sql_exact(DECISION_CYCLES_STATE_WAKE_SOURCE_INDEX_SQL)
     }))
+}
+
+fn migrate_decision_schema_to_v21(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    verify_decision_schema_v20(transaction)?;
+    for (name, sql) in [
+        (
+            "decision_attempts_unbound_state_created_idx",
+            DECISION_ATTEMPTS_UNBOUND_STATE_INDEX_SQL,
+        ),
+        (
+            "agent_run_events_project_event_run_idx",
+            AGENT_RUN_EVENTS_PROJECT_EVENT_RUN_INDEX_SQL,
+        ),
+    ] {
+        let existing_sql: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read SQLite v21 decision repair index"))?;
+        match existing_sql.as_deref() {
+            None => transaction
+                .execute_batch(sql)
+                .map_err(database_error("create SQLite v21 decision repair index"))?,
+            Some(actual) if compact_sql_exact(actual) == compact_sql_exact(sql) => {}
+            Some(_) => {
+                return Err(AppError::Runtime {
+                    operation: "verify SQLite v21 decision schema",
+                });
+            }
+        }
+    }
+    verify_decision_schema_v21(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 21;")
+        .map_err(database_error("set SQLite v21 schema version"))
+}
+
+fn verify_decision_schema_v21(connection: &Connection) -> Result<(), AppError> {
+    if decision_schema_v21_is_canonical(connection).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v21 decision schema",
+        })
+    }
+}
+
+fn decision_schema_v21_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+    if !decision_schema_v20_is_canonical(connection)? {
+        return Ok(false);
+    }
+    for (name, expected_sql) in [
+        (
+            "decision_attempts_unbound_state_created_idx",
+            DECISION_ATTEMPTS_UNBOUND_STATE_INDEX_SQL,
+        ),
+        (
+            "agent_run_events_project_event_run_idx",
+            AGENT_RUN_EVENTS_PROJECT_EVENT_RUN_INDEX_SQL,
+        ),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn decision_schema_v19_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {

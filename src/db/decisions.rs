@@ -21,6 +21,46 @@ const MAX_DECISION_SUMMARY_BYTES: usize = 2_048;
 const MAX_TERMINAL_DECISION_BACKFILL: i64 = 128;
 const MAX_FINALIZED_UNBOUND_REPAIRS: i64 = 128;
 
+pub(crate) fn campaign_decision_dedup_key(cycle_id: &str) -> String {
+    format!("campaign-decision:v1:{cycle_id}")
+}
+
+fn finalized_unbound_attempt_probe_sql(state: DecisionAttemptState) -> String {
+    let state = match state {
+        DecisionAttemptState::Reserved => "reserved",
+        DecisionAttemptState::EvidenceReady => "evidence_ready",
+        _ => unreachable!("repair probes only unbound reservable attempt states"),
+    };
+    format!(
+        "SELECT da.cycle_id, dc.campaign_id, dc.source_experiment_id,
+                da.attempt_number, da.created_at
+         FROM decision_attempts da INDEXED BY decision_attempts_unbound_state_created_idx
+         JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
+         WHERE da.agent_run_id IS NULL
+           AND da.state IN ('reserved','evidence_ready') AND da.state = '{state}'
+         ORDER BY da.created_at, da.cycle_id, da.attempt_number
+         LIMIT ?1"
+    )
+}
+
+const FINALIZED_UNBOUND_EVENT_SQL: &str =
+    "SELECT c.project_id, ev.event_id
+     FROM campaigns c
+     JOIN events ev ON ev.project_id = c.project_id AND ev.dedup_key = ?2
+     WHERE c.campaign_id = ?1
+       AND ev.campaign_id = ?1 AND ev.experiment_id = ?3
+       AND ev.kind = 'campaign_decision' AND ev.status = 'dead_letter'
+     LIMIT 1";
+const FINALIZED_UNBOUND_RUN_SQL: &str =
+    "SELECT run.run_id
+     FROM agent_run_events linked INDEXED BY agent_run_events_project_event_run_idx
+     JOIN agent_runs run
+       ON run.project_id = linked.project_id AND run.run_id = linked.run_id
+     WHERE linked.project_id = ?1 AND linked.event_id = ?2
+       AND run.status IN ('completed','failed','timed_out','cancelled')
+     ORDER BY linked.run_id DESC
+     LIMIT 1";
+
 const DECISION_CYCLE_SELECT: &str = "SELECT
     cycle_id, campaign_id, source_experiment_id, source_terminal_at, state, next_wake_at,
     consecutive_failed_attempts, last_decision_kind, last_failure_code,
@@ -228,7 +268,7 @@ impl<'db> DecisionRepository<'db> {
     ) -> Result<(DecisionCycle, Event), AppError> {
         let expected_cycle_id = decision_cycle_id(campaign_id, experiment_id);
         if event.kind != EventKind::CampaignDecision
-            || event.dedup_key != format!("campaign-decision:v1:{expected_cycle_id}")
+            || event.dedup_key != campaign_decision_dedup_key(&expected_cycle_id)
             || event.campaign_id.as_deref() != Some(campaign_id)
             || event.experiment_id.as_deref() != Some(experiment_id)
             || event.payload.get("source").and_then(serde_json::Value::as_str)
@@ -376,7 +416,7 @@ impl<'db> DecisionRepository<'db> {
             let event = NewEvent::new(
                 &backfill.project_id,
                 EventKind::CampaignDecision,
-                format!("campaign-decision:v1:{cycle_id}"),
+                campaign_decision_dedup_key(&cycle_id),
                 serde_json::json!({
                     "source": "terminal_experiment",
                     "cycle_id": cycle_id,
@@ -587,37 +627,57 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin unbound decision event recovery"))?;
-        let requeued = Self::try_requeue_unbound_attempt_in_transaction(
+        let recovered = Self::recover_unbound_attempt_event_in_transaction(
             &transaction,
+            reservation,
+            event_id,
+            now,
+            retry_at,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit unbound decision event recovery"))?;
+        Ok(recovered)
+    }
+
+    fn recover_unbound_attempt_event_in_transaction(
+        transaction: &Transaction<'_>,
+        reservation: &DecisionReservation,
+        event_id: i64,
+        now: i64,
+        retry_at: i64,
+    ) -> Result<Option<DecisionCycle>, AppError> {
+        let requeued = Self::try_requeue_unbound_attempt_in_transaction(
+            transaction,
             reservation,
             now,
         )?;
         let Some(requeued) = requeued else {
-            transaction
-                .commit()
-                .map_err(database_error("commit skipped bound decision event recovery"))?;
             return Ok(None);
         };
-        let event_status = transaction
+        let dedup_key = campaign_decision_dedup_key(&reservation.cycle_id);
+        let (event_project_id, event_status) = transaction
             .query_row(
-                "SELECT ev.status
-                 FROM events ev
-                 JOIN campaigns c ON c.campaign_id = ?2
-                 WHERE ev.event_id = ?1
-                   AND ev.project_id = c.project_id
-                   AND ev.campaign_id = ?2
-                   AND ev.experiment_id = ?3
+                "SELECT ev.project_id, ev.status
+                 FROM campaigns c
+                 JOIN events ev
+                   ON ev.project_id = c.project_id AND ev.dedup_key = ?2
+                 WHERE c.campaign_id = ?1 AND ev.event_id = ?3
+                   AND ev.campaign_id = ?1 AND ev.experiment_id = ?4
                    AND ev.kind = 'campaign_decision'
-                   AND json_extract(ev.payload_json, '$.source') = 'terminal_experiment'
-                   AND json_extract(ev.payload_json, '$.cycle_id') = ?4
-                   AND json_extract(ev.payload_json, '$.source_experiment_id') = ?3",
+                 LIMIT 1",
                 params![
-                    event_id,
                     reservation.campaign_id,
+                    dedup_key,
+                    event_id,
                     reservation.source_experiment_id,
-                    reservation.cycle_id,
                 ],
-                |row| row.get::<_, crate::models::EventStatus>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, crate::models::EventStatus>(1)?,
+                    ))
+                },
             )
             .optional()
             .map_err(database_error("validate unbound decision recovery event"))?
@@ -633,15 +693,17 @@ impl<'db> DecisionRepository<'db> {
                     "UPDATE events
                      SET status = 'pending', lease_until = NULL, completed_at = NULL,
                          attempts = attempts - 1
-                     WHERE event_id = ?1 AND status = 'claimed' AND attempts > 0",
-                    [event_id],
+                     WHERE project_id = ?1 AND dedup_key = ?2 AND event_id = ?3
+                       AND status = 'claimed' AND attempts > 0",
+                    params![event_project_id, dedup_key, event_id],
                 )
                 .map_err(database_error("defer recovered claimed decision event"))?,
             crate::models::EventStatus::RetryWait if requeued.transitioned => transaction
                 .execute(
                     "UPDATE events SET attempts = attempts - 1
-                     WHERE event_id = ?1 AND status = 'retry_wait' AND attempts > 0",
-                    [event_id],
+                     WHERE project_id = ?1 AND dedup_key = ?2 AND event_id = ?3
+                       AND status = 'retry_wait' AND attempts > 0",
+                    params![event_project_id, dedup_key, event_id],
                 )
                 .map_err(database_error("restore recovered decision event retry count"))?,
             crate::models::EventStatus::RetryWait => 1,
@@ -650,8 +712,9 @@ impl<'db> DecisionRepository<'db> {
                     "UPDATE events
                      SET status = 'retry_wait', not_before = ?1, lease_until = NULL,
                          completed_at = NULL, attempts = attempts - 1
-                     WHERE event_id = ?2 AND status = 'dead_letter' AND attempts > 0",
-                    params![retry_at, event_id],
+                     WHERE project_id = ?2 AND dedup_key = ?3 AND event_id = ?4
+                       AND status = 'dead_letter' AND attempts > 0",
+                    params![retry_at, event_project_id, dedup_key, event_id],
                 )
                 .map_err(database_error("revive unowned decision bind event"))?,
             _ => {
@@ -667,9 +730,6 @@ impl<'db> DecisionRepository<'db> {
                 "status changed during unbound decision event recovery",
             ));
         }
-        transaction
-            .commit()
-            .map_err(database_error("commit unbound decision event recovery"))?;
         Ok(Some(requeued.cycle))
     }
 
@@ -684,78 +744,116 @@ impl<'db> DecisionRepository<'db> {
                 "must be later than the repair timestamp",
             ));
         }
-        let connection = self.db.connect()?;
-        let repairs = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id,
-                            da.attempt_number, da.created_at, ev.event_id
-                     FROM events ev
-                     JOIN decision_cycles dc
-                       ON dc.campaign_id = ev.campaign_id
-                      AND dc.source_experiment_id = ev.experiment_id
-                     JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
-                     JOIN agent_run_events linked
-                       ON linked.project_id = ev.project_id
-                      AND linked.event_id = ev.event_id
-                     JOIN agent_runs run
-                       ON run.project_id = linked.project_id
-                      AND run.run_id = linked.run_id
-                     WHERE ev.status = 'dead_letter'
-                       AND ev.kind = 'campaign_decision'
-                       AND json_extract(ev.payload_json, '$.source') = 'terminal_experiment'
-                       AND json_extract(ev.payload_json, '$.cycle_id') = dc.cycle_id
-                       AND json_extract(ev.payload_json, '$.source_experiment_id') =
-                           dc.source_experiment_id
-                       AND da.state IN ('reserved','evidence_ready')
-                       AND da.agent_run_id IS NULL
-                       AND run.status IN ('completed','failed','timed_out','cancelled')
-                       AND run.run_id = (
-                           SELECT MAX(newest.run_id)
-                           FROM agent_run_events newest
-                           WHERE newest.project_id = ev.project_id
-                             AND newest.event_id = ev.event_id
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM decision_attempts owner
-                           WHERE owner.agent_run_id = run.run_id
-                       )
-                     ORDER BY ev.completed_at, ev.event_id
-                     LIMIT ?1",
-                )
+        let mut connection = self.db.connect()?;
+        Self::repair_finalized_unbound_attempt_events_in_connection(
+            &mut connection,
+            now,
+            retry_at,
+        )
+    }
+
+    fn repair_finalized_unbound_attempt_events_in_connection(
+        connection: &mut Connection,
+        now: i64,
+        retry_at: i64,
+    ) -> Result<usize, AppError> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin finalized unbound decision event repair"))?;
+        let mut candidates = Vec::with_capacity(MAX_FINALIZED_UNBOUND_REPAIRS as usize * 2);
+        for state in [
+            DecisionAttemptState::Reserved,
+            DecisionAttemptState::EvidenceReady,
+        ] {
+            let mut statement = transaction
+                .prepare(&finalized_unbound_attempt_probe_sql(state))
                 .map_err(database_error(
-                    "prepare finalized unbound decision event repair",
+                    "prepare finalized unbound decision attempt probe",
                 ))?;
-            let rows = statement
-                .query_map([MAX_FINALIZED_UNBOUND_REPAIRS], |row| {
-                    Ok((
-                        DecisionReservation {
+            candidates.extend(
+                statement
+                    .query_map([MAX_FINALIZED_UNBOUND_REPAIRS], |row| {
+                        Ok(DecisionReservation {
                             cycle_id: row.get(0)?,
                             campaign_id: row.get(1)?,
                             source_experiment_id: row.get(2)?,
                             attempt_number: row.get(3)?,
                             created_at: row.get(4)?,
-                        },
-                        row.get::<_, i64>(5)?,
-                    ))
-                })
-                .map_err(database_error(
-                    "query finalized unbound decision event repair",
-                ))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(database_error("read finalized unbound decision event repair"))?
-        };
-        drop(connection);
-
+                        })
+                    })
+                    .map_err(database_error(
+                        "query finalized unbound decision attempt probe",
+                    ))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(database_error(
+                        "read finalized unbound decision attempt probe",
+                    ))?,
+            );
+        }
+        candidates.sort_by(|left, right| {
+            (left.created_at, &left.cycle_id, left.attempt_number).cmp(&(
+                right.created_at,
+                &right.cycle_id,
+                right.attempt_number,
+            ))
+        });
+        candidates.truncate(MAX_FINALIZED_UNBOUND_REPAIRS as usize);
         let mut repaired = 0;
-        for (reservation, event_id) in repairs {
-            if self
-                .recover_unbound_attempt_event(&reservation, event_id, now, retry_at)?
-                .is_some()
+        for reservation in candidates {
+            let dedup_key = campaign_decision_dedup_key(&reservation.cycle_id);
+            let event = transaction
+                .query_row(
+                    FINALIZED_UNBOUND_EVENT_SQL,
+                    params![
+                        reservation.campaign_id,
+                        dedup_key,
+                        reservation.source_experiment_id,
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(database_error("read unbound decision repair event"))?;
+            let Some((project_id, event_id)) = event else {
+                continue;
+            };
+            let run_id = transaction
+                .query_row(
+                    FINALIZED_UNBOUND_RUN_SQL,
+                    params![project_id, event_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(database_error("read finalized unbound decision repair run"))?;
+            let Some(run_id) = run_id else {
+                continue;
+            };
+            let owned: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM decision_attempts WHERE agent_run_id = ?1
+                     )",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error("check finalized decision repair run owner"))?;
+            if owned {
+                continue;
+            }
+            if Self::recover_unbound_attempt_event_in_transaction(
+                &transaction,
+                &reservation,
+                event_id,
+                now,
+                retry_at,
+            )?
+            .is_some()
             {
                 repaired += 1;
             }
         }
+        transaction
+            .commit()
+            .map_err(database_error("commit finalized unbound decision event repair"))?;
         Ok(repaired)
     }
 
@@ -1144,24 +1242,23 @@ impl<'db> DecisionRepository<'db> {
             )
             .map_err(database_error("record decision cycle failure"))?;
         if !exhausted {
+            let dedup_key = campaign_decision_dedup_key(cycle_id);
             let requeued = transaction
                 .execute(
                     "UPDATE events
                      SET status = 'pending', not_before = ?1, lease_until = NULL,
                          completed_at = NULL, attempts = 0, last_error = NULL
-                     WHERE project_id = ?2 AND campaign_id = ?3 AND experiment_id = ?4
+                     WHERE project_id = ?2 AND dedup_key = ?3
+                       AND campaign_id = ?4 AND experiment_id = ?5
                        AND kind = 'campaign_decision'
-                       AND json_extract(payload_json, '$.source') = 'terminal_experiment'
-                       AND json_extract(payload_json, '$.cycle_id') = ?5
-                       AND json_extract(payload_json, '$.source_experiment_id') = ?4
                        AND (status IN ('completed','failed','dead_letter')
                             OR (status = 'retry_wait' AND not_before <= ?1))",
                     params![
                         now,
                         authority.project_id,
+                        dedup_key,
                         authority.cycle.campaign_id,
                         authority.cycle.source_experiment_id,
-                        cycle_id,
                     ],
                 )
                 .map_err(database_error("requeue retryable decision event"))?;
@@ -1295,23 +1392,30 @@ impl<'db> DecisionRepository<'db> {
                 ));
             }
             let cycle = read_cycle(&transaction, &cycle_id)?;
+            let project_id: String = transaction
+                .query_row(
+                    "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
+                    [&cycle.campaign_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error("read due decision event project"))?;
+            let dedup_key = campaign_decision_dedup_key(&cycle_id);
             let promoted_event = transaction
                 .execute(
                     "UPDATE events
                      SET status = 'pending', not_before = ?1, lease_until = NULL,
                          completed_at = NULL, attempts = 0, last_error = NULL
-                     WHERE campaign_id = ?2 AND experiment_id = ?3
+                     WHERE project_id = ?2 AND dedup_key = ?3
+                       AND campaign_id = ?4 AND experiment_id = ?5
                        AND kind = 'campaign_decision'
-                       AND json_extract(payload_json, '$.source') = 'terminal_experiment'
-                       AND json_extract(payload_json, '$.cycle_id') = ?4
-                       AND json_extract(payload_json, '$.source_experiment_id') = ?3
                        AND (status IN ('completed','failed','dead_letter')
                             OR (status = 'retry_wait' AND not_before <= ?1))",
                     params![
                         now,
+                        project_id,
+                        dedup_key,
                         cycle.campaign_id,
                         cycle.source_experiment_id,
-                        cycle_id
                     ],
                 )
                 .map_err(database_error("wake due decision event"))?;
@@ -1931,10 +2035,19 @@ fn validation_error(
 
 #[cfg(test)]
 mod due_query_plan_tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use rusqlite::{params, StatementStatus};
     use tempfile::TempDir;
 
-    use super::{CAMPAIGN_PENDING_DECISION_SQL, GLOBAL_DUE_WAIT_DECISION_SQL};
+    use super::{
+        finalized_unbound_attempt_probe_sql, DecisionAttemptState, DecisionRepository,
+        CAMPAIGN_PENDING_DECISION_SQL, FINALIZED_UNBOUND_EVENT_SQL,
+        FINALIZED_UNBOUND_RUN_SQL, GLOBAL_DUE_WAIT_DECISION_SQL,
+    };
     use crate::db::Db;
 
     #[test]
@@ -2051,5 +2164,248 @@ mod due_query_plan_tests {
 
         assert_eq!(cycle_ids, ["due-cycle"]);
         assert!(vm_steps < 200, "due wake used {vm_steps} VM steps");
+    }
+
+    #[test]
+    fn finalized_unbound_repair_probes_are_exact_bounded_and_index_ordered() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let connection = db.connect().unwrap();
+        for state in [
+            DecisionAttemptState::Reserved,
+            DecisionAttemptState::EvidenceReady,
+        ] {
+            let sql = finalized_unbound_attempt_probe_sql(state);
+            let details = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([128_i64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("decision_attempts_unbound_state_created_idx")
+                }),
+                "{details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+                "{details:?}"
+            );
+        }
+        for (sql, parameters, expected_index) in [
+            (
+                FINALIZED_UNBOUND_EVENT_SQL,
+                vec![
+                    &"campaign-a" as &dyn rusqlite::ToSql,
+                    &"campaign-decision:v1:cycle-a" as &dyn rusqlite::ToSql,
+                    &"experiment-a" as &dyn rusqlite::ToSql,
+                ],
+                "sqlite_autoindex_events_1",
+            ),
+            (
+                FINALIZED_UNBOUND_RUN_SQL,
+                vec![
+                    &"project-a" as &dyn rusqlite::ToSql,
+                    &1_i64 as &dyn rusqlite::ToSql,
+                ],
+                "agent_run_events_project_event_run_idx",
+            ),
+        ] {
+            let details = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "{details:?}"
+            );
+            assert!(
+                details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+                "{details:?}"
+            );
+        }
+        assert!(!FINALIZED_UNBOUND_EVENT_SQL.contains("json_"));
+        assert!(!FINALIZED_UNBOUND_RUN_SQL.contains("json_"));
+    }
+
+    #[test]
+    fn finalized_unbound_repair_full_transaction_has_constant_vm_work() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (
+                     project_id, root_path, pueue_group, config_path,
+                     enabled, paused, created_at, updated_at
+                 ) VALUES ('project-a', '/tmp/project-a', 'pa-project-a',
+                           '/tmp/project-a/config.toml', 1, 0, 1, 1);
+                 INSERT INTO campaigns (
+                     campaign_id, project_id, objective_text, objective_digest,
+                     initial_argv_json, state, created_at, updated_at
+                 ) VALUES ('campaign-a', 'project-a', 'objective', 'digest',
+                           '[]', 'active', 1, 1);",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for ordinal in 1..=1_000_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO decision_cycles (
+                         cycle_id, campaign_id, source_experiment_id,
+                         source_terminal_at, state, consecutive_failed_attempts,
+                         created_at, updated_at
+                     ) VALUES (?1, 'campaign-a', ?2, ?3, 'degraded', 1, ?3, ?3)",
+                    params![
+                        format!("old-cycle-{ordinal:04}"),
+                        format!("old-experiment-{ordinal:04}"),
+                        ordinal,
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO decision_attempts (
+                         cycle_id, attempt_number, state, failure_code,
+                         failure_summary, created_at, finished_at
+                     ) VALUES (?1, 1, 'failed', 'old', 'old', ?2, ?2)",
+                    params![format!("old-cycle-{ordinal:04}"), ordinal],
+                )
+                .unwrap();
+        }
+        for ordinal in 1..=128_i64 {
+            let cycle_id = format!("candidate-cycle-{ordinal:03}");
+            let experiment_id = format!("candidate-experiment-{ordinal:03}");
+            transaction
+                .execute(
+                    "INSERT INTO experiments (
+                         experiment_id, campaign_id, proposal_id, submission_id,
+                         attempt, status, created_at, updated_at, finished_at
+                     ) VALUES (?1, 'campaign-a', ?2, ?3, 0, 'failed',
+                               2000, 2000, 2000)",
+                    params![
+                        experiment_id,
+                        format!("candidate-proposal-{ordinal:03}"),
+                        format!("candidate-submission-{ordinal:03}"),
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO decision_cycles (
+                         cycle_id, campaign_id, source_experiment_id,
+                         source_terminal_at, state, consecutive_failed_attempts,
+                         created_at, updated_at
+                     ) VALUES (?1, 'campaign-a', ?2, 2000, 'analyzing', 0, 2000, 2000)",
+                    params![cycle_id, experiment_id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO decision_attempts (
+                         cycle_id, attempt_number, state, created_at
+                     ) VALUES (?1, 1, 'reserved', 2000)",
+                    [&cycle_id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO events (
+                         project_id, campaign_id, experiment_id, kind, dedup_key,
+                         payload_json, status, attempts, not_before, created_at,
+                         completed_at
+                     ) VALUES ('project-a', 'campaign-a', ?1, 'campaign_decision',
+                               ?2, '{}', 'dead_letter', 1, 2000, 2000, 2001)",
+                    params![
+                        experiment_id,
+                        format!("campaign-decision:v1:{cycle_id}"),
+                    ],
+                )
+                .unwrap();
+            let event_id = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO agent_runs (
+                         run_id, project_id, primary_event_id, status, started_at,
+                         finished_at, log_path, launch_gate_state
+                     ) VALUES (?1, 'project-a', ?2, 'failed', 2000, 2001,
+                               '/tmp/finalized-unbound.log', 'failed')",
+                    params![ordinal, event_id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO agent_run_events (project_id, run_id, event_id)
+                     VALUES ('project-a', ?1, ?2)",
+                    params![ordinal, event_id],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO events (
+                     project_id, kind, dedup_key, payload_json, status, attempts,
+                     not_before, created_at, completed_at
+                 ) VALUES ('project-a', 'deep_check', 'unrelated-dead-letter', '{}',
+                           'dead_letter', 1, 1, 1, 2)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let vm_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&vm_steps);
+        connection.progress_handler(
+            1,
+            Some(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let repaired = DecisionRepository::repair_finalized_unbound_attempt_events_in_connection(
+            &mut connection,
+            3000,
+            3060,
+        )
+        .unwrap();
+        connection.progress_handler(0, None::<fn() -> bool>);
+
+        assert_eq!(repaired, 128);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE kind = 'campaign_decision' AND status = 'retry_wait'
+                       AND not_before = 3060 AND attempts = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            128
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM events
+                     WHERE dedup_key = 'unrelated-dead-letter'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "dead_letter"
+        );
+        let vm_steps = vm_steps.load(Ordering::Relaxed);
+        assert!(
+            vm_steps < 250_000,
+            "full unbound repair transaction used {vm_steps} VM steps"
+        );
     }
 }

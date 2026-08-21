@@ -44,28 +44,22 @@ use crate::{
     AppError,
 };
 
-use super::{database_error, Db};
+use super::{database_error, decisions::campaign_decision_dedup_key, Db};
 
-fn event_claim_candidate_sql(status: EventStatus, blocked_project_ids: bool) -> String {
+const EVENT_CLAIM_WORK_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
+const EVENT_CLAIM_PROBE_PASSES: usize = 2;
+
+fn event_claim_candidate_sql(status: EventStatus) -> String {
     let status = match status {
         EventStatus::Pending => "pending",
         EventStatus::RetryWait => "retry_wait",
         _ => unreachable!("event claim probes only pending and retry-wait states"),
     };
-    let blocked_filter = if blocked_project_ids {
-        "AND NOT EXISTS (
-             SELECT 1 FROM json_each(?3) AS blocked_projects
-             WHERE blocked_projects.value = events.project_id
-         )"
-    } else {
-        ""
-    };
     format!(
-        "SELECT event_id, not_before, created_at
+        "SELECT event_id, project_id, not_before, created_at
          FROM events INDEXED BY events_claimable_idx
          WHERE status IN ('pending', 'retry_wait')
            AND status = '{status}' AND not_before <= ?1
-           {blocked_filter}
          ORDER BY not_before, created_at, event_id
          LIMIT ?2"
     )
@@ -1088,42 +1082,49 @@ impl<'db> EventRepository<'db> {
                 field: "event_claim_limit",
             });
         }
-        let limit = i64::try_from(limit).map_err(|_| AppError::Configuration {
+        let mut connection = self.db.connect()?;
+        Self::claim_batch_excluding_projects_in_connection(
+            &mut connection,
+            now,
+            lease_until,
+            limit,
+            blocked_project_ids,
+        )
+    }
+
+    fn claim_batch_excluding_projects_in_connection(
+        connection: &mut Connection,
+        now: i64,
+        lease_until: i64,
+        limit: usize,
+        blocked_project_ids: &BTreeSet<String>,
+    ) -> Result<Vec<Event>, AppError> {
+        let claim_limit = i64::try_from(limit).map_err(|_| AppError::Configuration {
             field: "event_claim_limit",
         })?;
-        let mut connection = self.db.connect()?;
+        let work_limit = i64::try_from(EVENT_CLAIM_WORK_LIMIT).unwrap_or(i64::MAX);
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin immediate event claim"))?;
-        let blocked_json = if blocked_project_ids.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(blocked_project_ids).map_err(|_| {
-                AppError::Runtime {
-                    operation: "serialize blocked project filter",
-                }
-            })?)
-        };
-        let event_ids = {
-            let mut query_params = vec![Value::Integer(now), Value::Integer(limit)];
-            if let Some(blocked_json) = blocked_json.as_ref() {
-                query_params.push(Value::Text(blocked_json.clone()));
+        let mut event_ids = Vec::with_capacity(limit);
+        for _ in 0..EVENT_CLAIM_PROBE_PASSES {
+            if i64::try_from(event_ids.len()).unwrap_or(i64::MAX) >= claim_limit {
+                break;
             }
-            let mut candidates = Vec::with_capacity(limit as usize * 2);
+            let mut candidates = Vec::with_capacity(EVENT_CLAIM_WORK_LIMIT * 2);
             for status in [EventStatus::Pending, EventStatus::RetryWait] {
                 let mut statement = transaction
-                    .prepare(&event_claim_candidate_sql(
-                        status,
-                        !blocked_project_ids.is_empty(),
-                    ))
+                    .prepare(&event_claim_candidate_sql(status))
                     .map_err(database_error("prepare event claim"))?;
                 candidates.extend(
                     statement
-                        .query_map(params_from_iter(query_params.iter()), |row| {
+                        .query_map(params![now, work_limit], |row| {
                             Ok((
                                 row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(1)?,
                                 row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                status,
                             ))
                         })
                         .map_err(database_error("query claimable events"))?
@@ -1131,27 +1132,48 @@ impl<'db> EventRepository<'db> {
                         .map_err(database_error("read claimable events"))?,
                 );
             }
-            candidates.sort_by_key(|(event_id, not_before, created_at)| {
+            candidates.sort_by_key(|(event_id, _, not_before, created_at, _)| {
                 (*not_before, *created_at, *event_id)
             });
-            candidates.truncate(limit as usize);
-            candidates
-                .into_iter()
-                .map(|(event_id, _, _)| event_id)
-                .collect::<Vec<_>>()
-        };
-
-        for event_id in &event_ids {
-            transaction
-                .execute(
-                    "UPDATE events
-                     SET status = 'claimed', lease_until = ?1, attempts = attempts + 1
-                     WHERE event_id = ?2
-                       AND status IN ('pending', 'retry_wait')
-                       AND not_before <= ?3",
-                    params![lease_until, event_id, now],
-                )
-                .map_err(database_error("claim event"))?;
+            candidates.truncate(EVENT_CLAIM_WORK_LIMIT);
+            if candidates.is_empty() {
+                break;
+            }
+            for (event_id, project_id, _, _, expected_status) in candidates {
+                if blocked_project_ids.contains(&project_id) {
+                    let rotated = transaction
+                        .execute(
+                            "UPDATE events
+                             SET status = 'retry_wait', not_before = ?1, lease_until = NULL
+                             WHERE project_id = ?2 AND event_id = ?3 AND status = ?4
+                               AND not_before <= ?5",
+                            params![lease_until, project_id, event_id, expected_status, now],
+                        )
+                        .map_err(database_error("rotate blocked event claim candidate"))?;
+                    if rotated != 1 {
+                        return Err(AppError::Runtime {
+                            operation: "rotate blocked event claim candidate",
+                        });
+                    }
+                } else if event_ids.len() < limit {
+                    let claimed = transaction
+                        .execute(
+                            "UPDATE events
+                             SET status = 'claimed', lease_until = ?1,
+                                 attempts = attempts + 1
+                             WHERE project_id = ?2 AND event_id = ?3 AND status = ?4
+                               AND not_before <= ?5",
+                            params![lease_until, project_id, event_id, expected_status, now],
+                        )
+                        .map_err(database_error("claim event"))?;
+                    if claimed != 1 {
+                        return Err(AppError::Runtime {
+                            operation: "claim event",
+                        });
+                    }
+                    event_ids.push(event_id);
+                }
+            }
         }
 
         let mut events = Vec::with_capacity(event_ids.len());
@@ -1438,7 +1460,14 @@ impl<'db> EventRepository<'db> {
             changed += transaction
                 .execute(
                     "UPDATE events
-                     SET status = 'pending',
+                     SET status = CASE
+                             WHEN kind = 'campaign_decision' THEN 'retry_wait'
+                             ELSE 'pending'
+                         END,
+                         not_before = CASE
+                             WHEN kind = 'campaign_decision' THEN lease_until
+                             ELSE not_before
+                         END,
                          lease_until = NULL,
                          attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
                      WHERE event_id = ?1 AND status = 'claimed'",
@@ -1485,6 +1514,12 @@ impl<'db> EventRepository<'db> {
                      SET status = ?1,
                          lease_until = NULL,
                          not_before = COALESCE(?2, not_before),
+                         attempts = CASE
+                             WHEN kind = 'campaign_decision' AND status = 'claimed'
+                                  AND ?1 = 'retry_wait' AND attempts > 0
+                                 THEN attempts - 1
+                             ELSE attempts
+                         END,
                          completed_at = CASE WHEN ?1 IN ('completed', 'failed') THEN ?3 ELSE completed_at END,
                          last_error = ?4
                      WHERE event_id = ?5",
@@ -4662,7 +4697,8 @@ impl<'db> AgentRunRepository<'db> {
         let linked_events = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT events.event_id, events.status, events.attempts, events.kind
+                    "SELECT events.event_id, events.status, events.attempts, events.kind,
+                            events.dedup_key, events.campaign_id, events.experiment_id
                      FROM agent_run_events
                      JOIN events
                        ON events.project_id = agent_run_events.project_id
@@ -4679,6 +4715,9 @@ impl<'db> AgentRunRepository<'db> {
                         row.get::<_, EventStatus>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, EventKind>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 })
                 .map_err(database_error("query agent run event finalization"))?
@@ -4689,13 +4728,13 @@ impl<'db> AgentRunRepository<'db> {
         let events_match = match phase {
             AgentRunFinalizationPhase::Generic => linked_events
                 .iter()
-                .all(|(_, event_status, _, _)| *event_status == EventStatus::Dispatched),
+                .all(|(_, event_status, ..)| *event_status == EventStatus::Dispatched),
             AgentRunFinalizationPhase::MarkerFailure
             | AgentRunFinalizationPhase::PendingMarkerPolicy
             | AgentRunFinalizationPhase::PreRelease => {
                 linked_events
                     .iter()
-                    .all(|(_, event_status, _, _)| *event_status == EventStatus::InFlight)
+                    .all(|(_, event_status, ..)| *event_status == EventStatus::InFlight)
             }
         };
         if !events_match {
@@ -4746,7 +4785,16 @@ impl<'db> AgentRunRepository<'db> {
                 EventStatus::InFlight
             }
         };
-        for (event_id, _, attempts, event_kind) in linked_events {
+        for (
+            event_id,
+            _,
+            attempts,
+            event_kind,
+            event_dedup_key,
+            event_campaign_id,
+            event_experiment_id,
+        ) in linked_events
+        {
             let (event_status, not_before, completed_at) = if matches!(
                 &resolution,
                 EventResolution::ExecutionUnknown { .. }
@@ -4797,34 +4845,169 @@ impl<'db> AgentRunRepository<'db> {
                 });
             }
             if event_kind == EventKind::CampaignDecision {
-                transaction
-                    .execute(
-                    "UPDATE events
-                     SET status = 'pending', not_before = ?1, lease_until = NULL,
-                         completed_at = NULL, attempts = 0, last_error = NULL
-                     WHERE project_id = ?2 AND event_id = ?3
-                       AND kind = 'campaign_decision'
-                       AND json_extract(payload_json, '$.source') = 'terminal_experiment'
-                       AND EXISTS (
-                           SELECT 1 FROM decision_cycles
-                           WHERE decision_cycles.cycle_id =
-                                 json_extract(events.payload_json, '$.cycle_id')
-                             AND decision_cycles.campaign_id = events.campaign_id
-                             AND decision_cycles.source_experiment_id = events.experiment_id
-                             AND json_extract(events.payload_json,
-                                              '$.source_experiment_id') =
-                                 decision_cycles.source_experiment_id
-                             AND decision_cycles.state = 'pending'
-                             AND EXISTS (
-                                 SELECT 1 FROM decision_attempts
-                                 WHERE decision_attempts.cycle_id = decision_cycles.cycle_id
-                                   AND decision_attempts.agent_run_id = ?4
-                                   AND decision_attempts.state = 'failed'
-                             )
-                       )",
-                        params![finished_at, project_id, event_id, run_id],
+                let failed_lineage = transaction
+                    .query_row(
+                        "SELECT dc.cycle_id, dc.campaign_id, dc.source_experiment_id,
+                                dc.state
+                         FROM decision_attempts da
+                         JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
+                         JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                         WHERE da.agent_run_id = ?1 AND da.state = 'failed'
+                           AND c.project_id = ?2",
+                        params![run_id, project_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, crate::models::DecisionCycleState>(3)?,
+                            ))
+                        },
                     )
-                    .map_err(database_error("requeue linked retryable decision event"))?;
+                    .optional()
+                    .map_err(database_error("read linked failed decision lineage"))?;
+                if let Some((cycle_id, campaign_id, source_experiment_id, cycle_state)) =
+                    failed_lineage
+                {
+                    let canonical_dedup_key = campaign_decision_dedup_key(&cycle_id);
+                    if event_dedup_key != canonical_dedup_key
+                        || event_campaign_id.as_deref() != Some(campaign_id.as_str())
+                        || event_experiment_id.as_deref()
+                            != Some(source_experiment_id.as_str())
+                    {
+                        return Err(AppError::Validation {
+                            field: "campaign_decision_event",
+                            message: "linked decision event does not match the failed attempt lineage",
+                        });
+                    }
+                    match &resolution {
+                        EventResolution::RetryPolicy(_) => {
+                            if cycle_state == crate::models::DecisionCycleState::Degraded {
+                                let dead_lettered = transaction
+                                    .execute(
+                                        "UPDATE events
+                                         SET status = 'dead_letter', lease_until = NULL,
+                                             completed_at = ?1
+                                         WHERE project_id = ?2 AND dedup_key = ?3
+                                           AND campaign_id = ?4 AND experiment_id = ?5
+                                           AND kind = 'campaign_decision' AND status = ?6",
+                                        params![
+                                            finished_at,
+                                            project_id,
+                                            canonical_dedup_key,
+                                            campaign_id,
+                                            source_experiment_id,
+                                            event_status,
+                                        ],
+                                    )
+                                    .map_err(database_error(
+                                        "dead-letter exhausted decision event",
+                                    ))?;
+                                if dead_lettered != 1 {
+                                    return Err(AppError::Validation {
+                                        field: "campaign_decision_event",
+                                        message: "exhausted decision event changed during finalization",
+                                    });
+                                }
+                                continue;
+                            }
+                            if cycle_state != crate::models::DecisionCycleState::Pending {
+                                return Err(AppError::Validation {
+                                    field: "decision_cycle",
+                                    message: "retryable failed decision must be pending",
+                                });
+                            }
+                            let requeued = transaction
+                                .execute(
+                                    "UPDATE events
+                                     SET status = 'pending', not_before = ?1,
+                                         lease_until = NULL, completed_at = NULL,
+                                         attempts = 0, last_error = NULL
+                                     WHERE project_id = ?2 AND dedup_key = ?3
+                                       AND campaign_id = ?4 AND experiment_id = ?5
+                                       AND kind = 'campaign_decision' AND status = ?6",
+                                    params![
+                                        finished_at,
+                                        project_id,
+                                        canonical_dedup_key,
+                                        campaign_id,
+                                        source_experiment_id,
+                                        event_status,
+                                    ],
+                                )
+                                .map_err(database_error(
+                                    "requeue linked retryable decision event",
+                                ))?;
+                            if requeued != 1 {
+                                return Err(AppError::Validation {
+                                    field: "campaign_decision_event",
+                                    message: "retryable decision event changed during finalization",
+                                });
+                            }
+                        }
+                        EventResolution::ExecutionUnknown { .. }
+                        | EventResolution::PolicyBlocked { .. } => {
+                            if cycle_state == crate::models::DecisionCycleState::Pending {
+                                let (failure_code, campaign_reason) = match &resolution {
+                                    EventResolution::ExecutionUnknown { .. } => (
+                                        "execution_unknown".to_owned(),
+                                        "decision_execution_unknown",
+                                    ),
+                                    EventResolution::PolicyBlocked { code, .. } => (
+                                        format!("policy_blocked:{}", code.as_str()),
+                                        "decision_policy_blocked",
+                                    ),
+                                    EventResolution::RetryPolicy(_) => unreachable!(),
+                                };
+                                let degraded = transaction
+                                    .execute(
+                                        "UPDATE decision_cycles
+                                         SET state = 'degraded', next_wake_at = NULL,
+                                             last_failure_code = ?1,
+                                             last_failure_summary = ?2, updated_at = ?3
+                                         WHERE cycle_id = ?4 AND campaign_id = ?5
+                                           AND source_experiment_id = ?6
+                                           AND state = 'pending'",
+                                        params![
+                                            failure_code,
+                                            bounded_event_error.as_deref(),
+                                            finished_at,
+                                            cycle_id,
+                                            campaign_id,
+                                            source_experiment_id,
+                                        ],
+                                    )
+                                    .map_err(database_error(
+                                        "degrade terminally resolved decision cycle",
+                                    ))?;
+                                if degraded != 1 {
+                                    return Err(AppError::Validation {
+                                        field: "decision_cycle",
+                                        message: "terminal decision cycle changed during finalization",
+                                    });
+                                }
+                                transaction
+                                    .execute(
+                                        "UPDATE campaigns
+                                         SET state = 'degraded', state_reason = ?1,
+                                             next_eligible_at = NULL, updated_at = ?2
+                                         WHERE campaign_id = ?3 AND project_id = ?4
+                                           AND state IN ('active','budget_waiting',
+                                                         'goal_reached_pending_review')",
+                                        params![
+                                            campaign_reason,
+                                            finished_at,
+                                            campaign_id,
+                                            project_id,
+                                        ],
+                                    )
+                                    .map_err(database_error(
+                                        "degrade terminally resolved decision campaign",
+                                    ))?;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -6713,7 +6896,14 @@ fn project_constraint_error(source: rusqlite::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use rusqlite::{params, StatementStatus};
     use serde_json::json;
@@ -6777,7 +6967,7 @@ mod tests {
             (EventStatus::Pending, 1_i64),
             (EventStatus::RetryWait, 2_i64),
         ] {
-            let sql = event_claim_candidate_sql(status, false);
+            let sql = event_claim_candidate_sql(status);
             let mut statement = connection.prepare(&sql).unwrap();
             let event_ids = statement
                 .query_map(params![100_i64, 1_i64], |row| row.get::<_, i64>(0))
@@ -6791,6 +6981,99 @@ mod tests {
             assert_eq!(event_ids, [expected_event_id]);
             assert!(vm_steps < 100, "event claim used {vm_steps} VM steps");
         }
+    }
+
+    #[test]
+    fn blocked_project_claim_probe_is_a_pure_index_prefix_without_json_filtering() {
+        for status in [EventStatus::Pending, EventStatus::RetryWait] {
+            let sql = event_claim_candidate_sql(status);
+            assert!(sql.contains("INDEXED BY events_claimable_idx"), "{sql}");
+            assert!(!sql.contains("json_each"), "{sql}");
+            assert!(!sql.contains("projects"), "{sql}");
+            assert!(!sql.contains("campaigns"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn blocked_project_claim_full_transaction_has_a_fixed_vm_work_bound() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (
+                     project_id, root_path, pueue_group, config_path,
+                     enabled, paused, created_at, updated_at
+                 ) VALUES
+                     ('blocked-project', '/tmp/blocked-project', 'blocked-group',
+                      '/tmp/blocked-project/config.toml', 1, 0, 1, 1),
+                     ('eligible-project', '/tmp/eligible-project', 'eligible-group',
+                      '/tmp/eligible-project/config.toml', 1, 0, 1, 1);",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for ordinal in 1..=EVENT_CLAIM_WORK_LIMIT {
+            transaction
+                .execute(
+                    "INSERT INTO events (
+                         project_id, kind, dedup_key, payload_json, status,
+                         attempts, not_before, created_at
+                     ) VALUES ('blocked-project', 'deep_check', ?1, '{}',
+                               'pending', 0, 1, ?2)",
+                    params![format!("blocked-{ordinal:04}"), ordinal as i64],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO events (
+                     project_id, kind, dedup_key, payload_json, status,
+                     attempts, not_before, created_at
+                 ) VALUES ('eligible-project', 'deep_check', 'eligible', '{}',
+                           'pending', 0, 1, 2000)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let vm_steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&vm_steps);
+        connection.progress_handler(
+            1,
+            Some(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let claimed = EventRepository::claim_batch_excluding_projects_in_connection(
+            &mut connection,
+            100,
+            160,
+            1,
+            &BTreeSet::from(["blocked-project".to_owned()]),
+        )
+        .unwrap();
+        connection.progress_handler(0, None::<fn() -> bool>);
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].project_id, "eligible-project");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE project_id = 'blocked-project' AND status = 'retry_wait'
+                       AND not_before = 160 AND attempts = 0",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            EVENT_CLAIM_WORK_LIMIT as i64
+        );
+        let vm_steps = vm_steps.load(Ordering::Relaxed);
+        assert!(
+            vm_steps < 150_000,
+            "full blocked claim transaction used {vm_steps} VM steps"
+        );
     }
 
     #[test]

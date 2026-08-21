@@ -771,10 +771,12 @@ async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_
         .connect()
         .unwrap()
         .execute_batch(&format!(
-            "CREATE TRIGGER keep_recovered_decision_pending
-             BEFORE UPDATE OF status ON events
-             WHEN OLD.event_id = {} AND OLD.status = 'pending' AND NEW.status = 'claimed'
-             BEGIN SELECT RAISE(IGNORE); END;",
+            "CREATE TRIGGER keep_recovered_decision_not_due
+             AFTER UPDATE OF status ON events
+             WHEN OLD.event_id = {} AND NEW.status = 'pending'
+             BEGIN
+                 UPDATE events SET not_before = 260 WHERE event_id = NEW.event_id;
+             END;",
             event.event_id
         ))
         .unwrap();
@@ -1319,7 +1321,8 @@ async fn cleanup_pending_project_defers_without_attempt_while_other_project_disp
         .find_by_id(blocked_event)
         .unwrap()
         .unwrap();
-    assert_eq!(blocked.status, EventStatus::Pending);
+    assert_eq!(blocked.status, EventStatus::RetryWait);
+    assert_eq!(blocked.not_before, 260);
     assert_eq!(blocked.attempts, 0);
     assert_eq!(harness.event_status(other_event), EventStatus::Dispatched);
     assert_eq!(
@@ -1427,8 +1430,8 @@ async fn cleanup_retry_is_fair_across_projects_and_finishes_after_fault_removal(
     let retry_event_a = harness.enqueue(EventKind::TaskFailed, "project-a", "cleanup-fair-retry-a");
     let retry_event_b = harness.enqueue(EventKind::TaskFailed, "project-b", "cleanup-fair-retry-b");
     daemon.run_once().await.unwrap();
-    assert_eq!(harness.event_status(retry_event_a), EventStatus::Pending);
-    assert_eq!(harness.event_status(retry_event_b), EventStatus::Pending);
+    assert_eq!(harness.event_status(retry_event_a), EventStatus::RetryWait);
+    assert_eq!(harness.event_status(retry_event_b), EventStatus::RetryWait);
 
     fs::remove_dir_all(overflow_a).unwrap();
     daemon.run_once().await.unwrap();
@@ -1438,7 +1441,8 @@ async fn cleanup_retry_is_fair_across_projects_and_finishes_after_fault_removal(
     fs::remove_dir_all(overflow_b).unwrap();
     daemon.run_once().await.unwrap();
     assert!(!run_b.join("cleanup-level-0").exists());
-    daemon.run_once().await.unwrap();
+    let mut resumed = harness.daemon_at(260);
+    resumed.run_once().await.unwrap();
     assert_eq!(harness.event_status(retry_event_a), EventStatus::Dispatched);
     assert_eq!(harness.event_status(retry_event_b), EventStatus::Dispatched);
     assert_eq!(
@@ -1656,7 +1660,8 @@ async fn bound_cleanup_pending_project_defers_without_attempt_while_other_projec
         .find_by_id(blocked_event)
         .unwrap()
         .unwrap();
-    assert_eq!(blocked.status, EventStatus::Pending);
+    assert_eq!(blocked.status, EventStatus::RetryWait);
+    assert_eq!(blocked.not_before, 260);
     assert_eq!(blocked.attempts, 0);
     assert_eq!(harness.event_status(other_event), EventStatus::Dispatched);
     assert_eq!(
