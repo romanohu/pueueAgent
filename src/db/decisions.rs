@@ -515,15 +515,38 @@ impl<'db> DecisionRepository<'db> {
             )
             .map_err(database_error("record decision cycle failure"))?;
         if exhausted {
-            transaction
-                .execute(
-                    "UPDATE campaigns
-                     SET state = 'degraded', state_reason = 'decision_attempts_exhausted',
-                         next_eligible_at = NULL, updated_at = ?1
-                     WHERE campaign_id = ?2 AND state = 'active'",
-                    params![now, authority.cycle.campaign_id],
-                )
-                .map_err(database_error("degrade campaign after decision failures"))?;
+            match authority.campaign_state {
+                CampaignState::Active
+                | CampaignState::BudgetWaiting
+                | CampaignState::GoalReachedPendingReview => {
+                    let updated = transaction
+                        .execute(
+                            "UPDATE campaigns
+                             SET state = 'degraded',
+                                 state_reason = 'decision_attempts_exhausted',
+                                 next_eligible_at = NULL, updated_at = ?1
+                             WHERE campaign_id = ?2 AND state = ?3",
+                            params![
+                                now,
+                                authority.cycle.campaign_id,
+                                authority.campaign_state
+                            ],
+                        )
+                        .map_err(database_error(
+                            "degrade campaign after decision failures",
+                        ))?;
+                    if updated != 1 {
+                        return Err(validation_error(
+                            "campaign",
+                            "state changed while degrading exhausted decision attempts",
+                        ));
+                    }
+                }
+                CampaignState::Paused
+                | CampaignState::Degraded
+                | CampaignState::Halted
+                | CampaignState::Retired => {}
+            }
         }
         let cycle = read_cycle(&transaction, cycle_id)?;
         transaction

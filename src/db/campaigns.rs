@@ -1212,6 +1212,33 @@ impl<'db> CampaignRepository<'db> {
                 "cannot resume while reconciliation or termination state is unknown",
             ));
         }
+        let has_degraded_decision_cycle: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM decision_cycles
+                    WHERE campaign_id = ?1 AND state = 'degraded'
+                 )",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error(
+                "check exhausted decision cycles before campaign resume",
+            ))?;
+        if has_degraded_decision_cycle {
+            update_campaign_state(
+                &transaction,
+                &campaign.campaign_id,
+                CampaignState::Degraded,
+                Some("decision_attempts_exhausted"),
+                now,
+                "preserve exhausted decision degradation during campaign resume",
+            )?;
+            let stored = read_campaign(&transaction, &campaign.campaign_id)?;
+            transaction.commit().map_err(database_error(
+                "commit degraded campaign resume transition",
+            ))?;
+            return Ok(stored);
+        }
         if campaign.state == CampaignState::Active {
             return Ok(campaign);
         }

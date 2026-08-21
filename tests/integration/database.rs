@@ -650,6 +650,44 @@ mod decision_cycle {
             .unwrap();
         assert_eq!(state, DecisionCycleState::Analyzing);
     }
+
+    #[test]
+    fn final_attempt_failure_while_paused_stays_paused_and_resume_reveals_degradation() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let repository = DecisionRepository::new(&harness.db);
+        let (cycle, attempt) = harness.reserved_decision_attempt();
+        let campaigns = CampaignRepository::new(&harness.db);
+        let paused = campaigns.pause(&harness.project_id, 192).unwrap();
+        assert_eq!(paused.state, CampaignState::Paused);
+
+        let limits = CampaignLimits {
+            max_decision_attempts_per_cycle: 1,
+            ..CampaignLimits::default()
+        };
+        let degraded_cycle = repository
+            .fail_attempt(
+                None,
+                &cycle.cycle_id,
+                attempt.attempt_number,
+                "decision_missing",
+                "analysis produced no decision",
+                limits,
+                193,
+            )
+            .unwrap();
+        assert_eq!(degraded_cycle.state, DecisionCycleState::Degraded);
+        let still_paused = campaigns.find_by_id(&harness.campaign_id).unwrap().unwrap();
+        assert_eq!(still_paused.state, CampaignState::Paused);
+        assert_eq!(still_paused.state_reason.as_deref(), Some("operator_paused"));
+
+        let resumed = campaigns.resume(&harness.project_id, 194).unwrap();
+        assert_eq!(resumed.state, CampaignState::Degraded);
+        assert_eq!(
+            resumed.state_reason.as_deref(),
+            Some("decision_attempts_exhausted")
+        );
+    }
 }
 
 struct V15Fixture {
