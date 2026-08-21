@@ -1146,6 +1146,56 @@ fn decision_status_uses_scheduler_due_and_source_terminal_order() {
 }
 
 #[test]
+fn decision_status_reports_the_next_due_wait_in_wake_promotion_order() {
+    let harness = DiagnosticsHarness::new();
+    let now = unix_now();
+    let (campaign_id, older_source_later_wake_cycle_id) =
+        harness.start_terminal_decision(now - 300);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles
+             SET state = 'waiting', next_wake_at = ?1, updated_at = ?2
+             WHERE cycle_id = ?3",
+            params![now - 10, now - 200, older_source_later_wake_cycle_id],
+        )
+        .unwrap();
+    let (_, next_wake_cycle_id) = harness.add_terminal_decision_cycle(
+        &campaign_id,
+        "newer-source-earlier-wake",
+        1,
+        now - 200,
+        "waiting",
+        Some(now - 20),
+        now - 100,
+    );
+
+    let input = harness.input(PueueSnapshot::Tasks(Vec::new()));
+    let human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    let compact = render_project_status_compact(&harness.db, &harness.project(), &input).unwrap();
+    let json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+    let campaign_json =
+        pueue_agent::campaign::render_status_for_project(&harness.db, &harness.project(), true)
+            .unwrap();
+
+    for rendered in [&human, &compact, &json, &campaign_json] {
+        assert!(rendered.contains(&next_wake_cycle_id), "{rendered}");
+        assert!(
+            !rendered.contains(&older_source_later_wake_cycle_id),
+            "{rendered}"
+        );
+    }
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["campaign"]["decision"]["state"], "waiting");
+    assert_eq!(
+        value["campaign"]["decision"]["next_wake_at"],
+        now - 20
+    );
+}
+
+#[test]
 fn decision_status_and_doctor_ignore_large_completed_history_when_future_wait_is_current() {
     let harness = DiagnosticsHarness::new();
     let now = unix_now();

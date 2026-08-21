@@ -902,6 +902,9 @@ async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decis
         if state == CampaignState::Retired {
             assert_eq!(event.status, EventStatus::RetryWait);
             assert_eq!(event.not_before, 160);
+        } else if state == CampaignState::BudgetWaiting {
+            assert_eq!(event.status, EventStatus::RetryWait);
+            assert_eq!(event.not_before, 3_700);
         } else {
             assert_eq!(event.status, EventStatus::Pending);
         }
@@ -913,6 +916,125 @@ async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decis
     assert!(scheduler.tick().await.unwrap().started.is_empty());
     assert_eq!(disabled.agent_run_count(), 0);
     assert_eq!(disabled.event_status(event_id), EventStatus::Pending);
+}
+
+#[tokio::test]
+async fn bounded_event_claim_revalidates_many_ineligible_decision_cycles_without_starvation() {
+    let harness = SchedulerHarness::new();
+    for (project_id, group) in [
+        ("project-b", "pb-project-b"),
+        ("project-c", "pc-project-c"),
+        ("project-d", "pd-project-d"),
+    ] {
+        harness.register_project(project_id, group, "/bin/echo", "");
+    }
+    let mut connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "UPDATE projects SET enabled = 0 WHERE project_id = 'project-b';
+             UPDATE projects SET paused = 1 WHERE project_id = 'project-c';
+             INSERT INTO campaigns (
+                 campaign_id, project_id, objective_text, objective_digest,
+                 initial_argv_json, state, created_at, updated_at
+             ) VALUES
+                 ('disabled-campaign', 'project-b', 'objective', 'disabled-digest',
+                  '[]', 'active', 1, 1),
+                 ('paused-project-campaign', 'project-c', 'objective', 'paused-project-digest',
+                  '[]', 'active', 1, 1),
+                 ('inactive-campaign', 'project-d', 'objective', 'inactive-digest',
+                  '[]', 'paused', 1, 1);
+             CREATE TABLE decision_claim_audit (event_id INTEGER PRIMARY KEY);
+             CREATE TRIGGER audit_ineligible_decision_claim
+             AFTER UPDATE OF status ON events
+             WHEN OLD.status = 'pending' AND NEW.status = 'claimed'
+                  AND OLD.project_id IN ('project-b', 'project-c', 'project-d')
+             BEGIN
+                 INSERT INTO decision_claim_audit (event_id) VALUES (NEW.event_id);
+             END;
+             PRAGMA foreign_keys = OFF;",
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    for ordinal in 1..=996_i64 {
+        let (project_id, campaign_id) = match ordinal % 3 {
+            0 => ("project-b", "disabled-campaign"),
+            1 => ("project-c", "paused-project-campaign"),
+            _ => ("project-d", "inactive-campaign"),
+        };
+        let cycle_id = format!("ineligible-cycle-{ordinal:04}");
+        let experiment_id = format!("ineligible-experiment-{ordinal:04}");
+        transaction
+            .execute(
+                "INSERT INTO decision_cycles (
+                     cycle_id, campaign_id, source_experiment_id, source_terminal_at,
+                     state, consecutive_failed_attempts, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?4, ?4)",
+                params![cycle_id, campaign_id, experiment_id, ordinal],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO events (
+                     project_id, campaign_id, kind, dedup_key, payload_json,
+                     status, attempts, not_before, created_at
+                 ) VALUES (?1, ?2, 'campaign_decision', ?3, ?4,
+                           'pending', 0, 1, ?5)",
+                params![
+                    project_id,
+                    campaign_id,
+                    format!("ineligible-decision-{ordinal:04}"),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle_id,
+                        "source_experiment_id": experiment_id,
+                    })
+                    .to_string(),
+                    ordinal,
+                ],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    drop(connection);
+    let eligible_event = harness.enqueue(EventKind::DeepCheck, "project-a", "eligible-after-996");
+
+    let mut report = harness.scheduler_with_claim_limit(1_000).tick().await.unwrap();
+
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].primary_event_id, eligible_event);
+    assert_eq!(harness.event_status(eligible_event), EventStatus::Dispatched);
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM decision_claim_audit", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        996
+    );
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE project_id IN ('project-b', 'project-c', 'project-d')
+                   AND status = 'pending' AND attempts = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        996
+    );
+    report.started[0]
+        .handle
+        .wait(&harness.db, harness.now)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -972,7 +1094,7 @@ async fn campaign_agent_budget_decision_defers_until_the_absolute_wake_without_a
         vec![campaign_id.clone()]
     );
     assert!(DecisionRepository::new(&harness.db)
-        .oldest_due_cycle_for_campaign("project-a", &campaign_id, 3_700)
+        .oldest_pending_cycle_for_campaign("project-a", &campaign_id)
         .unwrap()
         .is_some());
 }

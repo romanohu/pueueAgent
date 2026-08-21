@@ -1458,6 +1458,7 @@ impl DiagnosticsCliHarness {
             .unwrap()
             .execute_batch(
                 "DROP INDEX IF EXISTS decision_cycles_state_source_order_idx;
+                 DROP INDEX IF EXISTS decision_cycles_state_wake_source_order_idx;
                  DROP INDEX IF EXISTS decision_cycles_campaign_state_source_order_idx;
                  DROP INDEX IF EXISTS decision_cycles_campaign_state_wake_source_order_idx;
                  DROP INDEX IF EXISTS decision_cycles_campaign_state_wake_updated_idx;
@@ -1532,7 +1533,7 @@ fn writable_project_command_migrates_v18_after_its_read_only_project_preflight()
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        19
+        20
     );
 }
 

@@ -46,6 +46,31 @@ use crate::{
 
 use super::{database_error, Db};
 
+fn event_claim_candidate_sql(status: EventStatus, blocked_project_ids: bool) -> String {
+    let status = match status {
+        EventStatus::Pending => "pending",
+        EventStatus::RetryWait => "retry_wait",
+        _ => unreachable!("event claim probes only pending and retry-wait states"),
+    };
+    let blocked_filter = if blocked_project_ids {
+        "AND NOT EXISTS (
+             SELECT 1 FROM json_each(?3) AS blocked_projects
+             WHERE blocked_projects.value = events.project_id
+         )"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT event_id, not_before, created_at
+         FROM events INDEXED BY events_claimable_idx
+         WHERE status IN ('pending', 'retry_wait')
+           AND status = '{status}' AND not_before <= ?1
+           {blocked_filter}
+         ORDER BY not_before, created_at, event_id
+         LIMIT ?2"
+    )
+}
+
 pub struct ProjectRepository<'db> {
     db: &'db Db,
 }
@@ -1070,61 +1095,50 @@ impl<'db> EventRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin immediate event claim"))?;
-        let blocked_filter = if blocked_project_ids.is_empty() {
-            ""
+        let blocked_json = if blocked_project_ids.is_empty() {
+            None
         } else {
-            "AND NOT EXISTS (
-                           SELECT 1 FROM json_each(?3) AS blocked_projects
-                           WHERE blocked_projects.value = events.project_id
-                       )"
+            Some(serde_json::to_string(blocked_project_ids).map_err(|_| {
+                AppError::Runtime {
+                    operation: "serialize blocked project filter",
+                }
+            })?)
         };
         let event_ids = {
-            let mut statement = transaction
-                .prepare(&format!(
-                    "SELECT event_id FROM events
-                     WHERE status IN ('pending', 'retry_wait') AND not_before <= ?1
-                       AND EXISTS (
-                           SELECT 1 FROM projects
-                           WHERE projects.project_id = events.project_id
-                             AND enabled = 1
-                             AND paused = 0
-                             AND halted_reason IS NULL
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM agent_runs
-                           WHERE agent_runs.project_id = events.project_id
-                             AND status IN ('starting', 'running')
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM campaigns
-                           WHERE campaigns.project_id = events.project_id
-                             AND campaigns.state <> 'retired'
-                             AND campaigns.state <> 'active'
-                       )
-                       {blocked_filter}
-                     ORDER BY created_at, event_id
-                     LIMIT ?2"
-                ))
-                .map_err(database_error("prepare event claim"))?;
-            let blocked_json = if blocked_project_ids.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(blocked_project_ids).map_err(|_| {
-                    AppError::Runtime {
-                        operation: "serialize blocked project filter",
-                    }
-                })?)
-            };
             let mut query_params = vec![Value::Integer(now), Value::Integer(limit)];
-            if let Some(blocked_json) = blocked_json {
-                query_params.push(Value::Text(blocked_json));
+            if let Some(blocked_json) = blocked_json.as_ref() {
+                query_params.push(Value::Text(blocked_json.clone()));
             }
-            let rows = statement
-                .query_map(params_from_iter(query_params), |row| row.get::<_, i64>(0))
-                .map_err(database_error("query claimable events"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(database_error("read claimable events"))?;
-            rows
+            let mut candidates = Vec::with_capacity(limit as usize * 2);
+            for status in [EventStatus::Pending, EventStatus::RetryWait] {
+                let mut statement = transaction
+                    .prepare(&event_claim_candidate_sql(
+                        status,
+                        !blocked_project_ids.is_empty(),
+                    ))
+                    .map_err(database_error("prepare event claim"))?;
+                candidates.extend(
+                    statement
+                        .query_map(params_from_iter(query_params.iter()), |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })
+                        .map_err(database_error("query claimable events"))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(database_error("read claimable events"))?,
+                );
+            }
+            candidates.sort_by_key(|(event_id, not_before, created_at)| {
+                (*not_before, *created_at, *event_id)
+            });
+            candidates.truncate(limit as usize);
+            candidates
+                .into_iter()
+                .map(|(event_id, _, _)| event_id)
+                .collect::<Vec<_>>()
         };
 
         for event_id in &event_ids {
@@ -4648,7 +4662,7 @@ impl<'db> AgentRunRepository<'db> {
         let linked_events = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT events.event_id, events.status, events.attempts
+                    "SELECT events.event_id, events.status, events.attempts, events.kind
                      FROM agent_run_events
                      JOIN events
                        ON events.project_id = agent_run_events.project_id
@@ -4664,6 +4678,7 @@ impl<'db> AgentRunRepository<'db> {
                         row.get::<_, i64>(0)?,
                         row.get::<_, EventStatus>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, EventKind>(3)?,
                     ))
                 })
                 .map_err(database_error("query agent run event finalization"))?
@@ -4674,13 +4689,13 @@ impl<'db> AgentRunRepository<'db> {
         let events_match = match phase {
             AgentRunFinalizationPhase::Generic => linked_events
                 .iter()
-                .all(|(_, event_status, _)| *event_status == EventStatus::Dispatched),
+                .all(|(_, event_status, _, _)| *event_status == EventStatus::Dispatched),
             AgentRunFinalizationPhase::MarkerFailure
             | AgentRunFinalizationPhase::PendingMarkerPolicy
             | AgentRunFinalizationPhase::PreRelease => {
                 linked_events
                     .iter()
-                    .all(|(_, event_status, _)| *event_status == EventStatus::InFlight)
+                    .all(|(_, event_status, _, _)| *event_status == EventStatus::InFlight)
             }
         };
         if !events_match {
@@ -4731,7 +4746,7 @@ impl<'db> AgentRunRepository<'db> {
                 EventStatus::InFlight
             }
         };
-        for (event_id, _, attempts) in linked_events {
+        for (event_id, _, attempts, event_kind) in linked_events {
             let (event_status, not_before, completed_at) = if matches!(
                 &resolution,
                 EventResolution::ExecutionUnknown { .. }
@@ -4780,6 +4795,36 @@ impl<'db> AgentRunRepository<'db> {
                 return Err(AppError::Runtime {
                     operation: "resolve linked agent event",
                 });
+            }
+            if event_kind == EventKind::CampaignDecision {
+                transaction
+                    .execute(
+                    "UPDATE events
+                     SET status = 'pending', not_before = ?1, lease_until = NULL,
+                         completed_at = NULL, attempts = 0, last_error = NULL
+                     WHERE project_id = ?2 AND event_id = ?3
+                       AND kind = 'campaign_decision'
+                       AND json_extract(payload_json, '$.source') = 'terminal_experiment'
+                       AND EXISTS (
+                           SELECT 1 FROM decision_cycles
+                           WHERE decision_cycles.cycle_id =
+                                 json_extract(events.payload_json, '$.cycle_id')
+                             AND decision_cycles.campaign_id = events.campaign_id
+                             AND decision_cycles.source_experiment_id = events.experiment_id
+                             AND json_extract(events.payload_json,
+                                              '$.source_experiment_id') =
+                                 decision_cycles.source_experiment_id
+                             AND decision_cycles.state = 'pending'
+                             AND EXISTS (
+                                 SELECT 1 FROM decision_attempts
+                                 WHERE decision_attempts.cycle_id = decision_cycles.cycle_id
+                                   AND decision_attempts.agent_run_id = ?4
+                                   AND decision_attempts.state = 'failed'
+                             )
+                       )",
+                        params![finished_at, project_id, event_id, run_id],
+                    )
+                    .map_err(database_error("requeue linked retryable decision event"))?;
             }
         }
 
@@ -6670,11 +6715,83 @@ fn project_constraint_error(source: rusqlite::Error) -> AppError {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use rusqlite::params;
+    use rusqlite::{params, StatementStatus};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn event_claim_candidate_probe_is_bounded_before_one_thousand_ineligible_projects() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (
+                     project_id, root_path, pueue_group, config_path,
+                     enabled, paused, created_at, updated_at
+                 ) VALUES
+                     ('disabled-project', '/tmp/disabled-project', 'disabled-group',
+                      '/tmp/disabled-project/config.toml', 0, 0, 1, 1),
+                     ('eligible-project', '/tmp/eligible-project', 'eligible-group',
+                      '/tmp/eligible-project/config.toml', 1, 0, 1, 1);",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for ordinal in 1..=1_000_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO events (
+                         project_id, kind, dedup_key, payload_json, status,
+                         attempts, not_before, created_at
+                     ) VALUES ('disabled-project', 'campaign_decision', ?1, '{}',
+                               'pending', 0, 1, ?2)",
+                    params![format!("disabled-decision-{ordinal}"), ordinal],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO events (
+                         project_id, kind, dedup_key, payload_json, status,
+                         attempts, not_before, created_at
+                     ) VALUES ('disabled-project', 'campaign_decision', ?1, '{}',
+                               'retry_wait', 0, 1, ?2)",
+                    params![format!("disabled-retry-{ordinal}"), ordinal],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO events (
+                     project_id, kind, dedup_key, payload_json, status,
+                     attempts, not_before, created_at
+                 ) VALUES ('eligible-project', 'deep_check', 'eligible', '{}',
+                           'pending', 0, 1, 2000)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        for (status, expected_event_id) in [
+            (EventStatus::Pending, 1_i64),
+            (EventStatus::RetryWait, 2_i64),
+        ] {
+            let sql = event_claim_candidate_sql(status, false);
+            let mut statement = connection.prepare(&sql).unwrap();
+            let event_ids = statement
+                .query_map(params![100_i64, 1_i64], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let vm_steps = statement.get_status(StatementStatus::VmStep);
+
+            assert!(!sql.contains("projects"), "{sql}");
+            assert!(!sql.contains("campaigns"), "{sql}");
+            assert_eq!(event_ids, [expected_event_id]);
+            assert!(vm_steps < 100, "event claim used {vm_steps} VM steps");
+        }
+    }
 
     #[test]
     fn terminal_finalizer_result_read_failure_rolls_back_and_retries() {

@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     decision_evidence::{validate_stored_decision_context, DECISION_CONTEXT_SCHEMA_VERSION},
+    diagnostics::MAX_EVENT_LIST_LIMIT,
     execution_policy::CampaignLimits,
     models::{
         AgentRunStatus, CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle,
@@ -30,71 +31,30 @@ const DECISION_ATTEMPT_SELECT: &str = "SELECT
     agent_run_id, decision_json, decision_digest, decision_kind, failure_code,
     failure_summary, created_at, started_at, finished_at
     FROM decision_attempts";
-const GLOBAL_PENDING_DECISION_SQL: &str =
-    "SELECT dc.cycle_id, dc.source_terminal_at, dc.source_experiment_id
-     FROM decision_cycles dc INDEXED BY decision_cycles_state_source_order_idx
-     JOIN campaigns c ON c.campaign_id = dc.campaign_id
-     JOIN projects p ON p.project_id = c.project_id
-     WHERE dc.state = 'pending' AND c.state = 'active'
-       AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
-     ORDER BY dc.source_terminal_at, dc.source_experiment_id, dc.cycle_id
-     LIMIT ?1";
 const GLOBAL_DUE_WAIT_DECISION_SQL: &str =
-    "SELECT dc.cycle_id, dc.source_terminal_at, dc.source_experiment_id
-     FROM decision_cycles dc INDEXED BY decision_cycles_state_source_order_idx
-     JOIN campaigns c ON c.campaign_id = dc.campaign_id
-     JOIN projects p ON p.project_id = c.project_id
-     WHERE dc.state = 'waiting' AND dc.next_wake_at <= ?1 AND c.state = 'active'
-       AND p.enabled = 1 AND p.paused = 0 AND p.halted_reason IS NULL
-     ORDER BY dc.source_terminal_at, dc.source_experiment_id, dc.cycle_id
+    "SELECT cycle_id
+     FROM decision_cycles INDEXED BY decision_cycles_state_wake_source_order_idx
+     WHERE state = 'waiting' AND next_wake_at <= ?1
+     ORDER BY next_wake_at, source_terminal_at, source_experiment_id, cycle_id
      LIMIT ?2";
 const CAMPAIGN_PENDING_DECISION_SQL: &str =
-    "SELECT cycle_id, source_terminal_at, source_experiment_id
+    "SELECT cycle_id
      FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
      WHERE campaign_id = ?1 AND state = 'pending'
      ORDER BY source_terminal_at, source_experiment_id, cycle_id
      LIMIT 1";
-const CAMPAIGN_DUE_WAIT_DECISION_SQL: &str =
-    "SELECT cycle_id, source_terminal_at, source_experiment_id
-     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
-     WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at <= ?2
-     ORDER BY source_terminal_at, source_experiment_id, cycle_id
-     LIMIT 1";
 
-#[derive(Debug)]
-struct DecisionOrderCandidate {
-    cycle_id: String,
-    source_terminal_at: i64,
-    source_experiment_id: String,
-}
-
-impl DecisionOrderCandidate {
-    fn source_order(&self) -> (i64, &str, &str) {
-        (
-            self.source_terminal_at,
-            &self.source_experiment_id,
-            &self.cycle_id,
-        )
-    }
-}
-
-fn query_decision_order_candidates(
+fn query_decision_cycle_ids(
     connection: &Connection,
     sql: &str,
     parameters: &[&dyn rusqlite::ToSql],
     operation: &'static str,
-) -> Result<Vec<DecisionOrderCandidate>, AppError> {
+) -> Result<Vec<String>, AppError> {
     let mut statement = connection
         .prepare(sql)
         .map_err(database_error(operation))?;
     let candidates = statement
-        .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
-            Ok(DecisionOrderCandidate {
-                cycle_id: row.get(0)?,
-                source_terminal_at: row.get(1)?,
-                source_experiment_id: row.get(2)?,
-            })
-        })
+        .query_map(rusqlite::params_from_iter(parameters.iter()), |row| row.get(0))
         .map_err(database_error(operation))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(database_error(operation))?;
@@ -460,33 +420,9 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin decision attempt reservation"))?;
-        let mut authority = read_authority(&transaction, cycle_id)?;
+        let authority = read_authority(&transaction, cycle_id)?;
         validate_active_authority(&authority, Some(project_id))?;
 
-        if authority.cycle.state == DecisionCycleState::Waiting {
-            let next_wake_at = authority.cycle.next_wake_at.ok_or_else(|| {
-                validation_error(
-                    "decision_cycle.next_wake_at",
-                    "a waiting decision cycle must have a finite wake time",
-                )
-            })?;
-            if next_wake_at > now {
-                transaction
-                    .commit()
-                    .map_err(database_error("commit future decision cycle reservation"))?;
-                return Ok(None);
-            }
-            transaction
-                .execute(
-                    "UPDATE decision_cycles
-                     SET state = 'pending', next_wake_at = NULL, updated_at = ?1
-                     WHERE cycle_id = ?2 AND state = 'waiting' AND next_wake_at <= ?1",
-                    params![now, cycle_id],
-                )
-                .map_err(database_error("wake due decision cycle"))?;
-            authority.cycle.state = DecisionCycleState::Pending;
-            authority.cycle.next_wake_at = None;
-        }
         if authority.cycle.state != DecisionCycleState::Pending {
             transaction
                 .commit()
@@ -1207,6 +1143,35 @@ impl<'db> DecisionRepository<'db> {
                 params![state, failures, code, summary, now, cycle_id],
             )
             .map_err(database_error("record decision cycle failure"))?;
+        if !exhausted {
+            let requeued = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'pending', not_before = ?1, lease_until = NULL,
+                         completed_at = NULL, attempts = 0, last_error = NULL
+                     WHERE project_id = ?2 AND campaign_id = ?3 AND experiment_id = ?4
+                       AND kind = 'campaign_decision'
+                       AND json_extract(payload_json, '$.source') = 'terminal_experiment'
+                       AND json_extract(payload_json, '$.cycle_id') = ?5
+                       AND json_extract(payload_json, '$.source_experiment_id') = ?4
+                       AND (status IN ('completed','failed','dead_letter')
+                            OR (status = 'retry_wait' AND not_before <= ?1))",
+                    params![
+                        now,
+                        authority.project_id,
+                        authority.cycle.campaign_id,
+                        authority.cycle.source_experiment_id,
+                        cycle_id,
+                    ],
+                )
+                .map_err(database_error("requeue retryable decision event"))?;
+            if requeued > 1 {
+                return Err(validation_error(
+                    "campaign_decision_event",
+                    "retryable failure matched multiple lineage events",
+                ));
+            }
+        }
         if exhausted {
             match authority.campaign_state {
                 CampaignState::Active
@@ -1297,45 +1262,40 @@ impl<'db> DecisionRepository<'db> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        if limit > MAX_EVENT_LIST_LIMIT {
+            return Err(AppError::Configuration {
+                field: "event_claim_limit",
+            });
+        }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin due decision cycle query"))?;
-        let pending = query_decision_order_candidates(
-            &transaction,
-            GLOBAL_PENDING_DECISION_SQL,
-            &[&limit],
-            "query pending decision cycles",
-        )?;
-        let waiting = query_decision_order_candidates(
+        let cycle_ids = query_decision_cycle_ids(
             &transaction,
             GLOBAL_DUE_WAIT_DECISION_SQL,
             &[&now, &limit],
             "query due waiting decision cycles",
         )?;
-        let mut candidates = pending.into_iter().chain(waiting).collect::<Vec<_>>();
-        candidates.sort_unstable_by(|left, right| left.source_order().cmp(&right.source_order()));
-        let cycle_ids = candidates
-            .into_iter()
-            .take(usize::try_from(limit).unwrap_or(usize::MAX))
-            .map(|candidate| candidate.cycle_id)
-            .collect::<Vec<_>>();
         let mut cycles = Vec::with_capacity(cycle_ids.len());
         for cycle_id in cycle_ids {
-            let authority = read_authority(&transaction, &cycle_id)?;
-            validate_active_authority(&authority, None)?;
-            if authority.cycle.state == DecisionCycleState::Waiting {
-                transaction
-                    .execute(
-                        "UPDATE decision_cycles
-                         SET state = 'pending', next_wake_at = NULL, updated_at = ?1
-                         WHERE cycle_id = ?2 AND state = 'waiting' AND next_wake_at <= ?1",
-                        params![now, cycle_id],
-                    )
-                    .map_err(database_error("wake due decision cycle during query"))?;
+            let promoted = transaction
+                .execute(
+                    "UPDATE decision_cycles
+                     SET state = 'pending', next_wake_at = NULL, updated_at = ?1
+                     WHERE cycle_id = ?2 AND state = 'waiting' AND next_wake_at <= ?1",
+                    params![now, cycle_id],
+                )
+                .map_err(database_error("wake due decision cycle during query"))?;
+            if promoted != 1 {
+                return Err(validation_error(
+                    "decision_cycle",
+                    "due waiting cycle changed during wake promotion",
+                ));
             }
-            transaction
+            let cycle = read_cycle(&transaction, &cycle_id)?;
+            let promoted_event = transaction
                 .execute(
                     "UPDATE events
                      SET status = 'pending', not_before = ?1, lease_until = NULL,
@@ -1349,13 +1309,19 @@ impl<'db> DecisionRepository<'db> {
                             OR (status = 'retry_wait' AND not_before <= ?1))",
                     params![
                         now,
-                        authority.cycle.campaign_id,
-                        authority.cycle.source_experiment_id,
+                        cycle.campaign_id,
+                        cycle.source_experiment_id,
                         cycle_id
                     ],
                 )
                 .map_err(database_error("wake due decision event"))?;
-            cycles.push(read_cycle(&transaction, &cycle_id)?);
+            if promoted_event != 1 {
+                return Err(validation_error(
+                    "campaign_decision_event",
+                    "due wake requires exactly one matching lineage event",
+                ));
+            }
+            cycles.push(cycle);
         }
         transaction
             .commit()
@@ -1363,11 +1329,10 @@ impl<'db> DecisionRepository<'db> {
         Ok(cycles)
     }
 
-    pub fn oldest_due_cycle_for_campaign(
+    pub fn oldest_pending_cycle_for_campaign(
         &self,
         project_id: &str,
         campaign_id: &str,
-        now: i64,
     ) -> Result<Option<DecisionCycle>, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -1387,23 +1352,14 @@ impl<'db> DecisionRepository<'db> {
             .map_err(database_error("query decision campaign authority"))?
             .unwrap_or(false);
         let cycle_id = if campaign_active {
-            let pending = query_decision_order_candidates(
+            query_decision_cycle_ids(
                 &transaction,
                 CAMPAIGN_PENDING_DECISION_SQL,
                 &[&campaign_id],
                 "query oldest pending campaign decision",
-            )?;
-            let waiting = query_decision_order_candidates(
-                &transaction,
-                CAMPAIGN_DUE_WAIT_DECISION_SQL,
-                &[&campaign_id, &now],
-                "query oldest waiting campaign decision",
-            )?;
-            pending
+            )?
                 .into_iter()
-                .chain(waiting)
-                .min_by(|left, right| left.source_order().cmp(&right.source_order()))
-                .map(|candidate| candidate.cycle_id)
+                .next()
         } else {
             None
         };
@@ -1415,17 +1371,7 @@ impl<'db> DecisionRepository<'db> {
         };
         let authority = read_authority(&transaction, &cycle_id)?;
         validate_active_authority(&authority, Some(project_id))?;
-        if authority.cycle.state == DecisionCycleState::Waiting {
-            transaction
-                .execute(
-                    "UPDATE decision_cycles
-                     SET state = 'pending', next_wake_at = NULL, updated_at = ?1
-                     WHERE cycle_id = ?2 AND state = 'waiting' AND next_wake_at <= ?1",
-                    params![now, cycle_id],
-                )
-                .map_err(database_error("wake oldest due decision cycle"))?;
-        }
-        let cycle = read_cycle(&transaction, &cycle_id)?;
+        let cycle = authority.cycle;
         transaction
             .commit()
             .map_err(database_error("commit oldest due decision cycle query"))?;
@@ -1985,12 +1931,10 @@ fn validation_error(
 
 #[cfg(test)]
 mod due_query_plan_tests {
+    use rusqlite::{params, StatementStatus};
     use tempfile::TempDir;
 
-    use super::{
-        CAMPAIGN_DUE_WAIT_DECISION_SQL, CAMPAIGN_PENDING_DECISION_SQL,
-        GLOBAL_DUE_WAIT_DECISION_SQL, GLOBAL_PENDING_DECISION_SQL,
-    };
+    use super::{CAMPAIGN_PENDING_DECISION_SQL, GLOBAL_DUE_WAIT_DECISION_SQL};
     use crate::db::Db;
 
     #[test]
@@ -1999,33 +1943,18 @@ mod due_query_plan_tests {
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         for (name, sql, parameters, expected_index) in [
             (
-                "global pending",
-                GLOBAL_PENDING_DECISION_SQL,
-                vec![&4_i64 as &dyn rusqlite::ToSql],
-                "decision_cycles_state_source_order_idx",
-            ),
-            (
                 "global due waiting",
                 GLOBAL_DUE_WAIT_DECISION_SQL,
                 vec![
                     &100_i64 as &dyn rusqlite::ToSql,
                     &4_i64 as &dyn rusqlite::ToSql,
                 ],
-                "decision_cycles_state_source_order_idx",
+                "decision_cycles_state_wake_source_order_idx",
             ),
             (
                 "campaign pending",
                 CAMPAIGN_PENDING_DECISION_SQL,
                 vec![&"campaign-a" as &dyn rusqlite::ToSql],
-                "decision_cycles_campaign_state_source_order_idx",
-            ),
-            (
-                "campaign due waiting",
-                CAMPAIGN_DUE_WAIT_DECISION_SQL,
-                vec![
-                    &"campaign-a" as &dyn rusqlite::ToSql,
-                    &100_i64 as &dyn rusqlite::ToSql,
-                ],
                 "decision_cycles_campaign_state_source_order_idx",
             ),
         ] {
@@ -2054,5 +1983,73 @@ mod due_query_plan_tests {
                 "{name}: {details:?}"
             );
         }
+    }
+
+    #[test]
+    fn due_wake_probe_has_a_constant_vm_step_bound_before_one_thousand_future_waits() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects (
+                    project_id, root_path, pueue_group, config_path,
+                    enabled, paused, created_at, updated_at
+                 ) VALUES ('project-a', '/tmp/project-a', 'pa-project-a',
+                           '/tmp/project-a/config.toml', 1, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO campaigns (
+                    campaign_id, project_id, objective_text, objective_digest,
+                    initial_argv_json, state, created_at, updated_at
+                 ) VALUES ('campaign-a', 'project-a', 'objective', 'digest',
+                           '[]', 'active', 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let transaction = connection.transaction().unwrap();
+        for ordinal in 1..=1_000_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO decision_cycles (
+                        cycle_id, campaign_id, source_experiment_id,
+                        source_terminal_at, state, next_wake_at,
+                        consecutive_failed_attempts, created_at, updated_at
+                     ) VALUES (?1, 'campaign-a', ?2, ?3, 'waiting', 10000, 0, 1, 1)",
+                    params![
+                        format!("future-cycle-{ordinal:04}"),
+                        format!("future-experiment-{ordinal:04}"),
+                        ordinal,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO decision_cycles (
+                    cycle_id, campaign_id, source_experiment_id,
+                    source_terminal_at, state, next_wake_at,
+                    consecutive_failed_attempts, created_at, updated_at
+                 ) VALUES ('due-cycle', 'campaign-a', 'due-experiment',
+                           2000, 'waiting', 99, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let mut statement = connection.prepare(GLOBAL_DUE_WAIT_DECISION_SQL).unwrap();
+        let cycle_ids = statement
+            .query_map(params![100_i64, 1_i64], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let vm_steps = statement.get_status(StatementStatus::VmStep);
+
+        assert_eq!(cycle_ids, ["due-cycle"]);
+        assert!(vm_steps < 200, "due wake used {vm_steps} VM steps");
     }
 }

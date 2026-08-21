@@ -508,6 +508,53 @@ fn bc74e297_v18_decision_fixture() -> (TempDir, PathBuf) {
     (_temp, path)
 }
 
+fn canonical_v19_decision_fixture() -> (TempDir, PathBuf) {
+    let (_temp, path) = bc74e297_v18_decision_fixture();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE decision_cycles
+                ADD COLUMN source_terminal_at INTEGER NOT NULL DEFAULT 1
+                    CHECK(source_terminal_at > 0);
+            UPDATE decision_cycles
+               SET source_terminal_at = (
+                   SELECT COALESCE(experiments.finished_at, experiments.updated_at)
+                   FROM experiments
+                   WHERE experiments.experiment_id = decision_cycles.source_experiment_id
+                     AND experiments.campaign_id = decision_cycles.campaign_id
+                     AND experiments.status IN ('succeeded','failed','cancelled')
+               );
+            DROP INDEX decision_cycles_state_wake_updated_idx;
+            DROP INDEX decision_cycles_campaign_state_updated_idx;
+            CREATE INDEX decision_cycles_state_source_order_idx
+                ON decision_cycles(state, source_terminal_at, source_experiment_id, cycle_id);
+            CREATE INDEX decision_cycles_campaign_state_source_order_idx
+                ON decision_cycles(campaign_id, state, source_terminal_at, source_experiment_id, cycle_id);
+            CREATE INDEX decision_cycles_campaign_state_wake_source_order_idx
+                ON decision_cycles(campaign_id, state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id);
+            PRAGMA user_version = 19;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+    (_temp, path)
+}
+
+fn canonical_v20_decision_fixture() -> (TempDir, PathBuf) {
+    let (_temp, path) = canonical_v19_decision_fixture();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE INDEX decision_cycles_state_wake_source_order_idx
+                 ON decision_cycles(state, next_wake_at, source_terminal_at,
+                                    source_experiment_id, cycle_id);
+             PRAGMA user_version = 20;",
+        )
+        .unwrap();
+    (_temp, path)
+}
+
 mod decision_schema {
     use super::*;
 
@@ -520,7 +567,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
         assert_eq!(
             table_columns(&connection, "decision_cycles")
@@ -560,7 +607,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 18,
-                required: 19
+                required: 20
             }
         ));
         let rendered = error.render();
@@ -601,7 +648,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
         assert_eq!(
             connection
@@ -627,6 +674,10 @@ mod decision_schema {
                 "decision_cycles_campaign_state_wake_source_order_idx",
                 "campaign_id, state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id",
             ),
+            (
+                "decision_cycles_state_wake_source_order_idx",
+                "state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id",
+            ),
         ] {
             let sql: String = connection
                 .query_row(
@@ -640,7 +691,145 @@ mod decision_schema {
     }
 
     #[test]
-    fn v19_rejects_zero_source_terminal_projection_without_repair() {
+    fn v19_read_only_requires_v20_without_mutation() {
+        let (_temp, path) = canonical_v19_decision_fixture();
+        let before = Connection::open(&path).unwrap();
+        let before_schema_version: i64 = before
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        drop(before);
+
+        let readonly = Db::open_read_only(&path).unwrap();
+        let error = readonly.require_latest_schema().unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::SchemaMigrationRequired {
+                current: 19,
+                required: 20
+            }
+        ));
+
+        let after = Connection::open(&path).unwrap();
+        assert_eq!(
+            after
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            19
+        );
+        assert_eq!(
+            after
+                .pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before_schema_version
+        );
+        assert_eq!(
+            after
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name = 'decision_cycles_state_wake_source_order_idx'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn writable_open_atomically_migrates_v19_wake_index() {
+        let (_temp, path) = canonical_v19_decision_fixture();
+        let migrated = Db::open(&path).unwrap();
+        let connection = migrated.connect().unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            20
+        );
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'decision_cycles_state_wake_source_order_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            compact_schema_sql(&sql).contains(
+                "state, next_wake_at, source_terminal_at, source_experiment_id, cycle_id"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn failed_v19_wake_index_migration_rolls_back_version_and_index() {
+        let (_temp, path) = canonical_v19_decision_fixture();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE INDEX decision_cycles_state_wake_source_order_idx
+                     ON decision_cycles(state, next_wake_at);",
+            )
+            .unwrap();
+
+        assert!(Db::open(&path).is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            19
+        );
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'decision_cycles_state_wake_source_order_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("source_terminal_at"), "{sql}");
+    }
+
+    #[test]
+    fn current_v20_rejects_wrong_wake_index_without_repair() {
+        let (_temp, path) = canonical_v20_decision_fixture();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX decision_cycles_state_wake_source_order_idx;
+                 CREATE INDEX decision_cycles_state_wake_source_order_idx
+                 ON decision_cycles(state, next_wake_at);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = Db::open(&path).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Runtime {
+                operation: "verify SQLite v20 decision schema"
+            }
+        ));
+        let sql: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'decision_cycles_state_wake_source_order_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("source_terminal_at"), "{sql}");
+    }
+
+    #[test]
+    fn current_v20_rejects_zero_source_terminal_projection_without_repair() {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
         DecisionRepository::new(&harness.db)
             .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_000)
@@ -661,13 +850,13 @@ mod decision_schema {
         assert!(matches!(
             error,
             AppError::Runtime {
-                operation: "verify SQLite v19 decision schema"
+                operation: "verify SQLite v20 decision schema"
             }
         ));
     }
 
     #[test]
-    fn v19_rejects_noncanonical_source_terminal_projection_without_repair() {
+    fn current_v20_rejects_noncanonical_source_terminal_projection_without_repair() {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
         let cycle = DecisionRepository::new(&harness.db)
             .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_000)
@@ -688,7 +877,7 @@ mod decision_schema {
         assert!(matches!(
             error,
             AppError::Runtime {
-                operation: "verify SQLite v19 decision schema"
+                operation: "verify SQLite v20 decision schema"
             }
         ));
         assert_eq!(
@@ -707,7 +896,7 @@ mod decision_schema {
     }
 
     #[test]
-    fn current_v19_rejects_wrong_source_order_index_without_repair() {
+    fn current_v20_rejects_wrong_source_order_index_without_repair() {
         let test = TestDatabase::new();
         test.db
             .connect()
@@ -723,7 +912,7 @@ mod decision_schema {
         assert!(matches!(
             error,
             AppError::Runtime {
-                operation: "verify SQLite v19 decision schema"
+                operation: "verify SQLite v20 decision schema"
             }
         ));
         let sql: String = test
@@ -780,7 +969,7 @@ mod decision_schema {
     }
 
     #[test]
-    fn current_v19_rejects_extra_event_kind_without_repair() {
+    fn current_v20_rejects_extra_event_kind_without_repair() {
         let test = TestDatabase::new();
         test.db
             .connect()
@@ -804,7 +993,7 @@ mod decision_schema {
         assert!(matches!(
             error,
             AppError::Runtime {
-                operation: "verify SQLite v19 decision schema"
+                operation: "verify SQLite v20 decision schema"
             }
         ));
         let sql: String = Connection::open(&test.path)
@@ -951,6 +1140,349 @@ mod decision_cycle {
         assert_eq!(waiting.state, DecisionCycleState::Waiting);
         assert_eq!(waiting.next_wake_at, Some(260));
         assert_eq!(waiting.consecutive_failed_attempts, 0);
+    }
+
+    #[test]
+    fn due_wake_promotes_the_exact_cycle_and_event_atomically_once() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        decisions
+            .mark_waiting(&cycle_id, reservation.attempt_number, 260, 200)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', attempts = 3, completed_at = 201,
+                     last_error = 'old bounded retry fact'
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_exact_due_wake
+                 BEFORE UPDATE OF status ON events
+                 WHEN OLD.event_id = {event_id} AND NEW.status = 'pending'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected exact wake failure');
+                 END;"
+            ))
+            .unwrap();
+
+        assert!(decisions.due_cycles(260, 1).is_err());
+        let rolled_back: (DecisionCycleState, EventStatus, i64, Option<i64>) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.state, ev.status, ev.attempts, ev.completed_at
+                 FROM decision_cycles dc
+                 JOIN events ev ON ev.event_id = ?2
+                 WHERE dc.cycle_id = ?1",
+                params![cycle_id, event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            rolled_back,
+            (
+                DecisionCycleState::Waiting,
+                EventStatus::Completed,
+                3,
+                Some(201),
+            )
+        );
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_exact_due_wake;")
+            .unwrap();
+
+        let promoted = decisions.due_cycles(260, 1).unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].cycle_id, cycle_id);
+        assert_eq!(promoted[0].state, DecisionCycleState::Pending);
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::Pending);
+        assert_eq!(event.attempts, 0);
+        assert_eq!(event.completed_at, None);
+        assert_eq!(event.last_error, None);
+        assert!(decisions.due_cycles(260, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn due_wake_never_requeues_an_existing_pending_cycle_or_changes_its_event_accounting() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = 'dead_letter', attempts = 4, completed_at = 200,
+                     last_error = 'preserve this bounded retry fact'
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+
+        assert!(decisions.due_cycles(300, 1).unwrap().is_empty());
+        let cycle = decisions
+            .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cycle.cycle_id, cycle_id);
+        assert_eq!(cycle.state, DecisionCycleState::Pending);
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::DeadLetter);
+        assert_eq!(event.attempts, 4);
+        assert_eq!(event.completed_at, Some(200));
+        assert_eq!(
+            event.last_error.as_deref(),
+            Some("preserve this bounded retry fact")
+        );
+    }
+
+    #[test]
+    fn due_wake_rejects_a_limit_above_the_service_event_bound() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let error = DecisionRepository::new(&harness.db)
+            .due_cycles(300, 1_001)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Configuration {
+                field: "event_claim_limit"
+            }
+        ));
+    }
+
+    #[test]
+    fn campaign_selection_requires_wake_promotion_then_uses_pending_source_order() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        decisions
+            .mark_waiting(&cycle_id, reservation.attempt_number, 260, 200)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events SET status = 'completed', completed_at = 201
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+
+        assert!(decisions
+            .oldest_pending_cycle_for_campaign(
+                &harness.project_id,
+                &harness.campaign_id,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(decisions.due_cycles(260, 1).unwrap().len(), 1);
+        let selected = decisions
+            .oldest_pending_cycle_for_campaign(
+                &harness.project_id,
+                &harness.campaign_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.cycle_id, cycle_id);
+        assert_eq!(selected.state, DecisionCycleState::Pending);
+    }
+
+    #[test]
+    fn due_wake_rolls_back_when_the_exact_lineage_event_is_missing() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        decisions
+            .mark_waiting(&cycle_id, reservation.attempt_number, 260, 200)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute("DELETE FROM events WHERE event_id = ?1", [event_id])
+            .unwrap();
+
+        let error = decisions.due_cycles(260, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "campaign_decision_event",
+                ..
+            }
+        ));
+        assert_eq!(
+            decisions
+                .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DecisionCycleState::Waiting
+        );
+    }
+
+    #[test]
+    fn retryable_failure_requeues_its_exact_event_without_a_global_pending_scan() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', attempts = 2, completed_at = 192,
+                     last_error = 'old bounded failure'
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+
+        let cycle = decisions
+            .fail_attempt(
+                None,
+                &cycle_id,
+                reservation.attempt_number,
+                "decision_missing",
+                "decision output was absent",
+                CampaignLimits::default(),
+                200,
+            )
+            .unwrap();
+
+        assert_eq!(cycle.state, DecisionCycleState::Pending);
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::Pending);
+        assert_eq!(event.attempts, 0);
+        assert_eq!(event.completed_at, None);
+        assert_eq!(event.last_error, None);
+    }
+
+    #[test]
+    fn decision_run_finalization_keeps_a_retryable_cycle_event_pending_atomically() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Failed);
+        let decisions = DecisionRepository::new(&harness.db);
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let reservation = decisions
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .unwrap();
+        EventRepository::new(&harness.db)
+            .claim_batch(192, 252, 1)
+            .unwrap();
+        let runs = AgentRunRepository::new(&harness.db);
+        let run = runs
+            .insert_with_events(
+                &NewAgentRun::new(
+                    &harness.project_id,
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    193,
+                    harness.test.project_root("campaign-project").join("decision.log"),
+                ),
+                &[event_id],
+            )
+            .unwrap();
+        decisions
+            .bind_agent_run(&reservation, run.run_id, 194)
+            .unwrap();
+        runs.mark_running_and_apply_interventions(
+            &harness.project_id,
+            run.run_id,
+            4242,
+            195,
+        )
+        .unwrap();
+        runs.mark_gate_release_requested(&harness.project_id, run.run_id)
+            .unwrap();
+        runs.acknowledge_dispatch(&harness.project_id, run.run_id)
+            .unwrap();
+        decisions
+            .fail_attempt(
+                Some(run.run_id),
+                &cycle_id,
+                reservation.attempt_number,
+                "decision_missing",
+                "decision output was absent",
+                CampaignLimits::default(),
+                196,
+            )
+            .unwrap();
+
+        runs.finish_and_resolve_events(
+            &harness.project_id,
+            run.run_id,
+            AgentRunStatus::Completed,
+            197,
+            Some(0),
+            None,
+            EventResolution::RetryPolicy(RetryPolicy { max_retries: 2 }),
+        )
+        .unwrap();
+
+        let event = EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::Pending);
+        assert_eq!(event.attempts, 0);
+        assert_eq!(event.completed_at, None);
+        assert_eq!(event.last_error, None);
+        assert_eq!(
+            decisions
+                .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DecisionCycleState::Pending
+        );
     }
 
     #[test]
@@ -1458,18 +1990,32 @@ mod decision_cycle {
         let harness =
             CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let repository = DecisionRepository::new(&harness.db);
-        let (cycle, first_attempt) = harness.reserved_decision_attempt();
+        let (cycle_id, event_id) = published_terminal_decision(&harness, 190);
+        let first_attempt = repository
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 191)
+            .unwrap()
+            .unwrap();
         repository
-            .mark_waiting(&cycle.cycle_id, first_attempt.attempt_number, 260, 200)
+            .mark_waiting(&cycle_id, first_attempt.attempt_number, 260, 200)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events SET status = 'completed', completed_at = 200
+                 WHERE event_id = ?1",
+                [event_id],
+            )
             .unwrap();
         assert_eq!(repository.due_cycles(260, 10).unwrap().len(), 1);
         let second_attempt = repository
-            .reserve_next_attempt(&harness.project_id, &cycle.cycle_id, 261)
+            .reserve_next_attempt(&harness.project_id, &cycle_id, 261)
             .unwrap()
             .unwrap();
 
         let error = repository
-            .mark_waiting(&cycle.cycle_id, first_attempt.attempt_number, 300, 262)
+            .mark_waiting(&cycle_id, first_attempt.attempt_number, 300, 262)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -1484,7 +2030,7 @@ mod decision_cycle {
             .unwrap()
             .query_row(
                 "SELECT state FROM decision_cycles WHERE cycle_id = ?1",
-                [&cycle.cycle_id],
+                [&cycle_id],
                 |row| row.get(0),
             )
             .unwrap();

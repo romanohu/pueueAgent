@@ -296,6 +296,10 @@ impl Scheduler {
                 ));
                 continue;
             };
+            if !project.enabled || project.paused || project.halted_reason.is_some() {
+                return_scheduler_error!(EventRepository::new(&self.db).defer_claimed(&event_ids));
+                continue;
+            }
             let mut campaign = return_scheduler_error!(
                 CampaignRepository::new(&self.db).find_live_by_project(&project.project_id)
             );
@@ -597,10 +601,9 @@ impl Scheduler {
                     continue;
                 };
                 let due_cycle = return_scheduler_error!(
-                    DecisionRepository::new(&self.db).oldest_due_cycle_for_campaign(
+                    DecisionRepository::new(&self.db).oldest_pending_cycle_for_campaign(
                         &project.project_id,
                         &campaign.campaign_id,
-                        self.config.now,
                     )
                 );
                 let Some(due_cycle) = due_cycle else {

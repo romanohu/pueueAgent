@@ -341,16 +341,10 @@ const DECISION_STATUS_SOURCE_ASC_SQL: &str =
      WHERE campaign_id = ?1 AND state = ?2
      ORDER BY source_terminal_at, source_experiment_id, cycle_id
      LIMIT 1";
-const DECISION_STATUS_DUE_WAIT_SQL: &str =
-    "SELECT cycle_id, source_terminal_at, source_experiment_id
-     FROM decision_cycles INDEXED BY decision_cycles_campaign_state_source_order_idx
-     WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at <= ?2
-     ORDER BY source_terminal_at, source_experiment_id, cycle_id
-     LIMIT 1";
-const DECISION_STATUS_FUTURE_WAIT_SQL: &str =
+const DECISION_STATUS_WAIT_SQL: &str =
     "SELECT cycle_id, source_terminal_at, source_experiment_id
      FROM decision_cycles INDEXED BY decision_cycles_campaign_state_wake_source_order_idx
-     WHERE campaign_id = ?1 AND state = 'waiting' AND next_wake_at > ?2
+     WHERE campaign_id = ?1 AND state = 'waiting'
      ORDER BY next_wake_at, source_terminal_at, source_experiment_id, cycle_id
      LIMIT 1";
 const DECISION_STATUS_SOURCE_DESC_SQL: &str =
@@ -398,7 +392,7 @@ fn decision_status_candidate(
 pub(crate) fn current_decision_projection(
     db: &Db,
     campaign_id: &str,
-    now: i64,
+    _now: i64,
 ) -> Result<Option<DecisionDoctorProjection>, AppError> {
     let connection = db.connect()?;
     let analyzing = decision_status_candidate(
@@ -407,36 +401,27 @@ pub(crate) fn current_decision_projection(
         &[&campaign_id, &"analyzing"],
         "read active decision status candidate",
     )?;
-    let due = if analyzing.is_none() {
-        let pending = decision_status_candidate(
+    let pending = if analyzing.is_none() {
+        decision_status_candidate(
             &connection,
             DECISION_STATUS_SOURCE_ASC_SQL,
             &[&campaign_id, &"pending"],
             "read pending decision status candidate",
-        )?;
-        let waiting = decision_status_candidate(
-            &connection,
-            DECISION_STATUS_DUE_WAIT_SQL,
-            &[&campaign_id, &now],
-            "read due waiting decision status candidate",
-        )?;
-        pending.into_iter().chain(waiting).min_by(|left, right| {
-            left.source_order().cmp(&right.source_order())
-        })
+        )?
     } else {
         None
     };
-    let future_wait = if analyzing.is_none() && due.is_none() {
+    let waiting = if analyzing.is_none() && pending.is_none() {
         decision_status_candidate(
             &connection,
-            DECISION_STATUS_FUTURE_WAIT_SQL,
-            &[&campaign_id, &now],
+            DECISION_STATUS_WAIT_SQL,
+            &[&campaign_id],
             "read waiting decision status candidate",
         )?
     } else {
         None
     };
-    let terminal = if analyzing.is_none() && due.is_none() && future_wait.is_none()
+    let terminal = if analyzing.is_none() && pending.is_none() && waiting.is_none()
     {
         let mut candidates = Vec::with_capacity(2);
         for state in ["completed", "degraded"] {
@@ -457,8 +442,8 @@ pub(crate) fn current_decision_projection(
         None
     };
     let Some(cycle_id) = analyzing
-        .or(due)
-        .or(future_wait)
+        .or(pending)
+        .or(waiting)
         .or(terminal)
         .map(|candidate| candidate.cycle_id)
     else {
@@ -644,8 +629,8 @@ mod decision_query_plan_tests {
     use tempfile::TempDir;
 
     use super::{
-        DECISION_STATUS_DUE_WAIT_SQL, DECISION_STATUS_FUTURE_WAIT_SQL,
         DECISION_STATUS_SOURCE_ASC_SQL, DECISION_STATUS_SOURCE_DESC_SQL,
+        DECISION_STATUS_WAIT_SQL,
     };
     use crate::db::Db;
 
@@ -683,21 +668,9 @@ mod decision_query_plan_tests {
                 "decision_cycles_campaign_state_source_order_idx",
             ),
             (
-                "due waiting",
-                DECISION_STATUS_DUE_WAIT_SQL,
-                vec![
-                    &"campaign-a" as &dyn rusqlite::ToSql,
-                    &100_i64 as &dyn rusqlite::ToSql,
-                ],
-                "decision_cycles_campaign_state_source_order_idx",
-            ),
-            (
-                "future waiting",
-                DECISION_STATUS_FUTURE_WAIT_SQL,
-                vec![
-                    &"campaign-a" as &dyn rusqlite::ToSql,
-                    &100_i64 as &dyn rusqlite::ToSql,
-                ],
+                "waiting",
+                DECISION_STATUS_WAIT_SQL,
+                vec![&"campaign-a" as &dyn rusqlite::ToSql],
                 "decision_cycles_campaign_state_wake_source_order_idx",
             ),
             (
