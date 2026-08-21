@@ -136,38 +136,41 @@ where
                     now,
                 )?;
                 if let Some(experiment) = experiment.as_ref() {
-                    let cycle = DecisionRepository::new(self.db).ensure_cycle_for_terminal(
+                    let cycle_id = DecisionRepository::terminal_cycle_id(
                         &experiment.campaign_id,
                         &experiment.experiment_id,
+                    );
+                    let decision_event = NewEvent::new(
+                        &project.project_id,
+                        EventKind::CampaignDecision,
+                        format!("campaign-decision:v1:{cycle_id}"),
+                        json!({
+                            "source": "terminal_experiment",
+                            "cycle_id": cycle_id,
+                            "source_experiment_id": experiment.experiment_id,
+                            "terminal_observation": {
+                                "task_id": task.id,
+                                "task_signature": experiment.task_signature,
+                                "group": task.group,
+                                "state": task.state,
+                                "enqueued_at": task.enqueued_at.as_deref().and_then(parse_timestamp),
+                                "started_at": task.started_at.as_deref().and_then(parse_timestamp),
+                                "ended_at": task.ended_at.as_deref().and_then(parse_timestamp),
+                                "exit_code": task.result.as_ref().and_then(terminal_exit_code),
+                            },
+                        }),
                         now,
-                    )?;
-                    EventRepository::new(self.db).insert_idempotent(
-                        &NewEvent::new(
-                            &project.project_id,
-                            EventKind::CampaignDecision,
-                            format!("campaign-decision:v1:{}", cycle.cycle_id),
-                            json!({
-                                "source": "terminal_experiment",
-                                "cycle_id": cycle.cycle_id,
-                                "source_experiment_id": cycle.source_experiment_id,
-                                "terminal_observation": {
-                                    "task_id": task.id,
-                                    "task_signature": experiment.task_signature,
-                                    "group": task.group,
-                                    "state": task.state,
-                                    "enqueued_at": task.enqueued_at.as_deref().and_then(parse_timestamp),
-                                    "started_at": task.started_at.as_deref().and_then(parse_timestamp),
-                                    "ended_at": task.ended_at.as_deref().and_then(parse_timestamp),
-                                    "exit_code": task.result.as_ref().and_then(terminal_exit_code),
-                                },
-                            }),
-                            now,
-                            now,
-                        )
-                        .with_campaign_lineage(
-                            cycle.campaign_id,
-                            Some(experiment.experiment_id.clone()),
-                        ),
+                        now,
+                    )
+                    .with_campaign_lineage(
+                        experiment.campaign_id.clone(),
+                        Some(experiment.experiment_id.clone()),
+                    );
+                    DecisionRepository::new(self.db).publish_terminal_cycle_event(
+                        &experiment.campaign_id,
+                        &experiment.experiment_id,
+                        &decision_event,
+                        now,
                     )?;
                 }
                 match event_kind {
@@ -230,15 +233,17 @@ fn resolve_terminal_experiment(
     let submissions = SubmissionRepository::new(db);
     let experiments = ExperimentRepository::new(db);
     if tasks.iter().filter(|candidate| candidate.id == task.id).count() != 1 {
+        let mut ambiguous_experiment_ids = Vec::new();
         for submission_id in submission_ids {
             if let Some(experiment) = experiments.find_by_submission_id(&submission_id)? {
-                experiments.quarantine_accepted_identity(
-                    &experiment.experiment_id,
-                    "pueue_task_identity_ambiguous",
-                    now,
-                )?;
+                ambiguous_experiment_ids.push(experiment.experiment_id);
             }
         }
+        experiments.quarantine_accepted_identities(
+            &ambiguous_experiment_ids,
+            "pueue_task_identity_ambiguous",
+            now,
+        )?;
         return Ok(None);
     }
     let mut matches = Vec::new();
@@ -265,15 +270,17 @@ fn resolve_terminal_experiment(
         }
     }
     if matches.len() != 1 {
+        let mut ambiguous_experiment_ids = Vec::new();
         for submission in matches {
             if let Some(experiment) = experiments.find_by_submission_id(&submission.submission_id)? {
-                experiments.quarantine_accepted_identity(
-                    &experiment.experiment_id,
-                    "pueue_task_identity_ambiguous",
-                    now,
-                )?;
+                ambiguous_experiment_ids.push(experiment.experiment_id);
             }
         }
+        experiments.quarantine_accepted_identities(
+            &ambiguous_experiment_ids,
+            "pueue_task_identity_ambiguous",
+            now,
+        )?;
         return Ok(None);
     }
     let Some(experiment) = experiments.find_by_submission_id(&matches[0].submission_id)? else {

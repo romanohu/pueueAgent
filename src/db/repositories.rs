@@ -662,52 +662,15 @@ impl<'db> EventRepository<'db> {
         &self,
         event: &NewEvent,
     ) -> Result<(Event, bool), AppError> {
-        let payload_json =
-            serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
-                operation: "serialize event payload",
-                source,
-            })?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin idempotent event insert"))?;
-        validate_event_lineage(&transaction, event)?;
-        let inserted = transaction
-            .execute(
-                "INSERT INTO events (
-                    project_id, campaign_id, experiment_id, kind, dedup_key, payload_json, status, attempts,
-                    not_before, lease_until, created_at, completed_at, last_error
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, ?8, NULL, NULL)
-                 ON CONFLICT(project_id, dedup_key) DO NOTHING",
-                params![
-                    event.project_id,
-                    event.campaign_id,
-                    event.experiment_id,
-                    event.kind,
-                    event.dedup_key,
-                    payload_json,
-                    event.not_before,
-                    event.created_at,
-                ],
-            )
-            .map_err(database_error("insert event"))?;
-        let stored = transaction
-            .query_row(
-                &format!("{} WHERE project_id = ?1 AND dedup_key = ?2", EVENT_SELECT),
-                params![event.project_id, event.dedup_key],
-                event_from_row,
-            )
-            .map_err(database_error("read idempotent event"))?;
-        if stored.campaign_id != event.campaign_id || stored.experiment_id != event.experiment_id {
-            return Err(AppError::Validation {
-                field: "event.lineage",
-                message: "conflicts with the existing event lineage",
-            });
-        }
+        let stored = insert_event_idempotent_in_transaction(&transaction, event)?;
         transaction
             .commit()
             .map_err(database_error("commit idempotent event insert"))?;
-        Ok((stored, inserted == 1))
+        Ok(stored)
     }
 
     pub fn insert_periodic_deep_check_if_due(
@@ -5984,6 +5947,51 @@ impl<'db> TaskObservationRepository<'db> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read Pueue task observations"))
     }
+}
+
+pub(super) fn insert_event_idempotent_in_transaction(
+    transaction: &Transaction<'_>,
+    event: &NewEvent,
+) -> Result<(Event, bool), AppError> {
+    let payload_json =
+        serde_json::to_string(&event.payload).map_err(|source| AppError::Serialization {
+            operation: "serialize event payload",
+            source,
+        })?;
+    validate_event_lineage(transaction, event)?;
+    let inserted = transaction
+        .execute(
+            "INSERT INTO events (
+                project_id, campaign_id, experiment_id, kind, dedup_key, payload_json, status, attempts,
+                not_before, lease_until, created_at, completed_at, last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, ?8, NULL, NULL)
+             ON CONFLICT(project_id, dedup_key) DO NOTHING",
+            params![
+                event.project_id,
+                event.campaign_id,
+                event.experiment_id,
+                event.kind,
+                event.dedup_key,
+                payload_json,
+                event.not_before,
+                event.created_at,
+            ],
+        )
+        .map_err(database_error("insert event"))?;
+    let stored = transaction
+        .query_row(
+            &format!("{} WHERE project_id = ?1 AND dedup_key = ?2", EVENT_SELECT),
+            params![event.project_id, event.dedup_key],
+            event_from_row,
+        )
+        .map_err(database_error("read idempotent event"))?;
+    if stored.campaign_id != event.campaign_id || stored.experiment_id != event.experiment_id {
+        return Err(AppError::Validation {
+            field: "event.lineage",
+            message: "conflicts with the existing event lineage",
+        });
+    }
+    Ok((stored, inserted == 1))
 }
 
 const EVENT_SELECT: &str =

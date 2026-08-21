@@ -237,6 +237,46 @@ impl Harness {
         experiment_id
     }
 
+    fn duplicate_accepted_campaign_identity(&self) -> String {
+        let duplicate_experiment_id = "campaign-experiment-ambiguous";
+        self.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO submissions (
+                     submission_id, project_id, argv_json, created_at, pueue_task_id,
+                     task_signature, status, kind, metadata_json, origin_agent_run_id
+                 )
+                 SELECT 'campaign-submission-ambiguous', project_id, argv_json, created_at + 1,
+                        pueue_task_id, task_signature, status, kind, metadata_json,
+                        origin_agent_run_id
+                 FROM submissions WHERE submission_id = 'campaign-submission-baseline';
+                 INSERT INTO proposals (
+                     proposal_id, campaign_id, kind, status, hypothesis, source_experiment_id,
+                     argv_json, working_directory, expected_evidence_json, canonical_digest,
+                     reject_reason, created_at, updated_at
+                 )
+                 SELECT 'campaign-proposal-ambiguous', campaign_id, kind, status, hypothesis,
+                        source_experiment_id, argv_json, working_directory,
+                        expected_evidence_json, 'campaign-proposal-ambiguous-digest',
+                        reject_reason, created_at + 1, updated_at + 1
+                 FROM proposals WHERE proposal_id = 'campaign-proposal-baseline';
+                 INSERT INTO experiments (
+                     experiment_id, campaign_id, proposal_id, submission_id,
+                     parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                     failure_code, failure_fingerprint, created_at, updated_at, finished_at
+                 )
+                 SELECT 'campaign-experiment-ambiguous', campaign_id,
+                        'campaign-proposal-ambiguous', 'campaign-submission-ambiguous',
+                        parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                        failure_code, failure_fingerprint, created_at + 1, updated_at + 1,
+                        finished_at
+                 FROM experiments WHERE experiment_id = 'campaign-experiment-baseline';",
+            )
+            .unwrap();
+        duplicate_experiment_id.to_owned()
+    }
+
     async fn reconcile_task(&self, task: PueueTask) {
         Reconciler::new(&self.db, FakePueue::with_tasks(vec![task]))
             .run_once_at(200)
@@ -376,6 +416,123 @@ async fn terminal_success_and_failure_each_create_one_decision_cycle_event() {
         assert_eq!(harness.decision_event_count(&experiment_id), 1);
         assert!(harness.terminal_event_precedes_decision(&experiment_id));
     }
+}
+
+#[tokio::test]
+async fn terminal_cycle_and_decision_event_publication_rolls_back_and_republishes_on_restart() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    let task = terminal_task(41, "100", json!("Success"));
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_campaign_decision_publication
+             BEFORE INSERT ON events
+             WHEN NEW.kind = 'campaign_decision'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected campaign decision publication failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(Reconciler::new(&harness.db, FakePueue::with_tasks(vec![task.clone()]))
+        .run_once_at(200)
+        .await
+        .is_err());
+
+    assert_eq!(harness.decision_cycle_count(&experiment_id), 0);
+    assert_eq!(harness.decision_event_count(&experiment_id), 0);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_campaign_decision_publication;")
+        .unwrap();
+
+    Reconciler::new(&harness.db, FakePueue::with_tasks(vec![task]))
+        .run_once_at(201)
+        .await
+        .unwrap();
+
+    assert_eq!(harness.decision_cycle_count(&experiment_id), 1);
+    assert_eq!(harness.decision_event_count(&experiment_id), 1);
+}
+
+#[tokio::test]
+async fn ambiguous_accepted_identities_quarantine_atomically_across_interruption() {
+    let harness = Harness::new();
+    let first_experiment_id = harness.accepted_campaign_experiment(41);
+    let second_experiment_id = harness.duplicate_accepted_campaign_identity();
+    let task = terminal_task(41, "100", json!("Success"));
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER interrupt_ambiguous_identity_quarantine
+             BEFORE UPDATE OF status ON experiments
+             WHEN OLD.experiment_id = 'campaign-experiment-ambiguous'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected ambiguity quarantine interruption');
+             END;",
+        )
+        .unwrap();
+
+    assert!(Reconciler::new(&harness.db, FakePueue::with_tasks(vec![task.clone()]))
+        .run_once_at(200)
+        .await
+        .is_err());
+
+    let experiments = ExperimentRepository::new(&harness.db);
+    assert_eq!(
+        experiments
+            .find_by_id(&first_experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+    assert_eq!(
+        experiments
+            .find_by_id(&second_experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER interrupt_ambiguous_identity_quarantine;")
+        .unwrap();
+
+    Reconciler::new(&harness.db, FakePueue::with_tasks(vec![task]))
+        .run_once_at(201)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        experiments
+            .find_by_id(&first_experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
+    assert_eq!(
+        experiments
+            .find_by_id(&second_experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
+    assert_eq!(harness.decision_cycle_count(&first_experiment_id), 0);
+    assert_eq!(harness.decision_cycle_count(&second_experiment_id), 0);
+    assert_eq!(harness.pending_event_count(EventKind::CampaignDecision), 0);
 }
 
 #[tokio::test]

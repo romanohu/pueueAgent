@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -6,12 +6,12 @@ use crate::{
     execution_policy::CampaignLimits,
     models::{
         CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle, DecisionCycleState,
-        ExperimentStatus,
+        Event, EventKind, ExperimentStatus, NewEvent,
     },
     AppError,
 };
 
-use super::{database_error, Db};
+use super::{database_error, repositories::insert_event_idempotent_in_transaction, Db};
 
 const MAX_DECISION_PAYLOAD_BYTES: usize = 128 * 1024;
 const MAX_DECISION_DIGEST_BYTES: usize = 256;
@@ -138,54 +138,82 @@ impl<'db> DecisionRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin terminal decision cycle creation"))?;
-        let lineage = transaction
-            .query_row(
-                "SELECT c.project_id, e.campaign_id, e.status
-                 FROM campaigns c
-                 JOIN projects p ON p.project_id = c.project_id
-                 JOIN experiments e ON e.experiment_id = ?2
-                 WHERE c.campaign_id = ?1",
-                params![campaign_id, experiment_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, ExperimentStatus>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(database_error("read terminal decision lineage"))?;
-        let Some((_project_id, experiment_campaign_id, experiment_status)) = lineage else {
-            return Err(validation_error(
-                "source_experiment_id",
-                "must identify an experiment linked to an existing campaign and project",
-            ));
-        };
-        if experiment_campaign_id != campaign_id || !is_terminal(experiment_status) {
-            return Err(validation_error(
-                "source_experiment_id",
-                "must identify a terminal experiment in the same campaign",
-            ));
-        }
-
-        let cycle_id = decision_cycle_id(campaign_id, experiment_id);
-        transaction
-            .execute(
-                "INSERT INTO decision_cycles (
-                    cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
-                    consecutive_failed_attempts, last_decision_kind, last_failure_code,
-                    last_failure_summary, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, ?4, ?4)
-                 ON CONFLICT(campaign_id, source_experiment_id) DO NOTHING",
-                params![cycle_id, campaign_id, experiment_id, now],
-            )
-            .map_err(database_error("insert terminal decision cycle"))?;
-        let cycle = read_cycle_for_source(&transaction, campaign_id, experiment_id)?;
+        let cycle = ensure_terminal_cycle_in_transaction(
+            &transaction,
+            campaign_id,
+            experiment_id,
+            now,
+        )?;
         transaction
             .commit()
             .map_err(database_error("commit terminal decision cycle creation"))?;
         Ok(cycle)
+    }
+
+    pub(crate) fn terminal_cycle_id(campaign_id: &str, experiment_id: &str) -> String {
+        decision_cycle_id(campaign_id, experiment_id)
+    }
+
+    pub fn publish_terminal_cycle_event(
+        &self,
+        campaign_id: &str,
+        experiment_id: &str,
+        event: &NewEvent,
+        now: i64,
+    ) -> Result<(DecisionCycle, Event), AppError> {
+        let expected_cycle_id = decision_cycle_id(campaign_id, experiment_id);
+        if event.kind != EventKind::CampaignDecision
+            || event.dedup_key != format!("campaign-decision:v1:{expected_cycle_id}")
+            || event.campaign_id.as_deref() != Some(campaign_id)
+            || event.experiment_id.as_deref() != Some(experiment_id)
+            || event.payload.get("source").and_then(serde_json::Value::as_str)
+                != Some("terminal_experiment")
+            || event.payload.get("cycle_id").and_then(serde_json::Value::as_str)
+                != Some(expected_cycle_id.as_str())
+            || event
+                .payload
+                .get("source_experiment_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment_id)
+        {
+            return Err(validation_error(
+                "campaign_decision_event",
+                "must carry the exact terminal cycle and experiment lineage",
+            ));
+        }
+        let expected_payload = event.payload.clone();
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin terminal decision publication"))?;
+        let cycle = ensure_terminal_cycle_in_transaction(
+            &transaction,
+            campaign_id,
+            experiment_id,
+            now,
+        )?;
+        let (event, _) = insert_event_idempotent_in_transaction(&transaction, event)?;
+        if event.kind != EventKind::CampaignDecision
+            || event.payload != expected_payload
+            || event.payload.get("source").and_then(serde_json::Value::as_str)
+                != Some("terminal_experiment")
+            || event.payload.get("cycle_id").and_then(serde_json::Value::as_str)
+                != Some(expected_cycle_id.as_str())
+            || event
+                .payload
+                .get("source_experiment_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(experiment_id)
+        {
+            return Err(validation_error(
+                "campaign_decision_event",
+                "conflicts with the existing terminal decision projection",
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit terminal decision publication"))?;
+        Ok((cycle, event))
     }
 
     pub fn reserve_next_attempt(
@@ -232,20 +260,63 @@ impl<'db> DecisionRepository<'db> {
             return Ok(None);
         }
 
-        let campaign_has_active_attempt: bool = transaction
+        let reusable_attempt_number = transaction
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1
+                "SELECT attempt_number FROM decision_attempts
+                 WHERE cycle_id = ?1 AND state IN ('reserved','evidence_ready')
+                   AND agent_run_id IS NULL
+                 ORDER BY attempt_number DESC LIMIT 1",
+                [cycle_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(database_error("find reusable unbound decision attempt"))?;
+        let campaign_active_attempt_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
                     FROM decision_attempts da
                     JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
                     WHERE dc.campaign_id = ?1
-                      AND da.state IN ('reserved','evidence_ready','running')
-                 )",
+                      AND da.state IN ('reserved','evidence_ready','running')",
                 [&authority.cycle.campaign_id],
                 |row| row.get(0),
             )
-            .map_err(database_error("check active campaign decision attempt"))?;
-        if campaign_has_active_attempt {
+            .map_err(database_error("count active campaign decision attempts"))?;
+        if let Some(attempt_number) = reusable_attempt_number {
+            if campaign_active_attempt_count != 1 {
+                return Err(validation_error(
+                    "decision_attempt",
+                    "reusable unbound attempt must be the campaign's only active attempt",
+                ));
+            }
+            let attempt = read_attempt(&transaction, cycle_id, attempt_number)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE decision_cycles
+                     SET state = 'analyzing', next_wake_at = NULL, updated_at = ?1
+                     WHERE cycle_id = ?2 AND state = 'pending'",
+                    params![now, cycle_id],
+                )
+                .map_err(database_error("reactivate reusable decision attempt"))?;
+            if updated != 1 {
+                return Err(validation_error(
+                    "decision_cycle",
+                    "state changed while reactivating an unbound attempt",
+                ));
+            }
+            let reservation = DecisionReservation {
+                cycle_id: cycle_id.to_owned(),
+                campaign_id: authority.cycle.campaign_id,
+                source_experiment_id: authority.cycle.source_experiment_id,
+                attempt_number,
+                created_at: attempt.created_at,
+            };
+            transaction
+                .commit()
+                .map_err(database_error("commit reusable decision attempt reservation"))?;
+            return Ok(Some(reservation));
+        }
+        if campaign_active_attempt_count != 0 {
             transaction
                 .commit()
                 .map_err(database_error("commit contended decision attempt reservation"))?;
@@ -293,6 +364,91 @@ impl<'db> DecisionRepository<'db> {
             .commit()
             .map_err(database_error("commit decision attempt reservation"))?;
         Ok(Some(reservation))
+    }
+
+    pub fn requeue_unbound_attempt(
+        &self,
+        reservation: &DecisionReservation,
+        now: i64,
+    ) -> Result<DecisionCycle, AppError> {
+        self.try_requeue_unbound_attempt(reservation, now)?
+            .ok_or_else(|| {
+                validation_error(
+                    "decision_attempt",
+                    "only an unbound reserved or evidence-ready attempt can be requeued",
+                )
+            })
+    }
+
+    pub fn try_requeue_unbound_attempt(
+        &self,
+        reservation: &DecisionReservation,
+        now: i64,
+    ) -> Result<Option<DecisionCycle>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin unbound decision attempt requeue"))?;
+        let authority = read_authority(&transaction, &reservation.cycle_id)?;
+        validate_reservation_lineage(&authority, reservation)?;
+        let attempt = read_attempt(
+            &transaction,
+            &reservation.cycle_id,
+            reservation.attempt_number,
+        )?;
+        if !matches!(
+            attempt.state,
+            DecisionAttemptState::Reserved | DecisionAttemptState::EvidenceReady
+        ) || attempt.agent_run_id.is_some()
+        {
+            return Ok(None);
+        }
+        if attempt.state == DecisionAttemptState::EvidenceReady {
+            let updated = transaction
+                .execute(
+                    "UPDATE decision_attempts
+                     SET state = 'reserved', context_schema_version = NULL,
+                         context_json = NULL, context_digest = NULL
+                     WHERE cycle_id = ?1 AND attempt_number = ?2
+                       AND state = 'evidence_ready' AND agent_run_id IS NULL",
+                    params![reservation.cycle_id, reservation.attempt_number],
+                )
+                .map_err(database_error("discard stale unbound decision evidence"))?;
+            if updated != 1 {
+                return Err(validation_error(
+                    "decision_attempt",
+                    "state changed while discarding stale unbound evidence",
+                ));
+            }
+        }
+        if authority.cycle.state == DecisionCycleState::Pending {
+            transaction
+                .commit()
+                .map_err(database_error("commit existing unbound decision attempt requeue"))?;
+            return Ok(Some(authority.cycle));
+        }
+        if authority.cycle.state != DecisionCycleState::Analyzing {
+            return Ok(None);
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE decision_cycles
+                 SET state = 'pending', next_wake_at = NULL, updated_at = ?1
+                 WHERE cycle_id = ?2 AND state = 'analyzing'",
+                params![now, reservation.cycle_id],
+            )
+            .map_err(database_error("requeue unbound decision attempt"))?;
+        if updated != 1 {
+            return Err(validation_error(
+                "decision_cycle",
+                "state changed while requeuing an unbound attempt",
+            ));
+        }
+        let cycle = read_cycle(&transaction, &reservation.cycle_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit unbound decision attempt requeue"))?;
+        Ok(Some(cycle))
     }
 
     pub fn store_evidence(
@@ -950,6 +1106,58 @@ fn read_authority(
                 "must have complete project, campaign, and experiment lineage",
             )
         })
+}
+
+fn ensure_terminal_cycle_in_transaction(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    experiment_id: &str,
+    now: i64,
+) -> Result<DecisionCycle, AppError> {
+    let lineage = transaction
+        .query_row(
+            "SELECT c.project_id, e.campaign_id, e.status
+             FROM campaigns c
+             JOIN projects p ON p.project_id = c.project_id
+             JOIN experiments e ON e.experiment_id = ?2
+             WHERE c.campaign_id = ?1",
+            params![campaign_id, experiment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, ExperimentStatus>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read terminal decision lineage"))?;
+    let Some((_project_id, experiment_campaign_id, experiment_status)) = lineage else {
+        return Err(validation_error(
+            "source_experiment_id",
+            "must identify an experiment linked to an existing campaign and project",
+        ));
+    };
+    if experiment_campaign_id != campaign_id || !is_terminal(experiment_status) {
+        return Err(validation_error(
+            "source_experiment_id",
+            "must identify a terminal experiment in the same campaign",
+        ));
+    }
+
+    let cycle_id = decision_cycle_id(campaign_id, experiment_id);
+    transaction
+        .execute(
+            "INSERT INTO decision_cycles (
+                cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
+                consecutive_failed_attempts, last_decision_kind, last_failure_code,
+                last_failure_summary, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, ?4, ?4)
+             ON CONFLICT(campaign_id, source_experiment_id) DO NOTHING",
+            params![cycle_id, campaign_id, experiment_id, now],
+        )
+        .map_err(database_error("insert terminal decision cycle"))?;
+    read_cycle_for_source(transaction, campaign_id, experiment_id)
 }
 
 fn validate_authority_lineage(authority: &DecisionAuthority) -> Result<(), AppError> {

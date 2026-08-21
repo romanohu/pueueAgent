@@ -22,9 +22,9 @@ use pueue_agent::{
         StartCampaignRequest, SubmissionRepository,
     },
     models::{
-        AgentContextMode, AgentRunStatus, CampaignState, Event, EventKind, EventStatus,
-        ExperimentTerminalOutcome, NewAgentRun, NewEvent, NewProject, NewSubmission, ProposalKind,
-        SubmissionStatus,
+        AgentContextMode, AgentRunStatus, CampaignState, DecisionAttemptState,
+        DecisionCycleState, Event, EventKind, EventStatus, ExperimentTerminalOutcome, NewAgentRun,
+        NewEvent, NewProject, NewSubmission, ProposalKind, SubmissionStatus,
     },
     execution_policy::{
         load_existing_policy, CampaignLimits, PolicyLoadInput, PolicyViolationDetail,
@@ -40,8 +40,6 @@ use pueue_agent::{
 use rusqlite::params;
 use serde_json::json;
 use tempfile::TempDir;
-#[cfg(target_os = "linux")]
-use pueue_agent::models::{DecisionAttemptState, DecisionCycleState};
 #[cfg(unix)]
 use tokio::time::{sleep, Duration, Instant};
 
@@ -683,6 +681,24 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn decision_cycle_attempt_projection(
+        &self,
+    ) -> (DecisionCycleState, DecisionAttemptState, Option<i64>, i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT dc.state, da.state, da.agent_run_id,
+                        (SELECT COUNT(*) FROM decision_attempts)
+                 FROM decision_cycles dc
+                 JOIN decision_attempts da ON da.cycle_id = dc.cycle_id
+                 ORDER BY da.attempt_number DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
     fn campaign_decision_event_id(&self) -> i64 {
         self.db
             .connect()
@@ -882,7 +898,13 @@ async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decis
         let report = scheduler.tick().await.unwrap();
         assert!(report.started.is_empty());
         assert_eq!(harness.agent_run_count(), 0);
-        assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+        let event = harness.event(event_id);
+        if state == CampaignState::Retired {
+            assert_eq!(event.status, EventStatus::RetryWait);
+            assert_eq!(event.not_before, 160);
+        } else {
+            assert_eq!(event.status, EventStatus::Pending);
+        }
     }
     let disabled = SchedulerHarness::with_due_decision(CampaignState::Active);
     let event_id = disabled.campaign_decision_event_id();
@@ -936,6 +958,57 @@ async fn campaign_agent_budget_decision_defers_until_the_absolute_wake_without_a
     assert_eq!(event.status, EventStatus::RetryWait);
     assert_eq!(event.not_before, 3_700);
     assert_eq!(harness.agent_run_count(), 0);
+    assert_eq!(
+        harness.decision_cycle_attempt_projection(),
+        (
+            DecisionCycleState::Pending,
+            DecisionAttemptState::Reserved,
+            None,
+            1,
+        )
+    );
+    assert_eq!(
+        campaigns.wake_eligible_campaigns(3_700).unwrap(),
+        vec![campaign_id.clone()]
+    );
+    assert!(DecisionRepository::new(&harness.db)
+        .oldest_due_cycle_for_campaign("project-a", &campaign_id, 3_700)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn campaign_decision_evidence_storage_failure_requeues_the_unbound_attempt() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let event_id = harness.campaign_decision_event_id();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_decision_evidence_storage
+             BEFORE UPDATE OF state ON decision_attempts
+             WHEN NEW.state = 'evidence_ready'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected decision evidence storage failure');
+             END;",
+        )
+        .unwrap();
+    let mut scheduler = harness.scheduler();
+
+    assert!(scheduler.tick().await.is_err());
+
+    assert_eq!(harness.agent_run_count(), 0);
+    assert_eq!(harness.event_status(event_id), EventStatus::Pending);
+    assert_eq!(
+        harness.decision_cycle_attempt_projection(),
+        (
+            DecisionCycleState::Pending,
+            DecisionAttemptState::Reserved,
+            None,
+            1,
+        )
+    );
 }
 
 #[tokio::test]
@@ -992,6 +1065,32 @@ async fn campaign_decision_claim_limit_still_admits_the_oldest_terminal_cycle_fi
         harness.decision_attempt_source_experiment_id(),
         "scheduler-campaign-second-experiment"
     );
+}
+
+#[tokio::test]
+async fn retired_campaign_decision_does_not_starve_newer_work_at_claim_limit_one() {
+    let harness = SchedulerHarness::with_due_decision(CampaignState::Active);
+    let retired_event_id = harness.campaign_decision_event_id();
+    CampaignRepository::new(&harness.db)
+        .retire("project-a", 91)
+        .unwrap();
+    let newer_event_id = harness.enqueue(EventKind::DeepCheck, "project-a", "newer-work");
+    let mut first_scheduler = harness.scheduler_with_claim_limit(1);
+
+    assert!(first_scheduler.tick().await.unwrap().started.is_empty());
+
+    let retired = harness.event(retired_event_id);
+    assert_eq!(retired.status, EventStatus::RetryWait);
+    assert_eq!(retired.not_before, 160);
+    let mut second_scheduler = harness.scheduler_with_claim_limit(1);
+    let mut report = second_scheduler.tick().await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].primary_event_id, newer_event_id);
+    report.started[0]
+        .handle
+        .wait(&harness.db, harness.now)
+        .await
+        .unwrap();
 }
 
 #[test]

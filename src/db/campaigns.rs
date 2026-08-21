@@ -1701,54 +1701,79 @@ impl<'db> ExperimentRepository<'db> {
         reason_code: &'static str,
         now: i64,
     ) -> Result<Experiment, AppError> {
+        self.quarantine_accepted_identities(&[experiment_id.to_owned()], reason_code, now)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| validation_error("experiment_id", "must identify one experiment"))
+    }
+
+    pub fn quarantine_accepted_identities(
+        &self,
+        experiment_ids: &[String],
+        reason_code: &'static str,
+        now: i64,
+    ) -> Result<Vec<Experiment>, AppError> {
         validate_failure_field("reason_code", reason_code)?;
+        if experiment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error("begin accepted identity quarantine"))?;
-        let experiment = read_experiment(&transaction, experiment_id)?;
-        let submission = read_submission(&transaction, &experiment.submission_id)?;
-        if experiment.status == ExperimentStatus::Unreconciled
-            && experiment.failure_code.as_deref() == Some(reason_code)
-            && submission.status == SubmissionStatus::Unreconciled
-        {
-            return Ok(experiment);
+            .map_err(database_error("begin accepted identity batch quarantine"))?;
+        let mut identities = Vec::with_capacity(experiment_ids.len());
+        for experiment_id in experiment_ids {
+            let experiment = read_experiment(&transaction, experiment_id)?;
+            let submission = read_submission(&transaction, &experiment.submission_id)?;
+            let already_quarantined = experiment.status == ExperimentStatus::Unreconciled
+                && experiment.failure_code.as_deref() == Some(reason_code)
+                && submission.status == SubmissionStatus::Unreconciled;
+            if !already_quarantined
+                && (experiment.status != ExperimentStatus::Accepted
+                    || submission.status != SubmissionStatus::Accepted
+                    || experiment.pueue_task_id.is_none()
+                    || experiment.task_signature.is_none()
+                    || submission.pueue_task_id != experiment.pueue_task_id
+                    || submission.task_signature != experiment.task_signature)
+            {
+                return Err(validation_error(
+                    "experiment",
+                    "only consistently accepted identities can be quarantined",
+                ));
+            }
+            identities.push((experiment, submission, already_quarantined));
         }
-        if experiment.status != ExperimentStatus::Accepted
-            || submission.status != SubmissionStatus::Accepted
-            || experiment.pueue_task_id.is_none()
-            || experiment.task_signature.is_none()
-            || submission.pueue_task_id != experiment.pueue_task_id
-            || submission.task_signature != experiment.task_signature
-        {
-            return Err(validation_error(
-                "experiment",
-                "only a consistently accepted identity can be quarantined",
-            ));
+        for (experiment, submission, already_quarantined) in &identities {
+            if *already_quarantined {
+                continue;
+            }
+            transaction
+                .execute(
+                    "UPDATE submissions SET status = ?1 WHERE submission_id = ?2",
+                    params![SubmissionStatus::Unreconciled, submission.submission_id],
+                )
+                .map_err(database_error("quarantine accepted campaign submission"))?;
+            transaction
+                .execute(
+                    "UPDATE experiments
+                     SET status = ?1, failure_code = ?2, updated_at = ?3
+                     WHERE experiment_id = ?4",
+                    params![
+                        ExperimentStatus::Unreconciled,
+                        reason_code,
+                        now,
+                        experiment.experiment_id,
+                    ],
+                )
+                .map_err(database_error("quarantine accepted experiment identity"))?;
         }
-        transaction
-            .execute(
-                "UPDATE submissions SET status = ?1 WHERE submission_id = ?2",
-                params![SubmissionStatus::Unreconciled, submission.submission_id],
-            )
-            .map_err(database_error("quarantine accepted campaign submission"))?;
-        transaction
-            .execute(
-                "UPDATE experiments
-                 SET status = ?1, failure_code = ?2, updated_at = ?3
-                 WHERE experiment_id = ?4",
-                params![
-                    ExperimentStatus::Unreconciled,
-                    reason_code,
-                    now,
-                    experiment_id,
-                ],
-            )
-            .map_err(database_error("quarantine accepted experiment identity"))?;
-        let stored = read_experiment(&transaction, experiment_id)?;
+        let stored = experiment_ids
+            .iter()
+            .map(|experiment_id| read_experiment(&transaction, experiment_id))
+            .collect::<Result<Vec<_>, _>>()?;
         transaction
             .commit()
-            .map_err(database_error("commit accepted identity quarantine"))?;
+            .map_err(database_error("commit accepted identity batch quarantine"))?;
         Ok(stored)
     }
 

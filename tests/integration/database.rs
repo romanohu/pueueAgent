@@ -30,8 +30,8 @@ use pueue_agent::{
     },
     models::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
-        BudgetReservationStatus, Campaign, CampaignState, EventKind, EventStatus,
-        DecisionCycleState, ExecutionProjection, Experiment, ExperimentStatus,
+        BudgetReservationStatus, Campaign, CampaignState, DecisionAttemptState,
+        DecisionCycleState, EventKind, EventStatus, ExecutionProjection, Experiment, ExperimentStatus,
         ExperimentTerminalOutcome,
         IncidentStatus, IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent,
         NewIncident, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
@@ -589,6 +589,57 @@ mod decision_cycle {
     }
 
     #[test]
+    fn unbound_attempt_requeue_discards_stale_evidence_and_reuses_the_same_attempt() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let repository = DecisionRepository::new(&harness.db);
+        let (cycle, reservation) = harness.reserved_decision_attempt();
+        repository
+            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .unwrap();
+
+        let requeued = repository
+            .requeue_unbound_attempt(&reservation, 193)
+            .unwrap();
+
+        assert_eq!(requeued.state, DecisionCycleState::Pending);
+        assert_eq!(requeued.consecutive_failed_attempts, 0);
+        let retried = repository
+            .reserve_next_attempt(&harness.project_id, &cycle.cycle_id, 194)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried, reservation);
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM decision_attempts"), 1);
+        let (state, context): (DecisionAttemptState, Option<String>) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state, context_json FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![reservation.cycle_id, reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, DecisionAttemptState::Reserved);
+        assert_eq!(context, None);
+    }
+
+    #[test]
+    fn conditional_unbound_attempt_requeue_is_safe_after_spawn_errors() {
+        let harness =
+            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let repository = DecisionRepository::new(&harness.db);
+        let (_, reservation) = harness.reserved_decision_attempt();
+
+        let requeued = repository
+            .try_requeue_unbound_attempt(&reservation, 193)
+            .unwrap();
+
+        assert_eq!(requeued.unwrap().state, DecisionCycleState::Pending);
+    }
+
+    #[test]
     fn stale_attempt_cannot_overwrite_a_newer_active_attempt() {
         let harness =
             CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
@@ -818,6 +869,10 @@ mod decision_context {
             203, root.join("second.log"),
         ), &[second_event.event_id]).unwrap();
         assert!(decisions.bind_agent_run(&reservation, second_run.run_id, 204).is_err());
+        assert!(decisions
+            .try_requeue_unbound_attempt(&reservation, 205)
+            .unwrap()
+            .is_none());
         let (state, owner): (String, Option<i64>) = harness.db.connect().unwrap().query_row(
             "SELECT state, agent_run_id FROM decision_attempts
              WHERE cycle_id = ?1 AND attempt_number = ?2",
