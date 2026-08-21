@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    decision_evidence::{validate_stored_decision_context, DECISION_CONTEXT_SCHEMA_VERSION},
     execution_policy::CampaignLimits,
     models::{
         CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle, DecisionCycleState,
@@ -66,11 +67,65 @@ struct DecisionAuthority {
     project_halted: bool,
     experiment_campaign_id: String,
     experiment_status: ExperimentStatus,
+    objective_digest: String,
 }
 
 impl<'db> DecisionRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
         Self { db }
+    }
+
+    pub fn validate_launch_authority(
+        &self,
+        project_id: &str,
+        reservation: &DecisionReservation,
+    ) -> Result<(), AppError> {
+        let connection = self.db.connect()?;
+        let authority = read_authority(&connection, &reservation.cycle_id)?;
+        validate_reservation_lineage(&authority, reservation)?;
+        validate_active_authority(&authority, Some(project_id))
+    }
+
+    pub fn validate_launch_context(
+        &self,
+        project_id: &str,
+        reservation: &DecisionReservation,
+        context_json: &str,
+        context_digest: &str,
+    ) -> Result<String, AppError> {
+        let connection = self.db.connect()?;
+        let authority = read_authority(&connection, &reservation.cycle_id)?;
+        validate_reservation_lineage(&authority, reservation)?;
+        validate_active_authority(&authority, Some(project_id))?;
+        let attempt = read_attempt(
+            &connection,
+            &reservation.cycle_id,
+            reservation.attempt_number,
+        )?;
+        if attempt.state != DecisionAttemptState::EvidenceReady
+            || attempt.context_schema_version
+                != Some(i64::from(DECISION_CONTEXT_SCHEMA_VERSION))
+            || attempt.context_json.as_deref() != Some(context_json)
+            || attempt.context_digest.as_deref() != Some(context_digest)
+        {
+            return Err(validation_error(
+                "decision_context",
+                "must exactly match the reserved evidence-ready attempt",
+            ));
+        }
+        validate_payload("context_json", context_json)?;
+        validate_token("context_digest", context_digest, MAX_DECISION_DIGEST_BYTES)?;
+        if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+            return Err(validation_error(
+                "context_digest",
+                "does not match the persisted decision context",
+            ));
+        }
+        validate_stored_decision_context(
+            context_json,
+            &authority.objective_digest,
+            &authority.cycle.source_experiment_id,
+        )
     }
 
     pub fn ensure_cycle_for_terminal(
@@ -788,7 +843,8 @@ fn read_authority(
                         dc.next_wake_at, dc.consecutive_failed_attempts, dc.last_decision_kind,
                         dc.last_failure_code, dc.last_failure_summary, dc.created_at, dc.updated_at,
                         c.project_id, c.state, p.enabled, p.paused,
-                        p.halted_reason IS NOT NULL, e.campaign_id, e.status
+                        p.halted_reason IS NOT NULL, e.campaign_id, e.status,
+                        c.objective_digest
                  FROM decision_cycles dc
                  JOIN campaigns c ON c.campaign_id = dc.campaign_id
                  JOIN projects p ON p.project_id = c.project_id
@@ -806,6 +862,7 @@ fn read_authority(
                     project_halted: row.get(15)?,
                     experiment_campaign_id: row.get(16)?,
                     experiment_status: row.get(17)?,
+                    objective_digest: row.get(18)?,
                 })
             },
         )

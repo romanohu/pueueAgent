@@ -7,10 +7,11 @@ use std::{
 };
 
 use tokio::time::Instant;
-use sha2::{Digest, Sha256};
 
 use crate::{
-    codex_command::{CodexArgvBuilder, CodexCapabilities},
+    codex_command::{
+        probe_installed_codex_capabilities, CodexArgvBuilder, CodexCapabilities,
+    },
     config::{AgentConfig, ProjectConfig},
     db::{AgentRunRepository, DecisionRepository, DecisionReservation, GateFailurePolicy},
     decision_evidence::DecisionContextBundle,
@@ -42,58 +43,73 @@ use crate::{
 
 const DECISION_OUTPUT_SCHEMA: &[u8] = br#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "oneOf": [
-    {
-      "type": "object",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision", "proposal", "reason", "requested_wait_minutes", "expected_evidence"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "decision": {"enum": ["proposal", "wait"]},
+    "proposal": {
+      "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["schema_version", "decision", "proposal"],
+      "required": ["kind", "hypothesis", "source_experiment_id", "argv", "working_directory", "expected_evidence"],
       "properties": {
-        "schema_version": {"const": 1},
-        "decision": {"const": "proposal"},
-        "proposal": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "hypothesis", "source_experiment_id", "argv", "working_directory", "expected_evidence"],
-          "properties": {
-            "kind": {"enum": ["experiment", "repair", "broader_search", "recipe", "data_evaluation"]},
-            "hypothesis": {"type": "string"},
-            "source_experiment_id": {"type": ["string", "null"]},
-            "argv": {"type": "array", "items": {"type": "string"}},
-            "working_directory": {"type": "string"},
-            "expected_evidence": {"type": "array", "items": {"type": "string"}}
-          }
-        }
-      }
-    },
-    {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema_version", "decision", "reason", "requested_wait_minutes", "expected_evidence"],
-      "properties": {
-        "schema_version": {"const": 1},
-        "decision": {"const": "wait"},
-        "reason": {"type": "string"},
-        "requested_wait_minutes": {"type": "integer", "minimum": 1},
+        "kind": {"enum": ["experiment", "repair", "broader_search", "recipe", "data_evaluation"]},
+        "hypothesis": {"type": "string"},
+        "source_experiment_id": {"type": ["string", "null"]},
+        "argv": {"type": "array", "items": {"type": "string"}},
+        "working_directory": {"type": "string"},
         "expected_evidence": {"type": "array", "items": {"type": "string"}}
       }
+    },
+    "reason": {"type": ["string", "null"]},
+    "requested_wait_minutes": {"type": ["integer", "null"], "minimum": 1},
+    "expected_evidence": {
+      "type": ["array", "null"],
+      "items": {"type": "string"}
     }
-  ]
+  }
 }"#;
+
+#[cfg(test)]
+fn assert_strict_object_schema(schema: &serde_json::Value) {
+    let Some(properties) = schema.get("properties") else { return; };
+    assert_eq!(
+        schema.get("additionalProperties"),
+        Some(&serde_json::Value::Bool(false))
+    );
+    let properties = properties.as_object().unwrap();
+    let required = schema["required"].as_array().unwrap();
+    assert_eq!(required.len(), properties.len());
+    for (name, property) in properties {
+        assert!(required.iter().any(|required| required == name));
+        assert_strict_object_schema(property);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRunnerConfig {
     codex_capabilities: CodexCapabilities,
+    decision_capabilities: DecisionCapabilitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionCapabilitySource {
+    InstalledCli,
+    Fixed(CodexCapabilities),
 }
 
 impl AgentRunnerConfig {
     pub fn production() -> Self {
         Self {
-            codex_capabilities: CodexCapabilities::all(),
+            codex_capabilities: CodexCapabilities::standard_policy(),
+            decision_capabilities: DecisionCapabilitySource::InstalledCli,
         }
     }
 
     pub fn with_codex_capabilities(mut self, capabilities: CodexCapabilities) -> Self {
         self.codex_capabilities = capabilities;
+        self.decision_capabilities = DecisionCapabilitySource::Fixed(capabilities);
         self
     }
 }
@@ -446,13 +462,12 @@ struct DecisionFailureContext {
     cycle_id: String,
     attempt_number: i64,
     limits: CampaignLimits,
-    bound_to_run: bool,
 }
 
 impl DecisionFailureContext {
     fn persist(&self, db: &crate::db::Db, run_id: i64, now: i64) -> Result<(), AppError> {
         DecisionRepository::new(db).fail_attempt(
-            self.bound_to_run.then_some(run_id),
+            Some(run_id),
             &self.cycle_id,
             self.attempt_number,
             "decision_launch",
@@ -644,6 +659,7 @@ impl AgentRunner {
         config: &AgentConfig,
         prompt: &str,
         private_tmp: &VerifiedPrivateTemp,
+        capabilities: CodexCapabilities,
     ) -> Result<AgentCommand, AppError> {
         let program = policy
             .agent_anchor
@@ -653,7 +669,7 @@ impl AgentRunner {
                 field: "agent.program",
             })?
             .to_owned();
-        let args = CodexArgvBuilder::new(policy.clone(), self.config.codex_capabilities)
+        let args = CodexArgvBuilder::new(policy.clone(), capabilities)
             .build_decision_with_private_temp(config, prompt, private_tmp)
             .map_err(AppError::from)?
             .into_iter()
@@ -745,6 +761,7 @@ impl AgentRunner {
             None,
             AgentRunRole::Standard,
             None,
+            None,
             prompt,
             now,
             run_id_guard,
@@ -769,10 +786,27 @@ impl AgentRunner {
         run_id_guard: RunIdAdmissionGuard,
         project_lock: ProjectAdmissionLock,
     ) -> Result<AgentHandle, AgentSpawnError> {
+        validate_project_decision_authority(project, project_policy)
+            .map_err(|error| pre_binding_error(error.into()))?;
+        let objective_digest = DecisionRepository::new(db)
+            .validate_launch_context(
+                &project.project_id,
+                reservation,
+                &context.json,
+                &context.digest,
+            )
+            .map_err(pre_binding_error)?;
         let decision_policy = resolve_decision_project_policy(&self.policy, project_policy)
             .map_err(|error| pre_binding_error(error.into()))?;
-        let (prompt, objective_digest) = decision_launch_prompt(context)
-            .map_err(pre_binding_error)?;
+        let decision_capabilities = match self.config.decision_capabilities {
+            DecisionCapabilitySource::InstalledCli => {
+                probe_installed_codex_capabilities(&decision_policy.agent_anchor)
+                    .await
+                    .map_err(|error| pre_binding_error(error.into()))?
+            }
+            DecisionCapabilitySource::Fixed(capabilities) => capabilities,
+        };
+        let prompt = decision_launch_prompt(context);
         self.spawn_with_role(
             db,
             project,
@@ -788,6 +822,7 @@ impl AgentRunner {
                 attempt_number: reservation.attempt_number,
             },
             Some(objective_digest),
+            Some(decision_capabilities),
             &prompt,
             now,
             run_id_guard,
@@ -810,6 +845,7 @@ impl AgentRunner {
         decision_reservation: Option<&DecisionReservation>,
         role: AgentRunRole,
         objective_digest: Option<String>,
+        decision_capabilities: Option<CodexCapabilities>,
         prompt: &str,
         now: i64,
         run_id_guard: RunIdAdmissionGuard,
@@ -819,7 +855,10 @@ impl AgentRunner {
         match &role {
             AgentRunRole::Standard => self.preflight_project_launch(project_policy, config, prompt),
             AgentRunRole::Decision { .. } => {
-                CodexArgvBuilder::new(project_policy.clone(), self.config.codex_capabilities)
+                CodexArgvBuilder::new(
+                    project_policy.clone(),
+                    decision_capabilities.expect("decision launch capabilities were resolved"),
+                )
                     .preflight_decision(config, prompt)
             }
         }
@@ -859,22 +898,7 @@ impl AgentRunner {
             if let Err(error) =
                 DecisionRepository::new(db).bind_agent_run(decision_reservation, run.run_id, now)
             {
-                let decision_failure = DecisionFailureContext {
-                    cycle_id: decision_reservation.cycle_id.clone(),
-                    attempt_number: decision_reservation.attempt_number,
-                    limits: self.policy.campaign_limits,
-                    bound_to_run: false,
-                };
-                if let Err(failure_error) = decision_failure.persist(db, run.run_id, now) {
-                    return Err(pending_decision_finalization_error(
-                        project,
-                        run.run_id,
-                        decision_failure,
-                        BoundFinalizationIntent::from_failure(&error, retry_policy),
-                        failure_error,
-                    ));
-                }
-                return Err(resolve_bound_failure(
+                return Err(resolve_unowned_decision_bind_failure(
                     &repository,
                     project,
                     run.run_id,
@@ -888,7 +912,6 @@ impl AgentRunner {
             cycle_id: reservation.cycle_id.clone(),
             attempt_number: reservation.attempt_number,
             limits: self.policy.campaign_limits,
-            bound_to_run: true,
         });
         drop(agent_start_guard);
         let verified_root = project_policy
@@ -971,6 +994,7 @@ impl AgentRunner {
                 config,
                 prompt,
                 &private_temp_target,
+                decision_capabilities.expect("decision launch capabilities were resolved"),
             ),
         } {
             Ok(command) => command,
@@ -1178,6 +1202,28 @@ impl AgentRunner {
     }
 }
 
+fn validate_project_decision_authority(
+    project: &Project,
+    policy: &ResolvedProjectExecutionPolicy,
+) -> Result<(), PolicyViolation> {
+    if project.project_id != policy.project_id
+        || project.root_path != policy.root_anchor.canonical_path
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    policy
+        .root_anchor
+        .verify_identity()
+        .map(|_| ())
+        .map_err(|mut violation| {
+            violation.stage = PolicyViolationStage::PreBinding;
+            violation
+        })
+}
+
 #[derive(Default)]
 pub(crate) struct StartupGateMarkerEvidence {
     pub(crate) confirmed: BTreeSet<i64>,
@@ -1190,34 +1236,11 @@ fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
     ))
 }
 
-fn decision_launch_prompt(context: &DecisionContextBundle) -> Result<(String, String), AppError> {
-    if format!("{:x}", Sha256::digest(context.json.as_bytes())) != context.digest {
-        return Err(AppError::Validation {
-            field: "decision_context",
-            message: "digest does not match the supplied decision context",
-        });
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(&context.json).map_err(|source| AppError::Serialization {
-            operation: "parse decision launch context",
-            source,
-        })?;
-    let objective_digest = value
-        .pointer("/objective/digest")
-        .and_then(serde_json::Value::as_str)
-        .filter(|digest| !digest.is_empty())
-        .ok_or(AppError::Validation {
-            field: "decision_context.objective.digest",
-            message: "must contain the campaign objective digest",
-        })?
-        .to_owned();
-    Ok((
-        format!(
-            "Analyze this supervisor-owned campaign context without modifying the project. Return exactly one JSON decision matching the supplied schema.\n{}",
-            context.json
-        ),
-        objective_digest,
-    ))
+fn decision_launch_prompt(context: &DecisionContextBundle) -> String {
+    format!(
+        "Analyze this supervisor-owned campaign context without modifying the project. Return exactly one JSON decision matching the supplied schema.\n{}",
+        context.json
+    )
 }
 
 fn recovery_relative_log_path(
@@ -1335,6 +1358,25 @@ fn resolve_bound_failure(
             source,
         )
     }
+}
+
+fn resolve_unowned_decision_bind_failure(
+    repository: &AgentRunRepository<'_>,
+    project: &Project,
+    run_id: i64,
+    finished_at: i64,
+    policy: RetryPolicy,
+    source: AppError,
+) -> AgentSpawnError {
+    // A failed bind never transferred decision-attempt ownership to this run.
+    resolve_bound_failure(
+        repository,
+        project,
+        run_id,
+        finished_at,
+        policy,
+        source,
+    )
 }
 
 fn pending_decision_finalization_error(
@@ -2131,10 +2173,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_runner_enables_the_forced_codex_policy_surface() {
+    fn decision_output_schema_is_a_supported_strict_root_object() {
+        let schema: serde_json::Value = serde_json::from_slice(DECISION_OUTPUT_SCHEMA).unwrap();
+        assert_eq!(schema.get("type").and_then(serde_json::Value::as_str), Some("object"));
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+        assert_strict_object_schema(&schema);
+    }
+
+    #[test]
+    fn production_runner_probes_decision_capabilities_instead_of_assuming_them() {
         assert_eq!(
             AgentRunnerConfig::production().codex_capabilities,
-            CodexCapabilities::all()
+            CodexCapabilities::standard_policy()
+        );
+        assert_eq!(
+            AgentRunnerConfig::production().decision_capabilities,
+            DecisionCapabilitySource::InstalledCli
         );
     }
 
@@ -2147,6 +2202,53 @@ mod tests {
     #[test]
     #[ignore = "internal agent-handle terminal subprocess entry"]
     fn terminal_retry_subprocess() {}
+
+    #[test]
+    fn unowned_decision_bind_failure_terminalizes_only_the_new_agent_run() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let root = temporary.path().join("project");
+        std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        let project = crate::db::ProjectRepository::new(&db)
+            .register(&crate::models::NewProject::new(
+                "project-a", &root, "pa-project-a",
+                root.join(".pueue-agent/config.toml"), 1,
+            ))
+            .unwrap();
+        let event = crate::db::EventRepository::new(&db)
+            .insert_idempotent(&crate::models::NewEvent::new(
+                "project-a", crate::models::EventKind::CampaignDecision,
+                "bind-failure", serde_json::json!({}), 1, 1,
+            ))
+            .unwrap();
+        crate::db::EventRepository::new(&db).claim_batch(1, 100, 1).unwrap();
+        let repository = AgentRunRepository::new(&db);
+        let run = repository
+            .insert_with_events(
+                &NewAgentRun::new(
+                    "project-a", event.event_id, None, AgentRunStatus::Starting, 2,
+                    root.join(".pueue-agent/logs/bind-failure.log"),
+                ),
+                &[event.event_id],
+            )
+            .unwrap();
+        let error = resolve_unowned_decision_bind_failure(
+            &repository, &project, run.run_id, 3, RetryPolicy { max_retries: 1 },
+            AppError::Runtime { operation: "injected transient decision bind failure" },
+        );
+        assert_eq!(
+            error.stage,
+            AgentSpawnStage::RunBoundPreMarker { run_id: run.run_id, resolved: true }
+        );
+        assert_eq!(
+            repository.list_by_project("project-a", 10).unwrap()[0].status,
+            AgentRunStatus::Failed
+        );
+        let attempts: i64 = db.connect().unwrap()
+            .query_row("SELECT COUNT(*) FROM decision_attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
 
     #[tokio::test]
     async fn timeout_termination_error_retains_db_state_and_same_handle_for_retry() {

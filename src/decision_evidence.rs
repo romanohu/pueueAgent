@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -26,6 +26,183 @@ const MAX_RECENT_OUTCOMES: usize = 32;
 pub struct DecisionContextBundle {
     pub json: String,
     pub digest: String,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDecisionContext {
+    schema_version: u8,
+    objective: StoredObjective,
+    source_experiment: StoredSourceExperiment,
+    terminal_observation: StoredTerminalObservation,
+    recent_outcomes: StoredRecentOutcomes,
+    budgets: StoredBudgets,
+    intervention: StoredIntervention,
+    artifact_hints: Vec<StoredArtifactHint>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredObjective { text: String, digest: String }
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSourceExperiment {
+    experiment_id: String,
+    proposal_id: String,
+    proposal_kind: crate::models::ProposalKind,
+    status: crate::models::ExperimentStatus,
+    attempt: i64,
+    command_digest: String,
+    failure_code: Option<String>,
+    failure_fingerprint: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    finished_at: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTerminalObservation {
+    task_id: Option<i64>,
+    task_signature: Option<String>,
+    state: String,
+    enqueued_at: Option<i64>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    exit_code: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRecentOutcomes {
+    proposals: Vec<StoredRecentProposal>,
+    experiments: Vec<StoredRecentExperiment>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRecentProposal {
+    proposal_id: String,
+    kind: crate::models::ProposalKind,
+    status: crate::models::ProposalStatus,
+    source_experiment_id: Option<String>,
+    canonical_digest: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRecentExperiment {
+    experiment_id: String,
+    proposal_id: String,
+    status: crate::models::ExperimentStatus,
+    attempt: i64,
+    failure_code: Option<String>,
+    failure_fingerprint: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    finished_at: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredBudgets {
+    campaign_state: CampaignState,
+    next_eligible_at: Option<i64>,
+    rolling_usage: std::collections::BTreeMap<String, i64>,
+    experiment_counts: std::collections::BTreeMap<String, i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredIntervention { pending: Vec<StoredPendingIntervention> }
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPendingIntervention {
+    insertion_sequence: i64,
+    message: String,
+    created_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredArtifactHint { path: String, size: u64, mtime: i64 }
+
+pub(crate) fn validate_stored_decision_context(
+    json: &str,
+    expected_objective_digest: &str,
+    expected_source_experiment_id: &str,
+) -> Result<String, AppError> {
+    if json.is_empty() || json.len() > MAX_DECISION_CONTEXT_BYTES {
+        return Err(validation_error(
+            "decision_context",
+            "must fit the serialized context limit",
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|source| AppError::Serialization {
+            operation: "parse stored decision context",
+            source,
+        })?;
+    if contains_control_character(&value) {
+        return Err(validation_error(
+            "decision_context",
+            "must not contain control characters",
+        ));
+    }
+    let context: StoredDecisionContext =
+        serde_json::from_value(value).map_err(|source| AppError::Serialization {
+            operation: "validate stored decision context schema",
+            source,
+        })?;
+    if context.schema_version != DECISION_CONTEXT_SCHEMA_VERSION {
+        return Err(validation_error(
+            "decision_context.schema_version",
+            "does not match the supported schema version",
+        ));
+    }
+    if context.objective.digest != expected_objective_digest {
+        return Err(validation_error(
+            "decision_context.objective.digest",
+            "does not match the immutable campaign objective digest",
+        ));
+    }
+    if context.source_experiment.experiment_id != expected_source_experiment_id {
+        return Err(validation_error(
+            "decision_context.source_experiment.experiment_id",
+            "does not match the reserved source experiment",
+        ));
+    }
+    Ok(context.objective.digest)
+}
+
+fn contains_control_character(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.chars().any(invalid_context_character),
+        serde_json::Value::Array(values) => values.iter().any(contains_control_character),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            key.chars().any(invalid_context_character) || contains_control_character(value)
+        }),
+        _ => false,
+    }
+}
+
+fn invalid_context_character(character: char) -> bool {
+    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

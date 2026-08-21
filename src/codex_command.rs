@@ -26,6 +26,11 @@ use crate::{
     AppError,
 };
 
+#[cfg(target_os = "linux")]
+use std::{os::fd::AsRawFd, os::unix::process::CommandExt, process::Stdio};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncReadExt;
+
 /// Capabilities discovered from the installed Codex CLI.
 ///
 /// The adapter intentionally requires an explicit positive result for every
@@ -40,9 +45,23 @@ pub struct CodexCapabilities {
     pub project_config_isolation: bool,
     pub json_output_schema: bool,
     pub output_last_message: bool,
+    pub permission_profiles: bool,
 }
 
 impl CodexCapabilities {
+    pub const fn standard_policy() -> Self {
+        Self {
+            workspace_write: true,
+            read_only: false,
+            approval_never: true,
+            network_mode: true,
+            project_config_isolation: true,
+            json_output_schema: false,
+            output_last_message: false,
+            permission_profiles: false,
+        }
+    }
+
     pub const fn all() -> Self {
         Self {
             workspace_write: true,
@@ -52,6 +71,7 @@ impl CodexCapabilities {
             project_config_isolation: true,
             json_output_schema: true,
             output_last_message: true,
+            permission_profiles: true,
         }
     }
 
@@ -64,6 +84,7 @@ impl CodexCapabilities {
             project_config_isolation: false,
             json_output_schema: false,
             output_last_message: false,
+            permission_profiles: false,
         }
     }
 
@@ -81,7 +102,136 @@ impl CodexCapabilities {
             && self.project_config_isolation
             && self.json_output_schema
             && self.output_last_message
+            && self.permission_profiles
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn detect_codex_capabilities(
+    version_output: &str,
+    root_help: &str,
+    exec_help: &str,
+) -> Result<CodexCapabilities, PolicyViolation> {
+    let permission_profiles = codex_version_at_least(version_output, (0, 138, 0));
+    let capabilities = CodexCapabilities {
+        workspace_write: root_help.contains("workspace-write"),
+        read_only: root_help.contains("read-only"),
+        approval_never: root_help.contains("--ask-for-approval") && root_help.contains("never"),
+        network_mode: permission_profiles,
+        project_config_isolation: root_help.contains("--strict-config")
+            && exec_help.contains("--strict-config")
+            && exec_help.contains("--ignore-user-config")
+            && exec_help.contains("--ignore-rules"),
+        json_output_schema: exec_help.contains("--output-schema"),
+        output_last_message: exec_help.contains("--output-last-message"),
+        permission_profiles,
+    };
+    capabilities
+        .supports_decision_policy()
+        .then_some(capabilities)
+        .ok_or_else(unsafe_argument)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn codex_version_at_least(output: &str, minimum: (u64, u64, u64)) -> bool {
+    output.split_ascii_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            !character.is_ascii_digit() && character != '.'
+        });
+        let mut parts = token.split('.');
+        let version = (
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+            parts.next().and_then(|part| part.parse::<u64>().ok()),
+        );
+        matches!(version, (Some(major), Some(minor), Some(patch)) if (major, minor, patch) >= minimum)
+    })
+}
+
+pub(crate) async fn probe_installed_codex_capabilities(
+    anchor: &crate::execution_policy::ExecutableAnchor,
+) -> Result<CodexCapabilities, PolicyViolation> {
+    preflight_decision_runtime()?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = anchor;
+        unreachable!("decision runtime preflight rejects non-Linux hosts")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let version = probe_pinned_codex(anchor, &["--version"]).await?;
+        let root_help = probe_pinned_codex(anchor, &["--help"]).await?;
+        let exec_help = probe_pinned_codex(anchor, &["exec", "--help"]).await?;
+        detect_codex_capabilities(&version, &root_help, &exec_help)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_pinned_codex(
+    anchor: &crate::execution_policy::ExecutableAnchor,
+    args: &[&str],
+) -> Result<String, PolicyViolation> {
+    const MAX_PROBE_BYTES: u64 = 256 * 1024;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let verified = anchor.verify_identity().map_err(pre_binding_violation)?;
+    let program = format!("/proc/self/fd/{}", verified.file.as_raw_fd());
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command.process_group(0);
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| unsafe_argument())?;
+    let pid = child.id().ok_or_else(unsafe_argument)? as libc::pid_t;
+    let stdout = child.stdout.take().ok_or_else(unsafe_argument)?;
+    let reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_PROBE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map(|_| bytes)
+    });
+    let status = match tokio::time::timeout(PROBE_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) | Err(_) => {
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            reader.abort();
+            return Err(unsafe_argument());
+        }
+    };
+    let bytes = match tokio::time::timeout(PROBE_TIMEOUT, reader).await {
+        Ok(Ok(Ok(bytes))) => bytes,
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            return Err(unsafe_argument());
+        }
+    };
+    if !status.success() || bytes.len() as u64 > MAX_PROBE_BYTES {
+        return Err(unsafe_argument());
+    }
+    if unsafe { libc::kill(-pid, 0) } == 0 {
+        unsafe { libc::kill(-pid, libc::SIGKILL); }
+        return Err(unsafe_argument());
+    }
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        return Err(unsafe_argument());
+    }
+    anchor.verify_identity().map_err(pre_binding_violation)?;
+    String::from_utf8(bytes).map_err(|_| unsafe_argument())
+}
+
+#[cfg(target_os = "linux")]
+fn pre_binding_violation(mut violation: PolicyViolation) -> PolicyViolation {
+    violation.stage = PolicyViolationStage::PreBinding;
+    violation
 }
 
 /// A command builder bound to one resolved project policy.
@@ -147,8 +297,6 @@ impl CodexArgvBuilder {
             OsString::from("--ignore-user-config"),
             OsString::from("--ignore-rules"),
             OsString::from("--strict-config"),
-            OsString::from("--sandbox"),
-            OsString::from("read-only"),
             OsString::from("-C"),
             OsString::from(root.clone()),
             OsString::from("--output-schema"),
@@ -158,13 +306,7 @@ impl CodexArgvBuilder {
         ];
 
         push_codex_overrides(&mut argv, config)?;
-        push_config(
-            &mut argv,
-            format!(
-                "sandbox_workspace_write.network_access={}",
-                network_mode(self.policy.network)
-            ),
-        );
+        push_decision_permission_profile(&mut argv, self.policy.network);
         push_config(
             &mut argv,
             format!(
@@ -377,6 +519,24 @@ fn push_config(argv: &mut Vec<OsString>, value: String) {
     argv.push(OsString::from(value));
 }
 
+fn push_decision_permission_profile(argv: &mut Vec<OsString>, network: NetworkMode) {
+    push_config(
+        argv,
+        "permissions.pueue_agent_decision.extends=\":read-only\"".to_owned(),
+    );
+    push_config(
+        argv,
+        format!(
+            "permissions.pueue_agent_decision.network.enabled={}",
+            network_mode(network)
+        ),
+    );
+    push_config(
+        argv,
+        "default_permissions=\"pueue_agent_decision\"".to_owned(),
+    );
+}
+
 fn network_mode(network: NetworkMode) -> &'static str {
     match network {
         NetworkMode::Enabled => "true",
@@ -456,4 +616,47 @@ fn map_session_error(error: AppError) -> PolicyViolation {
         _ => PolicyViolationCode::SessionNotOwned,
     };
     PolicyViolation::new(code, PolicyViolationStage::PreBinding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_permission_profile_extends_read_only_and_owns_network_policy() {
+        for (network, expected) in [
+            (NetworkMode::Enabled, "permissions.pueue_agent_decision.network.enabled=true"),
+            (NetworkMode::Disabled, "permissions.pueue_agent_decision.network.enabled=false"),
+        ] {
+            let mut argv = Vec::new();
+            push_decision_permission_profile(&mut argv, network);
+            assert!(argv.iter().any(|value| {
+                value == "permissions.pueue_agent_decision.extends=\":read-only\""
+            }));
+            assert!(argv.iter().any(|value| value == expected));
+            assert!(argv.iter().any(|value| {
+                value == "default_permissions=\"pueue_agent_decision\""
+            }));
+            assert!(!argv.iter().any(|value| {
+                value == "--sandbox"
+                    || value.to_string_lossy().starts_with("sandbox_workspace_write.")
+            }));
+        }
+    }
+
+    #[test]
+    fn installed_codex_capabilities_require_supported_version_and_exact_help_surface() {
+        let root_help = "--strict-config --sandbox read-only workspace-write --ask-for-approval never";
+        let exec_help = "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message";
+        let capabilities = detect_codex_capabilities("codex-cli 0.148.0", root_help, exec_help)
+            .unwrap();
+        assert!(capabilities.supports_decision_policy());
+        assert!(detect_codex_capabilities("codex-cli 0.137.9", root_help, exec_help).is_err());
+        assert!(detect_codex_capabilities(
+            "codex-cli 0.148.0",
+            root_help,
+            "--ignore-user-config --ignore-rules --strict-config --output-schema",
+        )
+        .is_err());
+    }
 }

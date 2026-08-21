@@ -13,8 +13,7 @@ pub const MAX_WAIT_REASON_BYTES: usize = 4 * 1024;
 pub const MAX_WAIT_EVIDENCE_ITEMS: usize = 16;
 pub const MAX_WAIT_EVIDENCE_BYTES: usize = 512;
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug)]
 pub enum DecisionInput {
     Proposal {
         schema_version: u8,
@@ -26,6 +25,24 @@ pub enum DecisionInput {
         requested_wait_minutes: u32,
         expected_evidence: Vec<String>,
     },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionEnvelope {
+    schema_version: u8,
+    decision: DecisionKind,
+    proposal: Option<ProposalInput>,
+    reason: Option<String>,
+    requested_wait_minutes: Option<u32>,
+    expected_evidence: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DecisionKind {
+    Proposal,
+    Wait,
 }
 
 #[derive(Debug)]
@@ -79,10 +96,52 @@ pub fn parse_and_validate_decision(
         return Err(validation_error("decision", "must be 1 to 131072 bytes"));
     }
 
-    let input = serde_json::from_slice(bytes).map_err(|source| AppError::Serialization {
+    let envelope: DecisionEnvelope = serde_json::from_slice(bytes).map_err(|source| AppError::Serialization {
         operation: "parse campaign decision",
         source,
     })?;
+    let input = match envelope.decision {
+        DecisionKind::Proposal => {
+            if envelope.reason.is_some()
+                || envelope.requested_wait_minutes.is_some()
+                || envelope.expected_evidence.is_some()
+            {
+                return Err(validation_error(
+                    "decision",
+                    "wait fields must be null or absent for a proposal decision",
+                ));
+            }
+            DecisionInput::Proposal {
+                schema_version: envelope.schema_version,
+                proposal: envelope.proposal.ok_or_else(|| {
+                    validation_error("proposal", "must be present for a proposal decision")
+                })?,
+            }
+        }
+        DecisionKind::Wait => {
+            if envelope.proposal.is_some() {
+                return Err(validation_error(
+                    "proposal",
+                    "must be null or absent for a wait decision",
+                ));
+            }
+            DecisionInput::Wait {
+                schema_version: envelope.schema_version,
+                reason: envelope.reason.ok_or_else(|| {
+                    validation_error("reason", "must be present for a wait decision")
+                })?,
+                requested_wait_minutes: envelope.requested_wait_minutes.ok_or_else(|| {
+                    validation_error(
+                        "requested_wait_minutes",
+                        "must be present for a wait decision",
+                    )
+                })?,
+                expected_evidence: envelope.expected_evidence.ok_or_else(|| {
+                    validation_error("expected_evidence", "must be present for a wait decision")
+                })?,
+            }
+        }
+    };
 
     match input {
         DecisionInput::Proposal {
@@ -206,16 +265,24 @@ mod tests {
                 ..
             })
         ));
+
+        let strict_wait = br#"{"schema_version":1,"decision":"wait","proposal":null,"reason":"artifact pending","requested_wait_minutes":30,"expected_evidence":["checkpoint"]}"#;
+        assert!(matches!(
+            parse_and_validate_decision(strict_wait, "objective-digest", limits).unwrap(),
+            ValidatedDecision::Wait(_)
+        ));
     }
 
     #[test]
     fn decision_protocol_rejects_code_change_unknown_fields_and_unbounded_wait() {
         let limits = CampaignLimits::default();
-        let rejected: [&[u8]; 4] = [
+        let rejected: [&[u8]; 6] = [
             br#"{"schema_version":1,"decision":"proposal","proposal":{"kind":"code_change","hypothesis":"edit source","source_experiment_id":"exp-1","argv":["python","train.py"],"working_directory":".","expected_evidence":[]}}"#,
             br#"{"schema_version":1,"decision":"wait","reason":"later","requested_wait_minutes":30,"expected_evidence":[],"extra":true}"#,
             br#"{"schema_version":1,"decision":"wait","reason":"later","requested_wait_minutes":0,"expected_evidence":[]}"#,
             br#"{"schema_version":1,"decision":"wait","reason":"later","requested_wait_minutes":10081,"expected_evidence":[]}"#,
+            br#"{"schema_version":1,"decision":"proposal","proposal":{"kind":"experiment","hypothesis":"lower lr","source_experiment_id":null,"argv":["python","train.py"],"working_directory":".","expected_evidence":[]},"reason":"inactive","requested_wait_minutes":null,"expected_evidence":null}"#,
+            br#"{"schema_version":1,"decision":"wait","proposal":{"kind":"experiment","hypothesis":"lower lr","source_experiment_id":null,"argv":["python","train.py"],"working_directory":".","expected_evidence":[]},"reason":"later","requested_wait_minutes":30,"expected_evidence":[]}"#,
         ];
         for document in rejected {
             assert!(parse_and_validate_decision(document, "objective-digest", limits).is_err());

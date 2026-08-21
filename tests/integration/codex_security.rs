@@ -1456,7 +1456,35 @@ max_agent_runs = 10
             },
             "source_experiment": {
                 "experiment_id": "decision-experiment",
+                "proposal_id": "decision-proposal",
+                "proposal_kind": "experiment",
+                "status": "succeeded",
+                "attempt": 1,
+                "command_digest": "decision-command-digest",
+                "failure_code": null,
+                "failure_fingerprint": null,
+                "created_at": 100,
+                "updated_at": 103,
+                "finished_at": 103,
             },
+            "terminal_observation": {
+                "task_id": 41,
+                "task_signature": "decision-task-signature",
+                "state": "done",
+                "enqueued_at": 101,
+                "started_at": 102,
+                "ended_at": 103,
+                "exit_code": 0,
+            },
+            "recent_outcomes": {"proposals": [], "experiments": []},
+            "budgets": {
+                "campaign_state": "active",
+                "next_eligible_at": null,
+                "rolling_usage": {},
+                "experiment_counts": {},
+            },
+            "intervention": {"pending": []},
+            "artifact_hints": [],
         })
         .to_string();
         let context = DecisionContextBundle {
@@ -1651,12 +1679,24 @@ fn pair<'a>(args: &'a [String], name: &str) -> Option<&'a str> {{
 
 fn main() {{
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if pair(&args, "--sandbox") != Some("read-only") {{
+    if args == ["--version"] {{ println!("codex-cli 0.148.0"); return; }}
+    if args == ["--help"] {{
+        println!("--strict-config --sandbox read-only workspace-write --ask-for-approval never");
+        return;
+    }}
+    if args == ["exec", "--help"] {{
+        println!("--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message");
+        return;
+    }}
+    let configs = args.windows(2).filter_map(|pair| (pair[0] == "-c").then_some(pair[1].as_str())).collect::<Vec<_>>();
+    if pair(&args, "--sandbox").is_some()
+        || !configs.contains(&"permissions.pueue_agent_decision.extends=\":read-only\"")
+        || !configs.contains(&"default_permissions=\"pueue_agent_decision\"")
+        || configs.iter().any(|value| value.starts_with("sandbox_workspace_write."))
+    {{
         fs::write("forbidden-write", b"unsafe").unwrap();
     }}
-    let network = args.windows(2).find_map(|pair| {{
-        (pair[0] == "-c").then_some(pair[1].as_str())
-    }}).and_then(|value| value.strip_prefix("sandbox_workspace_write.network_access=")).unwrap_or("missing");
+    let network = configs.iter().find_map(|value| value.strip_prefix("permissions.pueue_agent_decision.network.enabled=")).unwrap_or("missing");
     let mut names = env::vars_os().filter_map(|(name, _)| name.into_string().ok()).collect::<Vec<_>>();
     names.sort();
     let mut capture = format!("network_access={{network}}\n");
@@ -1666,7 +1706,7 @@ fn main() {{
     let schema = pair(&args, "--output-schema").unwrap();
     let output = pair(&args, "--output-last-message").unwrap();
     if !Path::new(schema).is_file() || !Path::new(output).is_file() {{ exit(71); }}
-    let decision = br#"{{"schema_version":1,"decision":"proposal","proposal":{{"kind":"experiment","hypothesis":"lower learning rate","source_experiment_id":"decision-experiment","argv":["python","train.py","--lr","0.001"],"working_directory":".","expected_evidence":["validation loss"]}}}}"#;
+    let decision = br#"{{"schema_version":1,"decision":"proposal","proposal":{{"kind":"experiment","hypothesis":"lower learning rate","source_experiment_id":"decision-experiment","argv":["python","train.py","--lr","0.001"],"working_directory":".","expected_evidence":["validation loss"]}},"reason":null,"requested_wait_minutes":null,"expected_evidence":null}}"#;
     match {mutation:?} {{
         "Valid" => fs::write(output, decision).unwrap(),
         "ExitNonzeroValid" => {{

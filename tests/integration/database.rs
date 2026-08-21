@@ -699,6 +699,136 @@ mod decision_context {
     use super::*;
 
     #[test]
+    fn decision_launch_authority_rejects_project_and_reservation_lineage_mismatches() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let repository = DecisionRepository::new(&harness.db);
+        assert!(repository.validate_launch_authority("different-project", &reservation).is_err());
+        let mut wrong_campaign = reservation.clone();
+        wrong_campaign.campaign_id = "different-campaign".to_owned();
+        assert!(repository.validate_launch_authority(&harness.project_id, &wrong_campaign).is_err());
+        let mut wrong_source = reservation.clone();
+        wrong_source.source_experiment_id = "different-experiment".to_owned();
+        assert!(repository.validate_launch_authority(&harness.project_id, &wrong_source).is_err());
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 0);
+    }
+
+    #[test]
+    fn decision_launch_context_must_exactly_match_strict_persisted_evidence() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let campaign = CampaignRepository::new(&harness.db)
+            .find_by_id(&harness.campaign_id).unwrap().unwrap();
+        let valid = serde_json::json!({
+            "schema_version": 1,
+            "objective": {"text": campaign.objective_text, "digest": campaign.objective_digest},
+            "source_experiment": {
+                "experiment_id": harness.experiment_id, "proposal_id": "proposal-baseline",
+                "proposal_kind": "experiment", "status": "succeeded", "attempt": 1,
+                "command_digest": "command-digest", "failure_code": null,
+                "failure_fingerprint": null, "created_at": 100, "updated_at": 103,
+                "finished_at": 103
+            },
+            "terminal_observation": {
+                "task_id": 41, "task_signature": "pueue-task:v1:decision-fixture",
+                "state": "done", "enqueued_at": 100, "started_at": 101,
+                "ended_at": 103, "exit_code": 0
+            },
+            "recent_outcomes": {"proposals": [], "experiments": []},
+            "budgets": {"campaign_state": "active", "next_eligible_at": null,
+                "rolling_usage": {}, "experiment_counts": {}},
+            "intervention": {"pending": []}, "artifact_hints": []
+        });
+        let valid_json = serde_json::to_string(&valid).unwrap();
+        let valid_digest = format!("{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(valid_json.as_bytes()));
+        let repository = DecisionRepository::new(&harness.db);
+        repository.store_evidence(&reservation, &valid_json, &valid_digest, 201).unwrap();
+        assert_eq!(repository.validate_launch_context(
+            &harness.project_id, &reservation, &valid_json, &valid_digest,
+        ).unwrap(), valid["objective"]["digest"].as_str().unwrap());
+
+        let stale_json = valid_json.replace("command-digest", "stale-command-digest");
+        let stale_digest = format!("{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(stale_json.as_bytes()));
+        assert!(repository.validate_launch_context(
+            &harness.project_id, &reservation, &stale_json, &stale_digest,
+        ).is_err());
+
+        let mut unknown = valid.clone();
+        unknown.as_object_mut().unwrap().insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        let mut control = valid.clone();
+        control["objective"]["text"] = serde_json::Value::String("bad\u{0}text".to_owned());
+        let mut wrong_schema = valid.clone();
+        wrong_schema["schema_version"] = serde_json::Value::from(2);
+        let mut wrong_objective = valid.clone();
+        wrong_objective["objective"]["digest"] = serde_json::Value::String("different-objective".to_owned());
+        let rejected = [
+            serde_json::to_string(&unknown).unwrap(), serde_json::to_string(&control).unwrap(),
+            serde_json::to_string(&wrong_schema).unwrap(),
+            serde_json::to_string(&wrong_objective).unwrap(),
+            "x".repeat(MAX_DECISION_CONTEXT_BYTES + 1),
+        ];
+        for context_json in rejected {
+            let context_digest = format!("{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(context_json.as_bytes()));
+            harness.db.connect().unwrap().execute(
+                "UPDATE decision_attempts SET context_schema_version = 1,
+                 context_json = ?1, context_digest = ?2
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![context_json, context_digest, reservation.cycle_id, reservation.attempt_number],
+            ).unwrap();
+            assert!(repository.validate_launch_context(
+                &harness.project_id, &reservation, &context_json, &context_digest,
+            ).is_err());
+        }
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 0);
+    }
+
+    #[test]
+    fn conflicting_decision_bind_does_not_change_the_existing_attempt_owner() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let decisions = DecisionRepository::new(&harness.db);
+        decisions.store_evidence(&reservation, "{}", "context-digest", 200).unwrap();
+        let events = EventRepository::new(&harness.db);
+        let first_event = events.insert_idempotent(&NewEvent::new(
+            &harness.project_id, EventKind::CampaignDecision, "decision-owner-first",
+            serde_json::json!({}), 200, 200,
+        )).unwrap();
+        events.claim_batch(200, 300, 10).unwrap();
+        let runs = AgentRunRepository::new(&harness.db);
+        let root = harness.test.project_root("campaign-project");
+        let first_run = runs.insert_with_events(&NewAgentRun::new(
+            &harness.project_id, first_event.event_id, None, AgentRunStatus::Starting,
+            200, root.join("first.log"),
+        ), &[first_event.event_id]).unwrap();
+        decisions.bind_agent_run(&reservation, first_run.run_id, 201).unwrap();
+        harness.db.connect().unwrap().execute(
+            "UPDATE agent_runs SET status = 'failed', finished_at = 202 WHERE run_id = ?1",
+            [first_run.run_id],
+        ).unwrap();
+        let second_event = events.insert_idempotent(&NewEvent::new(
+            &harness.project_id, EventKind::CampaignDecision, "decision-owner-second",
+            serde_json::json!({}), 203, 203,
+        )).unwrap();
+        events.claim_batch(203, 303, 10).unwrap();
+        let second_run = runs.insert_with_events(&NewAgentRun::new(
+            &harness.project_id, second_event.event_id, None, AgentRunStatus::Starting,
+            203, root.join("second.log"),
+        ), &[second_event.event_id]).unwrap();
+        assert!(decisions.bind_agent_run(&reservation, second_run.run_id, 204).is_err());
+        let (state, owner): (String, Option<i64>) = harness.db.connect().unwrap().query_row(
+            "SELECT state, agent_run_id FROM decision_attempts
+             WHERE cycle_id = ?1 AND attempt_number = ?2",
+            params![reservation.cycle_id, reservation.attempt_number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "running");
+        assert_eq!(owner, Some(first_run.run_id));
+    }
+
+    #[test]
     fn decision_context_is_deterministic_bounded_and_uses_persisted_objective() {
         let harness =
             CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
