@@ -13,15 +13,16 @@ use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     db::{
-        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        InterventionRepository, ProjectRepository, StartCampaignRequest,
+        AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
+        ExperimentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
     },
     daemon::{Daemon, DaemonConfig, DaemonReport},
     execution_policy::CampaignLimits,
     interventions::InterventionStatus,
     models::{
-        AgentContextMode, AgentRunStatus, CampaignState, EventKind, EventStatus, ExperimentStatus,
-        NewAgentRun, NewEvent, NewProject, ProposalKind,
+        AgentContextMode, AgentRunStatus, CampaignState, DecisionAttemptState, DecisionCycleState,
+        EventKind, EventStatus, ExperimentStatus, ExperimentTerminalOutcome, NewAgentRun, NewEvent,
+        NewProject, ProposalKind,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
@@ -639,6 +640,84 @@ fn running_task() -> PueueTask {
         ended_at: None,
         result: None,
     }
+}
+
+#[tokio::test]
+async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_scheduling() {
+    let harness = DaemonHarness::new();
+    let experiment_id = harness.campaign_experiment();
+    let experiments = ExperimentRepository::new(&harness.db);
+    experiments.mark_submitting(&experiment_id, 110).unwrap();
+    experiments
+        .mark_accepted(
+            &experiment_id,
+            42,
+            "pueue-task:v1:decision-recovery-source",
+            120,
+        )
+        .unwrap();
+    experiments
+        .project_terminal_submission(
+            &experiment_id,
+            42,
+            ExperimentTerminalOutcome::Succeeded,
+            150,
+        )
+        .unwrap();
+    let decisions = DecisionRepository::new(&harness.db);
+    let cycle = decisions
+        .ensure_cycle_for_terminal("daemon-campaign", &experiment_id, 160)
+        .unwrap();
+    let reservation = decisions
+        .reserve_next_attempt("project-a", &cycle.cycle_id, 170)
+        .unwrap()
+        .unwrap();
+    decisions
+        .store_evidence(&reservation, "{}", "context-digest", 171)
+        .unwrap();
+    let event_id = harness.enqueue(
+        EventKind::CampaignDecision,
+        "project-a",
+        "decision-recovery-terminal-agent",
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'completed', completed_at = 172 WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    let run_id = harness.insert_active_run("project-a", event_id, AgentRunStatus::Running);
+    decisions
+        .bind_agent_run(&reservation, run_id, 173)
+        .unwrap();
+
+    harness.restart_at(200).await.unwrap();
+
+    let (attempt_state, failure_code): (DecisionAttemptState, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, failure_code FROM decision_attempts
+             WHERE cycle_id = ?1 AND attempt_number = ?2",
+            rusqlite::params![reservation.cycle_id, reservation.attempt_number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempt_state, DecisionAttemptState::Failed);
+    assert_eq!(failure_code.as_deref(), Some("decision_missing"));
+    assert_eq!(
+        DecisionRepository::new(&harness.db)
+            .find_cycle_for_source("daemon-campaign", &experiment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DecisionCycleState::Pending
+    );
+    assert_eq!(harness.agent_run_count(), 1);
 }
 
 #[tokio::test]

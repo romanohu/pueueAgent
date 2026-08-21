@@ -11,6 +11,7 @@ pub use campaigns::{
 pub use decisions::{
     DecisionDoctorProjection, DecisionRecovery, DecisionRepository, DecisionReservation,
 };
+pub(crate) use decisions::ReadyDecision;
 pub use migrations::LATEST_SCHEMA_VERSION;
 
 use std::{fs, path::Path, path::PathBuf, sync::{Arc, Mutex}, time::Duration};

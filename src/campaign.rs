@@ -6,7 +6,8 @@ use uuid::Uuid;
 use crate::{
     db::{
         CampaignRepository, Db, ExperimentRepository, ManagedSubmissionIntent,
-        ProjectRepository, ProposalRepository, StartCampaignRequest, SubmissionRepository,
+        ProjectRepository, ProposalAcceptance, ProposalRepository, StartCampaignRequest,
+        SubmissionRepository,
     },
     environment::ProjectAdmissionLock,
     execution_policy::{CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
@@ -169,9 +170,15 @@ pub struct CampaignCoordinator<'a, P: PueueApi + ?Sized> {
     root_anchor: Option<ProjectRootAnchor>,
 }
 
-struct CampaignAdmission {
+pub(crate) struct CampaignAdmission {
     verified_root: VerifiedProjectRoot,
     _lock: ProjectAdmissionLock,
+}
+
+pub(crate) struct AdmittedCampaignProposal {
+    pub(crate) intent: ManagedSubmissionIntent,
+    pub(crate) newly_accepted: bool,
+    admission: CampaignAdmission,
 }
 
 impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
@@ -274,6 +281,58 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     ) -> Result<CampaignSubmission, AppError> {
         self.submit_accepted_intent_inner(intent, project, now, None)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_proposal(
+        &self,
+        project: &Project,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &proposals::ValidatedProposal,
+        now: i64,
+    ) -> Result<Option<AdmittedCampaignProposal>, AppError> {
+        let admission = self.acquire_admission(project)?;
+        match CampaignRepository::new(self.db).accept_proposal(
+            campaign_id,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            &self.limits,
+            now,
+        )? {
+            ProposalAcceptance::Accepted(intent) => {
+                let newly_accepted = intent.proposal.proposal_id == proposal_id;
+                Ok(Some(AdmittedCampaignProposal {
+                    intent,
+                    newly_accepted,
+                    admission,
+                }))
+            }
+            ProposalAcceptance::BudgetWaiting { .. } => Ok(None),
+            ProposalAcceptance::PendingCodeChange => Err(AppError::Validation {
+                field: "proposal.kind",
+                message: "code_change decisions are not permitted",
+            }),
+        }
+    }
+
+    pub(crate) async fn submit_admitted_proposal(
+        &self,
+        admitted: AdmittedCampaignProposal,
+        project: &Project,
+        now: i64,
+    ) -> Result<CampaignSubmission, AppError> {
+        self.submit_accepted_intent_inner(
+            &admitted.intent,
+            project,
+            now,
+            Some(admitted.admission),
+        )
+        .await
     }
 
     async fn submit_accepted_intent_inner(
@@ -433,7 +492,10 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             .map(CampaignSubmission::Submitted)
     }
 
-    fn acquire_admission(&self, project: &Project) -> Result<CampaignAdmission, AppError> {
+    pub(crate) fn acquire_admission(
+        &self,
+        project: &Project,
+    ) -> Result<CampaignAdmission, AppError> {
         let root_anchor = match self.root_anchor.as_ref() {
             Some(anchor) => anchor.clone(),
             None => ProjectRootAnchor::resolve(&project.root_path).map_err(AppError::from)?,

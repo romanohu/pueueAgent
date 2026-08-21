@@ -5,8 +5,8 @@ use crate::{
     decision_evidence::{validate_stored_decision_context, DECISION_CONTEXT_SCHEMA_VERSION},
     execution_policy::CampaignLimits,
     models::{
-        CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle, DecisionCycleState,
-        Event, EventKind, ExperimentStatus, NewEvent,
+        AgentRunStatus, CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle,
+        DecisionCycleState, Event, EventKind, ExperimentStatus, NewEvent,
     },
     AppError,
 };
@@ -49,6 +49,16 @@ pub struct DecisionRecovery {
     pub reservation: DecisionReservation,
     pub state: DecisionAttemptState,
     pub agent_run_id: Option<i64>,
+    pub agent_run_status: Option<AgentRunStatus>,
+    pub event_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadyDecision {
+    pub(crate) reservation: DecisionReservation,
+    pub(crate) decision_json: String,
+    pub(crate) decision_digest: String,
+    pub(crate) decision_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -992,13 +1002,10 @@ impl<'db> DecisionRepository<'db> {
             .map_err(database_error("store decision output"))?;
         transaction
             .execute(
-                "UPDATE decision_cycles
-                 SET consecutive_failed_attempts = 0, last_decision_kind = ?1,
-                     last_failure_code = NULL, last_failure_summary = NULL, updated_at = ?2
-                 WHERE cycle_id = ?3",
-                params![decision_kind, now, attempt.cycle_id],
+                "UPDATE decision_cycles SET updated_at = ?1 WHERE cycle_id = ?2",
+                params![now, attempt.cycle_id],
             )
-            .map_err(database_error("record valid decision output"))?;
+            .map_err(database_error("touch decision cycle after output storage"))?;
         let stored = read_attempt(&transaction, &attempt.cycle_id, attempt.attempt_number)?;
         transaction
             .commit()
@@ -1015,6 +1022,51 @@ impl<'db> DecisionRepository<'db> {
         summary: &str,
         limits: CampaignLimits,
         now: i64,
+    ) -> Result<DecisionCycle, AppError> {
+        self.record_attempt_failure(
+            run_id,
+            cycle_id,
+            attempt_number,
+            code,
+            summary,
+            limits,
+            now,
+            false,
+        )
+    }
+
+    pub fn reject_decision(
+        &self,
+        cycle_id: &str,
+        attempt_number: i64,
+        code: &str,
+        summary: &str,
+        limits: CampaignLimits,
+        now: i64,
+    ) -> Result<DecisionCycle, AppError> {
+        self.record_attempt_failure(
+            None,
+            cycle_id,
+            attempt_number,
+            code,
+            summary,
+            limits,
+            now,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_attempt_failure(
+        &self,
+        run_id: Option<i64>,
+        cycle_id: &str,
+        attempt_number: i64,
+        code: &str,
+        summary: &str,
+        limits: CampaignLimits,
+        now: i64,
+        allow_decided: bool,
     ) -> Result<DecisionCycle, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -1047,7 +1099,7 @@ impl<'db> DecisionRepository<'db> {
                 "conflicts with the existing failure",
             ));
         }
-        if attempt.state == DecisionAttemptState::Decided {
+        if attempt.state == DecisionAttemptState::Decided && !allow_decided {
             return Err(validation_error(
                 "decision_attempt",
                 "a decided attempt cannot fail",
@@ -1058,7 +1110,7 @@ impl<'db> DecisionRepository<'db> {
                 "UPDATE decision_attempts
                  SET state = 'failed', failure_code = ?1, failure_summary = ?2, finished_at = ?3
                  WHERE cycle_id = ?4 AND attempt_number = ?5
-                   AND state IN ('reserved','evidence_ready','running')",
+                   AND state IN ('reserved','evidence_ready','running','decided')",
                 params![code, summary, now, cycle_id, attempt_number],
             )
             .map_err(database_error("fail decision attempt"))?;
@@ -1216,6 +1268,26 @@ impl<'db> DecisionRepository<'db> {
                     )
                     .map_err(database_error("wake due decision cycle during query"))?;
             }
+            transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'pending', not_before = ?1, lease_until = NULL,
+                         completed_at = NULL, attempts = 0, last_error = NULL
+                     WHERE campaign_id = ?2 AND experiment_id = ?3
+                       AND kind = 'campaign_decision'
+                       AND json_extract(payload_json, '$.source') = 'terminal_experiment'
+                       AND json_extract(payload_json, '$.cycle_id') = ?4
+                       AND json_extract(payload_json, '$.source_experiment_id') = ?3
+                       AND (status IN ('completed','failed','dead_letter')
+                            OR (status = 'retry_wait' AND not_before <= ?1))",
+                    params![
+                        now,
+                        authority.cycle.campaign_id,
+                        authority.cycle.source_experiment_id,
+                        cycle_id
+                    ],
+                )
+                .map_err(database_error("wake due decision event"))?;
             cycles.push(read_cycle(&transaction, &cycle_id)?);
         }
         transaction
@@ -1280,6 +1352,49 @@ impl<'db> DecisionRepository<'db> {
         Ok(Some(cycle))
     }
 
+    pub(crate) fn ready_decisions(&self, limit: usize) -> Result<Vec<ReadyDecision>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT da.cycle_id, dc.campaign_id, dc.source_experiment_id,
+                        da.attempt_number, da.created_at, da.decision_json,
+                        da.decision_digest, da.decision_kind
+                 FROM decision_attempts da
+                 JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
+                 WHERE dc.state = 'analyzing' AND da.state = 'decided'
+                   AND da.attempt_number = (
+                       SELECT MAX(latest.attempt_number)
+                       FROM decision_attempts latest WHERE latest.cycle_id = da.cycle_id
+                   )
+                 ORDER BY COALESCE(da.finished_at, da.created_at), da.cycle_id,
+                          da.attempt_number
+                 LIMIT ?1",
+            )
+            .map_err(database_error("prepare ready decision query"))?;
+        let decisions = statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(ReadyDecision {
+                    reservation: DecisionReservation {
+                        cycle_id: row.get(0)?,
+                        campaign_id: row.get(1)?,
+                        source_experiment_id: row.get(2)?,
+                        attempt_number: row.get(3)?,
+                        created_at: row.get(4)?,
+                    },
+                    decision_json: row.get(5)?,
+                    decision_digest: row.get(6)?,
+                    decision_kind: row.get(7)?,
+                })
+            })
+            .map_err(database_error("query ready decisions"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read ready decisions"))?;
+        Ok(decisions)
+    }
+
     pub fn recoverable_attempts(&self, limit: usize) -> Result<Vec<DecisionRecovery>, AppError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1288,9 +1403,23 @@ impl<'db> DecisionRepository<'db> {
         let mut statement = connection
             .prepare(
                 "SELECT da.cycle_id, dc.campaign_id, dc.source_experiment_id,
-                        da.attempt_number, da.created_at, da.state, da.agent_run_id
+                        da.attempt_number, da.created_at, da.state, da.agent_run_id,
+                        run.status,
+                        (SELECT ev.event_id
+                         FROM events ev
+                         JOIN campaigns c ON c.campaign_id = dc.campaign_id
+                         WHERE ev.project_id = c.project_id
+                           AND ev.campaign_id = dc.campaign_id
+                           AND ev.experiment_id = dc.source_experiment_id
+                           AND ev.kind = 'campaign_decision'
+                           AND json_extract(ev.payload_json, '$.source') = 'terminal_experiment'
+                           AND json_extract(ev.payload_json, '$.cycle_id') = dc.cycle_id
+                           AND json_extract(ev.payload_json, '$.source_experiment_id') =
+                               dc.source_experiment_id
+                         ORDER BY ev.event_id LIMIT 1)
                  FROM decision_attempts da
                  JOIN decision_cycles dc ON dc.cycle_id = da.cycle_id
+                 LEFT JOIN agent_runs run ON run.run_id = da.agent_run_id
                  WHERE dc.state = 'analyzing'
                    AND da.state IN ('reserved','evidence_ready','running','decided')
                  ORDER BY da.created_at, da.cycle_id, da.attempt_number
@@ -1309,6 +1438,8 @@ impl<'db> DecisionRepository<'db> {
                     },
                     state: row.get(5)?,
                     agent_run_id: row.get(6)?,
+                    agent_run_status: row.get(7)?,
+                    event_id: row.get(8)?,
                 })
             })
             .map_err(database_error("query recoverable decision attempts"))?
@@ -1360,6 +1491,7 @@ impl<'db> DecisionRepository<'db> {
                 .map_err(database_error("commit existing decision cycle completion"))?;
             return Ok(authority.cycle);
         }
+        validate_active_authority(&authority, None)?;
         let legal_attempt_state = if next_wake_at.is_some() {
             matches!(
                 attempt.state,

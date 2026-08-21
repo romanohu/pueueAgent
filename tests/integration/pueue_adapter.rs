@@ -6,6 +6,9 @@ mod config_read_barrier;
 #[cfg(all(unix, debug_assertions))]
 #[path = "../support/native_process_fixture.rs"]
 mod native_process_fixture;
+#[cfg(unix)]
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
 
 use std::{
     ffi::OsString,
@@ -15,18 +18,19 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 
 #[cfg(all(unix, debug_assertions))]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(all(unix, debug_assertions))]
 use std::process::Command;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
 
 use fake_pueue::{FakePueue, FakePueueCommand};
 #[cfg(unix)]
@@ -37,16 +41,22 @@ use native_process_fixture::{
     TIMEOUT_SENTINEL_REPETITIONS,
 };
 use pueue_agent::{
+    agent::{AgentRunner, AgentRunnerConfig},
     batches::{self, BatchJobResult},
     campaign::CampaignCoordinator,
+    daemon::{Daemon, DaemonConfig},
+    decision::DecisionCoordinator,
+    decision_protocol::parse_and_validate_decision,
     db::{
-        BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        ManagedSubmissionIntent, ProjectRepository, StartCampaignRequest, SubmissionRepository,
+        AgentRunRepository, BatchRepository, CampaignRepository, Db, DecisionRepository,
+        EventRepository, ExperimentRepository, ManagedSubmissionIntent, ProjectRepository,
+        StartCampaignRequest, SubmissionRepository,
     },
     execution_policy::{CampaignLimits, ProjectRootAnchor},
     models::{
-        AgentRunStatus, EventKind, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
-        ExperimentStatus, ProposalKind, Submission, SubmissionKind, SubmissionStatus,
+        AgentRunStatus, CampaignState, EventKind, EventStatus, ExperimentStatus,
+        ExperimentTerminalOutcome, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewProject,
+        ProposalKind, Submission, SubmissionKind, SubmissionStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{configured_pueue, validate_add_argv, PueueApi, PueueError, PueueTask, PUEUE_TIMEOUT},
@@ -1116,6 +1126,635 @@ impl PueueApi for TimeoutPueue {
 
 fn expected_provisional_signature(group: &str, task_id: i64, submission_id: &str) -> String {
     format!("provisional-submit:v1:group={group}:task-id={task_id}:intent={submission_id}")
+}
+
+#[derive(Clone, Copy)]
+enum DecisionFailpoint {
+    AfterDecisionCommit,
+    AfterPueueAdd,
+}
+
+struct DecisionHarness {
+    temp: TempDir,
+    db: Db,
+    root: PathBuf,
+    pueue: CountingFakePueue,
+    campaign_id: String,
+    source_experiment_id: String,
+    cycle_id: String,
+    decision_json: String,
+}
+
+impl DecisionHarness {
+    fn with_ready_proposal(status: ExperimentStatus) -> Self {
+        let mut harness = Self::with_terminal_source(status, None);
+        let decision = json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "experiment",
+                "hypothesis": "Lower the learning rate after the terminal baseline",
+                "source_experiment_id": harness.source_experiment_id,
+                "argv": ["python", "train.py", "--lr", "0.001"],
+                "working_directory": ".",
+                "expected_evidence": ["validation loss"]
+            }
+        })
+        .to_string();
+        harness.persist_ready_decision(&decision, "proposal", 200);
+        harness.decision_json = decision;
+        harness
+    }
+
+    fn with_ready_repair(fingerprint: Option<&str>) -> Self {
+        let mut harness = Self::with_terminal_source(ExperimentStatus::Failed, fingerprint);
+        let decision = json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "repair",
+                "hypothesis": "Retry the trusted failure with a smaller batch",
+                "source_experiment_id": harness.source_experiment_id,
+                "argv": ["python", "train.py", "--batch-size", "16"],
+                "working_directory": ".",
+                "expected_evidence": ["failure no longer reproduces"]
+            }
+        })
+        .to_string();
+        harness.persist_ready_decision(&decision, "proposal", 200);
+        harness.decision_json = decision;
+        harness
+    }
+
+    fn with_ready_wait(minutes: u32) -> Self {
+        let mut harness = Self::with_terminal_source(ExperimentStatus::Succeeded, None);
+        let decision = json!({
+            "schema_version": 1,
+            "decision": "wait",
+            "reason": "Wait for the next finite evidence window",
+            "requested_wait_minutes": minutes,
+            "expected_evidence": ["fresh checkpoint"]
+        })
+        .to_string();
+        harness.persist_ready_decision(&decision, "wait", 200);
+        harness.decision_json = decision;
+        harness
+    }
+
+    fn with_ready_code_change() -> Self {
+        let mut harness = Self::with_terminal_source(ExperimentStatus::Succeeded, None);
+        let decision = harness.code_change_decision();
+        harness.persist_ready_decision(&decision, "proposal", 200);
+        harness.decision_json = decision;
+        harness
+    }
+
+    fn with_terminal_source(
+        status: ExperimentStatus,
+        trusted_failure_fingerprint: Option<&str>,
+    ) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("decision-project");
+        fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        fs::write(
+            root.join(".pueue-agent/config.toml"),
+            r#"
+project_id = "decision-project"
+pueue_group = "decision-group"
+
+[agent]
+program = "/bin/echo"
+args = ["{prompt}"]
+timeout_minutes = 60
+max_retries = 2
+
+[check]
+interval_minutes = 10
+deep_check_interval_minutes = 0
+stall_minutes = 30
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".pueue-agent/STATE.md"),
+            "Reach validation loss below 0.20\n",
+        )
+        .unwrap();
+        fs::write(root.join(".pueue-agent/instructions.md"), "instructions\n").unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "decision-project",
+                &root,
+                "decision-group",
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        let objective = state::load_objective(&root).unwrap();
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the initial campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: vec!["python".to_owned(), "train.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        let campaign_id = "decision-campaign".to_owned();
+        let source_experiment_id = "decision-source-experiment".to_owned();
+        CampaignRepository::new(&db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: &campaign_id,
+                    project_id: "decision-project",
+                    objective: &objective,
+                    initial_argv: baseline.argv(),
+                    baseline: &baseline,
+                    submission_id: "decision-source-submission",
+                    experiment_id: &source_experiment_id,
+                    proposal_id: "decision-source-proposal",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        let experiments = ExperimentRepository::new(&db);
+        experiments
+            .mark_submitting(&source_experiment_id, 110)
+            .unwrap();
+        experiments
+            .mark_accepted(
+                &source_experiment_id,
+                40,
+                "pueue-task:v1:decision-source",
+                120,
+            )
+            .unwrap();
+        let outcome = match status {
+            ExperimentStatus::Succeeded => ExperimentTerminalOutcome::Succeeded,
+            ExperimentStatus::Failed => ExperimentTerminalOutcome::Failed {
+                failure_code: "training_failed",
+                failure_fingerprint: "trusted-fingerprint",
+            },
+            ExperimentStatus::Cancelled => ExperimentTerminalOutcome::Cancelled,
+            _ => panic!("decision source must be terminal"),
+        };
+        experiments
+            .project_terminal_submission(&source_experiment_id, 40, outcome, 150)
+            .unwrap();
+        if status == ExperimentStatus::Failed && trusted_failure_fingerprint.is_none() {
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE experiments SET failure_fingerprint = NULL WHERE experiment_id = ?1",
+                    [&source_experiment_id],
+                )
+                .unwrap();
+        }
+        let cycle_id = DecisionRepository::new(&db)
+            .ensure_cycle_for_terminal(&campaign_id, &source_experiment_id, 160)
+            .unwrap()
+            .cycle_id;
+        Self {
+            temp,
+            db,
+            root,
+            pueue: CountingFakePueue::new(),
+            campaign_id,
+            source_experiment_id,
+            cycle_id,
+            decision_json: String::new(),
+        }
+    }
+
+    fn persist_ready_decision(&self, decision_json: &str, kind: &str, now: i64) {
+        let decisions = DecisionRepository::new(&self.db);
+        let reservation = decisions
+            .reserve_next_attempt("decision-project", &self.cycle_id, now)
+            .unwrap()
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, "{}", "context-digest", now + 1)
+            .unwrap();
+        let event = EventRepository::new(&self.db)
+            .insert_idempotent(&NewEvent::new(
+                "decision-project",
+                EventKind::TaskFinished,
+                format!("decision-ready-run-{now}"),
+                json!({"source":"decision-test"}),
+                now + 1,
+                now + 1,
+            ))
+            .unwrap();
+        let run = AgentRunRepository::new(&self.db)
+            .insert(&NewAgentRun::new(
+                "decision-project",
+                event.event_id,
+                None,
+                AgentRunStatus::Running,
+                now + 1,
+                self.root
+                    .join(format!(".pueue-agent/logs/decision-{now}.log")),
+            ))
+            .unwrap();
+        decisions
+            .bind_agent_run(&reservation, run.run_id, now + 2)
+            .unwrap();
+        let digest = parse_and_validate_decision(
+            decision_json.as_bytes(),
+            &self.objective_digest(),
+            CampaignLimits::default(),
+        )
+        .map(|decision| decision.canonical_digest().to_owned())
+        .unwrap_or_else(|_| "persisted-invalid-decision-digest".to_owned());
+        decisions
+            .store_decision(run.run_id, decision_json, &digest, kind, now + 3)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .finish(
+                run.run_id,
+                AgentRunStatus::Completed,
+                now + 4,
+                Some(0),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn objective_digest(&self) -> String {
+        CampaignRepository::new(&self.db)
+            .find_by_id(&self.campaign_id)
+            .unwrap()
+            .unwrap()
+            .objective_digest
+    }
+
+    fn coordinator(&self) -> DecisionCoordinator<'_, CountingFakePueue> {
+        DecisionCoordinator::new(&self.db, &self.pueue, CampaignLimits::default())
+    }
+
+    fn child_experiment_count(&self) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM experiments WHERE parent_experiment_id = ?1",
+                [&self.source_experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn campaign_state(&self) -> CampaignState {
+        CampaignRepository::new(&self.db)
+            .find_by_id(&self.campaign_id)
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    fn complete_campaign_decision_event(&self, now: i64) -> i64 {
+        let event = NewEvent::new(
+            "decision-project",
+            EventKind::CampaignDecision,
+            format!("campaign-decision:v1:{}", self.cycle_id),
+            json!({
+                "source": "terminal_experiment",
+                "cycle_id": self.cycle_id,
+                "source_experiment_id": self.source_experiment_id,
+            }),
+            now,
+            now,
+        )
+        .with_campaign_lineage(
+            self.campaign_id.clone(),
+            Some(self.source_experiment_id.clone()),
+        );
+        let (_, event) = DecisionRepository::new(&self.db)
+            .publish_terminal_cycle_event(
+                &self.campaign_id,
+                &self.source_experiment_id,
+                &event,
+                now,
+            )
+            .unwrap();
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', attempts = 1, completed_at = ?1
+                 WHERE event_id = ?2",
+                rusqlite::params![now, event.event_id],
+            )
+            .unwrap();
+        event.event_id
+    }
+
+    fn event_status_and_attempts(&self, event_id: i64) -> (EventStatus, i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status, attempts FROM events WHERE event_id = ?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn enable_failpoint(&self, failpoint: DecisionFailpoint) {
+        let sql = match failpoint {
+            DecisionFailpoint::AfterDecisionCommit => {
+                "CREATE TRIGGER decision_fail_after_commit
+                 BEFORE UPDATE OF status ON experiments
+                 WHEN OLD.status = 'reserved' AND NEW.status = 'submitting'
+                 BEGIN SELECT RAISE(ABORT, 'injected after-decision-commit failure'); END;"
+            }
+            DecisionFailpoint::AfterPueueAdd => {
+                "CREATE TRIGGER decision_fail_after_pueue_add
+                 BEFORE UPDATE OF status ON experiments
+                 WHEN OLD.status = 'submitting' AND NEW.status = 'accepted'
+                 BEGIN SELECT RAISE(ABORT, 'injected after-pueue-add failure'); END;"
+            }
+        };
+        self.db.connect().unwrap().execute_batch(sql).unwrap();
+    }
+
+    fn disable_failpoints(&self) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS decision_fail_after_commit;
+                 DROP TRIGGER IF EXISTS decision_fail_after_pueue_add;",
+            )
+            .unwrap();
+    }
+
+    fn code_change_decision(&self) -> String {
+        json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "code_change",
+                "hypothesis": "Edit the training source",
+                "source_experiment_id": self.source_experiment_id,
+                "argv": ["python", "train.py"],
+                "working_directory": ".",
+                "expected_evidence": []
+            }
+        })
+        .to_string()
+    }
+
+    fn persist_duplicate_as_terminal(&self) {
+        let decision = parse_and_validate_decision(
+            self.decision_json.as_bytes(),
+            &self.objective_digest(),
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        let pueue_agent::decision_protocol::ValidatedDecision::Proposal(proposal) = decision else {
+            panic!("duplicate fixture requires a proposal");
+        };
+        let intent = CampaignRepository::new(&self.db)
+            .accept_proposal(
+                &self.campaign_id,
+                "existing-duplicate-proposal",
+                "existing-duplicate-experiment",
+                "existing-duplicate-submission",
+                &proposal,
+                &CampaignLimits::default(),
+                250,
+            )
+            .unwrap()
+            .accepted()
+            .unwrap();
+        let experiments = ExperimentRepository::new(&self.db);
+        experiments
+            .mark_submitting(&intent.experiment.experiment_id, 251)
+            .unwrap();
+        experiments
+            .mark_accepted(
+                &intent.experiment.experiment_id,
+                39,
+                "pueue-task:v1:existing-duplicate",
+                252,
+            )
+            .unwrap();
+        experiments
+            .project_terminal_submission(
+                &intent.experiment.experiment_id,
+                39,
+                ExperimentTerminalOutcome::Succeeded,
+                253,
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn restart_daemon_once(&self) -> Result<(), AppError> {
+        let configured_program = execution_policy_fixture::prepare_configured_program(
+            self.temp.path(),
+            "decision-project",
+            &self.root.join(".pueue-agent/config.toml"),
+        );
+        let policy = execution_policy_fixture::resolved_policy(
+            self.temp.path(),
+            &[("decision-project", self.root.as_path(), configured_program.as_path())],
+        );
+        let runner = AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            policy.clone(),
+        );
+        Daemon::new(
+            self.db.clone(),
+            self.pueue.clone(),
+            policy,
+            runner,
+            DaemonConfig {
+                interval: Duration::from_secs(60),
+                lease_seconds: 60,
+                claim_limit: 10,
+                now_override: Some(301),
+                shutdown_grace_period: Duration::from_secs(1),
+            },
+        )
+        .run_once()
+        .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn successful_terminal_decision_adds_exactly_one_next_experiment() {
+    let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
+
+    let first = harness.coordinator().apply_ready(300, 10).await.unwrap();
+    let second = harness.coordinator().apply_ready(301, 10).await.unwrap();
+
+    assert_eq!(first.proposals_applied, 1);
+    assert_eq!(second.proposals_applied, 0);
+    assert_eq!(harness.pueue.add_calls(), 1);
+    assert_eq!(harness.child_experiment_count(), 1);
+}
+
+#[tokio::test]
+async fn failed_terminal_decision_allows_trusted_repair_and_rejects_untrusted_repair() {
+    let trusted = DecisionHarness::with_ready_repair(Some("trusted-fingerprint"));
+    assert_eq!(
+        trusted
+            .coordinator()
+            .apply_ready(300, 10)
+            .await
+            .unwrap()
+            .proposals_applied,
+        1
+    );
+    assert_eq!(trusted.pueue.add_calls(), 1);
+
+    let untrusted = DecisionHarness::with_ready_repair(None);
+    assert!(matches!(
+        untrusted
+            .coordinator()
+            .apply_ready(300, 10)
+            .await
+            .unwrap_err(),
+        AppError::Validation {
+            field: "source_experiment_id",
+            ..
+        }
+    ));
+    assert_eq!(untrusted.pueue.add_calls(), 0);
+}
+
+#[tokio::test]
+async fn wait_decision_adds_no_task_and_wakes_same_cycle_at_the_finite_deadline() {
+    let harness = DecisionHarness::with_ready_wait(1);
+    let event_id = harness.complete_campaign_decision_event(299);
+
+    assert_eq!(
+        harness
+            .coordinator()
+            .apply_ready(300, 10)
+            .await
+            .unwrap()
+            .waits_scheduled,
+        1
+    );
+    assert_eq!(harness.pueue.add_calls(), 0);
+    assert!(
+        DecisionRepository::new(&harness.db)
+            .due_cycles(359, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        harness.event_status_and_attempts(event_id),
+        (EventStatus::Completed, 1)
+    );
+    assert_eq!(
+        DecisionRepository::new(&harness.db)
+            .due_cycles(360, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        harness.event_status_and_attempts(event_id),
+        (EventStatus::Pending, 0)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wait_decision_defers_while_project_admission_is_locked() {
+    let harness = DecisionHarness::with_ready_wait(1);
+    let guard = fs::File::open(&harness.root).unwrap();
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    assert_eq!(unsafe { flock(guard.as_raw_fd(), 2) }, 0);
+
+    let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
+
+    assert_eq!(report.waits_scheduled, 0);
+    assert_eq!(report.deferred, 1);
+    assert_eq!(harness.pueue.add_calls(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_after_decision_or_pueue_add_never_duplicates_the_external_add() {
+    for point in [
+        DecisionFailpoint::AfterDecisionCommit,
+        DecisionFailpoint::AfterPueueAdd,
+    ] {
+        let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
+        harness.enable_failpoint(point);
+        assert!(harness.coordinator().apply_ready(300, 10).await.is_err());
+        harness.disable_failpoints();
+
+        harness.restart_daemon_once().await.unwrap();
+
+        assert_eq!(harness.pueue.add_calls(), 1);
+        assert_eq!(harness.child_experiment_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn code_change_decision_is_rejected_before_submission() {
+    let harness = DecisionHarness::with_ready_code_change();
+
+    assert!(harness.coordinator().apply_ready(300, 10).await.is_err());
+
+    assert_eq!(harness.pueue.add_calls(), 0);
+    assert_eq!(harness.child_experiment_count(), 0);
+}
+
+#[tokio::test]
+async fn duplicate_proposal_decision_digest_does_not_add_another_task() {
+    let harness = DecisionHarness::with_ready_proposal(ExperimentStatus::Succeeded);
+    harness.persist_duplicate_as_terminal();
+
+    let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
+
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+    assert_eq!(harness.child_experiment_count(), 1);
+}
+
+#[tokio::test]
+async fn three_consecutive_invalid_decision_attempts_degrade_the_campaign() {
+    let harness = DecisionHarness::with_ready_code_change();
+
+    for now in [300, 400, 500] {
+        assert!(harness.coordinator().apply_ready(now, 10).await.is_err());
+        if now != 500 {
+            harness.persist_ready_decision(&harness.code_change_decision(), "proposal", now + 10);
+        }
+    }
+
+    assert_eq!(harness.campaign_state(), CampaignState::Degraded);
+    assert_eq!(harness.pueue.add_calls(), 0);
 }
 
 #[tokio::test]

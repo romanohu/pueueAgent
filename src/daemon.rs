@@ -15,9 +15,10 @@ use crate::{
     campaign::{CampaignCoordinator, CampaignSubmission},
     config,
     db::{
-        AgentRunRepository, CampaignRepository, Db, ProjectRepository,
+        AgentRunRepository, CampaignRepository, Db, DecisionRepository, ProjectRepository,
         TerminationRequestRepository,
     },
+    decision::{DecisionCoordinator, DecisionLoopReport, DecisionRecoveryReport},
     detect::Detector,
     execution_policy::ResolvedExecutionPolicy,
     incidents::IncidentStore,
@@ -64,6 +65,8 @@ pub struct DaemonReport {
     pub recovered_agent_runs: usize,
     pub requeued_agent_events: usize,
     pub dead_lettered_agent_events: usize,
+    pub decision_recovery: DecisionRecoveryReport,
+    pub decisions: DecisionLoopReport,
 }
 
 pub struct Daemon<P> {
@@ -155,11 +158,15 @@ where
             report.dead_lettered_agent_events = recovery.dead_lettered_events;
         }
 
-        CampaignRepository::new(&self.db)
-            .wake_eligible_campaigns_with_limits(&self.policy.campaign_limits, now)?;
         self.dispatch_reserved_campaign_submissions(now).await?;
 
-        report.finished_agents += self.poll_retained_ownership_at(now).await?;
+        report.decision_recovery = DecisionCoordinator::new(
+            &self.db,
+            &self.pueue,
+            self.policy.campaign_limits,
+        )
+        .with_policy(self.policy.as_ref())
+        .recover_interrupted(now, self.config.claim_limit)?;
 
         let reconciliation = Reconciler::new(&self.db, self.pueue.clone())
             .run_once_at(now)
@@ -168,6 +175,19 @@ where
         report.termination_outcomes = self.run_termination().await?;
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(&reconciliation.observed_tasks)?;
+
+        report.finished_agents += self.poll_retained_ownership_at(now).await?;
+        report.decisions = DecisionCoordinator::new(
+            &self.db,
+            &self.pueue,
+            self.policy.campaign_limits,
+        )
+        .with_policy(self.policy.as_ref())
+        .apply_ready(now, self.config.claim_limit)
+        .await?;
+        DecisionRepository::new(&self.db).due_cycles(now, self.config.claim_limit)?;
+        CampaignRepository::new(&self.db)
+            .wake_eligible_campaigns_with_limits(&self.policy.campaign_limits, now)?;
 
         let cleanup_blocked_projects = self
             .active_agents
