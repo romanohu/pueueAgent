@@ -39,6 +39,8 @@ max_same_spec_retries = 2
 max_repairs_per_failure_fingerprint = 2
 max_proposals_per_cycle = 1
 observer_interval_minutes = 30
+max_decision_attempts_per_cycle = 3
+max_decision_wait_minutes = 1440
 
 [executables]
 codex = "codex"
@@ -228,6 +230,8 @@ pub struct CampaignLimits {
     pub max_repairs_per_failure_fingerprint: u32,
     pub max_proposals_per_cycle: u32,
     pub observer_interval_minutes: u32,
+    pub max_decision_attempts_per_cycle: u32,
+    pub max_decision_wait_minutes: u32,
 }
 
 impl Default for CampaignLimits {
@@ -241,6 +245,8 @@ impl Default for CampaignLimits {
             max_repairs_per_failure_fingerprint: 2,
             max_proposals_per_cycle: 1,
             observer_interval_minutes: 30,
+            max_decision_attempts_per_cycle: 3,
+            max_decision_wait_minutes: 1_440,
         }
     }
 }
@@ -1399,6 +1405,12 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         observer_interval_minutes: raw
             .observer_interval_minutes
             .unwrap_or(defaults.observer_interval_minutes),
+        max_decision_attempts_per_cycle: raw
+            .max_decision_attempts_per_cycle
+            .unwrap_or(defaults.max_decision_attempts_per_cycle),
+        max_decision_wait_minutes: raw
+            .max_decision_wait_minutes
+            .unwrap_or(defaults.max_decision_wait_minutes),
     };
     if !(1..=64).contains(&limits.max_parallel_experiments)
         || !(1..=10_000).contains(&limits.max_new_experiments_per_24h)
@@ -1408,6 +1420,8 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         || limits.max_repairs_per_failure_fingerprint > 100
         || !(1..=32).contains(&limits.max_proposals_per_cycle)
         || !(1..=1_440).contains(&limits.observer_interval_minutes)
+        || !(1..=10).contains(&limits.max_decision_attempts_per_cycle)
+        || !(1..=10_080).contains(&limits.max_decision_wait_minutes)
     {
         return Err(PolicyViolation::new(
             PolicyViolationCode::PolicyUnknownField,
@@ -1944,6 +1958,8 @@ struct RawCampaignLimits {
     max_repairs_per_failure_fingerprint: Option<u32>,
     max_proposals_per_cycle: Option<u32>,
     observer_interval_minutes: Option<u32>,
+    max_decision_attempts_per_cycle: Option<u32>,
+    max_decision_wait_minutes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

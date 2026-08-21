@@ -212,7 +212,7 @@ fn missing_policy_is_atomic_secure_default() {
 }
 
 #[test]
-fn campaign_limits_have_safe_service_defaults() {
+fn decision_campaign_limits_have_safe_service_defaults() {
     let harness = PolicyHarness::new();
     let policy = load_or_create_policy(&harness.input()).unwrap();
     assert_eq!(
@@ -226,13 +226,27 @@ fn campaign_limits_have_safe_service_defaults() {
             max_repairs_per_failure_fingerprint: 2,
             max_proposals_per_cycle: 1,
             observer_interval_minutes: 30,
+            max_decision_attempts_per_cycle: 3,
+            max_decision_wait_minutes: 1_440,
         }
     );
     assert_eq!(policy.default_network, NetworkMode::Enabled);
+
+    let legacy_policy = fs::read_to_string(harness.policy())
+        .unwrap()
+        .replacen("max_decision_attempts_per_cycle = 3\n", "", 1)
+        .replacen("max_decision_wait_minutes = 1440\n", "", 1);
+    fs::write(harness.policy(), legacy_policy).unwrap();
+    secure_file(&harness.policy());
+    let legacy_limits = load_existing_policy(&harness.input())
+        .unwrap()
+        .campaign_limits;
+    assert_eq!(legacy_limits.max_decision_attempts_per_cycle, 3);
+    assert_eq!(legacy_limits.max_decision_wait_minutes, 1_440);
 }
 
 #[test]
-fn campaign_limits_reject_values_outside_service_bounds() {
+fn decision_campaign_limits_reject_values_outside_service_bounds() {
     let harness = PolicyHarness::new();
     load_or_create_policy(&harness.input()).unwrap();
     let default_policy = fs::read_to_string(harness.policy()).unwrap();
@@ -251,6 +265,10 @@ fn campaign_limits_reject_values_outside_service_bounds() {
         ("max_proposals_per_cycle", 33),
         ("observer_interval_minutes", 0),
         ("observer_interval_minutes", 1_441),
+        ("max_decision_attempts_per_cycle", 0),
+        ("max_decision_attempts_per_cycle", 11),
+        ("max_decision_wait_minutes", 0),
+        ("max_decision_wait_minutes", 10_081),
     ] {
         let updated = default_policy.replacen(
             &format!("{field} = {}", campaign_limit_default(field)),
@@ -758,6 +776,8 @@ fn campaign_limit_default(field: &str) -> u32 {
         "max_repairs_per_failure_fingerprint" => 2,
         "max_proposals_per_cycle" => 1,
         "observer_interval_minutes" => 30,
+        "max_decision_attempts_per_cycle" => 3,
+        "max_decision_wait_minutes" => 1_440,
         _ => unreachable!(),
     }
 }

@@ -7,6 +7,7 @@ pub mod codex_command;
 pub mod codex_session;
 pub mod config;
 pub mod daemon;
+pub mod decision_protocol;
 pub mod db;
 pub mod detect;
 pub mod diagnostics;
