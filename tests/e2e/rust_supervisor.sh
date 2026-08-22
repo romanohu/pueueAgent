@@ -1093,6 +1093,8 @@ stop_daemon
 wait_for_task_terminal "$task_bad"
 start_daemon
 wait_for_agent_calls "1" "auto-kill event did not launch the agent"
+wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'" "1" \
+  "auto-kill agent did not finish before shutdown"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'")" = "1" ] \
   || fail "auto-kill agent run was not completed during shutdown drain"
@@ -1116,6 +1118,8 @@ stop_daemon
 sql "UPDATE events SET not_before = 0 WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'"
 start_daemon
 wait_for_agent_calls "3" "retry event was not recoverable"
+wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'" "2" \
+  "retried agent did not finish before shutdown"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'")" = "2" ] \
   || fail "retried agent run was not completed during shutdown drain"
@@ -1190,6 +1194,8 @@ sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
      WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=904'"
 start_daemon
 wait_for_codex_call "Codex resume context was not invoked"
+wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND context_mode = 'resume' AND status = 'completed'" "1" \
+  "Codex resume run did not finish before shutdown"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND context_mode = 'resume' AND context_session_id = '$context_session_id' AND status = 'completed'")" = "1" ] \
   || fail "Codex resume context was not completed and recorded"
