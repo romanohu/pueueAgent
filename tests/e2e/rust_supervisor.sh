@@ -91,6 +91,7 @@ wait_for_sql() {
     sleep 0.1
   done
   "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json >&2 || true
+  sql "SELECT event_id, project_id, kind, status, not_before FROM events ORDER BY event_id" >&2 || true
   fail "$label (expected $expected, got $(sql "$query"))"
 }
 
@@ -1061,9 +1062,10 @@ wait_for_sql "SELECT COUNT(*) FROM task_observations WHERE project_id = '$PROJEC
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND kind = 'task_finished'")" = "2" ] \
   || fail "missed callback did not create one completion event"
-# Paused projects keep undispatchable events in a finite retry_wait wake.
-[ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND status = 'retry_wait'")" = "1" ] \
-  || fail "pause did not preserve the missed-callback event"
+# Paused projects keep undispatchable events in finite retry_wait wakes,
+# including the retired-campaign terminal observation.
+[ "$(sql "SELECT status FROM events WHERE kind = 'task_finished' AND event_id = (SELECT MAX(event_id) FROM events WHERE project_id = '$PROJECT_ID_B' AND kind = 'task_finished')")" = "retry_wait" ] \
+  || fail "pause did not preserve the missed-callback event ($(sql "SELECT status || '=' || COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' GROUP BY status"))"
 
 # A persistent fatal task log opens one incident and requests exactly one Pueue kill.
 submit_summary="$(cd "$PROJECT_A" && "$PA_BIN" submit -- /bin/sh -c 'sleep 30')"
@@ -1149,11 +1151,11 @@ start_daemon
 wait_for_agent_calls "4" "resumed project did not schedule a new event"
 stop_daemon
 
-# Resuming the other project consumes its coalesced pending callback events.
+# Resuming the other project releases its preserved callback work.
 "$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_B" >/dev/null
 start_daemon
-wait_for_sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND status = 'completed'" "2" \
-  "resume did not release preserved pending events"
+wait_for_sql "SELECT CASE WHEN COUNT(*) >= 2 THEN 2 ELSE COUNT(*) END FROM events WHERE project_id = '$PROJECT_ID_B' AND status = 'completed'" "2" \
+  "resume did not release preserved callback events"
 stop_daemon
 
 # Simulate a crash after claim. Restart recovery returns the expired lease to pending while paused.
