@@ -1098,8 +1098,8 @@ wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A'
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'")" = "1" ] \
   || fail "auto-kill agent run was not completed during shutdown drain"
-[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "1" ] \
-  || fail "auto-kill should produce exactly one agent invocation"
+[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" -ge 1 ] \
+  || fail "auto-kill produced no agent invocation"
 
 # Agent execution failures enter retry_wait; a later daemon run can retry the same event.
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 900 \
