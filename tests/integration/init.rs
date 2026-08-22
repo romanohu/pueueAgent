@@ -258,7 +258,9 @@ fn init_instructions_keep_phase_one_replacements_advisory_only() {
     assert!(instructions.contains(
         "bounded な replacement recommendation/proposal を `state.json` に記録する"
     ));
-    assert!(instructions.contains("`Phase 1` では replacement experiment を投入しない"));
+    assert!(instructions.contains(
+        "通常の実験 agent は replacement experiment を直接投入しない"
+    ));
     assert!(!instructions.contains("replacement experiment を投入する"));
     assert!(!instructions.contains("replacement を提案・投入"));
 }
