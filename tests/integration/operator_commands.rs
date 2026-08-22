@@ -1950,10 +1950,6 @@ async fn pause_prevents_new_agent_claims_and_automatic_termination_until_resume(
         .unwrap();
 
     status::pause_project(&harness.db, "project-a", harness.now + 1).unwrap();
-    assert!(EventRepository::new(&harness.db)
-        .claim_batch(harness.now + 1, harness.now + 60, 10)
-        .unwrap()
-        .is_empty());
 
     let pueue = OperatorPueue::with_tasks(vec![harness.running_task()]);
     let mut daemon = Daemon::new(
@@ -1980,10 +1976,37 @@ async fn pause_prevents_new_agent_claims_and_automatic_termination_until_resume(
             .status,
         TerminationRequestStatus::Requested
     );
+    let paused_event = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused_event.status, pueue_agent::models::EventStatus::RetryWait);
+    let paused_attempts: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT attempts FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(paused_attempts, 0);
+    let paused_runs: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE project_id = 'project-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(paused_runs, 0);
 
     status::resume_project(&harness.db, "project-a", harness.now + 2).unwrap();
     let claimed = EventRepository::new(&harness.db)
-        .claim_batch(harness.now + 2, harness.now + 60, 10)
+        .claim_batch(harness.now + 61, harness.now + 120, 10)
         .unwrap();
     assert_eq!(
         claimed
