@@ -418,12 +418,15 @@ cat > "$WORK/bin/native-script-runner.rs" <<'EOF'
 use std::{env, os::unix::process::CommandExt, path::PathBuf, process::Command};
 
 fn main() {
-    let executable = env::current_exe().expect("resolve fixture executable");
+    // Verified launchers execute this helper through /proc/self/fd magic
+    // links, so procfs-based self paths cannot locate the sibling script.
+    // The harness bakes the stable fixture directory in at build time.
+    let directory = PathBuf::from("__PUEUE_AGENT_E2E_FIXTURE_DIR__");
     let name = env::args_os()
         .next()
         .and_then(|argument| PathBuf::from(argument).file_name().map(ToOwned::to_owned))
         .expect("fixture executable name");
-    let mut script = executable.parent().expect("fixture directory").join(name);
+    let mut script = directory.join(name);
     script.set_extension("sh");
     let error = Command::new("/bin/bash")
         .arg(script)
@@ -433,8 +436,11 @@ fn main() {
     std::process::exit(127);
 }
 EOF
+sed \
+  -e "s|__PUEUE_AGENT_E2E_FIXTURE_DIR__|$WORK/bin|g" \
+  "$WORK/bin/native-script-runner.rs" > "$WORK/bin/native-script-runner.rendered.rs"
 rustc --edition=2021 --crate-name native_script_runner -O \
-  -o "$WORK/bin/native-script-runner" "$WORK/bin/native-script-runner.rs"
+  -o "$WORK/bin/native-script-runner" "$WORK/bin/native-script-runner.rendered.rs"
 cp "$WORK/bin/native-script-runner" "$WORK/bin/fake-agent"
 cp "$WORK/bin/native-script-runner" "$WORK/bin/capture-agent-environment"
 cp "$WORK/bin/native-script-runner" "$WORK/bin/codex"
