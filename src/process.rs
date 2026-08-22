@@ -835,7 +835,25 @@ async fn drain_owned_process_group_before(
                 }
                 return Ok(());
             }
-            Ok(true) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Ok(true) => {
+                // The unreaped leader keeps its process-group identifier
+                // alive on Linux, so existence polling cannot observe exit
+                // before the reap. Once the leader is terminal only
+                // descendants remain; they already received SIGTERM, so
+                // escalate immediately instead of waiting out the grace.
+                if matches!(
+                    child.terminal_observed()?,
+                    TerminalObservation::Terminal
+                ) {
+                    if let Err(error) =
+                        signal_owned_process_group(child, group, libc::SIGKILL)
+                    {
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -3857,6 +3875,19 @@ mod tests {
         assert!(matches!(child.process_group, ProcessGroupOwnership::Owned(_)));
         terminate_process_group(&mut child).await.unwrap();
         assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_process_group_does_not_wait_out_the_grace_after_leader_exit() {
+        let mut child = observation_child("hold");
+        let started = std::time::Instant::now();
+        terminate_process_group(&mut child).await.unwrap();
+        assert!(started.elapsed() < PROCESS_GROUP_TERM_GRACE);
+        assert!(matches!(
+            child.process_group,
+            ProcessGroupOwnership::Released
+        ));
     }
 
     #[cfg(unix)]
