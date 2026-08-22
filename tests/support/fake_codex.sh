@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -eu
 
-capture="${PUEUE_AGENT_TEST_CODEX_LOG:-${HOME:?HOME is required}/../codex-calls.log}"
-captured_env_names="${PUEUE_AGENT_TEST_CODEX_ENV_NAMES:-${HOME:?HOME is required}/../codex-env-names.log}"
+# Capability probes run under a cleared environment with no HOME, while
+# supervised decision agents receive the sanitized HOME whose parent is the
+# harness work directory, so the fallback lands on the asserted log paths.
+capture="${PUEUE_AGENT_TEST_CODEX_LOG:-}"
+captured_env_names="${PUEUE_AGENT_TEST_CODEX_ENV_NAMES:-}"
+if [ -z "$capture" ] && [ -n "${HOME:-}" ]; then
+  capture="$HOME/../codex-calls.log"
+fi
+if [ -z "$captured_env_names" ] && [ -n "${HOME:-}" ]; then
+  captured_env_names="$HOME/../codex-env-names.log"
+fi
 
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
   printf '%s\n' 'codex-cli 0.148.0'
@@ -24,6 +33,7 @@ default_read_only_profile=0
 network_access="missing"
 after_separator=0
 expect_output=0
+if [ -n "$capture" ]; then
 {
   if [ -n "${CODEX_HOME+x}" ]; then
     printf 'ENV_NAME=CODEX_HOME\n'
@@ -60,6 +70,7 @@ expect_output=0
     index=$((index + 1))
   done
 } >> "$capture"
+fi
 
 [ -n "$output" ] || exit 0
 [ -n "$prompt" ] || exit 70
@@ -71,28 +82,32 @@ failure_fingerprint="$(printf '%s' "$context" | jq -r '.source_experiment.failur
 objective="$(printf '%s' "$context" | jq -er '.objective.text')"
 
 call_number=1
-if [ -f "$capture" ]; then
-  while IFS= read -r line; do
-    case "$line" in
-      "DECISION_INVOCATION source_experiment_id=$source_experiment_id "*)
-        call_number=$((call_number + 1))
-        ;;
-    esac
-  done < "$capture"
-fi
-{
-  printf 'DECISION_INVOCATION source_experiment_id=%s call=%s\n' \
-    "$source_experiment_id" "$call_number"
-  if [ "$read_only_profile" -eq 1 ] && [ "$default_read_only_profile" -eq 1 ]; then
-    printf 'sandbox_read_only=true\n'
-  else
-    printf 'sandbox_read_only=false\n'
+if [ -n "$capture" ]; then
+  if [ -f "$capture" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        "DECISION_INVOCATION source_experiment_id=$source_experiment_id "*)
+          call_number=$((call_number + 1))
+          ;;
+      esac
+    done < "$capture"
   fi
-  printf 'network_access=%s\n' "$network_access"
-} >> "$capture"
-while IFS= read -r name; do
-  printf '%s\n' "$name"
-done < <(compgen -e) >> "$captured_env_names"
+  {
+    printf 'DECISION_INVOCATION source_experiment_id=%s call=%s\n' \
+      "$source_experiment_id" "$call_number"
+    if [ "$read_only_profile" -eq 1 ] && [ "$default_read_only_profile" -eq 1 ]; then
+      printf 'sandbox_read_only=true\n'
+    else
+      printf 'sandbox_read_only=false\n'
+    fi
+    printf 'network_access=%s\n' "$network_access"
+  } >> "$capture"
+fi
+if [ -n "$captured_env_names" ]; then
+  while IFS= read -r name; do
+    printf '%s\n' "$name"
+  done < <(compgen -e) >> "$captured_env_names"
+fi
 
 case "$objective" in
   *PUEUE_AGENT_E2E_INVALID_THREE*)

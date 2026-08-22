@@ -74,7 +74,10 @@ wait_for_sql() {
   query="$1"
   expected="$2"
   label="$3"
-  for _ in $(seq 100); do
+  # Decision cycles advance across multiple production daemon passes (the
+  # foreground daemon defaults to a 60-second interval), so this waiter must
+  # span several ticks instead of a single short grace window.
+  for _ in $(seq 6000); do
     actual="$(sql "$query")"
     if [ "$actual" = "$expected" ]; then
       return 0
@@ -419,14 +422,11 @@ use std::{env, os::unix::process::CommandExt, path::PathBuf, process::Command};
 
 fn main() {
     // Verified launchers execute this helper through /proc/self/fd magic
-    // links, so procfs-based self paths cannot locate the sibling script.
-    // The harness bakes the stable fixture directory in at build time.
+    // links, so procfs self paths and argv[0] cannot identify this helper
+    // or locate the sibling script. The harness bakes the stable fixture
+    // directory and script name in at build time.
     let directory = PathBuf::from("__PUEUE_AGENT_E2E_FIXTURE_DIR__");
-    let name = env::args_os()
-        .next()
-        .and_then(|argument| PathBuf::from(argument).file_name().map(ToOwned::to_owned))
-        .expect("fixture executable name");
-    let mut script = directory.join(name);
+    let mut script = directory.join("__PUEUE_AGENT_E2E_FIXTURE_NAME__");
     script.set_extension("sh");
     let error = Command::new("/bin/bash")
         .arg(script)
@@ -436,14 +436,14 @@ fn main() {
     std::process::exit(127);
 }
 EOF
-sed \
-  -e "s|__PUEUE_AGENT_E2E_FIXTURE_DIR__|$WORK/bin|g" \
-  "$WORK/bin/native-script-runner.rs" > "$WORK/bin/native-script-runner.rendered.rs"
-rustc --edition=2021 --crate-name native_script_runner -O \
-  -o "$WORK/bin/native-script-runner" "$WORK/bin/native-script-runner.rendered.rs"
-cp "$WORK/bin/native-script-runner" "$WORK/bin/fake-agent"
-cp "$WORK/bin/native-script-runner" "$WORK/bin/capture-agent-environment"
-cp "$WORK/bin/native-script-runner" "$WORK/bin/codex"
+for fixture in fake-agent capture-agent-environment codex; do
+  sed \
+    -e "s|__PUEUE_AGENT_E2E_FIXTURE_DIR__|$WORK/bin|g" \
+    -e "s|__PUEUE_AGENT_E2E_FIXTURE_NAME__|$fixture|g" \
+    "$WORK/bin/native-script-runner.rs" > "$WORK/bin/native-script-runner.$fixture.rs"
+  rustc --edition=2021 --crate-name native_script_runner -O \
+    -o "$WORK/bin/$fixture" "$WORK/bin/native-script-runner.$fixture.rs"
+done
 cp /usr/bin/bash /usr/bin/cat /usr/bin/sleep "$WORK/bin/"
 cat > "$WORK/bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
