@@ -295,7 +295,7 @@ pueue_group = "$group"
 [agent]
 program = "$agent_program"
 args = ["{prompt}"]
-timeout_minutes = 1
+timeout_minutes = 5
 max_retries = 2
 
 [agent.context]
