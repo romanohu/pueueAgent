@@ -781,6 +781,17 @@ start_daemon
 wait_for_sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_C'" "active" \
   "expired rolling budget did not reactivate the campaign"
 stop_daemon
+
+# Retirement requires terminal experiments, so stop the accepted success
+# child through the real scheduler and wait for its durable projection.
+# Pueue v4 reports killed tasks as Done with result Killed, which the
+# reconciler projects as a failed experiment.
+"$REAL_PUEUE" --config "$WORK/pueue.yml" kill "$SUCCESS_CHILD_TASK" >/dev/null
+wait_for_task_terminal "$SUCCESS_CHILD_TASK"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE pueue_task_id = $SUCCESS_CHILD_TASK" "failed" \
+  "killed success child was not projected failed"
+stop_daemon
 "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_C" >/dev/null
 
 # Reserved restart recovery adds once; a second accepted restart adds nothing.
