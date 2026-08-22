@@ -1061,8 +1061,9 @@ wait_for_sql "SELECT COUNT(*) FROM task_observations WHERE project_id = '$PROJEC
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND kind = 'task_finished'")" = "2" ] \
   || fail "missed callback did not create one completion event"
-[ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND status = 'pending'")" = "2" ] \
-  || fail "pause did not preserve pending callback events"
+# Paused projects keep undispatchable events in a finite retry_wait wake.
+[ "$(sql "SELECT COUNT(*) FROM events WHERE project_id = '$PROJECT_ID_B' AND status = 'retry_wait'")" = "1" ] \
+  || fail "pause did not preserve the missed-callback event"
 
 # A persistent fatal task log opens one incident and requests exactly one Pueue kill.
 submit_summary="$(cd "$PROJECT_A" && "$PA_BIN" submit -- /bin/sh -c 'sleep 30')"
