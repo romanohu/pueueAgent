@@ -884,21 +884,24 @@ stop_daemon
 TRUSTED_CHILD_TASK="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$CAMPAIGN_E' AND parent_experiment_id = '$TRUSTED_SOURCE'")"
 record_task_id "trusted-repair-child" "$TRUSTED_CHILD_TASK"
 
-# A failed source without a trusted fingerprint emits a non-repair experiment.
-untrusted_summary="$(cd "$PROJECT_F" && "$PA_BIN" submit -- /bin/sh -c 'exit 19')"
+# A cancelled source carries no trusted failure fingerprint, so its decision
+# must emit a non-repair experiment. The source is stopped through the real
+# scheduler while the project is paused; terminal projections are immutable,
+# so the trust signal cannot be stripped after the fact.
+untrusted_summary="$(cd "$PROJECT_F" && "$PA_BIN" submit -- /bin/sleep 20)"
 untrusted_task="$(submission_task_id "$untrusted_summary")"
 record_task_id "untrusted-failure-source" "$untrusted_task"
 "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_F" >/dev/null
+"$REAL_PUEUE" --config "$WORK/pueue.yml" kill "$untrusted_task" >/dev/null
 wait_for_task_terminal "$untrusted_task"
 CAMPAIGN_F="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $untrusted_task")"
 UNTRUSTED_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $untrusted_task")"
 start_daemon
-wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$UNTRUSTED_SOURCE'" "failed" \
-  "untrusted failure was not projected terminal while paused"
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$UNTRUSTED_SOURCE'" "cancelled" \
+  "untrusted cancellation was not projected terminal while paused"
 wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_F' AND source_experiment_id = '$UNTRUSTED_SOURCE'" "1" \
   "untrusted failure did not create one deferred cycle"
 stop_daemon
-sql "UPDATE experiments SET failure_fingerprint = NULL WHERE experiment_id = '$UNTRUSTED_SOURCE'"
 "$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_F" >/dev/null
 untrusted_add_before="$(pueue_add_call_count)"
 start_daemon
