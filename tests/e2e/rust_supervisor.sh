@@ -75,9 +75,10 @@ wait_for_sql() {
   expected="$2"
   label="$3"
   # Decision cycles advance across multiple production daemon passes (the
-  # foreground daemon defaults to a 60-second interval), so this waiter must
-  # span several ticks instead of a single short grace window.
-  for _ in $(seq 6000); do
+  # foreground daemon defaults to a 60-second interval). Decisions observed
+  # beside failure events additionally defer by one whole lease window, so
+  # this waiter must span the deferral plus spawn/reap/apply passes.
+  for _ in $(seq 12000); do
     actual="$(sql "$query")"
     if [ "$actual" = "$expected" ]; then
       return 0
