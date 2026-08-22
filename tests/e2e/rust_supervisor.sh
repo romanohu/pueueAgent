@@ -884,24 +884,71 @@ stop_daemon
 TRUSTED_CHILD_TASK="$(sql "SELECT pueue_task_id FROM experiments WHERE campaign_id = '$CAMPAIGN_E' AND parent_experiment_id = '$TRUSTED_SOURCE'")"
 record_task_id "trusted-repair-child" "$TRUSTED_CHILD_TASK"
 
-# A cancelled source carries no trusted failure fingerprint, so its decision
-# must emit a non-repair experiment. The source is stopped through the real
-# scheduler while the project is paused; terminal projections are immutable,
-# so the trust signal cannot be stripped after the fact.
-untrusted_summary="$(cd "$PROJECT_F" && "$PA_BIN" submit -- /bin/sleep 20)"
+# A terminal failure whose stored fingerprint is absent carries no trusted
+# repair evidence, so its decision must emit a non-repair experiment. The
+# source is synthesized from an already-observed real failed task: terminal
+# projections are immutable, so trust cannot be stripped after the fact.
+untrusted_summary="$(cd "$PROJECT_F" && "$PA_BIN" submit -- /bin/sh -c 'exit 19')"
 untrusted_task="$(submission_task_id "$untrusted_summary")"
 record_task_id "untrusted-failure-source" "$untrusted_task"
 "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_F" >/dev/null
-"$REAL_PUEUE" --config "$WORK/pueue.yml" kill "$untrusted_task" >/dev/null
 wait_for_task_terminal "$untrusted_task"
-CAMPAIGN_F="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $untrusted_task")"
-UNTRUSTED_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $untrusted_task")"
 start_daemon
-wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$UNTRUSTED_SOURCE'" "cancelled" \
-  "untrusted cancellation was not projected terminal while paused"
-wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_F' AND source_experiment_id = '$UNTRUSTED_SOURCE'" "1" \
-  "untrusted failure did not create one deferred cycle"
+wait_for_sql "SELECT COUNT(*) FROM task_observations WHERE project_id = '$PROJECT_ID_F' AND pueue_task_id = $untrusted_task AND lower(state) IN ('done','failed','killed','finished','success')" "1" \
+  "failing task was not observed while paused"
 stop_daemon
+UNTRUSTED_CAMPAIGN_ID="e2e-untrusted-boundary"
+CAMPAIGN_F="$UNTRUSTED_CAMPAIGN_ID"
+UNTRUSTED_SOURCE="e2e-untrusted-source-experiment"
+untrusted_now="$(date +%s)"
+UNTRUSTED_SIGNATURE="$(sql "SELECT task_signature FROM task_observations WHERE project_id = '$PROJECT_ID_F' AND pueue_task_id = $untrusted_task")"
+[ -n "$UNTRUSTED_SIGNATURE" ] || fail "observed failing task lacked a stable signature"
+sql "UPDATE campaigns SET state = 'retired', state_reason = 'superseded by untrusted fixture'
+     WHERE project_id = '$PROJECT_ID_F' AND state <> 'retired';
+     INSERT INTO campaigns (
+       campaign_id, project_id, objective_text, objective_digest, initial_argv_json,
+       state, baseline_experiment_id, created_at, updated_at
+     ) VALUES (
+       '$UNTRUSTED_CAMPAIGN_ID', '$PROJECT_ID_F',
+       'Choose a bounded follow-up without trusted failure evidence',
+       '$UNTRUSTED_CAMPAIGN_ID-objective-digest',
+       '[\"/bin/sh\",\"$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh\"]', 'active', NULL,
+       $untrusted_now, $untrusted_now
+     );
+     INSERT INTO proposals (
+       proposal_id, campaign_id, kind, status, hypothesis, argv_json, working_directory,
+       expected_evidence_json, canonical_digest, created_at, updated_at
+     ) VALUES (
+       '$UNTRUSTED_CAMPAIGN_ID-proposal', '$UNTRUSTED_CAMPAIGN_ID', 'experiment', 'accepted',
+       'Choose a bounded follow-up without trusted failure evidence',
+       '[\"/bin/sh\",\"$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh\"]', '.', '[]',
+       '$UNTRUSTED_CAMPAIGN_ID-canonical-digest', $untrusted_now, $untrusted_now
+     );
+     INSERT INTO submissions (
+       submission_id, project_id, argv_json, created_at, pueue_task_id,
+       task_signature, status, kind, metadata_json
+     ) VALUES (
+       '$UNTRUSTED_CAMPAIGN_ID-submission', '$PROJECT_ID_F',
+       '[\"/bin/sh\",\"$REPO_ROOT/tests/e2e/fake_experiments/train_ok.sh\"]', $untrusted_now,
+       $untrusted_task, '$UNTRUSTED_SIGNATURE', 'failed', 'experiment', '{}'
+     );
+     INSERT INTO experiments (
+       experiment_id, campaign_id, proposal_id, submission_id, attempt, status,
+       failure_code, failure_fingerprint, pueue_task_id, task_signature,
+       created_at, updated_at, finished_at
+     ) VALUES (
+       '$UNTRUSTED_SOURCE', '$UNTRUSTED_CAMPAIGN_ID', '$UNTRUSTED_CAMPAIGN_ID-proposal', '$UNTRUSTED_CAMPAIGN_ID-submission', 0, 'failed',
+       'pueue_failed', '', $untrusted_task, '$UNTRUSTED_SIGNATURE',
+       $untrusted_now, $untrusted_now, $untrusted_now
+     );
+     INSERT OR IGNORE INTO budget_reservations (
+       reservation_id, campaign_id, dimension, subject_key, status,
+       window_started_at, window_ends_at, created_at, updated_at
+     ) VALUES (
+       'experiment:$UNTRUSTED_SOURCE', '$UNTRUSTED_CAMPAIGN_ID', 'experiment',
+       '$UNTRUSTED_SOURCE', 'consumed', $untrusted_now, $((untrusted_now + 86400)),
+       $untrusted_now, $untrusted_now
+     );"
 "$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_F" >/dev/null
 untrusted_add_before="$(pueue_add_call_count)"
 start_daemon
