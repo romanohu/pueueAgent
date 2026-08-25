@@ -1184,8 +1184,10 @@ sql "UPDATE events SET campaign_id = '$CAMPAIGN_B'
 restart_key="pueue-callback:v1:group=$GROUP_B:task-id=903"
 sql "UPDATE events SET status = 'claimed', lease_until = 0 WHERE dedup_key = '$restart_key'"
 start_daemon
-wait_for_sql "SELECT status FROM events WHERE dedup_key = '$restart_key'" "pending" \
-  "restart did not recover the expired event lease"
+# Recovery parks the expired claim as a finite retry_wait wake; the paused
+# project re-defers it within the same pass instead of leaving it pending.
+wait_for_sql "SELECT status FROM events WHERE dedup_key = '$restart_key'" "retry_wait" \
+  "restart did not park the expired event lease"
 stop_daemon
 
 # Explicit Codex continuation exposes the production-derived network argument and no credentials.
