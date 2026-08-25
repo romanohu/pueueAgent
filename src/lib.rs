@@ -39,6 +39,7 @@ pub mod retry;
 pub mod runs;
 pub mod scheduler;
 pub mod service;
+pub mod signals;
 pub mod state;
 pub mod status;
 pub mod submit;

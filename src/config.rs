@@ -83,6 +83,7 @@ pub struct PatternConfig {
     pub regex: String,
     pub action: PatternAction,
     pub confirm_matches: u32,
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +381,8 @@ struct RawPatternConfig {
     action: String,
     #[serde(default = "default_confirm_matches")]
     confirm_matches: i64,
+    #[serde(default)]
+    class: Option<String>,
 }
 
 impl RawPatternConfig {
@@ -389,12 +392,16 @@ impl RawPatternConfig {
         if action == PatternAction::Kill {
             required(&self.name, "check.patterns.name")?;
         }
+        if let Some(class) = &self.class {
+            crate::signals::validate_class_name(class)?;
+        }
 
         Ok(PatternConfig {
             name: self.name,
             regex: self.regex,
             action,
             confirm_matches: positive(self.confirm_matches, "check.patterns.confirm_matches")?,
+            class: self.class,
         })
     }
 }

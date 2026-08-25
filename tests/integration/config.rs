@@ -430,6 +430,56 @@ fn misspelled_pattern_key_is_rejected() {
 }
 
 #[test]
+fn pattern_class_defaults_to_none_and_accepts_snake_case_names() {
+    let config = load_config(valid_config()).unwrap();
+    assert_eq!(config.check.patterns[0].class, None);
+
+    let configured = valid_config().replace(
+        "confirm_matches = 3",
+        "confirm_matches = 3\nclass = \"numerical\"",
+    );
+    let config = load_config(configured).unwrap();
+    assert_eq!(
+        config.check.patterns[0].class,
+        Some("numerical".to_owned())
+    );
+
+    let underscored = valid_config().replace(
+        "confirm_matches = 3",
+        "confirm_matches = 3\nclass = \"gpu_oom_kill\"",
+    );
+    let config = load_config(underscored).unwrap();
+    assert_eq!(
+        config.check.patterns[0].class,
+        Some("gpu_oom_kill".to_owned())
+    );
+}
+
+#[test]
+fn pattern_class_is_validated_against_bounded_snake_case() {
+    for value in ["Numerical", "has space", "with-dash", "excla!m", ""] {
+        let config = valid_config().replace(
+            "confirm_matches = 3",
+            &format!("confirm_matches = 3\nclass = \"{value}\""),
+        );
+        let error = load_config(config).unwrap_err();
+        assert!(
+            error.to_string().contains("check.patterns.class"),
+            "unexpected error for {value:?}: {error:?}"
+        );
+    }
+
+    let overlong = valid_config().replace(
+        "confirm_matches = 3",
+        &format!("confirm_matches = 3\nclass = \"{}\"", "a".repeat(33)),
+    );
+    assert!(load_config(overlong)
+        .unwrap_err()
+        .to_string()
+        .contains("check.patterns.class"));
+}
+
+#[test]
 fn kill_pattern_requires_a_name() {
     let config = valid_config()
         .replace("name = \"nan-loss\"", "name = \"\"")

@@ -16,6 +16,7 @@ use pueue_agent::{
     models::{EventKind, IncidentStatus, IncidentTransition, NewProject},
     pueue::PueueTask,
     reconcile::{task_incident_key, task_signature},
+    signals::{SignalClass, SignalSource},
 };
 use tempfile::TempDir;
 
@@ -269,6 +270,7 @@ fn pattern_requires_configured_confirmation_count_and_bounded_evidence() {
         regex: "loss: NaN".to_owned(),
         action: PatternAction::Wake,
         confirm_matches: 3,
+        class: None,
     });
 
     let observations = harness.detector().inspect_task(&task, &config).unwrap();
@@ -541,6 +543,7 @@ fn extra_logs_are_project_relative_and_reject_path_traversal_after_canonicalizat
         regex: "CUDA.*out of memory".to_owned(),
         action: PatternAction::Kill,
         confirm_matches: 1,
+        class: None,
     });
 
     let observations = harness.detector().inspect_task(&task, &config).unwrap();
@@ -634,4 +637,59 @@ fn task_id_reuse_keeps_incidents_separate_by_stable_task_incident_key() {
         )
         .unwrap();
     assert_eq!(active_count, 2);
+}
+
+#[test]
+fn pattern_hits_carry_declared_class_into_signal_observations() {
+    let harness = Harness::new();
+    let task = task();
+    let log_path = task_log_path(&harness.task_log_dir, task.id);
+    fs::write(&log_path, "Traceback (most recent call last):\n").unwrap();
+    let mut config = check_config(64);
+    config.patterns.push(PatternConfig {
+        name: "fatal-loss".to_owned(),
+        regex: "Traceback".to_owned(),
+        action: PatternAction::Wake,
+        confirm_matches: 1,
+        class: Some("exception".to_owned()),
+    });
+
+    let observations = harness.detector().inspect_task(&task, &config).unwrap();
+
+    assert_eq!(observations.len(), 1);
+    let signals = observations[0].signals();
+    let configured = signals
+        .iter()
+        .find(|signal| signal.source == SignalSource::ConfigPattern)
+        .unwrap();
+    assert_eq!(
+        configured.class,
+        SignalClass::Configured("exception".to_owned())
+    );
+    assert!(!configured.evidence_digest.is_empty());
+    assert_eq!(configured.observed_at, observations[0].seen_at());
+    assert!(signals
+        .iter()
+        .any(|signal| signal.source == SignalSource::BuiltinProbe
+            && signal.class == SignalClass::Exception));
+
+    let unmatched_class_signals = |pattern_class: &str| {
+        let mut config = check_config(64);
+        config.patterns.push(PatternConfig {
+            name: "fatal-loss".to_owned(),
+            regex: "never matches this".to_owned(),
+            action: PatternAction::Wake,
+            confirm_matches: 1,
+            class: Some(pattern_class.to_owned()),
+        });
+        harness
+            .detector()
+            .inspect_task(&task, &config)
+            .unwrap()
+            .iter()
+            .flat_map(|observation| observation.signals().to_vec())
+            .filter(|signal| signal.source == SignalSource::ConfigPattern)
+            .count()
+    };
+    assert_eq!(unmatched_class_signals("exception"), 0);
 }

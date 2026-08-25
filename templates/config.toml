@@ -27,11 +27,13 @@ stall_minutes = 30
 log_tail_bytes = 65536
 extra_log_paths = []
 
+# pattern は省略可能な class（[a-z_]{1,32}）を持ち、running health の信号分類に使われる。
 [[check.patterns]]
 name = "numerical-instability"
 regex = "NaN|Inf"
 action = "wake"
 confirm_matches = 1
+class = "numerical"
 
 [[check.patterns]]
 name = "python-traceback"
@@ -44,6 +46,7 @@ name = "cuda-error"
 regex = "CUDA (error|out of memory)"
 action = "wake"
 confirm_matches = 1
+class = "oom"
 
 # 出力停止時の既定 action は notify。自動終了する場合は kill と待ち時間を明示する。
 [check.stall]

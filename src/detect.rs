@@ -13,6 +13,10 @@ use crate::{
     logs::LogSnapshot,
     pueue::PueueTask,
     reconcile::task_incident_key,
+    signals::{
+        builtin_signal_observations, configured_pattern_signal, staleness_signal,
+        SignalObservation,
+    },
     AppError,
 };
 
@@ -38,6 +42,7 @@ pub struct Observation {
     confirmation_count: Option<u32>,
     evidence: String,
     source_path: Option<PathBuf>,
+    signals: Vec<SignalObservation>,
 }
 
 impl Observation {
@@ -66,6 +71,7 @@ impl Observation {
             confirmation_count: Some(confirmation_count),
             evidence: evidence.into(),
             source_path: None,
+            signals: Vec::new(),
         }
     }
 
@@ -95,6 +101,7 @@ impl Observation {
             confirmation_count: Some(confirmation_count),
             evidence: evidence.into(),
             source_path: None,
+            signals: Vec::new(),
         }
     }
 
@@ -124,6 +131,7 @@ impl Observation {
             confirmation_count: Some(confirmation_count),
             evidence: snapshot.evidence,
             source_path: Some(relative_path),
+            signals: Vec::new(),
         }
     }
 
@@ -151,6 +159,7 @@ impl Observation {
             confirmation_count: None,
             evidence: snapshot.evidence,
             source_path: Some(relative_path),
+            signals: Vec::new(),
         }
     }
 
@@ -195,6 +204,7 @@ impl Observation {
             confirmation_count: None,
             evidence: snapshot.evidence,
             source_path: None,
+            signals: Vec::new(),
         }
     }
 
@@ -234,6 +244,7 @@ impl Observation {
             confirmation_count: None,
             evidence: snapshot.evidence,
             source_path: None,
+            signals: Vec::new(),
         }
     }
 
@@ -255,6 +266,7 @@ impl Observation {
             confirmation_count: None,
             evidence: String::new(),
             source_path: None,
+            signals: Vec::new(),
         }
     }
 
@@ -304,6 +316,15 @@ impl Observation {
 
     pub fn source_path(&self) -> Option<&Path> {
         self.source_path.as_deref()
+    }
+
+    pub fn signals(&self) -> &[SignalObservation] {
+        &self.signals
+    }
+
+    pub fn with_signals(mut self, signals: Vec<SignalObservation>) -> Self {
+        self.signals = signals;
+        self
     }
 }
 
@@ -393,14 +414,19 @@ impl Detector {
         let task_key = task_incident_key(task);
         let signature = crate::reconcile::task_signature(task);
         if let Some(snapshot) = self.read_task_snapshot(task.id, config.log_tail_bytes)? {
-            observations.extend(task_pattern_observations(
-                project_id,
-                task_key.as_str(),
-                signature.as_str(),
-                &snapshot,
-                config,
-                seen_at,
-            )?);
+            let signals = tail_signal_observations(&snapshot.evidence, config, seen_at);
+            observations.extend(
+                task_pattern_observations(
+                    project_id,
+                    task_key.as_str(),
+                    signature.as_str(),
+                    &snapshot,
+                    config,
+                    seen_at,
+                )?
+                .into_iter()
+                .map(|observation| observation.with_signals(signals.clone())),
+            );
             let active_stall = self.active_stall_fingerprint(project_id, &task_key)?;
             let current_stall_fingerprint = stalled_observation_fingerprint(&task_key, &snapshot);
             if active_stall
@@ -417,24 +443,46 @@ impl Detector {
             } else if let Some(stalled) = task_stall_observation(
                 project_id, &task_key, &signature, task, &snapshot, config, seen_at,
             ) {
-                observations.push(stalled);
+                let mut stall_signals = signals.clone();
+                stall_signals.push(staleness_signal(&snapshot.evidence, seen_at));
+                observations.push(stalled.with_signals(stall_signals));
             }
         }
 
         for relative_path in &config.extra_log_paths {
             let path = self.canonical_extra_log_path(relative_path)?;
             let snapshot = LogSnapshot::read_tail(&path, config.log_tail_bytes)?;
-            observations.extend(pattern_observations(
-                project_id,
-                None,
-                Some(relative_path),
-                &snapshot,
-                config,
-                seen_at,
-            )?);
+            let signals = tail_signal_observations(&snapshot.evidence, config, seen_at);
+            observations.extend(
+                pattern_observations(
+                    project_id,
+                    None,
+                    Some(relative_path),
+                    &snapshot,
+                    config,
+                    seen_at,
+                )?
+                .into_iter()
+                .map(|observation| observation.with_signals(signals.clone())),
+            );
         }
 
         Ok(observations)
+    }
+
+    pub fn signal_observations_for(
+        &self,
+        _task: &PueueTask,
+        tail: &str,
+        config: &CheckConfig,
+        stalled: bool,
+        observed_at: i64,
+    ) -> Vec<SignalObservation> {
+        let mut signals = tail_signal_observations(tail, config, observed_at);
+        if stalled {
+            signals.push(staleness_signal(tail, observed_at));
+        }
+        signals
     }
 
     fn read_task_snapshot(
@@ -609,6 +657,25 @@ fn pattern_observations(
         })
         .filter_map(Result::transpose)
         .collect()
+}
+
+fn tail_signal_observations(
+    tail: &str,
+    config: &CheckConfig,
+    observed_at: i64,
+) -> Vec<SignalObservation> {
+    let mut signals = builtin_signal_observations(tail, observed_at);
+    for pattern in &config.patterns {
+        let Some(class_name) = pattern.class.as_deref() else {
+            continue;
+        };
+        let matched = count_matches(tail, &pattern.regex)
+            .is_ok_and(|count| count >= pattern.confirm_matches);
+        if matched {
+            signals.push(configured_pattern_signal(class_name, tail, observed_at));
+        }
+    }
+    signals
 }
 
 fn count_matches(haystack: &str, pattern: &str) -> Result<u32, AppError> {
