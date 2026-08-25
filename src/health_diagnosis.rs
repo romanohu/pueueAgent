@@ -282,7 +282,10 @@ async fn diagnose_row(
             .with_campaign_lineage(row.campaign_id.as_str(), Some(row.experiment_id.as_str())),
         )?;
     let events = EventRepository::new(db);
-    if events.claim_by_id(&row.project_id, event.event_id)?.is_none() {
+    if events
+        .claim_by_id(&row.project_id, event.event_id, now + 60)?
+        .is_none()
+    {
         report.deferred += 1;
         return Ok(());
     }

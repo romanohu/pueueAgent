@@ -688,6 +688,7 @@ impl<'db> EventRepository<'db> {
         &self,
         project_id: &str,
         event_id: i64,
+        lease_until: i64,
     ) -> Result<Option<Event>, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -696,9 +697,9 @@ impl<'db> EventRepository<'db> {
         let changed = transaction
             .execute(
                 "UPDATE events
-                 SET status = 'claimed', lease_until = NULL, attempts = attempts + 1
+                 SET status = 'claimed', lease_until = ?3, attempts = attempts + 1
                  WHERE project_id = ?1 AND event_id = ?2 AND status IN ('pending', 'retry_wait')",
-                params![project_id, event_id],
+                params![project_id, event_id, lease_until],
             )
             .map_err(database_error("claim event by id"))?;
         if changed != 1 {
