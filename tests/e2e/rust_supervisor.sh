@@ -56,10 +56,7 @@ cleanup() {
       fi
       ;;
   esac
-  case "${E2E_KEEP_WORK:-}" in
-    1) echo "E2E_KEEP_WORK: preserving $WORK" >&2 ;;
-    *) rm -rf "$WORK" ;;
-  esac
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 
