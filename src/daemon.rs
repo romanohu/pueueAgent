@@ -21,6 +21,7 @@ use crate::{
     decision::{DecisionCoordinator, DecisionLoopReport, DecisionRecoveryReport},
     detect::Detector,
     execution_policy::ResolvedExecutionPolicy,
+    health::{HealthEngine, HealthReport},
     incidents::IncidentStore,
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
@@ -58,6 +59,7 @@ impl Default for DaemonConfig {
 pub struct DaemonReport {
     pub reconciliation: ReconcileReport,
     pub observations: usize,
+    pub health: HealthReport,
     pub termination_outcomes: Vec<TerminationOutcome>,
     pub scheduled_deep_checks: usize,
     pub scheduler: SchedulerReport,
@@ -172,6 +174,7 @@ where
             .run_once_at(now)
             .await?;
         report.observations = self.run_detection(&reconciliation).await?;
+        report.health = self.run_health_observer(&reconciliation, now)?;
         report.termination_outcomes = self.run_termination().await?;
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(&reconciliation.observed_tasks)?;
@@ -426,6 +429,21 @@ where
         }
 
         Ok(observations)
+    }
+
+    fn run_health_observer(
+        &self,
+        reconciliation: &ReconcileReport,
+        now: i64,
+    ) -> Result<HealthReport, AppError> {
+        let projects = ProjectRepository::new(&self.db).list_enabled()?;
+        HealthEngine::run_once(
+            &self.db,
+            &projects,
+            &reconciliation.observed_tasks,
+            &self.policy.campaign_limits,
+            now,
+        )
     }
 
     async fn run_termination(&self) -> Result<Vec<TerminationOutcome>, AppError> {

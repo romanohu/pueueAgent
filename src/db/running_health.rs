@@ -154,6 +154,20 @@ impl HealthRepository {
             .map_err(database_error("commit running health observation"))
     }
 
+    pub fn mark_observed(db: &Db, experiment_id: &str, observed_at: i64) -> Result<(), AppError> {
+        let connection = db.connect()?;
+        let updated = connection
+            .execute(
+                "UPDATE running_health
+                 SET observation_count = observation_count + 1, last_observed_at = ?1,
+                     updated_at = ?1
+                 WHERE experiment_id = ?2",
+                params![observed_at, experiment_id],
+            )
+            .map_err(database_error("mark running health observed"))?;
+        require_running_health_row(updated)
+    }
+
     pub fn set_state(
         db: &Db,
         experiment_id: &str,

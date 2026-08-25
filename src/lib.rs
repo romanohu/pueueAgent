@@ -18,6 +18,7 @@ pub mod error;
 pub mod execution_policy;
 pub mod events;
 pub mod guardrails;
+pub mod health;
 pub mod incidents;
 pub mod init;
 pub mod interventions;

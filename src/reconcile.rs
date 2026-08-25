@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     db::{
-        Db, DecisionRepository, EventRepository, ExperimentRepository, ProjectRepository,
-        SubmissionRepository, TaskObservationRepository,
+        database_error, Db, DecisionRepository, EventRepository, ExperimentRepository,
+        HealthRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
     },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
@@ -101,6 +101,10 @@ where
             TaskObservationRepository::new(self.db).upsert(&observation)?;
             report.observed_task_count += 1;
             report.observed_tasks.push(task.clone());
+
+            if task.is_running() {
+                register_running_health(self.db, &project.project_id, task.id, now)?;
+            }
 
             if task.is_terminal() {
                 let auto_kill_request =
@@ -327,6 +331,38 @@ fn project_terminal_experiment(
             ExperimentTerminalOutcome::Succeeded,
             now,
         )?;
+    }
+    HealthRepository::delete_for_experiment(db, &experiment.experiment_id)
+}
+
+fn register_running_health(
+    db: &Db,
+    project_id: &str,
+    task_id: i64,
+    now: i64,
+) -> Result<(), AppError> {
+    let connection = db.connect()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT e.campaign_id, e.experiment_id
+             FROM experiments e
+             JOIN submissions s ON s.submission_id = e.submission_id
+             WHERE s.project_id = ?1 AND s.pueue_task_id = ?2 AND s.status = 'accepted'
+             ORDER BY e.created_at, e.experiment_id
+             LIMIT 2",
+        )
+        .map_err(database_error("prepare running health experiment lookup"))?;
+    let matches = statement
+        .query_map(rusqlite::params![project_id, task_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(database_error("query running health experiments"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read running health experiments"))?;
+    drop(statement);
+    drop(connection);
+    if let [(campaign_id, experiment_id)] = matches.as_slice() {
+        HealthRepository::ensure_running(db, project_id, campaign_id, experiment_id, task_id, now)?;
     }
     Ok(())
 }
