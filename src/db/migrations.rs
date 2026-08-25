@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 21;
+pub const LATEST_SCHEMA_VERSION: i64 = 22;
 const EVENTS_V18_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
 const EVENTS_V17_KIND_LIST: &str =
@@ -248,6 +248,30 @@ const DECISION_ATTEMPTS_UNBOUND_STATE_INDEX_SQL: &str =
 const AGENT_RUN_EVENTS_PROJECT_EVENT_RUN_INDEX_SQL: &str =
     "CREATE INDEX agent_run_events_project_event_run_idx
     ON agent_run_events(project_id, event_id, run_id DESC);";
+const RUNNING_HEALTH_V22_TABLE_SQL: &str = r#"
+    CREATE TABLE running_health (
+        experiment_id     TEXT PRIMARY KEY REFERENCES experiments(experiment_id)
+                          ON DELETE CASCADE,
+        campaign_id       TEXT NOT NULL,
+        project_id        TEXT NOT NULL,
+        pueue_task_id     INTEGER NOT NULL,
+        state             TEXT NOT NULL CHECK (state IN (
+                              'healthy','suspicious','diagnosing','action_pending')),
+        observation_count INTEGER NOT NULL DEFAULT 0,
+        last_observed_at  INTEGER NOT NULL,
+        signal_summary_json TEXT NOT NULL DEFAULT '[]',
+        diagnosis_json    TEXT,
+        created_at        INTEGER NOT NULL,
+        updated_at        INTEGER NOT NULL
+    );
+    CREATE INDEX running_health_due_idx ON running_health (last_observed_at);
+    CREATE INDEX running_health_campaign_state_idx
+        ON running_health (campaign_id, state);
+"#;
+const EXPERIMENTS_V22_RESUME_COLUMN_SQL: &str =
+    "ALTER TABLE experiments ADD COLUMN resume_of_experiment_id TEXT REFERENCES experiments(experiment_id);";
+const EXPERIMENTS_V22_CHECKPOINT_NOTE_COLUMN_SQL: &str =
+    "ALTER TABLE experiments ADD COLUMN checkpoint_note TEXT;";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -265,6 +289,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         && missing_execution_projection_columns(connection)?.is_empty();
     if version == LATEST_SCHEMA_VERSION {
         verify_decision_schema_v21(connection)?;
+        verify_running_health_schema_v22(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -697,6 +722,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_decision_schema_to_v21(&transaction)?;
     } else {
         verify_decision_schema_v21(&transaction)?;
+    }
+    if version <= 21 {
+        migrate_running_health_schema_to_v22(&transaction)?;
+    } else {
+        verify_running_health_schema_v22(&transaction)?;
     }
     transaction
         .commit()
@@ -2095,6 +2125,69 @@ fn decision_schema_v21_is_canonical(connection: &Connection) -> rusqlite::Result
     Ok(true)
 }
 
+fn migrate_running_health_schema_to_v22(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let already = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='running_health'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error("probe SQLite v22 running_health"))?;
+    if already == 0 {
+        transaction
+            .execute_batch(RUNNING_HEALTH_V22_TABLE_SQL)
+            .map_err(database_error("create SQLite v22 running_health"))?;
+    }
+    for (name, sql) in [
+        (
+            "resume_of_experiment_id",
+            EXPERIMENTS_V22_RESUME_COLUMN_SQL,
+        ),
+        ("checkpoint_note", EXPERIMENTS_V22_CHECKPOINT_NOTE_COLUMN_SQL),
+    ] {
+        let present = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('experiments') WHERE name = ?1
+                 )",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error("check SQLite v22 experiment column"))?;
+        if !present {
+            transaction
+                .execute_batch(sql)
+                .map_err(database_error("apply SQLite v22 experiment column"))?;
+        }
+    }
+    verify_running_health_schema_v22(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 22;")
+        .map_err(database_error("set SQLite v22 schema version"))
+}
+
+fn verify_running_health_schema_v22(connection: &Connection) -> Result<(), AppError> {
+    let found: i64 = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'table' AND name = 'running_health')
+                  + (SELECT COUNT(*) FROM pragma_table_info('experiments')
+                     WHERE name IN ('resume_of_experiment_id', 'checkpoint_note'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("verify SQLite v22 running health schema"))?;
+    if found == 3 {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v22 running health schema",
+        })
+    }
+}
+
 fn decision_schema_v19_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
     let event_sql: Option<String> = connection
         .query_row(
@@ -2285,10 +2378,15 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
                 |row| row.get(0),
             )
             .optional()?;
-        if !actual_sql
-            .as_deref()
-            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
-        {
+        let matches = actual_sql.as_deref().is_some_and(|sql| {
+            if table == "experiments" {
+                compact_sql_exact(&strip_v22_experiment_additions(sql))
+                    == compact_sql_exact(expected_sql)
+            } else {
+                compact_sql_exact(sql) == compact_sql_exact(expected_sql)
+            }
+        });
+        if !matches {
             return Ok(false);
         }
     }
@@ -2327,25 +2425,8 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
             ("created_at", "INTEGER", 1, 0),
             ("updated_at", "INTEGER", 1, 0),
         ],
-    )? || !campaign_table_info_matches(
+    )? || !experiments_campaign_columns_match(
         connection,
-        "experiments",
-        &[
-            ("experiment_id", "TEXT", 0, 1),
-            ("campaign_id", "TEXT", 1, 0),
-            ("proposal_id", "TEXT", 1, 0),
-            ("submission_id", "TEXT", 1, 0),
-            ("parent_experiment_id", "TEXT", 0, 0),
-            ("attempt", "INTEGER", 1, 0),
-            ("status", "TEXT", 1, 0),
-            ("pueue_task_id", "INTEGER", 0, 0),
-            ("task_signature", "TEXT", 0, 0),
-            ("failure_code", "TEXT", 0, 0),
-            ("failure_fingerprint", "TEXT", 0, 0),
-            ("created_at", "INTEGER", 1, 0),
-            ("updated_at", "INTEGER", 1, 0),
-            ("finished_at", "INTEGER", 0, 0),
-        ],
     )? || !campaign_table_info_matches(
         connection,
         "budget_reservations",
@@ -2389,25 +2470,8 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
                 "RESTRICT",
             ),
         ],
-    )? || !campaign_foreign_keys_match(
+    )? || !experiments_foreign_keys_match(
         connection,
-        "experiments",
-        &[
-            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
-            ("proposals", "proposal_id", "proposal_id", "RESTRICT"),
-            (
-                "submissions",
-                "submission_id",
-                "submission_id",
-                "RESTRICT",
-            ),
-            (
-                "experiments",
-                "parent_experiment_id",
-                "experiment_id",
-                "RESTRICT",
-            ),
-        ],
     )? || !campaign_foreign_keys_match(
         connection,
         "budget_reservations",
@@ -2466,6 +2530,77 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
     }
 
     Ok(true)
+}
+
+fn experiments_campaign_columns_match(connection: &Connection) -> rusqlite::Result<bool> {
+    const BASE_COLUMNS: [(&str, &str, i64, i64); 14] = [
+        ("experiment_id", "TEXT", 0, 1),
+        ("campaign_id", "TEXT", 1, 0),
+        ("proposal_id", "TEXT", 1, 0),
+        ("submission_id", "TEXT", 1, 0),
+        ("parent_experiment_id", "TEXT", 0, 0),
+        ("attempt", "INTEGER", 1, 0),
+        ("status", "TEXT", 1, 0),
+        ("pueue_task_id", "INTEGER", 0, 0),
+        ("task_signature", "TEXT", 0, 0),
+        ("failure_code", "TEXT", 0, 0),
+        ("failure_fingerprint", "TEXT", 0, 0),
+        ("created_at", "INTEGER", 1, 0),
+        ("updated_at", "INTEGER", 1, 0),
+        ("finished_at", "INTEGER", 0, 0),
+    ];
+    let mut expected = BASE_COLUMNS.to_vec();
+    if experiment_has_v22_additions(connection)? {
+        expected.push(("resume_of_experiment_id", "TEXT", 0, 0));
+        expected.push(("checkpoint_note", "TEXT", 0, 0));
+    }
+    campaign_table_info_matches(connection, "experiments", &expected)
+}
+
+fn experiments_foreign_keys_match(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut expected: Vec<(&str, &str, &str, &str)> = vec![
+        ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+        ("proposals", "proposal_id", "proposal_id", "RESTRICT"),
+        (
+            "submissions",
+            "submission_id",
+            "submission_id",
+            "RESTRICT",
+        ),
+        (
+            "experiments",
+            "parent_experiment_id",
+            "experiment_id",
+            "RESTRICT",
+        ),
+    ];
+    if experiment_has_v22_additions(connection)? {
+        expected.push((
+            "experiments",
+            "resume_of_experiment_id",
+            "experiment_id",
+            "NO ACTION",
+        ));
+    }
+    campaign_foreign_keys_match(connection, "experiments", &expected)
+}
+
+fn experiment_has_v22_additions(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('experiments')
+             WHERE name = 'checkpoint_note'
+         )",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn strip_v22_experiment_additions(sql: &str) -> String {
+    sql.replace(
+        ", resume_of_experiment_id TEXT REFERENCES experiments(experiment_id), checkpoint_note TEXT",
+        "",
+    )
 }
 
 fn campaign_table_info_matches(

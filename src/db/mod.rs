@@ -2,6 +2,7 @@ mod campaigns;
 mod decisions;
 mod migrations;
 mod repositories;
+pub mod running_health;
 
 pub use campaigns::{
     AgentDecisionReservation, CampaignDoctorProjection, CampaignRepository,
@@ -13,6 +14,7 @@ pub use decisions::{
 };
 pub(crate) use decisions::ReadyDecision;
 pub use migrations::LATEST_SCHEMA_VERSION;
+pub use running_health::HealthRepository;
 
 use std::{fs, path::Path, path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 

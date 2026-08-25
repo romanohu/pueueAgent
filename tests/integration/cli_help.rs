@@ -870,7 +870,8 @@ use pueue_agent::{
     config,
     db::{
         AgentRunRepository, CampaignRepository, Db, EventRepository, IncidentRepository,
-        ProjectRepository, StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
+        ProjectRepository, StartCampaignRequest, SubmissionRepository,
+        TaskObservationRepository, LATEST_SCHEMA_VERSION,
     },
     execution_policy::{CampaignLimits, StartupEnvironment},
     models::{
@@ -1609,7 +1610,7 @@ fn writable_project_command_migrates_v18_after_its_read_only_project_preflight()
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        21
+        LATEST_SCHEMA_VERSION
     );
 }
 

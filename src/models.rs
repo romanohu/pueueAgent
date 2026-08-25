@@ -240,6 +240,36 @@ database_enum!(BudgetReservationStatus {
     Released => "released",
 });
 
+database_enum!(HealthState {
+    Healthy => "healthy",
+    Suspicious => "suspicious",
+    Diagnosing => "diagnosing",
+    ActionPending => "action_pending",
+});
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalSummaryEntry {
+    pub class: String,
+    pub source: String,
+    pub evidence_digest: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningHealthRow {
+    pub experiment_id: String,
+    pub campaign_id: String,
+    pub project_id: String,
+    pub pueue_task_id: i64,
+    pub state: HealthState,
+    pub observation_count: i64,
+    pub last_observed_at: i64,
+    pub signal_summary_json: String,
+    pub diagnosis_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExperimentTerminalOutcome<'a> {
     Succeeded,

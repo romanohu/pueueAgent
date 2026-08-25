@@ -16,8 +16,9 @@ use pueue_agent::{
         inferred_pre_binding_policy_code, AgentDecisionReservation, AgentRunRepository,
         BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
         DecisionRepository, IncidentRepository, InterventionRepository, ProjectRepository,
-        RunLineageRepository, ProposalAcceptance, StartCampaignRequest, SubmissionRepository,
-        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+        RunLineageRepository, running_health::HealthRepository, ProposalAcceptance,
+        StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
+        TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
@@ -32,10 +33,10 @@ use pueue_agent::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
         BudgetReservationStatus, Campaign, CampaignState, DecisionAttemptState,
         DecisionCycleState, EventKind, EventStatus, ExecutionProjection, Experiment, ExperimentStatus,
-        ExperimentTerminalOutcome,
-        IncidentStatus, IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent,
+        ExperimentTerminalOutcome, HealthState, IncidentStatus, IncidentTransition, NewAgentRun,
+        NewBatchJob, NewBatchRequest, NewEvent,
         NewIncident, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
-        ProposalKind, ProposalStatus, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
+        ProposalKind, ProposalStatus, SignalSummaryEntry, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
         MAX_EXECUTABLE_IDENTITY_BYTES, MAX_EXECUTABLE_PATH_BYTES,
     },
     proposals::{self, ProposalInput, ValidatedProposal},
@@ -584,7 +585,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            LATEST_SCHEMA_VERSION
         );
         assert_eq!(
             table_columns(&connection, "decision_cycles")
@@ -624,7 +625,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 18,
-                required: 21
+                required: 22
             }
         ));
         let rendered = error.render();
@@ -665,7 +666,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            LATEST_SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -722,7 +723,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 19,
-                required: 21
+                required: 22
             }
         ));
 
@@ -762,7 +763,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            LATEST_SCHEMA_VERSION
         );
         let sql: String = connection
             .query_row(
@@ -860,7 +861,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 20,
-                required: 21
+                required: 22
             }
         ));
 
@@ -901,7 +902,7 @@ mod decision_schema {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            LATEST_SCHEMA_VERSION
         );
         for (name, expected) in [
             (
@@ -3952,6 +3953,13 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         .unwrap();
     assert_eq!(version, LATEST_SCHEMA_VERSION);
 
+    let experiments_latest_sql = EXPERIMENTS_V16_SQL.replacen(
+        "finished_at INTEGER,",
+        "finished_at INTEGER,
+        resume_of_experiment_id TEXT REFERENCES experiments(experiment_id),
+        checkpoint_note TEXT,",
+        1,
+    );
     for (table, expected_sql, expected_columns) in [
         (
             "campaigns",
@@ -3991,7 +3999,7 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         ),
         (
             "experiments",
-            EXPERIMENTS_V16_SQL,
+            experiments_latest_sql.as_str(),
             vec![
                 ("experiment_id", "TEXT", 0, 1),
                 ("campaign_id", "TEXT", 1, 0),
@@ -4007,6 +4015,8 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 ("created_at", "INTEGER", 1, 0),
                 ("updated_at", "INTEGER", 1, 0),
                 ("finished_at", "INTEGER", 0, 0),
+                ("resume_of_experiment_id", "TEXT", 0, 0),
+                ("checkpoint_note", "TEXT", 0, 0),
             ],
         ),
         (
@@ -4090,6 +4100,12 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 "parent_experiment_id",
                 "experiment_id",
                 "RESTRICT",
+            ),
+            (
+                "experiments",
+                "resume_of_experiment_id",
+                "experiment_id",
+                "NO ACTION",
             ),
         ])
     );
@@ -13776,4 +13792,207 @@ fn batch_stale_worker_token_is_rejected_after_lease_recovery() {
         accepted.jobs[0].submission_id.as_deref(),
         Some("current-submission")
     );
+}
+
+#[test]
+fn schema_v22_creates_running_health_and_survives_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("state.sqlite3");
+    let db = Db::open(&db_path).unwrap();
+    let connection = db.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+    let columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('running_health')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(columns.contains(&"state".to_string()));
+    assert!(columns.contains(&"last_observed_at".to_string()));
+    let experiment_columns: Vec<String> = connection
+        .prepare("SELECT name FROM pragma_table_info('experiments')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(experiment_columns.contains(&"resume_of_experiment_id".to_string()));
+    assert!(experiment_columns.contains(&"checkpoint_note".to_string()));
+    drop(connection);
+
+    let reopened = Db::open(&db_path).unwrap();
+    let version: i64 = reopened
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+}
+
+#[test]
+fn health_repository_lifecycle_is_bounded_and_resumable() {
+    let harness = CampaignDbHarness::with_experiment(ExperimentStatus::Accepted);
+    let experiment_id = &harness.experiment_id;
+
+    HealthRepository::ensure_running(
+        &harness.db,
+        &harness.project_id,
+        &harness.campaign_id,
+        experiment_id,
+        41,
+        200,
+    )
+    .unwrap();
+    HealthRepository::ensure_running(
+        &harness.db,
+        &harness.project_id,
+        &harness.campaign_id,
+        experiment_id,
+        42,
+        201,
+    )
+    .unwrap();
+    let row = HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, HealthState::Healthy);
+    assert_eq!(row.pueue_task_id, 41);
+    assert_eq!(row.observation_count, 0);
+    assert_eq!(row.signal_summary_json, "[]");
+    assert_eq!(row.diagnosis_json, None);
+
+    assert!(
+        HealthRepository::due_observations(&harness.db, 250, 10, 8)
+            .unwrap()
+            .is_empty()
+    );
+
+    HealthRepository::record_observation(
+        &harness.db,
+        experiment_id,
+        210,
+        SignalSummaryEntry {
+            class: "oom".to_owned(),
+            source: "stderr_tail".to_owned(),
+            evidence_digest: "digest-oom".to_owned(),
+            observed_at: 210,
+        },
+    )
+    .unwrap();
+    for ordinal in 0..32 {
+        let observed_at = 211 + ordinal;
+        HealthRepository::record_observation(
+            &harness.db,
+            experiment_id,
+            observed_at,
+            SignalSummaryEntry {
+                class: "stall".to_owned(),
+                source: "progress_log".to_owned(),
+                evidence_digest: format!("digest-{ordinal}"),
+                observed_at,
+            },
+        )
+        .unwrap();
+    }
+    let row = HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.observation_count, 33);
+    assert_eq!(row.last_observed_at, 242);
+    let summary: Vec<SignalSummaryEntry> =
+        serde_json::from_str(&row.signal_summary_json).unwrap();
+    assert_eq!(summary.len(), 32);
+    assert_eq!(summary[0].evidence_digest, "digest-0");
+    assert_eq!(summary[31].evidence_digest, "digest-31");
+
+    assert!(HealthRepository::due_observations(&harness.db, 300, 10, 8)
+        .unwrap()
+        .is_empty());
+    assert!(HealthRepository::due_observations(&harness.db, 900, 10, 0)
+        .unwrap()
+        .is_empty());
+    let due = HealthRepository::due_observations(&harness.db, 900, 10, 8).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].experiment_id, *experiment_id);
+
+    HealthRepository::set_state(&harness.db, experiment_id, HealthState::Suspicious, 905).unwrap();
+    let row = HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, HealthState::Suspicious);
+    assert_eq!(row.updated_at, 905);
+
+    HealthRepository::ensure_running(
+        &harness.db,
+        &harness.project_id,
+        &harness.campaign_id,
+        experiment_id,
+        43,
+        906,
+    )
+    .unwrap();
+    let row = HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, HealthState::Suspicious);
+    assert_eq!(row.observation_count, 33);
+    assert_eq!(row.pueue_task_id, 41);
+
+    let diagnosis = json!({"failure_class": "oom", "confidence": 0.82});
+    HealthRepository::store_diagnosis(&harness.db, experiment_id, &diagnosis, 907).unwrap();
+    let row = HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    let stored: serde_json::Value =
+        serde_json::from_str(row.diagnosis_json.as_deref().unwrap()).unwrap();
+    assert_eq!(stored, diagnosis);
+
+    HealthRepository::reset_to_healthy(&harness.db, experiment_id, 908).unwrap();
+    let row = HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, HealthState::Healthy);
+    assert_eq!(row.updated_at, 908);
+
+    HealthRepository::delete_for_experiment(&harness.db, experiment_id).unwrap();
+    assert!(HealthRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .is_none());
+    HealthRepository::delete_for_experiment(&harness.db, experiment_id).unwrap();
+
+    let error = HealthRepository::set_state(
+        &harness.db,
+        experiment_id,
+        HealthState::Healthy,
+        909,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "experiment_id",
+            ..
+        }
+    ));
+
+    let error = HealthRepository::ensure_running(
+        &harness.db,
+        "other-project",
+        &harness.campaign_id,
+        experiment_id,
+        41,
+        910,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "experiment_id",
+            ..
+        }
+    ));
 }
