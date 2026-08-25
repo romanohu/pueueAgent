@@ -68,14 +68,36 @@ pub(crate) fn validate_class_name(value: &str) -> Result<(), AppError> {
     }
 }
 
+fn contains_at_word_boundary(haystack: &str, marker: &str) -> bool {
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(marker) {
+        let idx = start + offset;
+        let end = idx + marker.len();
+        let prev_alnum = haystack[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        let next_alnum = haystack[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        if !prev_alnum && !next_alnum {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
 pub fn classify_log_tail(tail: &str) -> Vec<SignalClass> {
     let lowered = tail.to_lowercase();
     let mut classes = CLASSIFIER_RULES
         .iter()
-        .filter(|(_, markers)| {
-            markers
-                .iter()
-                .any(|marker| lowered.contains(marker))
+        .filter(|(class, markers)| {
+            markers.iter().any(|marker| match class {
+                SignalClass::Numerical => contains_at_word_boundary(&lowered, marker),
+                _ => lowered.contains(marker),
+            })
         })
         .map(|(class, _)| class.clone())
         .collect::<Vec<_>>();
@@ -132,6 +154,12 @@ mod tests {
         assert!(classify_log_tail("Traceback (most recent call last):")
             .contains(&SignalClass::Exception));
         assert!(classify_log_tail("all good here").is_empty());
+    }
+
+    #[test]
+    fn info_log_lines_do_not_trigger_numerical() {
+        let out = classify_log_tail("- INFO - training started");
+        assert!(!out.contains(&SignalClass::Numerical));
     }
 
     #[test]
