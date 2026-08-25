@@ -86,7 +86,7 @@ wait_for_sql() {
   local deadline=$(( $(date +%s) + 900 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     actual="$(sql "$query")"
-    if [ "$actual" -ge "$expected" ] 2>/dev/null; then
+    if [ "$actual" = "$expected" ]; then
       return 0
     fi
     if [ -n "$DAEMON_PID" ] && ! kill -0 "$DAEMON_PID" 2>/dev/null; then
