@@ -2476,7 +2476,7 @@ async fn operator_intervention_delivery_releases_rows_when_process_spawn_fails()
     fs::create_dir(
         harness
             .root("project-a")
-            .join(format!(".pueue-agent/logs/agent-{}-{event_id}.log", harness.now)),
+            .join(pueue_agent::agent::relative_log_path(event_id, harness.now)),
     )
     .unwrap();
 
@@ -3359,10 +3359,9 @@ async fn preexisting_marker_dead_letters_pending_run_without_execution() {
     harness.configure_agent(executable.to_str().unwrap(), &[]);
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "existing-marker");
     let intervention_id = harness.queue_intervention("must return to pending");
-    let marker = harness.root("project-a").join(format!(
-        ".pueue-agent/logs/agent-{}-{}.log.gate-started",
-        harness.now, event_id
-    ));
+    let mut marker_relative = pueue_agent::agent::relative_log_path(event_id, harness.now);
+    marker_relative.as_mut_os_string().push(".gate-started");
+    let marker = harness.root("project-a").join(&marker_relative);
     fs::write(&marker, b"authorized\n").unwrap();
     fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -3407,10 +3406,9 @@ async fn preexisting_marker_finalizer_failure_carries_retryable_pending_cleanup(
     let harness = SchedulerHarness::new();
     harness.configure_agent("/bin/echo", &[]);
     let event_id = harness.enqueue(EventKind::TaskFailed, "project-a", "existing-marker-retry");
-    let marker = harness.root("project-a").join(format!(
-        ".pueue-agent/logs/agent-{}-{}.log.gate-started",
-        harness.now, event_id
-    ));
+    let mut marker_relative = pueue_agent::agent::relative_log_path(event_id, harness.now);
+    marker_relative.as_mut_os_string().push(".gate-started");
+    let marker = harness.root("project-a").join(&marker_relative);
     fs::write(&marker, b"authorized\n").unwrap();
     fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
     harness
@@ -3648,7 +3646,7 @@ async fn log_open_failure_finishes_the_inserted_agent_run() {
     fs::create_dir(
         harness
             .root("project-a")
-            .join(format!(".pueue-agent/logs/agent-{}-{event_id}.log", harness.now)),
+            .join(pueue_agent::agent::relative_log_path(event_id, harness.now)),
     )
     .unwrap();
 
@@ -3810,7 +3808,7 @@ async fn scheduler_does_not_double_resolve_run_bound_spawn_failure() {
     fs::create_dir(
         harness
             .root("project-a")
-            .join(format!(".pueue-agent/logs/agent-{}-{event_id}.log", harness.now)),
+            .join(pueue_agent::agent::relative_log_path(event_id, harness.now)),
     )
     .unwrap();
     harness

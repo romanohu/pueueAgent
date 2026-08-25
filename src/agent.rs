@@ -2,10 +2,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -1238,17 +1235,9 @@ pub(crate) struct StartupGateMarkerEvidence {
     pub(crate) indeterminate: BTreeSet<i64>,
 }
 
-fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
-    // Second-resolution timestamps collide when one event retries within the
-    // same second or after a supervisor restart, and the leftover gate marker
-    // would block the retry. A per-process launch nonce plus a monotonic
-    // sequence keeps every attempt on its own log path across restarts.
-    static LAUNCH_NONCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-    let nonce = LAUNCH_NONCE.get_or_init(|| uuid::Uuid::new_v4().as_u128());
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let attempt = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+pub fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
     PathBuf::from(format!(
-        ".pueue-agent/logs/agent-{now}-{primary_event_id}-{nonce:032x}-{attempt}.log"
+        ".pueue-agent/logs/agent-{now}-{primary_event_id}.log"
     ))
 }
 

@@ -2758,7 +2758,7 @@ async fn startup_recovery_confirms_release_marker_through_project_root_descripto
         .unwrap()
         .unwrap()
         .root_path;
-    let log_path = project_root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let log_path = project_root.join(pueue_agent::agent::relative_log_path(event_id, 190));
     let runs = AgentRunRepository::new(&harness.db);
     let run = runs
         .insert_with_events(
@@ -2810,7 +2810,7 @@ async fn startup_recovery_closes_pending_marker_evidence_crash_window() {
         .unwrap()
         .unwrap()
         .root_path;
-    let log_path = project_root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let log_path = project_root.join(pueue_agent::agent::relative_log_path(event_id, 190));
     let run = AgentRunRepository::new(&harness.db)
         .insert_with_events(
             &NewAgentRun::new(
@@ -2908,7 +2908,7 @@ async fn recovery_retries_pre_marker_and_dead_letters_post_marker() {
         .unwrap();
     let post_log = harness
         .registered_root("project-b")
-        .join(format!(".pueue-agent/logs/agent-190-{post_event}.log"));
+        .join(pueue_agent::agent::relative_log_path(post_event, 190));
     let post_run = runs
         .insert_with_events_and_reservation(
             &NewAgentRun::new(
@@ -2960,7 +2960,7 @@ async fn recovery_dead_letters_indeterminate_relative_marker_without_releasing_i
         harness.reserve_intervention("already delivered", "indeterminate-token", harness.now + 600);
     let log_path = harness
         .registered_root("project-a")
-        .join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+        .join(pueue_agent::agent::relative_log_path(event_id, 190));
     let runs = AgentRunRepository::new(&harness.db);
     let run = runs
         .insert_with_events_and_reservation(
@@ -3004,7 +3004,7 @@ async fn recovery_dead_letters_indeterminate_pending_marker_as_post_marker_polic
     harness.claim_with_lease(event_id, harness.now + 600);
     let log_path = harness
         .registered_root("project-a")
-        .join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+        .join(pueue_agent::agent::relative_log_path(event_id, 190));
     let run = AgentRunRepository::new(&harness.db)
         .insert_with_events(
             &NewAgentRun::new(
@@ -3061,7 +3061,7 @@ async fn recovery_dead_letters_running_pending_indeterminate_marker_and_retains_
     );
     let log_path = harness
         .registered_root("project-a")
-        .join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+        .join(pueue_agent::agent::relative_log_path(event_id, 190));
     let runs = AgentRunRepository::new(&harness.db);
     let run = runs
         .insert_with_events_and_reservation(
@@ -3125,7 +3125,7 @@ async fn startup_recovery_rejects_symlinked_log_directory_without_database_mutat
         .unwrap()
         .unwrap()
         .root_path;
-    let log_path = project_root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let log_path = project_root.join(pueue_agent::agent::relative_log_path(event_id, 190));
     let runs = AgentRunRepository::new(&harness.db);
     let run = runs
         .insert_with_events(
@@ -3178,7 +3178,7 @@ async fn startup_recovery_rejects_replaced_project_root_without_database_mutatio
         .unwrap()
         .unwrap()
         .root_path;
-    let log_path = root.join(format!(".pueue-agent/logs/agent-190-{event_id}.log"));
+    let log_path = root.join(pueue_agent::agent::relative_log_path(event_id, 190));
     let runs = AgentRunRepository::new(&harness.db);
     let run = runs
         .insert_with_events(

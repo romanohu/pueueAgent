@@ -1123,6 +1123,9 @@ wait_for_sql \
   "retry_wait" "agent execution failure did not enter retry_wait"
 stop_daemon
 sql "UPDATE events SET not_before = 0 WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=900'"
+# Log and gate-marker names resolve per started second; keep the retry
+# generation out of the previous attempt's second.
+sleep 2
 start_daemon
 wait_for_agent_calls "3" "retry event was not recoverable"
 wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'" "2" \
