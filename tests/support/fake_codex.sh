@@ -76,10 +76,15 @@ fi
 [ -n "$prompt" ] || exit 70
 
 # Diagnosis-agent fixture mode: triggered by argv containing
-# --output-last-message plus PUEUE_AGENT_TEST_DIAGNOSE_MODE=1.  It must run
-# before the decision context parsing below because diagnosis prompts carry a
-# different evidence bundle.
-if [ "${PUEUE_AGENT_TEST_DIAGNOSE_MODE:-}" = "1" ]; then
+# --output-last-message plus PUEUE_AGENT_TEST_DIAGNOSE_MODE=1, or by a
+# health-diagnosis output artifact because the supervised Codex environment
+# strips extra variables.  It must run before the decision context parsing
+# below because diagnosis prompts carry a different evidence bundle.
+diagnose_artifact=0
+case "$output" in
+  */health-diagnosis.json) diagnose_artifact=1 ;;
+esac
+if [ "${PUEUE_AGENT_TEST_DIAGNOSE_MODE:-}" = "1" ] || [ "$diagnose_artifact" -eq 1 ]; then
   if [ -n "${PUEUE_AGENT_TEST_DIAGNOSE_CAPTURE:-}" ]; then
     printf 'DIAGNOSE_INVOCATION output=%s\n' "$output" \
       >> "$PUEUE_AGENT_TEST_DIAGNOSE_CAPTURE"

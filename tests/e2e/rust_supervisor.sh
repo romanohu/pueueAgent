@@ -276,6 +276,42 @@ insert_campaign_boundary() {
        WHERE campaign_id = '$campaign_id';"
 }
 
+insert_health_termination_request() {
+  project_id="$1"
+  group="$2"
+  task_id="$3"
+  experiment_id="$4"
+  # Mirror the supervisor task identity byte for byte: the health action
+  # executor only advances requests whose signature matches the live task.
+  signature="$($REAL_PUEUE --config "$WORK/pueue.yml" status --json | jq -r \
+    --arg id "$task_id" --arg group "$group" '
+    .tasks[$id] as $t |
+    ($t.status | keys[0]) as $state |
+    ($t.status[$state].enqueued_at // null) as $enqueued |
+    ($t.status[$state].start // null) as $started |
+    ($t.status[$state].end // null) as $ended |
+    {ended_at:$ended, enqueued_at:$enqueued, group:$group, id:($t.id | tonumber),
+     started_at:$started, state:$state} | "pueue-task:v1:" + tojson')"
+  case "$signature" in
+    *"\"id\":$task_id,"*|*"\"id\":$task_id}") ;;
+    *) fail "health fixture built an unexpected task signature: $signature" ;;
+  esac
+  requested_at="$(date +%s)"
+  sql "INSERT INTO incidents (
+         project_id, kind, task_key, fingerprint, status, first_seen_at, last_seen_at
+       ) VALUES (
+         '$project_id', 'health-diagnosed-oom', '$experiment_id', 'oom-$experiment_id',
+         'open', $requested_at, $requested_at
+       );
+       INSERT INTO termination_requests (
+         incident_id, project_id, task_signature, reason, status, requested_at
+       ) VALUES (
+         (SELECT MAX(incident_id) FROM incidents WHERE project_id = '$project_id'),
+         '$project_id', '$signature', 'diagnosed OOM requires kill_and_resume',
+         'requested', $requested_at
+       );"
+}
+
 submission_task_id() {
   summary="$1"
   task_id="$(printf '%s\n' "$summary" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^task=[0-9]+$/) { sub(/^task=/, "", $i); print $i } }')"
@@ -508,8 +544,10 @@ PROJECT_E="$WORK/e/trusted-failure"
 PROJECT_F="$WORK/f/untrusted-failure"
 PROJECT_G="$WORK/g/wait-once"
 PROJECT_H="$WORK/h/invalid-three"
+PROJECT_I="$WORK/i/running-health"
+PROJECT_J="$WORK/j/restart-diagnosis"
 mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D" \
-  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H"
+  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H" "$PROJECT_I" "$PROJECT_J"
 PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_A"
 "$PA_BIN" init "$PROJECT_B"
@@ -519,6 +557,8 @@ PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_F"
 "$PA_BIN" init "$PROJECT_G"
 "$PA_BIN" init "$PROJECT_H"
+"$PA_BIN" init "$PROJECT_I"
+"$PA_BIN" init "$PROJECT_J"
 
 CONFIG_A="$PROJECT_A/.pueue-agent/config.toml"
 CONFIG_B="$PROJECT_B/.pueue-agent/config.toml"
@@ -528,8 +568,11 @@ CONFIG_E="$PROJECT_E/.pueue-agent/config.toml"
 CONFIG_F="$PROJECT_F/.pueue-agent/config.toml"
 CONFIG_G="$PROJECT_G/.pueue-agent/config.toml"
 CONFIG_H="$PROJECT_H/.pueue-agent/config.toml"
+CONFIG_I="$PROJECT_I/.pueue-agent/config.toml"
+CONFIG_J="$PROJECT_J/.pueue-agent/config.toml"
 [ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] && [ -f "$CONFIG_C" ] && [ -f "$CONFIG_D" ] \
   && [ -f "$CONFIG_E" ] && [ -f "$CONFIG_F" ] && [ -f "$CONFIG_G" ] && [ -f "$CONFIG_H" ] \
+  && [ -f "$CONFIG_I" ] && [ -f "$CONFIG_J" ] \
   || fail "init did not create TOML configuration"
 PROJECT_ID_A="$(toml_value project_id "$CONFIG_A")"
 PROJECT_ID_B="$(toml_value project_id "$CONFIG_B")"
@@ -539,6 +582,8 @@ PROJECT_ID_E="$(toml_value project_id "$CONFIG_E")"
 PROJECT_ID_F="$(toml_value project_id "$CONFIG_F")"
 PROJECT_ID_G="$(toml_value project_id "$CONFIG_G")"
 PROJECT_ID_H="$(toml_value project_id "$CONFIG_H")"
+PROJECT_ID_I="$(toml_value project_id "$CONFIG_I")"
+PROJECT_ID_J="$(toml_value project_id "$CONFIG_J")"
 GROUP_A="$(toml_value pueue_group "$CONFIG_A")"
 GROUP_B="$(toml_value pueue_group "$CONFIG_B")"
 GROUP_C="$(toml_value pueue_group "$CONFIG_C")"
@@ -547,6 +592,8 @@ GROUP_E="$(toml_value pueue_group "$CONFIG_E")"
 GROUP_F="$(toml_value pueue_group "$CONFIG_F")"
 GROUP_G="$(toml_value pueue_group "$CONFIG_G")"
 GROUP_H="$(toml_value pueue_group "$CONFIG_H")"
+GROUP_I="$(toml_value pueue_group "$CONFIG_I")"
+GROUP_J="$(toml_value pueue_group "$CONFIG_J")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
@@ -558,6 +605,8 @@ write_config "$PROJECT_E" "$PROJECT_ID_E" "$GROUP_E" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_F" "$PROJECT_ID_F" "$GROUP_F" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_G" "$PROJECT_ID_G" "$GROUP_G" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_H" "$PROJECT_ID_H" "$GROUP_H" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_I" "$PROJECT_ID_I" "$GROUP_I" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_J" "$PROJECT_ID_J" "$GROUP_J" "$WORK/bin/fake-agent" 20
 printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
   > "$PROJECT_A/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
@@ -572,6 +621,10 @@ printf '%s\n' 'Choose a non-repair experiment when failure trust is absent.' \
   > "$PROJECT_F/.pueue-agent/STATE.md"
 printf '%s\n' 'PUEUE_AGENT_E2E_WAIT_ONCE' > "$PROJECT_G/.pueue-agent/STATE.md"
 printf '%s\n' 'PUEUE_AGENT_E2E_INVALID_THREE' > "$PROJECT_H/.pueue-agent/STATE.md"
+printf '%s\n' 'Keep the diagnosed OOM experiment observable for the running-health machine.' \
+  > "$PROJECT_I/.pueue-agent/STATE.md"
+printf '%s\n' 'Keep the restart-diagnosis experiment observable across daemon restarts.' \
+  > "$PROJECT_J/.pueue-agent/STATE.md"
 
 mkdir -p "$XDG_STATE_HOME"
 chmod 700 "$XDG_STATE_HOME"
@@ -591,7 +644,7 @@ max_code_change_proposals_per_24h = 10
 max_same_spec_retries = 2
 max_repairs_per_failure_fingerprint = 2
 max_proposals_per_cycle = 1
-observer_interval_minutes = 30
+observer_interval_minutes = 0
 max_decision_attempts_per_cycle = 3
 max_decision_wait_minutes = 1440
 
@@ -629,6 +682,14 @@ agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT
 [projects."$PROJECT_ID_H"]
 custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_I"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_J"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 EOF
 chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 
@@ -640,8 +701,10 @@ chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_F"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_G"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_H"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_I"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_J"
 STATE_DB="$XDG_STATE_HOME/pueue-agent/state.sqlite3"
-[ "$(sql 'SELECT COUNT(*) FROM projects')" = "8" ] || fail "projects were not registered"
+[ "$(sql 'SELECT COUNT(*) FROM projects')" = "10" ] || fail "projects were not registered"
 
 # Healthy monitoring performs reconciliation without spending agent tokens.
 start_daemon
@@ -1107,6 +1170,97 @@ stop_daemon
   || fail "auto-kill agent run was not completed during shutdown drain"
 [ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" -ge 1 ] \
   || fail "auto-kill produced no agent invocation"
+
+# Repeated OOM signals run the full running-health machine: the observer
+# escalates, the fake Codex diagnosis recommends kill_and_resume, and the
+# confirmed gate produces exactly one kill plus a resumed successor.
+oom_summary="$(cd "$PROJECT_I" && "$PA_BIN" submit -- /bin/sleep 30)"
+oom_task="$(submission_task_id "$oom_summary")"
+record_task_id "oom-source" "$oom_task"
+OOM_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $oom_task")"
+[ -n "$OOM_SOURCE" ] || fail "OOM fixture did not create its baseline experiment"
+wait_for_task_state "$oom_task" Running
+printf 'epoch=1 loss=0.91 torch.cuda.OutOfMemoryError: CUDA out of memory\n' \
+  > "$PROJECT_I/.pueue-agent/logs/$oom_task.log"
+kills_before_oom="$(wc -l < "$WORK/pueue-kills.log" | tr -d ' ')"
+start_daemon
+stop_daemon
+start_daemon
+wait_for_sql "SELECT state FROM running_health WHERE experiment_id = '$OOM_SOURCE'" "action_pending" \
+  "repeated OOM signals did not escalate into a stored diagnosis"
+stop_daemon
+[ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_I' AND execution_kind = 'diagnosis' AND status = 'completed'")" = "1" ] \
+  || fail "repeated OOM signals did not complete exactly one diagnosis agent"
+[ "$(sql "SELECT diagnosis_json FROM running_health WHERE experiment_id = '$OOM_SOURCE'")" \
+  = '{"root_cause_class":"oom","confidence":0.9,"recommended_action":"kill_and_resume","summary":"gpu exhausted"}' ] \
+  || fail "OOM diagnosis did not persist a kill_and_resume recommendation"
+insert_health_termination_request "$PROJECT_ID_I" "$GROUP_I" "$oom_task" "$OOM_SOURCE"
+start_daemon
+wait_for_sql "SELECT status FROM termination_requests WHERE project_id = '$PROJECT_ID_I'" "confirmed" \
+  "diagnosed kill_and_resume did not advance through the confirmed gate"
+stop_daemon
+[ "$(($(wc -l < "$WORK/pueue-kills.log" | tr -d ' ') - kills_before_oom))" = "1" ] \
+  || fail "diagnosed kill_and_resume did not invoke exactly one Pueue kill"
+[ "$(sql "SELECT COUNT(*) FROM running_health WHERE experiment_id = '$OOM_SOURCE'")" = "0" ] \
+  || fail "confirmed resume did not delete the consumed health row"
+OOM_SUCCESSOR="$(sql "SELECT experiment_id FROM experiments WHERE resume_of_experiment_id = '$OOM_SOURCE'")"
+[ -n "$OOM_SUCCESSOR" ] || fail "confirmed kill_and_resume did not reserve a successor experiment"
+[ "$(sql "SELECT parent_experiment_id FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'")" = "$OOM_SOURCE" ] \
+  || fail "successor experiment lacks the resume lineage"
+[ "$(sql "SELECT CASE WHEN checkpoint_note IS NULL THEN 0 ELSE 1 END FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'")" = "1" ] \
+  || fail "successor experiment lacks a checkpoint note"
+[ "$(sql "SELECT s.argv_json FROM experiments e JOIN submissions s ON s.submission_id = e.submission_id WHERE e.experiment_id = '$OOM_SUCCESSOR'")" = '["/bin/sleep","30"]' ] \
+  || fail "successor experiment did not reuse the source argv"
+record_task_id "oom-successor" \
+  "$(sql "SELECT pueue_task_id FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'")"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'" "accepted" \
+  "resume successor was not dispatched"
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'" "succeeded" \
+  "resume successor was not projected terminal"
+stop_daemon
+
+# Restarting while a diagnosis is in flight keeps exactly one diagnosis agent:
+# graceful shutdown drains and persists the outcome, and the resumed daemon
+# never respawns before the recommended action completes.
+restart_summary="$(cd "$PROJECT_J" && "$PA_BIN" submit -- /bin/sleep 120)"
+restart_task="$(submission_task_id "$restart_summary")"
+record_task_id "restart-source" "$restart_task"
+RESTART_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $restart_task")"
+[ -n "$RESTART_SOURCE" ] || fail "restart fixture did not create its baseline experiment"
+wait_for_task_state "$restart_task" Running
+printf 'epoch=1 torch.cuda.OutOfMemoryError: CUDA out of memory\n' \
+  > "$PROJECT_J/.pueue-agent/logs/$restart_task.log"
+kills_before_restart="$(wc -l < "$WORK/pueue-kills.log" | tr -d ' ')"
+start_daemon
+stop_daemon
+start_daemon
+sleep 1
+stop_daemon
+start_daemon
+wait_for_sql "SELECT state FROM running_health WHERE experiment_id = '$RESTART_SOURCE'" "action_pending" \
+  "restart while diagnosing lost the drained diagnosis"
+stop_daemon
+[ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_J' AND execution_kind = 'diagnosis'")" = "1" ] \
+  || fail "restart while diagnosing duplicated the diagnosis agent"
+[ "$(sql "SELECT diagnosis_json FROM running_health WHERE experiment_id = '$RESTART_SOURCE'")" \
+  = '{"root_cause_class":"oom","confidence":0.9,"recommended_action":"kill_and_resume","summary":"gpu exhausted"}' ] \
+  || fail "drained diagnosis did not persist its recommendation"
+insert_health_termination_request "$PROJECT_ID_J" "$GROUP_J" "$restart_task" "$RESTART_SOURCE"
+start_daemon
+wait_for_sql "SELECT status FROM termination_requests WHERE project_id = '$PROJECT_ID_J'" "confirmed" \
+  "restarted diagnosis action did not reach the confirmed gate"
+stop_daemon
+[ "$(($(wc -l < "$WORK/pueue-kills.log" | tr -d ' ') - kills_before_restart))" = "1" ] \
+  || fail "restarted diagnosis action did not invoke exactly one Pueue kill"
+RESTART_SUCCESSOR="$(sql "SELECT experiment_id FROM experiments WHERE resume_of_experiment_id = '$RESTART_SOURCE'")"
+[ -n "$RESTART_SUCCESSOR" ] || fail "restarted action did not reserve a successor experiment"
+[ "$(sql "SELECT CASE WHEN checkpoint_note IS NULL THEN 0 ELSE 1 END FROM experiments WHERE experiment_id = '$RESTART_SUCCESSOR'")" = "1" ] \
+  || fail "restarted successor lacks a checkpoint note"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$RESTART_SUCCESSOR'" "accepted" \
+  "restarted successor was not dispatched"
+stop_daemon
 
 # Agent execution failures enter retry_wait; a later daemon run can retry the same event.
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 900 \
