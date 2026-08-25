@@ -9,6 +9,7 @@ pub use campaigns::{
     CampaignStatusProjection, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
     ProposalAcceptance, StartCampaignRequest,
 };
+pub(crate) use campaigns::count_live_repair_descendants;
 pub use decisions::{
     DecisionDoctorProjection, DecisionRecovery, DecisionRepository, DecisionReservation,
 };

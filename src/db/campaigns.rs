@@ -641,13 +641,9 @@ impl<'db> CampaignRepository<'db> {
             ));
         }
 
-        let resume_count: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM experiments WHERE resume_of_experiment_id = ?1",
-                [source_experiment_id],
-                |row| row.get(0),
-            )
-            .map_err(database_error("count campaign resume successors"))?;
+        let resume_count: i64 =
+            count_live_repair_descendants(&transaction, source_experiment_id)
+                .map_err(database_error("count campaign resume successors"))?;
         if resume_count >= i64::from(limits.max_live_repairs) {
             transaction
                 .commit()
@@ -2271,6 +2267,38 @@ fn count_live_reservations(
             |row| row.get(0),
         )
         .map_err(database_error("count live rolling budget reservations"))
+}
+
+/// Total resume repairs across the whole `resume_of_experiment_id` lineage,
+/// counted from the origin experiment of `experiment_id` so repeated
+/// single-resume generations exhaust a cumulative chain-depth budget.
+pub(crate) fn count_live_repair_descendants(
+    connection: &rusqlite::Connection,
+    experiment_id: &str,
+) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "WITH RECURSIVE ancestry(experiment_id, depth) AS (
+             SELECT experiment_id, 0 FROM experiments WHERE experiment_id = ?1
+             UNION ALL
+             SELECT e.resume_of_experiment_id, ancestry.depth + 1
+             FROM experiments e
+             JOIN ancestry ON e.experiment_id = ancestry.experiment_id
+             WHERE e.resume_of_experiment_id IS NOT NULL
+         ),
+         origin AS (
+             SELECT experiment_id FROM ancestry ORDER BY depth DESC LIMIT 1
+         ),
+         repairs(experiment_id) AS (
+             SELECT experiment_id FROM experiments
+              WHERE resume_of_experiment_id = (SELECT experiment_id FROM origin)
+             UNION ALL
+             SELECT e.experiment_id FROM experiments e
+              JOIN repairs ON e.resume_of_experiment_id = repairs.experiment_id
+         )
+         SELECT COUNT(*) FROM repairs",
+        [experiment_id],
+        |row| row.get(0),
+    )
 }
 
 fn earliest_live_reservation_expiry(

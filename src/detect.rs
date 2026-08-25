@@ -367,6 +367,13 @@ pub struct Detector {
     incident_db: Option<Db>,
 }
 
+/// Result of one detection pass over a single task: the incident observations
+/// plus every signal classification derived from that task's own log tail.
+pub struct TaskInspection {
+    pub observations: Vec<Observation>,
+    pub signals: Vec<SignalObservation>,
+}
+
 impl Detector {
     pub fn new(project_root: impl Into<PathBuf>, task_log_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -400,7 +407,9 @@ impl Detector {
         task: &PueueTask,
         config: &CheckConfig,
     ) -> Result<Vec<Observation>, AppError> {
-        self.inspect_task_at(task, config, unix_timestamp()?)
+        Ok(self
+            .inspect_task_detailed(task, config, unix_timestamp()?)?
+            .observations)
     }
 
     pub fn inspect_task_at(
@@ -409,12 +418,37 @@ impl Detector {
         config: &CheckConfig,
         seen_at: i64,
     ) -> Result<Vec<Observation>, AppError> {
+        Ok(self
+            .inspect_task_detailed(task, config, seen_at)?
+            .observations)
+    }
+
+    /// Read the task log exactly once at the current system time and derive
+    /// both the incident observations and the signal observations from that
+    /// single snapshot.
+    pub fn inspect_task_now(
+        &self,
+        task: &PueueTask,
+        config: &CheckConfig,
+    ) -> Result<TaskInspection, AppError> {
+        self.inspect_task_detailed(task, config, unix_timestamp()?)
+    }
+
+    /// Read the task log exactly once and derive both the incident
+    /// observations and the signal observations from that single snapshot.
+    pub fn inspect_task_detailed(
+        &self,
+        task: &PueueTask,
+        config: &CheckConfig,
+        seen_at: i64,
+    ) -> Result<TaskInspection, AppError> {
         let mut observations = Vec::new();
+        let mut task_signals = Vec::new();
         let project_id = self.project_id.as_deref().unwrap_or(task.group.as_str());
         let task_key = task_incident_key(task);
         let signature = crate::reconcile::task_signature(task);
         if let Some(snapshot) = self.read_task_snapshot(task.id, config.log_tail_bytes)? {
-            let signals = tail_signal_observations(&snapshot.evidence, config, seen_at);
+            let mut signals = tail_signal_observations(&snapshot.evidence, config, seen_at);
             observations.extend(
                 task_pattern_observations(
                     project_id,
@@ -446,7 +480,9 @@ impl Detector {
                 let mut stall_signals = signals.clone();
                 stall_signals.push(staleness_signal(&snapshot.evidence, seen_at));
                 observations.push(stalled.with_signals(stall_signals));
+                signals.push(staleness_signal(&snapshot.evidence, seen_at));
             }
+            task_signals = signals;
         }
 
         for relative_path in &config.extra_log_paths {
@@ -467,22 +503,10 @@ impl Detector {
             );
         }
 
-        Ok(observations)
-    }
-
-    pub fn signal_observations_for(
-        &self,
-        _task: &PueueTask,
-        tail: &str,
-        config: &CheckConfig,
-        stalled: bool,
-        observed_at: i64,
-    ) -> Vec<SignalObservation> {
-        let mut signals = tail_signal_observations(tail, config, observed_at);
-        if stalled {
-            signals.push(staleness_signal(tail, observed_at));
-        }
-        signals
+        Ok(TaskInspection {
+            observations,
+            signals: task_signals,
+        })
     }
 
     fn read_task_snapshot(

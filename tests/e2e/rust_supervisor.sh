@@ -276,42 +276,6 @@ insert_campaign_boundary() {
        WHERE campaign_id = '$campaign_id';"
 }
 
-insert_health_termination_request() {
-  project_id="$1"
-  group="$2"
-  task_id="$3"
-  experiment_id="$4"
-  # Mirror the supervisor task identity byte for byte: the health action
-  # executor only advances requests whose signature matches the live task.
-  signature="$($REAL_PUEUE --config "$WORK/pueue.yml" status --json | jq -r \
-    --arg id "$task_id" --arg group "$group" '
-    .tasks[$id] as $t |
-    ($t.status | keys[0]) as $state |
-    ($t.status[$state].enqueued_at // null) as $enqueued |
-    ($t.status[$state].start // null) as $started |
-    ($t.status[$state].end // null) as $ended |
-    {ended_at:$ended, enqueued_at:$enqueued, group:$group, id:($t.id | tonumber),
-     started_at:$started, state:$state} | "pueue-task:v1:" + tojson')"
-  case "$signature" in
-    *"\"id\":$task_id,"*|*"\"id\":$task_id}") ;;
-    *) fail "health fixture built an unexpected task signature: $signature" ;;
-  esac
-  requested_at="$(date +%s)"
-  sql "INSERT INTO incidents (
-         project_id, kind, task_key, fingerprint, status, first_seen_at, last_seen_at
-       ) VALUES (
-         '$project_id', 'health-diagnosed-oom', '$experiment_id', 'oom-$experiment_id',
-         'open', $requested_at, $requested_at
-       );
-       INSERT INTO termination_requests (
-         incident_id, project_id, task_signature, reason, status, requested_at
-       ) VALUES (
-         (SELECT MAX(incident_id) FROM incidents WHERE project_id = '$project_id'),
-         '$project_id', '$signature', 'diagnosed OOM requires kill_and_resume',
-         'requested', $requested_at
-       );"
-}
-
 submission_task_id() {
   summary="$1"
   task_id="$(printf '%s\n' "$summary" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^task=[0-9]+$/) { sub(/^task=/, "", $i); print $i } }')"
@@ -1202,8 +1166,12 @@ stop_daemon
 [ "$(sql "SELECT diagnosis_json FROM running_health WHERE experiment_id = '$OOM_SOURCE'")" \
   = '{"root_cause_class":"oom","confidence":0.9,"recommended_action":"kill_and_resume","summary":"gpu exhausted"}' ] \
   || fail "OOM diagnosis did not persist a kill_and_resume recommendation"
-insert_health_termination_request "$PROJECT_ID_I" "$GROUP_I" "$oom_task" "$OOM_SOURCE"
+# The health executor opens the termination request from the stored
+# diagnosis; the same daemon pass drives it through the standard kill
+# pipeline and a later reconciliation confirms the killed task.
 start_daemon
+wait_for_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID_I'" "1" \
+  "diagnosed kill_and_resume did not open its termination request"
 wait_for_sql "SELECT status FROM termination_requests WHERE project_id = '$PROJECT_ID_I'" "confirmed" \
   "diagnosed kill_and_resume did not advance through the confirmed gate"
 stop_daemon
@@ -1261,8 +1229,11 @@ stop_daemon
 [ "$(sql "SELECT diagnosis_json FROM running_health WHERE experiment_id = '$RESTART_SOURCE'")" \
   = '{"root_cause_class":"oom","confidence":0.9,"recommended_action":"kill_and_resume","summary":"gpu exhausted"}' ] \
   || fail "drained diagnosis did not persist its recommendation"
-insert_health_termination_request "$PROJECT_ID_J" "$GROUP_J" "$restart_task" "$RESTART_SOURCE"
+# The restarted diagnosis opens its own termination request through the
+# health executor; no operator-side seeding is involved.
 start_daemon
+wait_for_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID_J'" "1" \
+  "restarted diagnosis action did not open its termination request"
 wait_for_sql "SELECT status FROM termination_requests WHERE project_id = '$PROJECT_ID_J'" "confirmed" \
   "restarted diagnosis action did not reach the confirmed gate"
 stop_daemon

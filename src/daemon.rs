@@ -21,7 +21,7 @@ use crate::{
     decision::{DecisionCoordinator, DecisionLoopReport, DecisionRecoveryReport},
     detect::Detector,
     execution_policy::ResolvedExecutionPolicy,
-    health::{HealthEngine, HealthReport},
+    health::{DetectionSignals, HealthEngine, HealthReport},
     health_diagnosis::run_due_diagnoses,
     incidents::IncidentStore,
     pueue::PueueApi,
@@ -175,8 +175,9 @@ where
         let reconciliation = Reconciler::new(&self.db, self.pueue.clone())
             .run_once_at(now)
             .await?;
-        report.observations = self.run_detection(&reconciliation).await?;
-        let mut health = self.run_health_observer(&reconciliation, now)?;
+        let (detection_signals, observations) = self.run_detection(&reconciliation).await?;
+        report.observations = observations;
+        let mut health = self.run_health_observer(&reconciliation, &detection_signals, now)?;
         health.executed_actions = self.run_health_actions(now).await?;
         report.health = health;
         report.diagnoses = self.run_health_diagnoses(now).await?;
@@ -404,12 +405,16 @@ where
         ))
     }
 
-    async fn run_detection(&self, reconciliation: &ReconcileReport) -> Result<usize, AppError> {
+    async fn run_detection(
+        &self,
+        reconciliation: &ReconcileReport,
+    ) -> Result<(DetectionSignals, usize), AppError> {
         let projects = ProjectRepository::new(&self.db).list_enabled()?;
         let projects_by_group = projects
             .iter()
             .map(|project| (project.pueue_group.as_str(), project))
             .collect::<BTreeMap<_, _>>();
+        let mut task_signals = DetectionSignals::new();
         let mut observations = 0;
 
         for task in reconciliation
@@ -427,18 +432,26 @@ where
                 project.root_path.join(".pueue-agent/logs"),
             )
             .with_incident_db(self.db.clone());
-            for observation in detector.inspect_task(task, &project_config.check)? {
+            let inspection = detector.inspect_task_now(task, &project_config.check)?;
+            let signals = task_signals.entry(task.id).or_default();
+            for signal in inspection.signals {
+                if !signals.contains(&signal) {
+                    signals.push(signal);
+                }
+            }
+            for observation in inspection.observations {
                 IncidentStore::new(&self.db).observe(observation)?;
                 observations += 1;
             }
         }
 
-        Ok(observations)
+        Ok((task_signals, observations))
     }
 
     fn run_health_observer(
         &self,
         reconciliation: &ReconcileReport,
+        detection_signals: &DetectionSignals,
         now: i64,
     ) -> Result<HealthReport, AppError> {
         let projects = ProjectRepository::new(&self.db).list_enabled()?;
@@ -446,6 +459,7 @@ where
             &self.db,
             &projects,
             &reconciliation.observed_tasks,
+            detection_signals,
             &self.policy.campaign_limits,
             now,
         )

@@ -7,24 +7,23 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use crate::{
-    config::{self, CheckConfig},
     db::{
-        database_error,
+        count_live_repair_descendants, database_error,
         running_health::HealthRepository,
-        CampaignRepository, Db, EventRepository, ProposalRepository, ProjectRepository,
-        SubmissionRepository,
+        CampaignRepository, Db, EventRepository, IncidentRepository, ProposalRepository,
+        ProjectRepository, SubmissionRepository,
     },
-    detect::Detector,
     execution_policy::CampaignLimits,
-    health_diagnosis::{parse_and_validate_diagnosis, RecommendedAction},
+    health_diagnosis::{parse_and_validate_diagnosis, RecommendedAction, ValidatedDiagnosis},
     logs::LogSnapshot,
     models::{
-        EventKind, Experiment, HealthState, NewEvent, Project, ProposalKind, RunningHealthRow,
-        SignalSummaryEntry, TerminationRequestStatus,
+        EventKind, Experiment, HealthState, NewEvent, NewIncident, Project, ProposalKind,
+        RunningHealthRow, SignalSummaryEntry, TerminationRequestStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
     signals::{SignalClass, SignalObservation, SignalSource},
+    reconcile::{task_incident_key, task_signature},
     termination::{latest_request_for_pueue_task, require_confirmed, TerminationManager},
     AppError,
 };
@@ -32,6 +31,12 @@ use crate::{
 const MAX_OBSERVATIONS_PER_PASS: usize = 100;
 const MAX_ACTIONS_PER_PASS: usize = 100;
 const STALENESS_CLASS: &str = "staleness";
+const HEALTH_DIAGNOSIS_INCIDENT_KIND: &str = "health_diagnosis";
+
+/// Signal observations collected during the daemon detection pass, keyed by
+/// Pueue task id.  The observer consumes these instead of re-reading task
+/// logs so every pass reads each log exactly once.
+pub type DetectionSignals = BTreeMap<i64, Vec<SignalObservation>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HealthReport {
@@ -47,6 +52,7 @@ impl HealthEngine {
         db: &Db,
         projects: &[Project],
         pueue_snapshot: &[PueueTask],
+        detection_signals: &DetectionSignals,
         limits: &CampaignLimits,
         now: i64,
     ) -> Result<HealthReport, AppError> {
@@ -83,17 +89,24 @@ impl HealthEngine {
                 continue;
             }
 
-            observe_experiment(db, project, &row, task, now, &mut report)?;
+            let signals = detection_signals
+                .get(&row.pueue_task_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            observe_experiment(db, &row, signals, now, &mut report)?;
         }
         Ok(report)
     }
 
     /// Execute the stored diagnosis of `ActionPending` rows.  `continue`
-    /// resets the row to healthy; kill actions ride an already-confirmed
-    /// termination request: missing or failed requests are refused with an
-    /// idempotent error event while in-flight requests are advanced through
-    /// the standard termination state machine exactly once per request.
-    pub async fn execute_pending<P: PueueApi + Clone>(
+    /// resets the row to healthy; kill actions ride the standard termination
+    /// pipeline: a missing request is opened here as `Requested` (the
+    /// daemon's termination pass performs the actual kill exactly once per
+    /// request), in-flight requests are left to that same pipeline, and an
+    /// already-confirmed request defers to the terminal projection hook.
+    /// Failed or timed-out requests are refused with an idempotent error
+    /// event.
+    pub async fn execute_pending<P: PueueApi>(
         db: &Db,
         pueue: &P,
         projects: &[Project],
@@ -137,12 +150,11 @@ impl HealthEngine {
                                 TerminationRequestStatus::Requested
                                     | TerminationRequestStatus::Dispatching
                                     | TerminationRequestStatus::Sent
-                            ) =>
-                        {
-                            TerminationManager::new(db, pueue.clone())
-                                .execute(request.request_id)
-                                .await?;
-                            executed += 1;
+                            ) => {}
+                        None => {
+                            if request_diagnosed_kill(db, pueue, &row, &diagnosis, now).await? {
+                                executed += 1;
+                            }
                         }
                         _ => {
                             record_refused_action(
@@ -158,6 +170,58 @@ impl HealthEngine {
         }
         Ok(executed)
     }
+}
+
+/// Open the `Requested` termination request behind a diagnosed kill so the
+/// daemon's standard termination pipeline performs the kill exactly once.
+/// The incident is keyed by the live task's stable incident identity; tasks
+/// that already disappeared return `false` and are left to the terminal
+/// projection hook.
+async fn request_diagnosed_kill<P: PueueApi>(
+    db: &Db,
+    pueue: &P,
+    row: &RunningHealthRow,
+    diagnosis: &ValidatedDiagnosis,
+    now: i64,
+) -> Result<bool, AppError> {
+    let Some(project) = ProjectRepository::new(db).find_by_id(&row.project_id)? else {
+        return Ok(false);
+    };
+    let task = match pueue
+        .status_json()
+        .await?
+        .into_iter()
+        .find(|task| task.id == row.pueue_task_id && task.group == project.pueue_group)
+    {
+        Some(task) => task,
+        None => return Ok(false),
+    };
+    let incident_key = task_incident_key(&task);
+    let update = IncidentRepository::new(db).upsert_active(&NewIncident::new(
+        &row.project_id,
+        HEALTH_DIAGNOSIS_INCIDENT_KIND,
+        Some(incident_key.as_str()),
+        format!("{}:{}", incident_key, row.experiment_id),
+        now,
+    ))?;
+    let reason = serde_json::json!({
+        "source": "health_action_executor",
+        "experiment_id": row.experiment_id,
+        "campaign_id": row.campaign_id,
+        "recommended_action": diagnosis.recommended_action,
+        "root_cause_class": diagnosis.root_cause_class,
+        "confidence": diagnosis.confidence,
+        "summary": diagnosis.summary,
+    })
+    .to_string();
+    TerminationManager::new_without_pueue(db).request_with_reason(
+        update.incident.incident_id,
+        task_signature(&task),
+        reason,
+        now,
+        None,
+    )?;
+    Ok(true)
 }
 
 /// Complete a confirmed health action once its killed task reaches the
@@ -201,12 +265,25 @@ pub(crate) fn handle_terminal_projection(
         record_refused_action(db, &row, diagnosis.recommended_action, now)?;
         return Ok(());
     }
-    if count_live_repairs(db, &experiment.experiment_id)? > 0 {
+    // A successor already dispatched for this projection makes any further
+    // work here a duplicate: reconcile reprocesses the same terminal task on
+    // every pass until the row is deleted.
+    if count_direct_resume_successors(db, &experiment.experiment_id)? > 0 {
         return Ok(());
     }
     match diagnosis.recommended_action {
         RecommendedAction::KillAndResume if limits.max_live_repairs > 0 => {
-            if !resume_experiment(db, &row, experiment, limits, now)? {
+            if count_live_repairs(db, &experiment.experiment_id)?
+                >= i64::from(limits.max_live_repairs)
+            {
+                escalate_after_terminal(
+                    db,
+                    &row,
+                    diagnosis.recommended_action,
+                    escalation_reason(diagnosis.recommended_action),
+                    now,
+                )?;
+            } else if !resume_experiment(db, &row, experiment, limits, now)? {
                 escalate_after_terminal(
                     db,
                     &row,
@@ -227,7 +304,7 @@ pub(crate) fn handle_terminal_projection(
     Ok(())
 }
 
-fn count_live_repairs(db: &Db, experiment_id: &str) -> Result<i64, AppError> {
+fn count_direct_resume_successors(db: &Db, experiment_id: &str) -> Result<i64, AppError> {
     let connection = db.connect()?;
     connection
         .query_row(
@@ -235,6 +312,15 @@ fn count_live_repairs(db: &Db, experiment_id: &str) -> Result<i64, AppError> {
             [experiment_id],
             |row| row.get(0),
         )
+        .map_err(database_error("count direct resume successors"))
+}
+
+/// Total resume repairs across the whole lineage rooted at the origin of
+/// `experiment_id`, so repeated single-resume generations exhaust
+/// `max_live_repairs` cumulatively instead of per generation.
+fn count_live_repairs(db: &Db, experiment_id: &str) -> Result<i64, AppError> {
+    let connection = db.connect()?;
+    count_live_repair_descendants(&connection, experiment_id)
         .map_err(database_error("count live resume repairs"))
 }
 
@@ -360,26 +446,14 @@ fn record_refused_action(
 
 fn observe_experiment(
     db: &Db,
-    project: &Project,
     row: &RunningHealthRow,
-    task: &PueueTask,
+    signals: &[SignalObservation],
     now: i64,
     report: &mut HealthReport,
 ) -> Result<(), AppError> {
-    let project_config = config::load(&project.config_path)?;
-    let log_dir = project.root_path.join(".pueue-agent/logs");
-    let snapshot = read_task_tail(&log_dir, task.id, project_config.check.log_tail_bytes)?;
-    let stalled = tail_is_stalled(snapshot.as_ref(), &project_config.check, now);
-    let detector = Detector::for_project(project.project_id.as_str(), &project.root_path, &log_dir);
-    let tail = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.evidence.as_str())
-        .unwrap_or("");
-    let signals = detector.signal_observations_for(task, tail, &project_config.check, stalled, now);
+    let repeated_class = repeated_non_staleness_class(&row.signal_summary_json, signals)?;
 
-    let repeated_class = repeated_non_staleness_class(&row.signal_summary_json, &signals)?;
-
-    for signal in &signals {
+    for signal in signals {
         HealthRepository::record_observation(db, &row.experiment_id, now, summary_entry(signal))?;
     }
     if signals.is_empty() {
@@ -426,17 +500,6 @@ pub(crate) fn read_task_tail(
         }
     }
     Ok(None)
-}
-
-fn tail_is_stalled(snapshot: Option<&LogSnapshot>, config: &CheckConfig, now: i64) -> bool {
-    let Some(modified_at_nanos) = snapshot.and_then(|snapshot| snapshot.modified_at_nanos) else {
-        return false;
-    };
-    let Ok(now) = u128::try_from(now) else {
-        return false;
-    };
-    let unchanged_seconds = now.saturating_sub(modified_at_nanos / 1_000_000_000);
-    unchanged_seconds >= u128::from(config.stall_minutes) * 60
 }
 
 fn repeated_non_staleness_class(

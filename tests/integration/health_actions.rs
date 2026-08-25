@@ -5,20 +5,18 @@ use std::{
 
 use async_trait::async_trait;
 use pueue_agent::{
-    config::PatternAction,
     db::{
         CampaignRepository, Db, ExperimentRepository, HealthRepository, ProjectRepository,
         StartCampaignRequest, TerminationRequestRepository,
     },
-    detect::Observation,
     execution_policy::CampaignLimits,
     health::HealthEngine,
-    incidents::IncidentStore,
     models::{ExperimentStatus, HealthState, NewProject, ProposalKind},
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
-    reconcile::{managed_task_run_signature, task_incident_key, task_signature, Reconciler},
+    reconcile::{managed_task_run_signature, Reconciler},
     state::ObjectiveSnapshot,
+    termination::TerminationManager,
     AppError,
 };
 use serde_json::json;
@@ -40,6 +38,10 @@ impl FakePueue {
 
     fn kill_calls(&self) -> Vec<i64> {
         self.kill_calls.lock().unwrap().clone()
+    }
+
+    fn push_task(&self, task: PueueTask) {
+        self.tasks.lock().unwrap().push(task);
     }
 }
 
@@ -239,15 +241,14 @@ impl Harness {
             "recommended_action": recommended_action,
             "summary": "gpu exhausted",
         });
-        self.db
-            .connect()
-            .unwrap()
-            .execute(
-                "UPDATE running_health SET state = 'action_pending', diagnosis_json = ?1
-                 WHERE experiment_id = ?2",
-                rusqlite::params![diagnosis.to_string(), experiment_id],
-            )
-            .unwrap();
+        HealthRepository::store_diagnosis(&self.db, experiment_id, &diagnosis, 240).unwrap();
+        HealthRepository::set_state(
+            &self.db,
+            experiment_id,
+            HealthState::ActionPending,
+            241,
+        )
+        .unwrap();
     }
 
     async fn reconcile_tasks(&self, tasks: Vec<PueueTask>, limits: &CampaignLimits, now: i64) {
@@ -255,21 +256,6 @@ impl Harness {
             .with_campaign_limits(*limits)
             .run_once_at(now)
             .await
-            .unwrap();
-    }
-
-    fn observe_fatal_pattern(&self, task: &PueueTask) {
-        IncidentStore::new(&self.db)
-            .observe(Observation::task_pattern(
-                "project-a",
-                task_incident_key(task),
-                task_signature(task),
-                "cuda-oom",
-                PatternAction::Kill,
-                1,
-                "CUDA out of memory",
-                200,
-            ))
             .unwrap();
     }
 
@@ -286,13 +272,41 @@ impl Harness {
         let projects = ProjectRepository::new(&self.db).list_enabled().unwrap();
         HealthEngine::execute_pending(
             &self.db,
-            &self.fake_pueue.clone(),
+            &self.fake_pueue,
             &projects,
             limits,
             now,
         )
         .await
         .unwrap()
+    }
+
+    /// Drive the standard termination pipeline for the single open request:
+    /// this is what the daemon's `run_termination` pass does every tick.
+    async fn run_termination_pass(&self) {
+        for request_id in self.pending_request_ids() {
+            TerminationManager::new(&self.db, self.fake_pueue.clone())
+                .execute(request_id)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Promote a reserved resume successor to an accepted experiment bound to
+    /// a fresh running Pueue task, as the daemon's reserved-intent dispatcher
+    /// plus Pueue would.
+    fn promote_successor_to_task(&self, experiment_id: &str, task_id: i64) {
+        let experiments = ExperimentRepository::new(&self.db);
+        experiments.mark_submitting(experiment_id, 500).unwrap();
+        experiments
+            .mark_accepted(
+                experiment_id,
+                task_id,
+                &managed_task_run_signature(&running_task("pa-project", task_id, "100")).unwrap(),
+                510,
+            )
+            .unwrap();
+        self.fake_pueue.push_task(running_task("pa-project", task_id, "100"));
     }
 
     fn event_count(&self, kind: &str) -> i64 {
@@ -380,7 +394,7 @@ async fn continue_resets_to_healthy_without_any_kill() {
 }
 
 #[tokio::test]
-async fn kill_and_resume_without_confirmed_request_is_refused_without_kill() {
+async fn diagnosed_kill_completes_full_chain_without_seeded_requests() {
     let harness = Harness::new();
     fs::write(harness.log_path("project-a", 41), "epoch 1 loss 0.52\n").unwrap();
     let experiment_id = harness.accepted_campaign_experiment("project-a", "pa-project", "a", 41);
@@ -393,48 +407,31 @@ async fn kill_and_resume_without_confirmed_request_is_refused_without_kill() {
         .await;
     harness.set_action_pending(&experiment_id, "kill_and_resume");
 
-    let executed = harness.execute_pending(&CampaignLimits::default(), 300).await;
+    // No incident or termination request exists: the executor opens the
+    // request itself instead of relying on the legacy kill-pattern route.
+    let limits = CampaignLimits::default();
+    let executed = harness.execute_pending(&limits, 300).await;
 
-    assert_eq!(executed, 0);
-    let row = HealthRepository::get(&harness.db, &experiment_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.state, HealthState::ActionPending);
-    assert_eq!(harness.fake_pueue.kill_calls(), Vec::<i64>::new());
-    assert_eq!(harness.event_count("termination_failed"), 1);
-
-    harness.execute_pending(&CampaignLimits::default(), 400).await;
-    assert_eq!(
-        harness.event_count("termination_failed"),
-        1,
-        "refusal logging must stay idempotent"
+    assert_eq!(executed, 1, "the executor opened the termination request");
+    assert_eq!(harness.pending_request_ids().len(), 1);
+    assert!(
+        harness.fake_pueue.kill_calls().is_empty(),
+        "request creation must defer the kill to the termination pass"
     );
-}
+    assert_eq!(harness.event_count("termination_failed"), 0);
 
-#[tokio::test]
-async fn confirmed_kill_and_resume_inserts_successor_after_killed_projection() {
-    let harness = Harness::new();
-    fs::write(harness.log_path("project-a", 41), "epoch 1 loss 0.52\n").unwrap();
-    let experiment_id = harness.accepted_campaign_experiment("project-a", "pa-project", "a", 41);
-    harness
-        .reconcile_tasks(
-            vec![running_task("pa-project", 41, "100")],
-            &CampaignLimits::default(),
-            200,
-        )
-        .await;
-    harness.set_action_pending(&experiment_id, "kill_and_resume");
-    harness.observe_fatal_pattern(&running_task("pa-project", 41, "100"));
+    // Repeat passes stay idempotent while the request is in flight.
+    let executed = harness.execute_pending(&limits, 320).await;
+    assert_eq!(executed, 0);
     assert_eq!(harness.pending_request_ids().len(), 1);
 
-    let limits = CampaignLimits::default();
-    let executed = harness.execute_pending(&limits, 250).await;
-
-    assert_eq!(executed, 1, "the in-flight kill pipeline advanced");
+    // The standard termination pipeline performs the kill exactly once.
+    harness.run_termination_pass().await;
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
 
+    // The killed projection confirms the request and inserts the successor.
     harness
-        .reconcile_tasks(vec![killed_task("pa-project", 41, "100")], &limits, 300)
+        .reconcile_tasks(vec![killed_task("pa-project", 41, "100")], &limits, 400)
         .await;
 
     let old = ExperimentRepository::new(&harness.db)
@@ -449,7 +446,10 @@ async fn confirmed_kill_and_resume_inserts_successor_after_killed_projection() {
         .unwrap()
         .unwrap();
     assert_eq!(successor.status, ExperimentStatus::Reserved);
-    assert_eq!(successor.parent_experiment_id.as_deref(), Some(experiment_id.as_str()));
+    assert_eq!(
+        successor.parent_experiment_id.as_deref(),
+        Some(experiment_id.as_str())
+    );
     let checkpoint_note: Option<String> = harness
         .db
         .connect()
@@ -474,7 +474,7 @@ async fn confirmed_kill_and_resume_inserts_successor_after_killed_projection() {
     );
 
     harness
-        .reconcile_tasks(vec![killed_task("pa-project", 41, "100")], &limits, 320)
+        .reconcile_tasks(vec![killed_task("pa-project", 41, "100")], &limits, 420)
         .await;
     assert_eq!(
         harness.experiment_ids_resuming(&experiment_id).len(),
@@ -482,6 +482,37 @@ async fn confirmed_kill_and_resume_inserts_successor_after_killed_projection() {
         "repeat projections must not duplicate the successor"
     );
     assert_eq!(harness.experiment_count(), 2);
+}
+
+#[tokio::test]
+async fn confirmed_request_keeps_executor_from_reopening_the_pipeline() {
+    let harness = Harness::new();
+    fs::write(harness.log_path("project-a", 41), "epoch 1 loss 0.52\n").unwrap();
+    let experiment_id = harness.accepted_campaign_experiment("project-a", "pa-project", "a", 41);
+    harness
+        .reconcile_tasks(
+            vec![running_task("pa-project", 41, "100")],
+            &CampaignLimits::default(),
+            200,
+        )
+        .await;
+    harness.set_action_pending(&experiment_id, "kill_and_resume");
+
+    let limits = CampaignLimits::default();
+    harness.execute_pending(&limits, 300).await;
+    let request_id = harness.pending_request_ids()[0];
+    TerminationRequestRepository::new(&harness.db)
+        .transition_status(request_id, pueue_agent::models::TerminationRequestStatus::Confirmed)
+        .unwrap();
+
+    let executed = harness.execute_pending(&limits, 340).await;
+
+    assert_eq!(
+        executed, 0,
+        "a confirmed request defers to the terminal projection hook"
+    );
+    assert!(harness.fake_pueue.kill_calls().is_empty());
+    assert_eq!(harness.event_count("termination_failed"), 0);
 }
 
 #[tokio::test]
@@ -497,13 +528,13 @@ async fn exhausted_live_repair_budget_escalates_instead_of_resubmitting() {
         )
         .await;
     harness.set_action_pending(&experiment_id, "kill_and_resume");
-    harness.observe_fatal_pattern(&running_task("pa-project", 41, "100"));
 
     let limits = CampaignLimits {
         max_live_repairs: 0,
         ..CampaignLimits::default()
     };
     harness.execute_pending(&limits, 250).await;
+    harness.run_termination_pass().await;
     assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
 
     harness
@@ -521,5 +552,87 @@ async fn exhausted_live_repair_budget_escalates_instead_of_resubmitting() {
         "escalation degrades the campaign"
     );
     assert_eq!(harness.event_count("operator_wake"), 1);
+}
+
+/// The chain-depth cap counts every resume repair descended from the origin
+/// experiment, so E→R1→R2 stops at `max_live_repairs = 2` even though each
+/// generation only ever sees its direct child.
+#[tokio::test]
+async fn resume_chain_depth_is_capped_across_all_descendants() {
+    for max_live_repairs in [0u32, 1, 2, 3] {
+        let harness = Harness::new();
+        fs::write(harness.log_path("project-a", 41), "epoch 1 loss 0.52\n").unwrap();
+        let limits = CampaignLimits {
+            max_live_repairs,
+            max_same_spec_retries: 8,
+            ..CampaignLimits::default()
+        };
+        let mut current_experiment =
+            harness.accepted_campaign_experiment("project-a", "pa-project", "a", 41);
+        let mut current_task = 41;
+        let mut next_task = 42;
+        harness
+            .reconcile_tasks(vec![running_task("pa-project", 41, "100")], &limits, 200)
+            .await;
+        let mut now = 600;
+
+        for generation in 0..=max_live_repairs {
+            harness.set_action_pending(&current_experiment, "kill_and_resume");
+            let executed = harness.execute_pending(&limits, now).await;
+            assert_eq!(executed, 1, "generation {generation} opened its request");
+            harness.run_termination_pass().await;
+            assert_eq!(
+                harness.fake_pueue.kill_calls().last(),
+                Some(&current_task),
+                "generation {generation} killed exactly its own task"
+            );
+            now += 100;
+            harness
+                .reconcile_tasks(
+                    vec![killed_task("pa-project", current_task, "100")],
+                    &limits,
+                    now,
+                )
+                .await;
+
+            let successors = harness.experiment_ids_resuming(&current_experiment);
+            if generation < max_live_repairs {
+                assert_eq!(
+                    successors.len(),
+                    1,
+                    "chain depth {generation} < {max_live_repairs} must resume"
+                );
+                let successor = successors[0].clone();
+                current_task = next_task;
+                next_task += 1;
+                harness.promote_successor_to_task(&successor, current_task);
+                now += 100;
+                harness
+                    .reconcile_tasks(
+                        vec![running_task("pa-project", current_task, "100")],
+                        &limits,
+                        now,
+                    )
+                    .await;
+                current_experiment = successor;
+            } else {
+                assert_eq!(
+                    successors.len(),
+                    0,
+                    "chain depth reached max_live_repairs={max_live_repairs}: must escalate"
+                );
+                assert_eq!(
+                    harness.campaign_state("campaign-health-a"),
+                    "degraded",
+                    "depth-capped chains degrade the campaign"
+                );
+                assert_eq!(
+                    harness.event_count("operator_wake"),
+                    1,
+                    "depth cap emits exactly one operator wake"
+                );
+            }
+        }
+    }
 }
 

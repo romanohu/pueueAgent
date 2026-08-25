@@ -1,16 +1,19 @@
 use std::{
+    collections::BTreeMap,
     fs,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use pueue_agent::{
+    config,
     db::{
         CampaignRepository, Db, ExperimentRepository, HealthRepository, ProjectRepository,
         StartCampaignRequest,
     },
+    detect::Detector,
     execution_policy::CampaignLimits,
-    health::{HealthEngine, HealthReport},
+    health::{DetectionSignals, HealthEngine, HealthReport},
     models::{ExperimentStatus, HealthState, NewProject, ProposalKind},
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
@@ -209,9 +212,48 @@ impl Harness {
             .unwrap();
     }
 
+    /// Mirror the daemon detection pass: read each running task's log once
+    /// and collect the emitted signal observations for the observer.
+    fn detection_signals(&self, tasks: &[PueueTask]) -> DetectionSignals {
+        let projects = ProjectRepository::new(&self.db).list_enabled().unwrap();
+        let projects_by_group = projects
+            .iter()
+            .map(|project| (project.pueue_group.as_str(), project))
+            .collect::<BTreeMap<_, _>>();
+        let mut signals = DetectionSignals::new();
+        for task in tasks.iter().filter(|task| task.is_running()) {
+            let Some(project) = projects_by_group.get(task.group.as_str()) else {
+                continue;
+            };
+            let project_config = config::load(&project.config_path).unwrap();
+            let detector = Detector::for_project(
+                &project.project_id,
+                &project.root_path,
+                project.root_path.join(".pueue-agent/logs"),
+            );
+            let inspection = detector.inspect_task_now(task, &project_config.check).unwrap();
+            let entry = signals.entry(task.id).or_default();
+            for signal in inspection.signals {
+                if !entry.contains(&signal) {
+                    entry.push(signal);
+                }
+            }
+        }
+        signals
+    }
+
     fn run_engine(&self, tasks: &[PueueTask], now: i64) -> HealthReport {
         let projects = ProjectRepository::new(&self.db).list_enabled().unwrap();
-        HealthEngine::run_once(&self.db, &projects, tasks, &CampaignLimits::default(), now).unwrap()
+        let detection_signals = self.detection_signals(tasks);
+        HealthEngine::run_once(
+            &self.db,
+            &projects,
+            tasks,
+            &detection_signals,
+            &CampaignLimits::default(),
+            now,
+        )
+        .unwrap()
     }
 
     fn agent_run_count(&self) -> i64 {
