@@ -259,6 +259,7 @@ mod commands {
         let input = StatusInput {
             daemon_health: ServiceManager.status()?,
             pueue,
+            now_override: None,
         };
         let rendered = if json {
             render_project_status_json(&db, &project, &input)?

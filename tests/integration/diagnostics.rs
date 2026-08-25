@@ -7,9 +7,9 @@ use pueue_agent::{
     cli::Cli,
     db::{
         AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
-        ExperimentRepository, IncidentRepository, InterventionRepository, ProjectRepository,
-        StartCampaignRequest, TaskObservationRepository, TerminationRequestRepository,
-        LATEST_SCHEMA_VERSION,
+        ExperimentRepository, HealthRepository, IncidentRepository, InterventionRepository,
+        ProjectRepository, StartCampaignRequest, TaskObservationRepository,
+        TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
         build_doctor_report, build_doctor_report_with_policy, render_doctor_report,
@@ -22,9 +22,9 @@ use pueue_agent::{
         StartupEnvironment,
     },
     models::{
-        AgentRunStatus, EventKind, EventStatus, ExecutionProjection, NewAgentRun, NewEvent,
-        NewIncident, NewProject, NewTaskObservation, NewTerminationRequest, ProposalKind,
-        TerminationRequestStatus,
+        AgentRunStatus, EventKind, EventStatus, ExecutionProjection, HealthState, NewAgentRun,
+        NewEvent, NewIncident, NewProject, NewTaskObservation, NewTerminationRequest,
+        ProposalKind, SignalSummaryEntry, TerminationRequestStatus,
     },
     output::redact_sensitive_text,
     pueue::PueueTask,
@@ -848,6 +848,7 @@ impl DiagnosticsHarness {
         StatusInput {
             daemon_health: ServiceStatus::Running,
             pueue,
+            now_override: None,
         }
     }
 
@@ -2653,6 +2654,170 @@ fn status_json_counts_project_interventions_without_exposing_message_bodies() {
     assert!(!rendered.contains(&pending.message));
     assert!(!rendered.contains(&reserved.message));
     assert!(!rendered.contains(&applied.message));
+}
+
+fn insert_running_health_listing_fixture(
+    harness: &DiagnosticsHarness,
+    suffix: &str,
+    updated_at: i64,
+) -> String {
+    let proposal_id = format!("diagnostics-{suffix}-proposal");
+    let submission_id = format!("diagnostics-{suffix}-submission");
+    let experiment_id = format!("diagnostics-{suffix}-experiment");
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                proposal_id, campaign_id, kind, status, hypothesis,
+                source_experiment_id, argv_json, working_directory,
+                expected_evidence_json, canonical_digest, reject_reason,
+                created_at, updated_at
+             ) VALUES (?1, 'diagnostics-campaign', 'experiment', 'accepted',
+                'health listing fixture', NULL, '[\"true\"]', '.', '[]', ?1, NULL, ?2, ?2)",
+            params![proposal_id, updated_at],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO submissions (
+                submission_id, project_id, argv_json, created_at, pueue_task_id,
+                task_signature, status, kind, metadata_json, origin_agent_run_id
+             ) VALUES (?1, 'project-a', '[\"true\"]', ?2, NULL, NULL, 'accepted',
+                'experiment', '{}', NULL)",
+            params![submission_id, updated_at],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO experiments (
+                experiment_id, campaign_id, proposal_id, submission_id,
+                parent_experiment_id, attempt, status, pueue_task_id,
+                task_signature, failure_code, failure_fingerprint,
+                created_at, updated_at, finished_at
+             ) VALUES (?1, 'diagnostics-campaign', ?2, ?3, NULL, 900, 'succeeded',
+                NULL, NULL, NULL, NULL, ?4, ?4, ?4)",
+            params![experiment_id, proposal_id, submission_id, updated_at],
+        )
+        .unwrap();
+    drop(connection);
+    HealthRepository::ensure_running(
+        &harness.db,
+        "project-a",
+        "diagnostics-campaign",
+        &experiment_id,
+        500,
+        updated_at,
+    )
+    .unwrap();
+    experiment_id
+}
+
+#[test]
+fn status_json_lists_running_health_rows_newest_first_with_bounded_signals() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    let older = insert_running_health_listing_fixture(&harness, "health-older", 110);
+    for observed_at in [105_i64, 108] {
+        HealthRepository::record_observation(
+            &harness.db,
+            &older,
+            observed_at,
+            SignalSummaryEntry {
+                class: "oom".to_owned(),
+                source: "builtin_probe".to_owned(),
+                evidence_digest: format!("oom-digest-{observed_at}"),
+                observed_at,
+            },
+        )
+        .unwrap();
+    }
+    HealthRepository::set_state(&harness.db, &older, HealthState::Suspicious, 111).unwrap();
+    HealthRepository::store_diagnosis(
+        &harness.db,
+        &older,
+        &json!({
+            "root_cause_class": "oom",
+            "confidence": 0.9,
+            "recommended_action": "kill_and_resume",
+            "summary": "gpu exhausted",
+        }),
+        112,
+    )
+    .unwrap();
+    let newer = insert_running_health_listing_fixture(&harness, "health-newer", 210);
+    HealthRepository::record_observation(
+        &harness.db,
+        &newer,
+        205,
+        SignalSummaryEntry {
+            class: "numerical".to_owned(),
+            source: "builtin_probe".to_owned(),
+            evidence_digest: "numerical-digest".to_owned(),
+            observed_at: 205,
+        },
+    )
+    .unwrap();
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+
+    let recent = value["health"]["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0]["experiment_id"], newer.as_str());
+    assert_eq!(recent[0]["state"], "healthy");
+    assert_eq!(recent[0]["observation_count"], 1);
+    assert_eq!(recent[0]["signals"].as_array().unwrap().len(), 1);
+    assert_eq!(recent[0]["signals"][0]["class"], "numerical");
+    assert!(recent[0].get("recommended_action").is_none());
+    assert_eq!(recent[1]["experiment_id"], older.as_str());
+    assert_eq!(recent[1]["state"], "suspicious");
+    assert_eq!(recent[1]["recommended_action"], "kill_and_resume");
+    assert_eq!(recent[1]["signals"].as_array().unwrap().len(), 2);
+    assert_eq!(recent[1]["signals"][0]["evidence_digest"], "oom-digest-105");
+    assert!(
+        recent[0]["updated_at"].as_i64().unwrap() >= recent[1]["updated_at"].as_i64().unwrap()
+    );
+}
+
+#[test]
+fn status_json_caps_running_health_listing_at_fifty_rows() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    for index in 0..52 {
+        insert_running_health_listing_fixture(
+            &harness,
+            &format!("health-cap-{index:02}"),
+            1000 - index as i64,
+        );
+    }
+
+    let rendered = render_project_status_json(
+        &harness.db,
+        &harness.project(),
+        &harness.input(PueueSnapshot::Tasks(vec![])),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&rendered).unwrap();
+
+    let recent = value["health"]["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 50);
+    assert_eq!(
+        recent[0]["experiment_id"],
+        "diagnostics-health-cap-00-experiment"
+    );
+    let all_updated = recent
+        .iter()
+        .map(|row| row["updated_at"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    let mut sorted = all_updated.clone();
+    sorted.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(all_updated, sorted);
+    assert!(all_updated[all_updated.len() - 1] >= 950);
 }
 
 #[test]

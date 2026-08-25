@@ -12,8 +12,8 @@ use crate::{
     db::{
         inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
         CampaignStatusProjection, Db, EventExecutionProjection, EventRepository,
-        IncidentRepository, InterventionRepository, ProjectRepository, SubmissionRepository,
-        TaskObservationRepository,
+        HealthRepository, IncidentRepository, InterventionRepository, ProjectRepository,
+        SubmissionRepository, TaskObservationRepository,
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
@@ -45,6 +45,7 @@ pub const DEFAULT_SUMMARY_LIMIT: usize = 8;
 pub const DEFAULT_EVENT_LIST_LIMIT: usize = 100;
 pub const MAX_EVENT_LIST_LIMIT: usize = 1_000;
 pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
+pub const MAX_HEALTH_ROW_LIMIT: usize = 50;
 
 const MAX_TASK_AGENT_RUNS: usize = 64;
 const MAX_RESTART_UNCERTAIN_SAMPLES: i64 = 3;
@@ -2300,6 +2301,16 @@ pub fn render_project_status_json(
         interventions: InterventionStatusProjection {
             counts: intervention_counts(db, &project.project_id)?,
         },
+        health: HealthSection {
+            recent: HealthRepository::list_for_project(
+                db,
+                &project.project_id,
+                MAX_HEALTH_ROW_LIMIT,
+            )?
+            .iter()
+            .map(RunningHealthSummary::from)
+            .collect(),
+        },
         campaign,
         policy: FutureSection::default(),
         resource: FutureSection::default(),
@@ -2324,6 +2335,7 @@ struct ProjectStatusReport {
     termination: TerminationSection,
     agent_runs: AgentRunSection,
     interventions: InterventionStatusProjection,
+    health: HealthSection,
     #[serde(skip_serializing_if = "Option::is_none")]
     campaign: Option<CampaignStatusSummary>,
     policy: FutureSection,
@@ -2612,6 +2624,51 @@ struct InterventionCountsProjection {
     pending: i64,
     reserved: i64,
     applied: i64,
+}
+
+#[derive(Serialize)]
+struct HealthSection {
+    recent: Vec<RunningHealthSummary>,
+}
+
+#[derive(Serialize)]
+struct RunningHealthSummary {
+    experiment_id: String,
+    campaign_id: String,
+    pueue_task_id: i64,
+    state: crate::models::HealthState,
+    observation_count: i64,
+    last_observed_at: i64,
+    updated_at: i64,
+    signals: Vec<crate::models::SignalSummaryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_action: Option<String>,
+}
+
+impl From<&crate::models::RunningHealthRow> for RunningHealthSummary {
+    fn from(row: &crate::models::RunningHealthRow) -> Self {
+        Self {
+            experiment_id: bounded_summary(&row.experiment_id),
+            campaign_id: bounded_summary(&row.campaign_id),
+            pueue_task_id: row.pueue_task_id,
+            state: row.state,
+            observation_count: row.observation_count,
+            last_observed_at: row.last_observed_at,
+            updated_at: row.updated_at,
+            signals: serde_json::from_str(&row.signal_summary_json).unwrap_or_default(),
+            recommended_action: running_health_recommended_action(&row.diagnosis_json),
+        }
+    }
+}
+
+fn running_health_recommended_action(diagnosis_json: &Option<String>) -> Option<String> {
+    let diagnosis = diagnosis_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())?;
+    diagnosis
+        .get("recommended_action")?
+        .as_str()
+        .map(bounded_summary)
 }
 
 #[derive(Serialize)]

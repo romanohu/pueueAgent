@@ -30,6 +30,7 @@ pub enum PueueSnapshot {
 pub struct StatusInput {
     pub daemon_health: ServiceStatus,
     pub pueue: PueueSnapshot,
+    pub now_override: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +194,10 @@ pub fn render_project_status(
         ));
     }
 
-    let now = status_timestamp()?;
+    let now = match input.now_override {
+        Some(now) => now,
+        None => status_timestamp()?,
+    };
     if let Some(campaign) = CampaignRepository::new(db)
         .status_projection_for_project(&project.project_id, now)?
     {
@@ -204,6 +208,7 @@ pub fn render_project_status(
             ));
         }
     }
+    lines.extend(running_health_lines(db, &project.project_id, now)?);
 
     lines.extend(guardrail_lines(db, project)?);
     lines.extend(context_lines(db, project)?);
@@ -213,6 +218,112 @@ pub fn render_project_status(
     )));
 
     Ok(lines.join("\n"))
+}
+
+const MAX_HEALTH_LINES: usize = 8;
+
+fn running_health_lines(db: &Db, project_id: &str, now: i64) -> Result<Vec<String>, AppError> {
+    let limit = i64::try_from(MAX_HEALTH_LINES).unwrap_or(1);
+    let connection = db.connect()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT rh.experiment_id, rh.state, rh.signal_summary_json,
+                    rh.diagnosis_json, rh.last_observed_at
+             FROM running_health AS rh
+             JOIN campaigns AS c ON c.campaign_id = rh.campaign_id
+             WHERE rh.project_id = ?1 AND c.state = 'active'
+             ORDER BY rh.last_observed_at DESC, rh.experiment_id DESC
+             LIMIT ?2",
+        )
+        .map_err(|source| AppError::Database {
+            operation: "prepare running health status query",
+            source,
+        })?;
+    let rows = statement
+        .query_map(rusqlite::params![project_id, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|source| AppError::Database {
+            operation: "query running health status rows",
+            source,
+        })?;
+    let collected = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::Database {
+            operation: "read running health status rows",
+            source,
+        })?;
+    Ok(collected
+        .into_iter()
+        .map(|(experiment_id, state, signal_summary_json, diagnosis_json, last_observed_at)| {
+            running_health_line(
+                &experiment_id,
+                &state,
+                &signal_summary_json,
+                diagnosis_json.as_deref(),
+                last_observed_at,
+                now,
+            )
+        })
+        .collect())
+}
+
+fn running_health_line(
+    experiment_id: &str,
+    state: &str,
+    signal_summary_json: &str,
+    diagnosis_json: Option<&str>,
+    last_observed_at: i64,
+    now: i64,
+) -> String {
+    format!(
+        "health: id={} state={} signals={} age={} action={}",
+        bounded_redacted_text(experiment_id),
+        bounded_redacted_text(state),
+        top_signal_label(signal_summary_json),
+        now.saturating_sub(last_observed_at),
+        last_recommended_action(diagnosis_json),
+    )
+}
+
+fn top_signal_label(signal_summary_json: &str) -> String {
+    let Ok(entries) =
+        serde_json::from_str::<Vec<crate::models::SignalSummaryEntry>>(signal_summary_json)
+    else {
+        return "none".to_owned();
+    };
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for entry in entries {
+        if let Some(counted) = counts.iter_mut().find(|(class, _)| class == entry.class.as_str()) {
+            counted.1 += 1;
+        } else {
+            counts.push((entry.class, 1));
+        }
+    }
+    counts.sort_unstable_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    counts
+        .first()
+        .map(|(class, count)| {
+            bounded_redacted_text(&format!("{}x{count}", bounded_redacted_text(class)))
+        })
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn last_recommended_action(diagnosis_json: Option<&str>) -> String {
+    let diagnosis = diagnosis_json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+    let action = diagnosis
+        .as_ref()
+        .and_then(|value| value.get("recommended_action"))
+        .and_then(serde_json::Value::as_str);
+    action
+        .map(bounded_redacted_text)
+        .unwrap_or_else(|| "none".to_owned())
 }
 
 pub fn render_project_status_compact(
@@ -971,4 +1082,68 @@ mod tests {
         assert!(!rendered.contains("GUARDRAIL_SECRET"));
         assert!(rendered.contains("[REDACTED]"));
     }
+
+    #[test]
+    fn running_health_line_ranks_top_signal_and_ages_by_observation_time() {
+        let summary = r#"[
+            {"class":"oom","source":"builtin_probe","evidence_digest":"d1","observed_at":90},
+            {"class":"numerical","source":"builtin_probe","evidence_digest":"d2","observed_at":95},
+            {"class":"oom","source":"config_pattern","evidence_digest":"d3","observed_at":99}
+        ]"#;
+        let diagnosis = r#"{"root_cause_class":"oom","confidence":0.9,"recommended_action":"kill_and_resume","summary":"gpu exhausted"}"#;
+
+        let line =
+            running_health_line("experiment-cli", "suspicious", summary, Some(diagnosis), 100, 205);
+
+        assert_eq!(
+            line,
+            "health: id=experiment-cli state=suspicious signals=oomx2 age=105 action=kill_and_resume"
+        );
+    }
+
+    #[test]
+    fn running_health_line_defaults_to_none_labels_without_signals_or_diagnosis() {
+        let line = running_health_line("experiment-cli", "healthy", "[]", None, 100, 130);
+
+        assert_eq!(
+            line,
+            "health: id=experiment-cli state=healthy signals=none age=30 action=none"
+        );
+    }
+
+    #[test]
+    fn running_health_line_bounds_and_redacts_untrusted_labels() {
+        let experiment_id = format!("AWS_SECRET_ACCESS_KEY=EXPERIMENT_SECRET {}", "e".repeat(400));
+        let class = format!("{}", "c".repeat(400));
+        let summary = format!(
+            r#"[{{"class":"{class}","source":"builtin_probe","evidence_digest":"d","observed_at":1}}]"#
+        );
+        let action = format!("kill_and_resume --password ACTION_SECRET {}", "a".repeat(400));
+        let diagnosis = format!(r#"{{"recommended_action":"{action}"}}"#);
+
+        let line = running_health_line(
+            &experiment_id,
+            "suspicious",
+            &summary,
+            Some(&diagnosis),
+            100,
+            101,
+        );
+
+        assert!(line.starts_with("health: "));
+        assert!(!line.contains("EXPERIMENT_SECRET"));
+        assert!(!line.contains("ACTION_SECRET"));
+        assert!(line.contains("age=1"));
+        for segment in line.split(' ') {
+            let value = match segment.split_once('=') {
+                Some((_, value)) => value,
+                None => continue,
+            };
+            assert!(value.len() <= 243, "unbounded segment value: {segment}");
+        }
+        let (_, age_and_action) = line.split_once("age=").unwrap();
+        assert!(age_and_action.starts_with("1 action="));
+        assert!(age_and_action.ends_with("..."));
+    }
 }
+

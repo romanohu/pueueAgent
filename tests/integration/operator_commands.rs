@@ -17,14 +17,14 @@ use pueue_agent::{
     daemon::{Daemon, DaemonConfig},
     db::{
         AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        IncidentRepository, ProjectRepository, StartCampaignRequest, TaskObservationRepository,
-        TerminationRequestRepository,
+        HealthRepository, IncidentRepository, ProjectRepository, StartCampaignRequest,
+        TaskObservationRepository, TerminationRequestRepository,
     },
     diagnostics::render_project_status_json,
     models::{
         AgentContextMode, AgentRunStatus, CampaignState, EventKind, ExperimentTerminalOutcome,
-        NewAgentRun, NewEvent, NewIncident, NewProject, NewTaskObservation,
-        NewTerminationRequest, ProposalKind, TerminationRequestStatus,
+        HealthState, NewAgentRun, NewEvent, NewIncident, NewProject, NewTaskObservation,
+        NewTerminationRequest, ProposalKind, SignalSummaryEntry, TerminationRequestStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
@@ -1306,6 +1306,7 @@ max_agent_runs = 10
         StatusInput {
             daemon_health: ServiceStatus::Running,
             pueue: snapshot,
+            now_override: None,
         }
     }
 
@@ -1920,6 +1921,73 @@ fn status_text_output_has_stable_active_project_projection() {
         format!(
             "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 claimed=0 retry_wait=0 in_flight=0 dispatched=0 failed=0 dead_letter=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\nguardrails: consecutive_failures=0/3 experiments=0/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
             project.root_path.display(),
+        )
+    );
+}
+
+#[test]
+fn status_text_output_has_stable_running_health_projection() {
+    let harness = OperatorHarness::with_accepted_experiment();
+    HealthRepository::ensure_running(
+        &harness.db,
+        "project-a",
+        "campaign-cli",
+        "experiment-cli",
+        41,
+        harness.now + 10,
+    )
+    .unwrap();
+    for observed_at in [harness.now + 11, harness.now + 12] {
+        HealthRepository::record_observation(
+            &harness.db,
+            "experiment-cli",
+            observed_at,
+            SignalSummaryEntry {
+                class: "oom".to_owned(),
+                source: "builtin_probe".to_owned(),
+                evidence_digest: format!("oom-digest-{observed_at}"),
+                observed_at,
+            },
+        )
+        .unwrap();
+    }
+    HealthRepository::set_state(
+        &harness.db,
+        "experiment-cli",
+        HealthState::Suspicious,
+        harness.now + 13,
+    )
+    .unwrap();
+    HealthRepository::store_diagnosis(
+        &harness.db,
+        "experiment-cli",
+        &json!({
+            "root_cause_class": "oom",
+            "confidence": 0.9,
+            "recommended_action": "kill_and_resume",
+            "summary": "gpu exhausted",
+        }),
+        harness.now + 13,
+    )
+    .unwrap();
+    let input = StatusInput {
+        daemon_health: ServiceStatus::Running,
+        pueue: PueueSnapshot::Tasks(vec![harness.running_task()]),
+        now_override: Some(harness.now + 20),
+    };
+
+    let output = status::render_project_status(
+        &harness.db,
+        &harness.project(),
+        &input,
+    )
+    .unwrap();
+
+    assert_eq!(
+        output,
+        format!(
+            "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 claimed=0 retry_wait=0 in_flight=0 dispatched=0 failed=0 dead_letter=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\ncampaign: id=campaign-cli state=active reason=none experiments=accepted=1 rolling_usage=experiment=1 next_eligible_at=none unreconciled=0 objective_digest=objective-digest-cli\nhealth: id=experiment-cli state=suspicious signals=oomx2 age=8 action=kill_and_resume\nguardrails: consecutive_failures=0/3 experiments=1/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
+            harness.project().root_path.display(),
         )
     );
 }

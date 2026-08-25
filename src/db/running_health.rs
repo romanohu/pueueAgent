@@ -62,6 +62,32 @@ impl HealthRepository {
             .map_err(database_error("read running health row"))
     }
 
+    /// Rows for an operator listing surface, most recently updated first.
+    pub fn list_for_project(
+        db: &Db,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RunningHealthRow>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{RUNNING_HEALTH_SELECT}
+                 WHERE project_id = ?1
+                 ORDER BY updated_at DESC, experiment_id DESC
+                 LIMIT ?2"
+            ))
+            .map_err(database_error("prepare running health list query"))?;
+        let rows = statement
+            .query_map(params![project_id, fetch_limit], read_running_health_row)
+            .map_err(database_error("query running health list"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read running health list"))
+    }
+
     pub fn due_observations(
         db: &Db,
         now: i64,
