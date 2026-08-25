@@ -155,6 +155,8 @@ decision analysis も agent-run hourly budget を消費します。1 cycle の�
 
 実行中 experiment は periodic observer によって継続評価されます。同じ class の信号が繰り返されるか log が stall すると experiment は `suspicious` になり、1 回の read-only diagnosis agent が bounded な証拠から原因と推奨 action（`continue` / `kill_and_resume` / `kill_and_escalate`）を返します。破壊的な action は確認済みの termination request を必要とし、`kill_and_resume` は live repair 予算が残る場合に限り同一 argv の後継 experiment を 1 つだけ再投入します。diagnosis の試行回数と signal 要約は上限付きで、生の log 行が SQLite に保存されることはありません。現在の状態は `pueue-agent status` の `health:` 行と `status --json` の `health.recent` で確認できます。
 
+Phase 3 の running health は、実行中 experiment を `running OOM/stall observer` 付きの `periodic observer` で継続評価します。
+
 `goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
 
 service-owned execution policy では network が既定で enabled です。ただし network access と credential access は別の権限であり、明示 allowlist にない credential/environment value は agent や agent task に継承されません。
