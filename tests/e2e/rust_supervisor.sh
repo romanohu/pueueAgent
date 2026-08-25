@@ -80,8 +80,11 @@ wait_for_sql() {
   # Decision cycles advance across multiple production daemon passes (the
   # foreground daemon defaults to a 60-second interval). Decisions observed
   # beside failure events additionally defer by one whole lease window, so
-  # this waiter must span the deferral plus spawn/reap/apply passes.
-  for _ in $(seq 12000); do
+  # this waiter must span the deferral plus spawn/reap/apply passes. Budget
+  # wall-clock seconds rather than iterations: loaded hosts stretch every
+  # polling query.
+  local deadline=$(( $(date +%s) + 900 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     actual="$(sql "$query")"
     if [ "$actual" -ge "$expected" ] 2>/dev/null; then
       return 0
@@ -95,13 +98,14 @@ wait_for_sql() {
   done
   "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json >&2 || true
   sql "SELECT event_id, project_id, kind, status, not_before FROM events ORDER BY event_id" >&2 || true
-  fail "$label (expected $expected, got $(sql "$query"))"
+  fail "$label (expected $(printf '%q' "$expected"), got $(printf '%q' "$(sql "$query")"))"
 }
 
 wait_for_agent_calls() {
   expected="$1"
   label="$2"
-  for _ in $(seq 100); do
+  local deadline=$(( $(date +%s) + 600 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     actual=0
     if [ -f "$PUEUE_AGENT_TEST_AGENT_LOG" ]; then
       actual="$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG" || true)"
@@ -120,7 +124,8 @@ wait_for_agent_calls() {
 
 wait_for_codex_call() {
   label="$1"
-  for _ in $(seq 100); do
+  local deadline=$(( $(date +%s) + 300 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     if [ -s "$PUEUE_AGENT_TEST_CODEX_LOG" ]; then
       return 0
     fi
@@ -164,7 +169,8 @@ stop_daemon() {
 wait_for_task_state() {
   task_id="$1"
   wanted="$2"
-  for _ in $(seq 100); do
+  local deadline=$(( $(date +%s) + 90 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     state="$($REAL_PUEUE --config "$WORK/pueue.yml" status --json \
       | jq -r --arg id "$task_id" '.tasks[$id].status | keys[0]' 2>/dev/null || true)"
     if [ "$state" = "$wanted" ]; then
@@ -178,7 +184,8 @@ wait_for_task_state() {
 
 wait_for_task_terminal() {
   task_id="$1"
-  for _ in $(seq 100); do
+  local deadline=$(( $(date +%s) + 180 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     state="$($REAL_PUEUE --config "$WORK/pueue.yml" status --json \
       | jq -r --arg id "$task_id" '.tasks[$id].status | keys[0]' 2>/dev/null || true)"
     if [ "$state" != "Running" ] && [ "$state" != "Queued" ] && [ "$state" != "Stashed" ] && [ "$state" != "null" ]; then
@@ -1137,10 +1144,11 @@ write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 3
 sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
      WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=901'"
 start_daemon
-for _ in $(seq 100); do
+halt_deadline=$(( $(date +%s) + 180 ))
+while [ "$(date +%s)" -lt "$halt_deadline" ]; do
   halted="$(sql "SELECT CASE WHEN halted_reason IS NULL THEN 0 ELSE 1 END FROM projects WHERE project_id = '$PROJECT_ID_A'")"
   [ "$halted" = "1" ] && break
-  sleep 0.1
+  sleep 0.2
 done
 stop_daemon
 [ "$halted" = "1" ] || fail "max_agent_runs did not halt the project"
