@@ -10,6 +10,7 @@ use crate::{
     },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
+    execution_policy::CampaignLimits,
     incidents::IncidentStore,
     models::{
         EventKind, Experiment, ExperimentTerminalOutcome, NewEvent, NewTaskObservation,
@@ -39,6 +40,7 @@ pub struct ReconcileReport {
 pub struct Reconciler<'db, P> {
     db: &'db Db,
     pueue: P,
+    campaign_limits: CampaignLimits,
 }
 
 impl<'db, P> Reconciler<'db, P>
@@ -46,7 +48,16 @@ where
     P: PueueApi,
 {
     pub fn new(db: &'db Db, pueue: P) -> Self {
-        Self { db, pueue }
+        Self {
+            db,
+            pueue,
+            campaign_limits: CampaignLimits::default(),
+        }
+    }
+
+    pub fn with_campaign_limits(mut self, limits: CampaignLimits) -> Self {
+        self.campaign_limits = limits;
+        self
     }
 
     pub async fn run_once(&mut self) -> Result<ReconcileReport, AppError> {
@@ -128,7 +139,13 @@ where
                     now,
                 )?;
                 if let Some(experiment) = experiment.as_ref() {
-                    project_terminal_experiment(self.db, experiment, task, now)?;
+                    project_terminal_experiment(
+                        self.db,
+                        experiment,
+                        task,
+                        &self.campaign_limits,
+                        now,
+                    )?;
                 }
                 let event = materialize_terminal_event(
                     self.db,
@@ -298,6 +315,7 @@ fn project_terminal_experiment(
     db: &Db,
     experiment: &Experiment,
     task: &PueueTask,
+    limits: &CampaignLimits,
     now: i64,
 ) -> Result<(), AppError> {
     let experiments = ExperimentRepository::new(db);
@@ -332,6 +350,7 @@ fn project_terminal_experiment(
             now,
         )?;
     }
+    crate::health::handle_terminal_projection(db, experiment, task, limits, now)?;
     HealthRepository::delete_for_experiment(db, &experiment.experiment_id)
 }
 

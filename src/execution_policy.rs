@@ -232,6 +232,7 @@ pub struct CampaignLimits {
     pub observer_interval_minutes: u32,
     pub max_decision_attempts_per_cycle: u32,
     pub max_decision_wait_minutes: u32,
+    pub max_live_repairs: u32,
 }
 
 impl Default for CampaignLimits {
@@ -247,6 +248,7 @@ impl Default for CampaignLimits {
             observer_interval_minutes: 30,
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
+            max_live_repairs: 2,
         }
     }
 }
@@ -1451,6 +1453,9 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         max_decision_wait_minutes: raw
             .max_decision_wait_minutes
             .unwrap_or(defaults.max_decision_wait_minutes),
+        max_live_repairs: raw
+            .max_live_repairs
+            .unwrap_or(defaults.max_live_repairs),
     };
     if !(1..=64).contains(&limits.max_parallel_experiments)
         || !(1..=10_000).contains(&limits.max_new_experiments_per_24h)
@@ -1462,6 +1467,7 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         || !(1..=1_440).contains(&limits.observer_interval_minutes)
         || !(1..=10).contains(&limits.max_decision_attempts_per_cycle)
         || !(1..=10_080).contains(&limits.max_decision_wait_minutes)
+        || limits.max_live_repairs > 8
     {
         return Err(PolicyViolation::new(
             PolicyViolationCode::PolicyUnknownField,
@@ -2000,6 +2006,7 @@ struct RawCampaignLimits {
     observer_interval_minutes: Option<u32>,
     max_decision_attempts_per_cycle: Option<u32>,
     max_decision_wait_minutes: Option<u32>,
+    max_live_repairs: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

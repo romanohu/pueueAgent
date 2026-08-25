@@ -255,6 +255,8 @@ impl<'db> CampaignRepository<'db> {
             request.submission_id,
             None,
             0,
+            None,
+            None,
             request.now,
         )?;
         insert_experiment_reservation(
@@ -545,6 +547,8 @@ impl<'db> CampaignRepository<'db> {
             submission_id,
             Some(source_experiment_id),
             same_spec_count,
+            None,
+            None,
             now,
         )?;
         insert_experiment_reservation(
@@ -559,6 +563,186 @@ impl<'db> CampaignRepository<'db> {
             .commit()
             .map_err(database_error("commit campaign proposal acceptance"))?;
         Ok(ProposalAcceptance::Accepted(intent))
+    }
+
+    /// Accept a same-spec resume proposal for a terminal source experiment and
+    /// reserve the successor experiment with checkpoint lineage metadata
+    /// (`resume_of_experiment_id`, `checkpoint_note`).  Returns `Ok(None)`
+    /// when the coordinator budget path cannot admit the successor now so the
+    /// caller can fall back to a bounded escalation instead of forcing the
+    /// reservation through.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_resume_proposal(
+        &self,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &ValidatedProposal,
+        checkpoint_note: &str,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> Result<Option<ManagedSubmissionIntent>, AppError> {
+        let argv_json = serialize_strings(
+            proposal.argv(),
+            "serialize campaign resume arguments",
+        )?;
+        let evidence_json = serialize_strings(
+            proposal.expected_evidence(),
+            "serialize campaign resume expected evidence",
+        )?;
+        let metadata_json =
+            serialize_submission_metadata(None, campaign_id, proposal_id, experiment_id)?;
+        let window_ends_at = rolling_window_end(now)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign resume proposal acceptance"))?;
+
+        let campaign = read_campaign(&transaction, campaign_id)?;
+        if campaign.state != CampaignState::Active {
+            transaction
+                .commit()
+                .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
+        validate_project_available(&transaction, &campaign.project_id)?;
+        if proposal.objective_digest() != campaign.objective_digest {
+            return Err(validation_error(
+                "proposal.objective_digest",
+                "must match the persisted campaign objective digest",
+            ));
+        }
+        if find_proposal_by_digest(&transaction, campaign_id, proposal.canonical_digest())?
+            .is_some()
+        {
+            return Err(validation_error(
+                "proposal.canonical_digest",
+                "already exists in this campaign",
+            ));
+        }
+        let source_experiment_id = proposal.source_experiment_id().ok_or_else(|| {
+            validation_error(
+                "source_experiment_id",
+                "is required for a resume proposal",
+            )
+        })?;
+        let source = read_experiment(&transaction, source_experiment_id)?;
+        if source.campaign_id != campaign_id {
+            return Err(validation_error(
+                "source_experiment_id",
+                "must belong to the same campaign",
+            ));
+        }
+        if !is_terminal(source.status) {
+            return Err(validation_error(
+                "source_experiment_id",
+                "must reference a terminal experiment",
+            ));
+        }
+
+        let resume_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments WHERE resume_of_experiment_id = ?1",
+                [source_experiment_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count campaign resume successors"))?;
+        if resume_count >= i64::from(limits.max_live_repairs) {
+            transaction
+                .commit()
+                .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
+        let parallel_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                 WHERE campaign_id = ?1
+                   AND status IN ('reserved','submitting','accepted','unreconciled')",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count parallel campaign experiments"))?;
+        if parallel_count >= i64::from(limits.max_parallel_experiments) {
+            transaction
+                .commit()
+                .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
+        let rolling_count = count_live_reservations(
+            &transaction,
+            campaign_id,
+            BudgetDimension::Experiment,
+            now,
+        )?;
+        if rolling_count >= i64::from(limits.max_new_experiments_per_24h) {
+            transaction
+                .commit()
+                .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
+        let same_spec_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM experiments AS experiment
+                 JOIN proposals AS candidate ON candidate.proposal_id = experiment.proposal_id
+                 WHERE experiment.campaign_id = ?1
+                   AND candidate.argv_json = ?2
+                   AND candidate.working_directory = ?3",
+                params![campaign_id, argv_json, proposal.working_directory()],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count same-spec campaign experiments"))?;
+        if same_spec_count > i64::from(limits.max_same_spec_retries) {
+            transaction
+                .commit()
+                .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
+
+        insert_proposal(
+            &transaction,
+            proposal_id,
+            campaign_id,
+            proposal,
+            ProposalStatus::Accepted,
+            &argv_json,
+            &evidence_json,
+            now,
+        )?;
+        insert_submission(
+            &transaction,
+            submission_id,
+            &campaign.project_id,
+            &argv_json,
+            &metadata_json,
+            None,
+            now,
+        )?;
+        insert_experiment(
+            &transaction,
+            experiment_id,
+            campaign_id,
+            proposal_id,
+            submission_id,
+            Some(source_experiment_id),
+            same_spec_count,
+            Some(source_experiment_id),
+            Some(checkpoint_note),
+            now,
+        )?;
+        insert_experiment_reservation(
+            &transaction,
+            campaign_id,
+            experiment_id,
+            now,
+            window_ends_at,
+        )?;
+        let intent = read_intent_by_experiment(&transaction, experiment_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign resume proposal acceptance"))?;
+        Ok(Some(intent))
     }
 
     pub fn find_by_id(&self, campaign_id: &str) -> Result<Option<Campaign>, AppError> {
@@ -1989,6 +2173,8 @@ fn insert_experiment(
     submission_id: &str,
     parent_experiment_id: Option<&str>,
     attempt: i64,
+    resume_of_experiment_id: Option<&str>,
+    checkpoint_note: Option<&str>,
     now: i64,
 ) -> Result<(), AppError> {
     transaction
@@ -1996,8 +2182,9 @@ fn insert_experiment(
             "INSERT INTO experiments (
                 experiment_id, campaign_id, proposal_id, submission_id, parent_experiment_id,
                 attempt, status, pueue_task_id, task_signature, failure_code,
-                failure_fingerprint, created_at, updated_at, finished_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL, ?8, ?8, NULL)",
+                failure_fingerprint, created_at, updated_at, finished_at,
+                resume_of_experiment_id, checkpoint_note
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL, ?8, ?8, NULL, ?9, ?10)",
             params![
                 experiment_id,
                 campaign_id,
@@ -2007,6 +2194,8 @@ fn insert_experiment(
                 attempt,
                 ExperimentStatus::Reserved,
                 now,
+                resume_of_experiment_id,
+                checkpoint_note,
             ],
         )
         .map_err(database_error("insert reserved campaign experiment"))?;

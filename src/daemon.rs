@@ -176,7 +176,9 @@ where
             .run_once_at(now)
             .await?;
         report.observations = self.run_detection(&reconciliation).await?;
-        report.health = self.run_health_observer(&reconciliation, now)?;
+        let mut health = self.run_health_observer(&reconciliation, now)?;
+        health.executed_actions = self.run_health_actions(now).await?;
+        report.health = health;
         report.diagnoses = self.run_health_diagnoses(now).await?;
         report.termination_outcomes = self.run_termination().await?;
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
@@ -447,6 +449,19 @@ where
             &self.policy.campaign_limits,
             now,
         )
+    }
+
+    /// Execute stored diagnoses on `ActionPending` running-health rows.
+    async fn run_health_actions(&self, now: i64) -> Result<usize, AppError> {
+        let projects = ProjectRepository::new(&self.db).list_enabled()?;
+        HealthEngine::execute_pending(
+            &self.db,
+            &self.pueue,
+            &projects,
+            &self.policy.campaign_limits,
+            now,
+        )
+        .await
     }
 
     /// Spawn bounded diagnosis agents for suspicious running-health rows.

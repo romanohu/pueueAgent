@@ -363,6 +363,56 @@ pub fn auto_kill_request_for_terminal_task(
     }))
 }
 
+/// Latest termination request for `pueue_task_id`, provided it reached the
+/// `Confirmed` state.  Health actions may only continue an already-confirmed
+/// kill; requests that are missing, in flight, failed, or timed out keep the
+/// gate closed.
+pub fn require_confirmed(
+    db: &Db,
+    project_id: &str,
+    pueue_task_id: i64,
+) -> Result<Option<crate::models::TerminationRequest>, AppError> {
+    Ok(latest_request_matching_task(db, project_id, pueue_task_id)?
+        .filter(|request| request.status == TerminationRequestStatus::Confirmed))
+}
+
+/// Latest termination request recorded for `pueue_task_id`, regardless of
+/// status.
+pub fn latest_request_for_pueue_task(
+    db: &Db,
+    project_id: &str,
+    pueue_task_id: i64,
+) -> Result<Option<crate::models::TerminationRequest>, AppError> {
+    latest_request_matching_task(db, project_id, pueue_task_id)
+}
+
+fn latest_request_matching_task(
+    db: &Db,
+    project_id: &str,
+    pueue_task_id: i64,
+) -> Result<Option<crate::models::TerminationRequest>, AppError> {
+    let requests = TerminationRequestRepository::new(db).find_by_project(project_id)?;
+    let mut latest = None;
+    for request in requests {
+        if request_signature_targets_task(&request, pueue_task_id) {
+            latest = Some(request);
+        }
+    }
+    Ok(latest)
+}
+
+fn request_signature_targets_task(
+    request: &crate::models::TerminationRequest,
+    pueue_task_id: i64,
+) -> bool {
+    request
+        .task_signature
+        .strip_prefix("pueue-task:v1:")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|identity| identity.get("id").and_then(serde_json::Value::as_i64))
+        == Some(pueue_task_id)
+}
+
 pub fn confirm_auto_kill_terminal_observation(
     db: &Db,
     request_id: TerminationRequestId,

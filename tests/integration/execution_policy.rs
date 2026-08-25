@@ -228,6 +228,7 @@ fn decision_campaign_limits_have_safe_service_defaults() {
             observer_interval_minutes: 30,
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
+            max_live_repairs: 2,
         }
     );
     assert_eq!(policy.default_network, NetworkMode::Enabled);
