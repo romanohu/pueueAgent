@@ -99,6 +99,10 @@ manifest は未知の field を許さない JSON object で、次の形式です
 
 `status --json` の `campaign.decision` は、実行中の analysis があればその cycle、なければ scheduler と同じ due 条件と source terminal 順で次の cycle を bounded に投影します。field は `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、`failure_code`、`failure_summary` です。raw prompt、objective、decision JSON、environment、argv、log excerpt は含めません。live campaign に decision cycle がなければ `campaign.decision` は明示的な `null` です。
 
+active campaign の実行中 experiment がある場合、`status` は experiment ごとに `health:` 行を表示します。行には experiment ID、状態（`healthy` / `suspicious` / `diagnosing` / `action_pending`）、最多 signal class と観測回数（signal がなければ `none`）、最後の観測からの経過秒、最新 diagnosis の推奨 action（なければ `none`）が入ります。最大 8 行までで、各値は bounded / redacted です。
+
+`status --json` の `health.recent` は `running_health` 行を `updated_at` の降順で最大 50 件列挙します。各行には state、観測回数、最終観測・更新時刻、bounded な signal 要約（class / source / evidence digest / 観測時刻）、推奨 action（格納されていれば）が含まれます。raw log 行は含まれません。
+
 ### `pueue-agent campaign`
 
 - **構文:** `pueue-agent campaign <status|pause|resume|retire> [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
