@@ -4,7 +4,9 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 22;
+pub const LATEST_SCHEMA_VERSION: i64 = 23;
+const EVENTS_V23_KIND_LIST: &str =
+    "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis'";
 const EVENTS_V18_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
 const EVENTS_V17_KIND_LIST: &str =
@@ -728,11 +730,86 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_running_health_schema_v22(&transaction)?;
     }
+    if version <= 22 {
+        migrate_event_kinds_to_v23(&transaction)?;
+    } else {
+        verify_event_kinds_v23(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
 
     Ok(())
+}
+
+fn migrate_event_kinds_to_v23(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite events schema for v23 migration"))?;
+    if !event_kind_list_matches(&event_sql, EVENTS_V23_KIND_LIST) {
+        if !event_kind_list_matches(&event_sql, EVENTS_V18_KIND_LIST) {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite event kinds before v23 migration",
+            });
+        }
+        let old_kind_list = event_kind_list(&event_sql).ok_or(AppError::Runtime {
+            operation: "read SQLite events kind list for v23 migration",
+        })?;
+        transaction
+            .execute_batch("PRAGMA writable_schema = ON;")
+            .map_err(database_error("enable SQLite writable schema for v23 event migration"))?;
+        let replaced = transaction.execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'
+                AND sql LIKE '%' || ?1 || '%'",
+            params![
+                old_kind_list,
+                EVENTS_V23_KIND_LIST
+            ],
+        );
+        let writable_schema_disabled = transaction
+            .execute_batch("PRAGMA writable_schema = OFF;")
+            .map_err(database_error(
+                "disable SQLite writable schema after v23 event migration",
+            ));
+        let replaced = replaced.map_err(database_error("add health diagnosis event kind"))?;
+        writable_schema_disabled?;
+        if replaced != 1 {
+            return Err(AppError::Runtime {
+                operation: "migrate exactly one SQLite events kind list to v23",
+            });
+        }
+    }
+    verify_event_kinds_v23(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 23;")
+        .map_err(database_error("set SQLite v23 schema version"))
+}
+
+fn verify_event_kinds_v23(connection: &Connection) -> Result<(), AppError> {
+    let event_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read SQLite events schema for v23 verification"))?;
+    if event_sql
+        .as_deref()
+        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V23_KIND_LIST))
+    {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v23 event kinds",
+        })
+    }
 }
 
 fn migrate_agent_run_execution_projection_to_v14(
@@ -1809,7 +1886,7 @@ fn decision_schema_v18_is_canonical(connection: &Connection) -> rusqlite::Result
         .optional()?;
     if !event_sql
         .as_deref()
-        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V18_KIND_LIST))
+        .is_some_and(|sql| events_kind_list_is_current(sql))
     {
         return Ok(false);
     }
@@ -2198,7 +2275,7 @@ fn decision_schema_v19_is_canonical(connection: &Connection) -> rusqlite::Result
         .optional()?;
     if !event_sql
         .as_deref()
-        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V18_KIND_LIST))
+        .is_some_and(|sql| events_kind_list_is_current(sql))
     {
         return Ok(false);
     }
@@ -2346,6 +2423,13 @@ fn event_kind_list_matches(event_sql: &str, canonical_kind_list: &str) -> bool {
         .map(|list| list.split_whitespace().collect::<String>())
         .as_deref()
         == Some(canonical_kind_list.as_str())
+}
+
+/// Databases mid-migration carry the v18 event kind list; current databases
+/// carry the v23 superset with `health_diagnosis`.
+fn events_kind_list_is_current(event_sql: &str) -> bool {
+    event_kind_list_matches(event_sql, EVENTS_V23_KIND_LIST)
+        || event_kind_list_matches(event_sql, EVENTS_V18_KIND_LIST)
 }
 
 fn event_kind_list(event_sql: &str) -> Option<&str> {
@@ -2792,4 +2876,89 @@ fn ensure_invariant_indexes(transaction: &rusqlite::Transaction<'_>) -> Result<(
                 .execute_batch(OPERATOR_LOGS_SQL)
                 .map_err(database_error("ensure SQLite operator log table"))
         })
+}
+
+#[cfg(test)]
+mod v23_event_kind_tests {
+    use super::*;
+
+    fn events_kind_list(connection: &Connection) -> String {
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        event_kind_list(&sql).unwrap().to_owned()
+    }
+
+    #[test]
+    fn fresh_databases_accept_health_diagnosis_events_at_v23() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db_path = temporary.path().join("state.sqlite3");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        {
+            let connection = db.connect().unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                LATEST_SCHEMA_VERSION
+            );
+            assert!(events_kind_list(&connection).contains("health_diagnosis"));
+        }
+    }
+
+    #[test]
+    fn v22_databases_gain_the_health_diagnosis_event_kind_on_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db_path = temporary.path().join("state.sqlite3");
+        {
+            let _db = crate::db::Db::open(&db_path).unwrap();
+        }
+        {
+            let mut connection = Connection::open(&db_path).unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute_batch("PRAGMA writable_schema = ON;")
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE sqlite_master
+                        SET sql = replace(sql, ?1, ?2)
+                      WHERE type = 'table' AND name = 'events'",
+                    params![
+                        ", 'health_diagnosis'",
+                        ""
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+            transaction
+                .execute_batch("PRAGMA user_version = 22;")
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let connection = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        drop(connection);
+
+        let db = crate::db::Db::open(&db_path).unwrap();
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        assert!(events_kind_list(&connection).contains("health_diagnosis"));
+    }
 }

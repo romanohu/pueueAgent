@@ -26,9 +26,10 @@ use crate::{
         ResolvedProjectExecutionPolicy,
     },
     interventions::InterventionReservation,
+    health_diagnosis::{parse_and_validate_diagnosis, HEALTH_DIAGNOSIS_SCHEMA},
     models::{
         launch_gate_marker_path, AgentContextMode, AgentRunRole, AgentRunStatus,
-        ExecutionProjection, NewAgentRun, Project,
+        ExecutionProjection, HealthState, NewAgentRun, Project,
     },
     native_launcher::{NativeAgentChild, NativeLaunchSpec, NativeLauncher},
     output::bounded_redacted_text,
@@ -164,6 +165,7 @@ pub struct AgentHandle {
     process_proof: ProcessProof,
     role: AgentRunRole,
     decision_persistence: Option<DecisionPersistence>,
+    diagnosis_persistence: Option<DiagnosisPersistence>,
 }
 
 enum RetainedLaunchAuthority {
@@ -453,6 +455,11 @@ enum DecisionPersistence {
     Persisted,
 }
 
+enum DiagnosisPersistence {
+    Pending,
+    Persisted,
+}
+
 enum PreparedDecision {
     Valid {
         json: String,
@@ -658,6 +665,35 @@ impl AgentRunner {
         Ok(AgentCommand { program, args })
     }
 
+    fn diagnosis_command_for(
+        &self,
+        policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+        capabilities: CodexCapabilities,
+    ) -> Result<AgentCommand, AppError> {
+        let program = policy
+            .agent_anchor
+            .canonical_path
+            .to_str()
+            .ok_or(AppError::Configuration {
+                field: "agent.program",
+            })?
+            .to_owned();
+        let args = CodexArgvBuilder::new(policy.clone(), capabilities)
+            .build_health_diagnosis_with_private_temp(config, prompt, private_tmp)
+            .map_err(AppError::from)?
+            .into_iter()
+            .map(|argument| {
+                argument
+                    .into_string()
+                    .map_err(|_| AppError::Configuration { field: "agent.args" })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AgentCommand { program, args })
+    }
+
     fn decision_command_for(
         &self,
         policy: &ResolvedProjectExecutionPolicy,
@@ -836,6 +872,61 @@ impl AgentRunner {
         .await
     }
 
+    /// Launch one bounded, read-only diagnosis run for a suspicious
+    /// running-health row.  The caller owns the already-claimed event and the
+    /// health-row state transition to `Diagnosing`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_diagnosis(
+        &self,
+        db: &crate::db::Db,
+        project: &Project,
+        project_policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        retry_policy: RetryPolicy,
+        primary_event_id: i64,
+        event_ids: &[i64],
+        experiment_id: &str,
+        evidence_json: &str,
+        now: i64,
+        run_id_guard: RunIdAdmissionGuard,
+        project_lock: ProjectAdmissionLock,
+    ) -> Result<AgentHandle, AgentSpawnError> {
+        validate_project_decision_authority(project, project_policy)
+            .map_err(|error| pre_binding_error(error.into()))?;
+        let decision_policy = resolve_decision_project_policy(&self.policy, project_policy)
+            .map_err(|error| pre_binding_error(error.into()))?;
+        let decision_capabilities = match self.config.decision_capabilities {
+            DecisionCapabilitySource::InstalledCli => {
+                probe_installed_codex_capabilities(&decision_policy.agent_anchor)
+                    .await
+                    .map_err(|error| pre_binding_error(error.into()))?
+            }
+            DecisionCapabilitySource::Fixed(capabilities) => capabilities,
+        };
+        let prompt = diagnosis_launch_prompt(evidence_json);
+        self.spawn_with_role(
+            db,
+            project,
+            &decision_policy,
+            config,
+            retry_policy,
+            primary_event_id,
+            event_ids,
+            None,
+            None,
+            AgentRunRole::Diagnosis {
+                experiment_id: experiment_id.to_owned(),
+            },
+            None,
+            Some(decision_capabilities),
+            &prompt,
+            now,
+            run_id_guard,
+            project_lock,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn spawn_with_role(
         &self,
@@ -859,7 +950,7 @@ impl AgentRunner {
         let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
         match &role {
             AgentRunRole::Standard => self.preflight_project_launch(project_policy, config, prompt),
-            AgentRunRole::Decision { .. } => {
+            AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
                 CodexArgvBuilder::new(
                     project_policy.clone(),
                     decision_capabilities.expect("decision launch capabilities were resolved"),
@@ -875,10 +966,21 @@ impl AgentRunner {
             .canonical_path
             .join(&relative_log_path);
         let execution = Self::execution_projection(project_policy).map_err(pre_binding_error)?;
+        let execution = match &role {
+            AgentRunRole::Diagnosis { .. } => ExecutionProjection::new(
+                "diagnosis",
+                execution.executable_path(),
+                execution.executable_identity(),
+            )
+            .map_err(pre_binding_error)?,
+            _ => execution,
+        };
         let repository = AgentRunRepository::new(db);
         let run_context = match &role {
             AgentRunRole::Standard => config.context.clone(),
-            AgentRunRole::Decision { .. } => AgentContextMode::Fresh,
+            AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
+                AgentContextMode::Fresh
+            }
         };
         let run = repository
             .insert_with_events_and_reservation_with_guard(
@@ -967,6 +1069,26 @@ impl AgentRunner {
                 ));
             }
         }
+        if matches!(&role, AgentRunRole::Diagnosis { .. }) {
+            if let Err(error) = temp.prepare_health_diagnosis_schema(HEALTH_DIAGNOSIS_SCHEMA) {
+                let error = AppError::from(error);
+                return Err(resolve_retained_temp_failure(
+                    db,
+                    project,
+                    run.run_id,
+                    now,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    error,
+                ));
+            }
+        }
         let private_temp_target = match temp.verified_target() {
             Ok(target) => target,
             Err(error) => {
@@ -1001,6 +1123,13 @@ impl AgentRunner {
                 &private_temp_target,
                 decision_capabilities.expect("decision launch capabilities were resolved"),
             ),
+            AgentRunRole::Diagnosis { .. } => self.diagnosis_command_for(
+                project_policy,
+                config,
+                prompt,
+                &private_temp_target,
+                decision_capabilities.expect("decision launch capabilities were resolved"),
+            ),
         } {
             Ok(command) => command,
             Err(error) => {
@@ -1023,7 +1152,7 @@ impl AgentRunner {
         };
         let environment = match match &role {
             AgentRunRole::Standard => self.environment_for(project_policy, run.run_id),
-            AgentRunRole::Decision { .. } => {
+            AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
                 self.decision_environment_for(project_policy, run.run_id)
             }
         } {
@@ -1202,6 +1331,10 @@ impl AgentRunner {
             decision_persistence: objective_digest.map(|objective_digest| {
                 DecisionPersistence::Pending { objective_digest }
             }),
+            diagnosis_persistence: match &role {
+                AgentRunRole::Diagnosis { .. } => Some(DiagnosisPersistence::Pending),
+                _ => None,
+            },
             role,
         })
     }
@@ -1245,6 +1378,13 @@ fn decision_launch_prompt(context: &DecisionContextBundle) -> String {
     format!(
         "Analyze this supervisor-owned campaign context without modifying the project. Return exactly one JSON decision matching the supplied schema.\n{}",
         context.json
+    )
+}
+
+fn diagnosis_launch_prompt(evidence_json: &str) -> String {
+    format!(
+        "Diagnose this running experiment's health signals without modifying anything. Return exactly one JSON diagnosis matching the supplied schema.\n{}",
+        evidence_json
     )
 }
 
@@ -1839,6 +1979,7 @@ impl AgentHandle {
                 cycle_id,
                 attempt_number,
             } => (cycle_id.clone(), *attempt_number),
+            AgentRunRole::Diagnosis { .. } => return Ok(()),
         };
         if matches!(self.decision_persistence, Some(DecisionPersistence::Persisted)) {
             return Ok(());
@@ -1891,6 +2032,91 @@ impl AgentHandle {
         Ok(())
     }
 
+    /// Persist the diagnosis outcome of a `Diagnosis` run onto its
+    /// running-health row before terminal cleanup releases the private temp.
+    fn persist_diagnosis_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let experiment_id = match &self.role {
+            AgentRunRole::Diagnosis { experiment_id } => experiment_id.clone(),
+            _ => return Ok(()),
+        };
+        if matches!(
+            self.diagnosis_persistence,
+            Some(DiagnosisPersistence::Persisted)
+        ) {
+            return Ok(());
+        }
+        let validated = if !self
+            .terminal_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.status == AgentRunStatus::Completed)
+        {
+            None
+        } else {
+            let temp = match &self.retained_authority {
+                RetainedLaunchAuthority::Retained { temp, .. } => temp,
+                RetainedLaunchAuthority::Released => {
+                    return Err(AppError::Runtime {
+                        operation: "read diagnosis output after releasing private temp",
+                    })
+                }
+                #[cfg(test)]
+                RetainedLaunchAuthority::Test => {
+                    return Err(AppError::Runtime {
+                        operation: "test diagnosis handle has no private temp",
+                    })
+                }
+            };
+            let parsed = match temp.read_health_diagnosis_output() {
+                Ok(bytes) => parse_and_validate_diagnosis(&bytes).ok(),
+                Err(_) => None,
+            };
+            parsed.map(|diagnosis| {
+                serde_json::to_value(&diagnosis)
+                    .expect("validated diagnosis always serializes")
+            })
+        };
+        match validated {
+            Some(value) => {
+                crate::db::HealthRepository::store_diagnosis(db, &experiment_id, &value, now)?;
+                crate::db::HealthRepository::set_state(
+                    db,
+                    &experiment_id,
+                    HealthState::ActionPending,
+                    now,
+                )?;
+            }
+            None => {
+                let attempts = match crate::db::HealthRepository::get(db, &experiment_id)? {
+                    Some(row) => row.diagnosis_attempt_count() + 1,
+                    None => 1,
+                };
+                let wrapper = serde_json::json!({ "attempt": attempts });
+                crate::db::HealthRepository::store_diagnosis(
+                    db,
+                    &experiment_id,
+                    &wrapper,
+                    now,
+                )?;
+                crate::db::HealthRepository::set_state(
+                    db,
+                    &experiment_id,
+                    HealthState::Suspicious,
+                    now,
+                )?;
+                if let Some(outcome) = &mut self.terminal_outcome {
+                    outcome.status = AgentRunStatus::Failed;
+                    outcome.last_error = Some("health_diagnosis_missing".to_owned());
+                }
+            }
+        }
+        self.diagnosis_persistence = Some(DiagnosisPersistence::Persisted);
+        Ok(())
+    }
+
     fn persist_terminal_outcome(
         &mut self,
         db: &crate::db::Db,
@@ -1905,6 +2131,7 @@ impl AgentHandle {
             });
         }
         self.persist_decision_outcome(db, now)?;
+        self.persist_diagnosis_outcome(db, now)?;
         let outcome = self
             .terminal_outcome
             .as_ref()
@@ -2512,6 +2739,7 @@ mod tests {
         let mut handle = AgentHandle {
             role: AgentRunRole::Standard,
             decision_persistence: None,
+            diagnosis_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid: child.id(),
@@ -2607,6 +2835,7 @@ mod tests {
         let mut handle = AgentHandle {
             role: AgentRunRole::Standard,
             decision_persistence: None,
+            diagnosis_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid,
@@ -2755,6 +2984,7 @@ mod tests {
         let handle = AgentHandle {
             role: AgentRunRole::Standard,
             decision_persistence: None,
+            diagnosis_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid,
@@ -3054,6 +3284,7 @@ mod tests {
         let mut handle = AgentHandle {
             role: AgentRunRole::Standard,
             decision_persistence: None,
+            diagnosis_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid: child.id(),

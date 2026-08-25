@@ -115,7 +115,7 @@ fn observe_experiment(
     Ok(())
 }
 
-fn campaign_defers(db: &Db, campaign_id: &str) -> Result<bool, AppError> {
+pub(crate) fn campaign_defers(db: &Db, campaign_id: &str) -> Result<bool, AppError> {
     let connection = db.connect()?;
     let state: Option<String> = connection
         .query_row(
@@ -128,7 +128,7 @@ fn campaign_defers(db: &Db, campaign_id: &str) -> Result<bool, AppError> {
     Ok(matches!(state.as_deref(), Some("paused") | Some("halted")))
 }
 
-fn read_task_tail(
+pub(crate) fn read_task_tail(
     log_dir: &Path,
     task_id: i64,
     tail_bytes: u32,

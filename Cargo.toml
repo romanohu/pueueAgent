@@ -87,6 +87,10 @@ path = "tests/integration/native_agent_gate.rs"
 name = "health_observer"
 path = "tests/integration/health_observer.rs"
 
+[[test]]
+name = "health_diagnosis"
+path = "tests/integration/health_diagnosis.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

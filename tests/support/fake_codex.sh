@@ -75,6 +75,27 @@ fi
 [ -n "$output" ] || exit 0
 [ -n "$prompt" ] || exit 70
 
+# Diagnosis-agent fixture mode: triggered by argv containing
+# --output-last-message plus PUEUE_AGENT_TEST_DIAGNOSE_MODE=1.  It must run
+# before the decision context parsing below because diagnosis prompts carry a
+# different evidence bundle.
+if [ "${PUEUE_AGENT_TEST_DIAGNOSE_MODE:-}" = "1" ]; then
+  if [ -n "${PUEUE_AGENT_TEST_DIAGNOSE_CAPTURE:-}" ]; then
+    printf 'DIAGNOSE_INVOCATION output=%s\n' "$output" \
+      >> "$PUEUE_AGENT_TEST_DIAGNOSE_CAPTURE"
+  fi
+  case "${PUEUE_AGENT_TEST_DIAGNOSE_OUTPUT:-valid}" in
+    malformed)
+      printf '%s\n' '{malformed-diagnosis' > "$output"
+      exit 0
+      ;;
+    *)
+      printf '%s\n' '{"root_cause_class":"oom","confidence":0.9,"recommended_action":"kill_and_resume","summary":"gpu exhausted"}' > "$output"
+      exit 0
+      ;;
+  esac
+fi
+
 context="${prompt#*$'\n'}"
 source_experiment_id="$(printf '%s' "$context" | jq -er '.source_experiment.experiment_id')"
 source_status="$(printf '%s' "$context" | jq -er '.source_experiment.status')"

@@ -64,6 +64,7 @@ fn event_claim_candidate_sql(status: EventStatus) -> String {
          FROM events INDEXED BY events_claimable_idx
          WHERE status IN ('pending', 'retry_wait')
            AND status = '{status}' AND not_before <= ?1
+           AND kind <> 'health_diagnosis'
          ORDER BY not_before, created_at, event_id
          LIMIT ?2"
     )
@@ -679,6 +680,45 @@ impl<'db> EventRepository<'db> {
     pub fn insert_idempotent(&self, event: &NewEvent) -> Result<Event, AppError> {
         self.insert_idempotent_with_inserted(event)
             .map(|(event, _)| event)
+    }
+
+    /// Claim one known event directly (used by the health-diagnosis
+    /// coordinator, which owns its events outside the scheduler claim loop).
+    pub fn claim_by_id(
+        &self,
+        project_id: &str,
+        event_id: i64,
+    ) -> Result<Option<Event>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin direct event claim"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE events
+                 SET status = 'claimed', lease_until = NULL, attempts = attempts + 1
+                 WHERE project_id = ?1 AND event_id = ?2 AND status IN ('pending', 'retry_wait')",
+                params![project_id, event_id],
+            )
+            .map_err(database_error("claim event by id"))?;
+        if changed != 1 {
+            transaction
+                .commit()
+                .map_err(database_error("commit empty direct event claim"))?;
+            return Ok(None);
+        }
+        let event = transaction
+            .query_row(
+                &format!("{EVENT_SELECT} WHERE project_id = ?1 AND event_id = ?2"),
+                params![project_id, event_id],
+                event_from_row,
+            )
+            .optional()
+            .map_err(database_error("read claimed event"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit direct event claim"))?;
+        Ok(event)
     }
 
     pub fn insert_idempotent_with_inserted(
@@ -1774,7 +1814,7 @@ impl<'db> EventRepository<'db> {
                 | EventKind::AutoKilled
                 | EventKind::TerminationFailed => count += 1,
                 EventKind::TaskFinished | EventKind::DeepCheck | EventKind::OperatorWake => break,
-                EventKind::CampaignDecision => {}
+                EventKind::CampaignDecision | EventKind::HealthDiagnosis => {}
             }
         }
         Ok(count)

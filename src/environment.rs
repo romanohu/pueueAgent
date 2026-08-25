@@ -909,9 +909,29 @@ impl PrivateRunTemp {
         &self,
         schema: &[u8],
     ) -> Result<(), PolicyViolation> {
+        self.prepare_named_output("decision-schema.json", "decision.json", schema)
+    }
+
+    pub(crate) fn prepare_health_diagnosis_schema(
+        &self,
+        schema: &[u8],
+    ) -> Result<(), PolicyViolation> {
+        self.prepare_named_output(
+            "health-diagnosis-schema.json",
+            "health-diagnosis.json",
+            schema,
+        )
+    }
+
+    fn prepare_named_output(
+        &self,
+        schema_name: &str,
+        output_name: &str,
+        schema: &[u8],
+    ) -> Result<(), PolicyViolation> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = schema;
+            let _ = (schema_name, output_name, schema);
             Err(PolicyViolation::new(
                 PolicyViolationCode::UnsupportedPlatform,
                 PolicyViolationStage::RunBoundPreMarker,
@@ -922,12 +942,12 @@ impl PrivateRunTemp {
             self.revalidate_current()?;
             drop(create_private_decision_file(
                 &self.directory,
-                OsStr::new("decision-schema.json"),
+                OsStr::new(schema_name),
                 schema,
             )?);
             let output = create_private_decision_file(
                 &self.directory,
-                OsStr::new("decision.json"),
+                OsStr::new(output_name),
                 &[],
             )?;
             *self
@@ -940,8 +960,17 @@ impl PrivateRunTemp {
     }
 
     pub(crate) fn read_decision_output(&self) -> Result<Vec<u8>, PolicyViolation> {
+        self.read_named_output("decision.json")
+    }
+
+    pub(crate) fn read_health_diagnosis_output(&self) -> Result<Vec<u8>, PolicyViolation> {
+        self.read_named_output("health-diagnosis.json")
+    }
+
+    fn read_named_output(&self, output_name: &str) -> Result<Vec<u8>, PolicyViolation> {
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = output_name;
             Err(PolicyViolation::new(
                 PolicyViolationCode::UnsupportedPlatform,
                 PolicyViolationStage::Finalized,
@@ -958,7 +987,7 @@ impl PrivateRunTemp {
                 .as_ref()
                 .ok_or_else(temp_error)?;
             let expected = anchor.identity;
-            let name = OsStr::new("decision.json");
+            let name = OsStr::new(output_name);
             let parent_mount = directory_mount_identity_at(
                 &self.directory,
                 PolicyViolationStage::Finalized,
@@ -983,7 +1012,8 @@ impl PrivateRunTemp {
                     PolicyViolationStage::Finalized,
                 ));
             }
-            let visible = artifact_entry_metadata_at(&self.directory, OsStr::new("decision.json"))?;
+            let visible =
+                artifact_entry_metadata_at(&self.directory, OsStr::new(output_name))?;
             if visible.identity != expected
                 || visible.mount_identity != parent_mount
                 || visible.owner != unsafe { libc::geteuid() as u32 }

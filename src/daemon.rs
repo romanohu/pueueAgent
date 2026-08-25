@@ -22,6 +22,7 @@ use crate::{
     detect::Detector,
     execution_policy::ResolvedExecutionPolicy,
     health::{HealthEngine, HealthReport},
+    health_diagnosis::run_due_diagnoses,
     incidents::IncidentStore,
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
@@ -60,6 +61,7 @@ pub struct DaemonReport {
     pub reconciliation: ReconcileReport,
     pub observations: usize,
     pub health: HealthReport,
+    pub diagnoses: usize,
     pub termination_outcomes: Vec<TerminationOutcome>,
     pub scheduled_deep_checks: usize,
     pub scheduler: SchedulerReport,
@@ -175,6 +177,7 @@ where
             .await?;
         report.observations = self.run_detection(&reconciliation).await?;
         report.health = self.run_health_observer(&reconciliation, now)?;
+        report.diagnoses = self.run_health_diagnoses(now).await?;
         report.termination_outcomes = self.run_termination().await?;
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(&reconciliation.observed_tasks)?;
@@ -444,6 +447,21 @@ where
             &self.policy.campaign_limits,
             now,
         )
+    }
+
+    /// Spawn bounded diagnosis agents for suspicious running-health rows.
+    async fn run_health_diagnoses(&mut self, now: i64) -> Result<usize, AppError> {
+        let runner = self.runner.take().ok_or(AppError::Runtime {
+            operation: "take daemon health-diagnosis runner",
+        })?;
+        let outcome = run_due_diagnoses(&self.db, &runner, self.config.claim_limit, now).await;
+        self.runner = Some(runner);
+        let report = outcome?;
+        let spawned = report.started.len();
+        self.active_cleanups.extend(report.cleanups);
+        self.active_agents
+            .extend(report.started.into_iter().map(|started| started.handle));
+        Ok(spawned)
     }
 
     async fn run_termination(&self) -> Result<Vec<TerminationOutcome>, AppError> {

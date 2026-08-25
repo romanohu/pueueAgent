@@ -229,6 +229,54 @@ impl HealthRepository {
             .map_err(database_error("delete running health row"))?;
         Ok(())
     }
+
+    /// Suspicious rows with diagnosis attempts left, oldest update first.
+    pub fn due_diagnoses(db: &Db, limit: usize) -> Result<Vec<RunningHealthRow>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_limit = i64::try_from(limit.saturating_mul(4).max(limit)).unwrap_or(i64::MAX);
+        let connection = db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{RUNNING_HEALTH_SELECT}
+                 WHERE state = 'suspicious'
+                 ORDER BY updated_at, experiment_id
+                 LIMIT ?1"
+            ))
+            .map_err(database_error("prepare due running health diagnoses query"))?;
+        let rows = statement
+            .query_map([fetch_limit], read_running_health_row)
+            .map_err(database_error("query due running health diagnoses"))?;
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read due running health diagnoses"))?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.diagnosis_attempt_count() < crate::models::MAX_DIAGNOSIS_ATTEMPTS)
+            .take(limit)
+            .collect())
+    }
+
+    /// Revert diagnosing rows whose diagnosis run is no longer live so the
+    /// bounded retry budget can resume after a daemon restart.
+    pub fn requeue_interrupted_diagnoses(db: &Db, now: i64) -> Result<usize, AppError> {
+        let connection = db.connect()?;
+        let updated = connection
+            .execute(
+                "UPDATE running_health SET state = 'suspicious', updated_at = ?1
+                 WHERE state = 'diagnosing' AND NOT EXISTS (
+                     SELECT 1 FROM agent_run_events are
+                     JOIN events e ON e.project_id = are.project_id AND e.event_id = are.event_id
+                     JOIN agent_runs ar ON ar.project_id = are.project_id AND ar.run_id = are.run_id
+                     WHERE e.kind = 'health_diagnosis'
+                       AND e.experiment_id = running_health.experiment_id
+                       AND ar.status IN ('starting', 'running'))",
+                params![now],
+            )
+            .map_err(database_error("requeue interrupted running health diagnoses"))?;
+        Ok(updated)
+    }
 }
 
 fn read_running_health_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunningHealthRow> {

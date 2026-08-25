@@ -285,11 +285,43 @@ impl CodexArgvBuilder {
         prompt: &str,
         private_tmp: &VerifiedPrivateTemp,
     ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_named_output_with_private_temp(
+            config,
+            prompt,
+            private_tmp,
+            "decision-schema.json",
+            "decision.json",
+        )
+    }
+
+    pub(crate) fn build_health_diagnosis_with_private_temp(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_named_output_with_private_temp(
+            config,
+            prompt,
+            private_tmp,
+            "health-diagnosis-schema.json",
+            "health-diagnosis.json",
+        )
+    }
+
+    fn build_named_output_with_private_temp(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+        schema_name: &str,
+        output_name: &str,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
         self.preflight_decision(config, prompt)?;
 
         let root = path_text(&self.policy.root_anchor.canonical_path)?;
-        let schema = path_text(&private_tmp.target_path().join("decision-schema.json"))?;
-        let output = path_text(&private_tmp.target_path().join("decision.json"))?;
+        let schema = path_text(&private_tmp.target_path().join(schema_name))?;
+        let output = path_text(&private_tmp.target_path().join(output_name))?;
         let mut argv = vec![
             OsString::from("--ask-for-approval"),
             OsString::from("never"),

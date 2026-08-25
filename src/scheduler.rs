@@ -1278,7 +1278,7 @@ fn event_priority(kind: EventKind) -> u8 {
         EventKind::Stalled => 1,
         EventKind::CampaignDecision => 2,
         EventKind::TaskFinished | EventKind::OperatorWake => 3,
-        EventKind::DeepCheck => 4,
+        EventKind::DeepCheck | EventKind::HealthDiagnosis => 4,
     }
 }
 
@@ -1289,7 +1289,7 @@ fn legacy_dispatch_mode(kind: EventKind) -> Option<&'static str> {
         EventKind::Stalled => Some("stalled"),
         EventKind::TaskFinished => Some("completion"),
         EventKind::OperatorWake => Some("operator_wake"),
-        EventKind::CampaignDecision => None,
+        EventKind::CampaignDecision | EventKind::HealthDiagnosis => None,
         EventKind::DeepCheck => Some("deep_check"),
     }
 }

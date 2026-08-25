@@ -625,7 +625,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 18,
-                required: 22
+                required: LATEST_SCHEMA_VERSION
             }
         ));
         let rendered = error.render();
@@ -723,7 +723,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 19,
-                required: 22
+                required: LATEST_SCHEMA_VERSION
             }
         ));
 
@@ -861,7 +861,7 @@ mod decision_schema {
             error,
             AppError::SchemaMigrationRequired {
                 current: 20,
-                required: 22
+                required: LATEST_SCHEMA_VERSION
             }
         ));
 

@@ -18,6 +18,9 @@ pub(crate) enum AgentRunRole {
         cycle_id: String,
         attempt_number: i64,
     },
+    Diagnosis {
+        experiment_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -103,6 +106,7 @@ database_enum!(EventKind {
     TerminationFailed => "termination_failed",
     OperatorWake => "operator_wake",
     CampaignDecision => "campaign_decision",
+    HealthDiagnosis => "health_diagnosis",
 });
 
 database_enum!(EventStatus {
@@ -268,6 +272,25 @@ pub struct RunningHealthRow {
     pub diagnosis_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Bounded diagnosis retry budget per running-health row.  The count lives in
+/// the `diagnosis_json` wrapper (`{"attempt": N}`) so degraded rows stay
+/// visible next to their failure history.
+pub const MAX_DIAGNOSIS_ATTEMPTS: i64 = 3;
+
+impl RunningHealthRow {
+    /// Number of recorded failed diagnosis attempts for this row.
+    pub fn diagnosis_attempt_count(&self) -> i64 {
+        parse_diagnosis_attempt_count(self.diagnosis_json.as_deref())
+    }
+}
+
+pub fn parse_diagnosis_attempt_count(diagnosis_json: Option<&str>) -> i64 {
+    diagnosis_json
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .and_then(|value| value.get("attempt").and_then(Value::as_i64))
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -789,10 +812,10 @@ impl ExecutionProjection {
         executable_identity: impl AsRef<str>,
     ) -> Result<Self, AppError> {
         let execution_kind = execution_kind.as_ref();
-        if !matches!(execution_kind, "codex" | "custom") {
+        if !matches!(execution_kind, "codex" | "custom" | "diagnosis") {
             return Err(AppError::Validation {
                 field: "execution_kind",
-                message: "must be codex or custom",
+                message: "must be codex, custom, or diagnosis",
             });
         }
 
