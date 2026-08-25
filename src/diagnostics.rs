@@ -2647,6 +2647,10 @@ struct RunningHealthSummary {
 
 impl From<&crate::models::RunningHealthRow> for RunningHealthSummary {
     fn from(row: &crate::models::RunningHealthRow) -> Self {
+        // A malformed persisted signal summary degrades to an explicit empty
+        // list so one bad row cannot fail the whole bounded listing.
+        let signals: Vec<crate::models::SignalSummaryEntry> =
+            serde_json::from_str(&row.signal_summary_json).unwrap_or_default();
         Self {
             experiment_id: bounded_summary(&row.experiment_id),
             campaign_id: bounded_summary(&row.campaign_id),
@@ -2655,7 +2659,7 @@ impl From<&crate::models::RunningHealthRow> for RunningHealthSummary {
             observation_count: row.observation_count,
             last_observed_at: row.last_observed_at,
             updated_at: row.updated_at,
-            signals: serde_json::from_str(&row.signal_summary_json).unwrap_or_default(),
+            signals,
             recommended_action: running_health_recommended_action(&row.diagnosis_json),
         }
     }

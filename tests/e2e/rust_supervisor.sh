@@ -644,7 +644,7 @@ max_code_change_proposals_per_24h = 10
 max_same_spec_retries = 2
 max_repairs_per_failure_fingerprint = 2
 max_proposals_per_cycle = 1
-observer_interval_minutes = 0
+observer_interval_minutes = 1
 max_decision_attempts_per_cycle = 3
 max_decision_wait_minutes = 1440
 
@@ -1173,8 +1173,10 @@ stop_daemon
 
 # Repeated OOM signals run the full running-health machine: the observer
 # escalates, the fake Codex diagnosis recommends kill_and_resume, and the
-# confirmed gate produces exactly one kill plus a resumed successor.
-oom_summary="$(cd "$PROJECT_I" && "$PA_BIN" submit -- /bin/sleep 30)"
+# confirmed gate produces exactly one kill plus a resumed successor.  The
+# observer interval is one minute, so each fixture pass backdates the row to
+# simulate elapsed time between due observations instead of sleeping.
+oom_summary="$(cd "$PROJECT_I" && "$PA_BIN" submit -- /bin/sleep 300)"
 oom_task="$(submission_task_id "$oom_summary")"
 record_task_id "oom-source" "$oom_task"
 OOM_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $oom_task")"
@@ -1185,6 +1187,12 @@ printf 'epoch=1 loss=0.91 torch.cuda.OutOfMemoryError: CUDA out of memory\n' \
 kills_before_oom="$(wc -l < "$WORK/pueue-kills.log" | tr -d ' ')"
 start_daemon
 stop_daemon
+sql "UPDATE running_health SET last_observed_at = last_observed_at - 120
+     WHERE experiment_id = '$OOM_SOURCE'"
+start_daemon
+stop_daemon
+sql "UPDATE running_health SET last_observed_at = last_observed_at - 120
+     WHERE experiment_id = '$OOM_SOURCE'"
 start_daemon
 wait_for_sql "SELECT state FROM running_health WHERE experiment_id = '$OOM_SOURCE'" "action_pending" \
   "repeated OOM signals did not escalate into a stored diagnosis"
@@ -1209,7 +1217,7 @@ OOM_SUCCESSOR="$(sql "SELECT experiment_id FROM experiments WHERE resume_of_expe
   || fail "successor experiment lacks the resume lineage"
 [ "$(sql "SELECT CASE WHEN checkpoint_note IS NULL THEN 0 ELSE 1 END FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'")" = "1" ] \
   || fail "successor experiment lacks a checkpoint note"
-[ "$(sql "SELECT s.argv_json FROM experiments e JOIN submissions s ON s.submission_id = e.submission_id WHERE e.experiment_id = '$OOM_SUCCESSOR'")" = '["/bin/sleep","30"]' ] \
+[ "$(sql "SELECT s.argv_json FROM experiments e JOIN submissions s ON s.submission_id = e.submission_id WHERE e.experiment_id = '$OOM_SUCCESSOR'")" = '["/bin/sleep","300"]' ] \
   || fail "successor experiment did not reuse the source argv"
 record_task_id "oom-successor" \
   "$(sql "SELECT pueue_task_id FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'")"
@@ -1221,8 +1229,8 @@ wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$OOM_SUCCESS
 stop_daemon
 
 # Restarting while a diagnosis is in flight keeps exactly one diagnosis agent:
-# graceful shutdown drains and persists the outcome, and the resumed daemon
-# never respawns before the recommended action completes.
+# shutdown is issued as soon as the spawned run is visible, graceful drain
+# persists the outcome exactly once, and the resumed daemon never respawns.
 restart_summary="$(cd "$PROJECT_J" && "$PA_BIN" submit -- /bin/sleep 120)"
 restart_task="$(submission_task_id "$restart_summary")"
 record_task_id "restart-source" "$restart_task"
@@ -1234,8 +1242,15 @@ printf 'epoch=1 torch.cuda.OutOfMemoryError: CUDA out of memory\n' \
 kills_before_restart="$(wc -l < "$WORK/pueue-kills.log" | tr -d ' ')"
 start_daemon
 stop_daemon
+sql "UPDATE running_health SET last_observed_at = last_observed_at - 120
+     WHERE experiment_id = '$RESTART_SOURCE'"
 start_daemon
-sleep 1
+stop_daemon
+sql "UPDATE running_health SET last_observed_at = last_observed_at - 120
+     WHERE experiment_id = '$RESTART_SOURCE'"
+start_daemon
+wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_J' AND execution_kind = 'diagnosis'" "1" \
+  "diagnosis run did not spawn before shutdown"
 stop_daemon
 start_daemon
 wait_for_sql "SELECT state FROM running_health WHERE experiment_id = '$RESTART_SOURCE'" "action_pending" \
