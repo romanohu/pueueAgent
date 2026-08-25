@@ -2,7 +2,10 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -1236,8 +1239,13 @@ pub(crate) struct StartupGateMarkerEvidence {
 }
 
 fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
+    // Second-resolution timestamps collide when one event retries within the
+    // same second, and the leftover gate marker would block the retry, so a
+    // process-wide sequence keeps every attempt on its own log path.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let attempt = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!(
-        ".pueue-agent/logs/agent-{now}-{primary_event_id}.log"
+        ".pueue-agent/logs/agent-{now}-{primary_event_id}-{attempt}.log"
     ))
 }
 
