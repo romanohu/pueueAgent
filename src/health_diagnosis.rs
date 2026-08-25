@@ -46,6 +46,7 @@ pub struct ValidatedDiagnosis {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecommendedAction {
     Continue,
     KillAndResume,
@@ -394,6 +395,32 @@ mod tests {
             assert_eq!(parsed.root_cause_class, "oom");
             assert_eq!(parsed.confidence, 0.9);
             assert_eq!(parsed.summary, "gpu exhausted");
+        }
+    }
+
+    #[test]
+    fn validated_diagnosis_persists_recommended_actions_in_snake_case() {
+        let parsed = parse_and_validate_diagnosis(&diagnosis_bytes(&serde_json::json!({
+            "root_cause_class": "oom",
+            "confidence": 0.9,
+            "recommended_action": "kill_and_resume",
+            "summary": "gpu exhausted",
+        })))
+        .unwrap();
+        let persisted = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            persisted["recommended_action"],
+            serde_json::Value::String("kill_and_resume".to_owned())
+        );
+        for (action, expected) in [
+            (RecommendedAction::Continue, "continue"),
+            (RecommendedAction::KillAndResume, "kill_and_resume"),
+            (RecommendedAction::KillAndEscalate, "kill_and_escalate"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::Value::String(expected.to_owned())
+            );
         }
     }
 
