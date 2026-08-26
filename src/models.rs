@@ -251,6 +251,31 @@ database_enum!(HealthState {
     ActionPending => "action_pending",
 });
 
+database_enum!(MetricDirection {
+    Minimize => "minimize",
+    Maximize => "maximize",
+});
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ObjectiveMetric {
+    pub name: String,
+    pub direction: MetricDirection,
+    pub min_delta: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExperimentMetricsRow {
+    pub experiment_id: String,
+    pub source: String,
+    pub primary_metric_name: Option<String>,
+    pub primary_metric_value: Option<f64>,
+    pub metrics_json: String,
+    pub artifact_defect: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalSummaryEntry {
     pub class: String,

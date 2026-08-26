@@ -1,5 +1,6 @@
 mod campaigns;
 mod decisions;
+pub mod experiment_metrics;
 mod migrations;
 mod repositories;
 pub mod running_health;
@@ -14,6 +15,7 @@ pub use decisions::{
     DecisionDoctorProjection, DecisionRecovery, DecisionRepository, DecisionReservation,
 };
 pub(crate) use decisions::ReadyDecision;
+pub use experiment_metrics::MetricsRepository;
 pub use migrations::LATEST_SCHEMA_VERSION;
 pub use running_health::HealthRepository;
 

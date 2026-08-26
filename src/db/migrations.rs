@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 23;
+pub const LATEST_SCHEMA_VERSION: i64 = 24;
 const EVENTS_V23_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis'";
 const EVENTS_V18_KIND_LIST: &str =
@@ -274,6 +274,25 @@ const EXPERIMENTS_V22_RESUME_COLUMN_SQL: &str =
     "ALTER TABLE experiments ADD COLUMN resume_of_experiment_id TEXT REFERENCES experiments(experiment_id);";
 const EXPERIMENTS_V22_CHECKPOINT_NOTE_COLUMN_SQL: &str =
     "ALTER TABLE experiments ADD COLUMN checkpoint_note TEXT;";
+const CAMPAIGNS_V24_OBJECTIVE_METRIC_COLUMN_SQL: &str =
+    "ALTER TABLE campaigns ADD COLUMN objective_metric_json TEXT;";
+const CAMPAIGNS_V24_CURRENT_BEST_COLUMN_SQL: &str =
+    "ALTER TABLE campaigns ADD COLUMN current_best_experiment_id TEXT;";
+const CAMPAIGNS_V24_PLATEAU_COUNT_COLUMN_SQL: &str =
+    "ALTER TABLE campaigns ADD COLUMN plateau_count INTEGER NOT NULL DEFAULT 0;";
+const EXPERIMENT_METRICS_V24_TABLE_SQL: &str = r#"
+    CREATE TABLE experiment_metrics (
+        experiment_id        TEXT PRIMARY KEY REFERENCES experiments(experiment_id)
+                             ON DELETE CASCADE,
+        source               TEXT NOT NULL CHECK (source IN ('manifest')),
+        primary_metric_name  TEXT,
+        primary_metric_value REAL,
+        metrics_json         TEXT NOT NULL DEFAULT '{}',
+        artifact_defect      TEXT,
+        created_at           INTEGER NOT NULL,
+        updated_at           INTEGER NOT NULL
+    );
+"#;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -292,6 +311,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     if version == LATEST_SCHEMA_VERSION {
         verify_decision_schema_v21(connection)?;
         verify_running_health_schema_v22(connection)?;
+        verify_evaluation_schema_v24(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -734,6 +754,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_event_kinds_to_v23(&transaction)?;
     } else {
         verify_event_kinds_v23(&transaction)?;
+    }
+    if version <= 23 {
+        migrate_evaluation_schema_to_v24(&transaction)?;
+    } else {
+        verify_evaluation_schema_v24(&transaction)?;
     }
     transaction
         .commit()
@@ -2265,6 +2290,74 @@ fn verify_running_health_schema_v22(connection: &Connection) -> Result<(), AppEr
     }
 }
 
+fn migrate_evaluation_schema_to_v24(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    let already = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='experiment_metrics'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error("probe SQLite v24 experiment_metrics"))?;
+    if already == 0 {
+        transaction
+            .execute_batch(EXPERIMENT_METRICS_V24_TABLE_SQL)
+            .map_err(database_error("create SQLite v24 experiment_metrics"))?;
+    }
+    for (name, sql) in [
+        (
+            "objective_metric_json",
+            CAMPAIGNS_V24_OBJECTIVE_METRIC_COLUMN_SQL,
+        ),
+        (
+            "current_best_experiment_id",
+            CAMPAIGNS_V24_CURRENT_BEST_COLUMN_SQL,
+        ),
+        ("plateau_count", CAMPAIGNS_V24_PLATEAU_COUNT_COLUMN_SQL),
+    ] {
+        let present = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('campaigns') WHERE name = ?1
+                 )",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error("check SQLite v24 campaign column"))?;
+        if !present {
+            transaction
+                .execute_batch(sql)
+                .map_err(database_error("apply SQLite v24 campaign column"))?;
+        }
+    }
+    verify_evaluation_schema_v24(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 24;")
+        .map_err(database_error("set SQLite v24 schema version"))
+}
+
+fn verify_evaluation_schema_v24(connection: &Connection) -> Result<(), AppError> {
+    let found: i64 = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'table' AND name = 'experiment_metrics')
+                  + (SELECT COUNT(*) FROM pragma_table_info('campaigns')
+                     WHERE name IN ('objective_metric_json', 'current_best_experiment_id',
+                                    'plateau_count'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("verify SQLite v24 evaluation schema"))?;
+    if found == 4 {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v24 evaluation schema",
+        })
+    }
+}
+
 fn decision_schema_v19_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
     let event_sql: Option<String> = connection
         .query_row(
@@ -2463,11 +2556,12 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
             )
             .optional()?;
         let matches = actual_sql.as_deref().is_some_and(|sql| {
-            if table == "experiments" {
-                compact_sql_exact(&strip_v22_experiment_additions(sql))
-                    == compact_sql_exact(expected_sql)
-            } else {
-                compact_sql_exact(sql) == compact_sql_exact(expected_sql)
+            match table {
+                "experiments" => compact_sql_exact(&strip_v22_experiment_additions(sql))
+                    == compact_sql_exact(expected_sql),
+                "campaigns" => compact_sql_exact(&strip_v24_campaign_additions(sql))
+                    == compact_sql_exact(expected_sql),
+                _ => compact_sql_exact(sql) == compact_sql_exact(expected_sql),
             }
         });
         if !matches {
@@ -2475,22 +2569,28 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
         }
     }
 
+    let mut campaign_columns: Vec<(&str, &str, i64, i64)> = vec![
+        ("campaign_id", "TEXT", 0, 1),
+        ("project_id", "TEXT", 1, 0),
+        ("objective_text", "TEXT", 1, 0),
+        ("objective_digest", "TEXT", 1, 0),
+        ("initial_argv_json", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("state_reason", "TEXT", 0, 0),
+        ("baseline_experiment_id", "TEXT", 0, 0),
+        ("next_eligible_at", "INTEGER", 0, 0),
+        ("created_at", "INTEGER", 1, 0),
+        ("updated_at", "INTEGER", 1, 0),
+    ];
+    if campaign_has_v24_additions(connection)? {
+        campaign_columns.push(("objective_metric_json", "TEXT", 0, 0));
+        campaign_columns.push(("current_best_experiment_id", "TEXT", 0, 0));
+        campaign_columns.push(("plateau_count", "INTEGER", 1, 0));
+    }
     if !campaign_table_info_matches(
         connection,
         "campaigns",
-        &[
-            ("campaign_id", "TEXT", 0, 1),
-            ("project_id", "TEXT", 1, 0),
-            ("objective_text", "TEXT", 1, 0),
-            ("objective_digest", "TEXT", 1, 0),
-            ("initial_argv_json", "TEXT", 1, 0),
-            ("state", "TEXT", 1, 0),
-            ("state_reason", "TEXT", 0, 0),
-            ("baseline_experiment_id", "TEXT", 0, 0),
-            ("next_eligible_at", "INTEGER", 0, 0),
-            ("created_at", "INTEGER", 1, 0),
-            ("updated_at", "INTEGER", 1, 0),
-        ],
+        &campaign_columns,
     )? || !campaign_table_info_matches(
         connection,
         "proposals",
@@ -2683,6 +2783,24 @@ fn experiment_has_v22_additions(connection: &Connection) -> rusqlite::Result<boo
 fn strip_v22_experiment_additions(sql: &str) -> String {
     sql.replace(
         ", resume_of_experiment_id TEXT REFERENCES experiments(experiment_id), checkpoint_note TEXT",
+        "",
+    )
+}
+
+fn campaign_has_v24_additions(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('campaigns')
+             WHERE name = 'plateau_count'
+         )",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn strip_v24_campaign_additions(sql: &str) -> String {
+    sql.replace(
+        ", objective_metric_json TEXT, current_best_experiment_id TEXT, plateau_count INTEGER NOT NULL DEFAULT 0",
         "",
     )
 }

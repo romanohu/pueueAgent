@@ -13,12 +13,13 @@ use pueue_agent::{
         MAX_DECISION_CONTEXT_BYTES,
     },
     db::{
-        inferred_pre_binding_policy_code, AgentDecisionReservation, AgentRunRepository,
-        BatchRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        DecisionRepository, IncidentRepository, InterventionRepository, ProjectRepository,
-        RunLineageRepository, running_health::HealthRepository, ProposalAcceptance,
-        StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
-        TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+        inferred_pre_binding_policy_code, experiment_metrics::MetricsRepository,
+        AgentDecisionReservation, AgentRunRepository, BatchRepository, CampaignRepository, Db,
+        EventRepository, ExperimentRepository, DecisionRepository, IncidentRepository,
+        InterventionRepository, ProjectRepository, RunLineageRepository,
+        running_health::HealthRepository, ProposalAcceptance, StartCampaignRequest,
+        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
+        LATEST_SCHEMA_VERSION,
     },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
@@ -33,11 +34,11 @@ use pueue_agent::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
         BudgetReservationStatus, Campaign, CampaignState, DecisionAttemptState,
         DecisionCycleState, EventKind, EventStatus, ExecutionProjection, Experiment, ExperimentStatus,
-        ExperimentTerminalOutcome, HealthState, IncidentStatus, IncidentTransition, NewAgentRun,
-        NewBatchJob, NewBatchRequest, NewEvent,
-        NewIncident, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
-        ProposalKind, ProposalStatus, SignalSummaryEntry, SubmissionKind, SubmissionStatus, TerminationRequestStatus,
-        MAX_EXECUTABLE_IDENTITY_BYTES, MAX_EXECUTABLE_PATH_BYTES,
+        ExperimentTerminalOutcome, ExperimentMetricsRow, HealthState, IncidentStatus,
+        IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident,
+        NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
+        ProposalKind, ProposalStatus, SignalSummaryEntry, SubmissionKind, SubmissionStatus,
+        TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES, MAX_EXECUTABLE_PATH_BYTES,
     },
     proposals::{self, ProposalInput, ValidatedProposal},
     runs::{collect_fresh, FollowCursor},
@@ -3960,10 +3961,17 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         checkpoint_note TEXT,",
         1,
     );
+    let campaigns_latest_sql = CAMPAIGNS_V16_SQL.replacen(
+        "updated_at INTEGER NOT NULL
+)",
+        "updated_at INTEGER NOT NULL
+        , objective_metric_json TEXT, current_best_experiment_id TEXT, plateau_count INTEGER NOT NULL DEFAULT 0)",
+        1,
+    );
     for (table, expected_sql, expected_columns) in [
         (
             "campaigns",
-            CAMPAIGNS_V16_SQL,
+            campaigns_latest_sql.as_str(),
             vec![
                 ("campaign_id", "TEXT", 0, 1),
                 ("project_id", "TEXT", 1, 0),
@@ -3976,6 +3984,9 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 ("next_eligible_at", "INTEGER", 0, 0),
                 ("created_at", "INTEGER", 1, 0),
                 ("updated_at", "INTEGER", 1, 0),
+                ("objective_metric_json", "TEXT", 0, 0),
+                ("current_best_experiment_id", "TEXT", 0, 0),
+                ("plateau_count", "INTEGER", 1, 0),
             ],
         ),
         (
@@ -13995,4 +14006,100 @@ fn health_repository_lifecycle_is_bounded_and_resumable() {
             ..
         }
     ));
+}
+
+#[test]
+fn schema_v24_adds_metrics_and_objective_columns() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+    let connection = db.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 24);
+    for column in ["objective_metric_json", "current_best_experiment_id", "plateau_count"] {
+        let hit: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('campaigns') WHERE name=?1",
+                [&column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1, "{column}");
+    }
+}
+
+#[test]
+fn metrics_repository_upsert_updates_single_row_and_get_missing_returns_none() {
+    let harness = CampaignDbHarness::with_experiment(ExperimentStatus::Accepted);
+    let experiment_id = &harness.experiment_id;
+
+    assert!(MetricsRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .is_none());
+
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: experiment_id.to_owned(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(0.42),
+            metrics_json: "{\"loss\":0.42}".to_owned(),
+            artifact_defect: None,
+            created_at: 200,
+            updated_at: 200,
+        },
+    )
+    .unwrap();
+    let row = MetricsRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.source, "manifest");
+    assert_eq!(row.primary_metric_name.as_deref(), Some("loss"));
+    assert_eq!(row.primary_metric_value, Some(0.42));
+    assert_eq!(row.metrics_json, "{\"loss\":0.42}");
+    assert_eq!(row.artifact_defect, None);
+    assert_eq!(row.created_at, 200);
+    assert_eq!(row.updated_at, 200);
+
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: experiment_id.to_owned(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(0.35),
+            metrics_json: "{\"loss\":0.35}".to_owned(),
+            artifact_defect: Some("result_invalid".to_owned()),
+            created_at: 200,
+            updated_at: 210,
+        },
+    )
+    .unwrap();
+
+    let count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = ?1",
+            [experiment_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let row = MetricsRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.primary_metric_value, Some(0.35));
+    assert_eq!(row.metrics_json, "{\"loss\":0.35}");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.created_at, 200);
+    assert_eq!(row.updated_at, 210);
+
+    assert!(MetricsRepository::get(&harness.db, "experiment-missing")
+        .unwrap()
+        .is_none());
 }
