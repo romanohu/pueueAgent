@@ -27,9 +27,9 @@ pub enum PromotionOutcome {
     /// `min_delta`, or completed successfully without a primary metric
     /// value (spec §5-1): `plateau_count` was incremented.
     NotImproved,
-    /// The experiment carries no primary metric value and is not a
-    /// successful completion, or no comparison anchor exists yet:
-    /// nothing was evaluated or changed.
+    /// The experiment did not complete successfully, carries no primary
+    /// metric value with no comparison anchor, or no comparison anchor
+    /// exists yet: nothing was evaluated or changed.
     SkippedNoMetric,
     /// The campaign declares no objective metric or is not active:
     /// evaluation is skipped entirely.
@@ -40,13 +40,20 @@ pub fn evaluate(
     db: &Db,
     campaign_id: &str,
     experiment_id: &str,
+    terminal_status: ExperimentStatus,
     now: i64,
 ) -> Result<PromotionOutcome, AppError> {
     let mut connection = db.connect()?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error("begin promotion evaluation"))?;
-    let outcome = evaluate_in_transaction(&transaction, campaign_id, experiment_id, now)?;
+    let outcome = evaluate_in_transaction(
+        &transaction,
+        campaign_id,
+        experiment_id,
+        terminal_status,
+        now,
+    )?;
     transaction
         .commit()
         .map_err(database_error("commit promotion evaluation"))?;
@@ -64,6 +71,7 @@ fn evaluate_in_transaction(
     connection: &Connection,
     campaign_id: &str,
     experiment_id: &str,
+    terminal_status: ExperimentStatus,
     now: i64,
 ) -> Result<PromotionOutcome, AppError> {
     let campaign = read_campaign_promotion_state(connection, campaign_id)?
@@ -77,12 +85,12 @@ fn evaluate_in_transaction(
     let Some(objective) = campaign.objective else {
         return Ok(PromotionOutcome::SkippedNoObjective);
     };
-    let Some(candidate_value) = primary_metric_value(connection, experiment_id)? else {
-        if experiment_status(connection, experiment_id)? == Some(ExperimentStatus::Succeeded) {
-            increment_plateau(connection, campaign_id, now)?;
-            return Ok(PromotionOutcome::NotImproved);
-        }
+    if terminal_status != ExperimentStatus::Succeeded {
         return Ok(PromotionOutcome::SkippedNoMetric);
+    }
+    let Some(candidate_value) = primary_metric_value(connection, experiment_id)? else {
+        increment_plateau(connection, campaign_id, now)?;
+        return Ok(PromotionOutcome::NotImproved);
     };
 
     match campaign.current_best_experiment_id.as_deref() {
@@ -210,20 +218,6 @@ fn read_campaign_promotion_state(
         )
         .optional()
         .map_err(database_error("read campaign promotion state"))
-}
-
-fn experiment_status(
-    connection: &Connection,
-    experiment_id: &str,
-) -> Result<Option<ExperimentStatus>, AppError> {
-    connection
-        .query_row(
-            "SELECT status FROM experiments WHERE experiment_id = ?1",
-            [experiment_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(database_error("read experiment promotion status"))
 }
 
 fn primary_metric_value(

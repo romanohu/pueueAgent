@@ -143,37 +143,42 @@ where
                     // here has to leave the experiment resolvable so the next
                     // reconcile pass retries instead of stranding the metrics
                     // row permanently.
-                    if let Some(objective) = crate::result_manifest::campaign_objective(
+                    let objective = crate::result_manifest::campaign_objective(
                         self.db,
                         &experiment.campaign_id,
-                    )? {
+                    )?;
+                    if let Some(objective) = objective.as_ref() {
                         crate::result_manifest::ingest(
                             self.db,
                             std::path::Path::new(&project.root_path),
                             &project.project_id,
                             &experiment.experiment_id,
                             task.id,
-                            Some(&objective),
+                            Some(objective),
                             now,
                         )?;
-                        if experiment.status == ExperimentStatus::Accepted
-                            && terminal_event_kind(task) == EventKind::TaskFinished
-                        {
-                            crate::promotion::evaluate(
-                                self.db,
-                                &experiment.campaign_id,
-                                &experiment.experiment_id,
-                                now,
-                            )?;
-                        }
                     }
-                    project_terminal_experiment(
+                    let projected_status = project_terminal_experiment(
                         self.db,
                         experiment,
                         task,
                         &self.campaign_limits,
                         now,
                     )?;
+                    // The promotion comparison needs the projected terminal
+                    // status. The finished_at guard keeps the evaluation
+                    // exactly-once per experiment: later reconcile passes
+                    // re-resolve the same accepted submission, and re-running
+                    // the evaluation would double-count plateau increments.
+                    if objective.is_some() && experiment.finished_at.is_none() {
+                        crate::promotion::evaluate(
+                            self.db,
+                            &experiment.campaign_id,
+                            &experiment.experiment_id,
+                            projected_status,
+                            now,
+                        )?;
+                    }
                 }
                 let event = materialize_terminal_event(
                     self.db,
@@ -345,15 +350,15 @@ fn project_terminal_experiment(
     task: &PueueTask,
     limits: &CampaignLimits,
     now: i64,
-) -> Result<(), AppError> {
+) -> Result<ExperimentStatus, AppError> {
     let experiments = ExperimentRepository::new(db);
-    if task.state.eq_ignore_ascii_case("killed") {
+    let projected = if task.state.eq_ignore_ascii_case("killed") {
         experiments.project_terminal_submission(
             &experiment.experiment_id,
             task.id,
             ExperimentTerminalOutcome::Cancelled,
             now,
-        )?;
+        )?
     } else if terminal_event_kind(task) == EventKind::TaskFailed {
         let failure_code = if task.state.eq_ignore_ascii_case("failed") {
             "pueue_failed"
@@ -369,17 +374,18 @@ fn project_terminal_experiment(
                 failure_fingerprint: &failure_fingerprint,
             },
             now,
-        )?;
+        )?
     } else {
         experiments.project_terminal_submission(
             &experiment.experiment_id,
             task.id,
             ExperimentTerminalOutcome::Succeeded,
             now,
-        )?;
-    }
+        )?
+    };
     crate::health::handle_terminal_projection(db, experiment, task, limits, now)?;
-    HealthRepository::delete_for_experiment(db, &experiment.experiment_id)
+    HealthRepository::delete_for_experiment(db, &experiment.experiment_id)?;
+    Ok(projected.status)
 }
 
 fn register_running_health(

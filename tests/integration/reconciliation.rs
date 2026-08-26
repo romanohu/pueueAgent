@@ -1728,6 +1728,90 @@ async fn campaigns_without_an_objective_skip_manifest_ingestion() {
 }
 
 #[tokio::test]
+async fn succeeded_projection_without_primary_metric_counts_toward_plateau() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness.metrics_row(&experiment_id).expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_missing"));
+    let (best, plateau): (Option<String>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT current_best_experiment_id, plateau_count FROM campaigns
+             WHERE campaign_id = 'campaign-reconciliation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(best, None);
+    assert_eq!(plateau, 1);
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(201)
+    .await
+    .unwrap();
+
+    let plateau: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT plateau_count FROM campaigns WHERE campaign_id = 'campaign-reconciliation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(plateau, 1);
+}
+
+#[tokio::test]
+async fn successful_baseline_promotes_itself_as_current_best() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42}}"#,
+    );
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let (best, plateau): (Option<String>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT current_best_experiment_id, plateau_count FROM campaigns
+             WHERE campaign_id = 'campaign-reconciliation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(best.as_deref(), Some(experiment_id.as_str()));
+    assert_eq!(plateau, 0);
+}
+
+#[tokio::test]
 async fn terminal_ingest_io_failure_recovers_on_the_next_cycle() {
     let harness = Harness::new();
     let experiment_id =
