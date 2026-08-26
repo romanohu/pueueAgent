@@ -12,8 +12,8 @@ use crate::{
     execution_policy::CampaignLimits,
     models::{
         BudgetDimension, BudgetReservation, BudgetReservationStatus, Campaign, CampaignState,
-        Experiment, ExperimentStatus, ExperimentTerminalOutcome, Proposal, ProposalKind,
-        ProposalStatus, Submission, SubmissionKind, SubmissionStatus,
+        Experiment, ExperimentStatus, ExperimentTerminalOutcome, ObjectiveMetric, Proposal,
+        ProposalKind, ProposalStatus, Submission, SubmissionKind, SubmissionStatus,
     },
     proposals::ValidatedProposal,
     state::ObjectiveSnapshot,
@@ -108,6 +108,7 @@ pub struct StartCampaignRequest<'a> {
     pub proposal_id: &'a str,
     pub metadata: &'a Value,
     pub origin_agent_run_id: Option<i64>,
+    pub objective_metric: Option<&'a ObjectiveMetric>,
     pub now: i64,
 }
 
@@ -149,6 +150,15 @@ impl<'db> CampaignRepository<'db> {
             request.proposal_id,
             request.experiment_id,
         )?;
+        let objective_metric_json = match request.objective_metric {
+            Some(metric) => Some(
+                serde_json::to_string(metric).map_err(|source| AppError::Serialization {
+                    operation: "serialize campaign objective metric",
+                    source,
+                })?,
+            ),
+            None => None,
+        };
         let window_ends_at = rolling_window_end(request.now)?;
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -215,8 +225,8 @@ impl<'db> CampaignRepository<'db> {
                 "INSERT INTO campaigns (
                     campaign_id, project_id, objective_text, objective_digest, initial_argv_json,
                     state, state_reason, baseline_experiment_id, next_eligible_at,
-                    created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?7)",
+                    objective_metric_json, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8, ?8)",
                 params![
                     request.campaign_id,
                     request.project_id,
@@ -224,6 +234,7 @@ impl<'db> CampaignRepository<'db> {
                     request.objective.digest,
                     initial_argv_json,
                     CampaignState::Active,
+                    objective_metric_json,
                     request.now,
                 ],
             )

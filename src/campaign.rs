@@ -12,7 +12,8 @@ use crate::{
     environment::ProjectAdmissionLock,
     execution_policy::{CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
     models::{
-        Campaign, Experiment, ExperimentStatus, Project, Proposal, ProposalKind, Submission,
+        Campaign, Experiment, ExperimentStatus, ObjectiveMetric, Project, Proposal, ProposalKind,
+        Submission,
     },
     output::{
         render_campaign_mutation, render_campaign_status_with_decision,
@@ -213,6 +214,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         initial_argv: &[String],
         metadata: &Value,
         origin_agent_run_id: Option<i64>,
+        objective_metric: Option<&ObjectiveMetric>,
         now: i64,
     ) -> Result<Submission, AppError> {
         let admission = self.acquire_admission(project)?;
@@ -250,6 +252,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 proposal_id: &proposal_id,
                 metadata,
                 origin_agent_run_id,
+                objective_metric,
                 now,
             },
             &self.limits,

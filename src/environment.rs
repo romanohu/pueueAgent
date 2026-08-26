@@ -33,7 +33,49 @@ pub use crate::execution_policy::StartupEnvironment;
 
 const PRIVATE_TEMP_ROOT: &str = ".pueue-agent";
 const PRIVATE_TEMP_DIR: &str = "tmp";
+const RESULTS_DIRECTORY: &str = "results";
+const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const MAX_RUN_ID_BYTES: usize = 20;
+
+/// The project-relative service directory owned by this supervisor.
+pub(crate) fn private_service_root() -> &'static str {
+    PRIVATE_TEMP_ROOT
+}
+
+/// Names and values injected onto agent tasks that manage one campaign
+/// experiment. Values are identifiers and derived paths only; the result and
+/// artifact directories are created by the task itself, never pre-created.
+pub fn campaign_experiment_task_environment(
+    project_root: &Path,
+    campaign_id: &str,
+    experiment_id: &str,
+) -> Vec<(String, OsString)> {
+    let service_root = project_root.join(PRIVATE_TEMP_ROOT);
+    vec![
+        (
+            "PUEUE_AGENT_EXPERIMENT_ID".to_owned(),
+            OsString::from(experiment_id),
+        ),
+        (
+            "PUEUE_AGENT_CAMPAIGN_ID".to_owned(),
+            OsString::from(campaign_id),
+        ),
+        (
+            "PUEUE_AGENT_RESULT_PATH".to_owned(),
+            service_root
+                .join(RESULTS_DIRECTORY)
+                .join(format!("{experiment_id}.json"))
+                .into_os_string(),
+        ),
+        (
+            "PUEUE_AGENT_ARTIFACT_DIR".to_owned(),
+            service_root
+                .join(ARTIFACTS_DIRECTORY)
+                .join(experiment_id)
+                .into_os_string(),
+        ),
+    ]
+}
 
 /// The sole private-temp descriptor inherited by native agent targets.
 pub const PRIVATE_TEMP_TARGET_FD: i32 = 11;
@@ -447,6 +489,15 @@ impl SanitizedEnvironment {
 
     fn insert_generated(&mut self, name: &str, value: impl Into<OsString>) {
         self.values.insert(OsString::from(name), value.into());
+    }
+
+    pub(crate) fn apply_campaign_experiment_variables(
+        &mut self,
+        variables: &[(String, OsString)],
+    ) {
+        for (name, value) in variables {
+            self.insert_generated(name, value.as_os_str());
+        }
     }
 
     fn insert_os(&mut self, name: OsString, value: OsString) {

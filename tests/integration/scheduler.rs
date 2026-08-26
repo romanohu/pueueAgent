@@ -436,6 +436,7 @@ max_agent_runs = 10
                     proposal_id: &format!("{id_prefix}-proposal"),
                     metadata: &json!({}),
                     origin_agent_run_id: None,
+                    objective_metric: None,
                     now: self.now,
                 },
                 &CampaignLimits::default(),

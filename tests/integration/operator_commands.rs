@@ -1177,6 +1177,7 @@ max_agent_runs = 10
                     proposal_id: "proposal-cli",
                     metadata: &json!({}),
                     origin_agent_run_id: None,
+                    objective_metric: None,
                     now: self.now,
                 },
                 &self.policy().campaign_limits,

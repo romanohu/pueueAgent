@@ -1,25 +1,34 @@
 use std::{
+    ffi::OsString,
     fs,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
+use clap::Parser as _;
 use pueue_agent::{
+    campaign::CampaignCoordinator,
+    cli::{Cli, Command},
     db::{
         CampaignRepository, Db, EventRepository, ExperimentRepository, ManagedSubmissionIntent,
-        ProjectRepository, StartCampaignRequest, SubmissionRepository, TaskObservationRepository,
+        MetricsRepository, ProjectRepository, StartCampaignRequest, SubmissionRepository,
+        TaskObservationRepository,
     },
+    environment,
     events::{
         callback_group_for_task, record_callback_with, CallbackMetadata, CallbackRecordResult,
     },
     execution_policy::CampaignLimits,
     models::{
-        BudgetReservationStatus, EventKind, EventStatus, ExperimentStatus, NewProject,
-        NewSubmission, NewTaskObservation, ProposalKind, SubmissionStatus,
+        BudgetReservationStatus, EventKind, EventStatus, ExperimentMetricsRow, ExperimentStatus,
+        MetricDirection, NewProject, NewSubmission, NewTaskObservation, ObjectiveMetric,
+        ProposalKind, SubmissionStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueError, PueueTask},
     reconcile::{managed_task_run_signature, task_signature, Reconciler},
+    state::ObjectiveSnapshot,
     AppError,
 };
 use serde_json::json;
@@ -30,6 +39,7 @@ struct FakePueue {
     tasks: Arc<Mutex<Vec<PueueTask>>>,
     status_calls: Arc<Mutex<usize>>,
     malformed: Arc<Mutex<bool>>,
+    recorded_adds: Arc<Mutex<Vec<Vec<OsString>>>>,
 }
 
 impl FakePueue {
@@ -38,7 +48,12 @@ impl FakePueue {
             tasks: Arc::new(Mutex::new(tasks)),
             status_calls: Arc::new(Mutex::new(0)),
             malformed: Arc::new(Mutex::new(false)),
+            recorded_adds: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn recorded_adds(&self) -> Vec<Vec<OsString>> {
+        self.recorded_adds.lock().unwrap().clone()
     }
 
     fn set_tasks(&self, tasks: Vec<PueueTask>) {
@@ -65,8 +80,9 @@ impl PueueApi for FakePueue {
         Ok(self.tasks.lock().unwrap().clone())
     }
 
-    async fn add(&self, _args: &[std::ffi::OsString]) -> Result<i64, AppError> {
-        panic!("reconciliation must not submit Pueue tasks")
+    async fn add(&self, args: &[std::ffi::OsString]) -> Result<i64, AppError> {
+        self.recorded_adds.lock().unwrap().push(args.to_vec());
+        Ok(41)
     }
 
     async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
@@ -110,6 +126,10 @@ impl Harness {
             ))
             .unwrap();
         Self { _temp: temp, db }
+    }
+
+    fn root(&self) -> PathBuf {
+        self._temp.path().join("project")
     }
 
     fn pending_event_count(&self, kind: EventKind) -> i64 {
@@ -170,6 +190,13 @@ impl Harness {
     }
 
     fn campaign_intent(&self) -> ManagedSubmissionIntent {
+        self.campaign_intent_with_objective(None)
+    }
+
+    fn campaign_intent_with_objective(
+        &self,
+        objective_metric: Option<&ObjectiveMetric>,
+    ) -> ManagedSubmissionIntent {
         let objective = pueue_agent::state::ObjectiveSnapshot {
             text: "Reach validation loss below 0.20\n".to_owned(),
             digest: "objective-digest".to_owned(),
@@ -205,11 +232,50 @@ impl Harness {
                     proposal_id: "campaign-proposal-baseline",
                     metadata: &json!({}),
                     origin_agent_run_id: None,
+                    objective_metric,
                     now: 100,
                 },
                 &CampaignLimits::default(),
             )
             .unwrap()
+    }
+
+    fn accepted_campaign_experiment_with_objective(
+        &self,
+        task_id: i64,
+        enqueued_at: &str,
+        objective_metric: Option<&ObjectiveMetric>,
+    ) -> String {
+        let intent = self.campaign_intent_with_objective(objective_metric);
+        let experiment_id = intent.experiment.experiment_id;
+        let experiments = ExperimentRepository::new(&self.db);
+        experiments.mark_submitting(&experiment_id, 101).unwrap();
+        experiments
+            .mark_accepted(
+                &experiment_id,
+                task_id,
+                &managed_task_run_signature(&terminal_task(
+                    task_id,
+                    enqueued_at,
+                    json!("Success"),
+                ))
+                .unwrap(),
+                102,
+            )
+            .unwrap();
+        experiment_id
+    }
+
+    fn write_result_manifest(&self, file_stem: &str, content: &str) -> PathBuf {
+        let results = self.root().join(".pueue-agent/results");
+        fs::create_dir_all(&results).unwrap();
+        let path = results.join(format!("{file_stem}.json"));
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn metrics_row(&self, experiment_id: &str) -> Option<ExperimentMetricsRow> {
+        MetricsRepository::get(&self.db, experiment_id).unwrap()
     }
 
     fn accepted_campaign_experiment(&self, task_id: i64) -> String {
@@ -1356,4 +1422,307 @@ fn callback_metadata_is_retained_as_json() {
     assert_eq!(event.payload["group"], "pa-project");
     assert_eq!(event.payload["task_id"], 41);
     assert_eq!(event.payload["metadata"]["state"], "Done");
+}
+
+fn objective_metric() -> ObjectiveMetric {
+    ObjectiveMetric {
+        name: "loss".to_owned(),
+        direction: MetricDirection::Minimize,
+        min_delta: Some(0.01),
+    }
+}
+
+#[test]
+fn campaign_task_environment_exposes_result_and_artifact_locations() {
+    let variables = environment::campaign_experiment_task_environment(
+        std::path::Path::new("/tmp/project-root"),
+        "campaign-a",
+        "experiment-a",
+    );
+
+    assert_eq!(
+        variables,
+        vec![
+            (
+                "PUEUE_AGENT_EXPERIMENT_ID".to_owned(),
+                OsString::from("experiment-a"),
+            ),
+            (
+                "PUEUE_AGENT_CAMPAIGN_ID".to_owned(),
+                OsString::from("campaign-a"),
+            ),
+            (
+                "PUEUE_AGENT_RESULT_PATH".to_owned(),
+                OsString::from("/tmp/project-root/.pueue-agent/results/experiment-a.json"),
+            ),
+            (
+                "PUEUE_AGENT_ARTIFACT_DIR".to_owned(),
+                OsString::from("/tmp/project-root/.pueue-agent/artifacts/experiment-a"),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn submit_metric_flags_require_the_full_trio() {
+    let error = Cli::try_parse_from([
+        "pueue-agent",
+        "submit",
+        "--metric-name",
+        "loss",
+        "--",
+        "python",
+        "train.py",
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("--metric-min-delta"));
+
+    let error = Cli::try_parse_from([
+        "pueue-agent",
+        "submit",
+        "--metric-direction",
+        "maximize",
+        "--metric-min-delta",
+        "0.5",
+        "--",
+        "python",
+        "train.py",
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("--metric-name"));
+
+    let parsed = Cli::try_parse_from([
+        "pueue-agent",
+        "submit",
+        "--metric-name",
+        "loss",
+        "--metric-direction",
+        "minimize",
+        "--metric-min-delta",
+        "-0.5",
+        "--",
+        "python",
+        "train.py",
+    ])
+    .unwrap();
+    let Command::Submit(args) = parsed.command else {
+        panic!("expected a submit command");
+    };
+    assert_eq!(args.metric_name.as_deref(), Some("loss"));
+    assert_eq!(args.metric_min_delta, Some(-0.5));
+}
+
+#[tokio::test]
+async fn start_baseline_persists_the_declared_objective_metric_json() {
+    let harness = Harness::new();
+    let root = harness.root();
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_root(&root)
+        .unwrap()
+        .unwrap();
+    let objective = ObjectiveSnapshot {
+        text: "Reach validation loss below 0.20\n".to_owned(),
+        digest: "objective-digest".to_owned(),
+    };
+    let argv = vec!["python".to_owned(), "train.py".to_owned()];
+    let mut task = terminal_task(41, "300", json!("Success"));
+    task.command = "python train.py".to_owned();
+    let fake = FakePueue::with_tasks(vec![task]);
+    let coordinator = CampaignCoordinator::new(&harness.db, &fake, CampaignLimits::default());
+
+    coordinator
+        .start_baseline(
+            &project,
+            &objective,
+            &argv,
+            &json!({}),
+            None,
+            Some(&objective_metric()),
+            100,
+        )
+        .await
+        .unwrap();
+
+    let stored: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT objective_metric_json FROM campaigns WHERE project_id = 'project-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(
+        parsed,
+        json!({"name": "loss", "direction": "minimize", "min_delta": 0.01})
+    );
+
+    let adds = fake.recorded_adds();
+    assert_eq!(adds.len(), 1);
+    assert!(
+        !adds[0]
+            .iter()
+            .any(|argument| argument.to_string_lossy().contains("PUEUE_AGENT_")),
+        "durable Pueue argv must stay free of supervisor env values"
+    );
+}
+
+#[tokio::test]
+async fn start_baseline_without_metric_flags_leaves_objective_json_null() {
+    let harness = Harness::new();
+    let root = harness.root();
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_root(&root)
+        .unwrap()
+        .unwrap();
+    let objective = ObjectiveSnapshot {
+        text: "Reach validation loss below 0.20\n".to_owned(),
+        digest: "objective-digest".to_owned(),
+    };
+    let argv = vec!["python".to_owned(), "train.py".to_owned()];
+    let mut task = terminal_task(41, "300", json!("Success"));
+    task.command = "python train.py".to_owned();
+    let fake = FakePueue::with_tasks(vec![task]);
+    let coordinator = CampaignCoordinator::new(&harness.db, &fake, CampaignLimits::default());
+
+    coordinator
+        .start_baseline(&project, &objective, &argv, &json!({}), None, None, 100)
+        .await
+        .unwrap();
+
+    let stored: Option<String> = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT objective_metric_json FROM campaigns WHERE project_id = 'project-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, None);
+}
+
+#[tokio::test]
+async fn terminal_projection_ingests_manifest_metrics() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42,"accuracy":0.9}}"#,
+    );
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("ingested metrics row");
+    assert_eq!(row.source, "manifest");
+    assert_eq!(row.artifact_defect, None);
+    assert_eq!(row.created_at, 200);
+    assert_eq!(row.updated_at, 200);
+    assert_eq!(row.primary_metric_name.as_deref(), Some("loss"));
+    assert_eq!(row.primary_metric_value, Some(0.42));
+    let metrics: serde_json::Value = serde_json::from_str(&row.metrics_json).unwrap();
+    assert_eq!(metrics["accuracy"], json!(0.9));
+}
+
+#[tokio::test]
+async fn terminal_projection_records_result_missing_without_a_manifest() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness.metrics_row(&experiment_id).expect("defect metrics row");
+    assert_eq!(row.source, "manifest");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_missing"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_name, None);
+    assert_eq!(row.primary_metric_value, None);
+}
+
+#[tokio::test]
+async fn terminal_projection_rejects_manifests_with_mismatched_experiment_ids() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"experiment-elsewhere","metrics":{"loss":0.1}}"#,
+    );
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness.metrics_row(&experiment_id).expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_name, None);
+    assert_eq!(row.primary_metric_value, None);
+}
+
+#[tokio::test]
+async fn terminal_projection_rejects_non_finite_manifest_values() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    harness.write_result_manifest(
+        &experiment_id,
+        "{\"schema_version\":1,\"experiment_id\":\"campaign-experiment-baseline\",\"metrics\":{\"loss\":1e999}}",
+    );
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness.metrics_row(&experiment_id).expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_value, None);
+}
+
+#[tokio::test]
+async fn campaigns_without_an_objective_skip_manifest_ingestion() {
+    let harness = Harness::new();
+    let experiment_id = harness.accepted_campaign_experiment(41);
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42}}"#,
+    );
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    assert!(harness.metrics_row(&experiment_id).is_none());
 }

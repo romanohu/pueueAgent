@@ -264,6 +264,30 @@ pub struct SubmitArgs {
     pub metadata: Option<PathBuf>,
     #[arg(long, value_name = "JSON", conflicts_with = "metadata")]
     pub metadata_json: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "metric_direction",
+        requires = "metric_min_delta"
+    )]
+    pub metric_name: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "DIRECTION",
+        requires = "metric_name",
+        requires = "metric_min_delta"
+    )]
+    pub metric_direction: Option<MetricDirectionArg>,
+    #[arg(
+        long,
+        value_name = "DELTA",
+        allow_negative_numbers = true,
+        requires = "metric_name",
+        requires = "metric_direction",
+        value_parser = parse_metric_min_delta
+    )]
+    pub metric_min_delta: Option<f64>,
     #[arg(long)]
     pub json: bool,
     #[arg(
@@ -273,6 +297,23 @@ pub struct SubmitArgs {
         value_name = "COMMAND"
     )]
     pub command: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum MetricDirectionArg {
+    Minimize,
+    Maximize,
+}
+
+fn parse_metric_min_delta(value: &str) -> Result<f64, String> {
+    let delta = value
+        .parse::<f64>()
+        .map_err(|_| "min delta must be a finite number".to_owned())?;
+    if delta.is_finite() {
+        Ok(delta)
+    } else {
+        Err("min delta must be a finite number".to_owned())
+    }
 }
 
 #[derive(Debug, Args)]

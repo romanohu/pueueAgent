@@ -1150,7 +1150,7 @@ impl AgentRunner {
                 ));
             }
         };
-        let environment = match match &role {
+        let mut environment = match match &role {
             AgentRunRole::Standard => self.environment_for(project_policy, run.run_id),
             AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
                 self.decision_environment_for(project_policy, run.run_id)
@@ -1176,6 +1176,35 @@ impl AgentRunner {
                 ));
             }
         };
+        let campaign_lineage = match campaign_experiment_lineage(db, primary_event_id) {
+            Ok(lineage) => lineage,
+            Err(error) => {
+                return Err(resolve_retained_temp_failure(
+                    db,
+                    project,
+                    run.run_id,
+                    now,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    error,
+                ));
+            }
+        };
+        if let Some((campaign_id, experiment_id)) = campaign_lineage {
+            environment.apply_campaign_experiment_variables(
+                &crate::environment::campaign_experiment_task_environment(
+                    &project_policy.root_anchor.canonical_path,
+                    &campaign_id,
+                    &experiment_id,
+                ),
+            );
+        }
         let mut argv = Vec::with_capacity(command.args.len() + 1);
         argv.push(OsString::from(&command.program));
         argv.extend(command.args.into_iter().map(OsString::from));
@@ -1457,6 +1486,29 @@ fn pre_binding_error(source: AppError) -> AgentSpawnError {
         policy,
         cleanup: None,
     }
+}
+
+/// Campaign-experiment lineage of the triggering event, when the run manages
+/// one campaign experiment. Drives the result/artifact env injection.
+fn campaign_experiment_lineage(
+    db: &crate::db::Db,
+    event_id: i64,
+) -> Result<Option<(String, String)>, AppError> {
+    use rusqlite::OptionalExtension;
+    let connection = db.connect()?;
+    connection
+        .query_row(
+            "SELECT campaign_id, experiment_id FROM events
+             WHERE event_id = ?1
+               AND campaign_id IS NOT NULL AND experiment_id IS NOT NULL",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|source| AppError::Database {
+            operation: "read campaign experiment event lineage",
+            source,
+        })
 }
 
 fn policy_from_error(source: &AppError) -> Option<PolicyViolation> {
@@ -2548,6 +2600,7 @@ mod tests {
                     proposal_id: "proposal-a",
                     metadata: &serde_json::json!({}),
                     origin_agent_run_id: None,
+                    objective_metric: None,
                     now: 2,
                 },
                 &CampaignLimits::default(),

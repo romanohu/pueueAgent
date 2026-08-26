@@ -146,6 +146,20 @@ where
                         &self.campaign_limits,
                         now,
                     )?;
+                    if let Some(objective) = crate::result_manifest::campaign_objective(
+                        self.db,
+                        &experiment.campaign_id,
+                    )? {
+                        crate::result_manifest::ingest(
+                            self.db,
+                            std::path::Path::new(&project.root_path),
+                            &project.project_id,
+                            &experiment.experiment_id,
+                            task.id,
+                            Some(&objective),
+                            now,
+                        )?;
+                    }
                 }
                 let event = materialize_terminal_event(
                     self.db,

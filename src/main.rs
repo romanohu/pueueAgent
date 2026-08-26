@@ -361,7 +361,12 @@ mod commands {
             metadata_json,
             json,
             command,
+            metric_name,
+            metric_direction,
+            metric_min_delta,
         } = args;
+        let objective_metric =
+            crate::objective_metric_from_flags(metric_name, metric_direction, metric_min_delta)?;
         let current_dir = env::current_dir().map_err(|source| AppError::Io {
             operation: "read current directory",
             source,
@@ -383,11 +388,12 @@ mod commands {
             .project_root_anchor(&registered.root_path)
             .map_err(AppError::from)?;
         let pueue = configured_pueue(Arc::clone(&policy))?;
-        let options = submit_command::SubmitOptions::new(
+        let mut options = submit_command::SubmitOptions::new(
             kind,
             submit_command::load_metadata(metadata.as_deref(), metadata_json.as_deref())?,
             submit_command::origin_from_environment(&registered.project_id)?,
         );
+        options.objective_metric = objective_metric;
         let submission = submit_command::run_with_options_with_root_anchor(
             &db,
             &project_root,
@@ -996,5 +1002,34 @@ mod commands {
                 ),
             })
         }
+    }
+}
+
+fn objective_metric_from_flags(
+    name: Option<String>,
+    direction: Option<pueue_agent::cli::MetricDirectionArg>,
+    min_delta: Option<f64>,
+) -> Result<Option<pueue_agent::models::ObjectiveMetric>, AppError> {
+    match (name, direction, min_delta) {
+        (None, None, None) => Ok(None),
+        (Some(name), Some(direction), Some(min_delta)) => Ok(Some(
+            pueue_agent::models::ObjectiveMetric {
+                name,
+                direction: match direction {
+                    pueue_agent::cli::MetricDirectionArg::Minimize => {
+                        pueue_agent::models::MetricDirection::Minimize
+                    }
+                    pueue_agent::cli::MetricDirectionArg::Maximize => {
+                        pueue_agent::models::MetricDirection::Maximize
+                    }
+                },
+                min_delta: Some(min_delta),
+            },
+        )),
+        _ => Err(AppError::Validation {
+            field: "submit.metric",
+            message:
+                "--metric-name, --metric-direction, and --metric-min-delta must be provided together",
+        }),
     }
 }

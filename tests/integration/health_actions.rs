@@ -215,6 +215,7 @@ impl Harness {
                     proposal_id: &format!("health-proposal-{suffix}"),
                     metadata: &json!({}),
                     origin_agent_run_id: None,
+                    objective_metric: None,
                     now: 100,
                 },
                 &CampaignLimits::default(),

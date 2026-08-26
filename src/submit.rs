@@ -16,7 +16,7 @@ use crate::{
     db::{AgentRunRepository, CampaignRepository, Db, ProjectRepository, SubmissionRepository},
     environment::ProjectAdmissionLock,
     execution_policy::{load_existing_policy, CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
-    models::{NewSubmission, Submission, SubmissionKind},
+    models::{NewSubmission, ObjectiveMetric, Submission, SubmissionKind},
     output::{bounded_redacted_text, format_state, human_header, human_summary},
     paths, project,
     pueue::{configured_pueue, validate_add_argv, PueueApi},
@@ -44,6 +44,7 @@ pub struct SubmitOptions {
     pub kind: SubmissionKind,
     pub metadata: Value,
     pub origin_agent_run_id: Option<i64>,
+    pub objective_metric: Option<ObjectiveMetric>,
 }
 
 impl SubmitOptions {
@@ -52,6 +53,7 @@ impl SubmitOptions {
             kind,
             metadata,
             origin_agent_run_id,
+            objective_metric: None,
         }
     }
 }
@@ -246,6 +248,7 @@ async fn run_with_options_inner<P: PueueApi + ?Sized>(
                 &argv,
                 &options.metadata,
                 options.origin_agent_run_id,
+                options.objective_metric.as_ref(),
                 created_at,
             )
             .await;

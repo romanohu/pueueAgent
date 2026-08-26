@@ -2081,6 +2081,7 @@ impl SubmitBatchCliHarness {
                     proposal_id: "active-campaign-submit-cli-proposal",
                     metadata: &Value::Object(Default::default()),
                     origin_agent_run_id: None,
+                    objective_metric: None,
                     now: 100,
                 },
                 &CampaignLimits::default(),

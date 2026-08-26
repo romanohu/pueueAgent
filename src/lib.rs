@@ -37,6 +37,7 @@ pub mod pueue;
 pub mod pueue_process;
 pub mod pueue_security;
 pub mod reconcile;
+pub mod result_manifest;
 pub mod retry;
 pub mod runs;
 pub mod scheduler;

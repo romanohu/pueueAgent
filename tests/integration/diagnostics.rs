@@ -892,6 +892,7 @@ impl DiagnosticsHarness {
                     proposal_id: "diagnostics-campaign-proposal",
                     metadata: &json!({}),
                     origin_agent_run_id: None,
+                    objective_metric: None,
                     now: unix_now(),
                 },
                 &CampaignLimits::default(),
