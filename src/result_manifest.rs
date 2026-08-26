@@ -126,8 +126,40 @@ fn defect_row(experiment_id: &str, defect: &'static str, now: i64) -> Experiment
 /// Ingest the finished experiment's result manifest, storing either the
 /// validated metrics or a bounded artifact defect row. Idempotent per
 /// experiment via the primary key on `experiment_metrics`.
+///
+/// On failure a best-effort bounded defect row is still persisted before the
+/// error propagates, so a transient IO or database problem can never leave the
+/// experiment without any durable metrics row; the upsert keeps later retries
+/// authoritative.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest(
+    db: &Db,
+    project_root: &Path,
+    project_id: &str,
+    experiment_id: &str,
+    pueue_task_id: i64,
+    objective: Option<&ObjectiveMetric>,
+    now: i64,
+) -> Result<(), AppError> {
+    match ingest_inner(
+        db,
+        project_root,
+        project_id,
+        experiment_id,
+        pueue_task_id,
+        objective,
+        now,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = MetricsRepository::upsert(db, &defect_row(experiment_id, "result_invalid", now));
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_inner(
     db: &Db,
     project_root: &Path,
     _project_id: &str,

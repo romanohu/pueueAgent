@@ -139,13 +139,10 @@ where
                     now,
                 )?;
                 if let Some(experiment) = experiment.as_ref() {
-                    project_terminal_experiment(
-                        self.db,
-                        experiment,
-                        task,
-                        &self.campaign_limits,
-                        now,
-                    )?;
+                    // Ingestion must precede the terminal projection: a failure
+                    // here has to leave the experiment resolvable so the next
+                    // reconcile pass retries instead of stranding the metrics
+                    // row permanently.
                     if let Some(objective) = crate::result_manifest::campaign_objective(
                         self.db,
                         &experiment.campaign_id,
@@ -160,6 +157,13 @@ where
                             now,
                         )?;
                     }
+                    project_terminal_experiment(
+                        self.db,
+                        experiment,
+                        task,
+                        &self.campaign_limits,
+                        now,
+                    )?;
                 }
                 let event = materialize_terminal_event(
                     self.db,

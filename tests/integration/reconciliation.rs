@@ -1726,3 +1726,71 @@ async fn campaigns_without_an_objective_skip_manifest_ingestion() {
 
     assert!(harness.metrics_row(&experiment_id).is_none());
 }
+
+#[tokio::test]
+async fn terminal_ingest_io_failure_recovers_on_the_next_cycle() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    let service = harness.root().join(".pueue-agent");
+    fs::create_dir_all(&service).unwrap();
+    // Replace the results directory with a plain file so opening the manifest
+    // path fails with a non-NotFound IO error.
+    fs::write(service.join("results"), b"not-a-directory").unwrap();
+
+    let error = Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, AppError::Io { .. }));
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("durable defect marker row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+
+    // The terminal projection must not have consumed the accepted identity:
+    // the next reconcile pass has to be able to retry the ingestion.
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+
+    fs::remove_file(service.join("results")).unwrap();
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42}}"#,
+    );
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(201)
+    .await
+    .unwrap();
+
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("recovered metrics row");
+    assert_eq!(row.artifact_defect, None);
+    assert_eq!(row.primary_metric_name.as_deref(), Some("loss"));
+    assert_eq!(row.primary_metric_value, Some(0.42));
+    assert_eq!(row.created_at, 200);
+    assert_eq!(row.updated_at, 201);
+
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Succeeded
+    );
+}
