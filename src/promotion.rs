@@ -9,22 +9,27 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     db::{database_error, Db},
-    models::{CampaignState, MetricDirection, ObjectiveMetric},
+    models::{CampaignState, ExperimentStatus, MetricDirection, ObjectiveMetric},
     AppError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromotionOutcome {
-    /// The experiment beat the current best by at least `min_delta`, or
-    /// established the first best as the completing baseline:
+    /// The experiment beat the current best by at least `min_delta`:
     /// `current_best_experiment_id` now references it and `plateau_count`
     /// was reset. Re-evaluating the recorded best is an idempotent no-op.
     Improved,
+    /// The completing baseline experiment became the first current best
+    /// without a prior comparison target: this is bookkeeping, not an
+    /// improvement event, so no plateau transition accompanies it.
+    BaselineEstablished,
     /// The experiment compared but did not beat the current best beyond
-    /// `min_delta`: `plateau_count` was incremented.
+    /// `min_delta`, or completed successfully without a primary metric
+    /// value (spec §5-1): `plateau_count` was incremented.
     NotImproved,
-    /// The experiment carries no primary metric value, or no comparison
-    /// anchor exists yet: nothing was evaluated or changed.
+    /// The experiment carries no primary metric value and is not a
+    /// successful completion, or no comparison anchor exists yet:
+    /// nothing was evaluated or changed.
     SkippedNoMetric,
     /// The campaign declares no objective metric or is not active:
     /// evaluation is skipped entirely.
@@ -73,11 +78,21 @@ fn evaluate_in_transaction(
         return Ok(PromotionOutcome::SkippedNoObjective);
     };
     let Some(candidate_value) = primary_metric_value(connection, experiment_id)? else {
+        if experiment_status(connection, experiment_id)? == Some(ExperimentStatus::Succeeded) {
+            increment_plateau(connection, campaign_id, now)?;
+            return Ok(PromotionOutcome::NotImproved);
+        }
         return Ok(PromotionOutcome::SkippedNoMetric);
     };
 
     match campaign.current_best_experiment_id.as_deref() {
-        Some(best_id) if best_id == experiment_id => Ok(PromotionOutcome::Improved),
+        Some(best_id) if best_id == experiment_id => {
+            if campaign.baseline_experiment_id.as_deref() == Some(experiment_id) {
+                Ok(PromotionOutcome::BaselineEstablished)
+            } else {
+                Ok(PromotionOutcome::Improved)
+            }
+        }
         Some(best_id) => compare_and_settle(
             connection,
             campaign_id,
@@ -90,7 +105,7 @@ fn evaluate_in_transaction(
         None => match campaign.baseline_experiment_id.as_deref() {
             Some(baseline_id) if baseline_id == experiment_id => {
                 promote(connection, campaign_id, experiment_id, now)?;
-                Ok(PromotionOutcome::Improved)
+                Ok(PromotionOutcome::BaselineEstablished)
             }
             Some(baseline_id) => compare_and_settle(
                 connection,
@@ -127,16 +142,25 @@ fn compare_and_settle(
         promote(connection, campaign_id, experiment_id, now)?;
         Ok(PromotionOutcome::Improved)
     } else {
-        connection
-            .execute(
-                "UPDATE campaigns
-                 SET plateau_count = plateau_count + 1, updated_at = ?1
-                 WHERE campaign_id = ?2",
-                rusqlite::params![now, campaign_id],
-            )
-            .map_err(database_error("increment campaign plateau count"))?;
+        increment_plateau(connection, campaign_id, now)?;
         Ok(PromotionOutcome::NotImproved)
     }
+}
+
+fn increment_plateau(
+    connection: &Connection,
+    campaign_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    connection
+        .execute(
+            "UPDATE campaigns
+             SET plateau_count = plateau_count + 1, updated_at = ?1
+             WHERE campaign_id = ?2",
+            rusqlite::params![now, campaign_id],
+        )
+        .map_err(database_error("increment campaign plateau count"))?;
+    Ok(())
 }
 
 fn promote(
@@ -186,6 +210,20 @@ fn read_campaign_promotion_state(
         )
         .optional()
         .map_err(database_error("read campaign promotion state"))
+}
+
+fn experiment_status(
+    connection: &Connection,
+    experiment_id: &str,
+) -> Result<Option<ExperimentStatus>, AppError> {
+    connection
+        .query_row(
+            "SELECT status FROM experiments WHERE experiment_id = ?1",
+            [experiment_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read experiment promotion status"))
 }
 
 fn primary_metric_value(

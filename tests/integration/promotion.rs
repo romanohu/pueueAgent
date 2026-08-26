@@ -179,6 +179,17 @@ impl Harness {
             .unwrap();
     }
 
+    fn set_experiment_status(&self, experiment_id: &str, status: &str) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET status = ?1, finished_at = 250 WHERE experiment_id = ?2",
+                params![status, experiment_id],
+            )
+            .unwrap();
+    }
+
     fn promotion_row(&self) -> (Option<String>, i64) {
         self.db
             .connect()
@@ -279,7 +290,7 @@ fn baseline_first_establishes_and_anchors_the_comparison() {
 
     let baseline_outcome = evaluate(&harness.db, CAMPAIGN_ID, BASELINE_EXPERIMENT_ID, 200).unwrap();
 
-    assert_eq!(baseline_outcome, PromotionOutcome::Improved);
+    assert_eq!(baseline_outcome, PromotionOutcome::BaselineEstablished);
     assert_eq!(
         harness.promotion_row(),
         (Some(BASELINE_EXPERIMENT_ID.to_owned()), 0)
@@ -295,6 +306,25 @@ fn baseline_first_establishes_and_anchors_the_comparison() {
     assert_eq!(
         harness.promotion_row(),
         (Some(CHALLENGER_EXPERIMENT_ID.to_owned()), 0)
+    );
+}
+
+#[test]
+fn succeeded_without_primary_metric_counts_toward_plateau() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, None);
+    harness.set_promotion_state(Some(BASELINE_EXPERIMENT_ID), 0);
+    harness.set_experiment_status(CHALLENGER_EXPERIMENT_ID, "succeeded");
+
+    let outcome = evaluate(&harness.db, CAMPAIGN_ID, CHALLENGER_EXPERIMENT_ID, 300).unwrap();
+
+    assert_eq!(outcome, PromotionOutcome::NotImproved);
+    assert_eq!(
+        harness.promotion_row(),
+        (Some(BASELINE_EXPERIMENT_ID.to_owned()), 1)
     );
 }
 
