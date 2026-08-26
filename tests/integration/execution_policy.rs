@@ -229,6 +229,7 @@ fn decision_campaign_limits_have_safe_service_defaults() {
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
             max_live_repairs: 2,
+            plateau_threshold: 3,
         }
     );
     assert_eq!(policy.default_network, NetworkMode::Enabled);
@@ -300,6 +301,39 @@ fn decision_campaign_limits_reject_values_outside_service_bounds() {
         fs::write(harness.policy(), updated).unwrap();
         secure_file(&harness.policy());
         assert!(load_existing_policy(&harness.input()).is_ok(), "{field} = 0");
+    }
+}
+
+#[test]
+fn plateau_threshold_accepts_the_documented_service_range() {
+    let harness = PolicyHarness::new();
+    load_or_create_policy(&harness.input()).unwrap();
+    let default_policy = fs::read_to_string(harness.policy()).unwrap();
+
+    for (value, accepted) in [(1, true), (3, true), (20, true), (0, false), (21, false)] {
+        let updated = default_policy.replacen(
+            "[campaign]",
+            &format!("[campaign]\nplateau_threshold = {value}"),
+            1,
+        );
+        fs::write(harness.policy(), updated).unwrap();
+        secure_file(&harness.policy());
+        let loaded = load_existing_policy(&harness.input());
+        if accepted {
+            let limits = loaded.unwrap().campaign_limits;
+            assert_eq!(limits.plateau_threshold, value, "plateau_threshold = {value}");
+        } else {
+            assert!(
+                matches!(
+                    loaded,
+                    Err(pueue_agent::execution_policy::PolicyViolation {
+                        code: PolicyViolationCode::PolicyUnknownField,
+                        ..
+                    })
+                ),
+                "plateau_threshold = {value}"
+            );
+        }
     }
 }
 

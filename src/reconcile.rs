@@ -176,6 +176,7 @@ where
                             &experiment.campaign_id,
                             &experiment.experiment_id,
                             projected_status,
+                            &self.campaign_limits,
                             now,
                         )?;
                     }

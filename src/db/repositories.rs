@@ -6436,7 +6436,7 @@ impl<'db> TaskObservationRepository<'db> {
     }
 }
 
-pub(super) fn insert_event_idempotent_in_transaction(
+pub(crate) fn insert_event_idempotent_in_transaction(
     transaction: &Transaction<'_>,
     event: &NewEvent,
 ) -> Result<(Event, bool), AppError> {

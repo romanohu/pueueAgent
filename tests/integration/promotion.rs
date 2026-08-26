@@ -189,6 +189,56 @@ impl Harness {
             )
             .unwrap()
     }
+
+    fn strategy_refresh_wakes(&self) -> Vec<(String, String)> {
+        let connection = self.db.connect().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT dedup_key, status FROM events
+                 WHERE project_id = ?1 AND kind = 'operator_wake'
+                   AND dedup_key LIKE 'strategy-refresh:v1:%'
+                 ORDER BY created_at, event_id",
+            )
+            .unwrap();
+        statement
+            .query_map([PROJECT_ID], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn wake_payload(&self, dedup_key: &str) -> (Option<String>, serde_json::Value) {
+        let (campaign_id, payload): (Option<String>, String) = self
+            .db
+            .connect()
+            .unwrap()
+            .query_row(                "SELECT campaign_id, payload_json FROM events
+                 WHERE project_id = ?1 AND dedup_key = ?2",
+                params![PROJECT_ID, dedup_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (campaign_id, serde_json::from_str(&payload).unwrap())
+    }
+}
+
+fn run_non_improvement(
+    harness: &Harness,
+    index: usize,
+    limits: &CampaignLimits,
+) -> PromotionOutcome {
+    let experiment_id = format!("{CHALLENGER_EXPERIMENT_ID}-{index}");
+    harness.add_experiment(&experiment_id);
+    harness.seed_metrics(&experiment_id, Some(2.0));
+    evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        &experiment_id,
+        ExperimentStatus::Succeeded,
+        limits,
+        300 + index as i64,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -205,6 +255,7 @@ fn improvement_updates_current_best_and_resets_plateau() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
@@ -228,6 +279,7 @@ fn non_improvement_increments_plateau_without_moving_the_best() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
@@ -249,6 +301,7 @@ fn exactly_at_delta_is_not_an_improvement() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
@@ -271,6 +324,7 @@ fn metric_less_campaign_skips_evaluation() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
@@ -292,11 +346,13 @@ fn inactive_campaign_skips_evaluation() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
     assert_eq!(outcome, PromotionOutcome::SkippedNoObjective);
     assert_eq!(harness.promotion_row(), (None, 0));
+    assert!(harness.strategy_refresh_wakes().is_empty());
 }
 
 #[test]
@@ -310,6 +366,7 @@ fn baseline_first_establishes_and_anchors_the_comparison() {
         CAMPAIGN_ID,
         BASELINE_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         200,
     ).unwrap();
 
@@ -328,6 +385,7 @@ fn baseline_first_establishes_and_anchors_the_comparison() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
@@ -352,6 +410,7 @@ fn succeeded_without_primary_metric_counts_toward_plateau() {
         CAMPAIGN_ID,
         CHALLENGER_EXPERIMENT_ID,
         ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
         300,
     ).unwrap();
 
@@ -377,6 +436,7 @@ fn failed_and_cancelled_experiments_skip_evaluation() {
             CAMPAIGN_ID,
             CHALLENGER_EXPERIMENT_ID,
             status,
+            &CampaignLimits::default(),
             300,
         )
         .unwrap();
@@ -387,4 +447,109 @@ fn failed_and_cancelled_experiments_skip_evaluation() {
             (Some(BASELINE_EXPERIMENT_ID.to_owned()), 2)
         );
     }
+}
+
+#[test]
+fn three_consecutive_non_improvements_emit_exactly_one_strategy_refresh_wake() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    let limits = CampaignLimits::default();
+
+    for index in 0..3 {
+        let outcome = run_non_improvement(&harness, index, &limits);
+        assert_eq!(outcome, PromotionOutcome::NotImproved);
+    }
+
+    let wake_key = format!("strategy-refresh:v1:{CAMPAIGN_ID}:1");
+    assert_eq!(
+        harness.strategy_refresh_wakes(),
+        vec![(wake_key.clone(), "pending".to_owned())]
+    );
+    let (campaign_lineage, payload) = harness.wake_payload(&wake_key);
+    assert_eq!(campaign_lineage.as_deref(), Some(CAMPAIGN_ID));
+    assert_eq!(payload["source"], "promotion");
+    assert_eq!(payload["reason"], "plateau_threshold_reached");
+    assert_eq!(payload["plateau_count"], 3);
+    assert_eq!(payload["round"], 1);
+    assert_eq!(
+        harness.promotion_row(),
+        (None, 3),
+        "the campaign stays active and keeps counting"
+    );
+}
+
+#[test]
+fn fourth_non_improvement_emits_no_additional_wake() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    let limits = CampaignLimits::default();
+
+    for index in 0..4 {
+        let outcome = run_non_improvement(&harness, index, &limits);
+        assert_eq!(outcome, PromotionOutcome::NotImproved);
+    }
+
+    assert_eq!(
+        harness.strategy_refresh_wakes(),
+        vec![(
+            format!("strategy-refresh:v1:{CAMPAIGN_ID}:1"),
+            "pending".to_owned()
+        )]
+    );
+    assert_eq!(harness.promotion_row(), (None, 4));
+}
+
+#[test]
+fn improvement_resets_the_plateau_and_the_next_round_wakes_with_round_two() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    let limits = CampaignLimits::default();
+
+    for index in 0..3 {
+        assert_eq!(
+            run_non_improvement(&harness, index, &limits),
+            PromotionOutcome::NotImproved
+        );
+    }
+    let improver = format!("{CHALLENGER_EXPERIMENT_ID}-improver");
+    harness.add_experiment(&improver);
+    harness.seed_metrics(&improver, Some(0.5));
+    assert_eq!(
+        evaluate(
+            &harness.db,
+            CAMPAIGN_ID,
+            &improver,
+            ExperimentStatus::Succeeded,
+            &limits,
+            400,
+        )
+        .unwrap(),
+        PromotionOutcome::Improved
+    );
+    for index in 10..13 {
+        assert_eq!(
+            run_non_improvement(&harness, index, &limits),
+            PromotionOutcome::NotImproved
+        );
+    }
+
+    assert_eq!(
+        harness.strategy_refresh_wakes(),
+        vec![
+            (
+                format!("strategy-refresh:v1:{CAMPAIGN_ID}:1"),
+                "pending".to_owned()
+            ),
+            (
+                format!("strategy-refresh:v1:{CAMPAIGN_ID}:2"),
+                "pending".to_owned()
+            ),
+        ]
+    );
+    let (_, payload) = harness.wake_payload(&format!("strategy-refresh:v1:{CAMPAIGN_ID}:2"));
+    assert_eq!(payload["round"], 2);
+    assert_eq!(harness.promotion_row(), (Some(improver), 3));
 }
