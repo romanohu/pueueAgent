@@ -95,6 +95,10 @@ path = "tests/integration/health_diagnosis.rs"
 name = "health_actions"
 path = "tests/integration/health_actions.rs"
 
+[[test]]
+name = "promotion"
+path = "tests/integration/promotion.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

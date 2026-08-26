@@ -32,6 +32,7 @@ pub mod periodic;
 pub mod process;
 pub mod project;
 pub mod project_logs;
+pub mod promotion;
 pub mod proposals;
 pub mod pueue;
 pub mod pueue_process;

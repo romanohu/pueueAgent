@@ -13,8 +13,8 @@ use crate::{
     execution_policy::CampaignLimits,
     incidents::IncidentStore,
     models::{
-        EventKind, Experiment, ExperimentTerminalOutcome, NewEvent, NewTaskObservation,
-        Submission, SubmissionStatus,
+        EventKind, Experiment, ExperimentStatus, ExperimentTerminalOutcome, NewEvent,
+        NewTaskObservation, Submission, SubmissionStatus,
     },
     pueue::{PueueApi, PueueTask},
     termination::{
@@ -156,6 +156,16 @@ where
                             Some(&objective),
                             now,
                         )?;
+                        if experiment.status == ExperimentStatus::Accepted
+                            && terminal_event_kind(task) == EventKind::TaskFinished
+                        {
+                            crate::promotion::evaluate(
+                                self.db,
+                                &experiment.campaign_id,
+                                &experiment.experiment_id,
+                                now,
+                            )?;
+                        }
                     }
                     project_terminal_experiment(
                         self.db,
