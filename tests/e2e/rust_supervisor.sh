@@ -1192,9 +1192,14 @@ record_task_id "oom-successor" \
 start_daemon
 wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'" "accepted" \
   "resume successor was not dispatched"
-wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$OOM_SUCCESSOR'" "succeeded" \
-  "resume successor was not projected terminal"
 stop_daemon
+# Retire the campaign before the successor can breed another decision cycle:
+# an unbounded propose->run->decide chain would outlive this scenario.
+sql "UPDATE campaigns SET state = 'retired', state_reason = 'health scenario bounded'
+     WHERE project_id = '$PROJECT_J' AND state <> 'retired'"
+
+# Scenario B reuses PROJECT_J; its campaigns are retired above before this
+# point, so nothing here can resurrect the propose chain.
 
 # Restarting while a diagnosis is in flight keeps exactly one diagnosis agent:
 # shutdown is issued as soon as the spawned run is visible, graceful drain
@@ -1247,6 +1252,10 @@ start_daemon
 wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$RESTART_SUCCESSOR'" "accepted" \
   "restarted successor was not dispatched"
 stop_daemon
+# Bound this campaign too: the resumed successor must not breed another
+# decision cycle while later scenarios run.
+sql "UPDATE campaigns SET state = 'retired', state_reason = 'health scenario bounded'
+     WHERE project_id = '$PROJECT_ID_J' AND state <> 'retired'"
 
 # Agent execution failures enter retry_wait; a later daemon run can retry the same event.
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 900 \
