@@ -77,6 +77,24 @@ pub fn campaign_experiment_task_environment(
     ]
 }
 
+pub fn campaign_experiment_runtime_argv(
+    project_root: &Path,
+    campaign_id: &str,
+    experiment_id: &str,
+    user_argv: &[String],
+) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(1 + 4 + user_argv.len());
+    argv.push(OsString::from("/usr/bin/env"));
+    for (name, value) in campaign_experiment_task_environment(project_root, campaign_id, experiment_id) {
+        let mut assignment = OsString::from(name);
+        assignment.push(OsString::from("="));
+        assignment.push(value);
+        argv.push(assignment);
+    }
+    argv.extend(user_argv.iter().map(OsString::from));
+    argv
+}
+
 /// The sole private-temp descriptor inherited by native agent targets.
 pub const PRIVATE_TEMP_TARGET_FD: i32 = 11;
 const PRIVATE_TEMP_TARGET_PATH: &str = "/dev/fd/11";

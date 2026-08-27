@@ -51,7 +51,7 @@
 - **例（評価）:** `pueue-agent submit --metric-name loss --metric-direction minimize --metric-min-delta 0.01 -- python train.py`
 - **失敗時の確認:** プロジェクトが有効であること、コマンド argv とメタデータ JSON、metric 指定の完全性（name と direction は同時必須、delta は finite）、Pueue 接続を確認します。
 
-`experiment` は既定の submission kind で、live campaign がなければ managed campaign と baseline を開始します。`control` は campaign 外の bootstrap、診断、後片付け用の direct submission です。どちらも live campaign 中は拒否され、追加指示には `steer` を使います。`control` も SQLite と Pueue task に記録され、guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。
+`experiment` は既定の submission kind で、live campaign がなければ managed campaign と baseline を開始します。`control` は campaign 外の bootstrap、診断、後片付け用の direct submission です。どちらも live campaign 中は拒否され、追加指示には `steer` を使います。`control` も SQLite と Pueue task に記録され、guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。Managed experiment の Pueue 追加は `/usr/bin/env` でラップされ、4つの派生変数（`PUEUE_AGENT_EXPERIMENT_ID`、`PUEUE_AGENT_CAMPAIGN_ID`、`PUEUE_AGENT_RESULT_PATH`、`PUEUE_AGENT_ARTIFACT_DIR`）が `NAME=value` 形式で付与された後に durable な user argv が続きます。Direct/control 投入はラップされず、Pueue の生コマンド表示はラップされた形式を含みます。
 
 ### `pueue-agent submit-batch`
 

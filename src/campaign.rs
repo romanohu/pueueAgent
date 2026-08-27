@@ -22,7 +22,7 @@ use crate::{
     },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
-    reconcile::{canonical_command_display, managed_task_run_signature},
+    reconcile::managed_task_run_signature,
     state::ObjectiveSnapshot,
     status::current_decision_projection,
     AppError,
@@ -251,17 +251,22 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             },
             &objective.digest,
         )?;
-        let add_args = pueue_add_args(
-            &project.pueue_group,
-            &admission.verified_root.anchor.canonical_path,
-            baseline.argv(),
-        );
-        validate_add_argv(&add_args)?;
-
         let campaign_id = Uuid::new_v4().to_string();
         let proposal_id = Uuid::new_v4().to_string();
         let experiment_id = Uuid::new_v4().to_string();
         let submission_id = Uuid::new_v4().to_string();
+        let runtime_argv = crate::environment::campaign_experiment_runtime_argv(
+            &admission.verified_root.anchor.canonical_path,
+            &campaign_id,
+            &experiment_id,
+            baseline.argv(),
+        );
+        let add_args = pueue_add_args(
+            &project.pueue_group,
+            &admission.verified_root.anchor.canonical_path,
+            &runtime_argv,
+        );
+        validate_add_argv(&add_args)?;
         let intent = CampaignRepository::new(self.db).start_with_baseline(
             StartCampaignRequest {
                 campaign_id: &campaign_id,
@@ -330,6 +335,21 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         now: i64,
     ) -> Result<Option<AdmittedCampaignProposal>, AppError> {
         let admission = self.acquire_admission(project)?;
+        let runtime_argv = crate::environment::campaign_experiment_runtime_argv(
+            &admission.verified_root.anchor.canonical_path,
+            campaign_id,
+            experiment_id,
+            proposal.argv(),
+        );
+        let add_args = pueue_add_args(
+            &project.pueue_group,
+            &explicit_working_directory(
+                &admission.verified_root.anchor.canonical_path,
+                proposal.working_directory(),
+            ),
+            &runtime_argv,
+        );
+        validate_add_argv(&add_args)?;
         match CampaignRepository::new(self.db).accept_proposal(
             campaign_id,
             proposal_id,
@@ -422,13 +442,19 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 message: "must match the startup-pinned project root",
             });
         }
+        let runtime_argv = crate::environment::campaign_experiment_runtime_argv(
+            &admission.verified_root.anchor.canonical_path,
+            &durable_campaign.campaign_id,
+            &current.experiment_id,
+            &durable_submission.argv,
+        );
         let add_args = pueue_add_args(
             &durable_project.pueue_group,
             &explicit_working_directory(
                 &admission.verified_root.anchor.canonical_path,
                 &durable_proposal.working_directory,
             ),
-            &durable_submission.argv,
+            &runtime_argv,
         );
         validate_add_argv(&add_args)?;
 
@@ -486,7 +512,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 return Err(error);
             }
         };
-        let expected_command = canonical_command_display(&durable_submission.argv);
+        let expected_command = canonical_command_display_os(&runtime_argv);
         let mut id_matches = tasks.iter().filter(|task| task.id == task_id);
         let task = id_matches.next();
         if task.is_none() || id_matches.next().is_some() {
@@ -591,15 +617,80 @@ fn validate_intent_identity(
     Ok(())
 }
 
-fn pueue_add_args(group: &str, project_root: &Path, argv: &[String]) -> Vec<OsString> {
+fn pueue_add_args(group: &str, project_root: &Path, argv: &[OsString]) -> Vec<OsString> {
     let mut add_args = Vec::with_capacity(argv.len() + 5);
     add_args.push(OsString::from("-g"));
     add_args.push(OsString::from(group));
     add_args.push(OsString::from("--working-directory"));
     add_args.push(project_root.as_os_str().to_owned());
     add_args.push(OsString::from("--"));
-    add_args.extend(argv.iter().map(OsString::from));
+    add_args.extend(argv.iter().cloned());
     add_args
+}
+
+fn canonical_command_display_os(argv: &[OsString]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote_os(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(unix)]
+fn shell_quote_os(arg: &OsString) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = arg.as_os_str().as_bytes();
+    if !bytes.is_empty()
+        && bytes.iter().all(|b| {
+            matches!(
+                *b,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'@'
+                    | b'%'
+                    | b'_'
+                    | b'+'
+                    | b'='
+                    | b':'
+                    | b','
+                    | b'.'
+                    | b'/'
+                    | b'-'
+            )
+        })
+    {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let lossy = String::from_utf8_lossy(bytes);
+    format!("'{}'", lossy.replace('\'', r"'\''"))
+}
+
+#[cfg(not(unix))]
+fn shell_quote_os(arg: &OsString) -> String {
+    let s = arg.to_string_lossy();
+    if !s.is_empty()
+        && s.bytes().all(|b| {
+            matches!(
+                b,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'@'
+                    | b'%'
+                    | b'_'
+                    | b'+'
+                    | b'='
+                    | b':'
+                    | b','
+                    | b'.'
+                    | b'/'
+                    | b'-'
+            )
+        })
+    {
+        return s.into_owned();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn explicit_working_directory(project_root: &Path, relative: &str) -> std::path::PathBuf {

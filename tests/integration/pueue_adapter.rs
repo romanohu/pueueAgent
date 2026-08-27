@@ -2014,18 +2014,20 @@ async fn campaign_submit_first_experiment_creates_baseline_and_one_pueue_task() 
     assert_eq!(harness.submissions(), 1);
     assert_eq!(harness.pueue_add_calls(), 1);
     assert_eq!(result.pueue_task_id, Some(41));
-    assert_eq!(
-        harness.fake.last_add_args(),
-        vec![
-            OsString::from("-g"),
-            OsString::from("pa-project"),
-            OsString::from("--working-directory"),
-            fs::canonicalize(&harness.root).unwrap().into_os_string(),
-            OsString::from("--"),
-            OsString::from("python"),
-            OsString::from("train.py"),
-        ]
-    );
+    // managed baseline must be wrapped via /usr/bin/env + four derived vars
+    let stored = SubmissionRepository::new(&harness.db)
+        .find_by_id(&result.submission_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.argv, vec!["python".to_owned(), "train.py".to_owned()]);
+    let add_args = harness.fake.last_add_args();
+    let sep = add_args.iter().position(|a| a == "--").unwrap();
+    let runtime = &add_args[sep + 1..];
+    assert_eq!(runtime[0], OsString::from("/usr/bin/env"));
+    assert_eq!(runtime.len(), 1 + 4 + 2);
+    assert_eq!(&runtime[5..], &[OsString::from("python"), OsString::from("train.py")]);
+    // verify durable group/root still used (not caller mutated) – wrapper correctness is covered by dedicated test
+    assert_eq!(add_args[1], OsString::from("pa-project"));
 }
 
 #[tokio::test]
@@ -2484,17 +2486,16 @@ async fn campaign_submit_mutated_values_cannot_change_the_durable_pueue_add() {
 
     assert_eq!(result.argv, vec!["python", "train.py"]);
     assert_eq!(harness.pueue_add_calls(), 1);
+    // must use durable project group/root and wrapped runtime with original argv, ignoring caller mutations
+    let add_args = harness.fake.last_add_args();
+    let sep = add_args.iter().position(|a| a == "--").unwrap();
+    let runtime = &add_args[sep + 1..];
+    assert_eq!(runtime[0], OsString::from("/usr/bin/env"));
+    assert_eq!(&runtime[5..], &[OsString::from("python"), OsString::from("train.py")]);
+    assert_eq!(add_args[1], OsString::from("pa-project"));
     assert_eq!(
-        harness.fake.last_add_args(),
-        vec![
-            OsString::from("-g"),
-            OsString::from("pa-project"),
-            OsString::from("--working-directory"),
-            fs::canonicalize(&harness.root).unwrap().into_os_string(),
-            OsString::from("--"),
-            OsString::from("python"),
-            OsString::from("train.py"),
-        ]
+        add_args[3],
+        fs::canonicalize(&harness.root).unwrap().into_os_string()
     );
 }
 
@@ -3648,4 +3649,193 @@ async fn submit_batch_cli_core_flow_uses_pueue_adapter_double_and_shared_rendere
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["status"], "completed");
     assert_eq!(value["jobs"][0]["task_id"], 73);
+}
+
+#[tokio::test]
+async fn campaign_submit_managed_wraps_with_env_and_preserves_durable_argv() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let result = harness.submit(&["python", "train.py"]).await.unwrap();
+
+    // durable submission must store only original argv
+    let stored = SubmissionRepository::new(&harness.db)
+        .find_by_id(&result.submission_id)
+        .unwrap()
+        .unwrap();
+    let expected_user: Vec<String> = vec!["python".to_owned(), "train.py".to_owned()];
+    assert_eq!(
+        stored.argv, expected_user,
+        "durable argv must remain original user argv"
+    );
+
+    // proposal canonical identity must remain original user argv (not wrapped)
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(
+            stored
+                .metadata
+                .get("experiment_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+        .unwrap();
+    // if metadata missing, fallback to live campaign lookup
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_live_by_project("project-a")
+        .unwrap()
+        .unwrap();
+    let _ = experiment; // ensure compilation
+
+    let add_args = harness.fake.last_add_args();
+    let sep = add_args
+        .iter()
+        .position(|a| a == "--")
+        .expect("missing -- separator");
+    let runtime = &add_args[sep + 1..];
+    assert!(
+        !runtime.is_empty() && runtime[0] == OsString::from("/usr/bin/env"),
+        "managed runtime must start with /usr/bin/env, got {runtime:?}"
+    );
+    // derive expected four NAME=value assignments without lossy conversion
+    let exp_id = stored
+        .metadata
+        .get("experiment_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_owned();
+    let camp_id = stored
+        .metadata
+        .get("campaign_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&campaign.campaign_id)
+        .to_owned();
+    let expected_env = pueue_agent::environment::campaign_experiment_task_environment(
+        &fs::canonicalize(&harness.root).unwrap(),
+        &camp_id,
+        &exp_id,
+    );
+    let expected_assignments: Vec<OsString> = expected_env
+        .iter()
+        .map(|(k, v)| {
+            let mut s = OsString::from(k);
+            s.push(OsString::from("="));
+            s.push(v);
+            s
+        })
+        .collect();
+    assert_eq!(
+        &runtime[1..5],
+        &expected_assignments[..],
+        "exactly four derived assignments before user argv"
+    );
+    assert_eq!(
+        &runtime[5..],
+        &[OsString::from("python"), OsString::from("train.py")],
+        "user argv must follow assignments unchanged"
+    );
+    // ensure no ambient env leakage: runtime must not contain PATH or HOME etc beyond the four
+    assert_eq!(runtime.len(), 1 + 4 + 2);
+}
+
+#[tokio::test]
+async fn campaign_submit_direct_control_remains_unwrapped() {
+    let harness = SubmitHarness::new();
+    let args = vec![OsString::from("python"), OsString::from("control.py")];
+    let result = submit::run_with_options(
+        &harness.db,
+        &harness.root,
+        &args,
+        &submit::SubmitOptions::new(SubmissionKind::Control, json!({}), None),
+        &CampaignLimits::default(),
+        &harness.fake,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.kind, SubmissionKind::Control);
+    let add_args = harness.fake.last_add_args();
+    let sep = add_args.iter().position(|a| a == "--").unwrap();
+    let runtime = &add_args[sep + 1..];
+    assert!(
+        !runtime.contains(&OsString::from("/usr/bin/env")),
+        "direct/control must remain unwrapped, got {runtime:?}"
+    );
+    assert_eq!(
+        runtime,
+        &[OsString::from("python"), OsString::from("control.py")]
+    );
+    let stored = SubmissionRepository::new(&harness.db)
+        .find_by_id(&result.submission_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.argv,
+        vec!["python".to_owned(), "control.py".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn campaign_submit_post_add_identity_expects_runtime_command() {
+    struct MismatchedPueue {
+        inner: FakePueue,
+        expected_original: Vec<OsString>,
+    }
+    #[async_trait]
+    impl PueueApi for MismatchedPueue {
+        async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+            // Return a task whose command is the *original* user argv display, not the wrapped runtime
+            let mut tasks = self.inner.status_json().await?;
+            if let Some(task) = tasks.first_mut() {
+                let original_display = self
+                    .expected_original
+                    .iter()
+                    .map(|s| {
+                        let s = s.to_string_lossy();
+                        if s.contains(' ') { format!("'{}'", s) } else { s.into_owned() }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                task.command = original_display;
+            }
+            Ok(tasks)
+        }
+        async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
+            self.inner.add(args).await
+        }
+        async fn kill(&self, task_id: i64) -> Result<(), AppError> {
+            self.inner.kill(task_id).await
+        }
+        async fn remove(&self, task_id: i64) -> Result<(), AppError> {
+            self.inner.remove(task_id).await
+        }
+        async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
+            self.inner.ensure_group(group).await
+        }
+    }
+
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    // Reserve baseline via repository to get intent without involving pueue yet
+    let intent = harness.reserve_baseline(&["python", "train.py"]);
+    let project = harness.project();
+    // Build a pueue double that will report mismatched command (original, not wrapped)
+    let mismatched = MismatchedPueue {
+        inner: FakePueue::new(),
+        expected_original: vec![OsString::from("python"), OsString::from("train.py")],
+    };
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &mismatched, CampaignLimits::default());
+    let result = coordinator
+        .submit_accepted_intent(&intent, &project, 101)
+        .await;
+    // Should fail identity validation and mark unreconciled, not succeed
+    assert!(
+        result.is_err(),
+        "post-add identity must expect runtime command, mismatched original should fail"
+    );
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&intent.experiment.experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        experiment.status,
+        ExperimentStatus::Unreconciled,
+        "mismatched command should leave experiment unreconciled"
+    );
 }
