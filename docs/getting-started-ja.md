@@ -157,7 +157,9 @@ decision analysis も agent-run hourly budget を消費します。1 cycle の�
 
 Phase 3 の running health は、実行中 experiment を `running OOM/stall observer` 付きの `periodic observer` で継続評価します。
 
-`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
+Phase 4 の evaluation は、campaign が `--metric-name` / `--metric-direction`（任意に `--metric-min-delta`）で宣言した objective metric に対して experiment task の `PUEUE_AGENT_RESULT_PATH` に書き出された result manifest（`schema_version:1`, `experiment_id`, `metrics`）を terminal projection 時に発見・検証し、`experiment_metrics` に永続化します。検証では有限数値のみを受理し、欠損や不一致は `artifact_defect`（`result_missing` / `result_invalid`）として記録して experiment の成否には影響しません。`current_best_experiment_id` と `plateau_count` は promotion で更新され、`minimize` は `value < best - delta`、`maximize` は `value > best + delta` で改善とみなし、改善で best を更新して plateau をリセット、非改善の `succeeded` では plateau をインクリメントし、`plateau_threshold`（既定 3, 1..20）到達で `strategy-refresh` の operator wake を round ごとに一度だけ発火します。決定は `goal_reached`（`evidence_ref` 必須、metrics row を参照）を返すと campaign を `goal_reached_pending_review` に遷移させ、`pueue-agent campaign review accept|reject [--note]` で確定（accept は `retired:goal_accepted`、reject は `active` に戻し該当 `goal_reached` 決定を dead-letter 化）します。いずれも `pueue-agent status` の `best:` / `plateau:` 行と `status --json` の `campaign.best_*` / `plateau_count` / `evaluation.recent`（最大 50 件）で観測できます。ログ解析は promotion しません。
+
+`goal review` は Phase 4 で `goal_reached` 決定を operator が承認/拒否するフローとして提供され、後続 phase の隔離された `code worktree` は Phase 5 の範囲です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
 
 service-owned execution policy では network が既定で enabled です。ただし network access と credential access は別の権限であり、明示 allowlist にない credential/environment value は agent や agent task に継承されません。
 

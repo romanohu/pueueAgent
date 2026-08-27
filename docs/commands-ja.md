@@ -43,12 +43,13 @@
 
 ### `pueue-agent submit`
 
-- **構文:** `pueue-agent submit [--kind KIND] [--metadata PATH | --metadata-json JSON] [--json] COMMAND...`
+- **構文:** `pueue-agent submit [--kind KIND] [--metadata PATH | --metadata-json JSON] [--metric-name NAME --metric-direction minimize|maximize [--metric-min-delta DELTA]] [--json] COMMAND...`
 - **目的:** 現在の有効プロジェクトへ 1 件のコマンドを投入します。
-- **状態変更:** 提出記録と Pueue タスクを作成します。
-- **主なオプション:** `--kind` は提出種別、`--metadata PATH` はメタデータファイル、`--metadata-json JSON` はインライン JSON（両者は排他）、`--json` は結果を JSON にします。末尾の `COMMAND...` は必須で、そのままコマンド argv として渡されます。
+- **状態変更:** 提出記録と Pueue タスクを作成します。`--metric-*` を指定すると campaign の objective metric として SQLite に保存され、後続の result manifest 評価に使われます。
+- **主なオプション:** `--kind` は提出種別、`--metadata PATH` はメタデータファイル、`--metadata-json JSON` はインライン JSON（両者は排他）、`--metric-name` と `--metric-direction` はセットで指定（`--metric-min-delta` は任意の有限数）、`--json` は結果を JSON にします。末尾の `COMMAND...` は必須で、そのままコマンド argv として渡されます。
 - **例:** `pueue-agent submit --kind experiment --metadata-json '{"dataset":"a"}' -- python train.py --epochs 5`
-- **失敗時の確認:** プロジェクトが有効であること、コマンド argv とメタデータ JSON、Pueue 接続を確認します。
+- **例（評価）:** `pueue-agent submit --metric-name loss --metric-direction minimize --metric-min-delta 0.01 -- python train.py`
+- **失敗時の確認:** プロジェクトが有効であること、コマンド argv とメタデータ JSON、metric 指定の完全性（name と direction は同時必須、delta は finite）、Pueue 接続を確認します。
 
 `experiment` は既定の submission kind で、live campaign がなければ managed campaign と baseline を開始します。`control` は campaign 外の bootstrap、診断、後片付け用の direct submission です。どちらも live campaign 中は拒否され、追加指示には `steer` を使います。`control` も SQLite と Pueue task に記録され、guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。
 
@@ -103,9 +104,11 @@ active campaign の実行中 experiment がある場合、`status` は experimen
 
 `status --json` の `health.recent` は `running_health` 行を `updated_at` の降順で最大 50 件列挙します。各行には state、観測回数、最終観測・更新時刻、bounded な signal 要約（class / source / evidence digest / 観測時刻）、推奨 action（格納されていれば）が含まれます。raw log 行は含まれません。
 
+campaign が objective metric を宣言している場合、`status` の人間向け出力には `best:` 行（current_best experiment ID と primary metric 値、存在すれば metric 名）と `plateau:` 行（plateau counter）が表示されます。`status --json` の `campaign` には `best_experiment_id`、`best_metric_name`、`best_metric_value`、`plateau_count` が、`evaluation.recent` には直近の `experiment_metrics` 行が `updated_at` 降順で最大 50 件含まれます。
+
 ### `pueue-agent campaign`
 
-- **構文:** `pueue-agent campaign <status|pause|resume|retire> [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
+- **構文:** `pueue-agent campaign <status|pause|resume|retire|review> [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
 - **目的:** 対象プロジェクトの最新 campaign の状態を確認、または operator による状態遷移を実行します。
 - **状態変更:** `status` は読み取り専用です。`pause`、`resume`、`retire` は campaign の状態だけを変更し、project や既存 Pueue task を直接変更しません。
 - **主なオプション:** `--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
@@ -114,6 +117,8 @@ active campaign の実行中 experiment がある場合、`status` は experimen
 
 `status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。`campaign status --json` の `decision` も project status と同じ current cycle と 8 field を投影し、cycle がなければ `null` です。objective 本文、raw argv、raw decision evidence は既定出力と JSON に含めません。
 
+`review accept` は `goal_reached_pending_review` の campaign を `retired`（`goal_accepted`）へ、`review reject` は `active` へ戻し、該当 `goal_reached` 決定イベントを `dead_letter` 化します。いずれも同一トランザクションで operator log を残し、非終端 experiment や予約が残る場合は失敗します。`accept` は idempotent で、`reject` は pending-review 以外では失敗します。
+
 公開 action は次のとおりです。
 
 ```text
@@ -121,6 +126,8 @@ pueue-agent campaign status
 pueue-agent campaign pause
 pueue-agent campaign resume
 pueue-agent campaign retire
+pueue-agent campaign review accept [--note TEXT]
+pueue-agent campaign review reject [--note TEXT]
 ```
 
 ### `pueue-agent proposal`
