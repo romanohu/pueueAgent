@@ -1368,6 +1368,254 @@ impl<'db> CampaignRepository<'db> {
         Ok(stored)
     }
 
+    pub fn review_accept(
+        &self,
+        project_id: &str,
+        note: Option<&str>,
+        now: i64,
+    ) -> Result<Campaign, AppError> {
+        if let Some(note) = note {
+            validate_review_note(note)?;
+        }
+        let _admission = super::repositories::acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire campaign review accept admission lock",
+        )?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign review accept transition"))?;
+        let campaign = read_latest_campaign_by_project(&transaction, project_id)?;
+        if campaign.state == CampaignState::Retired
+            && campaign.state_reason.as_deref() == Some("goal_accepted")
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit idempotent campaign review accept"))?;
+            return Ok(campaign);
+        }
+        if campaign.state != CampaignState::GoalReachedPendingReview {
+            return Err(validation_error(
+                "campaign",
+                "only a goal-reached pending-review campaign can be accepted",
+            ));
+        }
+        let (project_id_val, pueue_group): (String, String) = transaction
+            .query_row(
+                "SELECT project_id, pueue_group FROM projects WHERE project_id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read project for campaign review accept"))?
+            .ok_or_else(|| {
+                validation_error("project_id", "does not identify a registered project")
+            })?;
+        // Retire with goal_accepted reason atomically with operator log.
+        update_campaign_state(
+            &transaction,
+            &campaign.campaign_id,
+            CampaignState::Retired,
+            Some("goal_accepted"),
+            now,
+            "accept campaign goal review",
+        )?;
+        let mut details = serde_json::json!({
+            "campaign_id": campaign.campaign_id,
+            "review": "accept",
+            "reason": "goal_accepted",
+        });
+        if let Some(note) = note {
+            details["note"] = serde_json::Value::String(crate::output::bounded_redacted_text(note));
+        }
+        insert_review_operator_log(
+            &transaction,
+            &project_id_val,
+            &pueue_group,
+            "halt",
+            &details,
+            now,
+        )?;
+        let stored = read_campaign(&transaction, &campaign.campaign_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign review accept transition"))?;
+        Ok(stored)
+    }
+
+    pub fn review_reject(
+        &self,
+        project_id: &str,
+        note: Option<&str>,
+        now: i64,
+    ) -> Result<Campaign, AppError> {
+        if let Some(note) = note {
+            validate_review_note(note)?;
+        }
+        let _admission = super::repositories::acquire_project_lifecycle_admission(
+            self.db,
+            project_id,
+            "acquire campaign review reject admission lock",
+        )?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin campaign review reject transition"))?;
+        let campaign = read_latest_campaign_by_project(&transaction, project_id)?;
+        if campaign.state == CampaignState::Active
+            && campaign.state_reason.as_deref() == Some("goal_claim_rejected")
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit idempotent campaign review reject"))?;
+            return Ok(campaign);
+        }
+        if campaign.state != CampaignState::GoalReachedPendingReview {
+            return Err(validation_error(
+                "campaign",
+                "only a goal-reached pending-review campaign can be rejected",
+            ));
+        }
+        validate_project_available(&transaction, project_id)?;
+        let unsafe_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                  WHERE campaign_id = ?1
+                    AND (status = 'unreconciled' OR failure_code = 'termination_unknown')",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error(
+                "check campaign reconciliation before review reject",
+            ))?;
+        if unsafe_count != 0 {
+            return Err(validation_error(
+                "campaign",
+                "cannot reject while reconciliation or termination state is unknown",
+            ));
+        }
+        let (project_id_val, pueue_group): (String, String) = transaction
+            .query_row(
+                "SELECT project_id, pueue_group FROM projects WHERE project_id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read project for campaign review reject"))?
+            .ok_or_else(|| {
+                validation_error("project_id", "does not identify a registered project")
+            })?;
+        // Identify the unique current completed goal_reached claimant by joining
+        // decision_cycles to the exact campaign_decision event with matching
+        // dedup/campaign/source lineage and completed status. Fail closed unless
+        // exactly one such claimant exists.
+        let (cycle_id, source_experiment_id, event_id, payload_json) = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT dc.cycle_id, dc.source_experiment_id, ev.event_id, ev.payload_json
+                      FROM decision_cycles dc
+                      JOIN events ev
+                        ON ev.project_id = ?1
+                       AND ev.dedup_key = 'campaign-decision:v1:' || dc.cycle_id
+                       AND ev.campaign_id = dc.campaign_id
+                       AND ev.experiment_id = dc.source_experiment_id
+                       AND ev.kind = 'campaign_decision'
+                      WHERE dc.campaign_id = ?2
+                        AND dc.state = 'completed'
+                        AND dc.last_decision_kind = 'goal_reached'
+                        AND ev.status = 'completed'",
+                )
+                .map_err(database_error(
+                    "find claiming goal claimants for review reject",
+                ))?;
+            let rows = statement
+                .query_map(params![project_id, campaign.campaign_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(database_error(
+                    "query claiming goal claimants for review reject",
+                ))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error(
+                    "read claiming goal claimants for review reject",
+                ))?;
+            if rows.len() != 1 {
+                return Err(validation_error(
+                    "campaign_decision_event",
+                    "must have exactly one completed goal_reached claimant with a matching completed campaign_decision event",
+                ));
+            }
+            rows.into_iter().next().unwrap()
+        };
+        // Validate payload lineage exactly matches cycle and source.
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).map_err(|source| AppError::Serialization {
+                operation: "parse claiming decision event payload",
+                source,
+            })?;
+        if payload.get("source").and_then(|value| value.as_str()) != Some("terminal_experiment")
+            || payload.get("cycle_id").and_then(|value| value.as_str()) != Some(cycle_id.as_str())
+            || payload
+                .get("source_experiment_id")
+                .and_then(|value| value.as_str())
+                != Some(source_experiment_id.as_str())
+        {
+            return Err(validation_error(
+                "campaign_decision_event",
+                "payload lineage does not match the claiming goal cycle",
+            ));
+        }
+        // Atomically reactivate campaign and dead-letter that exact event.
+        update_campaign_state(
+            &transaction,
+            &campaign.campaign_id,
+            CampaignState::Active,
+            Some("goal_claim_rejected"),
+            now,
+            "reject campaign goal review",
+        )?;
+        // Preserve completed_at: do not clear it.
+        let updated = transaction
+            .execute(
+                "UPDATE events SET status = 'dead_letter', last_error = 'goal_claim_rejected' WHERE event_id = ?1 AND status = 'completed'",
+                [event_id],
+            )
+            .map_err(database_error("dead-letter claiming decision event"))?;
+        if updated != 1 {
+            return Err(validation_error(
+                "campaign_decision_event",
+                "status changed during review rejection",
+            ));
+        }
+        let mut details = serde_json::json!({
+            "campaign_id": campaign.campaign_id,
+            "review": "reject",
+            "reason": "goal_claim_rejected",
+        });
+        if let Some(note) = note {
+            details["note"] = serde_json::Value::String(crate::output::bounded_redacted_text(note));
+        }
+        insert_review_operator_log(
+            &transaction,
+            &project_id_val,
+            &pueue_group,
+            "resume",
+            &details,
+            now,
+        )?;
+        let stored = read_campaign(&transaction, &campaign.campaign_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit campaign review reject transition"))?;
+        Ok(stored)
+    }
+
     pub fn resume(&self, project_id: &str, now: i64) -> Result<Campaign, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -1380,7 +1628,6 @@ impl<'db> CampaignRepository<'db> {
                 | CampaignState::Paused
                 | CampaignState::BudgetWaiting
                 | CampaignState::Degraded
-                | CampaignState::GoalReachedPendingReview
         ) {
             return Err(validation_error(
                 "campaign",
@@ -1464,9 +1711,7 @@ impl<'db> CampaignRepository<'db> {
         }
         if !matches!(
             campaign.state,
-            CampaignState::Active
-                | CampaignState::Paused
-                | CampaignState::GoalReachedPendingReview
+            CampaignState::Active | CampaignState::Paused
         ) {
             return Err(validation_error(
                 "campaign",
@@ -2538,6 +2783,46 @@ fn update_campaign_state(
             "state changed concurrently during operator transition",
         ));
     }
+    Ok(())
+}
+
+fn validate_review_note(note: &str) -> Result<(), AppError> {
+    if note.len() > crate::decision_protocol::MAX_REVIEW_NOTE_BYTES
+        || note.chars().any(char::is_control)
+    {
+        return Err(validation_error(
+            "note",
+            "must fit the review note limit without control characters",
+        ));
+    }
+    if note.trim().is_empty() {
+        return Err(validation_error(
+            "note",
+            "must be non-empty without control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_review_operator_log(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    pueue_group: &str,
+    action: &'static str,
+    details: &Value,
+    now: i64,
+) -> Result<(), AppError> {
+    let details_json =
+        serde_json::to_string(details).map_err(|source| AppError::Serialization {
+            operation: "serialize review operator log details",
+            source,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO operator_logs (project_id, pueue_group, action, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, pueue_group, action, details_json, now],
+        )
+        .map_err(database_error("insert review operator log"))?;
     Ok(())
 }
 

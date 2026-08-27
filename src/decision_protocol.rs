@@ -2,16 +2,18 @@ use serde::Serialize;
 use sha2::Digest;
 
 use crate::{
-    AppError,
     execution_policy::CampaignLimits,
     models::ProposalKind,
     proposals::{self, ProposalInput, ValidatedProposal},
+    AppError,
 };
 
 pub const MAX_DECISION_BYTES: usize = 128 * 1024;
 pub const MAX_WAIT_REASON_BYTES: usize = 4 * 1024;
 pub const MAX_WAIT_EVIDENCE_ITEMS: usize = 16;
 pub const MAX_WAIT_EVIDENCE_BYTES: usize = 512;
+pub const MAX_EVIDENCE_REF_BYTES: usize = 512;
+pub const MAX_REVIEW_NOTE_BYTES: usize = 1024;
 
 #[derive(Debug)]
 pub enum DecisionInput {
@@ -36,6 +38,7 @@ struct DecisionEnvelope {
     reason: Option<String>,
     requested_wait_minutes: Option<u32>,
     expected_evidence: Option<Vec<String>>,
+    evidence_ref: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -43,12 +46,14 @@ struct DecisionEnvelope {
 enum DecisionKind {
     Proposal,
     Wait,
+    GoalReached,
 }
 
 #[derive(Debug)]
 pub enum ValidatedDecision {
     Proposal(ValidatedProposal),
     Wait(ValidatedWait),
+    GoalReached(ValidatedGoalReached),
 }
 
 impl ValidatedDecision {
@@ -56,6 +61,7 @@ impl ValidatedDecision {
         match self {
             Self::Proposal(proposal) => proposal.canonical_digest(),
             Self::Wait(wait) => wait.canonical_digest(),
+            Self::GoalReached(goal) => goal.canonical_digest(),
         }
     }
 }
@@ -87,6 +93,27 @@ impl ValidatedWait {
     }
 }
 
+#[derive(Debug)]
+pub struct ValidatedGoalReached {
+    objective_digest: String,
+    evidence_ref: String,
+    canonical_digest: String,
+}
+
+impl ValidatedGoalReached {
+    pub fn objective_digest(&self) -> &str {
+        &self.objective_digest
+    }
+
+    pub fn evidence_ref(&self) -> &str {
+        &self.evidence_ref
+    }
+
+    pub fn canonical_digest(&self) -> &str {
+        &self.canonical_digest
+    }
+}
+
 pub fn parse_and_validate_decision(
     bytes: &[u8],
     objective_digest: &str,
@@ -96,15 +123,17 @@ pub fn parse_and_validate_decision(
         return Err(validation_error("decision", "must be 1 to 131072 bytes"));
     }
 
-    let envelope: DecisionEnvelope = serde_json::from_slice(bytes).map_err(|source| AppError::Serialization {
-        operation: "parse campaign decision",
-        source,
-    })?;
+    let envelope: DecisionEnvelope =
+        serde_json::from_slice(bytes).map_err(|source| AppError::Serialization {
+            operation: "parse campaign decision",
+            source,
+        })?;
     let input = match envelope.decision {
         DecisionKind::Proposal => {
             if envelope.reason.is_some()
                 || envelope.requested_wait_minutes.is_some()
                 || envelope.expected_evidence.is_some()
+                || envelope.evidence_ref.is_some()
             {
                 return Err(validation_error(
                     "decision",
@@ -119,7 +148,7 @@ pub fn parse_and_validate_decision(
             }
         }
         DecisionKind::Wait => {
-            if envelope.proposal.is_some() {
+            if envelope.proposal.is_some() || envelope.evidence_ref.is_some() {
                 return Err(validation_error(
                     "proposal",
                     "must be null or absent for a wait decision",
@@ -140,6 +169,49 @@ pub fn parse_and_validate_decision(
                     validation_error("expected_evidence", "must be present for a wait decision")
                 })?,
             }
+        }
+        DecisionKind::GoalReached => {
+            if envelope.proposal.is_some()
+                || envelope.reason.is_some()
+                || envelope.requested_wait_minutes.is_some()
+                || envelope.expected_evidence.is_some()
+            {
+                return Err(validation_error(
+                    "decision",
+                    "proposal and wait fields must be null or absent for a goal_reached decision",
+                ));
+            }
+            let evidence_ref = envelope.evidence_ref.ok_or_else(|| {
+                validation_error(
+                    "evidence_ref",
+                    "must be present for a goal_reached decision",
+                )
+            })?;
+            return {
+                validate_schema_version(envelope.schema_version)?;
+                validate_wait_text("evidence_ref", &evidence_ref, MAX_EVIDENCE_REF_BYTES)?;
+                if evidence_ref.trim().is_empty() {
+                    return Err(validation_error(
+                        "evidence_ref",
+                        "must be non-empty without control characters",
+                    ));
+                }
+                let canonical = serde_json::to_vec(&CanonicalGoalReached {
+                    schema_version: envelope.schema_version,
+                    objective_digest,
+                    decision: "goal_reached",
+                    evidence_ref: &evidence_ref,
+                })
+                .map_err(|source| AppError::Serialization {
+                    operation: "serialize canonical campaign goal_reached decision",
+                    source,
+                })?;
+                Ok(ValidatedDecision::GoalReached(ValidatedGoalReached {
+                    objective_digest: objective_digest.to_owned(),
+                    evidence_ref,
+                    canonical_digest: format!("{:x}", sha2::Sha256::digest(canonical)),
+                }))
+            };
         }
     };
 
@@ -214,6 +286,14 @@ struct CanonicalWait<'a> {
     reason: &'a str,
     requested_wait_minutes: u32,
     expected_evidence: &'a [String],
+}
+
+#[derive(Serialize)]
+struct CanonicalGoalReached<'a> {
+    schema_version: u8,
+    objective_digest: &'a str,
+    decision: &'static str,
+    evidence_ref: &'a str,
 }
 
 fn validate_schema_version(schema_version: u8) -> Result<(), AppError> {

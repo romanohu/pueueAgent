@@ -46,10 +46,10 @@ const DECISION_OUTPUT_SCHEMA: &[u8] = br#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "decision", "proposal", "reason", "requested_wait_minutes", "expected_evidence"],
+  "required": ["schema_version", "decision", "proposal", "reason", "requested_wait_minutes", "expected_evidence", "evidence_ref"],
   "properties": {
     "schema_version": {"const": 1},
-    "decision": {"enum": ["proposal", "wait"]},
+    "decision": {"enum": ["proposal", "wait", "goal_reached"]},
     "proposal": {
       "type": ["object", "null"],
       "additionalProperties": false,
@@ -68,7 +68,8 @@ const DECISION_OUTPUT_SCHEMA: &[u8] = br#"{
     "expected_evidence": {
       "type": ["array", "null"],
       "items": {"type": "string"}
-    }
+    },
+    "evidence_ref": {"type": ["string", "null"], "maxLength": 512}
   }
 }"#;
 
@@ -2010,6 +2011,7 @@ impl AgentHandle {
                     kind: match decision {
                         ValidatedDecision::Proposal(_) => "proposal",
                         ValidatedDecision::Wait(_) => "wait",
+                        ValidatedDecision::GoalReached(_) => "goal_reached",
                     },
                 },
                 Err(_) => PreparedDecision::Invalid,
@@ -2485,6 +2487,63 @@ mod tests {
         assert!(schema.get("oneOf").is_none());
         assert!(schema.get("anyOf").is_none());
         assert_strict_object_schema(&schema);
+    }
+
+    #[test]
+    fn decision_output_schema_supports_goal_reached_with_evidence_ref() {
+        let schema: serde_json::Value = serde_json::from_slice(DECISION_OUTPUT_SCHEMA).unwrap();
+        let decision_enum = schema["properties"]["decision"]["enum"]
+            .as_array()
+            .expect("decision enum must be an array");
+        assert!(
+            decision_enum
+                .iter()
+                .any(|value| value.as_str() == Some("goal_reached")),
+            "decision enum must include goal_reached"
+        );
+        let properties = schema["properties"].as_object().expect("properties must be an object");
+        assert!(
+            properties.contains_key("evidence_ref"),
+            "properties must include evidence_ref"
+        );
+        let required = schema["required"].as_array().expect("required must be an array");
+        assert!(
+            required.iter().any(|value| value.as_str() == Some("evidence_ref")),
+            "required must include evidence_ref"
+        );
+        let evidence_ref = &properties["evidence_ref"];
+        let ty = evidence_ref.get("type").expect("evidence_ref must have a type");
+        let ty_string = ty.to_string();
+        assert!(
+            ty_string.contains("string") && ty_string.contains("null"),
+            "evidence_ref type must be string|null"
+        );
+        assert_eq!(
+            evidence_ref.get("maxLength").and_then(|value| value.as_u64()),
+            Some(512),
+            "evidence_ref maxLength must be 512"
+        );
+        assert_strict_object_schema(&schema);
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "decision": "goal_reached",
+            "proposal": null,
+            "reason": null,
+            "requested_wait_minutes": null,
+            "expected_evidence": null,
+            "evidence_ref": "experiment-123"
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let validated = crate::decision_protocol::parse_and_validate_decision(
+            &bytes,
+            "objective-digest",
+            crate::execution_policy::CampaignLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            validated,
+            crate::decision_protocol::ValidatedDecision::GoalReached(_)
+        ));
     }
 
     #[test]

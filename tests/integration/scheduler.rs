@@ -549,6 +549,18 @@ max_agent_runs = 10
                     AgentDecisionReservation::BudgetWaiting { .. }
                 ));
             }
+            CampaignState::GoalReachedPendingReview => {
+                // Direct fixture SQL is acceptable for the scheduler state-gating fixture only.
+                harness
+                    .db
+                    .connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE campaigns SET state='goal_reached_pending_review', state_reason='goal_reached:fixture', updated_at=91 WHERE campaign_id=?1",
+                        rusqlite::params![campaign_id],
+                    )
+                    .unwrap();
+            }
             state => panic!("unsupported due-decision fixture state: {state:?}"),
         }
         harness
@@ -887,17 +899,22 @@ async fn scheduler_runs_only_the_oldest_campaign_decision_and_binds_one_attempt(
 }
 
 #[tokio::test]
-async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decision_agent() {
+async fn paused_disabled_retired_budget_waiting_or_pending_review_campaign_never_starts_a_decision_agent(
+) {
     for state in [
         CampaignState::Paused,
         CampaignState::Retired,
         CampaignState::BudgetWaiting,
+        CampaignState::GoalReachedPendingReview,
     ] {
         let harness = SchedulerHarness::with_due_decision(state);
         let event_id = harness.campaign_decision_event_id();
         let mut scheduler = harness.scheduler();
         let report = scheduler.tick().await.unwrap();
-        assert!(report.started.is_empty());
+        assert!(
+            report.started.is_empty(),
+            "state {state:?} should not start a decision agent"
+        );
         assert_eq!(harness.agent_run_count(), 0);
         let event = harness.event(event_id);
         if state == CampaignState::Retired {
@@ -906,6 +923,11 @@ async fn paused_disabled_retired_or_budget_waiting_campaign_never_starts_a_decis
         } else if state == CampaignState::BudgetWaiting {
             assert_eq!(event.status, EventStatus::RetryWait);
             assert_eq!(event.not_before, 3_700);
+        } else if state == CampaignState::GoalReachedPendingReview {
+            // Pending review defers via campaign authority gate, no agent run.
+            assert_eq!(event.status, EventStatus::RetryWait);
+            assert_eq!(event.not_before, 160);
+            assert_eq!(event.attempts, 0);
         } else {
             assert_eq!(event.status, EventStatus::RetryWait);
             assert_eq!(event.not_before, 160);

@@ -57,6 +57,31 @@ pub enum CampaignAction {
     Pause(CampaignMutationArgs),
     Resume(CampaignMutationArgs),
     Retire(CampaignMutationArgs),
+    Review(CampaignReviewArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CampaignReviewArgs {
+    #[command(subcommand)]
+    pub action: CampaignReviewAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CampaignReviewAction {
+    Accept(CampaignReviewLeafArgs),
+    Reject(CampaignReviewLeafArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CampaignReviewLeafArgs {
+    #[arg(long, value_name = "NOTE")]
+    pub note: Option<String>,
+    #[arg(long, value_name = "PUEUE_CONFIG")]
+    pub pueue_config: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

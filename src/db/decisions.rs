@@ -915,10 +915,10 @@ impl<'db> DecisionRepository<'db> {
         validate_authority_lineage(&authority)?;
         validate_payload("decision_json", decision_json)?;
         validate_token("decision_digest", decision_digest, MAX_DECISION_DIGEST_BYTES)?;
-        if !matches!(decision_kind, "proposal" | "wait") {
+        if !matches!(decision_kind, "proposal" | "wait" | "goal_reached") {
             return Err(validation_error(
                 "decision_kind",
-                "must be proposal or wait",
+                "must be proposal, wait, or goal_reached",
             ));
         }
         if attempt.state == DecisionAttemptState::Decided
@@ -1172,6 +1172,170 @@ impl<'db> DecisionRepository<'db> {
         now: i64,
     ) -> Result<DecisionCycle, AppError> {
         self.finish_attempt(cycle_id, attempt_number, None, now)
+    }
+
+    pub fn complete_goal_claim_atomically(
+        &self,
+        cycle_id: &str,
+        attempt_number: i64,
+        evidence_ref: &str,
+        now: i64,
+    ) -> Result<DecisionCycle, AppError> {
+        if evidence_ref.is_empty()
+            || evidence_ref.len() > crate::decision_protocol::MAX_EVIDENCE_REF_BYTES
+            || evidence_ref.chars().any(char::is_control)
+            || evidence_ref.trim().is_empty()
+        {
+            return Err(validation_error(
+                "evidence_ref",
+                "must be bounded without control characters",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin goal claim atomic transition"))?;
+        let authority = read_authority(&transaction, cycle_id)?;
+        if attempt_number != {
+            let attempt = read_attempt(&transaction, cycle_id, attempt_number)?;
+            if attempt.state != DecisionAttemptState::Decided
+                || attempt.decision_kind.as_deref() != Some("goal_reached")
+            {
+                return Err(validation_error(
+                    "decision_attempt",
+                    "goal claim requires a decided goal_reached attempt",
+                ));
+            }
+            // Validate evidence_ref matches the persisted decision payload.
+            let decision_json = attempt.decision_json.as_deref().ok_or_else(|| {
+                validation_error("decision_json", "goal claim decision payload is missing")
+            })?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(decision_json).map_err(|source| AppError::Serialization {
+                    operation: "parse goal claim decision payload",
+                    source,
+                })?;
+            let payload_ref = parsed
+                .get("evidence_ref")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if payload_ref != evidence_ref {
+                return Err(validation_error(
+                    "evidence_ref",
+                    "must match the persisted goal decision payload",
+                ));
+            }
+            attempt.attempt_number
+        } {
+            return Err(validation_error(
+                "decision_attempt",
+                "attempt number mismatch during goal claim",
+            ));
+        }
+        // Idempotent: if already parked and cycle completed, return existing.
+        if authority.cycle.state == DecisionCycleState::Completed
+            && authority.cycle.last_decision_kind.as_deref() == Some("goal_reached")
+        {
+            let campaign_state: String = transaction
+                .query_row(
+                    "SELECT state FROM campaigns WHERE campaign_id = ?1",
+                    [&authority.cycle.campaign_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error(
+                    "check campaign state for idempotent goal claim",
+                ))?;
+            if campaign_state == CampaignState::GoalReachedPendingReview.as_str() {
+                let cycle = read_cycle(&transaction, cycle_id)?;
+                transaction
+                    .commit()
+                    .map_err(database_error("commit idempotent goal claim"))?;
+                return Ok(cycle);
+            }
+        }
+        validate_active_authority(&authority, None)?;
+        // Campaign must be active before parking.
+        let campaign_state: CampaignState = transaction
+            .query_row(
+                "SELECT state FROM campaigns WHERE campaign_id = ?1",
+                [&authority.cycle.campaign_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read campaign state for goal claim"))?
+            .ok_or_else(|| validation_error("campaign", "does not exist for goal claim"))?;
+        if campaign_state != CampaignState::Active {
+            return Err(validation_error(
+                "campaign",
+                "only an active campaign can be parked for goal review",
+            ));
+        }
+        // Evidence must belong to same campaign via experiment_metrics -> experiments.
+        let evidence_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM experiment_metrics m
+                    JOIN experiments e ON e.experiment_id = m.experiment_id
+                    WHERE m.experiment_id = ?1 AND e.campaign_id = ?2 AND m.artifact_defect IS NULL
+                )",
+                rusqlite::params![evidence_ref, authority.cycle.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check goal evidence reference"))?;
+        if !evidence_exists {
+            return Err(validation_error(
+                "evidence_ref",
+                "must reference an existing metrics row for this campaign",
+            ));
+        }
+        let reason = crate::output::bounded_redacted_text(&format!("goal_reached:{evidence_ref}"));
+        let updated = transaction
+            .execute(
+                "UPDATE campaigns SET state = ?1, state_reason = ?2, next_eligible_at = NULL, updated_at = ?3 WHERE campaign_id = ?4 AND state = 'active'",
+                rusqlite::params![
+                    CampaignState::GoalReachedPendingReview,
+                    reason,
+                    now,
+                    authority.cycle.campaign_id
+                ],
+            )
+            .map_err(database_error("park campaign for goal review"))?;
+        if updated != 1 {
+            return Err(validation_error(
+                "campaign",
+                "state changed while parking for goal review",
+            ));
+        }
+        // Complete the decision cycle atomically.
+        let updated_cycle = transaction
+            .execute(
+                "UPDATE decision_cycles SET state = ?1, next_wake_at = NULL, consecutive_failed_attempts = 0, last_decision_kind = ?2, last_failure_code = NULL, last_failure_summary = NULL, updated_at = ?3 WHERE cycle_id = ?4 AND state = 'analyzing'",
+                rusqlite::params![
+                    DecisionCycleState::Completed,
+                    "goal_reached",
+                    now,
+                    cycle_id
+                ],
+            )
+            .map_err(database_error("complete goal decision cycle"))?;
+        if updated_cycle != 1 {
+            return Err(validation_error(
+                "decision_cycle",
+                "state changed while completing goal claim",
+            ));
+        }
+        // Ensure attempt finished_at is set (store_decision already set, but ensure).
+        transaction
+            .execute(
+                "UPDATE decision_attempts SET finished_at = COALESCE(finished_at, ?1) WHERE cycle_id = ?2 AND attempt_number = ?3",
+                rusqlite::params![now, cycle_id, attempt_number],
+            )
+            .map_err(database_error("touch goal decision attempt"))?;
+        let cycle = read_cycle(&transaction, cycle_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit goal claim atomic transition"))?;
+        Ok(cycle)
     }
 
     pub fn find_cycle_for_source(

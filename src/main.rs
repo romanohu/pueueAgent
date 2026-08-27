@@ -535,6 +535,42 @@ mod commands {
                     )?
                 );
             }
+            CampaignAction::Review(review_args) => match review_args.action {
+                pueue_agent::cli::CampaignReviewAction::Accept(args) => {
+                    let pueue_config = args.pueue_config.clone();
+                    let project_root = args.project_root.clone();
+                    let json = args.json;
+                    let note = args.note.clone();
+                    let (db, project, _, _) = resolve_project(project_root, pueue_config)?;
+                    println!(
+                        "{}",
+                        pueue_agent::campaign::review_accept_for_project(
+                            &db,
+                            &project,
+                            note.as_deref(),
+                            unix_timestamp()?,
+                            json,
+                        )?
+                    );
+                }
+                pueue_agent::cli::CampaignReviewAction::Reject(args) => {
+                    let pueue_config = args.pueue_config.clone();
+                    let project_root = args.project_root.clone();
+                    let json = args.json;
+                    let note = args.note.clone();
+                    let (db, project, _, _) = resolve_project(project_root, pueue_config)?;
+                    println!(
+                        "{}",
+                        pueue_agent::campaign::review_reject_for_project(
+                            &db,
+                            &project,
+                            note.as_deref(),
+                            unix_timestamp()?,
+                            json,
+                        )?
+                    );
+                }
+            },
         }
         Ok(())
     }

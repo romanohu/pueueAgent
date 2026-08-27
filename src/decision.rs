@@ -289,6 +289,40 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                         CampaignSubmission::Deferred => report.deferred += 1,
                     }
                 }
+                ValidatedDecision::GoalReached(goal) => {
+                    // Atomic parking + cycle completion. Validation failures degrade
+                    // like malformed decisions; database errors propagate.
+                    let evidence_ref = goal.evidence_ref().to_owned();
+                    match repository.complete_goal_claim_atomically(
+                        &stored.reservation.cycle_id,
+                        stored.reservation.attempt_number,
+                        &evidence_ref,
+                        now,
+                    ) {
+                        Ok(_) => {
+                            // Further claims suppressed via campaign state; scheduler will defer.
+                        }
+                        Err(AppError::Validation { field, message }) => {
+                            // Propagate the specific reason through the degradation counter.
+                            let summary = if field == "evidence_ref" {
+                                "goal evidence reference does not exist or mismatches campaign"
+                            } else {
+                                message
+                            };
+                            record_rejection(
+                                &mut report,
+                                &repository,
+                                &stored.reservation.cycle_id,
+                                stored.reservation.attempt_number,
+                                summary,
+                                self.limits,
+                                now,
+                            )?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
         Ok(report)
@@ -382,6 +416,24 @@ fn validate_ready_decision(
                 });
             }
             "wait"
+        }
+        ValidatedDecision::GoalReached(goal) => {
+            if goal.objective_digest() != objective_digest {
+                return Err(AppError::Validation {
+                    field: "objective_digest",
+                    message: "must match the immutable campaign objective",
+                });
+            }
+            if goal.evidence_ref().is_empty()
+                || goal.evidence_ref().len() > crate::decision_protocol::MAX_EVIDENCE_REF_BYTES
+                || goal.evidence_ref().chars().any(char::is_control)
+            {
+                return Err(AppError::Validation {
+                    field: "evidence_ref",
+                    message: "must be bounded without control characters",
+                });
+            }
+            "goal_reached"
         }
     };
     if stored.decision_kind != kind || stored.decision_digest != decision.canonical_digest() {

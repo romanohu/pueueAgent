@@ -97,6 +97,28 @@ pub fn retire_for_project(
     render_campaign_mutation(&campaign, "retire", json)
 }
 
+pub fn review_accept_for_project(
+    db: &Db,
+    project: &Project,
+    note: Option<&str>,
+    now: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = CampaignRepository::new(db).review_accept(&project.project_id, note, now)?;
+    render_campaign_mutation(&campaign, "review_accept", json)
+}
+
+pub fn review_reject_for_project(
+    db: &Db,
+    project: &Project,
+    note: Option<&str>,
+    now: i64,
+    json: bool,
+) -> Result<String, AppError> {
+    let campaign = CampaignRepository::new(db).review_reject(&project.project_id, note, now)?;
+    render_campaign_mutation(&campaign, "review_reject", json)
+}
+
 pub fn render_proposals_for_project(
     db: &Db,
     project: &Project,
