@@ -65,6 +65,20 @@ CREATE TABLE experiment_metrics (
   Written at submit time when CLI flags are given; otherwise NULL.
 - Manifest discovery order: `$PUEUE_AGENT_RESULT_PATH` if set, else
   `.pueue-agent/results/<pueue_task_id>.json` inside the project root.
+- Pueue 4 has no per-task environment option. Managed experiment submissions
+  therefore keep the durable user argv unchanged but execute a derived runtime
+  argv of `/usr/bin/env` followed by exactly
+  `PUEUE_AGENT_EXPERIMENT_ID`, `PUEUE_AGENT_CAMPAIGN_ID`,
+  `PUEUE_AGENT_RESULT_PATH`, `PUEUE_AGENT_ARTIFACT_DIR`, then the durable user
+  argv. All four added values come only from persisted identifiers and the
+  startup-pinned project root. Direct/control submissions are not wrapped.
+- `PUEUE_AGENT_RESULT_PATH` is
+  `<root>/.pueue-agent/results/<experiment_id>.json`; the fixed fallback remains
+  available for terminal ingestion when the finished task environment cannot
+  be inspected.
+- Add preflight and post-add identity validation use the same derived runtime
+  argv. The stored submission argv remains the original user command, so
+  retries derive the wrapper again from durable campaign/experiment lineage.
 - Validation: JSON object, `schema_version == 1`, `experiment_id` matches the
   projected experiment, every metric value finite numbers only, paths in the
   manifest are never followed. Invalid → row stored with
@@ -108,9 +122,12 @@ a declared metric:
 ## 7. Security
 
 Manifest contents are validated numbers/ids only; artifact paths are recorded
-as digests, never followed. Env additions are names only — no values cross
-from the supervisor beyond ids already present. Review CLI actions append
-bounded operator-log entries like existing campaign mutations.
+as digests, never followed. The managed-task wrapper injects only persisted
+campaign/experiment ids and paths derived below the startup-pinned project
+root; the builder does not read or copy supervisor credential values. The
+normal environment inherited by a Pueue task is otherwise unchanged. Review
+CLI actions append bounded operator-log entries like existing campaign
+mutations.
 
 ## 8. Recovery windows
 
@@ -130,7 +147,10 @@ bounded operator-log entries like existing campaign mutations.
   ingestion stores metrics; promotion updates current_best and resets plateau;
   non-improvement increments and emits one strategy_refresh per round;
   goal_reached decision parks campaign and CLI accept/reject behave; metric-less
-  campaigns skip everything.
+  campaigns skip everything. Managed Pueue add argv contains the exact four
+  derived environment assignments before the original command, while direct
+  submissions remain byte-for-byte unchanged; post-add identity validation
+  compares against that same runtime command.
 - E2E (Linux): baseline completes without metric (no promotion churn);
   scenario with manifest-driven promotion; goal_reached → operator accept →
   retired.
@@ -146,3 +166,6 @@ bounded operator-log entries like existing campaign mutations.
 4. A goal_reached decision freezes the campaign pending review; operator
    accept retires it, reject resumes it.
 5. Metric-less campaigns are behaviourally identical to Phase 3.
+6. A managed experiment can write its manifest using only
+   `PUEUE_AGENT_RESULT_PATH` supplied by pueue-agent, without a repository-side
+   adapter or controller.

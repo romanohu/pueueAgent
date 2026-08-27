@@ -96,8 +96,8 @@ Add `models.rs` types (serde on ObjectiveMetric). Create repository file with up
 - Test: `tests/integration/reconciliation.rs` (append)
 
 **Interfaces:**
-- CLI (SubmitArgs): `--metric-name <n>`, `--metric-direction <minimize|maximize>`, `--metric-min-delta <f64>` (optional trio; all-or-nothing validation).
-- Env on campaign experiment tasks: `PUEUE_AGENT_EXPERIMENT_ID`, `PUEUE_AGENT_CAMPAIGN_ID`, `PUEUE_AGENT_RESULT_PATH` (= `<root>/.pueue-agent/results/<task>.json`), `PUEUE_AGENT_ARTIFACT_DIR`.
+- CLI (SubmitArgs): `--metric-name <n>` and `--metric-direction <minimize|maximize>` form an optional required pair; `--metric-min-delta <f64>` is optional when that pair is present.
+- Env derived for campaign experiment tasks: `PUEUE_AGENT_EXPERIMENT_ID`, `PUEUE_AGENT_CAMPAIGN_ID`, `PUEUE_AGENT_RESULT_PATH` (= `<root>/.pueue-agent/results/<experiment_id>.json`), `PUEUE_AGENT_ARTIFACT_DIR`.
 - `result_manifest::ingest(db, project_root, project_id, experiment_id, pueue_task_id, now) -> Result<(),AppError>` — discovery/validation/persist per spec §4 rules.
 
 - [ ] **Step 1: Failing tests**
@@ -119,7 +119,7 @@ async fn terminal_projection_ingests_manifest_metrics() { ... }
 
 - [ ] **Step 3: Implement.**
   - `result_manifest.rs`: discovery order RESULT_PATH env of the finished task cannot be read post-exit → use fixed project-relative path first; validate via serde_json Value walk; store row via MetricsRepository.
-  - environment.rs: extend campaign experiment env builder (same site as PUEUE_AGENT_RUN_ID).
+  - environment.rs: derive the campaign experiment environment values; Task 7 transports them into the managed Pueue runtime argv.
   - reconcile.rs: after `project_terminal_experiment` success and only when campaign has `objective_metric_json`, call ingest.
 
 - [ ] **Step 4: Green + full suite.**
@@ -193,8 +193,52 @@ async fn terminal_projection_ingests_manifest_metrics() { ... }
 - [ ] **Step 2:** E2E additions (Linux): scenario C (manifest promotion): submit with `--metric-name loss --metric-direction minimize`, fake task writes result manifest then exits success; assert metrics row + current_best set + plateau reset. Scenario D (goal): fake codex returns goal_reached with valid evidence_ref; assert pending_review; operator accept via CLI; assert retired. Both bounded (retire/stop-chain at section end like phase-3 pattern).
 - [ ] **Step 3:** bash -n; local suites; commit(s) `feat: surface evaluation state` / `test: exercise evaluation acceptance end to end` / `docs: document evaluation and goal review`.
 
+### Task 7: Fix managed experiment environment propagation
+
+**Files:**
+- Modify: `src/environment.rs`
+- Modify: `src/campaign.rs`
+- Modify: `tests/integration/pueue_adapter.rs`
+- Modify: `docs/commands-ja.md`, `docs/getting-started-ja.md`
+- Verify: `tests/e2e/rust_supervisor.sh`
+
+**Interfaces:**
+- Produce: `environment::campaign_experiment_runtime_argv(project_root, campaign_id, experiment_id, user_argv) -> Vec<OsString>`.
+- Runtime argv is `/usr/bin/env`, then exactly four `NAME=value` arguments from `campaign_experiment_task_environment`, then the durable user argv.
+- Durable `submissions.argv_json`, proposal canonical identity, and direct/control submission argv remain unchanged.
+- `campaign::pueue_add_args` and the post-add `canonical_command_display` comparison consume the same runtime argv.
+
+- [ ] **Step 1: Add focused failing tests.** In `tests/integration/pueue_adapter.rs`, assert a managed baseline Pueue add receives `/usr/bin/env` plus the exact experiment/campaign/result/artifact assignments before the original argv; assert the durable submission still stores only the original argv; assert a direct/control submission remains unwrapped. Add a mismatch test proving post-add identity validation expects the derived runtime command.
+
+- [ ] **Step 2: Run RED.**
+
+Run:
+
+```bash
+cargo test --test pueue_adapter campaign_submit -- --test-threads=1
+```
+
+Expected: the managed argv assertion fails because the current Pueue add contains only the original command.
+
+- [ ] **Step 3: Implement the runtime argv builder.** In `src/environment.rs`, prepend absolute `/usr/bin/env`, append the four existing derived variables as `NAME=value` `OsString` values without converting project paths through UTF-8, then append the original argv. Do not read ambient environment variables.
+
+- [ ] **Step 4: Use one derived argv for validation, add, and identity.** In `src/campaign.rs`, generate campaign/proposal/experiment/submission ids before baseline preflight, validate the exact wrapped add argv before the durable insert, preflight admitted proposals before `accept_proposal`, derive it again from durable rows in `submit_accepted_intent_inner`, and compare Pueue status against `canonical_command_display` of that runtime argv. Keep stored user argv unchanged.
+
+- [ ] **Step 5: Run GREEN and focused regressions.**
+
+```bash
+cargo test --test pueue_adapter -- --test-threads=1
+cargo test --test reconciliation -- --test-threads=1
+cargo check --all-targets
+git diff --check
+```
+
+- [ ] **Step 6: Document the managed wrapper and commit.** Explain that only managed experiments receive the four derived variables and that Pueue's raw command display includes the `/usr/bin/env` wrapper. Commit as `fix: propagate result manifest environment to experiments`.
+
+- [ ] **Step 7: Re-sync exact HEAD to roko and rerun the five Linux gates.** Scenario C must exit success, persist one non-defect metrics row, set current_best, and reset plateau; scenario D must reach pending review and retire through public operator accept. Record versions, exact commit, exit codes, warnings, and test counts in the ignored SDD ledger.
+
 ---
 
 ## Final Verification
 
-Full Linux gate on roko at merged HEAD (all five commands), evidence into SDD ledger, then merge/push upon user approval.
+Full Linux gate on roko at exact branch HEAD (all five commands), evidence into SDD ledger, then merge/push upon user approval.
