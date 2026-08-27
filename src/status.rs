@@ -458,12 +458,8 @@ fn best_status_line(campaign: &CampaignStatusProjection) -> String {
     match &campaign.current_best_experiment_id {
         None => "best: none".to_owned(),
         Some(best_id) => {
-            let short_raw = if best_id.len() >= 8 {
-                &best_id[..8]
-            } else {
-                best_id.as_str()
-            };
-            let id = bounded_redacted_text(short_raw);
+            let short_raw: String = best_id.chars().take(8).collect();
+            let id = bounded_redacted_text(&short_raw);
             match campaign.primary_metric_value {
                 Some(value) => {
                     let metric = campaign

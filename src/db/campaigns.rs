@@ -1139,16 +1139,26 @@ impl<'db> CampaignRepository<'db> {
             return Ok(None);
         };
         let has_objective = objective_metric_json.is_some();
-        let (primary_metric_name, primary_metric_value) = match &current_best_experiment_id {
-            Some(best_id) => connection
-                .query_row(
-                    "SELECT em.primary_metric_name, em.primary_metric_value FROM experiment_metrics em JOIN experiments e ON e.experiment_id = em.experiment_id WHERE em.experiment_id = ?1 AND e.campaign_id = ?2",
-                    rusqlite::params![best_id, campaign_id],
-                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<f64>>(1)?)),
-                )
-                .optional()
-                .map_err(database_error("read campaign best metric for status"))?
-                .unwrap_or((None, None)),
+        let mut current_best_experiment_id = current_best_experiment_id;
+        let (primary_metric_name, primary_metric_value) = match &current_best_experiment_id.clone() {
+            Some(best_id) => {
+                let row = connection
+                    .query_row(
+                        "SELECT em.primary_metric_name, em.primary_metric_value FROM experiment_metrics em JOIN experiments e ON e.experiment_id = em.experiment_id WHERE em.experiment_id = ?1 AND e.campaign_id = ?2",
+                        rusqlite::params![best_id, campaign_id],
+                        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<f64>>(1)?)),
+                    )
+                    .optional()
+                    .map_err(database_error("read campaign best metric for status"))?;
+                match row {
+                    Some((name, value)) => (name, value),
+                    None => {
+                        // malformed cross-campaign pointer – do not expose unvalidated best ID
+                        current_best_experiment_id = None;
+                        (None, None)
+                    }
+                }
+            }
             None => (None, None),
         };
         let experiment_counts = grouped_campaign_counts(

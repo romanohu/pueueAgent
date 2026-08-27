@@ -2258,18 +2258,18 @@ pub fn render_project_status_json(
         .list_by_project(&project.project_id, DEFAULT_SUMMARY_LIMIT)?;
     let agent_runs =
         AgentRunRepository::new(db).list_by_project(&project.project_id, DEFAULT_SUMMARY_LIMIT)?;
-    let campaign = CampaignRepository::new(db)
+    let campaign_projection = CampaignRepository::new(db)
         .status_projection_for_project(&project.project_id, crate::status::status_timestamp()?)?;
-    let campaign = match campaign {
-        Some(campaign) => {
+    let campaign = match campaign_projection.as_ref() {
+        Some(projection) => {
             let decision = current_decision_projection(
                 db,
-                &campaign.campaign_id,
+                &projection.campaign_id,
                 crate::status::status_timestamp()?,
             )?
                 .as_ref()
                 .map(DecisionStatusProjection::from);
-            Some(CampaignStatusSummary::new(campaign, decision))
+            Some(CampaignStatusSummary::new(projection.clone(), decision))
         }
         None => None,
     };
@@ -2313,7 +2313,13 @@ pub fn render_project_status_json(
             .collect(),
         },
         evaluation: {
-            let recent = evaluation_metrics(db, &project.project_id, MAX_METRICS_ROW_LIMIT)?;
+            let recent = if let Some(projection) =
+                campaign_projection.as_ref().filter(|p| p.has_objective)
+            {
+                evaluation_metrics(db, &projection.campaign_id, MAX_METRICS_ROW_LIMIT)?
+            } else {
+                Vec::new()
+            };
             if recent.is_empty() {
                 None
             } else {
@@ -2704,7 +2710,7 @@ struct MetricsSummary {
 
 fn evaluation_metrics(
     db: &crate::db::Db,
-    project_id: &str,
+    campaign_id: &str,
     limit: usize,
 ) -> Result<Vec<MetricsSummary>, AppError> {
     let connection = db.connect()?;
@@ -2713,8 +2719,7 @@ fn evaluation_metrics(
             "SELECT em.experiment_id, em.source, em.primary_metric_name, em.primary_metric_value, em.artifact_defect, em.created_at, em.updated_at
              FROM experiment_metrics em
              JOIN experiments e ON e.experiment_id = em.experiment_id
-             JOIN campaigns c ON c.campaign_id = e.campaign_id
-             WHERE c.project_id = ?1
+             WHERE e.campaign_id = ?1
              ORDER BY em.updated_at DESC, em.experiment_id DESC
              LIMIT ?2",
         )
@@ -2724,7 +2729,7 @@ fn evaluation_metrics(
         })?;
     let rows = statement
         .query_map(
-            rusqlite::params![project_id, limit as i64],
+            rusqlite::params![campaign_id, limit as i64],
             |row| {
                 Ok(MetricsSummary {
                     experiment_id: bounded_summary(&row.get::<_, String>(0)?),
