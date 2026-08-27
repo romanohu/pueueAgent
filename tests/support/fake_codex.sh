@@ -149,6 +149,11 @@ case "$objective" in
       exit 0
     fi
     ;;
+  *PUEUE_AGENT_E2E_GOAL*)
+    jq -cn --arg ref "$source_experiment_id" '{schema_version:1,decision:"goal_reached",evidence_ref:$ref,proposal:null,reason:null,requested_wait_minutes:null,expected_evidence:null}' \
+      > "$output"
+    exit 0
+    ;;
 esac
 
 proposal_kind="experiment"

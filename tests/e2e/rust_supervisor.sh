@@ -510,8 +510,10 @@ PROJECT_G="$WORK/g/wait-once"
 PROJECT_H="$WORK/h/invalid-three"
 PROJECT_I="$WORK/i/running-health"
 PROJECT_J="$WORK/j/restart-diagnosis"
+PROJECT_K="$WORK/k/manifest-promotion"
+PROJECT_L="$WORK/l/goal-review"
 mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D" \
-  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H" "$PROJECT_I" "$PROJECT_J"
+  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H" "$PROJECT_I" "$PROJECT_J" "$PROJECT_K" "$PROJECT_L"
 PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_A"
 "$PA_BIN" init "$PROJECT_B"
@@ -523,6 +525,8 @@ PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_H"
 "$PA_BIN" init "$PROJECT_I"
 "$PA_BIN" init "$PROJECT_J"
+"$PA_BIN" init "$PROJECT_K"
+"$PA_BIN" init "$PROJECT_L"
 
 CONFIG_A="$PROJECT_A/.pueue-agent/config.toml"
 CONFIG_B="$PROJECT_B/.pueue-agent/config.toml"
@@ -534,9 +538,11 @@ CONFIG_G="$PROJECT_G/.pueue-agent/config.toml"
 CONFIG_H="$PROJECT_H/.pueue-agent/config.toml"
 CONFIG_I="$PROJECT_I/.pueue-agent/config.toml"
 CONFIG_J="$PROJECT_J/.pueue-agent/config.toml"
+CONFIG_K="$PROJECT_K/.pueue-agent/config.toml"
+CONFIG_L="$PROJECT_L/.pueue-agent/config.toml"
 [ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] && [ -f "$CONFIG_C" ] && [ -f "$CONFIG_D" ] \
   && [ -f "$CONFIG_E" ] && [ -f "$CONFIG_F" ] && [ -f "$CONFIG_G" ] && [ -f "$CONFIG_H" ] \
-  && [ -f "$CONFIG_I" ] && [ -f "$CONFIG_J" ] \
+  && [ -f "$CONFIG_I" ] && [ -f "$CONFIG_J" ] && [ -f "$CONFIG_K" ] && [ -f "$CONFIG_L" ] \
   || fail "init did not create TOML configuration"
 PROJECT_ID_A="$(toml_value project_id "$CONFIG_A")"
 PROJECT_ID_B="$(toml_value project_id "$CONFIG_B")"
@@ -548,6 +554,8 @@ PROJECT_ID_G="$(toml_value project_id "$CONFIG_G")"
 PROJECT_ID_H="$(toml_value project_id "$CONFIG_H")"
 PROJECT_ID_I="$(toml_value project_id "$CONFIG_I")"
 PROJECT_ID_J="$(toml_value project_id "$CONFIG_J")"
+PROJECT_ID_K="$(toml_value project_id "$CONFIG_K")"
+PROJECT_ID_L="$(toml_value project_id "$CONFIG_L")"
 GROUP_A="$(toml_value pueue_group "$CONFIG_A")"
 GROUP_B="$(toml_value pueue_group "$CONFIG_B")"
 GROUP_C="$(toml_value pueue_group "$CONFIG_C")"
@@ -558,6 +566,8 @@ GROUP_G="$(toml_value pueue_group "$CONFIG_G")"
 GROUP_H="$(toml_value pueue_group "$CONFIG_H")"
 GROUP_I="$(toml_value pueue_group "$CONFIG_I")"
 GROUP_J="$(toml_value pueue_group "$CONFIG_J")"
+GROUP_K="$(toml_value pueue_group "$CONFIG_K")"
+GROUP_L="$(toml_value pueue_group "$CONFIG_L")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
@@ -571,6 +581,8 @@ write_config "$PROJECT_G" "$PROJECT_ID_G" "$GROUP_G" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_H" "$PROJECT_ID_H" "$GROUP_H" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_I" "$PROJECT_ID_I" "$GROUP_I" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_J" "$PROJECT_ID_J" "$GROUP_J" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_K" "$PROJECT_ID_K" "$GROUP_K" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_L" "$PROJECT_ID_L" "$GROUP_L" "$WORK/bin/fake-agent" 20
 printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
   > "$PROJECT_A/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
@@ -589,6 +601,9 @@ printf '%s\n' 'Keep the diagnosed OOM experiment observable for the running-heal
   > "$PROJECT_I/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep the restart-diagnosis experiment observable across daemon restarts.' \
   > "$PROJECT_J/.pueue-agent/STATE.md"
+printf '%s\n' 'Reach validation loss below 0.20 with promotion' \
+  > "$PROJECT_K/.pueue-agent/STATE.md"
+printf '%s\n' 'PUEUE_AGENT_E2E_GOAL' > "$PROJECT_L/.pueue-agent/STATE.md"
 
 mkdir -p "$XDG_STATE_HOME"
 chmod 700 "$XDG_STATE_HOME"
@@ -654,6 +669,14 @@ agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT
 [projects."$PROJECT_ID_J"]
 custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_K"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_L"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 EOF
 chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 
@@ -667,8 +690,10 @@ chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_H"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_I"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_J"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_K"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_L"
 STATE_DB="$XDG_STATE_HOME/pueue-agent/state.sqlite3"
-[ "$(sql 'SELECT COUNT(*) FROM projects')" = "10" ] || fail "projects were not registered"
+[ "$(sql 'SELECT COUNT(*) FROM projects')" = "12" ] || fail "projects were not registered"
 
 # Healthy monitoring performs reconciliation without spending agent tokens.
 start_daemon
@@ -889,6 +914,57 @@ stop_daemon
   || fail "restart changed the unreconciled quarantine"
 [ "$(pueue_group_task_count "$GROUP_D")" = "$((uncertain_before + 1))" ] \
   || fail "restart re-added an unreconciled Pueue task"
+
+# Scenario C: manifest promotion – submit with metric, task writes manifest then succeeds.
+metric_summary="$(cd "$PROJECT_K" && "$PA_BIN" submit --metric-name loss --metric-direction minimize -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_metrics.sh")"
+metric_task="$(submission_task_id "$metric_summary")"
+record_task_id "metric-promotion-source" "$metric_task"
+CAMPAIGN_K="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $metric_task")"
+METRIC_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $metric_task")"
+wait_for_task_terminal "$metric_task"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$METRIC_SOURCE'" "succeeded" \
+  "metric promotion baseline was not projected succeeded"
+wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$METRIC_SOURCE'" "1" \
+  "metric promotion did not persist metrics row"
+wait_for_sql "SELECT artifact_defect FROM experiment_metrics WHERE experiment_id = '$METRIC_SOURCE'" "" \
+  "metric promotion had unexpected artifact_defect"
+wait_for_sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$CAMPAIGN_K'" "$METRIC_SOURCE" \
+  "metric promotion did not set current_best"
+wait_for_sql "SELECT plateau_count FROM campaigns WHERE campaign_id = '$CAMPAIGN_K'" "0" \
+  "metric promotion did not reset plateau"
+stop_daemon
+# Verify status shows best and plateau, and diagnostics caps metrics at 50.
+"$PA_BIN" status --pueue-config "$WORK/pueue.yml" "$PROJECT_K" | grep -q "best:" \
+  || fail "metric promotion status missing best:"
+"$PA_BIN" status --pueue-config "$WORK/pueue.yml" "$PROJECT_K" | grep -q "plateau:" \
+  || fail "metric promotion status missing plateau:"
+# Bound this campaign before later scenarios.
+"$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_K" >/dev/null
+[ "$(sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_K'")" = "retired" ] \
+  || fail "metric promotion retire did not retire campaign"
+
+# Scenario D: goal_reached decision parks campaign pending review, operator accept retires.
+goal_summary="$(cd "$PROJECT_L" && "$PA_BIN" submit --metric-name loss --metric-direction minimize -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_metrics.sh")"
+goal_task="$(submission_task_id "$goal_summary")"
+record_task_id "goal-source" "$goal_task"
+CAMPAIGN_L="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $goal_task")"
+GOAL_SOURCE="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $goal_task")"
+wait_for_task_terminal "$goal_task"
+start_daemon
+wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$GOAL_SOURCE'" "succeeded" \
+  "goal source was not projected succeeded"
+wait_for_sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_L'" "goal_reached_pending_review" \
+  "goal_reached did not park campaign pending review"
+wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_L' AND source_experiment_id = '$GOAL_SOURCE' AND state = 'completed' AND last_decision_kind = 'goal_reached'" "1" \
+  "goal_reached decision cycle not completed"
+stop_daemon
+# Operator accept retires the campaign (requires terminal experiments, which is satisfied).
+"$PA_BIN" campaign review accept --pueue-config "$WORK/pueue.yml" "$PROJECT_L" >/dev/null
+[ "$(sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_L'")" = "retired" ] \
+  || fail "goal review accept did not retire campaign"
+[ "$(sql "SELECT state_reason FROM campaigns WHERE campaign_id = '$CAMPAIGN_L'")" = "goal_accepted" ] \
+  || fail "goal review accept reason not goal_accepted"
 
 # A trusted terminal failure emits one repair proposal and one child task.
 trusted_summary="$(cd "$PROJECT_E" && "$PA_BIN" submit -- /bin/sh -c 'exit 17')"
