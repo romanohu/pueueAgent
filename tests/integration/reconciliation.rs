@@ -1475,7 +1475,7 @@ fn submit_metric_flags_require_the_full_trio() {
         "train.py",
     ])
     .unwrap_err();
-    assert!(error.to_string().contains("--metric-min-delta"));
+    assert!(error.to_string().contains("--metric-direction"));
 
     let error = Cli::try_parse_from([
         "pueue-agent",
@@ -1490,6 +1490,26 @@ fn submit_metric_flags_require_the_full_trio() {
     ])
     .unwrap_err();
     assert!(error.to_string().contains("--metric-name"));
+
+    // name+direction without delta must parse (min-delta optional)
+    let parsed = Cli::try_parse_from([
+        "pueue-agent",
+        "submit",
+        "--metric-name",
+        "loss",
+        "--metric-direction",
+        "minimize",
+        "--",
+        "python",
+        "train.py",
+    ])
+    .unwrap();
+    let Command::Submit(args) = parsed.command else {
+        panic!("expected a submit command");
+    };
+    assert_eq!(args.metric_name.as_deref(), Some("loss"));
+    assert!(matches!(args.metric_direction.unwrap(), pueue_agent::cli::MetricDirectionArg::Minimize));
+    assert_eq!(args.metric_min_delta, None);
 
     let parsed = Cli::try_parse_from([
         "pueue-agent",

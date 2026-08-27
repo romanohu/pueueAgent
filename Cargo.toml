@@ -103,6 +103,10 @@ path = "tests/integration/promotion.rs"
 name = "goal_review"
 path = "tests/integration/goal_review.rs"
 
+[[test]]
+name = "evaluation_surface"
+path = "tests/integration/evaluation_surface.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }

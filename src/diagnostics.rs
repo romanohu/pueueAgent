@@ -46,6 +46,7 @@ pub const DEFAULT_EVENT_LIST_LIMIT: usize = 100;
 pub const MAX_EVENT_LIST_LIMIT: usize = 1_000;
 pub const MAX_TASK_SUMMARY_LIMIT: usize = MAX_EVENT_LIST_LIMIT;
 pub const MAX_HEALTH_ROW_LIMIT: usize = 50;
+pub const MAX_METRICS_ROW_LIMIT: usize = 50;
 
 const MAX_TASK_AGENT_RUNS: usize = 64;
 const MAX_RESTART_UNCERTAIN_SAMPLES: i64 = 3;
@@ -2311,6 +2312,14 @@ pub fn render_project_status_json(
             .map(RunningHealthSummary::from)
             .collect(),
         },
+        evaluation: {
+            let recent = evaluation_metrics(db, &project.project_id, MAX_METRICS_ROW_LIMIT)?;
+            if recent.is_empty() {
+                None
+            } else {
+                Some(EvaluationSection { recent })
+            }
+        },
         campaign,
         policy: FutureSection::default(),
         resource: FutureSection::default(),
@@ -2336,6 +2345,8 @@ struct ProjectStatusReport {
     agent_runs: AgentRunSection,
     interventions: InterventionStatusProjection,
     health: HealthSection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evaluation: Option<EvaluationSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     campaign: Option<CampaignStatusSummary>,
     policy: FutureSection,
@@ -2676,6 +2687,73 @@ fn running_health_recommended_action(diagnosis_json: &Option<String>) -> Option<
 }
 
 #[derive(Serialize)]
+struct EvaluationSection {
+    recent: Vec<MetricsSummary>,
+}
+
+#[derive(Serialize)]
+struct MetricsSummary {
+    experiment_id: String,
+    source: String,
+    primary_metric_name: Option<String>,
+    primary_metric_value: Option<f64>,
+    artifact_defect: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn evaluation_metrics(
+    db: &crate::db::Db,
+    project_id: &str,
+    limit: usize,
+) -> Result<Vec<MetricsSummary>, AppError> {
+    let connection = db.connect()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT em.experiment_id, em.source, em.primary_metric_name, em.primary_metric_value, em.artifact_defect, em.created_at, em.updated_at
+             FROM experiment_metrics em
+             JOIN experiments e ON e.experiment_id = em.experiment_id
+             JOIN campaigns c ON c.campaign_id = e.campaign_id
+             WHERE c.project_id = ?1
+             ORDER BY em.updated_at DESC, em.experiment_id DESC
+             LIMIT ?2",
+        )
+        .map_err(|source| AppError::Database {
+            operation: "prepare evaluation metrics listing",
+            source,
+        })?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![project_id, limit as i64],
+            |row| {
+                Ok(MetricsSummary {
+                    experiment_id: bounded_summary(&row.get::<_, String>(0)?),
+                    source: bounded_summary(&row.get::<_, String>(1)?),
+                    primary_metric_name: row
+                        .get::<_, Option<String>>(2)?
+                        .map(|v| bounded_summary(&v)),
+                    primary_metric_value: row.get::<_, Option<f64>>(3)?,
+                    artifact_defect: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|v| bounded_summary(&v)),
+                    created_at: row.get::<_, i64>(5)?,
+                    updated_at: row.get::<_, i64>(6)?,
+                })
+            },
+        )
+        .map_err(|source| AppError::Database {
+            operation: "query evaluation metrics listing",
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| AppError::Database {
+            operation: "read evaluation metrics listing",
+            source,
+        })?;
+    Ok(rows)
+}
+
+#[derive(Serialize)]
 struct CampaignStatusSummary {
     campaign_id: String,
     state: crate::models::CampaignState,
@@ -2685,6 +2763,14 @@ struct CampaignStatusSummary {
     experiment_counts: BTreeMap<String, i64>,
     rolling_usage: BTreeMap<String, i64>,
     unreconciled_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_experiment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plateau_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_metric_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_metric_value: Option<f64>,
     decision: Option<DecisionStatusProjection>,
 }
 
@@ -2693,6 +2779,15 @@ impl CampaignStatusSummary {
         campaign: CampaignStatusProjection,
         decision: Option<DecisionStatusProjection>,
     ) -> Self {
+        let has_objective = campaign.has_objective;
+        let best_experiment_id = if has_objective {
+            campaign
+                .current_best_experiment_id
+                .as_deref()
+                .map(bounded_summary)
+        } else {
+            None
+        };
         Self {
             campaign_id: bounded_summary(&campaign.campaign_id),
             state: campaign.state,
@@ -2702,6 +2797,22 @@ impl CampaignStatusSummary {
             experiment_counts: campaign.experiment_counts,
             rolling_usage: campaign.rolling_usage,
             unreconciled_count: campaign.unreconciled_count,
+            best_experiment_id,
+            plateau_count: if has_objective {
+                Some(campaign.plateau_count)
+            } else {
+                None
+            },
+            best_metric_name: if has_objective {
+                campaign.primary_metric_name.as_deref().map(bounded_summary)
+            } else {
+                None
+            },
+            best_metric_value: if has_objective {
+                campaign.primary_metric_value
+            } else {
+                None
+            },
             decision,
         }
     }

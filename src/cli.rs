@@ -292,16 +292,14 @@ pub struct SubmitArgs {
     #[arg(
         long,
         value_name = "NAME",
-        requires = "metric_direction",
-        requires = "metric_min_delta"
+        requires = "metric_direction"
     )]
     pub metric_name: Option<String>,
     #[arg(
         long,
         value_enum,
         value_name = "DIRECTION",
-        requires = "metric_name",
-        requires = "metric_min_delta"
+        requires = "metric_name"
     )]
     pub metric_direction: Option<MetricDirectionArg>,
     #[arg(

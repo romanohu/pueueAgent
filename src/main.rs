@@ -1048,7 +1048,7 @@ fn objective_metric_from_flags(
 ) -> Result<Option<pueue_agent::models::ObjectiveMetric>, AppError> {
     match (name, direction, min_delta) {
         (None, None, None) => Ok(None),
-        (Some(name), Some(direction), Some(min_delta)) => Ok(Some(
+        (Some(name), Some(direction), min_delta) => Ok(Some(
             pueue_agent::models::ObjectiveMetric {
                 name,
                 direction: match direction {
@@ -1059,13 +1059,44 @@ fn objective_metric_from_flags(
                         pueue_agent::models::MetricDirection::Maximize
                     }
                 },
-                min_delta: Some(min_delta),
+                min_delta,
             },
         )),
         _ => Err(AppError::Validation {
             field: "submit.metric",
             message:
-                "--metric-name, --metric-direction, and --metric-min-delta must be provided together",
+                "--metric-name and --metric-direction must be provided together; --metric-min-delta is optional and requires both",
         }),
+    }
+}
+
+#[cfg(test)]
+mod objective_metric_flag_tests {
+    use super::objective_metric_from_flags;
+    use pueue_agent::cli::MetricDirectionArg;
+
+    #[test]
+    fn accepts_name_and_direction_without_delta() {
+        let metric = objective_metric_from_flags(
+            Some("loss".to_owned()),
+            Some(MetricDirectionArg::Minimize),
+            None,
+        )
+        .unwrap();
+        let metric = metric.expect("must be Some");
+        assert_eq!(metric.name, "loss");
+        assert_eq!(metric.min_delta, None);
+    }
+
+    #[test]
+    fn rejects_incomplete_metric_flags() {
+        assert!(objective_metric_from_flags(Some("loss".to_owned()), None, None).is_err());
+        assert!(objective_metric_from_flags(None, Some(MetricDirectionArg::Maximize), None).is_err());
+        assert!(objective_metric_from_flags(None, None, Some(0.1)).is_err());
+        assert!(objective_metric_from_flags(Some("loss".to_owned()), None, Some(0.1)).is_err());
+        let err = objective_metric_from_flags(Some("loss".to_owned()), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be provided together") || err.contains("together"));
     }
 }

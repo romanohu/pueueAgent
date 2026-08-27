@@ -202,6 +202,10 @@ pub fn render_project_status(
         .status_projection_for_project(&project.project_id, now)?
     {
         lines.push(campaign_status_line(&campaign));
+        if campaign.has_objective {
+            lines.push(best_status_line(&campaign));
+            lines.push(plateau_status_line(&campaign));
+        }
         if let Some(decision) = current_decision_projection(db, &campaign.campaign_id, now)? {
             lines.push(render_decision_status_line(
                 &DecisionStatusProjection::from(&decision),
@@ -408,6 +412,10 @@ pub fn render_project_status_compact(
         .status_projection_for_project(&project.project_id, now)?
     {
         lines.push(campaign_status_line(&campaign));
+        if campaign.has_objective {
+            lines.push(best_status_line(&campaign));
+            lines.push(plateau_status_line(&campaign));
+        }
         if let Some(decision) = current_decision_projection(db, &campaign.campaign_id, now)? {
             lines.push(render_decision_status_line(
                 &DecisionStatusProjection::from(&decision),
@@ -444,6 +452,35 @@ fn campaign_status_line(campaign: &CampaignStatusProjection) -> String {
         campaign.unreconciled_count,
         bounded_redacted_text(&campaign.objective_digest),
     )
+}
+
+fn best_status_line(campaign: &CampaignStatusProjection) -> String {
+    match &campaign.current_best_experiment_id {
+        None => "best: none".to_owned(),
+        Some(best_id) => {
+            let short_raw = if best_id.len() >= 8 {
+                &best_id[..8]
+            } else {
+                best_id.as_str()
+            };
+            let id = bounded_redacted_text(short_raw);
+            match campaign.primary_metric_value {
+                Some(value) => {
+                    let metric = campaign
+                        .primary_metric_name
+                        .as_deref()
+                        .map(bounded_redacted_text)
+                        .unwrap_or_else(|| "none".to_owned());
+                    format!("best: id={id} value={value} metric={metric}")
+                }
+                None => format!("best: id={id}"),
+            }
+        }
+    }
+}
+
+fn plateau_status_line(campaign: &CampaignStatusProjection) -> String {
+    format!("plateau: count={}", campaign.plateau_count)
 }
 
 const DECISION_STATUS_SOURCE_ASC_SQL: &str =

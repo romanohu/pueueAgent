@@ -74,7 +74,7 @@ impl ProposalAcceptance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CampaignStatusProjection {
     pub campaign_id: String,
     pub state: CampaignState,
@@ -84,6 +84,11 @@ pub struct CampaignStatusProjection {
     pub experiment_counts: BTreeMap<String, i64>,
     pub rolling_usage: BTreeMap<String, i64>,
     pub unreconciled_count: i64,
+    pub current_best_experiment_id: Option<String>,
+    pub plateau_count: i64,
+    pub primary_metric_name: Option<String>,
+    pub primary_metric_value: Option<f64>,
+    pub has_objective: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1108,7 +1113,7 @@ impl<'db> CampaignRepository<'db> {
         let connection = self.db.connect()?;
         let campaign = connection
             .query_row(
-                "SELECT campaign_id, state, state_reason, objective_digest, next_eligible_at
+                "SELECT campaign_id, state, state_reason, objective_digest, next_eligible_at, current_best_experiment_id, plateau_count, objective_metric_json
                  FROM campaigns
                  WHERE project_id = ?1
                  ORDER BY (state = 'retired') ASC, created_at DESC, campaign_id DESC
@@ -1121,14 +1126,30 @@ impl<'db> CampaignRepository<'db> {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()
             .map_err(database_error("read bounded campaign status projection"))?;
-        let Some((campaign_id, state, state_reason, objective_digest, next_eligible_at)) = campaign
+        let Some((campaign_id, state, state_reason, objective_digest, next_eligible_at, current_best_experiment_id, plateau_count, objective_metric_json)) = campaign
         else {
             return Ok(None);
+        };
+        let has_objective = objective_metric_json.is_some();
+        let (primary_metric_name, primary_metric_value) = match &current_best_experiment_id {
+            Some(best_id) => connection
+                .query_row(
+                    "SELECT em.primary_metric_name, em.primary_metric_value FROM experiment_metrics em JOIN experiments e ON e.experiment_id = em.experiment_id WHERE em.experiment_id = ?1 AND e.campaign_id = ?2",
+                    rusqlite::params![best_id, campaign_id],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<f64>>(1)?)),
+                )
+                .optional()
+                .map_err(database_error("read campaign best metric for status"))?
+                .unwrap_or((None, None)),
+            None => (None, None),
         };
         let experiment_counts = grouped_campaign_counts(
             &connection,
@@ -1162,6 +1183,11 @@ impl<'db> CampaignRepository<'db> {
             experiment_counts,
             rolling_usage,
             unreconciled_count,
+            current_best_experiment_id,
+            plateau_count,
+            primary_metric_name,
+            primary_metric_value,
+            has_objective,
         }))
     }
 
