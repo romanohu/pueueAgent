@@ -1412,6 +1412,38 @@ impl<'db> CampaignRepository<'db> {
             .ok_or_else(|| {
                 validation_error("project_id", "does not identify a registered project")
             })?;
+        let nonterminal_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                  WHERE campaign_id = ?1
+                    AND (status NOT IN ('succeeded','failed','cancelled')
+                         OR failure_code = 'termination_unknown')",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check campaign experiments before review accept"))?;
+        if nonterminal_count != 0 {
+            return Err(validation_error(
+                "campaign",
+                "cannot accept while experiments are nonterminal or termination is unknown",
+            ));
+        }
+        let reserved_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                  WHERE campaign_id = ?1 AND status = 'reserved'",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error(
+                "check campaign reservations before review accept",
+            ))?;
+        if reserved_count != 0 {
+            return Err(validation_error(
+                "campaign",
+                "cannot accept while budget reservations remain reserved",
+            ));
+        }
         // Retire with goal_accepted reason atomically with operator log.
         update_campaign_state(
             &transaction,

@@ -905,6 +905,10 @@ fn note_bounds_are_enforced() {
 
 fn park_via_real_claim(db: &Db, run_id: i64, now_complete: i64) {
     terminalize_baseline(db);
+    park_baseline_claim(db, run_id, now_complete);
+}
+
+fn park_baseline_claim(db: &Db, run_id: i64, now_complete: i64) {
     let decisions = DecisionRepository::new(db);
     let cycle = decisions
         .ensure_cycle_for_terminal(CAMPAIGN_ID, BASELINE_EXPT, 130)
@@ -1171,6 +1175,109 @@ fn reject_fails_closed_when_ambiguous_multiple_completed_claimants_exist() {
         .unwrap()
         .unwrap();
     assert_eq!(campaign.state, CampaignState::GoalReachedPendingReview);
+}
+
+#[test]
+fn review_accept_rejects_when_nonterminal_experiment_exists() {
+    let (_temp, db, _root) = new_harness();
+    start_campaign(&db);
+    seed_metrics(&db, BASELINE_EXPT);
+    terminalize_baseline(&db);
+    // Create a second experiment that remains reserved (non-terminal with reserved budget).
+    create_second_experiment_reserved_only(&db, 131);
+    // Park baseline claim while second experiment is still live (baseline already terminalized).
+    park_baseline_claim(&db, 9001, 145);
+    let campaign = CampaignRepository::new(&db)
+        .find_by_id(CAMPAIGN_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.state, CampaignState::GoalReachedPendingReview);
+    // Accept must fail with the same retire safety invariants (nonterminal).
+    let result = CampaignRepository::new(&db).review_accept(PROJECT_ID, None, 150);
+    assert!(result.is_err(), "accept should reject nonterminal experiment, got {result:?}");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("nonterminal") || err.contains("termination is unknown"),
+        "expected nonterminal guard, got {err}"
+    );
+    // Ensure state unchanged and no operator log was written.
+    let after = CampaignRepository::new(&db)
+        .find_by_id(CAMPAIGN_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, CampaignState::GoalReachedPendingReview);
+    let log_count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM operator_logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(log_count, 0, "failed accept must not write operator log");
+}
+
+#[test]
+fn review_accept_rejects_when_reserved_budget_exists() {
+    let (_temp, db, _root) = new_harness();
+    start_campaign(&db);
+    seed_metrics(&db, BASELINE_EXPT);
+    park_via_real_claim(&db, 9001, 145);
+    // Insert a stray reserved budget reservation (mirrors retire invariant).
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO budget_reservations (reservation_id, campaign_id, experiment_id, dimension, subject_key, status, window_started_at, window_ends_at, created_at, updated_at) VALUES (?1, ?2, NULL, 'agent_run', 'stray', 'reserved', 140, 999999, 140, 140)",
+            params![format!("stray:{}", CAMPAIGN_ID), CAMPAIGN_ID],
+        )
+        .unwrap();
+    let result = CampaignRepository::new(&db).review_accept(PROJECT_ID, None, 150);
+    assert!(result.is_err(), "accept should reject reserved budget, got {result:?}");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("reserved"),
+        "expected reserved guard, got {err}"
+    );
+    let after = CampaignRepository::new(&db)
+        .find_by_id(CAMPAIGN_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, CampaignState::GoalReachedPendingReview);
+    let log_count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM operator_logs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(log_count, 0);
+}
+
+fn create_second_experiment_reserved_only(db: &Db, now: i64) {
+    let proposal = proposals::validate(
+        ProposalInput {
+            kind: pueue_agent::models::ProposalKind::Experiment,
+            hypothesis: "second reserved".to_owned(),
+            source_experiment_id: Some(BASELINE_EXPT.to_owned()),
+            argv: vec![
+                "python".to_owned(),
+                "train.py".to_owned(),
+                "--reserved-only".to_owned(),
+            ],
+            working_directory: ".".to_owned(),
+            expected_evidence: Vec::new(),
+        },
+        "objective-digest",
+    )
+    .unwrap();
+    CampaignRepository::new(db)
+        .accept_proposal(
+            CAMPAIGN_ID,
+            "proposal-second-reserved",
+            "experiment-second-reserved",
+            "submission-second-reserved",
+            &proposal,
+            &CampaignLimits::default(),
+            now,
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
 }
 
 #[test]
