@@ -173,7 +173,6 @@ fn shell_quote(argument: &str) -> String {
                     | b'_'
                     | b'+'
                     | b'='
-                    | b':'
                     | b','
                     | b'.'
                     | b'/'
