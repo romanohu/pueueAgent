@@ -290,7 +290,8 @@ const EXPERIMENT_METRICS_V24_TABLE_SQL: &str = r#"
         metrics_json         TEXT NOT NULL DEFAULT '{}',
         artifact_defect      TEXT,
         created_at           INTEGER NOT NULL,
-        updated_at           INTEGER NOT NULL
+        updated_at           INTEGER NOT NULL,
+        evaluated_at         INTEGER
     );
 "#;
 
@@ -2330,6 +2331,22 @@ fn migrate_evaluation_schema_to_v24(
                 .execute_batch(sql)
                 .map_err(database_error("apply SQLite v24 campaign column"))?;
         }
+    }
+    let has_evaluated_at: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('experiment_metrics') WHERE name = 'evaluated_at'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check SQLite v24 experiment_metrics evaluated_at"))?;
+    if !has_evaluated_at {
+        transaction
+            .execute_batch(
+                "ALTER TABLE experiment_metrics ADD COLUMN evaluated_at INTEGER;",
+            )
+            .map_err(database_error("add SQLite v24 experiment_metrics evaluated_at"))?;
     }
     verify_evaluation_schema_v24(transaction)?;
     transaction

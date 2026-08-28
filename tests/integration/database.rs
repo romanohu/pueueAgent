@@ -14052,6 +14052,7 @@ fn metrics_repository_upsert_updates_single_row_and_get_missing_returns_none() {
             artifact_defect: None,
             created_at: 200,
             updated_at: 200,
+            evaluated_at: None,
         },
     )
     .unwrap();
@@ -14077,6 +14078,7 @@ fn metrics_repository_upsert_updates_single_row_and_get_missing_returns_none() {
             artifact_defect: Some("result_invalid".to_owned()),
             created_at: 200,
             updated_at: 210,
+            evaluated_at: None,
         },
     )
     .unwrap();

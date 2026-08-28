@@ -114,6 +114,7 @@ impl Harness {
                 artifact_defect: None,
                 created_at: 150,
                 updated_at: 150,
+                evaluated_at: None,
             },
         )
         .unwrap();

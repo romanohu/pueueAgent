@@ -116,6 +116,7 @@ fn seed_metrics(db: &Db, experiment_id: &str) {
             artifact_defect: None,
             created_at: 150,
             updated_at: 150,
+            evaluated_at: None,
         },
     )
     .unwrap();
@@ -468,6 +469,7 @@ async fn cross_campaign_evidence_is_rejected_and_does_not_park() {
             artifact_defect: None,
             created_at: 150,
             updated_at: 150,
+            evaluated_at: None,
         },
     )
     .unwrap();
@@ -1053,6 +1055,7 @@ fn create_second_experiment(
             artifact_defect: None,
             created_at: now + 3,
             updated_at: now + 3,
+            evaluated_at: None,
         },
     )
     .unwrap();

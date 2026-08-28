@@ -274,6 +274,7 @@ pub struct ExperimentMetricsRow {
     pub artifact_defect: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub evaluated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

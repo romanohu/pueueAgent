@@ -88,10 +88,23 @@ fn evaluate_in_transaction(
     if campaign.state != CampaignState::Active {
         return Ok(PromotionOutcome::SkippedNoObjective);
     }
-    let Some(objective) = campaign.objective else {
+    if campaign.objective.is_none() {
+        return Ok(PromotionOutcome::SkippedNoObjective);
+    }
+    let is_evaluated = is_already_evaluated(connection, experiment_id)?;
+    if is_evaluated {
+        return Ok(deduce_already_evaluated_outcome(
+            &campaign,
+            experiment_id,
+            terminal_status,
+            connection,
+        )?);
+    }
+    let Some(ref objective) = campaign.objective else {
         return Ok(PromotionOutcome::SkippedNoObjective);
     };
     if terminal_status != ExperimentStatus::Succeeded {
+        mark_evaluated(connection, experiment_id, now)?;
         return Ok(PromotionOutcome::SkippedNoMetric);
     }
     let Some(candidate_value) = primary_metric_value(connection, experiment_id)? else {
@@ -103,45 +116,59 @@ fn evaluate_in_transaction(
             limits,
             now,
         )?;
+        mark_evaluated(connection, experiment_id, now)?;
         return Ok(PromotionOutcome::NotImproved);
     };
 
     match campaign.current_best_experiment_id.as_deref() {
         Some(best_id) if best_id == experiment_id => {
+            mark_evaluated(connection, experiment_id, now)?;
             if campaign.baseline_experiment_id.as_deref() == Some(experiment_id) {
                 Ok(PromotionOutcome::BaselineEstablished)
             } else {
                 Ok(PromotionOutcome::Improved)
             }
         }
-        Some(best_id) => compare_and_settle(
-            connection,
-            campaign_id,
-            &campaign.project_id,
-            experiment_id,
-            candidate_value,
-            best_id,
-            &objective,
-            limits,
-            now,
-        ),
-        None => match campaign.baseline_experiment_id.as_deref() {
-            Some(baseline_id) if baseline_id == experiment_id => {
-                promote(connection, campaign_id, experiment_id, now)?;
-                Ok(PromotionOutcome::BaselineEstablished)
-            }
-            Some(baseline_id) => compare_and_settle(
+        Some(best_id) => {
+            let outcome = compare_and_settle(
                 connection,
                 campaign_id,
                 &campaign.project_id,
                 experiment_id,
                 candidate_value,
-                baseline_id,
+                best_id,
                 &objective,
                 limits,
                 now,
-            ),
-            None => Ok(PromotionOutcome::SkippedNoMetric),
+            )?;
+            mark_evaluated(connection, experiment_id, now)?;
+            Ok(outcome)
+        }
+        None => match campaign.baseline_experiment_id.as_deref() {
+            Some(baseline_id) if baseline_id == experiment_id => {
+                promote_baseline(connection, campaign_id, experiment_id, now)?;
+                mark_evaluated(connection, experiment_id, now)?;
+                Ok(PromotionOutcome::BaselineEstablished)
+            }
+            Some(baseline_id) => {
+                let outcome = compare_and_settle(
+                    connection,
+                    campaign_id,
+                    &campaign.project_id,
+                    experiment_id,
+                    candidate_value,
+                    baseline_id,
+                    &objective,
+                    limits,
+                    now,
+                )?;
+                mark_evaluated(connection, experiment_id, now)?;
+                Ok(outcome)
+            }
+            None => {
+                mark_evaluated(connection, experiment_id, now)?;
+                Ok(PromotionOutcome::SkippedNoMetric)
+            }
         },
     }
 }
@@ -166,7 +193,7 @@ fn compare_and_settle(
         MetricDirection::Maximize => candidate_value > best_value + delta,
     };
     if improved {
-        promote(connection, campaign_id, experiment_id, now)?;
+        promote_challenger(connection, campaign_id, project_id, experiment_id, now)?;
         Ok(PromotionOutcome::Improved)
     } else {
         increment_plateau(connection, campaign_id, project_id, experiment_id, limits, now)?;
@@ -254,7 +281,7 @@ fn emit_strategy_refresh_wake(
     Ok(())
 }
 
-fn promote(
+fn promote_baseline(
     connection: &Connection,
     campaign_id: &str,
     experiment_id: &str,
@@ -269,6 +296,120 @@ fn promote(
         )
         .map_err(database_error("update campaign current best experiment"))?;
     Ok(())
+}
+
+fn promote_challenger(
+    connection: &Transaction<'_>,
+    campaign_id: &str,
+    project_id: &str,
+    experiment_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    connection
+        .execute(
+            "UPDATE campaigns
+             SET current_best_experiment_id = ?1, plateau_count = 0, updated_at = ?2
+             WHERE campaign_id = ?3",
+            rusqlite::params![experiment_id, now, campaign_id],
+        )
+        .map_err(database_error("update campaign current best experiment"))?;
+    emit_promotion_marker(connection, campaign_id, project_id, experiment_id, now)?;
+    Ok(())
+}
+
+fn emit_promotion_marker(
+    connection: &Transaction<'_>,
+    campaign_id: &str,
+    project_id: &str,
+    experiment_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let dedup_key = format!("promotion:v1:{campaign_id}:{experiment_id}");
+    let event = NewEvent::new(
+        project_id,
+        EventKind::OperatorWake,
+        dedup_key,
+        json!({
+            "source": "promotion",
+            "reason": "improved",
+            "campaign_id": campaign_id,
+            "experiment_id": experiment_id,
+        }),
+        now,
+        now,
+    )
+    .with_campaign_lineage(campaign_id.to_owned(), Some(experiment_id.to_owned()));
+    insert_event_idempotent_in_transaction(connection, &event)?;
+    Ok(())
+}
+
+fn is_already_evaluated(
+    connection: &Connection,
+    experiment_id: &str,
+) -> Result<bool, AppError> {
+    let evaluated: Option<Option<i64>> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+            [experiment_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read experiment evaluated marker"))?;
+    Ok(matches!(evaluated, Some(Some(_))))
+}
+
+fn mark_evaluated(
+    connection: &Connection,
+    experiment_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    connection
+        .execute(
+            "UPDATE experiment_metrics SET evaluated_at = ?1, updated_at = ?1
+              WHERE experiment_id = ?2 AND evaluated_at IS NULL",
+            rusqlite::params![now, experiment_id],
+        )
+        .map_err(database_error("mark experiment evaluated"))?;
+    Ok(())
+}
+
+fn deduce_already_evaluated_outcome(
+    campaign: &CampaignPromotionState,
+    experiment_id: &str,
+    terminal_status: ExperimentStatus,
+    connection: &Connection,
+) -> Result<PromotionOutcome, AppError> {
+    if campaign.state != CampaignState::Active || campaign.objective.is_none() {
+        return Ok(PromotionOutcome::SkippedNoObjective);
+    }
+    if terminal_status != ExperimentStatus::Succeeded {
+        return Ok(PromotionOutcome::SkippedNoMetric);
+    }
+    if primary_metric_value(connection, experiment_id)?.is_none() {
+        return Ok(PromotionOutcome::NotImproved);
+    }
+    match campaign.current_best_experiment_id.as_deref() {
+        Some(best_id) if best_id == experiment_id => {
+            if campaign.baseline_experiment_id.as_deref() == Some(experiment_id) {
+                Ok(PromotionOutcome::BaselineEstablished)
+            } else {
+                Ok(PromotionOutcome::Improved)
+            }
+        }
+        Some(_) => {
+            // Without recomputing delta, return NotImproved as idempotent default
+            // for already-evaluated challengers that are not the best.
+            // This avoids double-counting plateau.
+            Ok(PromotionOutcome::NotImproved)
+        }
+        None => {
+            if campaign.baseline_experiment_id.as_deref() == Some(experiment_id) {
+                Ok(PromotionOutcome::BaselineEstablished)
+            } else {
+                Ok(PromotionOutcome::SkippedNoMetric)
+            }
+        }
+    }
 }
 
 fn read_campaign_promotion_state(

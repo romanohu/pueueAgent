@@ -120,6 +120,7 @@ fn defect_row(experiment_id: &str, defect: &'static str, now: i64) -> Experiment
         artifact_defect: Some(defect.to_owned()),
         created_at: now,
         updated_at: now,
+        evaluated_at: None,
     }
 }
 
@@ -191,9 +192,15 @@ fn ingest_inner(
             artifact_defect: None,
             created_at: now,
             updated_at: now,
+            evaluated_at: None,
         },
     };
-    MetricsRepository::upsert(db, &row)
+    // Freeze first terminal evidence once evaluated; later mutations or
+    // removals must not desynchronize promotion/plateau state. The upsert
+    // is conditional on evaluated_at IS NULL so recovery before evaluation
+    // remains possible.
+    MetricsRepository::upsert(db, &row)?;
+    Ok(())
 }
 
 /// The declared objective metric of a campaign, if any.

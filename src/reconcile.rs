@@ -165,20 +165,27 @@ where
                         &self.campaign_limits,
                         now,
                     )?;
-                    // The promotion comparison needs the projected terminal
-                    // status. The finished_at guard keeps the evaluation
-                    // exactly-once per experiment: later reconcile passes
-                    // re-resolve the same accepted submission, and re-running
-                    // the evaluation would double-count plateau increments.
-                    if objective.is_some() && experiment.finished_at.is_none() {
-                        crate::promotion::evaluate(
-                            self.db,
-                            &experiment.campaign_id,
-                            &experiment.experiment_id,
-                            projected_status,
-                            &self.campaign_limits,
-                            now,
-                        )?;
+                    // Promotion must be recoverable across the
+                    // ingest→projection→evaluation crash window. The metrics
+                    // row is frozen on first ingest and carries a durable
+                    // evaluated_at marker; retries evaluate whenever that
+                    // marker is absent, even if finished_at is already set.
+                    if objective.is_some() {
+                        let needs_evaluation =
+                            crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?
+                                .as_ref()
+                                .and_then(|row| row.evaluated_at)
+                                .is_none();
+                        if needs_evaluation {
+                            crate::promotion::evaluate(
+                                self.db,
+                                &experiment.campaign_id,
+                                &experiment.experiment_id,
+                                projected_status,
+                                &self.campaign_limits,
+                                now,
+                            )?;
+                        }
                     }
                 }
                 let event = materialize_terminal_event(
