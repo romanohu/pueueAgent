@@ -32,6 +32,11 @@ use pueue_agent::{
     AppError,
 };
 use serde_json::json;
+
+#[path = "../support/fake_pueue.rs"]
+#[allow(dead_code)]
+mod add_echo_fake_pueue;
+use add_echo_fake_pueue::FakePueue as AddEchoFakePueue;
 use tempfile::TempDir;
 
 #[derive(Clone)]
@@ -39,7 +44,6 @@ struct FakePueue {
     tasks: Arc<Mutex<Vec<PueueTask>>>,
     status_calls: Arc<Mutex<usize>>,
     malformed: Arc<Mutex<bool>>,
-    recorded_adds: Arc<Mutex<Vec<Vec<OsString>>>>,
 }
 
 impl FakePueue {
@@ -48,12 +52,7 @@ impl FakePueue {
             tasks: Arc::new(Mutex::new(tasks)),
             status_calls: Arc::new(Mutex::new(0)),
             malformed: Arc::new(Mutex::new(false)),
-            recorded_adds: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    fn recorded_adds(&self) -> Vec<Vec<OsString>> {
-        self.recorded_adds.lock().unwrap().clone()
     }
 
     fn set_tasks(&self, tasks: Vec<PueueTask>) {
@@ -80,8 +79,7 @@ impl PueueApi for FakePueue {
         Ok(self.tasks.lock().unwrap().clone())
     }
 
-    async fn add(&self, args: &[std::ffi::OsString]) -> Result<i64, AppError> {
-        self.recorded_adds.lock().unwrap().push(args.to_vec());
+    async fn add(&self, _args: &[std::ffi::OsString]) -> Result<i64, AppError> {
         Ok(41)
     }
 
@@ -95,90 +93,6 @@ impl PueueApi for FakePueue {
 
     async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
         panic!("reconciliation must not provision Pueue groups")
-    }
-}
-
-struct WrappingFakePueue {
-    tasks: Arc<Mutex<Vec<PueueTask>>>,
-    recorded_adds: Arc<Mutex<Vec<Vec<OsString>>>>,
-}
-
-impl WrappingFakePueue {
-    fn new() -> Self {
-        Self {
-            tasks: Arc::new(Mutex::new(Vec::new())),
-            recorded_adds: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-    fn recorded_adds(&self) -> Vec<Vec<OsString>> {
-        self.recorded_adds.lock().unwrap().clone()
-    }
-}
-
-#[async_trait]
-impl PueueApi for WrappingFakePueue {
-    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
-        Ok(self.tasks.lock().unwrap().clone())
-    }
-    async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
-        self.recorded_adds.lock().unwrap().push(args.to_vec());
-        let command = args
-            .iter()
-            .position(|a| a == "--")
-            .map(|sep| {
-                args[sep + 1..]
-                    .iter()
-                    .map(|arg| {
-                        let s = arg.to_string_lossy();
-                        if !s.is_empty()
-                            && s.bytes().all(|b| {
-                                matches!(
-                                    b,
-                                    b'a'..=b'z'
-                                        | b'A'..=b'Z'
-                                        | b'0'..=b'9'
-                                        | b'@'
-                                        | b'%'
-                                        | b'_'
-                                        | b'+'
-                                        | b'='
-                                        | b':'
-                                        | b','
-                                        | b'.'
-                                        | b'/'
-                                        | b'-'
-                                )
-                            })
-                        {
-                            s.into_owned()
-                        } else {
-                            format!("'{}'", s.replace('\'', r"'\''"))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        self.tasks.lock().unwrap().push(PueueTask {
-            id: 41,
-            group: "pa-project".to_owned(),
-            command,
-            state: "Queued".to_owned(),
-            enqueued_at: Some("100".to_owned()),
-            started_at: None,
-            ended_at: None,
-            result: None,
-        });
-        Ok(41)
-    }
-    async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
-        Ok(())
-    }
-    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
-        Ok(())
-    }
-    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
-        Ok(())
     }
 }
 
@@ -1629,7 +1543,7 @@ async fn start_baseline_persists_the_declared_objective_metric_json() {
         digest: "objective-digest".to_owned(),
     };
     let argv = vec!["python".to_owned(), "train.py".to_owned()];
-    let fake = WrappingFakePueue::new();
+    let fake = AddEchoFakePueue::new();
     let coordinator = CampaignCoordinator::new(&harness.db, &fake, CampaignLimits::default());
 
     coordinator
@@ -1661,16 +1575,15 @@ async fn start_baseline_persists_the_declared_objective_metric_json() {
         json!({"name": "loss", "direction": "minimize", "min_delta": 0.01})
     );
 
-    let adds = fake.recorded_adds();
-    assert_eq!(adds.len(), 1);
+    let adds = fake.last_add_args();
     assert!(
-        adds[0]
+        adds
             .iter()
             .any(|argument| argument.to_string_lossy().contains("PUEUE_AGENT_EXPERIMENT_ID=")),
         "managed Pueue argv must be wrapped with env assignments"
     );
     assert!(
-        adds[0]
+        adds
             .iter()
             .any(|argument| argument.to_string_lossy().contains("PUEUE_AGENT_RESULT_PATH=")),
         "managed Pueue argv must contain result path"
@@ -1705,7 +1618,7 @@ async fn start_baseline_without_metric_flags_leaves_objective_json_null() {
         digest: "objective-digest".to_owned(),
     };
     let argv = vec!["python".to_owned(), "train.py".to_owned()];
-    let fake = WrappingFakePueue::new();
+    let fake = AddEchoFakePueue::new();
     let coordinator = CampaignCoordinator::new(&harness.db, &fake, CampaignLimits::default());
 
     coordinator

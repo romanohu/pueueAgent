@@ -22,7 +22,7 @@ use crate::{
     },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
-    reconcile::managed_task_run_signature,
+    reconcile::{managed_task_run_signature, try_canonical_command_display_os},
     state::ObjectiveSnapshot,
     status::current_decision_projection,
     AppError,
@@ -261,6 +261,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &experiment_id,
             baseline.argv(),
         );
+        try_canonical_command_display_os(&runtime_argv)?;
         let add_args = pueue_add_args(
             &project.pueue_group,
             &admission.verified_root.anchor.canonical_path,
@@ -341,6 +342,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             experiment_id,
             proposal.argv(),
         );
+        try_canonical_command_display_os(&runtime_argv)?;
         let add_args = pueue_add_args(
             &project.pueue_group,
             &explicit_working_directory(
@@ -448,6 +450,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &current.experiment_id,
             &durable_submission.argv,
         );
+        let expected_command = try_canonical_command_display_os(&runtime_argv)?;
         let add_args = pueue_add_args(
             &durable_project.pueue_group,
             &explicit_working_directory(
@@ -512,7 +515,6 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 return Err(error);
             }
         };
-        let expected_command = canonical_command_display_os(&runtime_argv);
         let mut id_matches = tasks.iter().filter(|task| task.id == task_id);
         let task = id_matches.next();
         if task.is_none() || id_matches.next().is_some() {
@@ -626,71 +628,6 @@ fn pueue_add_args(group: &str, project_root: &Path, argv: &[OsString]) -> Vec<Os
     add_args.push(OsString::from("--"));
     add_args.extend(argv.iter().cloned());
     add_args
-}
-
-fn canonical_command_display_os(argv: &[OsString]) -> String {
-    argv.iter()
-        .map(|arg| shell_quote_os(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(unix)]
-fn shell_quote_os(arg: &OsString) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = arg.as_os_str().as_bytes();
-    if !bytes.is_empty()
-        && bytes.iter().all(|b| {
-            matches!(
-                *b,
-                b'a'..=b'z'
-                    | b'A'..=b'Z'
-                    | b'0'..=b'9'
-                    | b'@'
-                    | b'%'
-                    | b'_'
-                    | b'+'
-                    | b'='
-                    | b':'
-                    | b','
-                    | b'.'
-                    | b'/'
-                    | b'-'
-            )
-        })
-    {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let lossy = String::from_utf8_lossy(bytes);
-    format!("'{}'", lossy.replace('\'', r"'\''"))
-}
-
-#[cfg(not(unix))]
-fn shell_quote_os(arg: &OsString) -> String {
-    let s = arg.to_string_lossy();
-    if !s.is_empty()
-        && s.bytes().all(|b| {
-            matches!(
-                b,
-                b'a'..=b'z'
-                    | b'A'..=b'Z'
-                    | b'0'..=b'9'
-                    | b'@'
-                    | b'%'
-                    | b'_'
-                    | b'+'
-                    | b'='
-                    | b':'
-                    | b','
-                    | b'.'
-                    | b'/'
-                    | b'-'
-            )
-        })
-    {
-        return s.into_owned();
-    }
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn explicit_working_directory(project_root: &Path, relative: &str) -> std::path::PathBuf {

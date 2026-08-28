@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{collections::BTreeMap, ffi::OsString, time::SystemTime};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -689,6 +689,20 @@ pub(crate) fn canonical_command_display(argv: &[String]) -> String {
         .join(" ")
 }
 
+pub(crate) fn try_canonical_command_display_os(argv: &[OsString]) -> Result<String, AppError> {
+    let mut parts = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let s = arg
+            .to_str()
+            .ok_or(AppError::Validation {
+                field: "argv",
+                message: "must be valid UTF-8 for display",
+            })?;
+        parts.push(shell_quote(s));
+    }
+    Ok(parts.join(" "))
+}
+
 fn shell_quote(argument: &str) -> String {
     if !argument.is_empty()
         && argument
@@ -777,4 +791,32 @@ fn unix_timestamp() -> Result<i64, AppError> {
         .map_err(|_| AppError::Runtime {
             operation: "represent the reconciliation timestamp",
         })
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::try_canonical_command_display_os;
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_runtime_argv_fails_display() {
+        let bad = OsString::from_vec(vec![0xff, 0xfe, b'a']);
+        let argv = vec![OsString::from("/usr/bin/env"), bad];
+        assert!(try_canonical_command_display_os(&argv).is_err());
+    }
+
+    #[test]
+    fn valid_runtime_argv_displays() {
+        let argv = vec![
+            OsString::from("/usr/bin/env"),
+            OsString::from("PUEUE_AGENT_EXPERIMENT_ID=exp-1"),
+            OsString::from("echo"),
+            OsString::from("hi"),
+        ];
+        let display = try_canonical_command_display_os(&argv).unwrap();
+        assert_eq!(display, "/usr/bin/env PUEUE_AGENT_EXPERIMENT_ID=exp-1 echo hi");
+    }
 }

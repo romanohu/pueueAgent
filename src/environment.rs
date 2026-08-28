@@ -3317,6 +3317,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn campaign_experiment_runtime_argv_preserves_arbitrary_root_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let raw_root = OsString::from_vec(vec![b'/', b't', b'm', b'p', 0xff, 0xfe]);
+        let root = Path::new(&raw_root);
+        let argv = campaign_experiment_runtime_argv(
+            root,
+            "camp-id",
+            "exp-id",
+            &["echo".to_owned(), "hi".to_owned()],
+        );
+        assert_eq!(argv[0], OsString::from("/usr/bin/env"));
+        assert_eq!(argv.len(), 1 + 4 + 2);
+        // result path is third assignment (index 3)
+        let result_assignment = &argv[3];
+        assert!(result_assignment.as_bytes().contains(&0xff));
+        assert!(result_assignment.as_bytes().contains(&0xfe));
+        // artifact dir is fourth assignment
+        let artifact_assignment = &argv[4];
+        assert!(artifact_assignment.as_bytes().contains(&0xff));
+    }
+
+    #[test]
     fn duplicate_directory_fd_sets_cloexec_atomically() {
         let (_holder, temp) = test_temp(701);
         let duplicate = duplicate_directory_fd(

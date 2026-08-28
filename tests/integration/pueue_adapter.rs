@@ -51,7 +51,7 @@ use pueue_agent::{
     db::{
         AgentRunRepository, BatchRepository, CampaignRepository, Db, DecisionRepository,
         EventRepository, ExperimentRepository, ManagedSubmissionIntent, ProjectRepository,
-        StartCampaignRequest, SubmissionRepository,
+        ProposalRepository, StartCampaignRequest, SubmissionRepository,
     },
     execution_policy::{CampaignLimits, ProjectRootAnchor},
     models::{
@@ -3667,72 +3667,62 @@ async fn campaign_submit_managed_wraps_with_env_and_preserves_durable_argv() {
         "durable argv must remain original user argv"
     );
 
-    // proposal canonical identity must remain original user argv (not wrapped)
+    let exp_id = stored.metadata.get("experiment_id").and_then(|v| v.as_str()).unwrap().to_owned();
+    let camp_id = stored.metadata.get("campaign_id").and_then(|v| v.as_str()).unwrap().to_owned();
     let experiment = ExperimentRepository::new(&harness.db)
-        .find_by_id(
-            stored
-                .metadata
-                .get("experiment_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        )
-        .unwrap();
-    // if metadata missing, fallback to live campaign lookup
-    let campaign = CampaignRepository::new(&harness.db)
-        .find_live_by_project("project-a")
+        .find_by_id(&exp_id)
         .unwrap()
         .unwrap();
-    let _ = experiment; // ensure compilation
+    let proposal = ProposalRepository::new(&harness.db)
+        .find_by_id(&experiment.proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proposal.argv, expected_user, "proposal argv must remain original user argv");
+    let objective = pueue_agent::state::load_objective(&harness.root).unwrap();
+    let expected_proposal = pueue_agent::proposals::validate_initial_baseline(
+        pueue_agent::proposals::ProposalInput {
+            kind: ProposalKind::Experiment,
+            hypothesis: "Establish the initial campaign baseline".to_owned(),
+            source_experiment_id: None,
+            argv: expected_user.clone(),
+            working_directory: ".".to_owned(),
+            expected_evidence: Vec::new(),
+        },
+        &objective.digest,
+    )
+    .unwrap();
+    assert_eq!(
+        proposal.canonical_digest, expected_proposal.canonical_digest(),
+        "proposal canonical digest must match original user argv"
+    );
 
     let add_args = harness.fake.last_add_args();
-    let sep = add_args
-        .iter()
-        .position(|a| a == "--")
-        .expect("missing -- separator");
+    let sep = add_args.iter().position(|a| a == "--").expect("missing -- separator");
     let runtime = &add_args[sep + 1..];
-    assert!(
-        !runtime.is_empty() && runtime[0] == OsString::from("/usr/bin/env"),
-        "managed runtime must start with /usr/bin/env, got {runtime:?}"
-    );
-    // derive expected four NAME=value assignments without lossy conversion
-    let exp_id = stored
-        .metadata
-        .get("experiment_id")
-        .and_then(|v| v.as_str())
-        .unwrap()
-        .to_owned();
-    let camp_id = stored
-        .metadata
-        .get("campaign_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&campaign.campaign_id)
-        .to_owned();
-    let expected_env = pueue_agent::environment::campaign_experiment_task_environment(
-        &fs::canonicalize(&harness.root).unwrap(),
-        &camp_id,
-        &exp_id,
-    );
-    let expected_assignments: Vec<OsString> = expected_env
-        .iter()
-        .map(|(k, v)| {
-            let mut s = OsString::from(k);
-            s.push(OsString::from("="));
-            s.push(v);
-            s
-        })
-        .collect();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let expected_runtime: Vec<OsString> = {
+        let mut v = Vec::with_capacity(7);
+        v.push(OsString::from("/usr/bin/env"));
+        v.push(OsString::from(format!("PUEUE_AGENT_EXPERIMENT_ID={}", exp_id)));
+        v.push(OsString::from(format!("PUEUE_AGENT_CAMPAIGN_ID={}", camp_id)));
+        let mut result_path = OsString::from("PUEUE_AGENT_RESULT_PATH=");
+        result_path.push(canonical_root.as_os_str().to_owned());
+        result_path.push("/.pueue-agent/results/");
+        result_path.push(OsString::from(format!("{}.json", exp_id)));
+        v.push(result_path);
+        let mut artifact_dir = OsString::from("PUEUE_AGENT_ARTIFACT_DIR=");
+        artifact_dir.push(canonical_root.as_os_str().to_owned());
+        artifact_dir.push("/.pueue-agent/artifacts/");
+        artifact_dir.push(OsString::from(&exp_id));
+        v.push(artifact_dir);
+        v.push(OsString::from("python"));
+        v.push(OsString::from("train.py"));
+        v
+    };
     assert_eq!(
-        &runtime[1..5],
-        &expected_assignments[..],
-        "exactly four derived assignments before user argv"
+        runtime, expected_runtime.as_slice(),
+        "complete runtime vector must match hand-built expectations"
     );
-    assert_eq!(
-        &runtime[5..],
-        &[OsString::from("python"), OsString::from("train.py")],
-        "user argv must follow assignments unchanged"
-    );
-    // ensure no ambient env leakage: runtime must not contain PATH or HOME etc beyond the four
-    assert_eq!(runtime.len(), 1 + 4 + 2);
 }
 
 #[tokio::test]
