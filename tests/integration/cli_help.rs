@@ -1798,6 +1798,7 @@ impl CustomPueueProfileHarness {
         let pueue = trusted_dir.join("pueue");
         let pueue_calls = temp.path().join("pueue-calls");
         let pueue_state = temp.path().join("pueue-state");
+        let pueue_command = temp.path().join("pueue-command");
         let source = temp.path().join("custom-profile-pueue.rs");
         let source_template = r#"use std::{fs, fs::OpenOptions, io::Write};
 fn current_count() -> usize {
@@ -1818,6 +1819,9 @@ fn main() {
     if operation == "add" {
         let count = current_count() + 1;
         fs::write(__STATE__, count.to_string()).unwrap();
+        if let Some(position) = args.iter().rposition(|argument| argument == "--") {
+            fs::write(__COMMAND__, args[position + 1..].join(" ")).unwrap();
+        }
         println!("{}", 700 + count);
     }
     if operation == "status" {
@@ -1826,11 +1830,13 @@ fn main() {
             std::io::stdout().write_all(b"\x7b\"tasks\":\x7b\x7d\x7d\n").unwrap();
         } else {
             let task_id = 700 + count;
+            let command = fs::read_to_string(__COMMAND__).unwrap_or_else(|_| "/usr/bin/true".to_owned());
             println!(
-                "{{\"tasks\":{{\"{}\":{{\"id\":{},\"group\":{:?},\"command\":\"/usr/bin/true\",\"status\":{{\"Queued\":{{\"enqueued_at\":\"{}\"}}}}}}}}}}",
+                "{{\"tasks\":{{\"{}\":{{\"id\":{},\"group\":{:?},\"command\":{:?},\"status\":{{\"Queued\":{{\"enqueued_at\":\"{}\"}}}}}}}}}}",
                 task_id,
                 task_id,
                 __GROUP__,
+                command,
                 task_id,
             );
         }
@@ -1842,6 +1848,7 @@ fn main() {
         let source_body = source_template
             .replace("__STATE__", &format!("{pueue_state:?}"))
             .replace("__CALLS__", &format!("{pueue_calls:?}"))
+            .replace("__COMMAND__", &format!("{pueue_command:?}"))
             .replace("__GROUP__", &format!("{:?}", project_config.pueue_group));
         fs::write(
             &source,
