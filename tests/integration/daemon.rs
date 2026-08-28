@@ -837,18 +837,21 @@ async fn campaign_recovery_resumes_only_reserved_intents_with_the_stored_working
     assert_eq!(harness.count("experiments"), 1);
     let add_calls = harness.fake_pueue.add_calls();
     assert_eq!(add_calls.len(), 1);
-    assert_eq!(
-        add_calls[0],
-        vec![
-            OsString::from("-g"),
-            OsString::from("pa-project"),
-            OsString::from("--working-directory"),
-            harness.registered_root("project-a").join("nested").into_os_string(),
-            OsString::from("--"),
-            OsString::from("python"),
-            OsString::from("train.py"),
-        ]
+    let expected_runtime = pueue_agent::environment::campaign_experiment_runtime_argv(
+        &harness.registered_root("project-a"),
+        "daemon-campaign",
+        "daemon-campaign-experiment",
+        &["python".to_owned(), "train.py".to_owned()],
     );
+    let mut expected = vec![
+        OsString::from("-g"),
+        OsString::from("pa-project"),
+        OsString::from("--working-directory"),
+        harness.registered_root("project-a").join("nested").into_os_string(),
+        OsString::from("--"),
+    ];
+    expected.extend(expected_runtime);
+    assert_eq!(add_calls[0], expected);
 }
 
 #[tokio::test]
