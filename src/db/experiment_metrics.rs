@@ -27,8 +27,7 @@ impl MetricsRepository {
                     metrics_json = excluded.metrics_json,
                     artifact_defect = excluded.artifact_defect,
                     updated_at = excluded.updated_at,
-                    evaluated_at = COALESCE(experiment_metrics.evaluated_at, excluded.evaluated_at)
-                  WHERE experiment_metrics.evaluated_at IS NULL",
+                    evaluated_at = COALESCE(experiment_metrics.evaluated_at, excluded.evaluated_at)",
                 params![
                     row.experiment_id,
                     row.source,

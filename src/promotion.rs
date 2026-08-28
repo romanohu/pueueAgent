@@ -5,11 +5,11 @@
 //! exists) inside a single IMMEDIATE transaction that also owns the
 //! `current_best_experiment_id` update and the plateau counter transition.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
 
 use crate::{
-    db::{database_error, insert_event_idempotent_in_transaction, Db},
+    db::{database_error, insert_event_completed_in_transaction, insert_event_idempotent_in_transaction, Db},
     execution_policy::CampaignLimits,
     models::{CampaignState, EventKind, ExperimentStatus, MetricDirection, NewEvent, ObjectiveMetric},
     AppError,
@@ -85,12 +85,16 @@ fn evaluate_in_transaction(
             field: "campaign_id",
             message: "does not identify a campaign",
         })?;
-    if campaign.state != CampaignState::Active {
-        return Ok(PromotionOutcome::SkippedNoObjective);
+
+    // Fail-closed: require metrics row before any state mutations.
+    // If metrics row is missing, settle the evaluated marker but change no state/plateau.
+    let metrics_exists = metrics_row_exists(connection, experiment_id)?;
+    if !metrics_exists {
+        mark_evaluated(connection, experiment_id, now)?;
+        return Ok(PromotionOutcome::SkippedNoMetric);
     }
-    if campaign.objective.is_none() {
-        return Ok(PromotionOutcome::SkippedNoObjective);
-    }
+
+    // Check if already evaluated - idempotent re-evaluation.
     let is_evaluated = is_already_evaluated(connection, experiment_id)?;
     if is_evaluated {
         return Ok(deduce_already_evaluated_outcome(
@@ -100,13 +104,26 @@ fn evaluate_in_transaction(
             connection,
         )?);
     }
+
+    // Inactive campaign or no objective: still settle marker, no state/plateau changes.
+    if campaign.state != CampaignState::Active || campaign.objective.is_none() {
+        mark_evaluated(connection, experiment_id, now)?;
+        return Ok(PromotionOutcome::SkippedNoObjective);
+    }
+
     let Some(ref objective) = campaign.objective else {
+        // Should not reach here due to check above, but defensive.
+        mark_evaluated(connection, experiment_id, now)?;
         return Ok(PromotionOutcome::SkippedNoObjective);
     };
+
+    // Non-successful terminal: settle marker, no comparison, no plateau change.
     if terminal_status != ExperimentStatus::Succeeded {
         mark_evaluated(connection, experiment_id, now)?;
         return Ok(PromotionOutcome::SkippedNoMetric);
     }
+
+    // Successful terminal with no primary metric value: increment plateau, settle marker.
     let Some(candidate_value) = primary_metric_value(connection, experiment_id)? else {
         increment_plateau(
             connection,
@@ -339,7 +356,9 @@ fn emit_promotion_marker(
         now,
     )
     .with_campaign_lineage(campaign_id.to_owned(), Some(experiment_id.to_owned()));
-    insert_event_idempotent_in_transaction(connection, &event)?;
+    // Insert as 'completed' to make the audit passive - never pending or scheduler-dispatchable.
+    // Retry idempotent via dedup_key.
+    insert_event_completed_in_transaction(connection, &event)?;
     Ok(())
 }
 
@@ -347,7 +366,7 @@ fn is_already_evaluated(
     connection: &Connection,
     experiment_id: &str,
 ) -> Result<bool, AppError> {
-    let evaluated: Option<Option<i64>> = connection
+    let evaluated: Option<Option<String>> = connection
         .query_row(
             "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
             [experiment_id],
@@ -358,16 +377,32 @@ fn is_already_evaluated(
     Ok(matches!(evaluated, Some(Some(_))))
 }
 
+fn metrics_row_exists(
+    connection: &Connection,
+    experiment_id: &str,
+) -> Result<bool, AppError> {
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM experiment_metrics WHERE experiment_id = ?1",
+            [experiment_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("check experiment metrics row exists"))?;
+    Ok(exists.is_some())
+}
+
 fn mark_evaluated(
     connection: &Connection,
     experiment_id: &str,
     now: i64,
 ) -> Result<(), AppError> {
+    let now_text = now.to_string();
     connection
         .execute(
             "UPDATE experiment_metrics SET evaluated_at = ?1, updated_at = ?1
               WHERE experiment_id = ?2 AND evaluated_at IS NULL",
-            rusqlite::params![now, experiment_id],
+            rusqlite::params![now_text, experiment_id],
         )
         .map_err(database_error("mark experiment evaluated"))?;
     Ok(())
@@ -458,5 +493,29 @@ fn primary_metric_value(
         .optional()
         .map_err(database_error("read experiment primary metric"))?
         .flatten())
+}
+
+fn ensure_metrics_row_with_evaluated(
+    connection: &Connection,
+    experiment_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    // Insert a minimal metrics row with evaluated_at set to settle the marker.
+    // This handles the fail-closed case where evaluation runs but no metrics row exists.
+    let now_text = now.to_string();
+    connection
+        .execute(
+            "INSERT INTO experiment_metrics (
+                experiment_id, source, primary_metric_name, primary_metric_value,
+                metrics_json, artifact_defect, created_at, updated_at, evaluated_at
+             ) VALUES (?1, 'manifest', NULL, NULL, '{}', 'evaluation_missing_row', ?2, ?2, ?3)
+             ON CONFLICT(experiment_id) DO UPDATE SET
+                evaluated_at = COALESCE(experiment_metrics.evaluated_at, excluded.evaluated_at),
+                updated_at = ?2
+             WHERE experiment_metrics.evaluated_at IS NULL",
+            rusqlite::params![experiment_id, now, now_text],
+        )
+        .map_err(database_error("ensure metrics row with evaluated marker"))?;
+    Ok(())
 }
 

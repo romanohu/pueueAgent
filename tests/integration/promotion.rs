@@ -1,14 +1,14 @@
 use std::fs;
 
 use pueue_agent::{
-    db::{CampaignRepository, Db, MetricsRepository, ProjectRepository, StartCampaignRequest},
+    db::{CampaignRepository, Db, MetricsRepository, ProjectRepository, StartCampaignRequest, migrations},
     execution_policy::CampaignLimits,
     models::{ExperimentMetricsRow, ExperimentStatus, MetricDirection, ObjectiveMetric, ProposalKind},
     promotion::{evaluate, PromotionOutcome},
     proposals::{self, ProposalInput},
     state::ObjectiveSnapshot,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -553,4 +553,678 @@ fn improvement_resets_the_plateau_and_the_next_round_wakes_with_round_two() {
     let (_, payload) = harness.wake_payload(&format!("strategy-refresh:v1:{CAMPAIGN_ID}:2"));
     assert_eq!(payload["round"], 2);
     assert_eq!(harness.promotion_row(), (Some(improver), 3));
+}
+
+/// Crash-window mutation freeze: first terminal evidence is frozen on ingestion.
+/// A crash after terminal projection but before evaluation cannot let a mutated
+/// manifest overwrite the frozen evidence. Genuine I/O failures leave the
+/// experiment accepted and retryable.
+#[test]
+fn crash_window_mutation_freeze() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+
+    // First evaluation - evidence is frozen
+    let outcome1 = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap();
+    assert_eq!(outcome1, PromotionOutcome::Improved);
+
+    // Simulate a mutated manifest trying to overwrite - attempt to insert new metrics
+    // with a different value. The frozen evidence should prevent this.
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(2.0)); // Different value
+
+    // Re-evaluation should be idempotent and return the same outcome
+    let outcome2 = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        400,
+    )
+    .unwrap();
+    assert_eq!(outcome2, PromotionOutcome::Improved);
+
+    // Plateau should not have changed (no double-counting)
+    assert_eq!(harness.promotion_row(), (Some(CHALLENGER_EXPERIMENT_ID.to_owned()), 0));
+}
+
+/// Passive audit idempotency: promotion audit marker is emitted as 'completed'
+/// in the same transaction, never pending or scheduler-dispatchable.
+/// Retries are idempotent via dedup_key.
+#[test]
+fn passive_audit_idempotent_no_dispatch() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+
+    // First evaluation - should emit audit marker
+    evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap();
+
+    // Check that exactly one promotion audit event was created with status 'completed'
+    let connection = harness.db.connect().unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND kind = 'operator_wake'
+               AND dedup_key LIKE 'promotion:v1:%'
+               AND status = 'completed'",
+            [PROJECT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "exactly one completed promotion audit event");
+
+    // Retry evaluation - should be idempotent, no additional audit event
+    evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        400,
+    )
+    .unwrap();
+
+    let count_after: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND kind = 'operator_wake'
+               AND dedup_key LIKE 'promotion:v1:%'
+               AND status = 'completed'",
+            [PROJECT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_after, 1, "retry should not create duplicate audit event");
+
+    // Ensure no 'pending' promotion audit events exist
+    let pending_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND kind = 'operator_wake'
+               AND dedup_key LIKE 'promotion:v1:%'
+               AND status = 'pending'",
+            [PROJECT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_count, 0, "promotion audit should never be pending");
+}
+
+/// Missing metrics row: evaluation should settle the evaluated marker but
+/// change no plateau or state.
+#[test]
+fn missing_metrics_row_settles_marker_no_plateau() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    // Do NOT add metrics for challenger - simulates missing row
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    // No seed_metrics call for challenger
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap();
+
+    assert_eq!(outcome, PromotionOutcome::SkippedNoMetric);
+
+    // Plateau should NOT have changed (still 0)
+    assert_eq!(harness.promotion_row(), (None, 0));
+
+    // But evaluated_at should be set (marker settled)
+    let evaluated: Option<Option<String>> = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+            [CHALLENGER_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(evaluated.flatten().is_some(), "evaluated_at marker should be settled");
+}
+
+/// Inactive campaign or no objective: evaluation should still settle the
+/// evaluated marker but change no plateau or state.
+#[test]
+fn inactive_campaign_settles_marker_no_plateau() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+
+    // Deactivate campaign
+    harness.set_campaign_state("paused");
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap();
+
+    assert_eq!(outcome, PromotionOutcome::SkippedNoObjective);
+
+    // Plateau should NOT have changed (still 0)
+    assert_eq!(harness.promotion_row(), (None, 0));
+
+    // But evaluated_at should be set (marker settled)
+    let evaluated: Option<Option<String>> = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+            [CHALLENGER_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(evaluated.flatten().is_some(), "evaluated_at marker should be settled");
+}
+
+/// v24-to-v25 backfill: terminal experiments get evaluated_at set to their
+/// updated_at timestamp, non-terminal experiments remain NULL.
+#[test]
+fn v24_to_v25_backfill_terminal_experiments_evaluated_nonterminal_null() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+
+    // Create a v24 database (schema version 24)
+    let connection = db.connect().unwrap();
+    connection.execute_batch("PRAGMA user_version = 24;").unwrap();
+
+    // Create minimal v24 schema for campaigns and experiment_metrics
+    connection.execute_batch(
+        "CREATE TABLE campaigns (
+            campaign_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            objective_text TEXT NOT NULL,
+            objective_digest TEXT NOT NULL,
+            initial_argv_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'active','budget_waiting','goal_reached_pending_review','paused',
+                'degraded','halted','retired'
+            )),
+            state_reason TEXT,
+            baseline_experiment_id TEXT,
+            next_eligible_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            objective_metric_json TEXT,
+            current_best_experiment_id TEXT,
+            plateau_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE experiments (
+            experiment_id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            proposal_id TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            parent_experiment_id TEXT,
+            attempt INTEGER NOT NULL CHECK (attempt >= 0),
+            status TEXT NOT NULL CHECK (status IN (
+                'reserved','submitting','accepted','unreconciled',
+                'succeeded','failed','cancelled'
+            )),
+            pueue_task_id INTEGER,
+            task_signature TEXT,
+            failure_code TEXT,
+            failure_fingerprint TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            finished_at INTEGER
+        );
+        CREATE TABLE experiment_metrics (
+            experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+            source TEXT NOT NULL CHECK (source IN ('manifest')),
+            primary_metric_name TEXT,
+            primary_metric_value REAL,
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            artifact_defect TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );",
+    ).unwrap();
+
+    // Insert terminal and non-terminal experiments with metrics
+    connection.execute(
+        "INSERT INTO campaigns (campaign_id, project_id, objective_text, objective_digest,
+            initial_argv_json, state, created_at, updated_at)
+         VALUES ('campaign-test', 'project-a', 'obj', 'digest', '[]', 'active', 100, 100)",
+        [],
+    ).unwrap();
+
+    // Terminal experiment (succeeded) - should get evaluated_at backfilled
+    connection.execute(
+        "INSERT INTO experiments (experiment_id, campaign_id, proposal_id, submission_id,
+            attempt, status, created_at, updated_at, finished_at)
+         VALUES ('exp-terminal', 'campaign-test', 'prop-1', 'sub-1', 0, 'succeeded', 150, 150, 200)",
+        [],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO experiment_metrics (experiment_id, source, primary_metric_name,
+            primary_metric_value, metrics_json, artifact_defect, created_at, updated_at)
+         VALUES ('exp-terminal', 'manifest', 'loss', 0.5, '{}', NULL, 150, 150)",
+        [],
+    ).unwrap();
+
+    // Non-terminal experiment (accepted) - should remain NULL
+    connection.execute(
+        "INSERT INTO experiments (experiment_id, campaign_id, proposal_id, submission_id,
+            attempt, status, created_at, updated_at, finished_at)
+         VALUES ('exp-nonterminal', 'campaign-test', 'prop-2', 'sub-2', 0, 'accepted', 150, 150, NULL)",
+        [],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO experiment_metrics (experiment_id, source, primary_metric_name,
+            primary_metric_value, metrics_json, artifact_defect, created_at, updated_at)
+         VALUES ('exp-nonterminal', 'manifest', 'loss', 0.3, '{}', NULL, 150, 150)",
+        [],
+    ).unwrap();
+
+    // Run migration to v25
+    {
+        let mut conn = db.connect().unwrap();
+        migrations::migrate(&mut conn).unwrap();
+    }
+
+    // Verify v25 schema version
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 25);
+
+    // Terminal experiment should have evaluated_at = updated_at (as TEXT)
+    let terminal_evaluated: Option<Option<String>> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = 'exp-terminal'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(terminal_evaluated.flatten().as_deref(), Some("150"));
+
+    // Non-terminal experiment should have evaluated_at = NULL
+    let nonterminal_evaluated: Option<Option<String>> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = 'exp-nonterminal'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(nonterminal_evaluated.flatten(), None);
+}
+
+#[test]
+fn promotion_audit_is_passive_completed_and_idempotent() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+    harness.set_promotion_state(Some(BASELINE_EXPERIMENT_ID), 0);
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    ).unwrap();
+    assert_eq!(outcome, PromotionOutcome::Improved);
+
+    let connection = harness.db.connect().unwrap();
+    let event: (String, String) = connection
+        .query_row(
+            "SELECT dedup_key, status FROM events
+             WHERE project_id = ?1 AND kind = 'operator_wake'
+               AND dedup_key LIKE 'promotion:v1:%'
+             ORDER BY created_at, event_id",
+            [PROJECT_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(event.1, "completed", "promotion audit must be completed, not pending");
+    assert_eq!(event.0, format!("promotion:v1:{CAMPAIGN_ID}:{CHALLENGER_EXPERIMENT_ID}"));
+
+    let _ = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        310,
+    ).unwrap();
+
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND kind = 'operator_wake'
+               AND dedup_key = ?2",
+            params![PROJECT_ID, format!("promotion:v1:{CAMPAIGN_ID}:{CHALLENGER_EXPERIMENT_ID}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "promotion audit must be idempotent on retry");
+}
+
+#[test]
+fn promotion_audit_not_emitted_for_baseline() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        BASELINE_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        200,
+    ).unwrap();
+    assert_eq!(outcome, PromotionOutcome::BaselineEstablished);
+
+    let connection = harness.db.connect().unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND kind = 'operator_wake'
+               AND dedup_key LIKE 'promotion:v1:%'",
+            [PROJECT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "baseline promotion must not emit audit marker");
+}
+
+#[test]
+fn evaluation_fail_closed_missing_metrics_row() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    // Do NOT seed metrics for challenger - simulating missing row
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    ).unwrap();
+    assert_eq!(outcome, PromotionOutcome::SkippedNoMetric);
+
+    let connection = harness.db.connect().unwrap();
+    let (best, plateau): (Option<String>, i64) = connection
+        .query_row(
+            "SELECT current_best_experiment_id, plateau_count
+             FROM campaigns WHERE campaign_id = ?1",
+            [CAMPAIGN_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(best, Some(BASELINE_EXPERIMENT_ID.to_owned()), "baseline must remain best");
+    assert_eq!(plateau, 0, "plateau must not change when metrics row is missing");
+
+    let evaluated_at: Option<i64> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics
+             WHERE experiment_id = ?1",
+            [CHALLENGER_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(evaluated_at.is_some(), "evaluated_at must be set even for missing row");
+}
+
+#[test]
+fn evaluation_settles_marker_for_inactive_campaign() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+    harness.set_campaign_state("paused");
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    ).unwrap();
+    assert_eq!(outcome, PromotionOutcome::SkippedNoObjective);
+
+    let connection = harness.db.connect().unwrap();
+    let evaluated_at: Option<i64> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics
+             WHERE experiment_id = ?1",
+            [CHALLENGER_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(evaluated_at.is_some(), "inactive campaign must still settle evaluated_at marker");
+
+    let (best, plateau): (Option<String>, i64) = connection
+        .query_row(
+            "SELECT current_best_experiment_id, plateau_count
+             FROM campaigns WHERE campaign_id = ?1",
+            [CAMPAIGN_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(best, Some(BASELINE_EXPERIMENT_ID.to_owned()));
+    assert_eq!(plateau, 0, "plateau must not change for inactive campaign");
+}
+
+#[test]
+fn evaluation_settles_marker_for_campaign_without_objective() {
+    let harness = Harness::new();
+    harness.start_campaign(None);
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    ).unwrap();
+    assert_eq!(outcome, PromotionOutcome::SkippedNoObjective);
+
+    let connection = harness.db.connect().unwrap();
+    let evaluated_at: Option<i64> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics
+             WHERE experiment_id = ?1",
+            [CHALLENGER_EXPERIMENT_ID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(evaluated_at.is_some(), "campaign without objective must still settle evaluated_at marker");
+}
+
+#[test]
+fn v24_to_v25_backfill_terminal_experiments_evaluated() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+    let connection = db.connect().unwrap();
+
+    connection.execute_batch(
+        "CREATE TABLE campaigns (
+             campaign_id TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             objective_text TEXT NOT NULL,
+             objective_digest TEXT NOT NULL,
+             initial_argv_json TEXT NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('active','paused')),
+             state_reason TEXT,
+             baseline_experiment_id TEXT,
+             next_eligible_at INTEGER,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             objective_metric_json TEXT,
+             current_best_experiment_id TEXT,
+             plateau_count INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE experiments (
+             experiment_id TEXT PRIMARY KEY,
+             campaign_id TEXT NOT NULL,
+             proposal_id TEXT NOT NULL,
+             submission_id TEXT NOT NULL,
+             parent_experiment_id TEXT,
+             attempt INTEGER NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('succeeded','failed','cancelled','accepted','reserved','submitting','unreconciled')),
+             pueue_task_id INTEGER,
+             task_signature TEXT,
+             failure_code TEXT,
+             failure_fingerprint TEXT,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             finished_at INTEGER
+         );
+         CREATE TABLE experiment_metrics (
+             experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+             source TEXT NOT NULL CHECK (source IN ('manifest')),
+             primary_metric_name TEXT,
+             primary_metric_value REAL,
+             metrics_json TEXT NOT NULL DEFAULT '{}',
+             artifact_defect TEXT,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );"
+    ).unwrap();
+
+    connection.execute(
+        "INSERT INTO campaigns (campaign_id, project_id, objective_text, objective_digest, initial_argv_json, state, created_at, updated_at) VALUES ('c1', 'p1', 'obj', 'digest', '[]', 'active', 100, 100)",
+        [],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO experiments (experiment_id, campaign_id, proposal_id, submission_id, attempt, status, created_at, updated_at, finished_at) VALUES
+         ('term1', 'c1', 'prop1', 'sub1', 0, 'succeeded', 200, 200, 250),
+         ('term2', 'c1', 'prop2', 'sub2', 0, 'failed', 300, 300, 350),
+         ('nonterm1', 'c1', 'prop3', 'sub3', 0, 'accepted', 400, 400, NULL),
+         ('nonterm2', 'c1', 'prop4', 'sub4', 0, 'reserved', 500, 500, NULL)",
+        [],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO experiment_metrics (experiment_id, source, created_at, updated_at) VALUES
+         ('term1', 'manifest', 200, 200),
+         ('term2', 'manifest', 300, 300),
+         ('nonterm1', 'manifest', 400, 400),
+         ('nonterm2', 'manifest', 500, 500)",
+        [],
+    ).unwrap();
+
+    connection.execute_batch("PRAGMA user_version = 24;").unwrap();
+
+    let db2 = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+    let conn2 = db2.connect().unwrap();
+    let version: i64 = conn2.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 25);
+
+    let term1_eval: Option<i64> = conn2
+        .query_row("SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = 'term1'", [], |r| r.get(0))
+        .unwrap();
+    let term2_eval: Option<i64> = conn2
+        .query_row("SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = 'term2'", [], |r| r.get(0))
+        .unwrap();
+    let nonterm1_eval: Option<i64> = conn2
+        .query_row("SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = 'nonterm1'", [], |r| r.get(0))
+        .unwrap();
+    let nonterm2_eval: Option<i64> = conn2
+        .query_row("SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = 'nonterm2'", [], |r| r.get(0))
+        .unwrap();
+
+    assert!(term1_eval.is_some(), "terminal succeeded must be evaluated");
+    assert!(term2_eval.is_some(), "terminal failed must be evaluated");
+    assert!(nonterm1_eval.is_none(), "accepted must remain NULL");
+    assert!(nonterm2_eval.is_none(), "reserved must remain NULL");
+}
+
+#[test]
+fn evaluation_idempotent_already_evaluated() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+    harness.set_promotion_state(Some(BASELINE_EXPERIMENT_ID), 0);
+
+    let _ = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    ).unwrap();
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        310,
+    ).unwrap();
+    assert_eq!(outcome, PromotionOutcome::Improved);
+
+    let connection = harness.db.connect().unwrap();
+    let (best, plateau): (Option<String>, i64) = connection
+        .query_row(
+            "SELECT current_best_experiment_id, plateau_count
+             FROM campaigns WHERE campaign_id = ?1",
+            [CAMPAIGN_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(best, Some(CHALLENGER_EXPERIMENT_ID.to_owned()));
+    assert_eq!(plateau, 0, "re-evaluation must not change plateau");
 }

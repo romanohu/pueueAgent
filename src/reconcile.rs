@@ -171,10 +171,10 @@ where
                     // evaluated_at marker; retries evaluate whenever that
                     // marker is absent, even if finished_at is already set.
                     if objective.is_some() {
-                        let needs_evaluation =
+let needs_evaluation =
                             crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?
                                 .as_ref()
-                                .and_then(|row| row.evaluated_at)
+                                .and_then(|row| row.evaluated_at.clone())
                                 .is_none();
                         if needs_evaluation {
                             crate::promotion::evaluate(

@@ -176,7 +176,7 @@ fn ingest_inner(
             break;
         }
     }
-    let row = match outcome {
+let row = match outcome {
         None => defect_row(experiment_id, "result_missing", now),
         Some(ManifestOutcome::Invalid) => defect_row(experiment_id, "result_invalid", now),
         Some(ManifestOutcome::Valid {
@@ -195,11 +195,15 @@ fn ingest_inner(
             evaluated_at: None,
         },
     };
-    // Freeze first terminal evidence once evaluated; later mutations or
-    // removals must not desynchronize promotion/plateau state. The upsert
-    // is conditional on evaluated_at IS NULL so recovery before evaluation
-    // remains possible.
-    MetricsRepository::upsert(db, &row)?;
+    // Freeze first terminal evidence on first successful valid ingestion.
+    // Defect rows (result_missing/result_invalid) are NOT frozen so that
+    // recovery from transient I/O errors can overwrite them on retry.
+    let should_freeze = row.artifact_defect.is_none();
+    if should_freeze {
+        let _ = MetricsRepository::insert_frozen(db, &row)?;
+    } else {
+        MetricsRepository::upsert(db, &row)?;
+    }
     Ok(())
 }
 

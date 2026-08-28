@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 24;
+pub const LATEST_SCHEMA_VERSION: i64 = 25;
 const EVENTS_V23_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis'";
 const EVENTS_V18_KIND_LIST: &str =
@@ -290,12 +290,13 @@ const EXPERIMENT_METRICS_V24_TABLE_SQL: &str = r#"
         metrics_json         TEXT NOT NULL DEFAULT '{}',
         artifact_defect      TEXT,
         created_at           INTEGER NOT NULL,
-        updated_at           INTEGER NOT NULL,
-        evaluated_at         INTEGER
+        updated_at           INTEGER NOT NULL
     );
 "#;
+const EXPERIMENT_METRICS_V25_EVALUATED_AT_COLUMN_SQL: &str =
+    "ALTER TABLE experiment_metrics ADD COLUMN evaluated_at TEXT NULL;";
 
-pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
+pub fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(database_error("read SQLite schema version"))?;
@@ -309,10 +310,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             && submissions_have_composite_origin_foreign_key(connection)?;
     let current_schema_has_execution_projection = version == LATEST_SCHEMA_VERSION
         && missing_execution_projection_columns(connection)?.is_empty();
-    if version == LATEST_SCHEMA_VERSION {
+if version == LATEST_SCHEMA_VERSION {
         verify_decision_schema_v21(connection)?;
         verify_running_health_schema_v22(connection)?;
         verify_evaluation_schema_v24(connection)?;
+        verify_evaluation_schema_v25(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -760,6 +762,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         migrate_evaluation_schema_to_v24(&transaction)?;
     } else {
         verify_evaluation_schema_v24(&transaction)?;
+    }
+    if version <= 24 {
+        migrate_evaluation_marker_to_v25(&transaction)?;
+    } else {
+        verify_evaluation_schema_v25(&transaction)?;
     }
     transaction
         .commit()
@@ -2332,6 +2339,15 @@ fn migrate_evaluation_schema_to_v24(
                 .map_err(database_error("apply SQLite v24 campaign column"))?;
         }
     }
+    verify_evaluation_schema_v24(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 24;")
+        .map_err(database_error("set SQLite v24 schema version"))
+}
+
+fn migrate_evaluation_marker_to_v25(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
     let has_evaluated_at: bool = transaction
         .query_row(
             "SELECT EXISTS(
@@ -2340,18 +2356,84 @@ fn migrate_evaluation_schema_to_v24(
             [],
             |row| row.get(0),
         )
-        .map_err(database_error("check SQLite v24 experiment_metrics evaluated_at"))?;
+        .map_err(database_error("check SQLite v25 evaluated_at"))?;
     if !has_evaluated_at {
         transaction
-            .execute_batch(
-                "ALTER TABLE experiment_metrics ADD COLUMN evaluated_at INTEGER;",
+            .execute_batch(EXPERIMENT_METRICS_V25_EVALUATED_AT_COLUMN_SQL)
+            .map_err(database_error("add SQLite v25 evaluated_at"))?;
+    } else {
+        // Handle legacy v24 INTEGER column from rejected fb14a96: if column exists but is not TEXT, recreate as TEXT
+        let col_type: String = transaction
+            .query_row(
+                "SELECT type FROM pragma_table_info('experiment_metrics') WHERE name='evaluated_at'",
+                [],
+                |row| row.get(0),
             )
-            .map_err(database_error("add SQLite v24 experiment_metrics evaluated_at"))?;
+            .map_err(database_error("read evaluated_at type"))?;
+        if col_type.to_uppercase() != "TEXT" {
+            // Recreate table with correct TEXT type preserving data
+            transaction
+                .execute_batch(
+                    r#"
+                CREATE TABLE experiment_metrics_v25_new (
+                    experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id) ON DELETE CASCADE,
+                    source TEXT NOT NULL CHECK (source IN ('manifest')),
+                    primary_metric_name TEXT,
+                    primary_metric_value REAL,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    artifact_defect TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    evaluated_at TEXT
+                );
+                INSERT INTO experiment_metrics_v25_new (experiment_id, source, primary_metric_name, primary_metric_value, metrics_json, artifact_defect, created_at, updated_at, evaluated_at)
+                    SELECT experiment_id, source, primary_metric_name, primary_metric_value, metrics_json, artifact_defect, created_at, updated_at, CAST(evaluated_at AS TEXT) FROM experiment_metrics;
+                DROP TABLE experiment_metrics;
+                ALTER TABLE experiment_metrics_v25_new RENAME TO experiment_metrics;
+                "#,
+                )
+                .map_err(database_error("migrate evaluated_at type to TEXT"))?;
+        }
     }
-    verify_evaluation_schema_v24(transaction)?;
+    // Backfill: terminal experiments as evaluated (set to updated_at timestamp), nonterminal remain NULL
     transaction
-        .execute_batch("PRAGMA user_version = 24;")
-        .map_err(database_error("set SQLite v24 schema version"))
+        .execute(
+            "UPDATE experiment_metrics SET evaluated_at = CAST(updated_at AS TEXT) WHERE evaluated_at IS NULL AND experiment_id IN (SELECT experiment_id FROM experiments WHERE status IN ('succeeded','failed','cancelled'))",
+            [],
+        )
+        .map_err(database_error("backfill evaluated_at for terminal experiments"))?;
+    verify_evaluation_schema_v25(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 25;")
+        .map_err(database_error("set SQLite v25 schema version"))
+}
+
+fn verify_evaluation_schema_v25(connection: &Connection) -> Result<(), AppError> {
+    let found: i64 = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='experiment_metrics') + (SELECT COUNT(*) FROM pragma_table_info('experiment_metrics') WHERE name='evaluated_at' AND type='TEXT') + (SELECT COUNT(*) FROM pragma_table_info('campaigns') WHERE name IN ('objective_metric_json', 'current_best_experiment_id', 'plateau_count'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("verify SQLite v25 evaluation schema"))?;
+    if found == 5 {
+        // Also ensure v24 base still canonical
+        verify_evaluation_schema_v24(connection)?;
+        // Verify backfill correctness: no nonterminal row should be marked, and every terminal row with metrics should be marked? We check that nonterminal evaluated_at is NULL
+        let bad: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM experiment_metrics em JOIN experiments e ON e.experiment_id = em.experiment_id WHERE e.status IN ('reserved','submitting','accepted','unreconciled') AND em.evaluated_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error("verify v25 backfill nonterminal"))?;
+        if bad != 0 {
+            return Err(AppError::Runtime { operation: "verify SQLite v25 backfill nonterminal evaluated_at must be NULL" });
+        }
+        Ok(())
+    } else {
+        Err(AppError::Runtime { operation: "verify SQLite v25 evaluation schema" })
+    }
 }
 
 fn verify_evaluation_schema_v24(connection: &Connection) -> Result<(), AppError> {
@@ -2374,6 +2456,7 @@ fn verify_evaluation_schema_v24(connection: &Connection) -> Result<(), AppError>
         })
     }
 }
+
 
 fn decision_schema_v19_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
     let event_sql: Option<String> = connection

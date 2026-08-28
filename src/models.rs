@@ -274,7 +274,7 @@ pub struct ExperimentMetricsRow {
     pub artifact_defect: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub evaluated_at: Option<i64>,
+    pub evaluated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,7 +387,7 @@ database_enum!(TerminationRequestStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub project_id: String,
-    pub root_path: PathBuf,
+pub root_path: PathBuf,
     pub pueue_group: String,
     pub config_path: PathBuf,
     pub enabled: bool,
