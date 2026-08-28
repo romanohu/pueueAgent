@@ -707,7 +707,7 @@ fn shell_quote(argument: &str) -> String {
     if !argument.is_empty()
         && argument
             .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'%' | b'_' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'))
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'%' | b'_' | b'+' | b'=' | b',' | b'.' | b'/' | b'-'))
     {
         return argument.to_owned();
     }
@@ -818,5 +818,23 @@ mod display_tests {
         ];
         let display = try_canonical_command_display_os(&argv).unwrap();
         assert_eq!(display, "/usr/bin/env PUEUE_AGENT_EXPERIMENT_ID=exp-1 echo hi");
+    }
+
+    #[test]
+    fn colon_in_managed_argv_is_quoted_like_real_pueue() {
+        let argv = vec![
+            OsString::from("/usr/bin/env"),
+            OsString::from("PUEUE_AGENT_EXPERIMENT_ID=decision-experiment:abc123"),
+            OsString::from("PUEUE_AGENT_CAMPAIGN_ID=daemon-campaign"),
+            OsString::from("PUEUE_AGENT_RESULT_PATH=/tmp/project/.pueue-agent/results/decision-experiment:abc123.json"),
+            OsString::from("PUEUE_AGENT_ARTIFACT_DIR=/tmp/project/.pueue-agent/artifacts/decision-experiment:abc123"),
+            OsString::from("python"),
+            OsString::from("train.py"),
+        ];
+        let display = try_canonical_command_display_os(&argv).unwrap();
+        assert_eq!(
+            display,
+            "/usr/bin/env 'PUEUE_AGENT_EXPERIMENT_ID=decision-experiment:abc123' PUEUE_AGENT_CAMPAIGN_ID=daemon-campaign 'PUEUE_AGENT_RESULT_PATH=/tmp/project/.pueue-agent/results/decision-experiment:abc123.json' 'PUEUE_AGENT_ARTIFACT_DIR=/tmp/project/.pueue-agent/artifacts/decision-experiment:abc123' python train.py"
+        );
     }
 }
