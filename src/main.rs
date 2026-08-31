@@ -1048,8 +1048,8 @@ fn objective_metric_from_flags(
 ) -> Result<Option<pueue_agent::models::ObjectiveMetric>, AppError> {
     match (name, direction, min_delta) {
         (None, None, None) => Ok(None),
-        (Some(name), Some(direction), min_delta) => Ok(Some(
-            pueue_agent::models::ObjectiveMetric {
+        (Some(name), Some(direction), min_delta) => {
+            let metric = pueue_agent::models::ObjectiveMetric {
                 name,
                 direction: match direction {
                     pueue_agent::cli::MetricDirectionArg::Minimize => {
@@ -1060,8 +1060,10 @@ fn objective_metric_from_flags(
                     }
                 },
                 min_delta,
-            },
-        )),
+            };
+            metric.validate()?;
+            Ok(Some(metric))
+        }
         _ => Err(AppError::Validation {
             field: "submit.metric",
             message:

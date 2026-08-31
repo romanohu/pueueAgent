@@ -26,7 +26,7 @@ use pueue_agent::{
     events::{
         callback_group_for_task, record_callback_with, CallbackMetadata, CallbackRecordResult,
     },
-    execution_policy::CampaignLimits,
+    execution_policy::{CampaignLimits, ProjectRootAnchor},
     models::{
         BudgetReservationStatus, EventKind, EventStatus, ExperimentMetricsRow, ExperimentStatus,
         MetricDirection, NewProject, NewSubmission, NewTaskObservation, ObjectiveMetric,
@@ -1529,12 +1529,8 @@ fn submit_metric_flags_require_the_full_trio() {
         "python",
         "train.py",
     ])
-    .unwrap();
-    let Command::Submit(args) = parsed.command else {
-        panic!("expected a submit command");
-    };
-    assert_eq!(args.metric_name.as_deref(), Some("loss"));
-    assert_eq!(args.metric_min_delta, Some(-0.5));
+    .unwrap_err();
+    assert!(parsed.to_string().contains("min delta must be non-negative"));
 }
 
 #[tokio::test]
@@ -1707,6 +1703,49 @@ async fn terminal_projection_rejects_symlink_manifest() {
     assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
     assert_eq!(row.metrics_json, "{}");
     assert_eq!(row.primary_metric_value, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_projection_rejects_results_parent_symlink_outside_pinned_root() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    let canonical_root = fs::canonicalize(harness.root()).unwrap();
+    fs::set_permissions(&canonical_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let pinned_root = ProjectRootAnchor::resolve(&canonical_root).unwrap();
+    pinned_root.verify_identity().unwrap();
+
+    let outside = harness._temp.path().join("outside-results");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join(format!("{experiment_id}.json")),
+        format!(
+            r#"{{"schema_version":1,"experiment_id":"{experiment_id}","metrics":{{"loss":0.01}}}}"#
+        ),
+    )
+    .unwrap();
+    let service = harness.root().join(".pueue-agent");
+    fs::create_dir_all(&service).unwrap();
+    symlink(&outside, service.join("results")).unwrap();
+
+    let result = Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await;
+
+    assert!(matches!(result, Err(AppError::PolicyViolation { .. })));
+    assert!(harness.metrics_row(&experiment_id).is_none());
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
 }
 
 #[cfg(unix)]

@@ -93,6 +93,12 @@ pub struct OpenedProjectLog {
     relative_path: PathBuf,
 }
 
+pub(crate) enum ResultManifestOpen {
+    Missing,
+    Invalid,
+    File(File),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogFileIdentity {
     pub device: u64,
@@ -208,6 +214,76 @@ impl ProjectRootLogReader {
                 file,
                 relative_path: relative.to_owned(),
             })
+        }
+    }
+
+    /// Open a result-manifest candidate below the pinned project root.
+    /// Missing entries and unsafe final entries are classified for discovery;
+    /// parent symlinks remain hard policy failures.
+    pub(crate) fn open_result_manifest(
+        &self,
+        relative: &Path,
+    ) -> Result<ResultManifestOpen, AppError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (self, relative);
+            return Err(unsupported_platform(PolicyViolationStage::PreBinding));
+        }
+        #[cfg(unix)]
+        {
+            let components = relative_components(relative)?;
+            let final_name = components
+                .last()
+                .expect("relative_components always returns one component")
+                .to_os_string();
+            let mut parent = self.root.directory.try_clone().map_err(|source| AppError::Io {
+                operation: "clone project root descriptor",
+                source,
+            })?;
+            for component in &components[..components.len() - 1] {
+                let child = match open_directory_at(&parent, component) {
+                    Ok(child) => child,
+                    Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                        return Ok(ResultManifestOpen::Missing);
+                    }
+                    Err(source) => {
+                        return Err(map_result_parent_open_error(&parent, component, source));
+                    }
+                };
+                validate_directory(&child)?;
+                parent = child;
+            }
+
+            let file = match openat_file(
+                &parent,
+                &final_name,
+                libc::O_RDONLY | libc::O_NONBLOCK,
+                0,
+            ) {
+                Ok(file) => file,
+                Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
+                    return Ok(ResultManifestOpen::Missing);
+                }
+                Err(source) => {
+                    if result_final_is_nonregular(&parent, &final_name) {
+                        return Ok(ResultManifestOpen::Invalid);
+                    }
+                    return Err(AppError::Io {
+                        operation: "open result manifest",
+                        source,
+                    });
+                }
+            };
+            let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|source| {
+                AppError::Io {
+                    operation: "read result manifest metadata",
+                    source,
+                }
+            })?;
+            if !identity.is_regular() {
+                return Ok(ResultManifestOpen::Invalid);
+            }
+            Ok(ResultManifestOpen::File(file))
         }
     }
 
@@ -1076,6 +1152,28 @@ fn map_component_open_error(parent: &File, name: &OsStr, source: io::Error) -> A
         return log_unsafe(LogUnsafeReason::Symlink);
     }
     map_walk_error(source)
+}
+
+#[cfg(unix)]
+fn map_result_parent_open_error(parent: &File, name: &OsStr, source: io::Error) -> AppError {
+    if matches!(
+        source.raw_os_error(),
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EISDIR)
+    ) && is_symlink_at(parent, name).unwrap_or(false)
+    {
+        return log_unsafe(LogUnsafeReason::Symlink);
+    }
+    AppError::Io {
+        operation: "open result manifest",
+        source,
+    }
+}
+
+#[cfg(unix)]
+fn result_final_is_nonregular(parent: &File, name: &OsStr) -> bool {
+    identity_at(parent, name)
+        .map(|identity| !identity.is_regular())
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]

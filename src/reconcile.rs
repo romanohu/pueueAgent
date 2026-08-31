@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::OsString, time::SystemTime};
+use std::{collections::BTreeMap, ffi::OsString, sync::Arc, time::SystemTime};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -10,13 +10,14 @@ use crate::{
     },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
-    execution_policy::CampaignLimits,
+    execution_policy::{CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy},
     incidents::IncidentStore,
     models::{
         EventKind, Experiment, ExperimentStatus, ExperimentTerminalOutcome, NewEvent,
         NewTaskObservation, Submission, SubmissionStatus,
     },
     pueue::{PueueApi, PueueTask},
+    project_logs::ProjectRootLogReader,
     termination::{
         auto_kill_request_for_terminal_task, confirm_auto_kill_terminal_observation,
         AutoKillConfirmation,
@@ -41,6 +42,7 @@ pub struct Reconciler<'db, P> {
     db: &'db Db,
     pueue: P,
     campaign_limits: CampaignLimits,
+    execution_policy: Option<Arc<ResolvedExecutionPolicy>>,
 }
 
 impl<'db, P> Reconciler<'db, P>
@@ -52,12 +54,32 @@ where
             db,
             pueue,
             campaign_limits: CampaignLimits::default(),
+            execution_policy: None,
         }
     }
 
     pub fn with_campaign_limits(mut self, limits: CampaignLimits) -> Self {
         self.campaign_limits = limits;
         self
+    }
+
+    pub fn with_execution_policy(mut self, policy: Arc<ResolvedExecutionPolicy>) -> Self {
+        self.execution_policy = Some(policy);
+        self
+    }
+
+    fn project_root_reader(
+        &self,
+        project: &crate::models::Project,
+    ) -> Result<ProjectRootLogReader, AppError> {
+        let root_anchor = match self.execution_policy.as_ref() {
+            Some(policy) => policy
+                .project_root_anchor(&project.root_path)
+                .map_err(AppError::from)?,
+            None => ProjectRootAnchor::resolve(&project.root_path).map_err(AppError::from)?,
+        };
+        let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+        Ok(ProjectRootLogReader::from_verified(verified_root))
     }
 
     pub async fn run_once(&mut self) -> Result<ReconcileReport, AppError> {
@@ -153,9 +175,10 @@ where
                     ) && crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?.is_some();
                     if !has_frozen_terminal_evidence {
                         if let Some(objective) = objective.as_ref() {
-                            crate::result_manifest::ingest(
+                            let root = self.project_root_reader(project)?;
+                            crate::result_manifest::ingest_from_verified_root(
                                 self.db,
-                                std::path::Path::new(&project.root_path),
+                                &root,
                                 &project.project_id,
                                 &experiment.experiment_id,
                                 task.id,

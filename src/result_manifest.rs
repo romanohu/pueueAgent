@@ -12,15 +12,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(not(unix))]
-use std::fs::File;
-
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::{
     db::{database_error, Db, MetricsRepository},
+    execution_policy::ProjectRootAnchor,
     models::{ExperimentMetricsRow, ObjectiveMetric},
+    project_logs::{ProjectRootLogReader, ResultManifestOpen},
     AppError,
 };
 
@@ -57,70 +56,23 @@ enum ManifestRead {
     Bytes(Vec<u8>),
 }
 
-fn read_manifest(path: &Path) -> Result<Option<ManifestRead>, AppError> {
-    #[cfg(unix)]
-    let file_result = {
-        use std::os::unix::fs::OpenOptionsExt;
+fn relative_result_path_candidates(experiment_id: &str, pueue_task_id: i64) -> Vec<PathBuf> {
+    let results = Path::new(".pueue-agent").join(RESULT_DIRECTORY);
+    vec![
+        results.join(format!("{experiment_id}.json")),
+        results.join(format!("{pueue_task_id}.json")),
+    ]
+}
 
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)
+fn read_manifest(
+    root: &ProjectRootLogReader,
+    relative: &Path,
+) -> Result<Option<ManifestRead>, AppError> {
+    let file = match root.open_result_manifest(relative)? {
+        ResultManifestOpen::Missing => return Ok(None),
+        ResultManifestOpen::Invalid => return Ok(Some(ManifestRead::Invalid)),
+        ResultManifestOpen::File(file) => file,
     };
-
-    #[cfg(not(unix))]
-    let file_result = File::open(path);
-
-    let file = match file_result {
-        Ok(file) => file,
-        #[cfg(not(unix))]
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        #[cfg(unix)]
-        Err(source) => {
-            // The safe open above remains the security decision. This
-            // no-follow probe only classifies an already-rejected candidate
-            // and never authorizes a later read.
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata) => {
-                    let file_type = metadata.file_type();
-                    if file_type.is_symlink() || !file_type.is_file() {
-                        return Ok(Some(ManifestRead::Invalid));
-                    }
-                }
-                Err(metadata_source) if metadata_source.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(None);
-                }
-                Err(_) => {
-                    return Err(AppError::Io {
-                        operation: "open result manifest",
-                        source,
-                    });
-                }
-            }
-            return Err(AppError::Io {
-                operation: "open result manifest",
-                source,
-            });
-        }
-        #[cfg(not(unix))]
-        Err(source) => {
-            return Err(AppError::Io {
-                operation: "open result manifest",
-                source,
-            })
-        }
-    };
-    if !file
-        .metadata()
-        .map_err(|source| AppError::Io {
-            operation: "read result manifest metadata",
-            source,
-        })?
-        .file_type()
-        .is_file()
-    {
-        return Ok(Some(ManifestRead::Invalid));
-    }
     let mut bytes = Vec::with_capacity(MAX_RESULT_MANIFEST_BYTES + 1);
     file.take((MAX_RESULT_MANIFEST_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -201,9 +153,37 @@ pub fn ingest(
     objective: Option<&ObjectiveMetric>,
     now: i64,
 ) -> Result<(), AppError> {
+    let canonical_root = std::fs::canonicalize(project_root).map_err(|source| AppError::Io {
+        operation: "canonicalize project root for result manifest",
+        source,
+    })?;
+    let root_anchor = ProjectRootAnchor::resolve(&canonical_root).map_err(AppError::from)?;
+    let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
+    let root = ProjectRootLogReader::from_verified(verified_root);
+    ingest_from_verified_root(
+        db,
+        &root,
+        project_id,
+        experiment_id,
+        pueue_task_id,
+        objective,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ingest_from_verified_root(
+    db: &Db,
+    root: &ProjectRootLogReader,
+    project_id: &str,
+    experiment_id: &str,
+    pueue_task_id: i64,
+    objective: Option<&ObjectiveMetric>,
+    now: i64,
+) -> Result<(), AppError> {
     match ingest_inner(
         db,
-        project_root,
+        root,
         project_id,
         experiment_id,
         pueue_task_id,
@@ -228,7 +208,7 @@ pub fn ingest(
 #[allow(clippy::too_many_arguments)]
 fn ingest_inner(
     db: &Db,
-    project_root: &Path,
+    root: &ProjectRootLogReader,
     _project_id: &str,
     experiment_id: &str,
     pueue_task_id: i64,
@@ -236,8 +216,8 @@ fn ingest_inner(
     now: i64,
 ) -> Result<(), AppError> {
     let mut outcome = None;
-    for path in result_path_candidates(project_root, experiment_id, pueue_task_id) {
-        match read_manifest(&path)? {
+    for path in relative_result_path_candidates(experiment_id, pueue_task_id) {
+        match read_manifest(root, &path)? {
             None => {}
             Some(ManifestRead::Invalid) => {
                 outcome = Some(ManifestOutcome::Invalid);
@@ -290,11 +270,15 @@ pub(crate) fn campaign_objective(
         .map_err(database_error("read campaign objective metric"))?;
     match stored.flatten() {
         None => Ok(None),
-        Some(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|source| AppError::Serialization {
-                operation: "parse campaign objective metric",
-                source,
-            }),
+        Some(text) => {
+            let objective = serde_json::from_str::<ObjectiveMetric>(&text).map_err(|source| {
+                AppError::Serialization {
+                    operation: "parse campaign objective metric",
+                    source,
+                }
+            })?;
+            objective.validate()?;
+            Ok(Some(objective))
+        }
     }
 }

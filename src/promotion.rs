@@ -85,6 +85,25 @@ fn evaluate_in_transaction(
             field: "campaign_id",
             message: "does not identify a campaign",
         })?;
+    if let Some(objective) = campaign.objective.as_ref() {
+        objective.validate()?;
+    }
+
+    validate_experiment_campaign(connection, campaign_id, experiment_id, "experiment_id")?;
+    for (field, comparison_id) in [
+        (
+            "current_best_experiment_id",
+            campaign.current_best_experiment_id.as_deref(),
+        ),
+        (
+            "baseline_experiment_id",
+            campaign.baseline_experiment_id.as_deref(),
+        ),
+    ] {
+        if let Some(comparison_id) = comparison_id {
+            validate_experiment_campaign(connection, campaign_id, comparison_id, field)?;
+        }
+    }
 
     // Fail-closed: require metrics row before any state mutations.
     // If metrics row is missing, return error without any mutation or evaluated_at marking.
@@ -101,6 +120,7 @@ fn evaluate_in_transaction(
     if is_evaluated {
         return Ok(deduce_already_evaluated_outcome(
             &campaign,
+            campaign_id,
             experiment_id,
             terminal_status,
             connection,
@@ -126,7 +146,7 @@ fn evaluate_in_transaction(
     }
 
     // Successful terminal with no primary metric value: increment plateau, settle marker.
-    let Some(candidate_value) = primary_metric_value(connection, experiment_id)? else {
+    let Some(candidate_value) = primary_metric_value(connection, campaign_id, experiment_id)? else {
         increment_plateau(
             connection,
             campaign_id,
@@ -203,7 +223,7 @@ fn compare_and_settle(
     limits: &CampaignLimits,
     now: i64,
 ) -> Result<PromotionOutcome, AppError> {
-    let Some(best_value) = primary_metric_value(connection, best_experiment_id)? else {
+    let Some(best_value) = primary_metric_value(connection, campaign_id, best_experiment_id)? else {
         return Ok(PromotionOutcome::SkippedNoMetric);
     };
     let delta = objective.min_delta.unwrap_or(0.0);
@@ -379,6 +399,33 @@ fn is_already_evaluated(
     Ok(matches!(evaluated, Some(Some(_))))
 }
 
+fn validate_experiment_campaign(
+    connection: &Connection,
+    campaign_id: &str,
+    experiment_id: &str,
+    field: &'static str,
+) -> Result<(), AppError> {
+    let experiment_campaign = connection
+        .query_row(
+            "SELECT campaign_id FROM experiments WHERE experiment_id = ?1",
+            [experiment_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error("validate experiment campaign lineage"))?;
+    match experiment_campaign {
+        Some(experiment_campaign) if experiment_campaign == campaign_id => Ok(()),
+        Some(_) => Err(AppError::Validation {
+            field,
+            message: "must belong to the same campaign",
+        }),
+        None => Err(AppError::Validation {
+            field,
+            message: "does not identify an experiment",
+        }),
+    }
+}
+
 fn metrics_row_exists(
     connection: &Connection,
     experiment_id: &str,
@@ -418,6 +465,7 @@ fn mark_evaluated(
 
 fn deduce_already_evaluated_outcome(
     campaign: &CampaignPromotionState,
+    campaign_id: &str,
     experiment_id: &str,
     terminal_status: ExperimentStatus,
     connection: &Connection,
@@ -428,7 +476,7 @@ fn deduce_already_evaluated_outcome(
     if terminal_status != ExperimentStatus::Succeeded {
         return Ok(PromotionOutcome::SkippedNoMetric);
     }
-    if primary_metric_value(connection, experiment_id)?.is_none() {
+    if primary_metric_value(connection, campaign_id, experiment_id)?.is_none() {
         return Ok(PromotionOutcome::NotImproved);
     }
     match campaign.current_best_experiment_id.as_deref() {
@@ -490,16 +538,21 @@ fn read_campaign_promotion_state(
 
 fn primary_metric_value(
     connection: &Connection,
+    campaign_id: &str,
     experiment_id: &str,
 ) -> Result<Option<f64>, AppError> {
     Ok(connection
         .query_row(
-            "SELECT primary_metric_value FROM experiment_metrics WHERE experiment_id = ?1",
-            [experiment_id],
+            "SELECT em.primary_metric_value
+             FROM experiment_metrics em
+             JOIN experiments e ON e.experiment_id = em.experiment_id
+             WHERE em.experiment_id = ?1
+               AND e.campaign_id = ?2
+               AND em.artifact_defect IS NULL",
+            rusqlite::params![experiment_id, campaign_id],
             |row| row.get::<_, Option<f64>>(0),
         )
         .optional()
         .map_err(database_error("read experiment primary metric"))?
         .flatten())
 }
-

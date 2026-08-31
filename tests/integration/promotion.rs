@@ -18,6 +18,8 @@ const BASELINE_EXPERIMENT_ID: &str = "promo-experiment-baseline";
 const BASELINE_SUBMISSION_ID: &str = "promo-submission-baseline";
 const BASELINE_PROPOSAL_ID: &str = "promo-proposal-baseline";
 const CHALLENGER_EXPERIMENT_ID: &str = "promo-experiment-challenger";
+const OTHER_CAMPAIGN_ID: &str = "campaign-promotion-other";
+const OTHER_EXPERIMENT_ID: &str = "promo-experiment-other";
 
 fn minimize_metric() -> ObjectiveMetric {
     ObjectiveMetric {
@@ -59,6 +61,13 @@ impl Harness {
     }
 
     fn start_campaign(&self, objective_metric: Option<&ObjectiveMetric>) {
+        self.try_start_campaign(objective_metric).unwrap();
+    }
+
+    fn try_start_campaign(
+        &self,
+        objective_metric: Option<&ObjectiveMetric>,
+    ) -> Result<(), pueue_agent::AppError> {
         let objective = ObjectiveSnapshot {
             text: "Reach validation loss below 0.20\n".to_owned(),
             digest: "objective-digest".to_owned(),
@@ -79,8 +88,7 @@ impl Harness {
                 expected_evidence: Vec::new(),
             },
             &objective.digest,
-        )
-        .unwrap();
+        )?;
         CampaignRepository::new(&self.db)
             .start_with_baseline(
                 StartCampaignRequest {
@@ -99,7 +107,8 @@ impl Harness {
                 },
                 &CampaignLimits::default(),
             )
-            .unwrap();
+            ?;
+        Ok(())
     }
 
     fn seed_metrics(&self, experiment_id: &str, value: Option<f64>) {
@@ -176,6 +185,104 @@ impl Harness {
                 params![state, CAMPAIGN_ID],
             )
             .unwrap();
+    }
+
+    fn add_other_campaign_experiment(&self) {
+        let connection = self.db.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO campaigns (
+                    campaign_id, project_id, objective_text, objective_digest,
+                    initial_argv_json, state, baseline_experiment_id, next_eligible_at,
+                    objective_metric_json, current_best_experiment_id, plateau_count,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, 'other objective', 'other-digest', '[]', 'retired',
+                           NULL, NULL, ?3, NULL, 0, 100, 100)",
+                params![
+                    OTHER_CAMPAIGN_ID,
+                    PROJECT_ID,
+                    serde_json::to_string(&minimize_metric()).unwrap(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at, pueue_task_id,
+                    task_signature, status, kind, metadata_json, origin_agent_run_id
+                 )
+                 SELECT ?1, project_id, argv_json, created_at + 1, pueue_task_id,
+                        task_signature, status, kind, metadata_json, origin_agent_run_id
+                 FROM submissions WHERE submission_id = ?2",
+                params![format!("{OTHER_EXPERIMENT_ID}-submission"), BASELINE_SUBMISSION_ID],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis, source_experiment_id,
+                    argv_json, working_directory, expected_evidence_json, canonical_digest,
+                    reject_reason, created_at, updated_at
+                 )
+                 SELECT ?1, ?2, kind, status, hypothesis, source_experiment_id, argv_json,
+                        working_directory, expected_evidence_json, ?3, reject_reason,
+                        created_at + 1, updated_at + 1
+                 FROM proposals WHERE proposal_id = ?4",
+                params![
+                    format!("{OTHER_EXPERIMENT_ID}-proposal"),
+                    OTHER_CAMPAIGN_ID,
+                    format!("{OTHER_EXPERIMENT_ID}-digest"),
+                    BASELINE_PROPOSAL_ID,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                    failure_code, failure_fingerprint, created_at, updated_at, finished_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, parent_experiment_id, attempt, status,
+                        pueue_task_id, task_signature, failure_code, failure_fingerprint,
+                        created_at + 1, updated_at + 1, finished_at
+                 FROM experiments WHERE experiment_id = ?5",
+                params![
+                    OTHER_EXPERIMENT_ID,
+                    OTHER_CAMPAIGN_ID,
+                    format!("{OTHER_EXPERIMENT_ID}-proposal"),
+                    format!("{OTHER_EXPERIMENT_ID}-submission"),
+                    BASELINE_EXPERIMENT_ID,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn set_baseline_experiment_id(&self, experiment_id: Option<&str>) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaigns SET baseline_experiment_id = ?1 WHERE campaign_id = ?2",
+                params![experiment_id, CAMPAIGN_ID],
+            )
+            .unwrap();
+    }
+
+    fn campaign_evaluation_row(
+        &self,
+        campaign_id: &str,
+    ) -> (Option<String>, Option<String>, i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT baseline_experiment_id, current_best_experiment_id, plateau_count
+                 FROM campaigns WHERE campaign_id = ?1",
+                [campaign_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
     }
 
     fn promotion_row(&self) -> (Option<String>, i64) {
@@ -824,4 +931,215 @@ fn evaluation_idempotent_already_evaluated() {
         .unwrap();
     assert_eq!(best, Some(CHALLENGER_EXPERIMENT_ID.to_owned()));
     assert_eq!(plateau, 0, "re-evaluation must not change plateau");
+}
+
+#[test]
+fn evaluation_rejects_candidate_from_another_campaign_without_mutation() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_other_campaign_experiment();
+    harness.seed_metrics(OTHER_EXPERIMENT_ID, Some(0.1));
+    let campaign_before = harness.campaign_evaluation_row(CAMPAIGN_ID);
+    let other_before = harness.campaign_evaluation_row(OTHER_CAMPAIGN_ID);
+    let event_count_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+
+    let error = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        OTHER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pueue_agent::AppError::Validation {
+            field: "experiment_id",
+            ..
+        }
+    ));
+    assert_eq!(harness.campaign_evaluation_row(CAMPAIGN_ID), campaign_before);
+    assert_eq!(
+        harness.campaign_evaluation_row(OTHER_CAMPAIGN_ID),
+        other_before
+    );
+    assert_eq!(harness.evaluated_at(OTHER_EXPERIMENT_ID), None);
+    let event_count_after: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(event_count_after, event_count_before);
+}
+
+#[test]
+fn evaluation_rejects_cross_campaign_persisted_comparison_pointers_before_mutation() {
+    for pointer in ["current_best", "baseline"] {
+        let harness = Harness::new();
+        harness.start_campaign(Some(&minimize_metric()));
+        harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+        harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+        harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+        harness.add_other_campaign_experiment();
+        harness.seed_metrics(OTHER_EXPERIMENT_ID, Some(0.1));
+        if pointer == "current_best" {
+            harness.set_promotion_state(Some(OTHER_EXPERIMENT_ID), 2);
+        } else {
+            harness.set_baseline_experiment_id(Some(OTHER_EXPERIMENT_ID));
+        }
+        let before = harness.campaign_evaluation_row(CAMPAIGN_ID);
+
+        let error = evaluate(
+            &harness.db,
+            CAMPAIGN_ID,
+            CHALLENGER_EXPERIMENT_ID,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            300,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            pueue_agent::AppError::Validation {
+                field: "current_best_experiment_id" | "baseline_experiment_id",
+                ..
+            }
+        ));
+        assert_eq!(harness.campaign_evaluation_row(CAMPAIGN_ID), before);
+        assert_eq!(harness.evaluated_at(CHALLENGER_EXPERIMENT_ID), None);
+    }
+}
+
+#[test]
+fn defect_metric_value_cannot_promote_a_best_experiment() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(0.5));
+    harness.set_promotion_state(Some(BASELINE_EXPERIMENT_ID), 0);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE experiment_metrics
+             SET artifact_defect = 'result_invalid', primary_metric_value = 0.5
+             WHERE experiment_id = ?1",
+            [CHALLENGER_EXPERIMENT_ID],
+        )
+        .unwrap();
+
+    let outcome = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap();
+
+    assert_eq!(outcome, PromotionOutcome::NotImproved);
+    assert_eq!(
+        harness.promotion_row(),
+        (Some(BASELINE_EXPERIMENT_ID.to_owned()), 1)
+    );
+    assert!(harness.evaluated_at(CHALLENGER_EXPERIMENT_ID).is_some());
+}
+
+#[test]
+fn campaign_rejects_negative_objective_metric_delta_before_insert() {
+    let harness = Harness::new();
+    let metric = ObjectiveMetric {
+        name: "loss".to_owned(),
+        direction: MetricDirection::Minimize,
+        min_delta: Some(-0.5),
+    };
+
+    let error = harness.try_start_campaign(Some(&metric)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        pueue_agent::AppError::Validation {
+            field: "objective_metric.min_delta",
+            ..
+        }
+    ));
+    let campaign_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM campaigns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(campaign_count, 0);
+}
+
+#[test]
+fn persisted_negative_delta_fails_closed_before_worse_result_promotion() {
+    let harness = Harness::new();
+    harness.start_campaign(Some(&minimize_metric()));
+    harness.seed_metrics(BASELINE_EXPERIMENT_ID, Some(1.0));
+    harness.add_experiment(CHALLENGER_EXPERIMENT_ID);
+    harness.seed_metrics(CHALLENGER_EXPERIMENT_ID, Some(1.2));
+    harness.set_promotion_state(Some(BASELINE_EXPERIMENT_ID), 0);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns
+             SET objective_metric_json = ?1
+             WHERE campaign_id = ?2",
+            params![
+                json!({
+                    "name": "loss",
+                    "direction": "minimize",
+                    "min_delta": -0.5,
+                })
+                .to_string(),
+                CAMPAIGN_ID,
+            ],
+        )
+        .unwrap();
+
+    let error = evaluate(
+        &harness.db,
+        CAMPAIGN_ID,
+        CHALLENGER_EXPERIMENT_ID,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        300,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pueue_agent::AppError::Validation {
+            field: "objective_metric.min_delta",
+            ..
+        }
+    ));
+    assert_eq!(
+        harness.promotion_row(),
+        (Some(BASELINE_EXPERIMENT_ID.to_owned()), 0)
+    );
+    assert_eq!(harness.evaluated_at(CHALLENGER_EXPERIMENT_ID), None);
+    let event_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(event_count, 0);
 }

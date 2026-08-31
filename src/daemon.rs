@@ -173,6 +173,7 @@ where
         .recover_interrupted(now, self.config.claim_limit)?;
 
         let reconciliation = Reconciler::new(&self.db, self.pueue.clone())
+            .with_execution_policy(Arc::clone(&self.policy))
             .run_once_at(now)
             .await?;
         let (detection_signals, observations) = self.run_detection(&reconciliation).await?;

@@ -333,7 +333,11 @@ fn parse_metric_min_delta(value: &str) -> Result<f64, String> {
         .parse::<f64>()
         .map_err(|_| "min delta must be a finite number".to_owned())?;
     if delta.is_finite() {
-        Ok(delta)
+        if delta >= 0.0 {
+            Ok(delta)
+        } else {
+            Err("min delta must be non-negative".to_owned())
+        }
     } else {
         Err("min delta must be a finite number".to_owned())
     }

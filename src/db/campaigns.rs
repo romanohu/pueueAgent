@@ -139,6 +139,9 @@ impl<'db> CampaignRepository<'db> {
         request: StartCampaignRequest<'_>,
         limits: &CampaignLimits,
     ) -> Result<ManagedSubmissionIntent, AppError> {
+        if let Some(objective_metric) = request.objective_metric {
+            objective_metric.validate()?;
+        }
         let initial_argv_json = serialize_strings(
             request.initial_argv,
             "serialize campaign initial arguments",

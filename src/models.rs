@@ -264,6 +264,27 @@ pub struct ObjectiveMetric {
     pub min_delta: Option<f64>,
 }
 
+impl ObjectiveMetric {
+    pub fn validate(&self) -> Result<(), AppError> {
+        let Some(min_delta) = self.min_delta else {
+            return Ok(());
+        };
+        if !min_delta.is_finite() {
+            return Err(AppError::Validation {
+                field: "objective_metric.min_delta",
+                message: "must be a finite number",
+            });
+        }
+        if min_delta < 0.0 {
+            return Err(AppError::Validation {
+                field: "objective_metric.min_delta",
+                message: "must be non-negative",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExperimentMetricsRow {
     pub experiment_id: String,
