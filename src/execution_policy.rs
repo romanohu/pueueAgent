@@ -2164,8 +2164,9 @@ mod fix_round_tests {
     fn publication_failures_unlink_only_the_descriptor_relative_temporary() {
         let _lock = POLICY_CWD_LOCK.lock().unwrap();
         let holder = tempfile::tempdir().unwrap();
-        let state_dir = holder.path().join("state");
-        let cwd = holder.path().join("cwd");
+        let holder_path = fs::canonicalize(holder.path()).unwrap();
+        let state_dir = holder_path.join("state");
+        let cwd = holder_path.join("cwd");
         fs::create_dir(&state_dir).unwrap();
         fs::create_dir(&cwd).unwrap();
         let opened = open_path_nofollow(&state_dir).unwrap();
