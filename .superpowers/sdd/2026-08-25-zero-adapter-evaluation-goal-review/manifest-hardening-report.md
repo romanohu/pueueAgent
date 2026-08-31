@@ -14,6 +14,8 @@ DONE
 ## Commit hashes
 
 - `ea106db912c1db76f560b18e39e9c495468f3066` — `fix: harden result manifest file types`
+- `ddc00d7a2e80fac3e3c6b2c7fb641ddb5bc16606` — original report commit (`docs: record manifest hardening verification`).
+- `ef3acdccf4ebbe55ead3ae6fbe044842f1281dff` — reviewed hash-appendix commit (`docs: append manifest hardening commit hashes`).
 
 ## Files changed
 
