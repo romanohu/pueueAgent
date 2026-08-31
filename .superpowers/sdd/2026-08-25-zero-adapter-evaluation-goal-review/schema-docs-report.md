@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete. The current-v25 open path now fails closed for malformed
+Complete after the round-1 review fix. The current-v25 open path now fails closed for malformed
 `experiment_metrics` schemas, while fresh-v25, canonical-v24 migration, and
 legacy-v24 crash-window behavior remain green. The Phase 4 prose now treats a
 persisted metrics row as the only goal evidence and defers artifact-digest
@@ -12,7 +12,8 @@ evidence persistence to a future schema migration.
 
 - Branch: `codex/phase4-evaluation-goal-review`
 - Base: `0cec818e976513c63c297337f81741353f95760e`
-- Implementation head: `8aefe7f542a687e808725f4c7849662e6995b625`
+- Initial implementation head: `8aefe7f542a687e808725f4c7849662e6995b625`
+- Round-1 fix head: `24cc9780d3679782360124eabdd455648a64b945`
 
 ## Files changed
 
@@ -24,6 +25,8 @@ evidence persistence to a future schema migration.
 - `tests/integration/database.rs`
   - Added real SQLite current-v25 regressions for a changed `source` CHECK and
     a non-canonical experiment foreign-key action.
+  - Added a regression for a double quote inside the single-quoted source CHECK
+    literal.
 - `docs/superpowers/specs/2026-08-25-zero-adapter-evaluation-goal-review-design.md`
   - Restricted `goal_reached.evidence_ref` to a persisted metrics row in the
     same project/campaign lineage and documented deferred artifact-digest
@@ -59,6 +62,20 @@ test result: FAILED. 0 passed; 2 failed
 called `Result::unwrap_err()` on an `Ok` value: Db { ... }
 ```
 
+The round-1 review then added a real SQLite regression for the exact malformed
+`CHECK (source IN ('man"ifest'))` shape and ran it before the fix with:
+
+```text
+cargo test --test database current_v25_schema_rejects_a_double_quote_in_experiment_metrics_check -- --exact --test-threads=1
+```
+
+It reproduced the review finding:
+
+```text
+called `Result::unwrap_err()` on an `Ok` value: Db { ... }
+test result: FAILED. 0 passed; 1 failed
+```
+
 ## Implementation
 
 The current-v25 verifier now requires the complete canonical table SQL,
@@ -68,7 +85,9 @@ the complete ordered column/type/nullability/primary-key shape and the exact
 `experiment_id` foreign key to `experiments(experiment_id)` with `ON DELETE
 CASCADE`. The SQL compaction tolerates only SQLite's formatting differences
 between an `ALTER TABLE`-produced v25 table and the v25 rebuild used by the
-legacy crash-window migration.
+legacy crash-window migration. The round-1 fix narrows quote removal to the
+legacy rebuilt table identifier, so double quotes inside single-quoted SQL
+string literals remain significant.
 
 The verification runs in the existing `version == LATEST_SCHEMA_VERSION`
 fast path before any migration transaction, so malformed databases are
@@ -77,9 +96,9 @@ rejected without repair or version changes.
 ## GREEN verification
 
 - `cargo test --test database current_v25_schema_rejects -- --test-threads=1`
-  - 2 passed, 0 failed.
+  - 3 passed, 0 failed.
 - `cargo test --test database -- --test-threads=1`
-  - 223 passed, 0 failed.
+  - 224 passed, 0 failed.
 - `cargo test --test goal_review -- --test-threads=1`
   - 13 passed, 0 failed.
 - `cargo check --all-targets`
@@ -95,11 +114,13 @@ legacy-v24 marker migration cases in addition to the new malformed-v25 tests.
 - No schema version bump, artifact-digest schema/repository support, goal-review
   behavior change, dependency change, or unrelated cleanup was added.
 - The verifier reuses the existing canonical column and foreign-key comparison
-  helpers and rejects both listed load-bearing mutations.
+  helpers and rejects all three listed load-bearing mutations, including the
+  embedded-quote normalization bypass found in round 1.
 - Documentation changes are limited to the contradictory goal-evidence prose;
   `<digest-or-metrics-ref>` no longer appears in the design or plan.
 - The implementation commit contains only the four requested files and is
-  followed by this separate report commit.
+  followed by the separate report commit; round 1 adds only the verifier fix
+  and its focused SQLite regression.
 
 ## Concerns
 
