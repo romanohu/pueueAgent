@@ -453,7 +453,7 @@ for fixture in fake-agent capture-agent-environment codex; do
   rustc --edition=2021 --crate-name native_script_runner -O \
     -o "$WORK/bin/$fixture" "$WORK/bin/native-script-runner.$fixture.rs"
 done
-cp /usr/bin/bash /usr/bin/cat /usr/bin/sleep "$WORK/bin/"
+cp /usr/bin/bash /usr/bin/cat "$(command -v dirname)" "$(command -v mkdir)" /usr/bin/sleep "$WORK/bin/"
 cat > "$WORK/bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -466,7 +466,7 @@ case "$*" in
 esac
 exit 0
 EOF
-chmod +x "$WORK/bin/pueue" "$WORK/bin/bash" "$WORK/bin/cat" "$WORK/bin/sleep" \
+chmod +x "$WORK/bin/pueue" "$WORK/bin/bash" "$WORK/bin/cat" "$WORK/bin/dirname" "$WORK/bin/mkdir" "$WORK/bin/sleep" \
   "$WORK/bin/jq" "$WORK/bin/fake-agent" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
   "$WORK/bin/launchctl" "$WORK/bin/systemctl"
 export PATH="$WORK/bin:$PATH"
