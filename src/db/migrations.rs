@@ -1644,7 +1644,7 @@ fn compact_sql_exact(sql: &str) -> String {
 fn compact_table_sql(sql: &str) -> String {
     sql.trim()
         .trim_end_matches(';')
-        .replace('"', "")
+        .replace("\"experiment_metrics\"", "experiment_metrics")
         .replace(',', " , ")
         .replace('(', " ( ")
         .replace(')', " ) ")

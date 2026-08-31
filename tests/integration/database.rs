@@ -14263,6 +14263,33 @@ fn current_v25_schema_rejects_a_noncanonical_experiment_metrics_check() {
 }
 
 #[test]
+fn current_v25_schema_rejects_a_double_quote_in_experiment_metrics_check() {
+    let test = TestDatabase::new();
+    test.db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            r#"
+            PRAGMA writable_schema = ON;
+            UPDATE sqlite_master
+               SET sql = replace(sql, '''manifest''', '''man"ifest''')
+             WHERE type = 'table' AND name = 'experiment_metrics';
+            PRAGMA writable_schema = OFF;
+            PRAGMA user_version = 25;
+            "#,
+        )
+        .unwrap();
+
+    let error = Db::open(&test.path).unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Runtime {
+            operation: "verify SQLite v25 evaluation schema"
+        }
+    ));
+}
+
+#[test]
 fn current_v25_schema_rejects_a_noncanonical_experiment_metrics_foreign_key() {
     let test = TestDatabase::new();
     test.db
