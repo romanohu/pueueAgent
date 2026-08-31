@@ -132,7 +132,7 @@ DONE
 ### Commit hashes
 
 - `d7d7f9b352e7fa9f1fb4eb03ce7da85fa51bce9e` — implementation and regression tests (`fix: classify all rejected manifest types`).
-- Report update commit: to be recorded in the follow-up hash appendix commit.
+- `3e02af70acba72c271d24ed4528fac87b585ab84` — report update commit (`docs: record manifest hardening fix round`).
 
 ### Changes
 
