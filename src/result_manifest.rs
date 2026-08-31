@@ -73,47 +73,34 @@ fn read_manifest(path: &Path) -> Result<Option<ManifestRead>, AppError> {
 
     let file = match file_result {
         Ok(file) => file,
+        #[cfg(not(unix))]
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         #[cfg(unix)]
-        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
-            return Ok(Some(ManifestRead::Invalid))
-        }
-        #[cfg(unix)]
-        Err(source)
-            if matches!(
-                source.raw_os_error(),
-                Some(libc::EISDIR)
-                    | Some(libc::ENXIO)
-                    | Some(libc::ENODEV)
-                    | Some(libc::EOPNOTSUPP)
-                    | Some(libc::EPERM)
-            ) =>
-        {
-            // Some Unix kernels reject opening sockets and other special files
-            // before returning a descriptor. The safe open above remains the
-            // security decision; this no-follow probe only classifies that
-            // already-rejected candidate when it can prove it is non-regular.
+        Err(source) => {
+            // The safe open above remains the security decision. This
+            // no-follow probe only classifies an already-rejected candidate
+            // and never authorizes a later read.
             match std::fs::symlink_metadata(path) {
-                Ok(metadata) if !metadata.file_type().is_file() => {
-                    return Ok(Some(ManifestRead::Invalid));
+                Ok(metadata) => {
+                    let file_type = metadata.file_type();
+                    if file_type.is_symlink() || !file_type.is_file() {
+                        return Ok(Some(ManifestRead::Invalid));
+                    }
                 }
-                Ok(_) => {}
                 Err(metadata_source) if metadata_source.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(None);
                 }
-                Err(_) => {}
+                Err(_) => {
+                    return Err(AppError::Io {
+                        operation: "open result manifest",
+                        source,
+                    });
+                }
             }
             return Err(AppError::Io {
                 operation: "open result manifest",
                 source,
             });
-        }
-        #[cfg(unix)]
-        Err(source) => {
-            return Err(AppError::Io {
-                operation: "open result manifest",
-                source,
-            })
         }
         #[cfg(not(unix))]
         Err(source) => {

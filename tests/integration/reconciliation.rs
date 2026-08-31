@@ -6,7 +6,11 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{io::Write, os::unix::fs::symlink, time::Duration};
+use std::{
+    io::Write,
+    os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use clap::Parser as _;
@@ -1749,6 +1753,88 @@ async fn terminal_projection_rejects_fifo_manifest_without_blocking() {
         );
     }
     assert!(timed.is_ok(), "FIFO manifest must not block reconciliation");
+
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_value, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_projection_rejects_nonregular_manifest_when_open_denied() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    let results = harness.root().join(".pueue-agent/results");
+    fs::create_dir_all(&results).unwrap();
+    let candidate = results.join(format!("{experiment_id}.json"));
+    fs::create_dir(&candidate).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o000)).unwrap();
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_value, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_projection_rejects_active_fifo_manifest_before_reading() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    let results = harness.root().join(".pueue-agent/results");
+    fs::create_dir_all(&results).unwrap();
+    let fifo = results.join(format!("{experiment_id}.json"));
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let mut holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    holder
+        .write_all(
+            br#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42}}"#,
+        )
+        .unwrap();
+
+    let db = harness.db.clone();
+    let mut reconciliation = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                Reconciler::new(
+                    &db,
+                    FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+                )
+                .run_once_at(200),
+            )
+    });
+    let timed = tokio::time::timeout(Duration::from_secs(1), &mut reconciliation).await;
+    drop(holder);
+    let result = match timed {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => reconciliation.await.unwrap(),
+    };
+    assert!(result.is_ok(), "active FIFO reconciliation should complete");
 
     let row = harness
         .metrics_row(&experiment_id)
