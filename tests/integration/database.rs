@@ -14011,15 +14011,209 @@ fn health_repository_lifecycle_is_bounded_and_resumable() {
     ));
 }
 
+fn force_v24_metrics_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE experiment_metrics_v24_fixture (
+                experiment_id        TEXT PRIMARY KEY REFERENCES experiments(experiment_id)
+                                     ON DELETE CASCADE,
+                source               TEXT NOT NULL CHECK (source IN ('manifest')),
+                primary_metric_name  TEXT,
+                primary_metric_value REAL,
+                metrics_json         TEXT NOT NULL DEFAULT '{}',
+                artifact_defect      TEXT,
+                created_at           INTEGER NOT NULL,
+                updated_at           INTEGER NOT NULL
+            );
+            INSERT INTO experiment_metrics_v24_fixture (
+                experiment_id, source, primary_metric_name, primary_metric_value,
+                metrics_json, artifact_defect, created_at, updated_at
+            )
+            SELECT experiment_id, source, primary_metric_name, primary_metric_value,
+                   metrics_json, artifact_defect, created_at, updated_at
+            FROM experiment_metrics;
+            DROP TABLE experiment_metrics;
+            ALTER TABLE experiment_metrics_v24_fixture RENAME TO experiment_metrics;
+            PRAGMA user_version = 24;
+            "#,
+        )
+        .unwrap();
+}
+
+fn force_legacy_marker_metrics_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE experiment_metrics_legacy_fixture (
+                experiment_id        TEXT PRIMARY KEY REFERENCES experiments(experiment_id)
+                                     ON DELETE CASCADE,
+                source               TEXT NOT NULL CHECK (source IN ('manifest')),
+                primary_metric_name  TEXT,
+                primary_metric_value REAL,
+                metrics_json         TEXT NOT NULL DEFAULT '{}',
+                artifact_defect      TEXT,
+                created_at           INTEGER NOT NULL,
+                updated_at           INTEGER NOT NULL,
+                evaluated_at         INTEGER
+            );
+            INSERT INTO experiment_metrics_legacy_fixture (
+                experiment_id, source, primary_metric_name, primary_metric_value,
+                metrics_json, artifact_defect, created_at, updated_at, evaluated_at
+            )
+            SELECT experiment_id, source, primary_metric_name, primary_metric_value,
+                   metrics_json, artifact_defect, created_at, updated_at, evaluated_at
+            FROM experiment_metrics;
+            DROP TABLE experiment_metrics;
+            ALTER TABLE experiment_metrics_legacy_fixture RENAME TO experiment_metrics;
+            PRAGMA user_version = 24;
+            "#,
+        )
+        .unwrap();
+}
+
 #[test]
-fn schema_v24_adds_metrics_and_objective_columns() {
+fn canonical_v24_migrates_metrics_evaluation_marker() {
+    let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+    let follow_up = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Measure the follow-up command",
+        Some(&harness.experiment_id),
+        &["python", "follow-up.py"],
+    );
+    let follow_up = harness
+        .accept(
+            "proposal-follow-up",
+            "experiment-follow-up",
+            "submission-follow-up",
+            &follow_up,
+            &CampaignLimits::default(),
+            200,
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    let terminal_id = harness.experiment_id.clone();
+    let nonterminal_id = follow_up.experiment.experiment_id.clone();
+
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: terminal_id.clone(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(0.42),
+            metrics_json: "{\"loss\":0.42}".to_owned(),
+            artifact_defect: None,
+            created_at: 200,
+            updated_at: 201,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: nonterminal_id.clone(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(0.50),
+            metrics_json: "{\"loss\":0.50}".to_owned(),
+            artifact_defect: None,
+            created_at: 200,
+            updated_at: 202,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+
+    let path = harness.db.path().to_path_buf();
+    force_v24_metrics_schema(&harness.db.connect().unwrap());
+    let migrated = Db::open(&path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let marker: (String, i64) = connection
+        .query_row(
+            "SELECT type, \"notnull\" FROM pragma_table_info('experiment_metrics')
+             WHERE name = 'evaluated_at'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(marker, ("TEXT".to_owned(), 0));
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+    let terminal_evaluated_at: Option<String> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+            [&terminal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(terminal_evaluated_at.as_deref(), Some("201"));
+    let nonterminal_evaluated_at: Option<String> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+            [&nonterminal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(nonterminal_evaluated_at, None);
+}
+
+#[test]
+fn legacy_marker_v24_preserves_terminal_null_evaluation() {
+    let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+    let terminal_id = harness.experiment_id.clone();
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: terminal_id.clone(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(0.42),
+            metrics_json: "{\"loss\":0.42}".to_owned(),
+            artifact_defect: None,
+            created_at: 200,
+            updated_at: 201,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+
+    let path = harness.db.path().to_path_buf();
+    force_legacy_marker_metrics_schema(&harness.db.connect().unwrap());
+    let migrated = Db::open(&path).unwrap();
+    let connection = migrated.connect().unwrap();
+    let marker: (String, i64) = connection
+        .query_row(
+            "SELECT type, \"notnull\" FROM pragma_table_info('experiment_metrics')
+             WHERE name = 'evaluated_at'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(marker, ("TEXT".to_owned(), 0));
+    let evaluated_at: Option<String> = connection
+        .query_row(
+            "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+            [&terminal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(evaluated_at, None);
+}
+
+#[test]
+fn fresh_database_starts_at_schema_v25_with_nullable_evaluation_marker() {
     let temp = tempfile::tempdir().unwrap();
     let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
     let connection = db.connect().unwrap();
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     for column in ["objective_metric_json", "current_best_experiment_id", "plateau_count"] {
         let hit: i64 = connection
             .query_row(
@@ -14030,6 +14224,15 @@ fn schema_v24_adds_metrics_and_objective_columns() {
             .unwrap();
         assert_eq!(hit, 1, "{column}");
     }
+    let marker: (String, i64) = connection
+        .query_row(
+            "SELECT type, \"notnull\" FROM pragma_table_info('experiment_metrics')
+             WHERE name = 'evaluated_at'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(marker, ("TEXT".to_owned(), 0));
 }
 
 #[test]

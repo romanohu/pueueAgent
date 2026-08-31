@@ -6513,18 +6513,62 @@ pub(crate) fn insert_event_completed_in_transaction(
             ],
         )
         .map_err(database_error("insert completed event"))?;
-    let stored = transaction
+    let mut stored = transaction
         .query_row(
             &format!("{} WHERE project_id = ?1 AND dedup_key = ?2", EVENT_SELECT),
             params![event.project_id, event.dedup_key],
             event_from_row,
         )
         .map_err(database_error("read idempotent completed event"))?;
+    if stored.kind != event.kind {
+        return Err(AppError::Validation {
+            field: "event.kind",
+            message: "conflicts with the existing event kind",
+        });
+    }
     if stored.campaign_id != event.campaign_id || stored.experiment_id != event.experiment_id {
         return Err(AppError::Validation {
             field: "event.lineage",
             message: "conflicts with the existing event lineage",
         });
+    }
+    if stored.payload != event.payload {
+        return Err(AppError::Validation {
+            field: "event.payload",
+            message: "conflicts with the existing event payload",
+        });
+    }
+    match stored.status {
+        EventStatus::Completed => {}
+        EventStatus::Pending => {
+            let changed = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'completed', lease_until = NULL,
+                         completed_at = ?1, last_error = NULL
+                     WHERE event_id = ?2 AND status = 'pending'",
+                    params![event.created_at, stored.event_id],
+                )
+                .map_err(database_error("complete legacy promotion event"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "complete legacy promotion event",
+                });
+            }
+            stored = transaction
+                .query_row(
+                    &format!("{} WHERE project_id = ?1 AND dedup_key = ?2", EVENT_SELECT),
+                    params![event.project_id, event.dedup_key],
+                    event_from_row,
+                )
+                .map_err(database_error("read completed legacy promotion event"))?;
+        }
+        _ => {
+            return Err(AppError::Validation {
+                field: "event.status",
+                message: "conflicts with the existing event status",
+            });
+        }
     }
     Ok((stored, inserted == 1))
 }

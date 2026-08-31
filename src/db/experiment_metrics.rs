@@ -12,6 +12,8 @@ const EXPERIMENT_METRICS_SELECT: &str = "SELECT
 pub struct MetricsRepository;
 
 impl MetricsRepository {
+    /// Simple upsert for general metrics writes. The terminal-ingestion path
+    /// uses `insert_terminal_classification` when evidence must be frozen.
     pub fn upsert(db: &Db, row: &ExperimentMetricsRow) -> Result<(), AppError> {
         let connection = db.connect()?;
         connection
@@ -44,16 +46,30 @@ impl MetricsRepository {
         Ok(())
     }
 
-    /// Insert a frozen row only if absent; never overwrites existing evidence.
-    pub fn insert_frozen(db: &Db, row: &ExperimentMetricsRow) -> Result<bool, AppError> {
+    /// Insert a terminal classification row, replacing only a prior retryable
+    /// result I/O marker. Once a valid, missing, or invalid classification is
+    /// stored, later ingestion attempts cannot overwrite its evidence.
+    pub fn insert_terminal_classification(
+        db: &Db,
+        row: &ExperimentMetricsRow,
+    ) -> Result<(), AppError> {
         let connection = db.connect()?;
-        let inserted = connection
+        connection
             .execute(
                 "INSERT INTO experiment_metrics (
                     experiment_id, source, primary_metric_name, primary_metric_value,
                     metrics_json, artifact_defect, created_at, updated_at, evaluated_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(experiment_id) DO NOTHING",
+                 ON CONFLICT(experiment_id) DO UPDATE SET
+                    source = excluded.source,
+                    primary_metric_name = excluded.primary_metric_name,
+                    primary_metric_value = excluded.primary_metric_value,
+                    metrics_json = excluded.metrics_json,
+                    artifact_defect = excluded.artifact_defect,
+                    updated_at = excluded.updated_at,
+                    evaluated_at = COALESCE(experiment_metrics.evaluated_at, excluded.evaluated_at)
+                 WHERE experiment_metrics.evaluated_at IS NULL
+                   AND experiment_metrics.artifact_defect = 'result_io_error'",
                 params![
                     row.experiment_id,
                     row.source,
@@ -66,8 +82,8 @@ impl MetricsRepository {
                     row.evaluated_at,
                 ],
             )
-            .map_err(database_error("insert frozen experiment metrics row"))?;
-        Ok(inserted == 1)
+            .map_err(database_error("insert terminal classification"))?;
+        Ok(())
     }
 
     pub fn get(

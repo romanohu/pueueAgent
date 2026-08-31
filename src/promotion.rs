@@ -5,7 +5,7 @@
 //! exists) inside a single IMMEDIATE transaction that also owns the
 //! `current_best_experiment_id` update and the plateau counter transition.
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
 
 use crate::{
@@ -87,11 +87,13 @@ fn evaluate_in_transaction(
         })?;
 
     // Fail-closed: require metrics row before any state mutations.
-    // If metrics row is missing, settle the evaluated marker but change no state/plateau.
+    // If metrics row is missing, return error without any mutation or evaluated_at marking.
     let metrics_exists = metrics_row_exists(connection, experiment_id)?;
     if !metrics_exists {
-        mark_evaluated(connection, experiment_id, now)?;
-        return Ok(PromotionOutcome::SkippedNoMetric);
+        return Err(AppError::Validation {
+            field: "experiment_id",
+            message: "missing experiment_metrics row; evaluation aborted",
+        });
     }
 
     // Check if already evaluated - idempotent re-evaluation.
@@ -398,13 +400,19 @@ fn mark_evaluated(
     now: i64,
 ) -> Result<(), AppError> {
     let now_text = now.to_string();
-    connection
+    let affected = connection
         .execute(
             "UPDATE experiment_metrics SET evaluated_at = ?1, updated_at = ?1
               WHERE experiment_id = ?2 AND evaluated_at IS NULL",
             rusqlite::params![now_text, experiment_id],
         )
         .map_err(database_error("mark experiment evaluated"))?;
+    if affected != 1 {
+        return Err(AppError::Validation {
+            field: "experiment_id",
+            message: "mark_evaluated expected exactly one affected row",
+        });
+    }
     Ok(())
 }
 
@@ -493,29 +501,5 @@ fn primary_metric_value(
         .optional()
         .map_err(database_error("read experiment primary metric"))?
         .flatten())
-}
-
-fn ensure_metrics_row_with_evaluated(
-    connection: &Connection,
-    experiment_id: &str,
-    now: i64,
-) -> Result<(), AppError> {
-    // Insert a minimal metrics row with evaluated_at set to settle the marker.
-    // This handles the fail-closed case where evaluation runs but no metrics row exists.
-    let now_text = now.to_string();
-    connection
-        .execute(
-            "INSERT INTO experiment_metrics (
-                experiment_id, source, primary_metric_name, primary_metric_value,
-                metrics_json, artifact_defect, created_at, updated_at, evaluated_at
-             ) VALUES (?1, 'manifest', NULL, NULL, '{}', 'evaluation_missing_row', ?2, ?2, ?3)
-             ON CONFLICT(experiment_id) DO UPDATE SET
-                evaluated_at = COALESCE(experiment_metrics.evaluated_at, excluded.evaluated_at),
-                updated_at = ?2
-             WHERE experiment_metrics.evaluated_at IS NULL",
-            rusqlite::params![experiment_id, now, now_text],
-        )
-        .map_err(database_error("ensure metrics row with evaluated marker"))?;
-    Ok(())
 }
 

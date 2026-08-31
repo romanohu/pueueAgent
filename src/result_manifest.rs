@@ -128,10 +128,9 @@ fn defect_row(experiment_id: &str, defect: &'static str, now: i64) -> Experiment
 /// validated metrics or a bounded artifact defect row. Idempotent per
 /// experiment via the primary key on `experiment_metrics`.
 ///
-/// On failure a best-effort bounded defect row is still persisted before the
-/// error propagates, so a transient IO or database problem can never leave the
-/// experiment without any durable metrics row; the upsert keeps later retries
-/// authoritative.
+/// On I/O failure, persist a retryable result_io_error marker and return the
+/// original error so the experiment remains accepted and retryable. Other
+/// errors are returned without creating a retry marker.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest(
     db: &Db,
@@ -152,10 +151,17 @@ pub fn ingest(
         now,
     ) {
         Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = MetricsRepository::upsert(db, &defect_row(experiment_id, "result_invalid", now));
+        Err(error @ AppError::Io { .. }) => {
+            // A read/open failure is retryable while the experiment remains
+            // nonterminal. The terminal-classification insert cannot overwrite
+            // an already-frozen result row.
+            MetricsRepository::insert_terminal_classification(
+                db,
+                &defect_row(experiment_id, "result_io_error", now),
+            )?;
             Err(error)
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -176,7 +182,7 @@ fn ingest_inner(
             break;
         }
     }
-let row = match outcome {
+    let row = match outcome {
         None => defect_row(experiment_id, "result_missing", now),
         Some(ManifestOutcome::Invalid) => defect_row(experiment_id, "result_invalid", now),
         Some(ManifestOutcome::Valid {
@@ -195,15 +201,9 @@ let row = match outcome {
             evaluated_at: None,
         },
     };
-    // Freeze first terminal evidence on first successful valid ingestion.
-    // Defect rows (result_missing/result_invalid) are NOT frozen so that
-    // recovery from transient I/O errors can overwrite them on retry.
-    let should_freeze = row.artifact_defect.is_none();
-    if should_freeze {
-        let _ = MetricsRepository::insert_frozen(db, &row)?;
-    } else {
-        MetricsRepository::upsert(db, &row)?;
-    }
+    // Freeze the first terminal classification and allow recovery only from a
+    // prior retryable result_io_error marker.
+    MetricsRepository::insert_terminal_classification(db, &row)?;
     Ok(())
 }
 

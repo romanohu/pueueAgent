@@ -147,16 +147,22 @@ where
                         self.db,
                         &experiment.campaign_id,
                     )?;
-                    if let Some(objective) = objective.as_ref() {
-                        crate::result_manifest::ingest(
-                            self.db,
-                            std::path::Path::new(&project.root_path),
-                            &project.project_id,
-                            &experiment.experiment_id,
-                            task.id,
-                            Some(objective),
-                            now,
-                        )?;
+                    let has_frozen_terminal_evidence = matches!(
+                        experiment.status,
+                        ExperimentStatus::Succeeded | ExperimentStatus::Failed | ExperimentStatus::Cancelled
+                    ) && crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?.is_some();
+                    if !has_frozen_terminal_evidence {
+                        if let Some(objective) = objective.as_ref() {
+                            crate::result_manifest::ingest(
+                                self.db,
+                                std::path::Path::new(&project.root_path),
+                                &project.project_id,
+                                &experiment.experiment_id,
+                                task.id,
+                                Some(objective),
+                                now,
+                            )?;
+                        }
                     }
                     let projected_status = project_terminal_experiment(
                         self.db,
@@ -171,7 +177,7 @@ where
                     // evaluated_at marker; retries evaluate whenever that
                     // marker is absent, even if finished_at is already set.
                     if objective.is_some() {
-let needs_evaluation =
+                        let needs_evaluation =
                             crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?
                                 .as_ref()
                                 .and_then(|row| row.evaluated_at.clone())

@@ -1868,7 +1868,7 @@ async fn terminal_ingest_io_failure_recovers_on_the_next_cycle() {
     let row = harness
         .metrics_row(&experiment_id)
         .expect("durable defect marker row");
-    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_io_error"));
 
     // The terminal projection must not have consumed the accepted identity:
     // the next reconcile pass has to be able to retry the ingestion.
@@ -1911,4 +1911,69 @@ async fn terminal_ingest_io_failure_recovers_on_the_next_cycle() {
             .status,
         ExperimentStatus::Succeeded
     );
+}
+
+#[tokio::test]
+async fn terminal_evidence_is_frozen_across_projection_evaluation_crash() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42}}"#,
+    );
+    pueue_agent::result_manifest::ingest(
+        &harness.db,
+        &harness.root(),
+        "project-a",
+        &experiment_id,
+        41,
+        Some(&objective_metric()),
+        200,
+    )
+    .unwrap();
+
+    // Simulate a crash after terminal projection but before evaluation by using
+    // the real repository transition, which also consumes the reservation.
+    ExperimentRepository::new(&harness.db)
+        .project_terminal_submission(
+            &experiment_id,
+            41,
+            pueue_agent::models::ExperimentTerminalOutcome::Succeeded,
+            200,
+        )
+        .unwrap();
+    let before_row = harness.metrics_row(&experiment_id).expect("metrics row");
+    assert_eq!(before_row.primary_metric_value, Some(0.42));
+    assert_eq!(before_row.evaluated_at, None);
+
+    // A later manifest mutation must not overwrite the frozen evidence.
+    harness.write_result_manifest(
+        &experiment_id,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":9.0}}"#,
+    );
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(201)
+    .await
+    .unwrap();
+
+    let after_row = harness.metrics_row(&experiment_id).expect("recovered metrics row");
+    assert_eq!(after_row.primary_metric_value, Some(0.42));
+    assert!(after_row.evaluated_at.is_some());
+    let (best, plateau): (Option<String>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT current_best_experiment_id, plateau_count FROM campaigns
+             WHERE campaign_id = 'campaign-reconciliation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(best.as_deref(), Some(experiment_id.as_str()));
+    assert_eq!(plateau, 0);
 }
