@@ -5,6 +5,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(unix)]
+use std::{io::Write, os::unix::fs::symlink, time::Duration};
+
 use async_trait::async_trait;
 use clap::Parser as _;
 use pueue_agent::{
@@ -1668,6 +1671,91 @@ async fn terminal_projection_ingests_manifest_metrics() {
     assert_eq!(row.primary_metric_value, Some(0.42));
     let metrics: serde_json::Value = serde_json::from_str(&row.metrics_json).unwrap();
     assert_eq!(metrics["accuracy"], json!(0.9));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_projection_rejects_symlink_manifest() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    let results = harness.root().join(".pueue-agent/results");
+    fs::create_dir_all(&results).unwrap();
+    let target = harness._temp.path().join("valid-result.json");
+    fs::write(
+        &target,
+        r#"{"schema_version":1,"experiment_id":"campaign-experiment-baseline","metrics":{"loss":0.42}}"#,
+    )
+    .unwrap();
+    symlink(&target, results.join(format!("{experiment_id}.json"))).unwrap();
+
+    Reconciler::new(
+        &harness.db,
+        FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+    )
+    .run_once_at(200)
+    .await
+    .unwrap();
+
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_value, None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_projection_rejects_fifo_manifest_without_blocking() {
+    let harness = Harness::new();
+    let experiment_id =
+        harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
+    let results = harness.root().join(".pueue-agent/results");
+    fs::create_dir_all(&results).unwrap();
+    let fifo = results.join(format!("{experiment_id}.json"));
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+    let db = harness.db.clone();
+    let mut reconciliation = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                Reconciler::new(
+                    &db,
+                    FakePueue::with_tasks(vec![terminal_task(41, "100", json!("Success"))]),
+                )
+                .run_once_at(200),
+            )
+    });
+    let timed = tokio::time::timeout(Duration::from_millis(250), &mut reconciliation).await;
+    if timed.is_err() {
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .unwrap();
+            file.write_all(b"{}").unwrap();
+        });
+        let cleanup_result = reconciliation.await.unwrap();
+        writer.join().unwrap();
+        assert!(
+            cleanup_result.is_ok(),
+            "FIFO cleanup should release reconciliation"
+        );
+    }
+    assert!(timed.is_ok(), "FIFO manifest must not block reconciliation");
+
+    let row = harness
+        .metrics_row(&experiment_id)
+        .expect("defect metrics row");
+    assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(row.metrics_json, "{}");
+    assert_eq!(row.primary_metric_value, None);
 }
 
 #[tokio::test]

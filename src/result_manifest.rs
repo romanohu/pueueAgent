@@ -8,10 +8,12 @@
 
 use std::{
     collections::BTreeMap,
-    fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
+
+#[cfg(not(unix))]
+use std::fs::File;
 
 use rusqlite::OptionalExtension;
 use serde_json::Value;
@@ -50,10 +52,70 @@ enum ManifestOutcome {
     },
 }
 
-fn read_manifest(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
-    let file = match File::open(path) {
+enum ManifestRead {
+    Invalid,
+    Bytes(Vec<u8>),
+}
+
+fn read_manifest(path: &Path) -> Result<Option<ManifestRead>, AppError> {
+    #[cfg(unix)]
+    let file_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+    };
+
+    #[cfg(not(unix))]
+    let file_result = File::open(path);
+
+    let file = match file_result {
         Ok(file) => file,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(source) if source.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(Some(ManifestRead::Invalid))
+        }
+        #[cfg(unix)]
+        Err(source)
+            if matches!(
+                source.raw_os_error(),
+                Some(libc::EISDIR)
+                    | Some(libc::ENXIO)
+                    | Some(libc::ENODEV)
+                    | Some(libc::EOPNOTSUPP)
+                    | Some(libc::EPERM)
+            ) =>
+        {
+            // Some Unix kernels reject opening sockets and other special files
+            // before returning a descriptor. The safe open above remains the
+            // security decision; this no-follow probe only classifies that
+            // already-rejected candidate when it can prove it is non-regular.
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Ok(Some(ManifestRead::Invalid));
+                }
+                Ok(_) => {}
+                Err(metadata_source) if metadata_source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(_) => {}
+            }
+            return Err(AppError::Io {
+                operation: "open result manifest",
+                source,
+            });
+        }
+        #[cfg(unix)]
+        Err(source) => {
+            return Err(AppError::Io {
+                operation: "open result manifest",
+                source,
+            })
+        }
+        #[cfg(not(unix))]
         Err(source) => {
             return Err(AppError::Io {
                 operation: "open result manifest",
@@ -61,6 +123,17 @@ fn read_manifest(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
             })
         }
     };
+    if !file
+        .metadata()
+        .map_err(|source| AppError::Io {
+            operation: "read result manifest metadata",
+            source,
+        })?
+        .file_type()
+        .is_file()
+    {
+        return Ok(Some(ManifestRead::Invalid));
+    }
     let mut bytes = Vec::with_capacity(MAX_RESULT_MANIFEST_BYTES + 1);
     file.take((MAX_RESULT_MANIFEST_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -68,7 +141,7 @@ fn read_manifest(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
             operation: "read result manifest",
             source,
         })?;
-    Ok(Some(bytes))
+    Ok(Some(ManifestRead::Bytes(bytes)))
 }
 
 fn classify_manifest(bytes: &[u8], experiment_id: &str) -> Result<ManifestOutcome, AppError> {
@@ -177,9 +250,16 @@ fn ingest_inner(
 ) -> Result<(), AppError> {
     let mut outcome = None;
     for path in result_path_candidates(project_root, experiment_id, pueue_task_id) {
-        if let Some(bytes) = read_manifest(&path)? {
-            outcome = Some(classify_manifest(&bytes, experiment_id)?);
-            break;
+        match read_manifest(&path)? {
+            None => {}
+            Some(ManifestRead::Invalid) => {
+                outcome = Some(ManifestOutcome::Invalid);
+                break;
+            }
+            Some(ManifestRead::Bytes(bytes)) => {
+                outcome = Some(classify_manifest(&bytes, experiment_id)?);
+                break;
+            }
         }
     }
     let row = match outcome {
