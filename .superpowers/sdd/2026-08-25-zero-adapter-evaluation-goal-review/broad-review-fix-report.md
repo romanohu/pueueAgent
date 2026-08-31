@@ -143,3 +143,40 @@ against the pre-fix implementation:
   path. The initial parallel run also had two additional timing/process-fixture
   failures; those passed in the isolated rerun.
 - No merge, push, or roko access was performed.
+
+## Follow-up harness fix
+
+The Linux roko E2E failure exposed after the broad-review wave was isolated to
+the manifest fixture's reduced `PATH`: `train_metrics.sh` invokes `dirname`
+and `mkdir`, while `rust_supervisor.sh` copied only `bash`, `cat`, and `sleep`
+into `$WORK/bin`. The harness-only fix is committed as:
+
+- `187de34` — `fix: include manifest script utilities in e2e path`
+
+### RED evidence
+
+The exact isolated-path reproduction, before the fix, was:
+
+```text
+tests/e2e/fake_experiments/train_metrics.sh: line 8: dirname: command not found
+tests/e2e/fake_experiments/train_metrics.sh: line 8: mkdir: command not found
+isolated_status=127
+```
+
+This is the same exit-127 break reported by the roko E2E task and names the
+missing harness utilities rather than a production manifest or promotion
+failure.
+
+### GREEN evidence
+
+After the two-line harness change, the focused fixture ran with an isolated
+`PATH` containing only the required utilities and produced:
+
+```text
+step 1 loss 0.42
+final loss 0.42
+result={"schema_version":1,"experiment_id":"exp-green","metrics":{"loss":0.42,"accuracy":0.91}}
+```
+
+`bash -n tests/e2e/rust_supervisor.sh` and `git diff --check` both passed.
+The full Linux/roko E2E was not rerun from this local macOS environment.
