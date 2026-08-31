@@ -170,7 +170,10 @@ async fn terminal_projection_ingests_manifest_metrics() { ... }
 - Test: `tests/integration/goal_review.rs` (new)
 
 **Interfaces:**
-- Decision output adds `"decision":"goal_reached","evidence_ref":"<digest-or-metrics-ref>"`; validator requires referenced row exists.
+- Decision output adds a `goal_reached` decision with `evidence_ref` naming the
+  experiment; the validator requires it to identify a persisted
+  `experiment_metrics` row for the same project/campaign lineage. Artifact-digest
+  evidence persistence is deferred to a future schema migration.
 - On apply: campaign → `goal_reached_pending_review`, decision event Completed, further claims for that campaign suppressed.
 - CLI: accept → retired(`goal_accepted`) in same tx as operator-log entry; reject → active + claiming decision dead-lettered(`goal_claim_rejected`).
 

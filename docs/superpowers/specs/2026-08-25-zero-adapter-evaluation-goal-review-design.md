@@ -107,8 +107,9 @@ a declared metric:
 ## 6. Goal review
 
 - `DecisionKind::GoalReached { evidence_ref }` joins Proposal | Wait. The
-  decision validator requires `evidence_ref` to reference a stored artifact
-  digest or metrics row.
+  decision validator requires `evidence_ref` to identify a persisted
+  `experiment_metrics` row for the same project/campaign lineage. Artifact-digest
+  evidence persistence is deferred to a future schema migration.
 - Accepted parse transitions the campaign to
   `goal_reached_pending_review`, stops further scheduling for that campaign,
   and stores the claim.

@@ -295,6 +295,20 @@ const EXPERIMENT_METRICS_V24_TABLE_SQL: &str = r#"
 "#;
 const EXPERIMENT_METRICS_V25_EVALUATED_AT_COLUMN_SQL: &str =
     "ALTER TABLE experiment_metrics ADD COLUMN evaluated_at TEXT NULL;";
+const EXPERIMENT_METRICS_V25_TABLE_SQL: &str = r#"
+    CREATE TABLE experiment_metrics (
+        experiment_id        TEXT PRIMARY KEY REFERENCES experiments(experiment_id)
+                             ON DELETE CASCADE,
+        source               TEXT NOT NULL CHECK (source IN ('manifest')),
+        primary_metric_name  TEXT,
+        primary_metric_value REAL,
+        metrics_json         TEXT NOT NULL DEFAULT '{}',
+        artifact_defect      TEXT,
+        created_at           INTEGER NOT NULL,
+        updated_at           INTEGER NOT NULL,
+        evaluated_at         TEXT NULL
+    );
+"#;
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -1627,6 +1641,18 @@ fn compact_sql_exact(sql: &str) -> String {
         .to_owned()
 }
 
+fn compact_table_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .replace('"', "")
+        .replace(',', " , ")
+        .replace('(', " ( ")
+        .replace(')', " ) ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn migrate_campaign_schema_to_v16(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<(), AppError> {
@@ -2433,6 +2459,11 @@ fn verify_evaluation_schema_v25(connection: &Connection) -> Result<(), AppError>
         .map_err(database_error("verify SQLite v25 evaluation schema"))?;
     if found == 5 {
         verify_evaluation_schema_v24(connection)?;
+        if !experiment_metrics_schema_v25_is_canonical(connection).unwrap_or(false) {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite v25 evaluation schema",
+            });
+        }
         let bad: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM experiment_metrics em
@@ -2454,6 +2485,49 @@ fn verify_evaluation_schema_v25(connection: &Connection) -> Result<(), AppError>
             operation: "verify SQLite v25 evaluation schema",
         })
     }
+}
+
+fn experiment_metrics_schema_v25_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+    let actual_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'experiment_metrics'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !actual_sql.as_deref().is_some_and(|sql| {
+        compact_table_sql(sql) == compact_table_sql(EXPERIMENT_METRICS_V25_TABLE_SQL)
+    }) {
+        return Ok(false);
+    }
+    if !campaign_table_info_matches(
+        connection,
+        "experiment_metrics",
+        &[
+            ("experiment_id", "TEXT", 0, 1),
+            ("source", "TEXT", 1, 0),
+            ("primary_metric_name", "TEXT", 0, 0),
+            ("primary_metric_value", "REAL", 0, 0),
+            ("metrics_json", "TEXT", 1, 0),
+            ("artifact_defect", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("evaluated_at", "TEXT", 0, 0),
+        ],
+    )? {
+        return Ok(false);
+    }
+    campaign_foreign_keys_match(
+        connection,
+        "experiment_metrics",
+        &[(
+            "experiments",
+            "experiment_id",
+            "experiment_id",
+            "CASCADE",
+        )],
+    )
 }
 
 fn verify_evaluation_schema_v24(connection: &Connection) -> Result<(), AppError> {

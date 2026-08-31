@@ -14236,6 +14236,64 @@ fn fresh_database_starts_at_schema_v25_with_nullable_evaluation_marker() {
 }
 
 #[test]
+fn current_v25_schema_rejects_a_noncanonical_experiment_metrics_check() {
+    let test = TestDatabase::new();
+    test.db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            r#"
+            PRAGMA writable_schema = ON;
+            UPDATE sqlite_master
+               SET sql = replace(sql, '''manifest''', '''other''')
+             WHERE type = 'table' AND name = 'experiment_metrics';
+            PRAGMA writable_schema = OFF;
+            PRAGMA user_version = 25;
+            "#,
+        )
+        .unwrap();
+
+    let error = Db::open(&test.path).unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Runtime {
+            operation: "verify SQLite v25 evaluation schema"
+        }
+    ));
+}
+
+#[test]
+fn current_v25_schema_rejects_a_noncanonical_experiment_metrics_foreign_key() {
+    let test = TestDatabase::new();
+    test.db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            r#"
+            PRAGMA writable_schema = ON;
+            UPDATE sqlite_master
+               SET sql = replace(
+                   sql,
+                   'ON DELETE CASCADE',
+                   'ON DELETE RESTRICT'
+               )
+             WHERE type = 'table' AND name = 'experiment_metrics';
+            PRAGMA writable_schema = OFF;
+            PRAGMA user_version = 25;
+            "#,
+        )
+        .unwrap();
+
+    let error = Db::open(&test.path).unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Runtime {
+            operation: "verify SQLite v25 evaluation schema"
+        }
+    ));
+}
+
+#[test]
 fn metrics_repository_upsert_updates_single_row_and_get_missing_returns_none() {
     let harness = CampaignDbHarness::with_experiment(ExperimentStatus::Accepted);
     let experiment_id = &harness.experiment_id;
