@@ -2022,8 +2022,11 @@ mod tests {
             run_pinned_git(&anchor, temporary.path(), &["rev-parse", "HEAD"]),
         )
         .await
-        .expect("pinned Git must remain bounded")
-        .expect_err("the fixture must exceed the bounded stderr limit");
+        .expect("pinned Git must remain bounded");
+        let result = match result {
+            Ok(_) => panic!("the fixture must exceed the bounded stderr limit"),
+            Err(error) => error,
+        };
         assert!(matches!(result, AppError::Validation { field: "git.output", .. }));
 
         let descendant = std::fs::read_to_string(temporary.path().join("descendant.pid"))

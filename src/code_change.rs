@@ -5743,7 +5743,7 @@ fn restore_quarantined_entry(parent: &File, quarantine: &OsStr, original: &OsStr
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn secure_owned_directory_mode(mode: u32) -> bool {
     mode & 0o077 == 0
 }
