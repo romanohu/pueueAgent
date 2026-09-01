@@ -806,9 +806,17 @@ struct GitDirectoryProof {
 #[cfg(unix)]
 #[derive(Clone)]
 #[derive(Copy)]
+enum GitPointerTarget {
+    Directory,
+    File,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+#[derive(Copy)]
 enum GitPointerKind {
     GitDir,
-    Path,
+    Path(GitPointerTarget),
 }
 
 #[cfg(unix)]
@@ -990,7 +998,7 @@ impl GitRepositoryProof {
                 let file = open_git_file(
                     &commondir_path,
                     Some(&admin_path),
-                    Some(GitPointerKind::Path),
+                    Some(GitPointerKind::Path(GitPointerTarget::Directory)),
                 )?;
                 Some(file)
             }
@@ -1017,7 +1025,7 @@ impl GitRepositoryProof {
                 Some(open_git_file(
                     &admin_gitdir_path,
                     Some(&admin_path),
-                    Some(GitPointerKind::Path),
+                    Some(GitPointerKind::Path(GitPointerTarget::File)),
                 )?)
             }
             Ok(_) => {
@@ -2063,7 +2071,11 @@ impl WorktreeManager {
             else {
                 continue;
             };
-            let target = parse_git_pointer(&gitdir, &descriptor_path(&admin), GitPointerKind::Path)?;
+            let target = parse_git_pointer(
+                &gitdir,
+                &descriptor_path(&admin),
+                GitPointerKind::Path(GitPointerTarget::File),
+            )?;
             if target == self.worktree_path.join(".git") {
                 return Ok(true);
             }
@@ -4055,18 +4067,20 @@ fn parse_git_pointer(
             "Git metadata pointer must contain one line",
         ));
     }
-    let value = match kind {
-        GitPointerKind::GitDir => text
-            .strip_prefix("gitdir:")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                validation(
-                    "git.metadata",
-                    "Git worktree metadata must identify a Git directory",
-                )
-            })?,
-        GitPointerKind::Path => text.trim(),
+    let (value, target) = match kind {
+        GitPointerKind::GitDir => (
+            text.strip_prefix("gitdir:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    validation(
+                        "git.metadata",
+                        "Git worktree metadata must identify a Git directory",
+                    )
+                })?,
+            GitPointerTarget::Directory,
+        ),
+        GitPointerKind::Path(target) => (text.trim(), target),
     };
     if value.is_empty() {
         return Err(validation(
@@ -4085,7 +4099,11 @@ fn parse_git_pointer(
     }
     let canonical = fs::canonicalize(&path).map_err(|_| recovery_required())?;
     let metadata = fs::symlink_metadata(&canonical).map_err(|_| recovery_required())?;
-    if !metadata.is_dir() {
+    let valid_target = match target {
+        GitPointerTarget::Directory => metadata.is_dir(),
+        GitPointerTarget::File => metadata.is_file(),
+    };
+    if !valid_target {
         return Err(recovery_required());
     }
     Ok(canonical)
@@ -6025,6 +6043,53 @@ mod tests {
             "campaign/campaign-1/candidate/proposal-1"
         );
         assert_eq!(best_ref("campaign-1").unwrap(), "campaign/campaign-1/best");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_pointer_target_types_are_enforced() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("admin");
+        fs::create_dir(&directory).unwrap();
+        let file = root.path().join("candidate.git");
+        fs::write(&file, b"gitdir\n").unwrap();
+
+        assert!(parse_git_pointer(
+            b"admin\n",
+            root.path(),
+            GitPointerKind::Path(GitPointerTarget::Directory),
+        )
+        .is_ok());
+        assert!(parse_git_pointer(
+            b"candidate.git\n",
+            root.path(),
+            GitPointerKind::Path(GitPointerTarget::Directory),
+        )
+        .is_err());
+        assert!(parse_git_pointer(
+            b"admin\n",
+            root.path(),
+            GitPointerKind::Path(GitPointerTarget::File),
+        )
+        .is_err());
+        assert!(parse_git_pointer(
+            b"candidate.git\n",
+            root.path(),
+            GitPointerKind::Path(GitPointerTarget::File),
+        )
+        .is_ok());
+        assert!(parse_git_pointer(
+            b"gitdir: admin\n",
+            root.path(),
+            GitPointerKind::GitDir,
+        )
+        .is_ok());
+        assert!(parse_git_pointer(
+            b"gitdir: candidate.git\n",
+            root.path(),
+            GitPointerKind::GitDir,
+        )
+        .is_err());
     }
 
     #[test]
