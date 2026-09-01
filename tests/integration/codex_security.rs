@@ -1842,6 +1842,7 @@ impl Harness {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
             for directory in [
                 root.clone(),
                 other.clone(),
