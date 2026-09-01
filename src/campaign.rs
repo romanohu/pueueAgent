@@ -648,21 +648,17 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         let Ok(best) = code_change::best_ref(campaign_id) else {
             return CodeChangeBaseResolution::Unavailable;
         };
-        let best_presence =
-            run_pinned_git(anchor, project_root, &["rev-parse", "--verify", "--quiet", &best])
-                .await;
-        let best_present = match best_presence {
-            Ok(output) if output.status.success() => true,
-            Ok(_) => {
-                match git_ref_path_present(anchor, project_root, &best).await {
-                    Ok(present) => present,
-                    Err(_) => return CodeChangeBaseResolution::Unavailable,
-                }
-            }
+        let best_reference = format!("refs/heads/{best}");
+        let best_presence = match classify_exact_git_ref(anchor, project_root, &best_reference).await
+        {
+            Ok(value) => value,
             Err(_) => return CodeChangeBaseResolution::Unavailable,
         };
-        let best_revision = format!("{best}^{{commit}}");
-        if best_present {
+        if best_presence == GitRefPresence::Invalid {
+            return CodeChangeBaseResolution::InvalidBest;
+        }
+        let best_revision = format!("{best_reference}^{{commit}}");
+        if best_presence == GitRefPresence::Present {
             match run_pinned_git(
                 anchor,
                 project_root,
@@ -924,44 +920,331 @@ struct PinnedGitOutput {
     stdout: Vec<u8>,
 }
 
-async fn git_ref_path_present(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitRefPresence {
+    Present,
+    Absent,
+    Invalid,
+}
+
+fn read_bounded_git_file(path: &Path) -> Result<Vec<u8>, AppError> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|_| AppError::Runtime {
+        operation: "read local Git metadata",
+    })?;
+    let mut bytes = Vec::new();
+    file.take((MAX_GIT_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::Runtime {
+            operation: "read local Git metadata",
+        })?;
+    if bytes.len() > MAX_GIT_OUTPUT_BYTES {
+        return Err(AppError::Validation {
+            field: "git.metadata",
+            message: "exceeds the bounded Git metadata size",
+        });
+    }
+    Ok(bytes)
+}
+
+fn local_git_dir(project_root: &Path) -> Result<Option<std::path::PathBuf>, AppError> {
+    let dot_git = project_root.join(".git");
+    let metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(AppError::Runtime {
+                operation: "inspect local Git metadata",
+            })
+        }
+    };
+    if metadata.is_dir() {
+        return Ok(Some(dot_git));
+    }
+    if !metadata.is_file() {
+        return Err(AppError::Validation {
+            field: "git.metadata",
+            message: "local Git metadata must be a regular directory or worktree file",
+        });
+    }
+    let contents = read_bounded_git_file(&dot_git)?;
+    let contents = std::str::from_utf8(&contents).map_err(|_| AppError::Validation {
+        field: "git.metadata",
+        message: "local Git metadata must be valid UTF-8",
+    })?;
+    let gitdir = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains('\0'))
+        .ok_or(AppError::Validation {
+            field: "git.metadata",
+            message: "worktree Git metadata must identify a Git directory",
+        })?;
+    let gitdir = Path::new(gitdir);
+    Ok(Some(if gitdir.is_absolute() {
+        gitdir.to_owned()
+    } else {
+        project_root.join(gitdir)
+    }))
+}
+
+fn validate_local_git_config_file(path: &Path) -> Result<(), AppError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| AppError::Runtime {
+        operation: "inspect local Git configuration",
+    })?;
+    if !metadata.is_file() {
+        return Err(AppError::Validation {
+            field: "git.config",
+            message: "local Git configuration must be a regular file",
+        });
+    }
+    let contents = read_bounded_git_file(path)?;
+    let contents = std::str::from_utf8(&contents).map_err(|_| AppError::Validation {
+        field: "git.config",
+        message: "local Git configuration must be valid UTF-8",
+    })?;
+    let mut section = String::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let Some(end) = header.find(']') else {
+                return Err(AppError::Validation {
+                    field: "git.config",
+                    message: "local Git configuration has an invalid section",
+                });
+            };
+            if !header[end + 1..].trim().is_empty() {
+                return Err(AppError::Validation {
+                    field: "git.config",
+                    message: "local Git configuration has trailing section data",
+                });
+            }
+            section = header[..end]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(section.as_str(), "filter" | "include" | "includeif") {
+                return Err(AppError::Validation {
+                    field: "git.config",
+                    message: "local Git configuration contains an execution channel",
+                });
+            }
+            continue;
+        }
+        let key = line
+            .split(['=', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if key.is_empty() {
+            return Err(AppError::Validation {
+                field: "git.config",
+                message: "local Git configuration has an invalid key",
+            });
+        }
+        let full_key = if section.is_empty() {
+            key.clone()
+        } else {
+            format!("{section}.{key}")
+        };
+        if section == "filter"
+            || key.starts_with("filter.")
+            || full_key == "core.worktree"
+            || full_key == "include.path"
+            || full_key == "includeif.path"
+        {
+            return Err(AppError::Validation {
+                field: "git.config",
+                message: "local Git configuration contains an execution or path channel",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_git_config(project_root: &Path) -> Result<(), AppError> {
+    let Some(gitdir) = local_git_dir(project_root)? else {
+        return Ok(());
+    };
+    let mut gitdirs = vec![gitdir.clone()];
+    let commondir = gitdir.join("commondir");
+    match std::fs::symlink_metadata(&commondir) {
+        Ok(metadata) if metadata.is_file() => {
+            let contents = read_bounded_git_file(&commondir)?;
+            let contents = std::str::from_utf8(&contents).map_err(|_| AppError::Validation {
+                field: "git.metadata",
+                message: "common Git metadata must be valid UTF-8",
+            })?;
+            let common = contents
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.contains('\0'))
+                .ok_or(AppError::Validation {
+                    field: "git.metadata",
+                    message: "common Git metadata must identify a Git directory",
+                })?;
+            let common = Path::new(common);
+            gitdirs.push(if common.is_absolute() {
+                common.to_owned()
+            } else {
+                gitdir.join(common)
+            });
+        }
+        Ok(_) => {
+            return Err(AppError::Validation {
+                field: "git.metadata",
+                message: "common Git metadata must be a regular file",
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(AppError::Runtime {
+                operation: "inspect local Git metadata",
+            })
+        }
+    }
+    for gitdir in gitdirs {
+        for name in ["config", "config.worktree"] {
+            let path = gitdir.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => validate_local_git_config_file(&path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(AppError::Runtime {
+                        operation: "inspect local Git configuration",
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_packed_refs(contents: &[u8], reference: &str) -> GitRefPresence {
+    let Ok(contents) = std::str::from_utf8(contents) else {
+        return GitRefPresence::Invalid;
+    };
+    let mut presence = GitRefPresence::Absent;
+    for line in contents.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(peeled) = line.strip_prefix('^') {
+            if code_change::canonical_full_sha(peeled).is_err() {
+                return GitRefPresence::Invalid;
+            }
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(object_id) = fields.next() else {
+            return GitRefPresence::Invalid;
+        };
+        let Some(ref_name) = fields.next() else {
+            return GitRefPresence::Invalid;
+        };
+        if fields.next().is_some() || code_change::canonical_full_sha(object_id).is_err() {
+            return GitRefPresence::Invalid;
+        }
+        if ref_name == reference {
+            presence = GitRefPresence::Present;
+        }
+    }
+    presence
+}
+
+async fn git_metadata_path(
     anchor: &crate::execution_policy::ExecutableAnchor,
     project_root: &Path,
-    reference: &str,
-) -> Result<bool, AppError> {
-    let git_path = format!("refs/heads/{reference}");
+    path_name: &str,
+) -> Result<std::path::PathBuf, AppError> {
     let output = run_pinned_git(
         anchor,
         project_root,
-        &["rev-parse", "--git-path", &git_path],
+        &["rev-parse", "--git-path", path_name],
     )
     .await?;
     if !output.status.success() {
         return Err(AppError::Runtime {
-            operation: "resolve pinned Git ref path",
+            operation: "resolve pinned Git metadata path",
         });
     }
     let path = String::from_utf8(output.stdout).map_err(|_| AppError::Runtime {
-        operation: "read pinned Git ref path",
+        operation: "read pinned Git metadata path",
     })?;
     let path = path.trim();
     if path.is_empty() || path.contains('\0') {
         return Err(AppError::Runtime {
-            operation: "validate pinned Git ref path",
+            operation: "validate pinned Git metadata path",
         });
     }
     let path = Path::new(path);
-    let path = if path.is_absolute() {
+    Ok(if path.is_absolute() {
         path.to_owned()
     } else {
         project_root.join(path)
+    })
+}
+
+async fn classify_exact_git_ref(
+    anchor: &crate::execution_policy::ExecutableAnchor,
+    project_root: &Path,
+    reference: &str,
+) -> Result<GitRefPresence, AppError> {
+    if !reference.starts_with("refs/heads/") {
+        return Ok(GitRefPresence::Invalid);
+    }
+    let output = run_pinned_git(
+        anchor,
+        project_root,
+        &["for-each-ref", "--format=%(refname)", "--", reference],
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok(GitRefPresence::Invalid);
+    }
+    let git_present = String::from_utf8(output.stdout)
+        .map_err(|_| AppError::Runtime {
+            operation: "read pinned Git ref",
+        })?
+        .lines()
+        .any(|line| line == reference);
+    let loose_path = git_metadata_path(anchor, project_root, reference).await?;
+    let loose_presence = match std::fs::symlink_metadata(loose_path) {
+        Ok(metadata) if metadata.is_file() => GitRefPresence::Present,
+        Ok(_) => GitRefPresence::Invalid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitRefPresence::Absent,
+        Err(_) => GitRefPresence::Invalid,
     };
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(AppError::Runtime {
-            operation: "inspect pinned Git ref path",
-        }),
+    if loose_presence == GitRefPresence::Invalid {
+        return Ok(GitRefPresence::Invalid);
+    }
+    let packed_path = git_metadata_path(anchor, project_root, "packed-refs").await?;
+    let packed_presence = match std::fs::symlink_metadata(&packed_path) {
+        Ok(metadata) if metadata.is_file() => match read_bounded_git_file(&packed_path) {
+            Ok(contents) => parse_packed_refs(&contents, reference),
+            Err(_) => GitRefPresence::Invalid,
+        },
+        Ok(_) => GitRefPresence::Invalid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitRefPresence::Absent,
+        Err(_) => GitRefPresence::Invalid,
+    };
+    if packed_presence == GitRefPresence::Invalid {
+        return Ok(GitRefPresence::Invalid);
+    }
+    if git_present
+        || loose_presence == GitRefPresence::Present
+        || packed_presence == GitRefPresence::Present
+    {
+        Ok(GitRefPresence::Present)
+    } else {
+        Ok(GitRefPresence::Absent)
     }
 }
 
@@ -980,6 +1263,8 @@ fn pinned_git_argv(argv: &[&str]) -> Vec<OsString> {
         "core.askPass=",
         "-c",
         "core.sshCommand=",
+        "-c",
+        "diff.external=",
         "-c",
         "commit.gpgSign=false",
         "-c",
@@ -1020,12 +1305,36 @@ fn verified_git_program(verified: &crate::execution_policy::VerifiedExecutable) 
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn inherited_verified_git_fd_flags(flags: libc::c_int) -> libc::c_int {
+    flags & !libc::FD_CLOEXEC
+}
+
+#[cfg(target_os = "linux")]
+fn inherit_verified_git_fd(command: &mut std::process::Command, fd: libc::c_int) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, inherited_verified_git_fd_flags(flags)) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[cfg(unix)]
 async fn run_pinned_git(
     anchor: &crate::execution_policy::ExecutableAnchor,
     project_root: &Path,
     argv: &[&str],
 ) -> Result<PinnedGitOutput, AppError> {
+    validate_local_git_config(project_root)?;
     let verified = anchor.verify_identity().map_err(AppError::from)?;
     use std::os::unix::process::CommandExt;
 
@@ -1041,19 +1350,24 @@ async fn run_pinned_git(
         command.env(name, value);
     }
     command.process_group(0);
+    #[cfg(target_os = "linux")]
+    inherit_verified_git_fd(&mut command, std::os::fd::AsRawFd::as_raw_fd(&verified.file));
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
     let mut child = command.spawn().map_err(|_| AppError::Runtime {
         operation: "spawn pinned Git",
     })?;
+    let pid = child.id().ok_or(AppError::Runtime {
+        operation: "read pinned Git process ID",
+    })? as libc::pid_t;
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
+        terminate_pinned_git_group(pid, &mut child).await;
         return Err(AppError::Runtime {
             operation: "capture pinned Git stdout",
         });
     };
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill().await;
+        terminate_pinned_git_group(pid, &mut child).await;
         return Err(AppError::Runtime {
             operation: "capture pinned Git stderr",
         });
@@ -1075,7 +1389,7 @@ async fn run_pinned_git(
                     Ok(value) => status = Some(value),
                     Err(_) => {
                         drop(wait);
-                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
                         return Err(AppError::Runtime { operation: "wait for pinned Git" });
                     }
                 }
@@ -1085,12 +1399,12 @@ async fn run_pinned_git(
                     Ok(Ok(value)) => stdout_bytes = Some(value),
                     Ok(Err(error)) => {
                         drop(wait);
-                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
                         return Err(error);
                     }
                     Err(_) => {
                         drop(wait);
-                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
                         return Err(AppError::Runtime { operation: "read pinned Git stdout" });
                     }
                 }
@@ -1100,19 +1414,19 @@ async fn run_pinned_git(
                     Ok(Ok(value)) => stderr_bytes = Some(value),
                     Ok(Err(error)) => {
                         drop(wait);
-                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
                         return Err(error);
                     }
                     Err(_) => {
                         drop(wait);
-                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
                         return Err(AppError::Runtime { operation: "read pinned Git stderr" });
                     }
                 }
             }
             _ = &mut timeout => {
                 drop(wait);
-                abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
                 return Err(AppError::Runtime { operation: "pinned Git timeout" });
             }
         }
@@ -1158,18 +1472,22 @@ where
 }
 
 #[cfg(unix)]
+async fn terminate_pinned_git_group(pid: libc::pid_t, child: &mut tokio::process::Child) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
 async fn abort_pinned_git(
+    pid: libc::pid_t,
     child: &mut tokio::process::Child,
     stdout_task: &mut tokio::task::JoinHandle<Result<Vec<u8>, AppError>>,
     stderr_task: &mut tokio::task::JoinHandle<Result<Vec<u8>, AppError>>,
 ) {
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-        }
-    }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    terminate_pinned_git_group(pid, child).await;
     stdout_task.abort();
     stderr_task.abort();
 }
@@ -1259,13 +1577,18 @@ mod tests {
         assert!(argv.windows(2).any(|pair| pair == ["-c", "core.hooksPath=/dev/null"]));
         assert!(argv.windows(2).any(|pair| pair == ["-c", "core.fsmonitor=false"]));
         assert!(argv.windows(2).any(|pair| pair == ["-c", "credential.helper="]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c", "diff.external="]));
         assert!(argv.windows(2).any(|pair| pair == ["-c", "commit.gpgSign=false"]));
         assert!(argv.contains(&"--no-pager".to_owned()));
         let environment = pinned_git_environment();
         assert!(environment.contains(&("GIT_CONFIG_NOSYSTEM", "1")));
+        assert!(environment.contains(&("GIT_CONFIG_SYSTEM", "/dev/null")));
         assert!(environment.contains(&("GIT_CONFIG_GLOBAL", "/dev/null")));
         assert!(environment.contains(&("GIT_TERMINAL_PROMPT", "0")));
         assert!(environment.contains(&("GIT_ASKPASS", "/bin/false")));
+        assert!(environment.contains(&("SSH_ASKPASS", "/bin/false")));
+        assert!(environment.contains(&("GIT_EDITOR", "/bin/false")));
+        assert!(environment.contains(&("GIT_SEQUENCE_EDITOR", "/bin/false")));
         assert!(!environment.iter().any(|(name, _)| {
             matches!(*name, "HOME" | "PATH" | "AWS_SECRET_ACCESS_KEY" | "GITHUB_TOKEN")
         }));
@@ -1284,5 +1607,195 @@ mod tests {
         } else {
             assert_eq!(program, executable.into_os_string());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_git_fd_inheritance_clears_only_close_on_exec() {
+        assert_eq!(
+            inherited_verified_git_fd_flags(libc::FD_CLOEXEC | libc::FD_CLOEXEC << 1),
+            libc::FD_CLOEXEC << 1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_git_runs_a_verified_shebang_script_anchor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("git-script");
+        std::fs::write(&script, b"#!/bin/sh\nprintf 'script-ran\\n'\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let anchor = ExecutableAnchor::from_absolute(&script, &[]).unwrap();
+
+        let output = run_pinned_git(&anchor, temporary.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"script-ran\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_git_kills_the_saved_process_group_after_leader_exit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("git-script");
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\n( /bin/sleep 1; /bin/dd if=/dev/zero bs=70000 count=1 2>/dev/null; /bin/sleep 30 ) >&2 &\nprintf '%s' \"$!\" > descendant.pid\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let anchor = ExecutableAnchor::from_absolute(&script, &[]).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_pinned_git(&anchor, temporary.path(), &["rev-parse", "HEAD"]),
+        )
+        .await
+        .expect("pinned Git must remain bounded")
+        .expect_err("the fixture must exceed the bounded stderr limit");
+        assert!(matches!(result, AppError::Validation { field: "git.output", .. }));
+
+        let descendant = std::fs::read_to_string(temporary.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        for _ in 0..100 {
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+        panic!("pinned Git descendant survived process-group cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_git_does_not_execute_a_local_clean_filter() {
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.name", "fixture"].as_slice(),
+            ["config", "user.email", "fixture@example.invalid"].as_slice(),
+        ] {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(temporary.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?}: {:?}", args, output);
+        }
+        std::fs::write(temporary.path().join(".gitattributes"), "tracked filter=clean\n")
+            .unwrap();
+        std::fs::write(temporary.path().join("tracked"), "baseline\n").unwrap();
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["add", "."])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git add: {:?}", output);
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["commit", "-qm", "baseline"])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git commit: {:?}", output);
+        let git_path = temporary.path().join("git");
+        std::fs::write(&git_path, b"#!/bin/sh\nexec /usr/bin/git \"$@\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&git_path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&git_path, permissions).unwrap();
+        let git = ExecutableAnchor::from_absolute(&git_path, &[]).unwrap();
+        let marker = temporary.path().join("filter-executed");
+        let filter = temporary.path().join("filter.sh");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\n/bin/touch {}\n/bin/cat\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&filter).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&filter, permissions).unwrap();
+        let config = temporary.path().join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!("\n[filter \"clean\"]\n\tclean = {}\n", filter.display()));
+        std::fs::write(config, contents).unwrap();
+        std::fs::write(temporary.path().join("tracked"), "changed\n").unwrap();
+
+        let _ = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"]).await;
+
+        assert!(!marker.exists(), "local clean filter was executed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_git_rejects_a_local_core_worktree_redirect() {
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.name", "fixture"].as_slice(),
+            ["config", "user.email", "fixture@example.invalid"].as_slice(),
+        ] {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(temporary.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?}: {:?}", args, output);
+        }
+        std::fs::write(temporary.path().join("tracked"), "baseline\n").unwrap();
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["add", "."])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git add: {:?}", output);
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["commit", "-qm", "baseline"])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git commit: {:?}", output);
+        let git_path = temporary.path().join("git");
+        std::fs::write(&git_path, b"#!/bin/sh\nexec /usr/bin/git \"$@\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&git_path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&git_path, permissions).unwrap();
+        let git = ExecutableAnchor::from_absolute(&git_path, &[]).unwrap();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("outside.txt"), "outside\n").unwrap();
+        let config = temporary.path().join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!("\n[core]\n\tworktree = {}\n", outside.display()));
+        std::fs::write(config, contents).unwrap();
+
+        let result = run_pinned_git(
+            &git,
+            temporary.path(),
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Validation {
+                field: "git.config",
+                ..
+            })
+        ));
     }
 }

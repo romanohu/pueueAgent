@@ -2178,6 +2178,203 @@ async fn invalid_present_best_ref_rejects_code_change() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn same_name_best_tag_is_ignored_for_code_change_base_resolution() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    let second = Command::new("/usr/bin/git")
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "second",
+        ])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "git commit: {:?}", second);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let best = code_change::best_ref(&harness.campaign_id).unwrap();
+    let tag = Command::new("/usr/bin/git")
+        .args(["tag", &best])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(tag.status.success(), "git tag: {:?}", tag);
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposals_applied, 1);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    let run = CodeChangeRepository::new(&harness.db)
+        .find_by_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.base_sha, expected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn packed_best_branch_is_selected_for_code_change_base_resolution() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    let second = Command::new("/usr/bin/git")
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "second",
+        ])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "git commit: {:?}", second);
+    let alternate = String::from_utf8(
+        Command::new("/usr/bin/git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&harness.root)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_ne!(expected, alternate);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![alternate, harness.campaign_id],
+        )
+        .unwrap();
+    let best = code_change::best_ref(&harness.campaign_id).unwrap();
+    let best_ref = format!("refs/heads/{best}");
+    let update = Command::new("/usr/bin/git")
+        .args(["update-ref", &best_ref, &expected])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(update.status.success(), "git update-ref: {:?}", update);
+    let packed = Command::new("/usr/bin/git")
+        .args(["pack-refs", "--all", "--prune"])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(packed.status.success(), "git pack-refs: {:?}", packed);
+    assert!(!harness
+        .root
+        .join(".git")
+        .join("refs/heads")
+        .join(&best)
+        .exists());
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposals_applied, 1);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    let run = CodeChangeRepository::new(&harness.db)
+        .find_by_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.base_sha, expected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn corrupt_packed_best_ref_rejects_without_campaign_base_fallback() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let best = code_change::best_ref(&harness.campaign_id).unwrap();
+    fs::write(
+        harness.root.join(".git/packed-refs"),
+        format!("# pack-refs with: peeled fully-peeled sorted\nnot-a-ref refs/heads/{best}\n"),
+    )
+    .unwrap();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Rejected);
+    assert_eq!(
+        proposal.reject_reason.as_deref(),
+        Some("best_ref_invalid")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn duplicate_code_change_digest_reuses_durable_outcome() {
     let harness = DecisionHarness::with_ready_code_change();
     let expected = initialize_clean_git(&harness.root);
@@ -2591,6 +2788,138 @@ async fn experiment_submit_with_root_anchor_dirty_git_preserves_null_base() {
         .unwrap();
     assert_eq!(campaign.base_revision_sha, None);
     assert_eq!(harness.fake.add_calls(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn experiment_submit_with_root_anchor_does_not_execute_a_local_clean_filter() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    initialize_clean_git(&harness.root);
+    fs::write(
+        harness.root.join(".gitattributes"),
+        "tracked.txt filter=clean\n",
+    )
+    .unwrap();
+    fs::write(harness.root.join("tracked.txt"), "baseline\n").unwrap();
+    for args in [
+        ["add", ".gitattributes", "tracked.txt"].as_slice(),
+        [
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "filter-baseline",
+        ]
+        .as_slice(),
+    ] {
+        let output = Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(&harness.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {:?}: {:?}", args, output);
+    }
+    let marker = harness._temp.path().join("clean-filter-executed");
+    let filter = harness._temp.path().join("clean-filter.sh");
+    fs::write(
+        &filter,
+        format!(
+            "#!/bin/sh\n/bin/touch {}\n/bin/cat\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&filter).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&filter, permissions).unwrap();
+    let config_path = harness.root.join(".git/config");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        "\n[filter \"clean\"]\n\tclean = {}\n",
+        filter.display()
+    ));
+    fs::write(config_path, config).unwrap();
+    fs::write(harness.root.join("tracked.txt"), "changed\n").unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness._temp.path(),
+        &[("project-a", harness.root.as_path(), Path::new("codex"))],
+    );
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let root_anchor = policy
+        .project_root_anchor(&canonical_root)
+        .map_err(AppError::from)
+        .unwrap();
+    let limits = policy.campaign_limits;
+
+    submit::run_with_options_with_root_anchor(
+        &harness.db,
+        &harness.root,
+        &[OsString::from("python"), OsString::from("train.py")],
+        &submit::SubmitOptions::default(),
+        &limits,
+        &harness.fake,
+        root_anchor,
+        policy,
+    )
+    .await
+    .unwrap();
+
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_live_by_project("project-a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.base_revision_sha, None);
+    assert!(!marker.exists(), "local clean filter was executed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn experiment_submit_with_root_anchor_cannot_redirect_status_with_local_worktree() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    initialize_clean_git(&harness.root);
+    let outside = harness._temp.path().join("outside-worktree");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("outside.txt"), "outside\n").unwrap();
+    let config_path = harness.root.join(".git/config");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!("\n[core]\n\tworktree = {}\n", outside.display()));
+    fs::write(config_path, config).unwrap();
+    fs::write(
+        harness.root.join(".pueue-agent/STATE.md"),
+        "changed objective state\n",
+    )
+    .unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness._temp.path(),
+        &[("project-a", harness.root.as_path(), Path::new("codex"))],
+    );
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let root_anchor = policy
+        .project_root_anchor(&canonical_root)
+        .map_err(AppError::from)
+        .unwrap();
+    let limits = policy.campaign_limits;
+
+    submit::run_with_options_with_root_anchor(
+        &harness.db,
+        &harness.root,
+        &[OsString::from("python"), OsString::from("train.py")],
+        &submit::SubmitOptions::default(),
+        &limits,
+        &harness.fake,
+        root_anchor,
+        policy,
+    )
+    .await
+    .unwrap();
+
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_live_by_project("project-a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.base_revision_sha, None);
 }
 
 #[cfg(unix)]
