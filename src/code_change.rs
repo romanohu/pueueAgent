@@ -1919,11 +1919,7 @@ impl WorktreeManager {
             // candidate administration directory.  A missing worktree root
             // in that state is a moved/orphaned target, not an idempotent
             // successful cleanup.
-            return if allow_missing_target {
-                Ok(())
-            } else {
-                Err(recovery_required())
-            };
+            return validate_disappeared_cleanup_target(allow_missing_target);
         }
         let current_before_remove = ProjectRootAnchor::resolve(&self.worktree_path)?
             .verify_identity()?;
@@ -3821,6 +3817,10 @@ fn recovery_required() -> AppError {
     AppError::Runtime {
         operation: "recover code-change ownership",
     }
+}
+
+fn validate_disappeared_cleanup_target(_allow_missing_target: bool) -> Result<(), AppError> {
+    Err(recovery_required())
 }
 
 fn validate_cleanup_state_for_mutation(state: CodeChangeState) -> Result<(), AppError> {
@@ -6561,6 +6561,11 @@ mod tests {
         fs::write(&marker, b"untouched").unwrap();
         assert!(validate_cleanup_state_for_mutation(CodeChangeState::RecoveryRequired).is_err());
         assert_eq!(fs::read(&marker).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn cleanup_target_disappearance_after_observation_requires_recovery() {
+        assert!(validate_disappeared_cleanup_target(true).is_err());
     }
 
     #[cfg(unix)]
