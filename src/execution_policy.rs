@@ -222,6 +222,146 @@ pub struct VerifiedProjectRoot {
     pub anchor: ProjectRootAnchor,
 }
 
+/// A directory capability opened relative to a verified project root.  The
+/// descriptor, rather than its pathname, is carried across the native launch
+/// boundary so a nested working directory cannot be swapped after validation.
+pub struct VerifiedWorkingDirectory {
+    pub(crate) directory: File,
+    canonical_path: PathBuf,
+    identity: ExecutableIdentity,
+    root_identity: ExecutableIdentity,
+}
+
+impl fmt::Debug for VerifiedWorkingDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedWorkingDirectory")
+            .field("canonical_path", &self.canonical_path)
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+impl VerifiedWorkingDirectory {
+    /// Open `relative` one component at a time beneath `root`.  Every
+    /// component is opened with `O_NOFOLLOW` and checked before the next is
+    /// traversed; absolute paths and parent traversal are rejected.
+    pub fn open_descendant(
+        root: &VerifiedProjectRoot,
+        relative: &Path,
+    ) -> Result<Self, PolicyViolation> {
+        #[cfg(not(unix))]
+        {
+            let _ = (root, relative);
+            return Err(unsupported_platform());
+        }
+        #[cfg(unix)]
+        {
+            if relative.is_absolute()
+                || relative.components().any(|component| {
+                    matches!(component, Component::RootDir | Component::ParentDir)
+                })
+            {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::NativeGate,
+                ));
+            }
+            let root_metadata = root.directory.metadata().map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                )
+            })?;
+            if !root_metadata.is_dir()
+                || !secure_metadata(&root_metadata)
+                || identity(&root_metadata) != root.anchor.identity
+            {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let mut current = root.directory.try_clone().map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::NativeGate,
+                )
+            })?;
+            let mut canonical_path = root.anchor.canonical_path.clone();
+            for component in relative.components() {
+                let Component::Normal(name) = component else {
+                    // CurDir is harmless and normalized away.  Prefixes are
+                    // impossible for a relative path on Unix.
+                    continue;
+                };
+                let opened = openat_nofollow(&current, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+                    .map_err(|_| {
+                        PolicyViolation::new(
+                            PolicyViolationCode::RootChanged,
+                            PolicyViolationStage::NativeGate,
+                        )
+                    })?;
+                let metadata = opened.metadata().map_err(|_| {
+                    PolicyViolation::new(
+                        PolicyViolationCode::RootChanged,
+                        PolicyViolationStage::NativeGate,
+                    )
+                })?;
+                if !metadata.is_dir() || !secure_component_metadata(&metadata) {
+                    return Err(PolicyViolation::new(
+                        PolicyViolationCode::RootChanged,
+                        PolicyViolationStage::NativeGate,
+                    ));
+                }
+                canonical_path.push(name);
+                current = opened;
+            }
+            let metadata = current.metadata().map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::NativeGate,
+                )
+            })?;
+            let identity = identity(&metadata);
+            Ok(Self {
+                directory: current,
+                canonical_path,
+                identity,
+                root_identity: root.anchor.identity,
+            })
+        }
+    }
+
+    pub fn root(root: &VerifiedProjectRoot) -> Result<Self, PolicyViolation> {
+        Self::open_descendant(root, Path::new("."))
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    pub fn identity(&self) -> ExecutableIdentity {
+        self.identity
+    }
+
+    pub(crate) fn root_identity(&self) -> ExecutableIdentity {
+        self.root_identity
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, AppError> {
+        Ok(Self {
+            directory: self.directory.try_clone().map_err(|source| AppError::Io {
+                operation: "clone verified working directory",
+                source,
+            })?,
+            canonical_path: self.canonical_path.clone(),
+            identity: self.identity,
+            root_identity: self.root_identity,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkMode {
     Enabled,
@@ -359,6 +499,150 @@ impl ResolvedExecutionPolicy {
 
     pub fn code_change_git_anchor(&self) -> Option<&ExecutableAnchor> {
         self.code_change_tool(CodeChangeTool::Git)
+    }
+
+    /// Rebind an already resolved project policy to an owned candidate
+    /// worktree.  The candidate remains subject to the same agent, tool,
+    /// network, and environment authority; only its project-root descriptor
+    /// changes.
+    pub fn for_code_change_worktree(
+        &self,
+        project: &Project,
+        original: &ResolvedProjectExecutionPolicy,
+        candidate: &VerifiedProjectRoot,
+    ) -> Result<ResolvedProjectExecutionPolicy, PolicyViolation> {
+        if original.project_id != project.project_id {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        let original_anchor = self.project_root_anchor(&project.root_path)?;
+        if original.root_anchor != original_anchor {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        verify_state_root_identity(self)?;
+        let worktrees = self
+            .state_root
+            .canonical_path
+            .join("worktrees");
+        let candidate_path = &candidate.anchor.canonical_path;
+        if !candidate_path.starts_with(&worktrees)
+            || candidate_path == worktrees.as_path()
+            || candidate_path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        let candidate_descriptor_metadata = candidate.directory.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        if !candidate_descriptor_metadata.is_dir()
+            || !secure_metadata(&candidate_descriptor_metadata)
+            || identity(&candidate_descriptor_metadata) != candidate.anchor.identity
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        let verified_candidate = candidate.anchor.verify_identity()?;
+        let candidate_metadata = verified_candidate
+            .directory
+            .metadata()
+            .map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::PreBinding,
+                )
+            })?;
+        if candidate_metadata.file_type().is_symlink()
+            || !candidate_metadata.is_dir()
+            || identity(&candidate_metadata) != candidate.anchor.identity
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        if original.agent_anchor != self
+            .resolve_original_agent_anchor(original)?
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::AnchorReplaced,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        // Revalidate the original root and the agent/tool anchors at this
+        // boundary.  No authority is widened by the candidate rebind.
+        original.root_anchor.verify_identity()?;
+        original.agent_anchor.verify_identity()?;
+        for tool in [
+            CodeChangeTool::Git,
+            CodeChangeTool::Cargo,
+            CodeChangeTool::Uv,
+            CodeChangeTool::Python,
+        ] {
+            if let Some(anchor) = self.code_change_tool(tool) {
+                anchor.verify_identity()?;
+            }
+        }
+        Ok(ResolvedProjectExecutionPolicy {
+            project_id: original.project_id.clone(),
+            root_anchor: candidate.anchor.clone(),
+            agent_anchor: original.agent_anchor.clone(),
+            agent_kind: original.agent_kind,
+            network: original.network,
+            agent_environment_allow: original.agent_environment_allow.clone(),
+            task_environment_allow: original.task_environment_allow.clone(),
+            codex_home: original.codex_home.clone(),
+            trusted_path: original.trusted_path.clone(),
+            private_temp_relative_root: original.private_temp_relative_root.clone(),
+        })
+    }
+
+    /// The retained, startup-verified state root used by code-change
+    /// worktree ownership.  The returned path is informational; mutation is
+    /// performed only by the worktree manager through owned descriptors.
+    pub(crate) fn code_change_state_root_path(&self) -> &Path {
+        &self.state_root.canonical_path
+    }
+
+    pub(crate) fn code_change_state_root_directory(&self) -> Arc<File> {
+        self.state_root.directory.clone()
+    }
+
+    pub(crate) fn verify_code_change_state_root(&self) -> Result<(), PolicyViolation> {
+        verify_state_root_identity(self)
+    }
+
+    fn resolve_original_agent_anchor(
+        &self,
+        original: &ResolvedProjectExecutionPolicy,
+    ) -> Result<ExecutableAnchor, PolicyViolation> {
+        if original.agent_kind == AgentKind::BuiltInCodex {
+            Ok(self.codex_anchor.clone())
+        } else {
+            self.custom_allowlist
+                .get(&original.project_id)
+                .cloned()
+                .ok_or_else(|| {
+                    PolicyViolation::new(
+                        PolicyViolationCode::CustomAgentNotEnrolled,
+                        PolicyViolationStage::PreBinding,
+                    )
+                })
+        }
     }
 }
 
@@ -2077,6 +2361,45 @@ fn secure_component_metadata(metadata: &Metadata) -> bool {
     // A root-owned sticky directory such as the host temporary directory does
     // not allow another uid to replace an entry owned by this service account.
     owner(metadata) == 0 && mode(metadata) & 0o1000 != 0
+}
+
+fn verify_state_root_identity(policy: &ResolvedExecutionPolicy) -> Result<(), PolicyViolation> {
+    let metadata = policy.state_root.directory.metadata().map_err(|_| {
+        PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        )
+    })?;
+    if !metadata.is_dir()
+        || !secure_component_metadata(&metadata)
+        || identity(&metadata) != policy.state_root.identity
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    let opened = open_path_nofollow(&policy.state_root.canonical_path).map_err(|_| {
+        PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        )
+    })?;
+    if opened.canonical_path != policy.state_root.canonical_path
+        || opened.resolution_fingerprint != policy.state_root.resolution_fingerprint
+        || identity(&opened.file.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?) != policy.state_root.identity
+    {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    Ok(())
 }
 
 fn current_uid() -> u32 {

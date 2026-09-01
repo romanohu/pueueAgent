@@ -24,7 +24,7 @@ use crate::{
     environment::{PrivateRunTemp, SanitizedEnvironment, VerifiedPrivateTemp},
     execution_policy::{
         ExecutableAnchor, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
-        VerifiedProjectRoot, VerifiedPueueConfig,
+        VerifiedProjectRoot, VerifiedPueueConfig, VerifiedWorkingDirectory,
     },
     project_logs::LogFileIdentity,
     AppError,
@@ -36,7 +36,7 @@ use std::{
     mem,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
-        unix::ffi::{OsStrExt, OsStringExt},
+        unix::{ffi::{OsStrExt, OsStringExt}, fs::MetadataExt},
     },
     ptr,
 };
@@ -60,6 +60,8 @@ pub const AGENT_LOG_FD: RawFd = 8;
 pub const PUEUE_CONFIG_FD: RawFd = 9;
 pub const RELEASE_ACK_FD: RawFd = 10;
 pub use crate::environment::PRIVATE_TEMP_TARGET_FD;
+/// Descriptor carrying the verified working-directory capability.
+pub const WORKING_DIRECTORY_FD: RawFd = 12;
 /// Compatibility alias for the final acknowledgement descriptor.
 pub const ACK_FD: RawFd = RELEASE_ACK_FD;
 
@@ -81,13 +83,14 @@ const TEST_LIFECYCLE_DELAYS_ENV: &str = "PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS";
 const TEST_LIFECYCLE_TRACE_ENV: &str = "PUEUE_AGENT_TEST_LIFECYCLE_TRACE";
 
 const HEADER_SIZE: usize = 12;
-const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT | FLAG_AGENT_LOG | FLAG_PUEUE_CONFIG | FLAG_PROCESS_GROUP | FLAG_LIFECYCLE | FLAG_PRIVATE_TEMP;
+const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT | FLAG_AGENT_LOG | FLAG_PUEUE_CONFIG | FLAG_PROCESS_GROUP | FLAG_LIFECYCLE | FLAG_PRIVATE_TEMP | FLAG_WORKING_DIRECTORY;
 const FLAG_PROJECT_ROOT: u16 = 1 << 0;
 const FLAG_AGENT_LOG: u16 = 1 << 1;
 const FLAG_PUEUE_CONFIG: u16 = 1 << 2;
 const FLAG_PROCESS_GROUP: u16 = 1 << 3;
 const FLAG_LIFECYCLE: u16 = 1 << 4;
 const FLAG_PRIVATE_TEMP: u16 = 1 << 5;
+const FLAG_WORKING_DIRECTORY: u16 = 1 << 6;
 
 const FIELD_ARGV: u8 = 1;
 const FIELD_ENV: u8 = 2;
@@ -98,6 +101,7 @@ const FIELD_AGENT_LOG_IDENTITY: u8 = 6;
 const FIELD_PUEUE_CONFIG_IDENTITY: u8 = 7;
 const FIELD_TARGET_PATH: u8 = 8;
 const FIELD_PRIVATE_TEMP_IDENTITY: u8 = 9;
+const FIELD_WORKING_DIRECTORY_IDENTITY: u8 = 10;
 const IDENTITY_SIZE: usize = 8 + 8 + 4 + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +115,7 @@ pub struct FixedFdContract {
     pub pueue_config: RawFd,
     pub release_ack: RawFd,
     pub private_temp: RawFd,
+    pub working_directory: RawFd,
 }
 
 impl Default for FixedFdContract {
@@ -125,6 +130,7 @@ impl Default for FixedFdContract {
             pueue_config: PUEUE_CONFIG_FD,
             release_ack: RELEASE_ACK_FD,
             private_temp: PRIVATE_TEMP_TARGET_FD,
+            working_directory: WORKING_DIRECTORY_FD,
         }
     }
 }
@@ -141,6 +147,7 @@ impl FixedFdContract {
             pueue_config: PUEUE_CONFIG_FD,
             release_ack: RELEASE_ACK_FD,
             private_temp: PRIVATE_TEMP_TARGET_FD,
+            working_directory: WORKING_DIRECTORY_FD,
         }
     }
 
@@ -154,6 +161,7 @@ impl FixedFdContract {
             && self.pueue_config == PUEUE_CONFIG_FD
             && self.release_ack == RELEASE_ACK_FD
             && self.private_temp == PRIVATE_TEMP_TARGET_FD
+            && self.working_directory == WORKING_DIRECTORY_FD
     }
 }
 
@@ -162,6 +170,7 @@ impl FixedFdContract {
 pub enum LaunchMode {
     Agent = 1,
     Pueue = 2,
+    OwnedTool = 3,
 }
 
 impl TryFrom<u8> for LaunchMode {
@@ -171,6 +180,7 @@ impl TryFrom<u8> for LaunchMode {
         match value {
             1 => Ok(Self::Agent),
             2 => Ok(Self::Pueue),
+            3 => Ok(Self::OwnedTool),
             _ => Err(CodecError::UnknownMode),
         }
     }
@@ -187,6 +197,7 @@ impl LaunchFlags {
     pub const PROCESS_GROUP: Self = Self(FLAG_PROCESS_GROUP);
     pub const LIFECYCLE: Self = Self(FLAG_LIFECYCLE);
     pub const PRIVATE_TEMP: Self = Self(FLAG_PRIVATE_TEMP);
+    pub const WORKING_DIRECTORY: Self = Self(FLAG_WORKING_DIRECTORY);
 
     pub const fn bits(self) -> u16 { self.0 }
     pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
@@ -217,6 +228,7 @@ pub struct ControlFrame {
     pub pueue_config_identity: Option<ExecutableIdentity>,
     pub target_path: Option<OsString>,
     pub private_temp_identity: Option<ExecutableIdentity>,
+    pub working_directory_identity: Option<ExecutableIdentity>,
 }
 
 impl fmt::Debug for ControlFrame {
@@ -234,6 +246,10 @@ impl fmt::Debug for ControlFrame {
             .field("pueue_config_identity_present", &self.pueue_config_identity.is_some())
             .field("target_path_present", &self.target_path.is_some())
             .field("private_temp_identity_present", &self.private_temp_identity.is_some())
+            .field(
+                "working_directory_identity_present",
+                &self.working_directory_identity.is_some(),
+            )
             .finish()
     }
 }
@@ -461,7 +477,7 @@ pub struct VerifiedCommandSpec {
     pub launcher: ExecutableAnchor,
     pub executable: ExecutableAnchor,
     pub argv: Vec<OsString>,
-    pub cwd: Option<std::path::PathBuf>,
+    pub working_directory: Option<VerifiedWorkingDirectory>,
     pub environment: SanitizedEnvironment,
     pub process_group: ProcessGroupRequirement,
     pub start_suspended: bool,
@@ -1015,7 +1031,7 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
     // Keep a duplicate of stdin solely for the bounded failure record. The
     // fixed-map installer owns and may close fd 0 on an error path.
     let failure_channel = unsafe {
-        libc::fcntl(0, libc::F_DUPFD_CLOEXEC, PRIVATE_TEMP_TARGET_FD + 1)
+        libc::fcntl(0, libc::F_DUPFD_CLOEXEC, WORKING_DIRECTORY_FD + 1)
     };
     let result = receive_and_install_bootstrap(libc::STDIN_FILENO);
     let outcome = match result {
@@ -1053,13 +1069,16 @@ fn run_installed_target(frame: ControlFrame) -> Result<(), BootstrapError> {
     if unsafe { libc::setsid() } < 0 {
         return Err(BootstrapError::TargetCreate);
     }
-    if frame.cwd.is_some() {
-        if frame.cwd.as_deref() != Some(OsStr::new("."))
-            || !frame.flags.contains(LaunchFlags::PROJECT_ROOT)
-            || unsafe { libc::fchdir(PROJECT_ROOT_FD) } < 0
-        {
-            return Err(BootstrapError::TargetCreate);
-        }
+    if frame.working_directory_identity.is_some()
+        && (!frame.flags.contains(LaunchFlags::WORKING_DIRECTORY)
+            || unsafe { libc::fchdir(WORKING_DIRECTORY_FD) } < 0)
+    {
+        return Err(BootstrapError::TargetCreate);
+    }
+    // `cwd` is retained in the wire codec for compatibility with older
+    // helpers, but new launches carry only the descriptor-backed capability.
+    if frame.cwd.is_some() && frame.cwd.as_deref() != Some(OsStr::new(".")) {
+        return Err(BootstrapError::TargetCreate);
     }
     // The helper is the isolated process boundary for target creation. Keep
     // the supervisor's umask untouched while ensuring target-created private
@@ -1441,7 +1460,7 @@ impl PlatformTarget {
         let gate_write_raw = gate_write.as_raw_fd();
         let exec_read_raw = exec_read.as_raw_fd();
         let exec_write_raw = exec_write.as_raw_fd();
-        let change_directory = frame.cwd.is_some();
+        let change_directory = frame.working_directory_identity.is_some();
         let argv_raw = argv_pointers.as_ptr();
         let environment_raw = environment_pointers.as_ptr();
         if frame.mode == LaunchMode::Agent {
@@ -1472,7 +1491,7 @@ impl PlatformTarget {
             if !allowed {
                 unsafe { libc::_exit(125); }
             }
-            if change_directory && unsafe { libc::fchdir(PROJECT_ROOT_FD) } < 0 {
+            if change_directory && unsafe { libc::fchdir(WORKING_DIRECTORY_FD) } < 0 {
                 let _ = unsafe { libc::write(exec_write_raw, EXEC_FAILURE_RECORD.as_ptr().cast(), EXEC_FAILURE_RECORD.len()) };
                 unsafe { libc::_exit(126); }
             }
@@ -2095,9 +2114,16 @@ fn spawn_verified_command_with_deadlines(
     if spec.process_group != ProcessGroupRequirement::Required || !spec.start_suspended {
         return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
     }
-    let mode = match (&spec.project_root, &spec.pueue_config, &private_temp) {
-        (Some(_), None, Some(_)) => LaunchMode::Agent,
-        (None, Some(_), None) => LaunchMode::Pueue,
+    let mode = match (
+        &spec.project_root,
+        &spec.working_directory,
+        &private_temp,
+        &spec.child_io,
+        &spec.pueue_config,
+    ) {
+        (Some(_), Some(_), Some(_), VerifiedChildIo::AgentLog { .. }, None) => LaunchMode::Agent,
+        (Some(_), Some(_), None, VerifiedChildIo::Capture, None) => LaunchMode::OwnedTool,
+        (None, None, None, VerifiedChildIo::Capture, Some(_)) => LaunchMode::Pueue,
         _ => return Err(native_gate_error(PolicyViolationStage::NativeGate).into()),
     };
     if spec.argv.is_empty() {
@@ -2109,12 +2135,23 @@ fn spawn_verified_command_with_deadlines(
     let target_file = verified_target.file;
     let target_identity = verified_target.anchor.identity;
 
-    if let Some(cwd) = spec.cwd.as_deref() {
-        let root = spec
-            .project_root
-            .as_ref()
-            .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))?;
-        if cwd != root.anchor.canonical_path {
+    if let (Some(root), Some(working_directory)) =
+        (spec.project_root.as_ref(), spec.working_directory.as_ref())
+    {
+        if working_directory.root_identity() != root.anchor.identity {
+            return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
+        }
+        let working_metadata = working_directory
+            .directory
+            .metadata()
+            .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+        let actual_working_identity = ExecutableIdentity {
+            device: working_metadata.dev(),
+            inode: working_metadata.ino(),
+            owner: working_metadata.uid(),
+            mode: working_metadata.mode() & 0o7777,
+        };
+        if !working_metadata.is_dir() || actual_working_identity != working_directory.identity() {
             return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
         }
     }
@@ -2135,6 +2172,15 @@ fn spawn_verified_command_with_deadlines(
     if let Some(root) = spec.project_root.as_ref() {
         flags = flags.union(LaunchFlags::PROJECT_ROOT);
         rights.push(duplicate_owned(&root.directory)?);
+    }
+
+    let working_directory_identity = spec
+        .working_directory
+        .as_ref()
+        .map(VerifiedWorkingDirectory::identity);
+    if let Some(working_directory) = spec.working_directory.as_ref() {
+        flags = flags.union(LaunchFlags::WORKING_DIRECTORY);
+        rights.push(duplicate_owned(&working_directory.directory)?);
     }
 
     let mut agent_log_identity = None;
@@ -2174,13 +2220,16 @@ fn spawn_verified_command_with_deadlines(
             .entries()
             .map(|(name, value)| (name.to_os_string(), value.to_os_string()))
             .collect(),
-        cwd: spec.cwd.map(|_| OsString::from(".")),
+        // Legacy path-based cwd is deliberately left empty.  The helper
+        // receives and uses only the descriptor-backed identity/right.
+        cwd: None,
         target_identity,
         project_root_identity,
         agent_log_identity,
         pueue_config_identity,
         target_path: Some(spec.executable.canonical_path.as_os_str().to_os_string()),
         private_temp_identity,
+        working_directory_identity,
     };
     frame
         .encode()
@@ -2672,6 +2721,7 @@ pub(crate) fn bootstrap_slots(frame: &ControlFrame) -> Result<Vec<RawFd>, CodecE
     validate_frame_shape(frame)?;
     let mut slots = vec![CONTROL_FD, RELEASE_FD, EXEC_STATUS_FD, TARGET_FD];
     if frame.flags.contains(LaunchFlags::PROJECT_ROOT) { slots.push(PROJECT_ROOT_FD); }
+    if frame.flags.contains(LaunchFlags::WORKING_DIRECTORY) { slots.push(WORKING_DIRECTORY_FD); }
     if frame.flags.contains(LaunchFlags::AGENT_LOG) { slots.push(AGENT_LOG_FD); }
     if frame.flags.contains(LaunchFlags::PUEUE_CONFIG) { slots.push(PUEUE_CONFIG_FD); }
     slots.push(RELEASE_ACK_FD);
@@ -2797,7 +2847,7 @@ fn receive_bootstrap_packet_with_timeout(
     let mut first = [0u8; 1];
     // One extra slot ensures an over-cardinality sender is observed rather
     // than silently accepted at the protocol maximum.
-    let max_rights = 9usize;
+    let max_rights = 10usize;
     let ancillary_bytes = max_rights * mem::size_of::<RawFd>();
     let control_len = unsafe { libc::CMSG_SPACE(ancillary_bytes as _) } as usize;
     let mut control = vec![0u8; control_len];
@@ -2865,7 +2915,7 @@ fn receive_bootstrap_packet_with_timeout(
         return Err(BootstrapError::UnexpectedAncillary);
     }
     if rights.is_empty() { return Err(BootstrapError::MissingRights); }
-    if rights.len() > 8 { return Err(BootstrapError::WrongRightCount); }
+    if rights.len() > 9 { return Err(BootstrapError::WrongRightCount); }
     for right in &rights {
         let flags = unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
@@ -2967,7 +3017,7 @@ pub(crate) fn receive_and_install_bootstrap(
     let packet = receive_bootstrap_packet(socket)?;
     // The Command-owned bootstrap endpoint is normally stdin.  Duplicate it
     // before touching any fixed ABI descriptor so every dup2 source is above
-    // the complete 3..10 destination range.
+    // the complete 3..12 destination range.
     // SAFETY: after the receive finishes, the helper transfers exclusive
     // ownership of its bootstrap descriptor into fixed-map installation.
     let control = unsafe { OwnedFd::from_raw_fd(socket) };
@@ -3045,7 +3095,7 @@ struct FixedSlotTracker {
 #[cfg(unix)]
 impl FixedSlotTracker {
     fn new(expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
-        Self::with_range(CONTROL_FD, PRIVATE_TEMP_TARGET_FD, expected, owned)
+        Self::with_range(CONTROL_FD, WORKING_DIRECTORY_FD, expected, owned)
     }
     fn with_range(base: RawFd, end: RawFd, expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
         let states = (base..=end).map(|fd| {
@@ -3119,7 +3169,7 @@ struct TrackedSource {
 fn original_fixed_slots(control: Option<&OwnedFd>, rights: &[OwnedFd]) -> Vec<RawFd> {
     control.into_iter().chain(rights.iter())
         .map(AsRawFd::as_raw_fd)
-        .filter(|fd| (CONTROL_FD..=PRIVATE_TEMP_TARGET_FD).contains(fd))
+        .filter(|fd| (CONTROL_FD..=WORKING_DIRECTORY_FD).contains(fd))
         .collect()
 }
 
@@ -3140,7 +3190,7 @@ fn release_original_at(sources: &mut [TrackedSource], destination: RawFd) {
 #[cfg(unix)]
 impl TrackedSource {
     fn move_above_fixed(descriptor: OwnedFd) -> Result<Self, BootstrapError> {
-        Self::move_above_ceiling(descriptor, PRIVATE_TEMP_TARGET_FD)
+        Self::move_above_ceiling(descriptor, WORKING_DIRECTORY_FD)
     }
 
     fn move_above_ceiling(
@@ -3272,6 +3322,9 @@ fn validate_role(
         PROJECT_ROOT_FD if file_type == libc::S_IFDIR && access == libc::O_RDONLY => {
             frame.project_root_identity
         }
+        WORKING_DIRECTORY_FD if file_type == libc::S_IFDIR && access == libc::O_RDONLY => {
+            frame.working_directory_identity
+        }
         AGENT_LOG_FD
             if file_type == libc::S_IFREG
                 && (access == libc::O_WRONLY || access == libc::O_RDWR) =>
@@ -3287,7 +3340,16 @@ fn validate_role(
         }
         _ => return Err(BootstrapError::WrongRightCount),
     };
-    if slot == TARGET_FD || matches!(slot, PROJECT_ROOT_FD | AGENT_LOG_FD | PUEUE_CONFIG_FD | PRIVATE_TEMP_TARGET_FD) {
+    if slot == TARGET_FD
+        || matches!(
+            slot,
+            PROJECT_ROOT_FD
+                | WORKING_DIRECTORY_FD
+                | AGENT_LOG_FD
+                | PUEUE_CONFIG_FD
+                | PRIVATE_TEMP_TARGET_FD
+        )
+    {
         let expected = expected_identity.ok_or(BootstrapError::WrongRightCount)?;
         let actual = ExecutableIdentity {
             device: stat.st_dev as u64,
@@ -3309,6 +3371,7 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     let field_count = 3
         + usize::from(frame.cwd.is_some())
         + usize::from(frame.project_root_identity.is_some())
+        + usize::from(frame.working_directory_identity.is_some())
         + usize::from(frame.agent_log_identity.is_some())
         + usize::from(frame.pueue_config_identity.is_some())
         + usize::from(frame.target_path.is_some())
@@ -3319,7 +3382,12 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
         .and_then(|value| value.checked_add(encoded_field_size(IDENTITY_SIZE)))
         .ok_or(CodecError::LengthOverflow)?;
     if frame.cwd.is_some() { payload_len = payload_len.checked_add(encoded_field_size(cwd_len)).ok_or(CodecError::LengthOverflow)?; }
-    for present in [frame.project_root_identity.is_some(), frame.agent_log_identity.is_some(), frame.pueue_config_identity.is_some()] {
+    for present in [
+        frame.project_root_identity.is_some(),
+        frame.working_directory_identity.is_some(),
+        frame.agent_log_identity.is_some(),
+        frame.pueue_config_identity.is_some(),
+    ] {
         if present { payload_len = payload_len.checked_add(encoded_field_size(IDENTITY_SIZE)).ok_or(CodecError::LengthOverflow)?; }
     }
     if frame.target_path.is_some() { payload_len = payload_len.checked_add(encoded_field_size(target_path_len)).ok_or(CodecError::LengthOverflow)?; }
@@ -3354,6 +3422,9 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     if let Some(identity) = frame.private_temp_identity {
         append_identity_field(&mut output, FIELD_PRIVATE_TEMP_IDENTITY, &identity);
     }
+    if let Some(identity) = frame.working_directory_identity {
+        append_identity_field(&mut output, FIELD_WORKING_DIRECTORY_IDENTITY, &identity);
+    }
     Ok(output)
 }
 
@@ -3370,7 +3441,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     if bytes.len() > total { return Err(CodecError::TrailingBytes); }
     let mut cursor = Cursor::new(&bytes[HEADER_SIZE..total]);
     let field_count = cursor.u32()? as usize;
-    if field_count > 9 { return Err(CodecError::TooManyFields); }
+    if field_count > 10 { return Err(CodecError::TooManyFields); }
     let mut argv = None;
     let mut environment = None;
     let mut target_identity = None;
@@ -3380,6 +3451,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     let mut pueue_config_identity = None;
     let mut target_path = None;
     let mut private_temp_identity = None;
+    let mut working_directory_identity = None;
     let mut previous_kind = 0;
     for _ in 0..field_count {
         let kind = cursor.u8()?;
@@ -3398,6 +3470,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
             FIELD_PUEUE_CONFIG_IDENTITY => set_once(&mut pueue_config_identity, decode_identity(body), kind)?,
             FIELD_TARGET_PATH => set_once(&mut target_path, decode_os_field(body), kind)?,
             FIELD_PRIVATE_TEMP_IDENTITY => set_once(&mut private_temp_identity, decode_identity(body), kind)?,
+            FIELD_WORKING_DIRECTORY_IDENTITY => set_once(&mut working_directory_identity, decode_identity(body), kind)?,
             other => return Err(CodecError::UnknownField(other)),
         }
     }
@@ -3414,6 +3487,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
         pueue_config_identity: pueue_config_identity.transpose()?,
         target_path: target_path.transpose()?,
         private_temp_identity: private_temp_identity.transpose()?,
+        working_directory_identity: working_directory_identity.transpose()?,
     };
     validate_frame_shape(&frame)?;
     Ok(frame)
@@ -3428,9 +3502,13 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     let pueue = frame.flags.contains(LaunchFlags::PUEUE_CONFIG);
     let lifecycle = frame.flags.contains(LaunchFlags::LIFECYCLE);
     let private_temp = frame.flags.contains(LaunchFlags::PRIVATE_TEMP);
+    let working_directory = frame.flags.contains(LaunchFlags::WORKING_DIRECTORY);
     if !frame.flags.contains(LaunchFlags::PROCESS_GROUP) { return Err(CodecError::MissingProcessGroup); }
     if !private_temp && frame.private_temp_identity.is_some() {
         return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY));
+    }
+    if !working_directory && frame.working_directory_identity.is_some() {
+        return Err(CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY));
     }
     match frame.mode {
         LaunchMode::Agent => {
@@ -3438,18 +3516,52 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
             if !private_temp { return Err(CodecError::MissingField(FIELD_PRIVATE_TEMP_IDENTITY)); }
             if !lifecycle && !log { return Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)); }
             if pueue { return Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY)); }
+            if !working_directory {
+                return Err(CodecError::MissingField(FIELD_WORKING_DIRECTORY_IDENTITY));
+            }
+            if lifecycle && frame.cwd.is_some() {
+                return Err(CodecError::UnexpectedField(FIELD_CWD));
+            }
         }
         LaunchMode::Pueue => {
             if !pueue { return Err(CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY)); }
             if root { return Err(CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY)); }
             if log { return Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY)); }
             if private_temp { return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY)); }
+            if working_directory { return Err(CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY)); }
+            if frame.cwd.is_some() { return Err(CodecError::UnexpectedField(FIELD_CWD)); }
+        }
+        LaunchMode::OwnedTool => {
+            if !root || !working_directory {
+                return Err(CodecError::MissingField(if !root {
+                    FIELD_PROJECT_ROOT_IDENTITY
+                } else {
+                    FIELD_WORKING_DIRECTORY_IDENTITY
+                }));
+            }
+            if log {
+                return Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY));
+            }
+            if pueue {
+                return Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY));
+            }
+            if private_temp {
+                return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY));
+            }
+            if frame.cwd.is_some() { return Err(CodecError::UnexpectedField(FIELD_CWD)); }
         }
     }
     if root != frame.project_root_identity.is_some() { return Err(if root { CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PROJECT_ROOT_IDENTITY) }); }
     if log != frame.agent_log_identity.is_some() { return Err(if log { CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY) }); }
     if pueue != frame.pueue_config_identity.is_some() { return Err(if pueue { CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY) }); }
     if private_temp != frame.private_temp_identity.is_some() { return Err(if private_temp { CodecError::MissingField(FIELD_PRIVATE_TEMP_IDENTITY) } else { CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY) }); }
+    if working_directory != frame.working_directory_identity.is_some() {
+        return Err(if working_directory {
+            CodecError::MissingField(FIELD_WORKING_DIRECTORY_IDENTITY)
+        } else {
+            CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY)
+        });
+    }
     if lifecycle != frame.target_path.is_some() {
         return Err(if lifecycle { CodecError::MissingField(FIELD_TARGET_PATH) } else { CodecError::UnexpectedField(FIELD_TARGET_PATH) });
     }
@@ -3668,12 +3780,17 @@ mod tests {
     fn frame() -> ControlFrame {
         ControlFrame {
             mode: LaunchMode::Agent,
-            flags: LaunchFlags::PROJECT_ROOT | LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP | LaunchFlags::PRIVATE_TEMP,
+            flags: LaunchFlags::PROJECT_ROOT
+                | LaunchFlags::WORKING_DIRECTORY
+                | LaunchFlags::AGENT_LOG
+                | LaunchFlags::PROCESS_GROUP
+                | LaunchFlags::PRIVATE_TEMP,
             argv: vec![OsString::from("codex"), OsString::from("prompt")],
             environment: vec![(OsString::from("LANG"), OsString::from("C"))],
             cwd: Some(OsString::from("/trusted/project")),
             target_identity: identity(),
             project_root_identity: Some(identity()),
+            working_directory_identity: Some(identity()),
             agent_log_identity: Some(identity()),
             pueue_config_identity: None,
             target_path: None,
@@ -3991,7 +4108,7 @@ mod tests {
         let mut unknown = encoded.clone();
         // Replace the first canonical field id with an unknown value.
         let field_count_offset = HEADER_SIZE;
-        assert_eq!(u32::from_be_bytes(unknown[field_count_offset..field_count_offset + 4].try_into().unwrap()), 7);
+        assert_eq!(u32::from_be_bytes(unknown[field_count_offset..field_count_offset + 4].try_into().unwrap()), 8);
         let offset = HEADER_SIZE + 4;
         unknown[offset] = 99;
         assert!(matches!(ControlFrame::decode(&unknown), Err(CodecError::UnknownField(99))));
@@ -4065,7 +4182,9 @@ mod tests {
     fn optional_descriptor_flags_must_match_identity_fields() {
         let mut missing = frame(); missing.project_root_identity = None;
         assert_eq!(missing.encode(), Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)));
-        let mut unexpected = frame(); unexpected.flags = LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP | LaunchFlags::PRIVATE_TEMP;
+        let mut unexpected = frame();
+        unexpected.flags = LaunchFlags::AGENT_LOG | LaunchFlags::PROCESS_GROUP | LaunchFlags::PRIVATE_TEMP;
+        unexpected.working_directory_identity = None;
         assert_eq!(unexpected.encode(), Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)));
     }
 
@@ -4074,9 +4193,11 @@ mod tests {
         let mut agent = frame();
         assert!(agent.encode().is_ok());
         agent.flags = LaunchFlags::PROJECT_ROOT
+            | LaunchFlags::AGENT_LOG
             | LaunchFlags::PROCESS_GROUP
             | LaunchFlags::PRIVATE_TEMP;
-        assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)));
+        agent.working_directory_identity = None;
+        assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_WORKING_DIRECTORY_IDENTITY)));
         agent.flags = LaunchFlags::PROJECT_ROOT
             | LaunchFlags::AGENT_LOG
             | LaunchFlags::PUEUE_CONFIG
@@ -4089,6 +4210,8 @@ mod tests {
         agent.agent_log_identity = None;
         agent.pueue_config_identity = Some(identity());
         agent.private_temp_identity = None;
+        agent.working_directory_identity = None;
+        agent.cwd = None;
         assert!(agent.encode().is_ok());
         agent.flags = LaunchFlags::PROCESS_GROUP;
         assert_eq!(agent.encode(), Err(CodecError::MissingField(FIELD_PUEUE_CONFIG_IDENTITY)));
@@ -4104,7 +4227,29 @@ mod tests {
         agent.agent_log_identity = Some(identity());
         agent.pueue_config_identity = None;
         agent.private_temp_identity = Some(identity());
+        agent.working_directory_identity = None;
         assert_eq!(agent.encode(), Err(CodecError::MissingProcessGroup));
+    }
+
+    #[test]
+    fn owned_tool_mode_requires_root_and_working_directory_without_agent_resources() {
+        let mut tool = frame();
+        tool.mode = LaunchMode::OwnedTool;
+        tool.flags = LaunchFlags::PROJECT_ROOT
+            | LaunchFlags::WORKING_DIRECTORY
+            | LaunchFlags::PROCESS_GROUP
+            | LaunchFlags::LIFECYCLE;
+        tool.cwd = None;
+        tool.agent_log_identity = None;
+        tool.private_temp_identity = None;
+        tool.pueue_config_identity = None;
+        tool.target_path = Some(OsString::from("/trusted/tool"));
+        tool.working_directory_identity = Some(identity());
+        assert!(tool.encode().is_ok());
+        assert_eq!(
+            bootstrap_slots(&tool).unwrap(),
+            vec![3, 4, 5, 6, 7, 12, 10]
+        );
     }
 
     #[test]
@@ -4313,6 +4458,8 @@ mod tests {
             mode: LaunchMode::Agent,
             flags: LaunchFlags::PROCESS_GROUP
                 .union(LaunchFlags::LIFECYCLE)
+                .union(LaunchFlags::PROJECT_ROOT)
+                .union(LaunchFlags::WORKING_DIRECTORY)
                 .union(LaunchFlags::PRIVATE_TEMP),
             argv: vec![
                 executable.as_os_str().to_os_string(),
@@ -4327,7 +4474,8 @@ mod tests {
             )],
             cwd: None,
             target_identity: metadata_identity(&target.metadata().unwrap()),
-            project_root_identity: None,
+            project_root_identity: Some(identity()),
+            working_directory_identity: Some(identity()),
             agent_log_identity: None,
             pueue_config_identity: None,
             target_path: Some(executable.into_os_string()),
@@ -4355,27 +4503,73 @@ mod tests {
         let mut frame = installed_target_fault_frame(target_mode);
         let executable = File::open(frame.target_path.as_ref().unwrap()).unwrap();
         let temporary = tempfile::tempdir().unwrap();
+        let root = File::open(temporary.path()).unwrap();
         let private_temp = private_temp_file(temporary.path());
+        frame.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        frame.working_directory_identity = Some(metadata_identity(&root.metadata().unwrap()));
         frame.private_temp_identity = Some(metadata_identity(&private_temp.metadata().unwrap()));
 
         let (ready_parent, ready_helper) = std::os::unix::net::UnixStream::pair().unwrap();
-        let ready_helper = duplicate_above_protocol(ready_helper.as_raw_fd());
+        let ready_parent = {
+            let duplicate = duplicate_above_protocol(ready_parent.as_raw_fd());
+            drop(ready_parent);
+            unsafe { std::os::unix::net::UnixStream::from_raw_fd(duplicate.into_raw_fd()) }
+        };
+        let ready_helper = {
+            let duplicate = duplicate_above_protocol(ready_helper.as_raw_fd());
+            drop(ready_helper);
+            duplicate
+        };
         let (release_read, release_write) = pipe_pair();
-        let release_read = duplicate_above_protocol(release_read.as_raw_fd());
+        let release_read = {
+            let duplicate = duplicate_above_protocol(release_read.as_raw_fd());
+            drop(release_read);
+            duplicate
+        };
         let mut release_write = File::from(release_write);
         release_write.write_all(&RELEASE_AUTHORIZATION).unwrap();
         drop(release_write);
-        let (_exec_read, exec_write) = pipe_pair();
-        let exec_write = duplicate_above_protocol(exec_write.as_raw_fd());
+        let (exec_read, exec_write) = pipe_pair();
+        drop(exec_read);
+        let exec_write = {
+            let duplicate = duplicate_above_protocol(exec_write.as_raw_fd());
+            drop(exec_write);
+            duplicate
+        };
         let (ack_read, ack_write) = pipe_pair();
-        let ack_write = duplicate_above_protocol(ack_write.as_raw_fd());
-        let target = duplicate_above_protocol(executable.as_raw_fd());
-        let private_temp = duplicate_above_protocol(private_temp.as_raw_fd());
+        let ack_read = {
+            let duplicate = duplicate_above_protocol(ack_read.as_raw_fd());
+            drop(ack_read);
+            duplicate
+        };
+        let ack_write = {
+            let duplicate = duplicate_above_protocol(ack_write.as_raw_fd());
+            drop(ack_write);
+            duplicate
+        };
+        let target = {
+            let duplicate = duplicate_above_protocol(executable.as_raw_fd());
+            drop(executable);
+            duplicate
+        };
+        let root = {
+            let duplicate = duplicate_above_protocol(root.as_raw_fd());
+            drop(root);
+            duplicate
+        };
+        let working_directory = duplicate_above_protocol(root.as_raw_fd());
+        let private_temp = {
+            let duplicate = duplicate_above_protocol(private_temp.as_raw_fd());
+            drop(private_temp);
+            duplicate
+        };
 
         install_test_fixed_fd(&ready_helper, CONTROL_FD);
         install_test_fixed_fd(&release_read, RELEASE_FD);
         install_test_fixed_fd(&exec_write, EXEC_STATUS_FD);
         install_test_fixed_fd(&target, TARGET_FD);
+        install_test_fixed_fd(&root, PROJECT_ROOT_FD);
+        install_test_fixed_fd(&working_directory, WORKING_DIRECTORY_FD);
         install_test_fixed_fd(&ack_write, RELEASE_ACK_FD);
         install_test_fixed_fd(&private_temp, PRIVATE_TEMP_TARGET_FD);
 
@@ -4389,7 +4583,8 @@ mod tests {
         }
 
         TEST_PREPARED_TARGET_PID.store(0, Ordering::SeqCst);
-        assert!(run_installed_target(frame).is_err());
+        let result = run_installed_target(frame);
+        assert!(result.is_err());
         let pid = TEST_PREPARED_TARGET_PID.load(Ordering::SeqCst);
         assert!(pid > 0);
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
@@ -4449,7 +4644,7 @@ mod tests {
     #[test]
     fn bootstrap_role_matrix_has_exact_optional_slots() {
         let frame = frame();
-        assert_eq!(bootstrap_slots(&frame).unwrap(), vec![3, 4, 5, 6, 7, 8, 10, 11]);
+        assert_eq!(bootstrap_slots(&frame).unwrap(), vec![3, 4, 5, 6, 7, 12, 8, 10, 11]);
 
         let mut pueue = frame;
         pueue.mode = LaunchMode::Pueue;
@@ -4457,7 +4652,9 @@ mod tests {
         pueue.project_root_identity = None;
         pueue.agent_log_identity = None;
         pueue.private_temp_identity = None;
+        pueue.working_directory_identity = None;
         pueue.pueue_config_identity = Some(identity());
+        pueue.cwd = None;
         assert_eq!(bootstrap_slots(&pueue).unwrap(), vec![3, 4, 5, 6, 9, 10]);
     }
 
@@ -4500,7 +4697,7 @@ mod tests {
     fn scm_rights_round_trip_is_exact_and_close_on_exec() {
         let (sender, receiver) = socket_pair();
         let mut owned = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..8 {
             let (read, _write) = pipe_pair();
             owned.push(read);
         }
@@ -4508,7 +4705,7 @@ mod tests {
         send_bootstrap_packet(sender.as_raw_fd(), &frame(), &raw).unwrap();
         let packet = receive_bootstrap_packet(receiver.as_raw_fd()).unwrap();
         assert_eq!(packet.frame, frame());
-        assert_eq!(packet.rights.len(), 7);
+        assert_eq!(packet.rights.len(), 8);
         for descriptor in packet.rights {
             let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
             assert_ne!(flags & libc::FD_CLOEXEC, 0);
@@ -4520,7 +4717,7 @@ mod tests {
     fn stream_receiver_rejects_trailing_bytes_after_half_close() {
         let (sender, receiver) = socket_pair();
         let mut owned = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..8 {
             let (read, _write) = pipe_pair();
             owned.push(read);
         }
@@ -4626,7 +4823,7 @@ mod tests {
     fn scm_rights_sender_rejects_missing_or_extra_descriptors() {
         let (sender, _receiver) = socket_pair();
         let mut owned = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..9 {
             let (read, _write) = pipe_pair();
             owned.push(read);
         }
@@ -4889,12 +5086,14 @@ mod tests {
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        launch.working_directory_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         launch.private_temp_identity = Some(metadata_identity(&private_temp.metadata().unwrap()));
         let rights = [
             release_read.as_raw_fd(),
             exec_write.as_raw_fd(),
             target.as_raw_fd(),
+            root.as_raw_fd(),
             root.as_raw_fd(),
             log.as_raw_fd(),
             ack_write.as_raw_fd(),
@@ -4945,11 +5144,12 @@ mod tests {
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        launch.working_directory_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         launch.private_temp_identity = Some(metadata_identity(&private_temp.metadata().unwrap()));
         let rights = [
             release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(),
-            root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(), private_temp.as_raw_fd(),
+            root.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(), private_temp.as_raw_fd(),
         ];
         let launch_guard = process_launch_guard().unwrap();
         let (parent_socket, child_socket) = bootstrap_socket_pair(&launch_guard).unwrap();
@@ -4988,9 +5188,10 @@ mod tests {
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.target_identity.inode = launch.target_identity.inode.wrapping_add(1);
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        launch.working_directory_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         launch.private_temp_identity = Some(metadata_identity(&private_temp.metadata().unwrap()));
-        let rights = [release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(), private_temp.as_raw_fd()];
+        let rights = [release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(), root.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(), private_temp.as_raw_fd()];
         assert_install_failure_closes_map(&launch, &rights);
     }
 
@@ -5013,9 +5214,10 @@ mod tests {
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        launch.working_directory_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         launch.private_temp_identity = Some(metadata_identity(&private_temp.metadata().unwrap()));
-        let rights = [release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(), private_temp.as_raw_fd()];
+        let rights = [release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(), root.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), ack_write.as_raw_fd(), private_temp.as_raw_fd()];
         assert_install_failure_closes_map(&launch, &rights);
     }
 
@@ -5036,11 +5238,12 @@ mod tests {
         let mut launch = frame();
         launch.target_identity = metadata_identity(&target.metadata().unwrap());
         launch.project_root_identity = Some(metadata_identity(&root.metadata().unwrap()));
+        launch.working_directory_identity = Some(metadata_identity(&root.metadata().unwrap()));
         launch.agent_log_identity = Some(metadata_identity(&log.metadata().unwrap()));
         launch.private_temp_identity = Some(metadata_identity(&private_temp.metadata().unwrap()));
         let rights = [
             release_read.as_raw_fd(), exec_write.as_raw_fd(), target.as_raw_fd(),
-            root.as_raw_fd(), log.as_raw_fd(), exec_write.as_raw_fd(), private_temp.as_raw_fd(),
+            root.as_raw_fd(), root.as_raw_fd(), log.as_raw_fd(), exec_write.as_raw_fd(), private_temp.as_raw_fd(),
         ];
         assert_install_failure_closes_map(&launch, &rights);
         drop(release_write);

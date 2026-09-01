@@ -10,7 +10,7 @@ use pueue_agent::{
     execution_policy::{
         load_existing_policy, load_or_create_policy, preflight_code_change_uid,
         resolve_project_policy, AgentKind, CampaignLimits, CodeChangeTool, NetworkMode,
-        PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
+        PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor, StartupEnvironment,
     },
     models::{AgentContextMode, NewProject, Project},
     service::{ServicePaths, ServiceStatus},
@@ -293,6 +293,22 @@ fn optional_code_change_absolute_path_must_be_in_trusted_path() {
 fn code_change_uid_preflight_is_pure_and_rejects_only_root() {
     assert!(preflight_code_change_uid(0).is_err());
     assert!(preflight_code_change_uid(501).is_ok());
+}
+
+#[test]
+fn code_change_worktree_root_is_rebound_below_the_retained_state_root() {
+    let harness = PolicyHarness::new();
+    let policy = load_or_create_policy(&harness.input()).unwrap();
+    let project = harness.project("project-a");
+    let original = resolve_project_policy(&policy, &project, &custom_config("project-a", "codex", NetworkMode::Enabled)).unwrap();
+    let worktree = harness.state_dir.join("worktrees/project-a/proposal-a");
+    fs::create_dir_all(&worktree).unwrap();
+    secure_directory(&harness.state_dir.join("worktrees"));
+    secure_directory(&harness.state_dir.join("worktrees/project-a"));
+    secure_directory(&worktree);
+    let candidate = ProjectRootAnchor::resolve(&worktree).unwrap().verify_identity().unwrap();
+    let rebound = policy.for_code_change_worktree(&project, &original, &candidate).unwrap();
+    assert_eq!(rebound.root_anchor.canonical_path, fs::canonicalize(worktree).unwrap());
 }
 
 #[test]

@@ -429,6 +429,36 @@ impl SanitizedEnvironment {
         Ok(environment)
     }
 
+    /// Environment for service-owned Git/tool invocations.  It starts from
+    /// the same default-deny baseline as Pueue and adds only fixed controls
+    /// that disable configuration, authentication, paging, and signing
+    /// channels.  Startup credentials are never copied here.
+    pub fn for_code_change_tool(
+        policy: &ResolvedExecutionPolicy,
+    ) -> Result<Self, PolicyViolation> {
+        let mut environment = Self::for_pueue(policy)?;
+        for (name, value) in [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_PAGER", "cat"),
+            ("PAGER", "cat"),
+            ("GIT_ASKPASS", "/bin/false"),
+            ("SSH_ASKPASS", "/bin/false"),
+            ("GIT_EDITOR", "/bin/false"),
+            ("GIT_SEQUENCE_EDITOR", "/bin/false"),
+        ] {
+            environment.insert_generated(name, OsStr::new(value));
+        }
+        Ok(environment)
+    }
+
+    pub(crate) fn with_generated(&mut self, name: &str, value: impl Into<OsString>) {
+        self.insert_generated(name, value);
+    }
+
     fn project_baseline(
         startup: &StartupEnvironment,
         policy: &ResolvedProjectExecutionPolicy,

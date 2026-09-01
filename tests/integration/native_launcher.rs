@@ -14,7 +14,8 @@ mod unix {
 
     use pueue_agent::{
         environment::{PrivateRunTemp, SanitizedEnvironment},
-        execution_policy::{ExecutableAnchor, ExecutableIdentity, PueueConfigAnchor},
+        execution_policy::{ExecutableAnchor, ExecutableIdentity, PueueConfigAnchor, VerifiedWorkingDirectory},
+        project_logs::LogFileIdentity,
         process::{
             spawn_validated_helper, spawn_verified_command, spawn_verified_command_in_private_temp,
             BootstrapError, ControlFrame,
@@ -95,15 +96,28 @@ fn main() {
         let executable = directory.join("generated-private-temp-target");
         fs::write(
             &source,
-            r#"use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+            r#"use std::{env, fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf};
 extern "C" { fn umask(mask: u32) -> u32; }
 
 fn main() {
     let private_temp = PathBuf::from(env::args_os().nth(1).expect("private temp argument"));
-    assert!(private_temp.is_dir(), "private temp target descriptor is not visible");
+    let private_temp_metadata = fs::metadata(&private_temp).expect("private temp path");
+    let descriptor = fs::File::open("/dev/fd/11").expect("private temp target descriptor");
+    let descriptor_metadata = descriptor.metadata().expect("private temp target descriptor metadata");
+    assert!(descriptor_metadata.is_dir(), "private temp target descriptor is not visible");
+    assert_eq!(descriptor_metadata.dev(), private_temp_metadata.dev());
+    assert_eq!(descriptor_metadata.ino(), private_temp_metadata.ino());
     for descriptor in 3..=10 {
+        // macOS may reserve fd 3 for a runtime-owned directory after exec;
+        // the remaining protocol descriptors are still required to be closed.
+        #[cfg(target_os = "macos")]
+        if descriptor == 3 {
+            continue;
+        }
+        let descriptor_path = format!("/dev/fd/{descriptor}");
+        let descriptor_file = fs::File::open(&descriptor_path);
         assert!(
-            !PathBuf::from(format!("/dev/fd/{descriptor}")).exists(),
+            descriptor_file.is_err(),
             "protocol descriptor {descriptor} leaked into target"
         );
     }
@@ -252,11 +266,13 @@ fn main() {
             mode: LaunchMode::Agent,
             flags: LaunchFlags::PROCESS_GROUP
                 .union(LaunchFlags::PROJECT_ROOT)
+                .union(LaunchFlags::WORKING_DIRECTORY)
                 .union(LaunchFlags::AGENT_LOG)
                 .union(LaunchFlags::PRIVATE_TEMP),
             argv: vec![OsString::from("generated-fixture"), OsString::from("payload-sentinel")],
             environment: vec![(OsString::from("FIXTURE_NAME"), OsString::from("fixture-value"))],
             cwd: None,
+            working_directory_identity: Some(identity(&root.metadata().unwrap())),
             target_identity: identity(&target.metadata().unwrap()),
             project_root_identity: Some(identity(&root.metadata().unwrap())),
             agent_log_identity: Some(identity(&log.metadata().unwrap())),
@@ -275,6 +291,7 @@ fn main() {
                 release_read,
                 exec_write,
                 unsafe { OwnedFd::from_raw_fd(target.try_clone().unwrap().into_raw_fd()) },
+                unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
                 unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
                 unsafe { OwnedFd::from_raw_fd(log.try_clone().unwrap().into_raw_fd()) },
                 ack_write,
@@ -301,6 +318,27 @@ fn main() {
         fs::set_permissions(&private_temp_path, fs::Permissions::from_mode(0o700)).unwrap();
         let private_temp = File::open(private_temp_path).unwrap();
         (target, root, log, private_temp)
+    }
+
+    fn agent_log_io(directory: &Path) -> VerifiedChildIo {
+        let path = directory.join("agent-test.log");
+        let stdout = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let stderr = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let identity = LogFileIdentity::from_open_descriptor(&stdout).unwrap();
+        VerifiedChildIo::AgentLog {
+            stdout,
+            stderr,
+            identity,
+        }
     }
 
     #[test]
@@ -458,6 +496,7 @@ fn main() {
             exec_write,
             unsafe { OwnedFd::from_raw_fd(target.try_clone().unwrap().into_raw_fd()) },
             unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
+            unsafe { OwnedFd::from_raw_fd(root.try_clone().unwrap().into_raw_fd()) },
             unsafe { OwnedFd::from_raw_fd(log.try_clone().unwrap().into_raw_fd()) },
             ack_write,
             unsafe { OwnedFd::from_raw_fd(private_temp.try_clone().unwrap().into_raw_fd()) },
@@ -527,6 +566,7 @@ fn main() {
                 argv: Vec::new(),
                 environment: Vec::new(),
                 cwd: None,
+                working_directory_identity: None,
                 target_identity: ExecutableIdentity { device: 0, inode: 0, owner: 0, mode: 0 },
                 project_root_identity: None,
                 agent_log_identity: None,
@@ -539,6 +579,65 @@ fn main() {
         assert!(matches!(result, Err(pueue_agent::process::ProcessLaunchError::LauncherRejected)));
     }
 
+    #[test]
+    fn code_change_valid_nested_cwd_is_descriptor_verified() {
+        let temporary = tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let nested = base.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let root = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&base).unwrap();
+        let verified = root.verify_identity().unwrap();
+        let working = VerifiedWorkingDirectory::open_descendant(&verified, Path::new("nested")).unwrap();
+        assert_eq!(working.canonical_path(), fs::canonicalize(nested).unwrap());
+    }
+
+    #[test]
+    fn code_change_sibling_cwd_is_rejected() {
+        let temporary = tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let sibling_parent = tempdir().unwrap();
+        let sibling = sibling_parent.path().join("sibling-cwd");
+        fs::create_dir(&sibling).unwrap();
+        let root = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&base).unwrap();
+        let verified = root.verify_identity().unwrap();
+        assert!(VerifiedWorkingDirectory::open_descendant(&verified, &sibling).is_err());
+    }
+
+    #[test]
+    fn code_change_symlink_descendant_is_rejected() {
+        let temporary = tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let target = base.join("target");
+        let link = base.join("link");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let root = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&base).unwrap();
+        let verified = root.verify_identity().unwrap();
+        assert!(VerifiedWorkingDirectory::open_descendant(&verified, Path::new("link")).is_err());
+    }
+
+    #[test]
+    fn code_change_replaced_candidate_root_is_rejected() {
+        let temporary = tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let candidate = base.join("candidate");
+        fs::create_dir(&candidate).unwrap();
+        let anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&candidate).unwrap();
+        let replacement = base.join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::rename(&candidate, base.join("candidate-old")).unwrap();
+        fs::rename(&replacement, &candidate).unwrap();
+        assert!(anchor.verify_identity().is_err());
+    }
+
+    #[test]
+    fn code_change_cwd_descriptor_matrix() {
+        code_change_valid_nested_cwd_is_descriptor_verified();
+        code_change_sibling_cwd_is_rejected();
+        code_change_symlink_descendant_is_rejected();
+        code_change_replaced_candidate_root_is_rejected();
+    }
+
     #[tokio::test]
     async fn verified_target_stays_blocked_until_release_then_executes_and_is_acked() {
         let temporary = tempdir().unwrap();
@@ -548,10 +647,11 @@ fn main() {
             &fs::canonicalize(temporary.path()).unwrap(),
         )
         .unwrap();
-        let canonical_root = root_anchor.canonical_path.clone();
         let started = temporary.path().join("target-started");
         let verified_root = root_anchor.verify_identity().unwrap();
         let private_temp = PrivateRunTemp::create(&verified_root, 1).unwrap();
+        let working_directory = VerifiedWorkingDirectory::root(&verified_root).unwrap();
+        let child_io = agent_log_io(temporary.path());
         let mut child = spawn_verified_command_in_private_temp(VerifiedCommandSpec {
             launcher,
             executable: target,
@@ -559,13 +659,13 @@ fn main() {
                 OsString::from("generated-target"),
                 started.as_os_str().to_os_string(),
             ],
-            cwd: Some(canonical_root),
+            working_directory: Some(working_directory),
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
             project_root: Some(verified_root),
             pueue_config: None,
-            child_io: VerifiedChildIo::Capture,
+            child_io,
         }, &private_temp)
         .unwrap();
 
@@ -591,20 +691,22 @@ fn main() {
 
         let verified_root = root_anchor.verify_identity().unwrap();
         let private_temp = PrivateRunTemp::create(&verified_root, 2).unwrap();
+        let working_directory = VerifiedWorkingDirectory::root(&verified_root).unwrap();
+        let child_io = agent_log_io(temporary.path());
         let mut child = spawn_verified_command_in_private_temp(VerifiedCommandSpec {
             launcher,
             executable: target,
             argv: vec![
                 OsString::from("generated-private-temp-target"),
-                OsString::from("/dev/fd/11"),
+                private_temp.path().as_os_str().to_os_string(),
             ],
-            cwd: Some(root_anchor.canonical_path.clone()),
+            working_directory: Some(working_directory),
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
             project_root: Some(verified_root),
             pueue_config: None,
-            child_io: VerifiedChildIo::Capture,
+            child_io,
         }, &private_temp)
         .unwrap();
 
@@ -647,7 +749,7 @@ fn main() {
                 OsString::from("generated-pueue-target"),
                 result_path.as_os_str().to_os_string(),
             ],
-            cwd: None,
+            working_directory: None,
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
@@ -677,6 +779,8 @@ fn main() {
         let pid_path = temporary.path().join("descendant.pid");
         let verified_root = root_anchor.verify_identity().unwrap();
         let private_temp = PrivateRunTemp::create(&verified_root, 3).unwrap();
+        let working_directory = VerifiedWorkingDirectory::root(&verified_root).unwrap();
+        let child_io = agent_log_io(temporary.path());
         let mut child = spawn_verified_command_in_private_temp(VerifiedCommandSpec {
             launcher,
             executable: target,
@@ -685,13 +789,13 @@ fn main() {
                 OsString::from("parent"),
                 pid_path.as_os_str().to_os_string(),
             ],
-            cwd: Some(root_anchor.canonical_path.clone()),
+            working_directory: Some(working_directory),
             environment: SanitizedEnvironment::default(),
             process_group: ProcessGroupRequirement::Required,
             start_suspended: true,
             project_root: Some(verified_root),
             pueue_config: None,
-            child_io: VerifiedChildIo::Capture,
+            child_io,
         }, &private_temp)
         .unwrap();
         child.release().unwrap();

@@ -582,6 +582,66 @@ fn pueue_environment_is_fixed_baseline_without_proxy_auth_or_task_values() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn code_change_tool_environment_is_default_deny_and_disables_git_auth_channels() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = Harness::new();
+    let base = fs::canonicalize(harness._temp.path()).unwrap();
+    let state_dir = base.join("state");
+    let trusted_bin = base.join("trusted-bin");
+    let codex_home = base.join("code-change-codex-home");
+    fs::create_dir(&state_dir).unwrap();
+    fs::create_dir(&trusted_bin).unwrap();
+    fs::create_dir(&codex_home).unwrap();
+    let pueue = trusted_bin.join("pueue");
+    let codex = trusted_bin.join("codex");
+    let git = trusted_bin.join("git");
+    let launcher = trusted_bin.join("launcher");
+    for executable in [&pueue, &codex, &git, &launcher] {
+        fs::write(executable, b"fixture").unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let pueue_config = base.join("pueue.yml");
+    fs::write(&pueue_config, b"fixture: true\n").unwrap();
+    fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+    for directory in [&state_dir, &trusted_bin, &codex_home] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::set_permissions(&harness.root, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let startup = StartupEnvironment::from_pairs([
+        ("HOME", "/service/home"),
+        ("PATH", "/ambient/bin"),
+        ("OPENAI_API_KEY", "secret"),
+        ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ("SSH_AUTH_SOCK", "/fixture/ssh-agent.sock"),
+        ("GIT_CONFIG_GLOBAL", "/attacker/config"),
+    ]);
+    let global = load_or_create_policy(&PolicyLoadInput {
+        state_dir,
+        project_roots: vec![harness.root.clone()],
+        inherited_path: trusted_bin.clone().into_os_string(),
+        startup_environment: startup,
+        codex_home,
+        pueue_config,
+        launcher_path: launcher,
+    })
+    .unwrap();
+    let environment = SanitizedEnvironment::for_code_change_tool(&global).unwrap();
+    assert_eq!(environment.get("GIT_CONFIG_NOSYSTEM"), Some(std::ffi::OsStr::new("1")));
+    assert_eq!(environment.get("GIT_CONFIG_SYSTEM"), Some(std::ffi::OsStr::new("/dev/null")));
+    assert_eq!(environment.get("GIT_CONFIG_GLOBAL"), Some(std::ffi::OsStr::new("/dev/null")));
+    assert_eq!(environment.get("GIT_ASKPASS"), Some(std::ffi::OsStr::new("/bin/false")));
+    assert_eq!(environment.get("SSH_ASKPASS"), Some(std::ffi::OsStr::new("/bin/false")));
+    assert_eq!(environment.get("GIT_EDITOR"), Some(std::ffi::OsStr::new("/bin/false")));
+    for name in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"] {
+        assert_eq!(environment.get(name), None, "{name}");
+    }
+    assert!(!format!("{environment:?}").contains("secret"));
+}
+
 #[test]
 fn codex_shell_filters_always_have_a_nonsecret_baseline() {
     let harness = Harness::new();

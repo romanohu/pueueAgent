@@ -11,7 +11,7 @@ use crate::{
     environment::{PrivateRunTemp, SanitizedEnvironment, VerifiedPrivateTemp},
     execution_policy::{
         ExecutableAnchor, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
-        VerifiedProjectRoot,
+        VerifiedProjectRoot, VerifiedWorkingDirectory,
     },
     project_logs::{ensure_agent_log_dir, LogFileIdentity, ProjectRootLogReader},
     process::TerminalObservation,
@@ -79,6 +79,7 @@ impl NativeLauncher {
         spec: NativeLaunchSpec,
         private_temp: VerifiedPrivateTemp,
     ) -> Result<NativeAgentChild, AppError> {
+        let working_directory = verified_working_directory(&spec.project_root, spec.cwd.as_deref())?;
         let command_root = spec.project_root.try_clone()?;
         let reader = ProjectRootLogReader::from_verified(spec.project_root);
 
@@ -107,7 +108,7 @@ impl NativeLauncher {
                 launcher: spec.launcher,
                 executable: spec.executable,
                 argv: spec.argv,
-                cwd: spec.cwd,
+                working_directory: Some(working_directory),
                 environment: spec.environment,
                 process_group: crate::process::ProcessGroupRequirement::Required,
                 start_suspended: true,
@@ -120,7 +121,8 @@ impl NativeLauncher {
                 },
             },
             private_temp,
-        )?;
+        );
+        let verified = verified?;
 
         Ok(NativeAgentChild {
             verified,
@@ -160,6 +162,21 @@ impl NativeLauncher {
         )
         .into())
     }
+}
+
+#[cfg(unix)]
+fn verified_working_directory(
+    root: &VerifiedProjectRoot,
+    cwd: Option<&std::path::Path>,
+) -> Result<VerifiedWorkingDirectory, AppError> {
+    let cwd = cwd.ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))?;
+    if !cwd.is_absolute() {
+        return Err(native_gate_error(PolicyViolationStage::NativeGate));
+    }
+    let relative = cwd
+        .strip_prefix(&root.anchor.canonical_path)
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    VerifiedWorkingDirectory::open_descendant(root, relative).map_err(AppError::from)
 }
 
 impl Default for NativeLauncher {

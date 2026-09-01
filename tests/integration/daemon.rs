@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use std::process::Command;
+
 use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
@@ -27,6 +30,12 @@ use pueue_agent::{
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
     AppError,
+};
+
+#[cfg(target_os = "linux")]
+use pueue_agent::{
+    execution_policy::{resolve_project_policy, NetworkMode},
+    models::Project,
 };
 use sha2::{Digest, Sha256};
 use serde_json::json;
@@ -3672,4 +3681,149 @@ async fn startup_recovery_runs_before_the_first_scheduling_pass() {
         AgentRunStatus::Failed
     );
     assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_candidate() {
+    let temp = TempDir::new().unwrap();
+    let fixture_root = fs::canonicalize(temp.path()).unwrap();
+    let project_root = fixture_root.join("project");
+    fs::create_dir(&project_root).unwrap();
+    fs::create_dir(project_root.join(".pueue-agent")).unwrap();
+    fs::set_permissions(
+        &project_root,
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::set_permissions(
+        project_root.join(".pueue-agent"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("model.py"), "score = 1\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", "."]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let original_main = String::from_utf8(run_git(&["rev-parse", "refs/heads/main"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    // The Linux native launcher requires an ELF target for execveat(AT_EMPTY_PATH).
+    // Keep the policy fixture's launcher but replace its optional Git fixture with
+    // the startup-pinned system Git before resolving the immutable policy.
+    let trusted_git = fixture_root.join("execution-policy-bin/git");
+    fs::create_dir_all(trusted_git.parent().unwrap()).unwrap();
+    fs::copy("/usr/bin/git", &trusted_git).unwrap();
+    fs::set_permissions(&trusted_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let codex_program = PathBuf::from("codex");
+    let policy = execution_policy_fixture::resolved_policy(
+        &fixture_root,
+        &[("project-a", &project_root, codex_program.as_path())],
+    );
+    let project = Project {
+        project_id: "project-a".to_owned(),
+        root_path: fs::canonicalize(&project_root).unwrap(),
+        pueue_group: "pa-test".to_owned(),
+        config_path: project_root.join(".pueue-agent/config.toml"),
+        enabled: true,
+        paused: false,
+        halted_reason: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let config = pueue_agent::config::ProjectConfig {
+        project_id: "project-a".to_owned(),
+        pueue_group: "pa-test".to_owned(),
+        agent: pueue_agent::config::AgentConfig {
+            program: "codex".to_owned(),
+            args: vec!["{prompt}".to_owned()],
+            timeout_minutes: 1,
+            max_retries: 0,
+            context: AgentContextMode::Fresh,
+            execution: pueue_agent::config::AgentExecutionConfig {
+                network: NetworkMode::Enabled,
+            },
+            codex: pueue_agent::config::AgentCodexConfig {
+                model: None,
+                reasoning_effort: None,
+            },
+        },
+        check: pueue_agent::config::CheckConfig {
+            interval_minutes: 1,
+            deep_check_interval_minutes: 0,
+            stall_minutes: 1,
+            log_tail_bytes: 1,
+            extra_log_paths: Vec::new(),
+            patterns: Vec::new(),
+            stall: pueue_agent::config::StallConfig {
+                action: pueue_agent::config::PatternAction::Notify,
+                kill_after_minutes: 0,
+            },
+        },
+        guardrails: pueue_agent::config::GuardrailsConfig {
+            max_consecutive_failures: 1,
+            max_experiments: 1,
+            max_agent_runs: 1,
+        },
+    };
+    let original = resolve_project_policy(&policy, &project, &config).unwrap();
+    let candidate_base = pueue_agent::code_change::prepare_code_change_worktree(
+        &policy,
+        &project,
+        &original,
+        "campaign-a",
+        "proposal-a",
+        &original_main,
+    )
+    .await
+    .unwrap();
+    let candidate_path = candidate_base.path().to_owned();
+    fs::write(candidate_path.join("model.py"), "score = 2\n").unwrap();
+    let mut candidate = candidate_base;
+    let facts = candidate.verify().await.unwrap();
+    assert_eq!(facts.file_count, 1);
+    assert!(facts.diff_bytes > 0);
+    let candidate_sha = candidate.commit().await.unwrap();
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        "campaign-a",
+        "proposal-a",
+    )
+    .unwrap();
+    let observed_ref = String::from_utf8(
+        run_git(&["rev-parse", &format!("refs/heads/{candidate_ref}")]).stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_eq!(observed_ref, candidate_sha);
+    assert_eq!(
+        String::from_utf8(run_git(&["rev-parse", "refs/heads/main"]).stdout)
+            .unwrap()
+            .trim(),
+        original_main
+    );
+    assert_eq!(fs::read_to_string(project_root.join("model.py")).unwrap(), "score = 1\n");
+    candidate.cleanup().await.unwrap();
+    assert!(!candidate_path.exists());
 }
