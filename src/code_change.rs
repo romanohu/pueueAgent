@@ -3893,30 +3893,57 @@ fn inspect_common_directory<'a>(
             .await?;
         require_success(&output, "inspect Git common directory")?;
         let text = bounded_utf8_line(&output.stdout, "Git common directory")?;
-        let path = Path::new(text);
-        let path = if path.is_absolute() {
-            path.to_owned()
+        let retained_common = if text == git_descriptor_path(GIT_COMMON_DIR_FD) {
+            let repository = if root.anchor.canonical_path == manager.project.root_path {
+                manager.original_repository.as_ref()
+            } else if root.anchor.canonical_path == manager.worktree_path {
+                manager.candidate_repository.as_ref()
+            } else {
+                None
+            };
+            let repository = repository.ok_or_else(recovery_required)?;
+            Some(&repository.common)
         } else {
-            root.anchor.canonical_path.join(path)
+            None
         };
-        if path_has_symlink_component(&path)? {
-            return Err(validation(
-                "code_change.git",
-                "Git common directory contains a symlink",
-            ));
-        }
-        let canonical = fs::canonicalize(&path).map_err(|_| AppError::Validation {
-            field: "code_change.git",
-            message: "Git common directory is not readable",
-        })?;
-        if !canonical.is_dir() {
-            return Err(validation(
-                "code_change.git",
-                "Git common directory is not a directory",
-            ));
-        }
-        Ok(canonical)
+        resolve_git_common_directory_output(text, &root.anchor.canonical_path, retained_common)
     }
+}
+
+#[cfg(unix)]
+fn resolve_git_common_directory_output(
+    text: &str,
+    root_path: &Path,
+    retained_common: Option<&GitDirectoryProof>,
+) -> Result<PathBuf, AppError> {
+    if text == git_descriptor_path(GIT_COMMON_DIR_FD) {
+        let common = retained_common.ok_or_else(recovery_required)?;
+        revalidate_git_directory_descriptor(common)?;
+        return Ok(common.path.clone());
+    }
+    let path = Path::new(text);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        root_path.join(path)
+    };
+    if path_has_symlink_component(&path)? {
+        return Err(validation(
+            "code_change.git",
+            "Git common directory contains a symlink",
+        ));
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| AppError::Validation {
+        field: "code_change.git",
+        message: "Git common directory is not readable",
+    })?;
+    if !canonical.is_dir() {
+        return Err(validation(
+            "code_change.git",
+            "Git common directory is not a directory",
+        ));
+    }
+    Ok(canonical)
 }
 
 #[cfg(unix)]
@@ -5939,6 +5966,8 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[cfg(unix)]
     fn test_owned_index(root: &Path) -> OwnedTemporaryIndex {
@@ -6293,6 +6322,33 @@ mod tests {
             Some(&git_descriptor_path(7))
         );
         assert!(!environment.values().any(|value| value.contains(".git")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_backed_git_common_directory_output_uses_retained_proof() {
+        let root = tempdir().unwrap();
+        let common_path = root.path().join("common");
+        fs::create_dir(&common_path).unwrap();
+        fs::set_permissions(&common_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(&common_path).unwrap();
+        let proof = GitDirectoryProof {
+            path: common_path.clone(),
+            identity: executable_identity_from_metadata(&directory.metadata().unwrap()),
+            directory: Arc::new(directory),
+        };
+        let descriptor = git_descriptor_path(GIT_COMMON_DIR_FD);
+        assert_eq!(
+            resolve_git_common_directory_output(&descriptor, root.path(), Some(&proof)).unwrap(),
+            common_path
+        );
+        assert!(resolve_git_common_directory_output(
+            "/proc/self/fd/999",
+            root.path(),
+            Some(&proof),
+        )
+        .is_err());
+        assert!(resolve_git_common_directory_output(&descriptor, root.path(), None).is_err());
     }
 
     #[cfg(unix)]

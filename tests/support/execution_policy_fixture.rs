@@ -13,6 +13,23 @@ use pueue_agent::execution_policy::{
     load_existing_policy, PolicyLoadInput, ResolvedExecutionPolicy, StartupEnvironment,
 };
 
+fn secure_git_metadata(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    let permissions = if metadata.is_dir() { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(permissions))
+        .expect("secure fixture Git metadata");
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).expect("read fixture Git metadata") {
+            secure_git_metadata(&entry.expect("read fixture Git metadata entry").path());
+        }
+    }
+}
+
 pub fn resolved_policy(
     fixture_root: &Path,
     projects: &[(&str, &Path, &Path)],
@@ -57,6 +74,7 @@ pub fn resolved_policy(
             fs::Permissions::from_mode(0o700),
         )
         .expect("secure policy fixture service directory");
+        secure_git_metadata(&root.join(".git"));
         let root = fs::canonicalize(root).expect("canonical policy fixture project root");
         project_roots.push(root);
         if *program == Path::new("codex") {
