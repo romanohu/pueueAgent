@@ -5998,10 +5998,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(unix)]
+    fn secure_test_directory(path: &Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn secure_test_file(path: &Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
     fn test_owned_index(root: &Path) -> OwnedTemporaryIndex {
+        secure_test_directory(root);
         let parent = File::open(root).unwrap();
         let directory_name = OsString::from(".owned-index");
         fs::create_dir(root.join(&directory_name)).unwrap();
+        secure_test_directory(&root.join(&directory_name));
         let directory = Arc::new(File::open(root.join(&directory_name)).unwrap());
         let name = OsString::from("index");
         let path = root.join(&directory_name).join(&name);
@@ -6254,6 +6266,7 @@ mod tests {
         let lock_path = root.path().join(".owned-index/index.lock");
         let index = test_owned_index(root.path());
         fs::write(&lock_path, b"lock").unwrap();
+        secure_test_file(&lock_path);
         *index.lock_identity.lock().unwrap() = temporary_entry_identity(
             &index.directory,
             OsStr::new("index.lock"),
@@ -6261,6 +6274,7 @@ mod tests {
         .unwrap();
         let replacement = root.path().join("replacement-index");
         fs::write(&replacement, b"DIRC").unwrap();
+        secure_test_file(&replacement);
         fs::rename(replacement, &path).unwrap();
         drop(index);
         assert!(path.exists());
@@ -6274,6 +6288,7 @@ mod tests {
         let path = root.path().join("config");
         fs::write(&path, b"[remote \"origin\"]\nurl = https://example.invalid/repo\n")
             .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let proof = open_git_file(&path, None, None).unwrap();
         let first = read_git_file(&proof).unwrap();
         let second = read_git_file(&proof).unwrap();
@@ -6289,6 +6304,7 @@ mod tests {
         let index = test_owned_index(root.path());
         let replacement = root.path().join("replacement-index");
         fs::write(&replacement, b"DIRC-unrelated replacement").unwrap();
+        secure_test_file(&replacement);
         fs::rename(replacement, &path).unwrap();
         drop(index);
         assert!(path.exists(), "an unproven replacement must not be deleted");
@@ -6302,6 +6318,7 @@ mod tests {
         let index = test_owned_index(root.path());
         let replacement = root.path().join("replacement-index");
         fs::write(&replacement, b"untrusted replacement").unwrap();
+        secure_test_file(&replacement);
         fs::rename(replacement, &path).unwrap();
         assert!(index.record_after_command().is_err());
         assert!(path.exists(), "an untrusted replacement must be retained");
@@ -6311,7 +6328,9 @@ mod tests {
     #[test]
     fn ignored_status_walk_rejects_recursive_protected_descendants() {
         let root = tempdir().unwrap();
+        secure_test_directory(root.path());
         fs::create_dir(root.path().join("build")).unwrap();
+        secure_test_directory(&root.path().join("build"));
         fs::write(root.path().join("build/.env"), b"secret").unwrap();
         assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_err());
 
@@ -6321,6 +6340,7 @@ mod tests {
 
         fs::remove_file(root.path().join("build/.ENV")).unwrap();
         fs::create_dir(root.path().join("build/nested")).unwrap();
+        secure_test_directory(&root.path().join("build/nested"));
         fs::write(root.path().join("build/nested/credentials.txt"), b"secret").unwrap();
         assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_err());
 
@@ -6333,9 +6353,11 @@ mod tests {
     #[test]
     fn ignored_status_walk_does_not_follow_symlinked_directories() {
         let root = tempdir().unwrap();
+        secure_test_directory(root.path());
         let outside = tempdir().unwrap();
         fs::write(outside.path().join("credentials.json"), b"secret").unwrap();
         fs::create_dir(root.path().join("build")).unwrap();
+        secure_test_directory(&root.path().join("build"));
         std::os::unix::fs::symlink(outside.path(), root.path().join("build/outside")).unwrap();
         assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_ok());
     }
@@ -6344,8 +6366,10 @@ mod tests {
     #[test]
     fn ignored_status_walk_fails_closed_on_recursive_bounds() {
         let root = tempdir().unwrap();
+        secure_test_directory(root.path());
         let build = root.path().join("build");
         fs::create_dir(&build).unwrap();
+        secure_test_directory(&build);
         for index in 0..=MAX_IGNORED_SCAN_ENTRIES {
             fs::write(build.join(format!("artifact-{index}")), b"x").unwrap();
         }
@@ -6353,6 +6377,7 @@ mod tests {
 
         let bytes = root.path().join("bytes");
         fs::create_dir(&bytes).unwrap();
+        secure_test_directory(&bytes);
         fs::write(
             bytes.join("large"),
             vec![b'x'; (MAX_IGNORED_SCAN_BYTES + 1) as usize],

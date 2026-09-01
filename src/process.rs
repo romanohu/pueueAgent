@@ -4456,8 +4456,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn blocking_process_group_cleanup_reaps_before_temporary_owner_can_drop() {
+    #[tokio::test]
+    async fn blocking_process_group_cleanup_reaps_before_temporary_owner_can_drop() {
         let mut child = observation_child("hold");
         let pid = child.pid as libc::pid_t;
         child.terminate_and_reap_blocking().unwrap();
@@ -4754,6 +4754,7 @@ mod tests {
     #[test]
     fn final_revalidation_rejects_replacement_after_command_construction() {
         let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let launcher = temporary.path().join("trusted-launcher");
         fs::copy(std::env::current_exe().unwrap(), &launcher).unwrap();
         fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
