@@ -2178,6 +2178,56 @@ async fn invalid_present_best_ref_rejects_code_change() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn symlinked_best_ref_parent_rejects_code_change() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let best = code_change::best_ref(&harness.campaign_id).unwrap();
+    let outside = harness.temp.path().join("outside-refs");
+    let outside_best = outside.join(best.strip_prefix("campaign/").unwrap());
+    fs::create_dir_all(outside_best.parent().unwrap()).unwrap();
+    fs::write(&outside_best, format!("{expected}\n")).unwrap();
+    let campaign_parent = harness.root.join(".git/refs/heads/campaign");
+    fs::create_dir_all(campaign_parent.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &campaign_parent).unwrap();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(report.deferred, 0);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Rejected);
+    assert_eq!(
+        proposal.reject_reason.as_deref(),
+        Some("best_ref_invalid")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn same_name_best_tag_is_ignored_for_code_change_base_resolution() {
     let harness = DecisionHarness::with_ready_code_change();
     let expected = initialize_clean_git(&harness.root);
@@ -2371,6 +2421,57 @@ async fn corrupt_packed_best_ref_rejects_without_campaign_base_fallback() {
         proposal.reject_reason.as_deref(),
         Some("best_ref_invalid")
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn duplicate_orphan_packed_best_ref_records_reject_without_campaign_base_fallback() {
+    for record in ["duplicate", "orphan-peeled"] {
+        let harness = DecisionHarness::with_ready_code_change();
+        let expected = initialize_clean_git(&harness.root);
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+                rusqlite::params![expected, harness.campaign_id],
+            )
+            .unwrap();
+        let best = code_change::best_ref(&harness.campaign_id).unwrap();
+        let contents = if record == "duplicate" {
+            format!("{expected} refs/heads/{best}\n{expected} refs/heads/{best}\n")
+        } else {
+            format!("^{}\n", "b".repeat(40))
+        };
+        fs::write(harness.root.join(".git/packed-refs"), contents).unwrap();
+        let canonical_root = fs::canonicalize(&harness.root).unwrap();
+        let policy = execution_policy_fixture::resolved_policy(
+            harness.temp.path(),
+            &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        );
+
+        let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+            .with_policy(&policy)
+            .apply_ready(300, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.proposals_applied, 0, "record: {record}");
+        assert_eq!(report.deferred, 0, "record: {record}");
+        let proposal = ProposalRepository::new(&harness.db)
+            .list_for_campaign(&harness.campaign_id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+            .unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Rejected, "record: {record}");
+        assert_eq!(
+            proposal.reject_reason.as_deref(),
+            Some("best_ref_invalid"),
+            "record: {record}"
+        );
+    }
 }
 
 #[cfg(unix)]

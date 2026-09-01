@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    path::Path,
+    path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
     time::Duration,
 };
@@ -649,33 +649,34 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             return CodeChangeBaseResolution::Unavailable;
         };
         let best_reference = format!("refs/heads/{best}");
-        let best_presence = match classify_exact_git_ref(anchor, project_root, &best_reference).await
+        let best_resolution = match resolve_exact_git_ref(anchor, project_root, &best_reference).await
         {
             Ok(value) => value,
             Err(_) => return CodeChangeBaseResolution::Unavailable,
         };
-        if best_presence == GitRefPresence::Invalid {
-            return CodeChangeBaseResolution::InvalidBest;
-        }
-        let best_revision = format!("{best_reference}^{{commit}}");
-        if best_presence == GitRefPresence::Present {
-            match run_pinned_git(
-                anchor,
-                project_root,
-                &["rev-parse", "--verify", &best_revision],
-            )
-            .await
-            {
-                Ok(output) if output.status.success() => {
-                    if let Ok(value) = String::from_utf8(output.stdout) {
-                        if let Ok(value) = code_change::canonical_full_sha(value.trim()) {
-                            return CodeChangeBaseResolution::Available(value);
-                        }
-                    }
+        match best_resolution {
+            GitRefResolution::Invalid => return CodeChangeBaseResolution::InvalidBest,
+            GitRefResolution::Present(value) => {
+                let Ok(reverified) =
+                    resolve_exact_git_ref(anchor, project_root, &best_reference).await
+                else {
+                    return CodeChangeBaseResolution::InvalidBest;
+                };
+                if reverified == GitRefResolution::Present(value.clone()) {
+                    return CodeChangeBaseResolution::Available(value);
                 }
-                Ok(_) | Err(_) => {}
+                return CodeChangeBaseResolution::InvalidBest;
             }
-            return CodeChangeBaseResolution::InvalidBest;
+            GitRefResolution::Absent => {
+                let Ok(reverified) =
+                    resolve_exact_git_ref(anchor, project_root, &best_reference).await
+                else {
+                    return CodeChangeBaseResolution::InvalidBest;
+                };
+                if reverified != GitRefResolution::Absent {
+                    return CodeChangeBaseResolution::InvalidBest;
+                }
+            }
         }
         let campaign = CampaignRepository::new(self.db)
             .find_by_id(campaign_id)
@@ -702,10 +703,19 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         let Ok(value) = code_change::canonical_full_sha(value.trim()) else {
             return CodeChangeBaseResolution::Unavailable;
         };
-        if value == base {
-            CodeChangeBaseResolution::Available(value)
-        } else {
+        if value != base {
             CodeChangeBaseResolution::Unavailable
+        } else {
+            let Ok(reverified) =
+                resolve_exact_git_ref(anchor, project_root, &best_reference).await
+            else {
+                return CodeChangeBaseResolution::InvalidBest;
+            };
+            if reverified == GitRefResolution::Absent {
+                CodeChangeBaseResolution::Available(value)
+            } else {
+                CodeChangeBaseResolution::InvalidBest
+            }
         }
     }
 
@@ -927,6 +937,13 @@ enum GitRefPresence {
     Invalid,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GitRefResolution {
+    Present(String),
+    Absent,
+    Invalid,
+}
+
 fn read_bounded_git_file(path: &Path) -> Result<Vec<u8>, AppError> {
     use std::io::Read;
 
@@ -1053,11 +1070,20 @@ fn validate_local_git_config_file(path: &Path) -> Result<(), AppError> {
         } else {
             format!("{section}.{key}")
         };
+        let diff_execution_channel = full_key == "diff.external"
+            || (section == "diff"
+                && matches!(key.as_str(), "command" | "textconv" | "trustexitcode"))
+            || (full_key.starts_with("diff.")
+                && matches!(
+                    full_key.rsplit('.').next(),
+                    Some("command" | "textconv" | "trustexitcode")
+                ));
         if section == "filter"
             || key.starts_with("filter.")
             || full_key == "core.worktree"
             || full_key == "include.path"
             || full_key == "includeif.path"
+            || diff_execution_channel
         {
             return Err(AppError::Validation {
                 field: "git.config",
@@ -1132,31 +1158,105 @@ fn parse_packed_refs(contents: &[u8], reference: &str) -> GitRefPresence {
         return GitRefPresence::Invalid;
     };
     let mut presence = GitRefPresence::Absent;
+    let mut target_entries = 0;
+    let mut previous_was_tag = false;
     for line in contents.lines() {
         if line.is_empty() || line.starts_with('#') {
+            previous_was_tag = false;
             continue;
         }
         if let Some(peeled) = line.strip_prefix('^') {
-            if code_change::canonical_full_sha(peeled).is_err() {
+            if !previous_was_tag || code_change::canonical_full_sha(peeled).is_err() {
                 return GitRefPresence::Invalid;
             }
+            previous_was_tag = false;
             continue;
         }
-        let mut fields = line.split_whitespace();
+        if line.trim() != line {
+            return GitRefPresence::Invalid;
+        }
+        let mut fields = line.split(' ');
         let Some(object_id) = fields.next() else {
             return GitRefPresence::Invalid;
         };
         let Some(ref_name) = fields.next() else {
             return GitRefPresence::Invalid;
         };
-        if fields.next().is_some() || code_change::canonical_full_sha(object_id).is_err() {
+        if fields.next().is_some()
+            || code_change::canonical_full_sha(object_id).is_err()
+            || !ref_name.starts_with("refs/")
+        {
             return GitRefPresence::Invalid;
         }
         if ref_name == reference {
+            if target_entries != 0 {
+                return GitRefPresence::Invalid;
+            }
+            target_entries += 1;
             presence = GitRefPresence::Present;
         }
+        previous_was_tag = ref_name.starts_with("refs/tags/");
     }
     presence
+}
+
+async fn resolve_exact_git_ref(
+    anchor: &crate::execution_policy::ExecutableAnchor,
+    project_root: &Path,
+    reference: &str,
+) -> Result<GitRefResolution, AppError> {
+    match classify_exact_git_ref(anchor, project_root, reference).await? {
+        GitRefPresence::Absent => Ok(GitRefResolution::Absent),
+        GitRefPresence::Invalid => Ok(GitRefResolution::Invalid),
+        GitRefPresence::Present => {
+            let revision = format!("{reference}^{{commit}}");
+            let output = run_pinned_git(
+                anchor,
+                project_root,
+                &["rev-parse", "--verify", &revision],
+            )
+            .await?;
+            if !output.status.success() {
+                return Ok(GitRefResolution::Invalid);
+            }
+            let Ok(value) = String::from_utf8(output.stdout) else {
+                return Ok(GitRefResolution::Invalid);
+            };
+            let Ok(value) = code_change::canonical_full_sha(value.trim()) else {
+                return Ok(GitRefResolution::Invalid);
+            };
+            Ok(GitRefResolution::Present(value))
+        }
+    }
+}
+
+fn path_has_symlink_component(path: &Path) -> Result<bool, AppError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new("/")),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(AppError::Validation {
+                    field: "git.metadata",
+                    message: "Git metadata path must not traverse a parent",
+                })
+            }
+            Component::Normal(name) => current.push(name),
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => {
+                return Err(AppError::Runtime {
+                    operation: "inspect pinned Git metadata path",
+                })
+            }
+        }
+    }
+    Ok(false)
 }
 
 async fn git_metadata_path(
@@ -1216,6 +1316,9 @@ async fn classify_exact_git_ref(
         .lines()
         .any(|line| line == reference);
     let loose_path = git_metadata_path(anchor, project_root, reference).await?;
+    if path_has_symlink_component(&loose_path).unwrap_or(true) {
+        return Ok(GitRefPresence::Invalid);
+    }
     let loose_presence = match std::fs::symlink_metadata(loose_path) {
         Ok(metadata) if metadata.is_file() => GitRefPresence::Present,
         Ok(_) => GitRefPresence::Invalid,
@@ -1226,6 +1329,9 @@ async fn classify_exact_git_ref(
         return Ok(GitRefPresence::Invalid);
     }
     let packed_path = git_metadata_path(anchor, project_root, "packed-refs").await?;
+    if path_has_symlink_component(&packed_path).unwrap_or(true) {
+        return Ok(GitRefPresence::Invalid);
+    }
     let packed_presence = match std::fs::symlink_metadata(&packed_path) {
         Ok(metadata) if metadata.is_file() => match read_bounded_git_file(&packed_path) {
             Ok(contents) => parse_packed_refs(&contents, reference),
@@ -1263,8 +1369,6 @@ fn pinned_git_argv(argv: &[&str]) -> Vec<OsString> {
         "core.askPass=",
         "-c",
         "core.sshCommand=",
-        "-c",
-        "diff.external=",
         "-c",
         "commit.gpgSign=false",
         "-c",
@@ -1431,7 +1535,11 @@ async fn run_pinned_git(
             }
         }
     }
-    anchor.verify_identity().map_err(AppError::from)?;
+    drop(wait);
+    if let Err(error) = anchor.verify_identity() {
+        abort_pinned_git(pid, &mut child, &mut stdout_task, &mut stderr_task).await;
+        return Err(error.into());
+    }
     Ok(PinnedGitOutput {
         status: status.expect("Git status was checked"),
         stdout: stdout_bytes.expect("Git stdout was checked"),
@@ -1577,7 +1685,7 @@ mod tests {
         assert!(argv.windows(2).any(|pair| pair == ["-c", "core.hooksPath=/dev/null"]));
         assert!(argv.windows(2).any(|pair| pair == ["-c", "core.fsmonitor=false"]));
         assert!(argv.windows(2).any(|pair| pair == ["-c", "credential.helper="]));
-        assert!(argv.windows(2).any(|pair| pair == ["-c", "diff.external="]));
+        assert!(!argv.windows(2).any(|pair| pair == ["-c", "diff.external="]));
         assert!(argv.windows(2).any(|pair| pair == ["-c", "commit.gpgSign=false"]));
         assert!(argv.contains(&"--no-pager".to_owned()));
         let environment = pinned_git_environment();
@@ -1594,6 +1702,165 @@ mod tests {
         }));
         assert!(validate_git_output_len(MAX_GIT_OUTPUT_BYTES).is_ok());
         assert!(validate_git_output_len(MAX_GIT_OUTPUT_BYTES + 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_git_allows_modified_tracked_file_diff() {
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let git_path = temporary.path().join("git");
+        std::fs::write(&git_path, b"#!/bin/sh\nexec /usr/bin/git \"$@\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&git_path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&git_path, permissions).unwrap();
+        let git = ExecutableAnchor::from_absolute(&git_path, &[]).unwrap();
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.name", "fixture"].as_slice(),
+            ["config", "user.email", "fixture@example.invalid"].as_slice(),
+        ] {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(temporary.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?}: {:?}", args, output);
+        }
+        std::fs::write(temporary.path().join("tracked"), "baseline\n").unwrap();
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["add", "."])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git add: {:?}", output);
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["commit", "-qm", "baseline"])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git commit: {:?}", output);
+        std::fs::write(temporary.path().join("tracked"), "changed\n").unwrap();
+
+        let output = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"])
+            .await
+            .expect("ordinary Git diff must complete");
+
+        assert_eq!(output.status.code(), Some(1));
+    }
+
+    #[test]
+    fn local_git_config_rejects_all_diff_execution_keys_but_allows_remote_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            ("exact", "[diff]\n\texternal = /tmp/sentinel\n"),
+            ("command", "[diff \"driver\"]\n\tcommand = /tmp/sentinel\n"),
+            ("textconv", "[DiFf \"driver\"]\n\ttextConv = /tmp/sentinel\n"),
+            (
+                "trust-exit-code",
+                "[diff \"driver\"]\n\ttrustExitCode = true\n",
+            ),
+        ] {
+            let path = temporary.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            assert!(
+                matches!(
+                    validate_local_git_config_file(&path),
+                    Err(AppError::Validation {
+                        field: "git.config",
+                        ..
+                    })
+                ),
+                "configuration {name} must be rejected"
+            );
+        }
+        let remote = temporary.path().join("remote");
+        std::fs::write(
+            &remote,
+            "[remote \"origin\"]\n\turl = https://example.invalid/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        )
+        .unwrap();
+        assert!(validate_local_git_config_file(&remote).is_ok());
+    }
+
+    #[test]
+    fn packed_refs_reject_duplicate_targets_and_orphan_peeled_lines() {
+        let reference = "refs/heads/campaign/demo/best";
+        let sha = "a".repeat(40);
+        let duplicate = format!("{sha} {reference}\n{sha} {reference}\n");
+        assert_eq!(
+            parse_packed_refs(duplicate.as_bytes(), reference),
+            GitRefPresence::Invalid
+        );
+        let orphan = format!("^{}\n", "b".repeat(40));
+        assert_eq!(
+            parse_packed_refs(orphan.as_bytes(), reference),
+            GitRefPresence::Invalid
+        );
+    }
+
+    #[test]
+    fn packed_refs_accept_unrelated_annotated_tag_peeled_records() {
+        let reference = "refs/heads/campaign/demo/best";
+        let branch = "a".repeat(40);
+        let tag = "b".repeat(40);
+        let peeled = "c".repeat(40);
+        let contents = format!(
+            "{tag} refs/tags/unrelated\n^{peeled}\n{branch} {reference}\n"
+        );
+        assert_eq!(
+            parse_packed_refs(contents.as_bytes(), reference),
+            GitRefPresence::Present
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_git_cleans_up_after_final_anchor_identity_failure() {
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let script = temporary.path().join("git-script");
+        let replacement = temporary.path().join("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&replacement).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&replacement, permissions).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n( /bin/sleep 30 ) >/dev/null 2>&1 &\nprintf '%s' \"$!\" > descendant.pid\n/bin/mv '{}' '{}'\nprintf done\nexit 0\n",
+                replacement.display(),
+                script.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let anchor = ExecutableAnchor::from_absolute(&script, &[]).unwrap();
+
+        let result = match run_pinned_git(&anchor, temporary.path(), &["rev-parse", "HEAD"]).await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("replaced anchor must fail closed"),
+        };
+        assert!(matches!(result, AppError::PolicyViolation { .. }));
+
+        let descendant = std::fs::read_to_string(temporary.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        for _ in 0..100 {
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+        panic!("pinned Git descendant survived final identity cleanup");
     }
 
     #[test]
