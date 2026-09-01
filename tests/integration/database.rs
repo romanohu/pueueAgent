@@ -63,6 +63,11 @@ struct TestDatabase {
 impl TestDatabase {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let path = temp.path().join("state.sqlite3");
         let db = Db::open(&path).unwrap();
         Self {
