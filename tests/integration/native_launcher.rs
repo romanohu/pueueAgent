@@ -102,22 +102,23 @@ fn main() {
         let executable = directory.join("generated-private-temp-target");
         fs::write(
             &source,
-            r#"use std::{env, fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf};
+            r#"use std::{env, fs, os::{fd::AsRawFd, unix::fs::{MetadataExt, PermissionsExt}}, path::PathBuf};
 extern "C" { fn umask(mask: u32) -> u32; }
 
 fn main() {
     let private_temp = PathBuf::from(env::args_os().nth(1).expect("private temp argument"));
     let private_temp_metadata = fs::metadata(&private_temp).expect("private temp path");
     let descriptor = fs::File::open("/dev/fd/11").expect("private temp target descriptor");
+    let private_temp_fd = descriptor.as_raw_fd();
     let descriptor_metadata = descriptor.metadata().expect("private temp target descriptor metadata");
     assert!(descriptor_metadata.is_dir(), "private temp target descriptor is not visible");
     assert_eq!(descriptor_metadata.dev(), private_temp_metadata.dev());
     assert_eq!(descriptor_metadata.ino(), private_temp_metadata.ino());
     for descriptor in 3..=10 {
-        // macOS may reserve fd 3 for a runtime-owned directory after exec;
-        // the remaining protocol descriptors are still required to be closed.
-        #[cfg(target_os = "macos")]
-        if descriptor == 3 {
+        // Opening the verified private-temp descriptor duplicates it at the
+        // lowest available fd. Skip only that exact duplicate and verify
+        // every other protocol descriptor is closed.
+        if descriptor == private_temp_fd {
             continue;
         }
         let descriptor_path = format!("/dev/fd/{descriptor}");
