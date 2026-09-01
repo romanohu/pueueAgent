@@ -706,6 +706,18 @@ pub struct CodeChangeRun {
     pub promotion_expected_old_sha: Option<String>,
     pub promotion_target_sha: Option<String>,
     pub cleanup_completed_at: Option<i64>,
+    /// Descriptor/identity proof retained for durable cleanup authorization.
+    /// These are opaque, bounded encodings of the startup-verified inode
+    /// identities; callers must compare them exactly and never reconstruct a
+    /// capability from a pathname alone.
+    pub state_root_identity: Option<String>,
+    pub worktrees_identity: Option<String>,
+    pub campaign_identity: Option<String>,
+    pub candidate_root_identity: Option<String>,
+    pub candidate_admin_identity: Option<String>,
+    pub candidate_common_identity: Option<String>,
+    pub candidate_admin_path: Option<String>,
+    pub candidate_common_path: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

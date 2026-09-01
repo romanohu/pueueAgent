@@ -11,7 +11,7 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use sha2::{Digest, Sha256};
@@ -95,6 +95,7 @@ impl DiffFacts {
 
 /// Opaque ownership of one detached candidate worktree.  Its root and path
 /// are only produced by the descriptor-checked worktree manager.
+#[cfg(unix)]
 pub struct VerifiedCodeChangeWorktree {
     manager: WorktreeManager,
     candidate: VerifiedProjectRoot,
@@ -102,6 +103,7 @@ pub struct VerifiedCodeChangeWorktree {
     candidate_sha: Option<String>,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for VerifiedCodeChangeWorktree {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -112,6 +114,7 @@ impl std::fmt::Debug for VerifiedCodeChangeWorktree {
     }
 }
 
+#[cfg(unix)]
 impl VerifiedCodeChangeWorktree {
     pub fn path(&self) -> &Path {
         &self.manager.worktree_path
@@ -172,6 +175,30 @@ impl VerifiedCodeChangeWorktree {
             )
             .await
     }
+
+    /// Perform the narrowly-scoped Task 3 best-ref compare-and-swap.  The
+    /// durable authorization is reloaded by the manager immediately before
+    /// the ref boundary; callers cannot supply a campaign/ref independently.
+    pub async fn update_best_ref_cas(
+        &mut self,
+        authorization: &CodeChangeCleanupAuthorization,
+        expected_old_sha: Option<&str>,
+    ) -> Result<(), AppError> {
+        let candidate_sha = self.candidate_sha.clone().ok_or(AppError::Validation {
+            field: "code_change.candidate_sha",
+            message: "must commit the candidate before updating best",
+        })?;
+        let run = authorization.fresh_run()?;
+        self.manager
+            .verify_cleanup_run(&run, Some(&candidate_sha), Some(&self.candidate), authorization)?;
+        CandidateRepository::new(&self.manager, &self.candidate)?
+            .update_best_ref_cas_authorized(
+                authorization,
+                &candidate_sha,
+                expected_old_sha,
+            )
+            .await
+    }
 }
 
 /// A durable, one-run cleanup capability.  It intentionally contains a
@@ -218,6 +245,7 @@ impl CodeChangeCleanupAuthorization {
 /// supplies only the startup policy/project capabilities and a run ID; all
 /// campaign/proposal/worktree identifiers and the base revision come from a
 /// fresh database query.
+#[cfg(unix)]
 pub async fn prepare_code_change_worktree_for_run(
     policy: &ResolvedExecutionPolicy,
     project: &Project,
@@ -241,7 +269,7 @@ pub async fn prepare_code_change_worktree_for_run(
         format!("refs/heads/{}", candidate_ref(&run.campaign_id, &run.proposal_id)?);
     let expected_best_ref = format!("refs/heads/{}", best_ref(&run.campaign_id)?);
     if Path::new(&run.worktree_relative_path) != expected_relative.as_path()
-        || run.worktree_id.is_empty()
+        || run.worktree_id != run.code_change_run_id
         || run.candidate_ref != expected_candidate_ref
         || run.best_ref != expected_best_ref
     {
@@ -257,31 +285,34 @@ pub async fn prepare_code_change_worktree_for_run(
         &run.worktree_id,
         &expected_relative,
     )?;
-    finish_prepared_manager(manager, policy, project, original).await
+    let candidate = finish_prepared_manager(manager, policy, project, original).await?;
+    let proof = candidate.manager.durable_ownership_proof(&candidate.candidate)?;
+    let ownership_result = CodeChangeRepository::new(db).record_worktree_ownership(
+        run_id,
+        &proof.state_root_identity,
+        &proof.worktrees_identity,
+        &proof.campaign_identity,
+        &proof.candidate_root_identity,
+        &proof.candidate_admin_identity,
+        &proof.candidate_common_identity,
+        &proof.candidate_admin_path,
+        &proof.candidate_common_path,
+        unix_timestamp()?,
+    );
+    if let Err(error) = ownership_result {
+        return Err(match candidate
+            .manager
+            .cleanup(Some(&candidate.candidate), None, false)
+            .await
+        {
+            Ok(()) => error,
+            Err(cleanup) => cleanup,
+        });
+    }
+    Ok(candidate)
 }
 
-/// Prepare one owned, detached candidate under the startup-retained state
-/// root. This is the narrow public entry point used by the later coordinator;
-/// all Git and filesystem ownership remains in the private manager types.
-pub async fn prepare_code_change_worktree(
-    policy: &ResolvedExecutionPolicy,
-    project: &Project,
-    original: &ResolvedProjectExecutionPolicy,
-    campaign_id: &str,
-    proposal_id: &str,
-    base_sha: &str,
-) -> Result<VerifiedCodeChangeWorktree, AppError> {
-    let manager = WorktreeManager::new(
-        policy,
-        project,
-        original,
-        campaign_id,
-        proposal_id,
-        base_sha,
-    )?;
-    finish_prepared_manager(manager, policy, project, original).await
-}
-
+#[cfg(unix)]
 async fn finish_prepared_manager(
     mut manager: WorktreeManager,
     policy: &ResolvedExecutionPolicy,
@@ -405,11 +436,10 @@ fn is_worktree_administration(args: &[OsString]) -> bool {
 
 #[cfg(unix)]
 fn descriptor_worktree_leaf(leaf: &str) -> OsString {
-    OsString::from(format!(
-        "{}/{}",
-        git_descriptor_path(GIT_WORKTREE_PARENT_FD),
-        leaf
-    ))
+    // The parent descriptor is installed as the command cwd.  Git receives
+    // only the manager-validated single leaf, so it cannot rediscover a
+    // replaceable absolute candidate pathname.
+    OsString::from(leaf)
 }
 
 const MAX_EDITOR_OUTPUT_BYTES: usize = 64 * 1024;
@@ -757,6 +787,7 @@ pub fn has_project_check(checks: &[ProposedCheck]) -> bool {
 }
 
 #[derive(Clone)]
+#[cfg(unix)]
 struct GitBaseline {
     #[cfg(unix)]
     repository: GitRepositoryProof,
@@ -1171,8 +1202,40 @@ impl GitRepositoryProof {
         }
         Ok(())
     }
+
+    /// Revalidate only the descriptors retained by the manager.  This is the
+    /// missing-target path: Git may have removed the candidate pathname and
+    /// its administration entries, so reopening those pathnames would turn a
+    /// legitimate idempotent cleanup into a pathname race.  The retained
+    /// descriptors still prove that none of the backpointers/configuration
+    /// bytes were replaced before the entries disappeared.
+    fn revalidate_retained_descriptors(&self, root: &VerifiedProjectRoot) -> Result<(), AppError> {
+        let metadata = root.directory.metadata().map_err(|_| recovery_required())?;
+        if !metadata.is_dir()
+            || !secure_metadata_for_git(&metadata)
+            || executable_identity_from_metadata(&metadata) != root.anchor.identity
+        {
+            return Err(recovery_required());
+        }
+        revalidate_git_entry_descriptor(&self.root_git)?;
+        revalidate_git_directory_descriptor(&self.admin)?;
+        revalidate_git_directory_descriptor(&self.common)?;
+        for file in [self.admin_gitdir.as_ref(), self.commondir.as_ref()] {
+            if let Some(file) = file {
+                revalidate_git_file_descriptor(file)?;
+            }
+        }
+        revalidate_git_file_descriptor(&self.common_config)?;
+        for file in [self.admin_config.as_ref(), self.worktree_config.as_ref()] {
+            if let Some(file) = file {
+                revalidate_git_file_descriptor(file)?;
+            }
+        }
+        Ok(())
+    }
 }
 
+#[cfg(unix)]
 struct WorktreeManager {
     policy: ResolvedExecutionPolicy,
     project: Project,
@@ -1194,29 +1257,19 @@ struct WorktreeManager {
     baseline: Option<GitBaseline>,
 }
 
-impl WorktreeManager {
-    fn new(
-        policy: &ResolvedExecutionPolicy,
-        project: &Project,
-        original: &ResolvedProjectExecutionPolicy,
-        campaign_id: &str,
-        proposal_id: &str,
-        base_sha: &str,
-    ) -> Result<Self, AppError> {
-        let worktree_relative_path = owned_worktree_relative_path(campaign_id, proposal_id)?;
-        let worktree_id = format!("{campaign_id}/{proposal_id}");
-        Self::new_with_ownership(
-            policy,
-            project,
-            original,
-            campaign_id,
-            proposal_id,
-            base_sha,
-            &worktree_id,
-            &worktree_relative_path,
-        )
-    }
+struct DurableOwnershipProof {
+    state_root_identity: String,
+    worktrees_identity: String,
+    campaign_identity: String,
+    candidate_root_identity: String,
+    candidate_admin_identity: String,
+    candidate_common_identity: String,
+    candidate_admin_path: String,
+    candidate_common_path: String,
+}
 
+#[cfg(unix)]
+impl WorktreeManager {
     fn new_for_run(
         policy: &ResolvedExecutionPolicy,
         project: &Project,
@@ -1289,6 +1342,43 @@ impl WorktreeManager {
             #[cfg(unix)]
             worktree_parents: None,
             baseline: None,
+        })
+    }
+
+    #[cfg(unix)]
+    fn durable_ownership_proof(
+        &self,
+        candidate: &VerifiedProjectRoot,
+    ) -> Result<DurableOwnershipProof, AppError> {
+        let parents = self.worktree_parents.as_ref().ok_or_else(recovery_required)?;
+        let repository = self
+            .candidate_repository
+            .as_ref()
+            .ok_or_else(recovery_required)?;
+        let candidate_metadata = candidate.directory.metadata().map_err(|_| recovery_required())?;
+        if !candidate_metadata.is_dir()
+            || executable_identity_from_metadata(&candidate_metadata) != candidate.anchor.identity
+        {
+            return Err(recovery_required());
+        }
+        // Read identities from the retained descriptors rather than
+        // reopening replaceable administration pathnames.  This remains
+        // usable for an authorized idempotent cleanup after the worktree
+        // pathname has disappeared.
+        if directory_identity(&repository.admin.directory)? != repository.admin.identity
+            || directory_identity(&repository.common.directory)? != repository.common.identity
+        {
+            return Err(recovery_required());
+        }
+        Ok(DurableOwnershipProof {
+            state_root_identity: identity_token(parents.state_root_identity),
+            worktrees_identity: identity_token(parents.worktrees_identity),
+            campaign_identity: identity_token(parents.campaign_identity),
+            candidate_root_identity: identity_token(candidate.anchor.identity),
+            candidate_admin_identity: identity_token(repository.admin.identity),
+            candidate_common_identity: identity_token(repository.common.identity),
+            candidate_admin_path: repository.admin_path.to_string_lossy().into_owned(),
+            candidate_common_path: repository.common_path.to_string_lossy().into_owned(),
         })
     }
 
@@ -1393,8 +1483,10 @@ impl WorktreeManager {
             "refs/heads/{}",
             candidate_ref(&self.campaign_id, &self.proposal_id)?,
         );
+        let best_ref_name = format!("refs/heads/{}", best_ref(&self.campaign_id)?);
+        let controlled_refs = [owned_ref.as_str(), best_ref_name.as_str()];
         let protected_ref_digest = self
-            .protected_ref_digest(&original_root, &working_directory, Some(&owned_ref))
+            .protected_ref_digest(&original_root, &working_directory, &controlled_refs)
             .await?;
         let existing_candidate_ref = self
             .git(
@@ -1484,12 +1576,21 @@ impl WorktreeManager {
             OsString::from(base),
         ];
         #[cfg(unix)]
-        {
-            let _ = open_worktree_parent(self)?;
-        }
+        let candidate_parent = open_worktree_parent(self)?.ok_or_else(recovery_required)?;
         if let Err(error) = self.validate_original_state().await {
             return Err(self.cleanup_after_prepare_error(error).await);
         }
+        #[cfg(unix)]
+        let output = self
+            .git_os_with_worktree_parent(
+                &original_root,
+                &working_directory,
+                &args,
+                MAX_GIT_OUTPUT_BYTES,
+                Some(candidate_parent),
+            )
+            .await;
+        #[cfg(not(unix))]
         let output = self
             .git_os(&original_root, &working_directory, &args, MAX_GIT_OUTPUT_BYTES)
             .await;
@@ -1548,8 +1649,10 @@ impl WorktreeManager {
             "refs/heads/{}",
             candidate_ref(&self.campaign_id, &self.proposal_id)?,
         );
+        let best_ref_name = format!("refs/heads/{}", best_ref(&self.campaign_id)?);
+        let controlled_refs = [owned_ref.as_str(), best_ref_name.as_str()];
         let protected_ref_digest = match self
-            .protected_ref_digest(&original_root, &working_directory, Some(&owned_ref))
+            .protected_ref_digest(&original_root, &working_directory, &controlled_refs)
             .await
         {
             Ok(digest) => digest,
@@ -1570,16 +1673,14 @@ impl WorktreeManager {
             let error = recovery_required();
             return Err(self.cleanup_after_prepare_error(error).await);
         }
+        let parents = self.worktree_parents.as_ref().ok_or_else(recovery_required)?;
         let candidate = match candidate.mark_code_change_owned(
             self.policy.code_change_state_root_identity(),
-            self.worktree_parents
-                .as_ref()
-                .map(|parents| parents.worktrees_identity)
-                .ok_or_else(recovery_required)?,
-            self.worktree_parents
-                .as_ref()
-                .map(|parents| parents.campaign_identity)
-                .ok_or_else(recovery_required)?,
+            parents.worktrees_identity,
+            parents.campaign_identity,
+            parents.state_root.clone(),
+            parents.worktrees.clone(),
+            parents.campaign.clone(),
             &self.worktree_path,
             &self.worktree_relative_path,
             &self.campaign_id,
@@ -1656,24 +1757,25 @@ impl WorktreeManager {
         let candidate_parent = open_worktree_parent(self)?;
         #[cfg(unix)]
         let Some(candidate_parent) = candidate_parent else {
-            return if allow_missing_target {
-                Ok(())
-            } else {
-                Err(recovery_required())
-            };
+            return Err(recovery_required());
         };
         #[cfg(unix)]
         let candidate_parent_identity = directory_identity(&candidate_parent)?;
         #[cfg(unix)]
         if !directory_entry_exists(&candidate_parent, OsStr::new(&self.proposal_id))? {
+            self.validate_original_state().await?;
             if let Some(repository) = self.candidate_repository.as_ref() {
-                if revalidate_git_directory(&repository.admin).is_ok() {
-                    // The candidate directory disappeared while its linked
-                    // Git administration remains registered.  Treat this as
-                    // an orphan/move requiring recovery, never as idempotent
-                    // cleanup success.
-                    return Err(recovery_required());
-                }
+                // Preserve the descriptor-backed proof even though the
+                // candidate pathname itself is gone.  Any changed retained
+                // metadata is an orphan/replacement and must fail closed.
+                repository.revalidate_retained_descriptors(
+                    candidate.ok_or_else(recovery_required)?,
+                )?;
+            }
+            if self.candidate_ref_exists().await?
+                || self.candidate_admin_registered_elsewhere()?
+            {
+                return Err(recovery_required());
             }
             return if allow_missing_target {
                 Ok(())
@@ -1722,11 +1824,13 @@ impl WorktreeManager {
                 "refs/heads/{}",
                 candidate_ref(&self.campaign_id, &self.proposal_id)?,
             );
+            let best_ref_name = format!("refs/heads/{}", best_ref(&self.campaign_id)?);
+            let controlled_refs = [excluded_ref.as_str(), best_ref_name.as_str()];
             let current_refs = self
                 .protected_ref_digest(
                     &original_root,
                     &working_directory,
-                    Some(&excluded_ref),
+                    &controlled_refs,
                 )
                 .await?;
             if self
@@ -1759,6 +1863,26 @@ impl WorktreeManager {
             if bounded_utf8_line(&actual.stdout, "candidate HEAD")? != expected_sha {
                 return Err(recovery_required());
             }
+            if let Some(candidate_sha) = expected_candidate_sha {
+                let reference = format!(
+                    "refs/heads/{}",
+                    candidate_ref(&self.campaign_id, &self.proposal_id)?
+                );
+                let candidate_ref_output = self
+                    .git(
+                        current,
+                        &VerifiedWorkingDirectory::root(current)?,
+                        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+                        MAX_GIT_OUTPUT_BYTES,
+                    )
+                    .await?;
+                require_success(&candidate_ref_output, "verify candidate ref before cleanup")?;
+                if bounded_utf8_line(&candidate_ref_output.stdout, "candidate ref before cleanup")?
+                    != candidate_sha
+                {
+                    return Err(recovery_required());
+                }
+            }
         }
         if current.is_none() {
             // The durable parent entry proves that Git still registered a
@@ -1788,7 +1912,7 @@ impl WorktreeManager {
             return Err(recovery_required());
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let cleanup_path = descriptor_path(&candidate_directory).into_os_string();
+        let cleanup_path = descriptor_worktree_leaf(&self.proposal_id);
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         let cleanup_path = descriptor_worktree_leaf(&self.proposal_id);
         #[cfg(not(unix))]
@@ -1830,6 +1954,9 @@ impl WorktreeManager {
         if !output.success {
             return Err(recovery_required());
         }
+        if let Some(candidate_sha) = expected_candidate_sha {
+            self.remove_candidate_ref(candidate_sha).await?;
+        }
         self.validate_original_state().await?;
         #[cfg(unix)]
         {
@@ -1850,6 +1977,106 @@ impl WorktreeManager {
         }
     }
 
+    async fn remove_candidate_ref(&self, expected_sha: &str) -> Result<(), AppError> {
+        let reference = format!(
+            "refs/heads/{}",
+            candidate_ref(&self.campaign_id, &self.proposal_id)?
+        );
+        let original_root = self.original.root_anchor.verify_identity()?;
+        let output = self
+            .git(
+                &original_root,
+                &VerifiedWorkingDirectory::root(&original_root)?,
+                &["update-ref", "-d", &reference, expected_sha],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        if !output.success {
+            return Err(recovery_required());
+        }
+        let remaining = self
+            .git(
+                &original_root,
+                &VerifiedWorkingDirectory::root(&original_root)?,
+                &["show-ref", "--verify", "--quiet", &reference],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        if remaining.success || remaining.exit_code != Some(1) {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
+    async fn candidate_ref_exists(&self) -> Result<bool, AppError> {
+        let reference = format!(
+            "refs/heads/{}",
+            candidate_ref(&self.campaign_id, &self.proposal_id)?
+        );
+        let original_root = self.original.root_anchor.verify_identity()?;
+        let output = self
+            .git(
+                &original_root,
+                &VerifiedWorkingDirectory::root(&original_root)?,
+                &["show-ref", "--verify", "--quiet", &reference],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        if output.success {
+            return Ok(true);
+        }
+        if output.exit_code == Some(1) {
+            return Ok(false);
+        }
+        Err(recovery_required())
+    }
+
+    #[cfg(unix)]
+    fn candidate_admin_registered_elsewhere(&self) -> Result<bool, AppError> {
+        let Some(repository) = self.original_repository.as_ref() else {
+            return Err(recovery_required());
+        };
+        let worktrees = match open_existing_directory_at(
+            &repository.common.directory,
+            OsStr::new("worktrees"),
+        ) {
+            Ok(worktrees) => worktrees,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(recovery_required()),
+        };
+        let mut count = 0usize;
+        for entry in
+            fs::read_dir(descriptor_path(&worktrees)).map_err(|_| recovery_required())?
+        {
+            count = count.saturating_add(1);
+            if count > MAX_STATUS_PATHS {
+                return Err(recovery_required());
+            }
+            let entry = entry.map_err(|_| recovery_required())?;
+            let name = entry.file_name();
+            let admin = match open_existing_directory_at(&worktrees, &name) {
+                Ok(admin) => admin,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(recovery_required()),
+            };
+            let Some(gitdir) =
+                read_bounded_entry_at(&admin, OsStr::new("gitdir"), "git.metadata")?
+            else {
+                continue;
+            };
+            let target = parse_git_pointer(&gitdir, &descriptor_path(&admin), GitPointerKind::Path)?;
+            if target == self.worktree_path.join(".git") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(unix))]
+    fn candidate_admin_registered_elsewhere(&self) -> Result<bool, AppError> {
+        Err(recovery_required())
+    }
+
     async fn cleanup_authorized(
         &self,
         candidate: Option<&VerifiedProjectRoot>,
@@ -1857,14 +2084,23 @@ impl WorktreeManager {
         authorization: &CodeChangeCleanupAuthorization,
     ) -> Result<(), AppError> {
         let run = authorization.fresh_run()?;
-        self.verify_cleanup_run(&run, expected_candidate_sha, authorization)?;
-        self.cleanup(candidate, expected_candidate_sha, true).await
+        self.verify_cleanup_run(&run, expected_candidate_sha, candidate, authorization)?;
+        self.cleanup(candidate, expected_candidate_sha, true).await?;
+        // Re-query after the filesystem boundary and persist the outcome
+        // through the repository.  A concurrent DB change therefore cannot
+        // be hidden by an in-memory authorization row.
+        let latest = authorization.fresh_run()?;
+        self.verify_cleanup_run(&latest, expected_candidate_sha, candidate, authorization)?;
+        CodeChangeRepository::new(&authorization.db)
+            .finish_cleanup(&latest.code_change_run_id, unix_timestamp()?)?;
+        Ok(())
     }
 
     fn verify_cleanup_run(
         &self,
         run: &CodeChangeRun,
         expected_candidate_sha: Option<&str>,
+        candidate: Option<&VerifiedProjectRoot>,
         authorization: &CodeChangeCleanupAuthorization,
     ) -> Result<(), AppError> {
         let expected_candidate_ref = format!(
@@ -1885,6 +2121,7 @@ impl WorktreeManager {
             return Err(recovery_required());
         }
         verify_durable_run_scope(&authorization.db, run, &self.project)?;
+        self.verify_durable_ownership_proof(run, candidate)?;
         if !matches!(
             run.state,
             CodeChangeState::CandidateReady
@@ -1915,6 +2152,7 @@ impl WorktreeManager {
             }
         }
         let connection = authorization.db.connect()?;
+        let mut authoritative_rows = 0usize;
         if let Some(experiment_id) = run.experiment_id.as_deref() {
             let mut statement = connection
                 .prepare(
@@ -1945,6 +2183,17 @@ impl WorktreeManager {
                 {
                     return Err(recovery_required());
                 }
+                if !matches!(
+                    status.as_str(),
+                    "starting"
+                        | "running"
+                        | "completed"
+                        | "failed"
+                        | "timed_out"
+                        | "cancelled"
+                ) {
+                    return Err(recovery_required());
+                }
                 if matches!(status.as_str(), "starting" | "running") && pid.is_none() {
                     return Err(recovery_required());
                 }
@@ -1957,12 +2206,13 @@ impl WorktreeManager {
                 // not enough durable evidence that no live process remains.
                 return Err(recovery_required());
             }
+            authoritative_rows = authoritative_rows.saturating_add(lineage_rows);
         }
         let mut statement = connection
             .prepare(
-                "SELECT a.status, r.pid, r.project_id
+                "SELECT a.status, r.pid, r.project_id, r.run_id
                  FROM code_change_editor_attempts AS a
-                 JOIN agent_runs AS r ON r.run_id = a.agent_run_id
+                 LEFT JOIN agent_runs AS r ON r.run_id = a.agent_run_id
                  WHERE a.code_change_run_id = ?1",
             )
             .map_err(crate::db::database_error("inspect code-change editor liveness"))?;
@@ -1971,14 +2221,18 @@ impl WorktreeManager {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             })
             .map_err(crate::db::database_error("read code-change editor liveness"))?;
         for row in rows {
-            let (status, pid, agent_project) = row
+            let (status, pid, agent_project, agent_run_id) = row
                 .map_err(crate::db::database_error("read code-change editor liveness"))?;
-            if agent_project != self.project.project_id {
+            if agent_run_id.is_none() || agent_project.as_deref() != Some(self.project.project_id.as_str()) {
+                return Err(recovery_required());
+            }
+            if !matches!(status.as_str(), "reserved" | "running" | "ready" | "failed") {
                 return Err(recovery_required());
             }
             if matches!(status.as_str(), "reserved" | "running") && pid.is_none() {
@@ -1987,6 +2241,37 @@ impl WorktreeManager {
             if pid.is_some_and(process_is_alive) {
                 return Err(recovery_required());
             }
+            authoritative_rows = authoritative_rows.saturating_add(1);
+        }
+        if authoritative_rows == 0 {
+            // Absence of an experiment/editor lineage row is not evidence
+            // that no process is live; cleanup must fail closed.
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn verify_durable_ownership_proof(
+        &self,
+        run: &CodeChangeRun,
+        candidate: Option<&VerifiedProjectRoot>,
+    ) -> Result<(), AppError> {
+        let candidate = candidate.ok_or_else(recovery_required)?;
+        let proof = self.durable_ownership_proof(candidate)?;
+        if run.state_root_identity.as_deref() != Some(proof.state_root_identity.as_str())
+            || run.worktrees_identity.as_deref() != Some(proof.worktrees_identity.as_str())
+            || run.campaign_identity.as_deref() != Some(proof.campaign_identity.as_str())
+            || run.candidate_root_identity.as_deref()
+                != Some(proof.candidate_root_identity.as_str())
+            || run.candidate_admin_identity.as_deref()
+                != Some(proof.candidate_admin_identity.as_str())
+            || run.candidate_common_identity.as_deref()
+                != Some(proof.candidate_common_identity.as_str())
+            || run.candidate_admin_path.as_deref() != Some(proof.candidate_admin_path.as_str())
+            || run.candidate_common_path.as_deref() != Some(proof.candidate_common_path.as_str())
+        {
+            return Err(recovery_required());
         }
         Ok(())
     }
@@ -2036,9 +2321,34 @@ impl WorktreeManager {
         } else {
             None
         };
+        if let Some(parent) = parent.as_ref() {
+            let expected = self
+                .worktree_parents
+                .as_ref()
+                .ok_or_else(recovery_required)?
+                .campaign_identity;
+            if directory_identity(parent)? != expected {
+                return Err(recovery_required());
+            }
+        }
+        let command_working_directory = if let Some(parent) = parent.as_ref() {
+            let parent_path = self
+                .worktree_parents
+                .as_ref()
+                .ok_or_else(recovery_required)?
+                .campaign_path
+                .clone();
+            VerifiedWorkingDirectory::from_owned_descriptor(
+                parent.try_clone().map_err(|_| recovery_required())?,
+                parent_path,
+                root.anchor.identity,
+            )?
+        } else {
+            working_directory.try_clone().map_err(|_| recovery_required())?
+        };
         self.run_git_owned(
             root,
-            working_directory,
+            &command_working_directory,
             argv,
             cap,
             environment,
@@ -2165,7 +2475,7 @@ impl WorktreeManager {
         &self,
         root: &VerifiedProjectRoot,
         working_directory: &VerifiedWorkingDirectory,
-        candidate_ref: Option<&str>,
+        excluded_refs: &[&str],
     ) -> Result<String, AppError> {
         let output = self
             .git(
@@ -2176,7 +2486,7 @@ impl WorktreeManager {
             )
             .await?;
         require_success(&output, "inspect protected Git refs")?;
-        digest_protected_refs(&output.stdout, candidate_ref)
+        digest_protected_refs(&output.stdout, excluded_refs)
     }
 
     async fn remote_config_digest(
@@ -2244,8 +2554,10 @@ impl WorktreeManager {
             "refs/heads/{}",
             candidate_ref(&self.campaign_id, &self.proposal_id)?,
         );
+        let best_ref_name = format!("refs/heads/{}", best_ref(&self.campaign_id)?);
+        let controlled_refs = [excluded_ref.as_str(), best_ref_name.as_str()];
         let refs = self
-            .protected_ref_digest(&original_root, &working_directory, Some(&excluded_ref))
+            .protected_ref_digest(&original_root, &working_directory, &controlled_refs)
             .await?;
         if refs != baseline.protected_ref_digest {
             return Err(recovery_required());
@@ -2260,11 +2572,13 @@ impl WorktreeManager {
     }
 }
 
+#[cfg(unix)]
 struct CandidateValidator<'a> {
     manager: &'a WorktreeManager,
     candidate: &'a VerifiedProjectRoot,
 }
 
+#[cfg(unix)]
 impl<'a> CandidateValidator<'a> {
     fn new(
         manager: &'a WorktreeManager,
@@ -2333,12 +2647,18 @@ impl<'a> CandidateValidator<'a> {
         if remote != baseline.remote_config_digest {
             return Err(recovery_required());
         }
+        let candidate_ref_name = format!(
+            "refs/heads/{}",
+            candidate_ref(&self.manager.campaign_id, &self.manager.proposal_id)?,
+        );
+        let best_ref_name = format!("refs/heads/{}", best_ref(&self.manager.campaign_id)?);
+        let controlled_refs = [candidate_ref_name.as_str(), best_ref_name.as_str()];
         let refs = self
             .manager
             .protected_ref_digest(
                 &candidate,
                 &working_directory,
-                Some(&format!("refs/heads/{}", candidate_ref(&self.manager.campaign_id, &self.manager.proposal_id)?)),
+                &controlled_refs,
             )
             .await?;
         if refs != baseline.protected_ref_digest {
@@ -2444,11 +2764,13 @@ impl<'a> CandidateValidator<'a> {
     }
 }
 
+#[cfg(unix)]
 struct CandidateRepository<'a> {
     manager: &'a WorktreeManager,
     candidate: &'a VerifiedProjectRoot,
 }
 
+#[cfg(unix)]
 impl<'a> CandidateRepository<'a> {
     fn new(
         manager: &'a WorktreeManager,
@@ -2735,12 +3057,15 @@ impl<'a> CandidateRepository<'a> {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn update_best_ref_cas(
+    async fn update_best_ref_cas_authorized(
         &self,
+        authorization: &CodeChangeCleanupAuthorization,
         new_sha: &str,
         expected_old_sha: Option<&str>,
     ) -> Result<(), AppError> {
+        let run = authorization.fresh_run()?;
+        self.manager
+            .verify_cleanup_run(&run, Some(new_sha), Some(self.candidate), authorization)?;
         self.manager.validate_original_state().await?;
         canonical_full_sha(new_sha)?;
         let zero = self.manager.zero_object_id()?;
@@ -2750,37 +3075,156 @@ impl<'a> CandidateRepository<'a> {
                 "candidate object ID does not match the repository format",
             ));
         }
-        let expected = expected_old_sha.unwrap_or(&zero);
-        if expected != zero.as_str() {
-            canonical_full_sha(expected)?;
-            if expected.len() != zero.len() {
-                return Err(validation(
-                    "code_change.sha",
-                    "expected object ID does not match the repository format",
-                ));
+        let expected = match expected_old_sha {
+            Some(value) => {
+                canonical_full_sha(value)?;
+                if value.len() != zero.len() {
+                    return Err(validation(
+                        "code_change.sha",
+                        "expected object ID does not match the repository format",
+                    ));
+                }
+                value.to_owned()
             }
-        }
+            None => zero.clone(),
+        };
+        self.verify_candidate_ref(new_sha).await?;
+        let original_root = self.manager.original.root_anchor.verify_identity()?;
+        let original_cwd = VerifiedWorkingDirectory::root(&original_root)?;
         let reference = format!("refs/heads/{}", best_ref(&self.manager.campaign_id)?);
+        let current = self
+            .read_ref(&original_root, &original_cwd, &reference)
+            .await?;
+        match expected_old_sha {
+            Some(expected) if current.as_deref() != Some(expected) => {
+                return Err(recovery_required());
+            }
+            None if current.is_some() => return Err(recovery_required()),
+            _ => {}
+        }
         let output = self
             .manager
             .git(
-                self.candidate,
-                &VerifiedWorkingDirectory::root(self.candidate)?,
-                &["update-ref", &reference, new_sha, expected],
+                &original_root,
+                &original_cwd,
+                &["update-ref", &reference, new_sha, &expected],
                 MAX_GIT_OUTPUT_BYTES,
             )
             .await?;
-        let result = if output.success {
-            Ok(())
-        } else {
-            Err(recovery_required())
-        };
-        let boundary = self.manager.validate_original_state().await;
-        match (result, boundary) {
-            (_, Err(error)) => Err(error),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
+        if !output.success {
+            return Err(recovery_required());
         }
+        let post = match self
+            .read_ref(&original_root, &original_cwd, &reference)
+            .await
+        {
+            Ok(post) => post,
+            Err(error) => {
+                let rollback = self
+                    .manager
+                    .git(
+                        &original_root,
+                        &original_cwd,
+                        &["update-ref", &reference, &expected, new_sha],
+                        MAX_GIT_OUTPUT_BYTES,
+                    )
+                    .await
+                    .ok()
+                    .filter(|output| output.success)
+                    .is_some();
+                if !rollback {
+                    return Err(recovery_required());
+                }
+                return Err(error);
+            }
+        };
+        if post.as_deref() != Some(new_sha) {
+            // A concurrent writer changed the ref between the CAS and the
+            // postcondition read.  Restore only our exact value with another
+            // CAS; never overwrite the concurrent writer's value.
+            let _ = self
+                .manager
+                .git(
+                    &original_root,
+                    &original_cwd,
+                    &["update-ref", &reference, &expected, new_sha],
+                    MAX_GIT_OUTPUT_BYTES,
+                )
+                .await;
+            return Err(recovery_required());
+        }
+        if let Err(error) = self.verify_candidate_ref(new_sha).await {
+            let rollback = self
+                .manager
+                .git(
+                    &original_root,
+                    &original_cwd,
+                    &["update-ref", &reference, &expected, new_sha],
+                    MAX_GIT_OUTPUT_BYTES,
+                )
+                .await
+                .ok()
+                .filter(|output| output.success)
+                .is_some();
+            if !rollback {
+                return Err(recovery_required());
+            }
+            return Err(error);
+        }
+        let boundary = self.manager.validate_original_state().await;
+        if let Err(error) = boundary {
+            let rollback = self
+                .manager
+                .git(
+                    &original_root,
+                    &original_cwd,
+                    &["update-ref", &reference, &expected, new_sha],
+                    MAX_GIT_OUTPUT_BYTES,
+                )
+                .await
+                .ok()
+                .filter(|output| output.success)
+                .is_some();
+            if !rollback {
+                return Err(recovery_required());
+            }
+            return Err(error);
+        }
+        self.manager.validate_original_state().await
+    }
+
+    async fn read_ref(
+        &self,
+        root: &VerifiedProjectRoot,
+        working_directory: &VerifiedWorkingDirectory,
+        reference: &str,
+    ) -> Result<Option<String>, AppError> {
+        let output = self
+            .manager
+            .git(
+                root,
+                working_directory,
+                &["show-ref", "--verify", "--quiet", reference],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        if !output.success && output.exit_code == Some(1) {
+            return Ok(None);
+        }
+        if !output.success {
+            return Err(recovery_required());
+        }
+        let output = self
+            .manager
+            .git(
+                root,
+                working_directory,
+                &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&output, "read best ref")?;
+        Ok(Some(bounded_utf8_line(&output.stdout, "best ref")?.to_owned()))
     }
 }
 
@@ -2852,18 +3296,18 @@ impl Drop for ToolProcessLease {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        // A cancelled caller cannot await an async cleanup path. Keep the
-        // temporary-index owner alive in the cleanup task until the process
-        // group has been terminated and the helper reaped. This prevents a
-        // detached Git/tool child from observing a dropped index pathname.
         let temporary_index = self.temporary_index.take();
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(30))
-            .unwrap_or_else(Instant::now);
-        tokio::spawn(async move {
-            let _ = terminate_process_group_before(&mut child, deadline).await;
-            drop(temporary_index);
-        });
+        // Cancellation cannot leave a detached task holding the Git index
+        // pathname.  Reap the complete owned group synchronously before the
+        // temporary owner is dropped; retain the index for recovery if the
+        // kernel does not prove quiescence.
+        let result = child.terminate_and_reap_blocking();
+        if result.is_err() {
+            if let Some(index) = temporary_index.as_ref() {
+                index.retain_for_recovery();
+            }
+        }
+        drop(temporary_index);
     }
 }
 
@@ -3037,12 +3481,14 @@ impl BoundedToolRunner {
 /// protocol.  The result is a bounded digest list; check output is discarded
 /// as soon as the caller has enough information to classify the outcome.
 #[allow(dead_code)]
+#[cfg(unix)]
 struct CheckRunner<'a> {
     manager: &'a WorktreeManager,
     candidate: &'a VerifiedProjectRoot,
 }
 
 #[allow(dead_code)]
+#[cfg(unix)]
 impl<'a> CheckRunner<'a> {
     async fn run(
         &self,
@@ -3301,6 +3747,7 @@ fn executable_identity_from_metadata(metadata: &fs::Metadata) -> ExecutableIdent
     }
 }
 
+#[cfg(unix)]
 fn require_success(output: &BoundedToolOutput, _operation: &'static str) -> Result<(), AppError> {
     if output.success {
         Ok(())
@@ -3311,6 +3758,7 @@ fn require_success(output: &BoundedToolOutput, _operation: &'static str) -> Resu
     }
 }
 
+#[cfg(unix)]
 fn bounded_utf8_line<'a>(bytes: &'a [u8], _summary: &'static str) -> Result<&'a str, AppError> {
     if bytes.len() > MAX_GIT_OUTPUT_BYTES {
         return Err(AppError::Validation {
@@ -3340,6 +3788,32 @@ fn recovery_required() -> AppError {
     AppError::Runtime {
         operation: "recover code-change ownership",
     }
+}
+
+fn identity_token(identity: ExecutableIdentity) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        identity.device, identity.inode, identity.owner, identity.mode
+    )
+}
+
+/// Public Task 3 recovery entry point.  The coordinator uses the repository
+/// query rather than an in-memory list so recovery decisions are durable and
+/// bounded by the caller's requested limit.
+pub fn list_recoverable_code_change_runs(
+    db: &Db,
+    limit: usize,
+) -> Result<Vec<CodeChangeRun>, AppError> {
+    CodeChangeRepository::new(db).list_recoverable(limit)
+}
+
+fn unix_timestamp() -> Result<i64, AppError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .map_err(|_| AppError::Runtime {
+            operation: "represent code-change lifecycle timestamp",
+        })
 }
 
 #[cfg(unix)]
@@ -3403,6 +3877,7 @@ fn verify_durable_run_scope(
     Ok(())
 }
 
+#[cfg(unix)]
 fn inspect_common_directory<'a>(
     manager: &'a WorktreeManager,
     root: &'a VerifiedProjectRoot,
@@ -3632,6 +4107,50 @@ fn revalidate_git_entry(proof: &GitEntryProof) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
+fn revalidate_git_directory_descriptor(proof: &GitDirectoryProof) -> Result<(), AppError> {
+    let metadata = proof.directory.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_dir()
+        || !secure_metadata_for_git(&metadata)
+        || proof.identity != executable_identity_from_metadata(&metadata)
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn revalidate_git_file_descriptor(proof: &GitFileProof) -> Result<(), AppError> {
+    let metadata = proof.file.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_file()
+        || !secure_metadata_for_git(&metadata)
+        || proof.identity != executable_identity_from_metadata(&metadata)
+    {
+        return Err(recovery_required());
+    }
+    let bytes = read_bounded_descriptor(&proof.file, "git.metadata")?;
+    if sha256_hex(&bytes) != proof.digest {
+        return Err(recovery_required());
+    }
+    let target = match (proof.target_base.as_deref(), proof.pointer_kind) {
+        (Some(base), Some(kind)) => Some(parse_git_pointer(&bytes, base, kind)?),
+        (None, None) => None,
+        _ => return Err(recovery_required()),
+    };
+    if target != proof.target {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn revalidate_git_entry_descriptor(proof: &GitEntryProof) -> Result<(), AppError> {
+    match proof {
+        GitEntryProof::Directory(directory) => revalidate_git_directory_descriptor(directory),
+        GitEntryProof::File(file) => revalidate_git_file_descriptor(file),
+    }
+}
+
+#[cfg(unix)]
 fn existing_regular_path(path: &Path) -> Result<Option<PathBuf>, AppError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(recovery_required()),
@@ -3830,6 +4349,37 @@ fn read_bounded_file(path: &Path, field: &'static str) -> Result<Vec<u8>, AppErr
         return Err(validation(field, "exceeds the bounded Git metadata size"));
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_bounded_entry_at(
+    parent: &File,
+    name: &OsStr,
+    field: &'static str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| validation(field, "metadata entry name contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(recovery_required());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_file() {
+        return Err(validation(field, "metadata entry must be a regular file"));
+    }
+    read_bounded_descriptor(&file, field).map(Some)
 }
 
 fn path_has_symlink_component(path: &Path) -> Result<bool, AppError> {
@@ -4099,7 +4649,7 @@ fn validate_local_git_config(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn digest_protected_refs(bytes: &[u8], excluded_ref: Option<&str>) -> Result<String, AppError> {
+fn digest_protected_refs(bytes: &[u8], excluded_refs: &[&str]) -> Result<String, AppError> {
     if bytes.len() > MAX_GIT_OUTPUT_BYTES {
         return Err(validation(
             "code_change.git_refs",
@@ -4137,7 +4687,7 @@ fn digest_protected_refs(bytes: &[u8], excluded_ref: Option<&str>) -> Result<Str
             ));
         }
         canonical_full_sha(object)?;
-        if excluded_ref != Some(reference) {
+        if !excluded_refs.iter().any(|excluded| *excluded == reference) {
             values.push((reference.to_owned(), object.to_owned()));
         }
     }
@@ -4750,7 +5300,22 @@ impl OwnedTemporaryIndex {
             }
             let directory = match open_existing_directory_at(&parent, &directory_name) {
                 Ok(directory) => Arc::new(directory),
-                Err(_) => return Err(recovery_required()),
+                Err(_) => {
+                    // Reopen by the manager's unique name solely to prove
+                    // the directory identity before attempting its removal;
+                    // a failed open otherwise leaves a recovery artifact.
+                    if let Ok(directory) = open_existing_directory_at(&parent, &directory_name)
+                    {
+                        if let Ok(identity) = directory_identity(&directory) {
+                            let _ = remove_owned_temp_directory(
+                                &parent,
+                                &directory_name,
+                                identity,
+                            );
+                        }
+                    }
+                    return Err(recovery_required());
+                }
             };
             let name = OsString::from("index");
             let name_c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
@@ -4892,6 +5457,20 @@ impl OwnedTemporaryIndex {
             error
         })?;
         if let Some(current) = current_index {
+            let expected = *self
+                .identity
+                .lock()
+                .map_err(|_| recovery_required())?;
+            if expected != Some(current)
+                && !temporary_index_has_git_signature(&self.directory, &self.name)?
+            {
+                // Git legitimately replaces index with index.lock and then
+                // renames the lock into place.  Only a bounded, structurally
+                // valid Git index can be adopted as that rename; an unknown
+                // same-name inode remains retained for recovery.
+                self.unproven.store(true, Ordering::Release);
+                return Err(recovery_required());
+            }
             *self
                 .identity
                 .lock()
@@ -4903,17 +5482,20 @@ impl OwnedTemporaryIndex {
                 error
             })?;
         if let Some(current_lock) = current_lock {
-            let mut expected = self
+            let expected = *self
                 .lock_identity
                 .lock()
                 .map_err(|_| recovery_required())?;
-            if expected.is_some() && *expected != Some(current_lock) {
+            if expected != Some(current_lock) {
                 self.unproven.store(true, Ordering::Release);
                 return Err(recovery_required());
             }
-            *expected = Some(current_lock);
         }
         Ok(())
+    }
+
+    fn retain_for_recovery(&self) {
+        self.unproven.store(true, Ordering::Release);
     }
 }
 
@@ -4962,6 +5544,12 @@ fn remove_owned_temp_entry(
     name: &OsStr,
     initial_identity: Option<ExecutableIdentity>,
 ) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return quarantine_owned_temp_entry(parent, name, initial_identity, false);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
     let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
         return false;
     };
@@ -4997,6 +5585,7 @@ fn remove_owned_temp_entry(
         return false;
     }
     unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) == 0 }
+    }
 }
 
 #[cfg(unix)]
@@ -5005,6 +5594,12 @@ fn remove_owned_temp_directory(
     name: &OsStr,
     expected_identity: ExecutableIdentity,
 ) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return quarantine_owned_temp_entry(parent, name, Some(expected_identity), true);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
     let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
         return false;
     };
@@ -5034,6 +5629,118 @@ fn remove_owned_temp_directory(
         return false;
     }
     unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) == 0 }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn quarantine_owned_temp_entry(
+    parent: &File,
+    name: &OsStr,
+    expected_identity: Option<ExecutableIdentity>,
+    directory: bool,
+) -> bool {
+    let Ok(source) = std::ffi::CString::new(name.as_bytes()) else {
+        return false;
+    };
+    let quarantine_name = OsString::from(format!(
+        ".code-change-quarantine-{}-{}",
+        std::process::id(),
+        TEMP_INDEX_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let Ok(quarantine) = std::ffi::CString::new(quarantine_name.as_bytes()) else {
+        return false;
+    };
+    // renameat2(RENAME_NOREPLACE) moves the exact current directory entry
+    // into a manager-generated capability name atomically.  If a concurrent
+    // actor replaced the source, the moved inode is inspected and restored;
+    // it is never unlinked merely because the source name matched.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            quarantine.as_ptr(),
+            1u32,
+        )
+    };
+    if result != 0 {
+        return false;
+    }
+    let identity = match if directory {
+        open_existing_directory_at(parent, &quarantine_name)
+            .and_then(|entry| directory_identity(&entry))
+    } else {
+        match temporary_entry_identity(parent, &quarantine_name) {
+            Ok(Some(identity)) => Ok(identity),
+            Ok(None) => Err(recovery_required()),
+            Err(error) => Err(error),
+        }
+    } {
+        Ok(identity) => identity,
+        _ => {
+            restore_quarantined_entry(parent, &quarantine_name, name);
+            return false;
+        }
+    };
+    if expected_identity != Some(identity)
+        || (directory && !entry_is_directory(parent, &quarantine_name))
+        || (!directory && entry_is_directory(parent, &quarantine_name))
+    {
+        restore_quarantined_entry(parent, &quarantine_name, name);
+        return false;
+    }
+    let removed = unsafe {
+        libc::unlinkat(
+            parent.as_raw_fd(),
+            quarantine.as_ptr(),
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        ) == 0
+    };
+    if !removed {
+        restore_quarantined_entry(parent, &quarantine_name, name);
+    }
+    removed
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn entry_is_directory(parent: &File, name: &OsStr) -> bool {
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return false;
+    }
+    unsafe { stat.assume_init() }.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn restore_quarantined_entry(parent: &File, quarantine: &OsStr, original: &OsStr) {
+    let Ok(quarantine) = std::ffi::CString::new(quarantine.as_bytes()) else {
+        return;
+    };
+    let Ok(original) = std::ffi::CString::new(original.as_bytes()) else {
+        return;
+    };
+    unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            parent.as_raw_fd(),
+            quarantine.as_ptr(),
+            parent.as_raw_fd(),
+            original.as_ptr(),
+            1u32,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -5077,6 +5784,36 @@ fn temporary_entry_identity(
         owner: stat.st_uid,
         mode: stat.st_mode as u32 & 0o7777,
     }))
+}
+
+#[cfg(unix)]
+fn temporary_index_has_git_signature(parent: &File, name: &OsStr) -> Result<bool, AppError> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| validation("code_change.index", "temporary index name is invalid"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(recovery_required());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_file() || metadata.len() > MAX_GIT_OUTPUT_BYTES as u64 {
+        return Ok(false);
+    }
+    let mut header = [0u8; 12];
+    let read = file.read_at(&mut header, 0).map_err(|_| recovery_required())?;
+    if read != header.len() || &header[..4] != b"DIRC" {
+        return Ok(false);
+    }
+    let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    let _entries = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    Ok((2..=4).contains(&version)
+        && metadata.len() >= 12 + 20)
 }
 
 fn validate_internal_id(field: &'static str, value: &str) -> Result<(), AppError> {
@@ -5455,10 +6192,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn owned_temporary_index_record_after_command_rejects_same_name_replacement() {
+        let root = tempdir().unwrap();
+        let path = root.path().join(".owned-index/index");
+        let index = test_owned_index(root.path());
+        let replacement = root.path().join("replacement-index");
+        fs::write(&replacement, b"untrusted replacement").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert!(index.record_after_command().is_err());
+        assert!(path.exists(), "an untrusted replacement must be retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ignored_status_walk_rejects_recursive_protected_descendants() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join("build")).unwrap();
         fs::write(root.path().join("build/.env"), b"secret").unwrap();
+        assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_err());
+
+        fs::remove_file(root.path().join("build/.env")).unwrap();
+        fs::write(root.path().join("build/.ENV"), b"secret").unwrap();
+        assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_err());
+
+        fs::remove_file(root.path().join("build/.ENV")).unwrap();
+        fs::create_dir(root.path().join("build/nested")).unwrap();
+        fs::write(root.path().join("build/nested/credentials.txt"), b"secret").unwrap();
+        assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_err());
+
+        fs::remove_file(root.path().join("build/nested/credentials.txt")).unwrap();
+        fs::write(root.path().join("build/nested/.git"), b"gitdir: nowhere\n").unwrap();
         assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_err());
     }
 
@@ -5494,6 +6257,25 @@ mod tests {
         assert!(validate_ignored_tree(root.path(), &[PathBuf::from("bytes/")]).is_err());
     }
 
+    #[test]
+    fn protected_ref_digest_excludes_only_controlled_candidate_and_best() {
+        let initial = b"refs/heads/campaign/a/candidate/p\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0refs/heads/campaign/a/best\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0refs/heads/main\0cccccccccccccccccccccccccccccccccccccccc\0";
+        let controlled_changed = b"refs/heads/campaign/a/candidate/p\0dddddddddddddddddddddddddddddddddddddddd\0refs/heads/campaign/a/best\0eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\0refs/heads/main\0cccccccccccccccccccccccccccccccccccccccc\0";
+        let unrelated_changed = b"refs/heads/campaign/a/candidate/p\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0refs/heads/campaign/a/best\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0refs/heads/main\0ffffffffffffffffffffffffffffffffffffffff\0";
+        let excluded = [
+            "refs/heads/campaign/a/candidate/p",
+            "refs/heads/campaign/a/best",
+        ];
+        assert_eq!(
+            digest_protected_refs(initial, &excluded).unwrap(),
+            digest_protected_refs(controlled_changed, &excluded).unwrap()
+        );
+        assert_ne!(
+            digest_protected_refs(initial, &excluded).unwrap(),
+            digest_protected_refs(unrelated_changed, &excluded).unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn git_descriptor_environment_uses_fixed_rights() {
@@ -5513,11 +6295,18 @@ mod tests {
         assert!(!environment.values().any(|value| value.contains(".git")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worktree_administration_uses_only_a_single_relative_leaf() {
+        assert_eq!(descriptor_worktree_leaf("proposal"), OsString::from("proposal"));
+    }
+
     #[test]
     fn cleanup_authorization_requires_a_fresh_durable_run_row() {
         let root = tempdir().unwrap();
         let db = crate::db::Db::open(&root.path().join("agent.sqlite")).unwrap();
         assert!(CodeChangeCleanupAuthorization::load(&db, "missing-run").is_err());
+        assert!(list_recoverable_code_change_runs(&db, 10).unwrap().is_empty());
     }
 
     #[cfg(unix)]

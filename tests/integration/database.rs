@@ -14336,7 +14336,7 @@ fn schema_v26_adds_isolated_code_change_state() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
     for table in [
         "code_change_runs",
         "code_change_editor_attempts",
@@ -14368,6 +14368,32 @@ fn schema_v26_adds_isolated_code_change_state() {
             )
             .unwrap();
         assert_eq!(present, 1, "{table}.{column}");
+    }
+}
+
+#[test]
+fn code_change_run_persists_exact_cleanup_identity_proof_columns() {
+    let temporary = tempfile::tempdir().unwrap();
+    let db = Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+    let connection = db.connect().unwrap();
+    for column in [
+        "state_root_identity",
+        "worktrees_identity",
+        "campaign_identity",
+        "candidate_root_identity",
+        "candidate_admin_identity",
+        "candidate_common_identity",
+        "candidate_admin_path",
+        "candidate_common_path",
+    ] {
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('code_change_runs') WHERE name=?1",
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "code_change_runs.{column}");
     }
 }
 

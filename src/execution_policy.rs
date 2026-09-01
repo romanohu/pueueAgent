@@ -217,11 +217,15 @@ pub struct ProjectRootAnchor {
     pub resolution_fingerprint: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct CodeChangeWorktreeOwnership {
     state_root_identity: ExecutableIdentity,
     worktrees_identity: ExecutableIdentity,
     campaign_identity: ExecutableIdentity,
+    state_root: Arc<File>,
+    worktrees: Arc<File>,
+    campaign: Arc<File>,
+    proposal: Arc<File>,
     canonical_path: PathBuf,
     worktree_relative_path: PathBuf,
     campaign_id: String,
@@ -348,6 +352,38 @@ impl VerifiedWorkingDirectory {
 
     pub fn root(root: &VerifiedProjectRoot) -> Result<Self, PolicyViolation> {
         Self::open_descendant(root, Path::new("."))
+    }
+
+    /// Construct a working-directory capability from a descriptor retained by
+    /// a narrowly-scoped owner (currently the code-change worktree parent).
+    /// The descriptor is never reopened by the native launcher.  The supplied
+    /// root identity binds this capability to the same verified project
+    /// operation while allowing Git's administrative commands to run from
+    /// their retained parent directory.
+    #[cfg(unix)]
+    pub(crate) fn from_owned_descriptor(
+        directory: File,
+        canonical_path: PathBuf,
+        root_identity: ExecutableIdentity,
+    ) -> Result<Self, PolicyViolation> {
+        let metadata = directory.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::NativeGate,
+            )
+        })?;
+        if !metadata.is_dir() || !secure_metadata(&metadata) {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::NativeGate,
+            ));
+        }
+        Ok(Self {
+            directory,
+            canonical_path,
+            identity: identity(&metadata),
+            root_identity,
+        })
     }
 
     pub fn canonical_path(&self) -> &Path {
@@ -551,6 +587,38 @@ impl ResolvedExecutionPolicy {
             || ownership.canonical_path != expected_owned_path
             || ownership.worktree_relative_path != expected_relative_path
             || ownership.worktree_id.is_empty()
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        for (descriptor, expected) in [
+            (&ownership.state_root, ownership.state_root_identity),
+            (&ownership.worktrees, ownership.worktrees_identity),
+            (&ownership.campaign, ownership.campaign_identity),
+        ] {
+            let metadata = descriptor.metadata().map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::PreBinding,
+                )
+            })?;
+            if !metadata.is_dir() || identity(&metadata) != expected {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::PreBinding,
+                ));
+            }
+        }
+        let proposal_metadata = ownership.proposal.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        if !proposal_metadata.is_dir()
+            || identity(&proposal_metadata) != candidate.anchor.identity
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::RootChanged,
@@ -1392,6 +1460,9 @@ impl VerifiedProjectRoot {
         state_root_identity: ExecutableIdentity,
         worktrees_identity: ExecutableIdentity,
         campaign_identity: ExecutableIdentity,
+        state_root: Arc<File>,
+        worktrees: Arc<File>,
+        campaign: Arc<File>,
         expected_path: &Path,
         worktree_relative_path: &Path,
         campaign_id: &str,
@@ -1409,10 +1480,20 @@ impl VerifiedProjectRoot {
                 PolicyViolationStage::PreBinding,
             ));
         }
+        let proposal = Arc::new(self.directory.try_clone().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?);
         self.code_change_ownership = Some(CodeChangeWorktreeOwnership {
             state_root_identity,
             worktrees_identity,
             campaign_identity,
+            state_root,
+            worktrees,
+            campaign,
+            proposal,
             canonical_path: expected_path.to_owned(),
             worktree_relative_path: worktree_relative_path.to_owned(),
             campaign_id: campaign_id.to_owned(),

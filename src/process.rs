@@ -773,6 +773,102 @@ impl VerifiedChild {
         self.reap_after_terminal_group_cleanup().await
     }
 
+    /// Synchronously terminate and reap the owned child group.  This is used
+    /// by cancellation/drop paths where spawning an asynchronous cleanup task
+    /// would let a temporary capability disappear while a descendant still
+    /// holds it.  The leader is reaped with `waitpid`; the group is polled
+    /// until no member remains, so the caller regains ownership only after
+    /// process quiescence.
+    pub(crate) fn terminate_and_reap_blocking(&mut self) -> Result<(), AppError> {
+        let Some(group) = self.process_group.id() else {
+            return Ok(());
+        };
+        let signal = unsafe { libc::kill(-group, libc::SIGTERM) };
+        if signal < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(AppError::Io {
+                    operation: "terminate verified child process group",
+                    source: error,
+                });
+            }
+        }
+        // Do not wait indefinitely on a misbehaving descendant.  Escalate
+        // immediately after the bounded grace; the leader is always reaped
+        // before this method returns.
+        let deadline = Instant::now()
+            .checked_add(PROCESS_GROUP_TERM_GRACE)
+            .unwrap_or_else(Instant::now);
+        let mut leader_reaped = false;
+        while Instant::now() < deadline {
+            let result = unsafe { libc::waitpid(self.pid as libc::pid_t, ptr::null_mut(), libc::WNOHANG) };
+            if result == self.pid as libc::pid_t {
+                leader_reaped = true;
+                break;
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    leader_reaped = true;
+                    break;
+                }
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(AppError::Io {
+                        operation: "observe verified child termination",
+                        source: error,
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !leader_reaped {
+            let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+            loop {
+                let result = unsafe { libc::waitpid(self.pid as libc::pid_t, ptr::null_mut(), 0) };
+                if result == self.pid as libc::pid_t {
+                    break;
+                }
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        break;
+                    }
+                    return Err(AppError::Io {
+                        operation: "reap verified child after cancellation",
+                        source: error,
+                    });
+                }
+            }
+        }
+        // Once the leader is reaped, force any remaining group member down
+        // and wait a short bounded interval for the kernel to retire it.
+        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+        let settle_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        while Instant::now() < settle_deadline {
+            match unsafe { libc::kill(-group, 0) } {
+                0 => std::thread::sleep(Duration::from_millis(5)),
+                -1 if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => break,
+                -1 => return Err(AppError::Io {
+                    operation: "verify verified child process-group quiescence",
+                    source: io::Error::last_os_error(),
+                }),
+                _ => {}
+            }
+        }
+        if unsafe { libc::kill(-group, 0) } == 0 {
+            return Err(AppError::Runtime {
+                operation: "retain verified child process group for recovery",
+            });
+        }
+        self.process_group.release();
+        Ok(())
+    }
+
     pub fn release(&mut self) -> Result<(), AppError> {
         self.release_before(lifecycle_deadline())
     }
@@ -4357,6 +4453,16 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_process_group_cleanup_reaps_before_temporary_owner_can_drop() {
+        let mut child = observation_child("hold");
+        let pid = child.pid as libc::pid_t;
+        child.terminate_and_reap_blocking().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[cfg(unix)]

@@ -95,11 +95,16 @@ impl<'db> CodeChangeRepository<'db> {
                     worktree_relative_path, editor_session_id, editor_attempts,
                     diff_digest, changed_file_count, diff_bytes, experiment_id,
                     rejection_code, rejection_summary, promotion_outcome,
-                    promotion_expected_best_experiment_id, promotion_expected_old_sha,
-                    promotion_target_sha, cleanup_completed_at, created_at, updated_at
+                 promotion_expected_best_experiment_id, promotion_expected_old_sha,
+                    promotion_target_sha, cleanup_completed_at,
+                    state_root_identity, worktrees_identity, campaign_identity,
+                    candidate_root_identity, candidate_admin_identity,
+                    candidate_common_identity, candidate_admin_path,
+                    candidate_common_path, created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10,
                            0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                           NULL, NULL, NULL, ?11, ?11)",
+                           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                           NULL, NULL, NULL, NULL, ?11, ?11)",
                 params![
                     run.code_change_run_id,
                     run.proposal_id,
@@ -148,7 +153,7 @@ impl<'db> CodeChangeRepository<'db> {
             .prepare(&format!(
                 "{CODE_CHANGE_SELECT}
                  WHERE state <> 'completed'
-                   AND (state <> 'rejected' OR cleanup_completed_at IS NULL)
+                   AND cleanup_completed_at IS NULL
                  ORDER BY updated_at, code_change_run_id
                  LIMIT ?1"
             ))
@@ -245,7 +250,7 @@ impl<'db> CodeChangeRepository<'db> {
                 message: "all editor attempts must use the same session",
             });
         }
-        transaction
+        let changed = transaction
             .execute(
                 "INSERT INTO code_change_editor_attempts (
                     code_change_run_id, attempt, agent_run_id, editor_session_id, status,
@@ -893,6 +898,11 @@ impl<'db> CodeChangeRepository<'db> {
         let run = read_run(&transaction, run_id)?;
         let next = match run.state {
             CodeChangeState::CleanupPending => CodeChangeState::Completed,
+            // A Task 3 candidate can be cleaned before Task 4 creates an
+            // experiment.  Preserve the candidate-ready state while
+            // recording the durable cleanup completion marker; the schema
+            // intentionally permits that marker independently of state.
+            CodeChangeState::CandidateReady => CodeChangeState::CandidateReady,
             CodeChangeState::Completed if run.cleanup_completed_at.is_some() => {
                 transaction
                     .commit()
@@ -940,6 +950,126 @@ impl<'db> CodeChangeRepository<'db> {
             .commit()
             .map_err(database_error("commit code-change cleanup completion"))?;
         read_by_id(&connection, run_id)
+    }
+
+    /// Persist the exact descriptor proof produced by the Task 3 manager.
+    /// The proof is write-once: a second call is idempotent only when every
+    /// field is byte-for-byte identical, so a later caller cannot replace the
+    /// ownership boundary with a same-path capability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_worktree_ownership(
+        &self,
+        run_id: &str,
+        state_root_identity: &str,
+        worktrees_identity: &str,
+        campaign_identity: &str,
+        candidate_root_identity: &str,
+        candidate_admin_identity: &str,
+        candidate_common_identity: &str,
+        candidate_admin_path: &str,
+        candidate_common_path: &str,
+        now: i64,
+    ) -> Result<CodeChangeRun, AppError> {
+        validate_identifier("code_change_run_id", run_id)?;
+        for (field, value) in [
+            ("state_root_identity", state_root_identity),
+            ("worktrees_identity", worktrees_identity),
+            ("campaign_identity", campaign_identity),
+            ("candidate_root_identity", candidate_root_identity),
+            ("candidate_admin_identity", candidate_admin_identity),
+            ("candidate_common_identity", candidate_common_identity),
+            ("candidate_admin_path", candidate_admin_path),
+            ("candidate_common_path", candidate_common_path),
+        ] {
+            if value.is_empty() || value.len() > MAX_CODE_CHANGE_ID_BYTES || value.contains('\0') {
+                return Err(AppError::Validation {
+                    field,
+                    message: "must be a bounded non-empty ownership proof",
+                });
+            }
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin code-change ownership proof"))?;
+        let run = read_run(&transaction, run_id)?;
+        let values = [
+            state_root_identity,
+            worktrees_identity,
+            campaign_identity,
+            candidate_root_identity,
+            candidate_admin_identity,
+            candidate_common_identity,
+            candidate_admin_path,
+            candidate_common_path,
+        ];
+        let existing = [
+            run.state_root_identity.as_deref(),
+            run.worktrees_identity.as_deref(),
+            run.campaign_identity.as_deref(),
+            run.candidate_root_identity.as_deref(),
+            run.candidate_admin_identity.as_deref(),
+            run.candidate_common_identity.as_deref(),
+            run.candidate_admin_path.as_deref(),
+            run.candidate_common_path.as_deref(),
+        ];
+        if existing.iter().any(Option::is_some) {
+            if existing
+                .iter()
+                .zip(values.iter())
+                .all(|(stored, expected)| *stored == Some(*expected))
+            {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit idempotent code-change ownership proof"))?;
+                return Ok(run);
+            }
+            return Err(AppError::Validation {
+                field: "code_change.ownership",
+                message: "durable ownership proof cannot be replaced",
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE code_change_runs
+                 SET state_root_identity = ?1, worktrees_identity = ?2,
+                     campaign_identity = ?3, candidate_root_identity = ?4,
+                     candidate_admin_identity = ?5, candidate_common_identity = ?6,
+                     candidate_admin_path = ?7, candidate_common_path = ?8,
+                     updated_at = ?9
+                 WHERE code_change_run_id = ?10
+                   AND state_root_identity IS NULL
+                   AND worktrees_identity IS NULL
+                   AND campaign_identity IS NULL
+                   AND candidate_root_identity IS NULL
+                   AND candidate_admin_identity IS NULL
+                   AND candidate_common_identity IS NULL
+                   AND candidate_admin_path IS NULL
+                   AND candidate_common_path IS NULL",
+                params![
+                    state_root_identity,
+                    worktrees_identity,
+                    campaign_identity,
+                    candidate_root_identity,
+                    candidate_admin_identity,
+                    candidate_common_identity,
+                    candidate_admin_path,
+                    candidate_common_path,
+                    now,
+                    run_id,
+                ],
+            )
+            .map_err(database_error("persist code-change ownership proof"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "persist code-change ownership proof changed concurrently",
+            });
+        }
+        let stored = read_run(&transaction, run_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit code-change ownership proof"))?;
+        Ok(stored)
     }
 
     fn finish_terminal(
@@ -1028,7 +1158,9 @@ const CODE_CHANGE_SELECT: &str = "SELECT code_change_run_id, proposal_id, campai
         changed_file_count, diff_bytes, experiment_id, rejection_code,
         rejection_summary, promotion_outcome, promotion_expected_best_experiment_id,
         promotion_expected_old_sha, promotion_target_sha, cleanup_completed_at,
-        created_at, updated_at
+        state_root_identity, worktrees_identity, campaign_identity,
+        candidate_root_identity, candidate_admin_identity, candidate_common_identity,
+        candidate_admin_path, candidate_common_path, created_at, updated_at
     FROM code_change_runs";
 
 const CODE_CHANGE_CHECK_SELECT: &str = "SELECT code_change_run_id, attempt, ordinal, source,
@@ -1166,8 +1298,16 @@ fn code_change_run_from_row(row: &Row<'_>) -> rusqlite::Result<CodeChangeRun> {
         promotion_expected_old_sha: row.get(20)?,
         promotion_target_sha: row.get(21)?,
         cleanup_completed_at: row.get(22)?,
-        created_at: row.get(23)?,
-        updated_at: row.get(24)?,
+        state_root_identity: row.get(23)?,
+        worktrees_identity: row.get(24)?,
+        campaign_identity: row.get(25)?,
+        candidate_root_identity: row.get(26)?,
+        candidate_admin_identity: row.get(27)?,
+        candidate_common_identity: row.get(28)?,
+        candidate_admin_path: row.get(29)?,
+        candidate_common_path: row.get(30)?,
+        created_at: row.get(31)?,
+        updated_at: row.get(32)?,
     })
 }
 
