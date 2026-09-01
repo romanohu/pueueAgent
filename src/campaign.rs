@@ -1018,10 +1018,25 @@ fn validate_local_git_config_file(path: &Path) -> Result<(), AppError> {
         });
     }
     let contents = read_bounded_git_file(path)?;
+    if contents.windows(3).any(|window| window == b"\xef\xbb\xbf") {
+        return Err(AppError::Validation {
+            field: "git.config",
+            message: "local Git configuration contains a byte-order mark",
+        });
+    }
     let contents = std::str::from_utf8(&contents).map_err(|_| AppError::Validation {
         field: "git.config",
         message: "local Git configuration must be valid UTF-8",
     })?;
+    if contents
+        .lines()
+        .any(|line| line.trim_end().ends_with('\\'))
+    {
+        return Err(AppError::Validation {
+            field: "git.config",
+            message: "local Git configuration contains a line continuation",
+        });
+    }
     let mut section = String::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -1833,6 +1848,38 @@ mod tests {
     }
 
     #[test]
+    fn local_git_config_rejects_bom_and_continuation_syntax() {
+        let temporary = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            (
+                "bom-filter",
+                "\u{feff}[filter.foo]\n\tclean = /tmp/sentinel\n",
+            ),
+            (
+                "bom-include",
+                "\u{feff}[include]\n\tpath = /tmp/malicious.config\n",
+            ),
+            (
+                "continued-diff",
+                "[DiFf.foo]\r\n\tsafe = x \\   \r\n[BAR]\r\n\tTeXtCoNv = /tmp/sentinel\r\n",
+            ),
+        ] {
+            let path = temporary.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            assert!(
+                matches!(
+                    validate_local_git_config_file(&path),
+                    Err(AppError::Validation {
+                        field: "git.config",
+                        ..
+                    })
+                ),
+                "configuration {name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn packed_refs_reject_duplicate_targets_and_orphan_peeled_lines() {
         let reference = "refs/heads/campaign/demo/best";
         let sha = "a".repeat(40);
@@ -2057,7 +2104,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn pinned_git_rejects_dotted_local_clean_filter_without_running_sentinel() {
+    async fn pinned_git_rejects_bom_and_continuation_config_without_running_sentinel() {
         let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         for args in [
             ["init", "-q"].as_slice(),
@@ -2071,8 +2118,11 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "git {:?}: {:?}", args, output);
         }
-        std::fs::write(temporary.path().join(".gitattributes"), "tracked filter=foo\n")
-            .unwrap();
+        std::fs::write(
+            temporary.path().join(".gitattributes"),
+            "tracked filter=foo\ntracked diff=foo\n",
+        )
+        .unwrap();
         std::fs::write(temporary.path().join("tracked"), "baseline\n").unwrap();
         let output = std::process::Command::new("/usr/bin/git")
             .args(["add", "."])
@@ -2104,9 +2154,11 @@ mod tests {
         permissions.set_mode(0o700);
         std::fs::set_permissions(&filter, permissions).unwrap();
         let config = temporary.path().join(".git/config");
-        let mut contents = std::fs::read_to_string(&config).unwrap();
-        contents.push_str(&format!("\n[filter.foo]\n\tclean = {}\n", filter.display()));
-        std::fs::write(config, contents).unwrap();
+        std::fs::write(
+            &config,
+            format!("\u{feff}[filter.foo]\n\tclean = {}\n", filter.display()),
+        )
+        .unwrap();
         std::fs::write(temporary.path().join("tracked"), "changed\n").unwrap();
 
         let result = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"]).await;
@@ -2119,9 +2171,56 @@ mod tests {
                     ..
                 })
             ),
-            "dotted local clean filter must fail closed"
+            "BOM-prefixed local clean filter must fail closed"
         );
         assert!(!marker.exists(), "local clean filter was executed");
+
+        let included = temporary.path().join("included.config");
+        std::fs::write(
+            &included,
+            format!("[filter.foo]\n\tclean = {}\n", filter.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            &config,
+            format!("\u{feff}[include]\n\tpath = {}\n", included.display()),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&marker);
+        let result = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"]).await;
+        assert!(
+            matches!(
+                result,
+                Err(AppError::Validation {
+                    field: "git.config",
+                    ..
+                })
+            ),
+            "BOM-prefixed local include must fail closed"
+        );
+        assert!(!marker.exists(), "included local clean filter was executed");
+
+        std::fs::write(
+            &config,
+            format!(
+                "[DiFf.foo]\r\n\tsafe = x \\   \r\n[BAR]\r\n\tTeXtCoNv = {}\r\n",
+                filter.display()
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&marker);
+        let result = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"]).await;
+        assert!(
+            matches!(
+                result,
+                Err(AppError::Validation {
+                    field: "git.config",
+                    ..
+                })
+            ),
+            "continued local diff config must fail closed"
+        );
+        assert!(!marker.exists(), "continued local textconv was executed");
     }
 
     #[cfg(target_os = "linux")]
