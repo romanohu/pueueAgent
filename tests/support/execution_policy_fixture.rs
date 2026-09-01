@@ -17,6 +17,8 @@ pub fn resolved_policy(
     fixture_root: &Path,
     projects: &[(&str, &Path, &Path)],
 ) -> Arc<ResolvedExecutionPolicy> {
+    fs::set_permissions(fixture_root, fs::Permissions::from_mode(0o700))
+        .expect("secure policy fixture root");
     let fixture_root = fs::canonicalize(fixture_root).expect("canonical fixture root");
     let state_dir = fixture_root.join("execution-policy-state");
     let trusted_dir = fixture_root.join("execution-policy-bin");
