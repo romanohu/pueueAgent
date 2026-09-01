@@ -438,6 +438,8 @@ impl SanitizedEnvironment {
     ) -> Result<Self, PolicyViolation> {
         let mut environment = Self::for_pueue(policy)?;
         for (name, value) in [
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_SYSTEM", "/dev/null"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),

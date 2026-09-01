@@ -217,9 +217,18 @@ pub struct ProjectRootAnchor {
     pub resolution_fingerprint: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodeChangeWorktreeOwnership {
+    state_root_identity: ExecutableIdentity,
+    canonical_path: PathBuf,
+    campaign_id: String,
+    proposal_id: String,
+}
+
 pub struct VerifiedProjectRoot {
     pub directory: File,
     pub anchor: ProjectRootAnchor,
+    code_change_ownership: Option<CodeChangeWorktreeOwnership>,
 }
 
 /// A directory capability opened relative to a verified project root.  The
@@ -517,6 +526,27 @@ impl ResolvedExecutionPolicy {
                 PolicyViolationStage::PreBinding,
             ));
         }
+        let ownership = candidate.code_change_ownership.as_ref().ok_or_else(|| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        let expected_owned_path = self
+            .state_root
+            .canonical_path
+            .join("worktrees")
+            .join(&ownership.campaign_id)
+            .join(&ownership.proposal_id);
+        if ownership.state_root_identity != self.state_root.identity
+            || ownership.canonical_path != candidate.anchor.canonical_path
+            || ownership.canonical_path != expected_owned_path
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
         let original_anchor = self.project_root_anchor(&project.root_path)?;
         if original.root_anchor != original_anchor {
             return Err(PolicyViolation::new(
@@ -525,13 +555,9 @@ impl ResolvedExecutionPolicy {
             ));
         }
         verify_state_root_identity(self)?;
-        let worktrees = self
-            .state_root
-            .canonical_path
-            .join("worktrees");
+        let worktrees = self.state_root.canonical_path.join("worktrees");
         let candidate_path = &candidate.anchor.canonical_path;
-        if !candidate_path.starts_with(&worktrees)
-            || candidate_path == worktrees.as_path()
+        if candidate_path == worktrees.as_path()
             || candidate_path
                 .components()
                 .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
@@ -620,6 +646,10 @@ impl ResolvedExecutionPolicy {
 
     pub(crate) fn code_change_state_root_directory(&self) -> Arc<File> {
         self.state_root.directory.clone()
+    }
+
+    pub(crate) fn code_change_state_root_identity(&self) -> ExecutableIdentity {
+        self.state_root.identity
     }
 
     pub(crate) fn verify_code_change_state_root(&self) -> Result<(), PolicyViolation> {
@@ -1285,6 +1315,7 @@ impl ProjectRootAnchor {
         Ok(VerifiedProjectRoot {
             directory: opened.file,
             anchor: self.clone(),
+            code_change_ownership: None,
         })
         }
     }
@@ -1299,7 +1330,59 @@ impl VerifiedProjectRoot {
         Ok(Self {
             directory,
             anchor: self.anchor.clone(),
+            code_change_ownership: self.code_change_ownership.clone(),
         })
+    }
+
+    pub(crate) fn mark_code_change_owned(
+        mut self,
+        state_root_identity: ExecutableIdentity,
+        expected_path: &Path,
+        campaign_id: &str,
+        proposal_id: &str,
+    ) -> Result<Self, PolicyViolation> {
+        if self.anchor.canonical_path != expected_path
+            || campaign_id.is_empty()
+            || proposal_id.is_empty()
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        self.code_change_ownership = Some(CodeChangeWorktreeOwnership {
+            state_root_identity,
+            canonical_path: expected_path.to_owned(),
+            campaign_id: campaign_id.to_owned(),
+            proposal_id: proposal_id.to_owned(),
+        });
+        Ok(self)
+    }
+
+    pub(crate) fn verify_code_change_ownership(
+        &self,
+        state_root_identity: ExecutableIdentity,
+        expected_path: &Path,
+        campaign_id: &str,
+        proposal_id: &str,
+    ) -> Result<(), PolicyViolation> {
+        let ownership = self.code_change_ownership.as_ref().ok_or_else(|| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        if ownership.state_root_identity != state_root_identity
+            || ownership.canonical_path != expected_path
+            || ownership.campaign_id != campaign_id
+            || ownership.proposal_id != proposal_id
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        Ok(())
     }
 }
 

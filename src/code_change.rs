@@ -49,7 +49,6 @@ const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHECK_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_WORKTREE_ID_BYTES: usize = 128;
 const MAX_STATUS_PATHS: usize = 50;
-const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 static TEMP_INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The only candidate-change facts that are eligible for durable projection.
@@ -121,6 +120,17 @@ impl VerifiedCodeChangeWorktree {
         Ok(facts)
     }
 
+    pub async fn run_checks(
+        &mut self,
+        checks: &[ProposedCheck],
+    ) -> Result<Vec<String>, AppError> {
+        let runner = CheckRunner {
+            manager: &self.manager,
+            candidate: &self.candidate,
+        };
+        runner.run(&self.candidate, checks).await
+    }
+
     pub async fn commit(&mut self) -> Result<String, AppError> {
         let expected = self.diff_facts.as_ref().ok_or(AppError::Validation {
             field: "code_change.diff",
@@ -141,11 +151,7 @@ impl VerifiedCodeChangeWorktree {
 
     pub async fn cleanup(self) -> Result<(), AppError> {
         self.manager
-            .cleanup(
-                Some(&self.candidate),
-                self.candidate_sha.as_deref(),
-                false,
-            )
+            .cleanup(Some(&self.candidate), self.candidate_sha.as_deref())
             .await
     }
 }
@@ -173,8 +179,23 @@ pub async fn prepare_code_change_worktree(
     let candidate = manager.prepare().await?;
     if let Err(error) = policy.for_code_change_worktree(project, original, &candidate) {
         let original = AppError::from(error);
-        return Err(match manager.cleanup(Some(&candidate), None, false).await {
+        return Err(match manager.cleanup(Some(&candidate), None).await {
             Ok(()) => original,
+            Err(cleanup) => cleanup,
+        });
+    }
+    let validator = match CandidateValidator::new(&manager, &candidate) {
+        Ok(validator) => validator,
+        Err(error) => {
+            return Err(match manager.cleanup(Some(&candidate), None).await {
+                Ok(()) => error,
+                Err(cleanup) => cleanup,
+            });
+        }
+    };
+    if let Err(error) = validator.verify().await {
+        return Err(match manager.cleanup(Some(&candidate), None).await {
+            Ok(()) => error,
             Err(cleanup) => cleanup,
         });
     }
@@ -189,6 +210,36 @@ pub async fn prepare_code_change_worktree(
 pub const RUST_CHECK: &[&str] = &["cargo", "test", "--all-targets", "--", "--test-threads=1"];
 pub const UV_PYTEST_CHECK: &[&str] = &["uv", "run", "pytest"];
 pub const PYTHON_PYTEST_CHECK: &[&str] = &["python", "-m", "pytest"];
+
+fn pinned_git_argv(args: &[OsString]) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(args.len() + 22);
+    for argument in [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=",
+        "-c",
+        "core.sshCommand=",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "tag.gpgSign=false",
+        "-c",
+        "user.signingKey=",
+        "--no-pager",
+    ] {
+        argv.push(OsString::from(argument));
+    }
+    argv.extend_from_slice(args);
+    argv
+}
 
 const MAX_EDITOR_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_EDITOR_SUMMARY_BYTES: usize = 64 * 1024;
@@ -537,10 +588,421 @@ pub fn has_project_check(checks: &[ProposedCheck]) -> bool {
     })
 }
 
+#[derive(Clone)]
 struct GitBaseline {
+    #[cfg(unix)]
+    repository: GitRepositoryProof,
     common_directory: PathBuf,
     protected_ref_digest: String,
     remote_config_digest: String,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct GitDirectoryProof {
+    path: PathBuf,
+    identity: ExecutableIdentity,
+    directory: Arc<File>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+#[derive(Copy)]
+enum GitPointerKind {
+    GitDir,
+    Path,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct GitFileProof {
+    path: PathBuf,
+    identity: ExecutableIdentity,
+    digest: String,
+    target: Option<PathBuf>,
+    target_base: Option<PathBuf>,
+    pointer_kind: Option<GitPointerKind>,
+    file: Arc<File>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+enum GitEntryProof {
+    Directory(GitDirectoryProof),
+    File(GitFileProof),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct GitRepositoryProof {
+    root_git: GitEntryProof,
+    admin: GitDirectoryProof,
+    common: GitDirectoryProof,
+    admin_path: PathBuf,
+    common_path: PathBuf,
+    admin_gitdir: Option<GitFileProof>,
+    commondir: Option<GitFileProof>,
+    common_config: GitFileProof,
+    admin_config: Option<GitFileProof>,
+    worktree_config: Option<GitFileProof>,
+    expected_root: PathBuf,
+    expected_admin_name: Option<OsString>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct WorktreeParentProof {
+    state_root_path: PathBuf,
+    state_root_identity: ExecutableIdentity,
+    state_root: Arc<File>,
+    worktrees_path: PathBuf,
+    worktrees_identity: ExecutableIdentity,
+    worktrees: Arc<File>,
+    campaign_path: PathBuf,
+    campaign_identity: ExecutableIdentity,
+    campaign: Arc<File>,
+}
+
+#[cfg(unix)]
+impl WorktreeParentProof {
+    fn retain(policy: &ResolvedExecutionPolicy, campaign_id: &str) -> Result<Self, AppError> {
+        policy.verify_code_change_state_root()?;
+        let state_root = policy.code_change_state_root_directory();
+        let state_root_identity = directory_identity(&state_root)?;
+        let worktrees = Arc::new(open_or_create_directory_at(
+            &state_root,
+            OsStr::new("worktrees"),
+        )?);
+        let worktrees_path = policy.code_change_state_root_path().join("worktrees");
+        let worktrees_identity = directory_identity(&worktrees)?;
+        let campaign = Arc::new(open_or_create_directory_at(
+            &worktrees,
+            OsStr::new(campaign_id),
+        )?);
+        let campaign_path = worktrees_path.join(campaign_id);
+        let campaign_identity = directory_identity(&campaign)?;
+        Ok(Self {
+            state_root_path: policy.code_change_state_root_path().to_owned(),
+            state_root_identity,
+            state_root,
+            worktrees_path,
+            worktrees_identity,
+            worktrees,
+            campaign_path,
+            campaign_identity,
+            campaign,
+        })
+    }
+
+    fn revalidate(
+        &self,
+        policy: &ResolvedExecutionPolicy,
+        campaign_id: &str,
+    ) -> Result<File, AppError> {
+        policy.verify_code_change_state_root()?;
+        if policy.code_change_state_root_path() != self.state_root_path {
+            return Err(recovery_required());
+        }
+        if directory_identity(&self.state_root)? != self.state_root_identity {
+            return Err(recovery_required());
+        }
+        let worktrees = open_existing_directory_at(&self.state_root, OsStr::new("worktrees"))
+            .map_err(|_| recovery_required())?;
+        if self.worktrees_path != self.state_root_path.join("worktrees")
+            || directory_identity(&worktrees)? != self.worktrees_identity
+            || directory_identity(&self.worktrees)? != self.worktrees_identity
+        {
+            return Err(recovery_required());
+        }
+        let campaign = open_existing_directory_at(&worktrees, OsStr::new(campaign_id))
+            .map_err(|_| recovery_required())?;
+        if self.campaign_path != self.worktrees_path.join(campaign_id)
+            || directory_identity(&campaign)? != self.campaign_identity
+            || directory_identity(&self.campaign)? != self.campaign_identity
+        {
+            return Err(recovery_required());
+        }
+        Ok(campaign)
+    }
+}
+
+#[cfg(unix)]
+impl GitRepositoryProof {
+    fn capture_original(root: &VerifiedProjectRoot) -> Result<Self, AppError> {
+        Self::capture(root, None, None)
+    }
+
+    fn capture_candidate(
+        root: &VerifiedProjectRoot,
+        original: &Self,
+    ) -> Result<Self, AppError> {
+        let candidate = Self::capture(
+            root,
+            Some(&original.common_path),
+            root.anchor.canonical_path.file_name(),
+        )?;
+        if candidate.admin_path == original.admin_path {
+            return Err(recovery_required());
+        }
+        Ok(candidate)
+    }
+
+    fn capture(
+        root: &VerifiedProjectRoot,
+        expected_common: Option<&PathBuf>,
+        expected_admin_name: Option<&OsStr>,
+    ) -> Result<Self, AppError> {
+        let root_git_path = root.anchor.canonical_path.join(".git");
+        if path_has_symlink_component(&root_git_path)? {
+            return Err(recovery_required());
+        }
+        let root_git_metadata = fs::symlink_metadata(&root_git_path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                validation("code_change.git", "Git metadata is missing")
+            } else {
+                recovery_required()
+            }
+        })?;
+        let (root_git, admin_path) = if root_git_metadata.is_dir() {
+            (
+                GitEntryProof::Directory(open_git_directory(&root_git_path)?),
+                root_git_path.clone(),
+            )
+        } else if root_git_metadata.is_file() {
+            let file = open_git_file(
+                &root_git_path,
+                Some(&root.anchor.canonical_path),
+                Some(GitPointerKind::GitDir),
+            )?;
+            let target = file.target.clone().ok_or_else(recovery_required)?;
+            (GitEntryProof::File(file), target)
+        } else {
+            return Err(validation(
+                "code_change.git",
+                "Git metadata must be a regular file or directory",
+            ));
+        };
+        let admin = open_git_directory(&admin_path)?;
+        let commondir_path = admin_path.join("commondir");
+        let commondir = match fs::symlink_metadata(&commondir_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(recovery_required())
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let file = open_git_file(
+                    &commondir_path,
+                    Some(&admin_path),
+                    Some(GitPointerKind::Path),
+                )?;
+                Some(file)
+            }
+            Ok(_) => {
+                return Err(validation(
+                    "git.metadata",
+                    "Git common-directory file must be regular",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Err(recovery_required()),
+        };
+        let common_path = commondir
+            .as_ref()
+            .and_then(|file| file.target.clone())
+            .unwrap_or_else(|| admin_path.clone());
+        let common = open_git_directory(&common_path)?;
+        let admin_gitdir_path = admin_path.join("gitdir");
+        let admin_gitdir = match fs::symlink_metadata(&admin_gitdir_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(recovery_required())
+            }
+            Ok(metadata) if metadata.is_file() => {
+                Some(open_git_file(
+                    &admin_gitdir_path,
+                    Some(&admin_path),
+                    Some(GitPointerKind::Path),
+                )?)
+            }
+            Ok(_) => {
+                return Err(validation(
+                    "git.metadata",
+                    "Git worktree gitdir file must be regular",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Err(recovery_required()),
+        };
+        let worktree_config_path = admin_path.join("config.worktree");
+        let worktree_config = match fs::symlink_metadata(&worktree_config_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(recovery_required())
+            }
+            Ok(metadata) if metadata.is_file() => {
+                Some(open_git_file(&worktree_config_path, None, None)?)
+            }
+            Ok(_) => {
+                return Err(validation(
+                    "git.config",
+                    "Git worktree configuration must be regular",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Err(recovery_required()),
+        };
+        if let Some(expected) = expected_common {
+            if common.path != *expected {
+                return Err(recovery_required());
+            }
+        }
+        if let Some(expected) = expected_admin_name {
+            let expected_parent = common.path.join("worktrees");
+            if admin_path.parent() != Some(expected_parent.as_path())
+                || admin_path.file_name() != Some(expected)
+            {
+                return Err(recovery_required());
+            }
+            let candidate_git = match &root_git {
+                GitEntryProof::File(file) => file,
+                GitEntryProof::Directory(_) => return Err(recovery_required()),
+            };
+            if candidate_git.target.as_deref() != Some(admin_path.as_path()) {
+                return Err(recovery_required());
+            }
+            if admin_gitdir
+                .as_ref()
+                .and_then(|file| file.target.as_deref())
+                != Some(root_git_path.as_path())
+            {
+                return Err(recovery_required());
+            }
+            if commondir.is_none() {
+                // A linked candidate must retain Git's exact common-dir
+                // backpointer; a missing file would change administration.
+                return Err(recovery_required());
+            }
+        }
+        if matches!(&root_git, GitEntryProof::File(_)) {
+            if admin_gitdir
+                .as_ref()
+                .and_then(|file| file.target.as_deref())
+                != Some(root_git_path.as_path())
+                || commondir.is_none()
+            {
+                return Err(recovery_required());
+            }
+        }
+        let common_config = open_git_file(&common.path.join("config"), None, None)?;
+        let admin_config_path = admin_path.join("config");
+        let admin_config = match existing_regular_path(&admin_config_path)? {
+            Some(path) => Some(open_git_file(&path, None, None)?),
+            None => None,
+        };
+        validate_git_config_proof(&common_config, None)?;
+        if let Some(config) = &admin_config {
+            validate_git_config_proof(config, Some(&root.anchor.canonical_path))?;
+        }
+        if let Some(config) = &worktree_config {
+            validate_git_config_proof(config, Some(&root.anchor.canonical_path))?;
+        }
+        Ok(Self {
+            root_git,
+            admin,
+            common,
+            admin_path,
+            common_path,
+            admin_gitdir,
+            commondir,
+            common_config,
+            admin_config,
+            worktree_config,
+            expected_root: root.anchor.canonical_path.clone(),
+            expected_admin_name: expected_admin_name.map(OsStr::to_os_string),
+        })
+    }
+
+    fn revalidate(&self, root: &VerifiedProjectRoot) -> Result<(), AppError> {
+        if root.anchor.canonical_path != self.expected_root {
+            return Err(recovery_required());
+        }
+        let root_metadata = root.directory.metadata().map_err(|_| recovery_required())?;
+        if !root_metadata.is_dir()
+            || !secure_metadata_for_git(&root_metadata)
+            || executable_identity_from_metadata(&root_metadata) != root.anchor.identity
+        {
+            return Err(recovery_required());
+        }
+        revalidate_git_entry(&self.root_git)?;
+        revalidate_git_directory(&self.admin)?;
+        revalidate_git_directory(&self.common)?;
+        if self.admin.path != self.admin_path || self.common.path != self.common_path {
+            return Err(recovery_required());
+        }
+        if self.expected_admin_name.is_some() {
+            let expected_parent = self.common_path.join("worktrees");
+            if self.admin_path.parent() != Some(expected_parent.as_path())
+                || self.admin_path.file_name() != self.expected_admin_name.as_deref()
+            {
+                return Err(recovery_required());
+            }
+            if !matches!(&self.root_git, GitEntryProof::File(_)) {
+                return Err(recovery_required());
+            }
+        }
+        revalidate_git_file(&self.common_config, None)?;
+        validate_git_config_proof(&self.common_config, None)?;
+        if let Some(config) = &self.admin_config {
+            revalidate_git_file(config, None)?;
+            validate_git_config_proof(config, Some(&self.expected_root))?;
+        }
+        if let Some(file) = &self.admin_gitdir {
+            revalidate_git_file(file, Some(&self.admin_path))?;
+            if (self.expected_admin_name.is_some()
+                || matches!(&self.root_git, GitEntryProof::File(_)))
+                && file.target.as_deref()
+                    != Some(root.anchor.canonical_path.join(".git").as_path())
+            {
+                return Err(recovery_required());
+            }
+        } else if existing_regular_path(&self.admin_path.join("gitdir"))?.is_some()
+            || matches!(&self.root_git, GitEntryProof::File(_))
+        {
+            return Err(recovery_required());
+        }
+        if let Some(file) = &self.commondir {
+            revalidate_git_file(file, Some(&self.admin_path))?;
+            if file.target.as_deref() != Some(self.common_path.as_path()) {
+                return Err(recovery_required());
+            }
+        } else if existing_regular_path(&self.admin_path.join("commondir"))?.is_some()
+            || matches!(&self.root_git, GitEntryProof::File(_))
+        {
+            return Err(recovery_required());
+        }
+        match (&self.worktree_config, existing_regular_path(&self.admin_path.join("config.worktree"))?) {
+            (Some(expected), Some(current)) => {
+                if current != expected.path {
+                    return Err(recovery_required());
+                }
+                revalidate_git_file(expected, None)?;
+                validate_git_config_proof(expected, Some(&root.anchor.canonical_path))?;
+            }
+            (None, None) => {}
+            _ => return Err(recovery_required()),
+        }
+        if self.admin_config.is_none()
+            && existing_regular_path(&self.admin_path.join("config"))?.is_some()
+        {
+            return Err(recovery_required());
+        }
+        if let GitEntryProof::File(file) = &self.root_git {
+            revalidate_git_file(file, Some(&root.anchor.canonical_path))?;
+            if self.expected_admin_name.is_some()
+                && file.target.as_deref() != Some(self.admin_path.as_path())
+            {
+                return Err(recovery_required());
+            }
+        }
+        Ok(())
+    }
 }
 
 struct WorktreeManager {
@@ -552,6 +1014,13 @@ struct WorktreeManager {
     base_sha: String,
     worktree_path: PathBuf,
     candidate_identity: Option<ExecutableIdentity>,
+    object_id_len: Option<usize>,
+    #[cfg(unix)]
+    original_repository: Option<GitRepositoryProof>,
+    #[cfg(unix)]
+    candidate_repository: Option<GitRepositoryProof>,
+    #[cfg(unix)]
+    worktree_parents: Option<WorktreeParentProof>,
     baseline: Option<GitBaseline>,
 }
 
@@ -587,6 +1056,13 @@ impl WorktreeManager {
             base_sha: base_sha.to_owned(),
             worktree_path,
             candidate_identity: None,
+            object_id_len: None,
+            #[cfg(unix)]
+            original_repository: None,
+            #[cfg(unix)]
+            candidate_repository: None,
+            #[cfg(unix)]
+            worktree_parents: None,
             baseline: None,
         })
     }
@@ -601,6 +1077,10 @@ impl WorktreeManager {
             ));
         }
         validate_local_git_metadata(&original_root.anchor.canonical_path)?;
+        #[cfg(unix)]
+        {
+            self.original_repository = Some(GitRepositoryProof::capture_original(&original_root)?);
+        }
         let working_directory = VerifiedWorkingDirectory::root(&original_root)?;
         let top_level = self
             .git(
@@ -639,6 +1119,33 @@ impl WorktreeManager {
                 "does not match the current project HEAD",
             ));
         }
+        let object_format = self
+            .git(
+                &original_root,
+                &working_directory,
+                &["rev-parse", "--show-object-format"],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&object_format, "inspect Git object format")?;
+        let object_format = bounded_utf8_line(&object_format.stdout, "Git object format")?;
+        let object_id_len = match object_format {
+            "sha1" => 40,
+            "sha256" => 64,
+            _ => {
+                return Err(validation(
+                    "code_change.git",
+                    "Git object format is unsupported",
+                ))
+            }
+        };
+        if self.base_sha.len() != object_id_len {
+            return Err(validation(
+                "code_change.base_sha",
+                "does not match the repository object ID length",
+            ));
+        }
+        self.object_id_len = Some(object_id_len);
 
         let status = self
             .git(
@@ -686,6 +1193,14 @@ impl WorktreeManager {
         }
         let remote_config_digest = self.remote_config_digest(&original_root, &working_directory).await?;
         self.baseline = Some(GitBaseline {
+            #[cfg(unix)]
+            repository: self
+                .original_repository
+                .as_ref()
+                .ok_or(AppError::Runtime {
+                    operation: "retain original Git administration proof",
+                })?
+                .clone(),
             common_directory: common,
             protected_ref_digest,
             remote_config_digest,
@@ -694,10 +1209,18 @@ impl WorktreeManager {
     }
 
     async fn prepare(&mut self) -> Result<VerifiedProjectRoot, AppError> {
-        let baseline = self.baseline.as_ref().ok_or(AppError::Runtime {
+        let baseline = self.baseline.clone().ok_or(AppError::Runtime {
             operation: "prepare code-change worktree before base inspection",
         })?;
         self.policy.verify_code_change_state_root()?;
+        #[cfg(unix)]
+        {
+            self.worktree_parents = Some(WorktreeParentProof::retain(
+                &self.policy,
+                &self.campaign_id,
+            )?);
+        }
+        #[cfg(not(unix))]
         ensure_state_worktree_parents(&self.policy, &self.campaign_id)?;
         let candidate_parent = self
             .policy
@@ -732,6 +1255,13 @@ impl WorktreeManager {
             path,
             OsString::from(base),
         ];
+        #[cfg(unix)]
+        {
+            let _ = open_worktree_parent(self)?;
+        }
+        if let Err(error) = self.validate_original_state().await {
+            return Err(self.cleanup_after_prepare_error(error).await);
+        }
         let output = self
             .git_os(&original_root, &working_directory, &args, MAX_GIT_OUTPUT_BYTES)
             .await;
@@ -743,6 +1273,9 @@ impl WorktreeManager {
             );
             return Err(self.cleanup_after_prepare_error(error).await);
         }
+        if let Err(error) = self.validate_original_state().await {
+            return Err(self.cleanup_after_prepare_error(error).await);
+        }
         let candidate_anchor = match ProjectRootAnchor::resolve(&self.worktree_path) {
             Ok(anchor) => anchor,
             Err(error) => return Err(self.cleanup_after_prepare_error(error.into()).await),
@@ -751,10 +1284,20 @@ impl WorktreeManager {
             Ok(candidate) => candidate,
             Err(error) => return Err(self.cleanup_after_prepare_error(error.into()).await),
         };
+        #[cfg(unix)]
+        {
+            let original_repository = baseline.repository.clone();
+            let repository = match GitRepositoryProof::capture_candidate(
+                &candidate,
+                &original_repository,
+            ) {
+                Ok(repository) => repository,
+                Err(error) => return Err(self.cleanup_after_prepare_error(error).await),
+            };
+            self.candidate_repository = Some(repository);
+        }
         self.candidate_identity = Some(candidate.anchor.identity);
-        if !candidate.anchor.canonical_path.starts_with(
-            self.policy.code_change_state_root_path().join("worktrees"),
-        ) {
+        if candidate.anchor.canonical_path != self.worktree_path {
             let error = validation(
                 "code_change.worktree",
                 "candidate path escaped the retained state root",
@@ -799,11 +1342,20 @@ impl WorktreeManager {
             let error = recovery_required();
             return Err(self.cleanup_after_prepare_error(error).await);
         }
+        let candidate = match candidate.mark_code_change_owned(
+            self.policy.code_change_state_root_identity(),
+            &self.worktree_path,
+            &self.campaign_id,
+            &self.proposal_id,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => return Err(self.cleanup_after_prepare_error(error.into()).await),
+        };
         Ok(candidate)
     }
 
     async fn cleanup_after_prepare_error(&self, original: AppError) -> AppError {
-        match self.cleanup(None, None, false).await {
+        match self.cleanup(None, None).await {
             Ok(()) => original,
             Err(cleanup) => cleanup,
         }
@@ -818,14 +1370,7 @@ impl WorktreeManager {
         &self,
         candidate: Option<&VerifiedProjectRoot>,
         expected_candidate_sha: Option<&str>,
-        live_experiment: bool,
     ) -> Result<(), AppError> {
-        if live_experiment {
-            return Err(validation(
-                "code_change.cleanup",
-                "cannot clean a live candidate experiment",
-            ));
-        }
         self.policy.verify_code_change_state_root()?;
         let expected_path = self
             .policy
@@ -839,6 +1384,25 @@ impl WorktreeManager {
                 "candidate path is not owned by this run",
             ));
         }
+        if let Some(candidate) = candidate {
+            if candidate.anchor.canonical_path != expected_path {
+                return Err(recovery_required());
+            }
+            candidate.verify_code_change_ownership(
+                self.policy.code_change_state_root_identity(),
+                &expected_path,
+                &self.campaign_id,
+                &self.proposal_id,
+            )?;
+        } else if self.candidate_identity.is_none() {
+            // A cleanup without a candidate capability is only valid while
+            // rolling back a preparation that never produced a verified root.
+            // Durable cleanup callers must retain the manager-issued root
+            // capability above; a missing DB ownership row is not success.
+            if expected_candidate_sha.is_some() {
+                return Err(recovery_required());
+            }
+        }
         #[cfg(unix)]
         let candidate_parent = open_worktree_parent(self)?;
         #[cfg(unix)]
@@ -849,12 +1413,16 @@ impl WorktreeManager {
         let candidate_parent_identity = directory_identity(&candidate_parent)?;
         #[cfg(unix)]
         if !directory_entry_exists(&candidate_parent, OsStr::new(&self.proposal_id))? {
-            return Ok(());
-        }
-        if let Some(candidate) = candidate {
-            if candidate.anchor.canonical_path != expected_path {
-                return Err(recovery_required());
+            if let Some(repository) = self.candidate_repository.as_ref() {
+                if revalidate_git_directory(&repository.admin).is_ok() {
+                    // The candidate directory disappeared while its linked
+                    // Git administration remains registered.  Treat this as
+                    // an orphan/move requiring recovery, never as idempotent
+                    // cleanup success.
+                    return Err(recovery_required());
+                }
             }
+            return Ok(());
         }
         if path_has_symlink_component(&self.worktree_path)? {
             return Err(recovery_required());
@@ -878,6 +1446,7 @@ impl WorktreeManager {
             if expected_identity != Some(current.anchor.identity) {
                 return Err(recovery_required());
             }
+            self.validate_git_boundary(current)?;
             validate_local_git_metadata(&current.anchor.canonical_path)?;
             let current_common = inspect_common_directory(
                 self,
@@ -935,8 +1504,19 @@ impl WorktreeManager {
             }
         }
         if current.is_none() {
-            return Ok(());
+            // The durable parent entry proves that Git still registered a
+            // candidate administration directory.  A missing worktree root
+            // in that state is a moved/orphaned target, not an idempotent
+            // successful cleanup.
+            return Err(recovery_required());
         }
+        let current_before_remove = ProjectRootAnchor::resolve(&self.worktree_path)?
+            .verify_identity()?;
+        if expected_identity != Some(current_before_remove.anchor.identity) {
+            return Err(recovery_required());
+        }
+        self.validate_git_boundary(&current_before_remove)?;
+        self.validate_original_state().await?;
         let output = self
             .git_os(
                 &original_root,
@@ -953,6 +1533,7 @@ impl WorktreeManager {
         if !output.success {
             return Err(recovery_required());
         }
+        self.validate_original_state().await?;
         #[cfg(unix)]
         {
             let reopened_parent = open_worktree_parent(self)?
@@ -990,22 +1571,49 @@ impl WorktreeManager {
         args: &[OsString],
         cap: usize,
     ) -> Result<BoundedToolOutput, AppError> {
+        self.validate_git_boundary(root)?;
         let anchor = self.policy.code_change_git_anchor().ok_or(validation(
             "code_change.git",
             "pinned Git is unavailable",
         ))?;
-        let mut argv = vec![
-            OsString::from("git"),
-            OsString::from("-c"),
-            OsString::from("core.hooksPath=/dev/null"),
-            OsString::from("-c"),
-            OsString::from("core.fsmonitor=false"),
-        ];
-        argv.extend_from_slice(args);
+        let argv = pinned_git_argv(args);
         let environment = SanitizedEnvironment::for_code_change_tool(&self.policy)?;
-        BoundedToolRunner::new(&self.policy, cap)
+        let result = BoundedToolRunner::new(&self.policy, cap)
             .run(anchor.clone(), root, working_directory, argv, environment, "pinned Git")
-            .await
+            .await;
+        let boundary = self.validate_git_boundary(root);
+        match (result, boundary) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(output), Ok(())) => Ok(output),
+        }
+    }
+
+    fn validate_git_boundary(&self, root: &VerifiedProjectRoot) -> Result<(), AppError> {
+        #[cfg(unix)]
+        {
+            let proof = if root.anchor.canonical_path == self.project.root_path {
+                self.original_repository.as_ref()
+            } else if root.anchor.canonical_path == self.worktree_path {
+                self.candidate_repository.as_ref()
+            } else {
+                None
+            }
+            .ok_or_else(recovery_required)?;
+            proof.revalidate(root)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            Ok(())
+        }
+    }
+
+    fn zero_object_id(&self) -> Result<String, AppError> {
+        let length = self.object_id_len.ok_or(AppError::Runtime {
+            operation: "read Git object ID format before ref mutation",
+        })?;
+        Ok("0".repeat(length))
     }
 
     async fn protected_ref_digest(
@@ -1050,6 +1658,61 @@ impl WorktreeManager {
             "remote configuration could not be inspected",
         ))
     }
+
+    async fn validate_original_state(&self) -> Result<(), AppError> {
+        let baseline = self.baseline.as_ref().ok_or(AppError::Runtime {
+            operation: "validate original Git state before base inspection",
+        })?;
+        let original_root = self.original.root_anchor.verify_identity()?;
+        self.validate_git_boundary(&original_root)?;
+        validate_local_git_metadata(&original_root.anchor.canonical_path)?;
+        let working_directory = VerifiedWorkingDirectory::root(&original_root)?;
+        let head = self
+            .git(
+                &original_root,
+                &working_directory,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&head, "verify original Git HEAD")?;
+        if bounded_utf8_line(&head.stdout, "original HEAD")? != self.base_sha {
+            return Err(recovery_required());
+        }
+        let status = self
+            .git(
+                &original_root,
+                &working_directory,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&status, "verify original Git cleanliness")?;
+        if !status.stdout.is_empty() {
+            return Err(recovery_required());
+        }
+        let common = inspect_common_directory(self, &original_root, &working_directory).await?;
+        if common != baseline.common_directory {
+            return Err(recovery_required());
+        }
+        let excluded_ref = format!(
+            "refs/heads/{}",
+            candidate_ref(&self.campaign_id, &self.proposal_id)?,
+        );
+        let refs = self
+            .protected_ref_digest(&original_root, &working_directory, Some(&excluded_ref))
+            .await?;
+        if refs != baseline.protected_ref_digest {
+            return Err(recovery_required());
+        }
+        let remote = self
+            .remote_config_digest(&original_root, &working_directory)
+            .await?;
+        if remote != baseline.remote_config_digest {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
 }
 
 struct CandidateValidator<'a> {
@@ -1065,12 +1728,20 @@ impl<'a> CandidateValidator<'a> {
         if candidate.anchor.canonical_path != manager.worktree_path {
             return Err(recovery_required());
         }
+        candidate.verify_code_change_ownership(
+            manager.policy.code_change_state_root_identity(),
+            &manager.worktree_path,
+            &manager.campaign_id,
+            &manager.proposal_id,
+        )?;
         Ok(Self { manager, candidate })
     }
 
     async fn verify(&self) -> Result<DiffFacts, AppError> {
         self.manager.policy.verify_code_change_state_root()?;
+        self.manager.validate_original_state().await?;
         let candidate = self.candidate.anchor.verify_identity()?;
+        self.manager.validate_git_boundary(&candidate)?;
         let working_directory = VerifiedWorkingDirectory::root(&candidate)?;
         validate_local_git_metadata(&candidate.anchor.canonical_path)?;
         let baseline = self.manager.baseline.as_ref().ok_or(AppError::Runtime {
@@ -1118,12 +1789,17 @@ impl<'a> CandidateValidator<'a> {
         }
         let paths = self.changed_paths(&candidate, &working_directory).await?;
         validate_protected_paths(&paths)?;
+        self.validate_ignored_protected_paths(&candidate, &working_directory)
+            .await?;
         validate_no_nested_repositories(&candidate.anchor.canonical_path, &paths)?;
         self.validate_no_submodules(&candidate, &working_directory, &paths)
             .await?;
         let repository = CandidateRepository::new(self.manager, &candidate)?;
         let facts = repository.diff_facts(&paths).await?;
         validate_diff_limits(facts.file_count, facts.diff_bytes, &self.manager.policy.campaign_limits)?;
+        self.manager.validate_original_state().await?;
+        let final_candidate = self.candidate.anchor.verify_identity()?;
+        self.manager.validate_git_boundary(&final_candidate)?;
         Ok(facts)
     }
 
@@ -1155,7 +1831,6 @@ impl<'a> CandidateValidator<'a> {
             return Ok(());
         }
         let mut args = vec![
-            OsString::from("git"),
             OsString::from("ls-files"),
             OsString::from("--stage"),
             OsString::from("-z"),
@@ -1184,6 +1859,31 @@ impl<'a> CandidateValidator<'a> {
         }
         Ok(())
     }
+
+    async fn validate_ignored_protected_paths(
+        &self,
+        candidate: &VerifiedProjectRoot,
+        working_directory: &VerifiedWorkingDirectory,
+    ) -> Result<(), AppError> {
+        let output = self
+            .manager
+            .git(
+                candidate,
+                working_directory,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--ignored=matching",
+                    "--untracked-files=all",
+                ],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&output, "inspect ignored candidate paths")?;
+        let ignored = validate_ignored_status_paths(&output.stdout)?;
+        validate_no_nested_repositories(&candidate.anchor.canonical_path, &ignored)
+    }
 }
 
 struct CandidateRepository<'a> {
@@ -1203,6 +1903,7 @@ impl<'a> CandidateRepository<'a> {
     }
 
     async fn diff_facts(&self, paths: &[PathBuf]) -> Result<DiffFacts, AppError> {
+        self.manager.validate_original_state().await?;
         let index = OwnedTemporaryIndex::create(&self.manager.policy)?;
         let working_directory = VerifiedWorkingDirectory::root(self.candidate)?;
         let mut environment = SanitizedEnvironment::for_code_change_tool(&self.manager.policy)?;
@@ -1212,32 +1913,47 @@ impl<'a> CandidateRepository<'a> {
             "pinned Git is unavailable",
         ))?;
         let root = self.candidate.try_clone()?;
-        let run = |args: Vec<OsString>| async {
-            BoundedToolRunner::new(&self.manager.policy, MAX_GIT_OUTPUT_BYTES)
-                .run(
-                    git.clone(),
-                    &root,
-                    &working_directory,
-                    args,
-                    environment.clone(),
-                    "Git candidate metadata",
-                )
-                .await
-        };
-        let read_tree = run(vec![
-            OsString::from("git"),
-            OsString::from("read-tree"),
-            OsString::from(self.manager.base_sha.clone()),
-        ])
-        .await?;
+        let read_tree = self
+            .run_git_metadata(
+                &root,
+                &working_directory,
+                git,
+                &environment,
+                &[
+                    OsString::from("read-tree"),
+                    OsString::from(self.manager.base_sha.clone()),
+                ],
+            )
+            .await?;
         require_success(&read_tree, "construct candidate index")?;
-        let mut add_args = vec![OsString::from("git"), OsString::from("add"), OsString::from("-A"), OsString::from("--")];
+        let mut add_args = vec![
+            OsString::from("add"),
+            OsString::from("-A"),
+            OsString::from("--"),
+        ];
         add_args.extend(paths.iter().map(|path| path.as_os_str().to_os_string()));
-        let add = run(add_args).await?;
+        let add = self
+            .run_git_metadata(
+                &root,
+                &working_directory,
+                git,
+                &environment,
+                &add_args,
+            )
+            .await?;
         require_success(&add, "stage candidate changes")?;
-        let tree = run(vec![OsString::from("git"), OsString::from("write-tree")]).await?;
+        let tree = self
+            .run_git_metadata(
+                &root,
+                &working_directory,
+                git,
+                &environment,
+                &[OsString::from("write-tree")],
+            )
+            .await?;
         require_success(&tree, "write candidate tree")?;
         let tree_sha = canonical_full_sha(bounded_utf8_line(&tree.stdout, "candidate tree")?)?;
+        self.manager.validate_original_state().await?;
         let diff = self
             .manager
             .git(
@@ -1248,6 +1964,7 @@ impl<'a> CandidateRepository<'a> {
             )
             .await?;
         require_success(&diff, "read candidate diff")?;
+        self.manager.validate_original_state().await?;
         let mut sorted_paths = paths.to_vec();
         sorted_paths.sort();
         Ok(DiffFacts {
@@ -1259,7 +1976,35 @@ impl<'a> CandidateRepository<'a> {
         })
     }
 
+    async fn run_git_metadata(
+        &self,
+        root: &VerifiedProjectRoot,
+        working_directory: &VerifiedWorkingDirectory,
+        git: &ExecutableAnchor,
+        environment: &SanitizedEnvironment,
+        args: &[OsString],
+    ) -> Result<BoundedToolOutput, AppError> {
+        self.manager.validate_git_boundary(root)?;
+        let output = BoundedToolRunner::new(&self.manager.policy, MAX_GIT_OUTPUT_BYTES)
+            .run(
+                git.clone(),
+                root,
+                working_directory,
+                pinned_git_argv(args),
+                environment.clone(),
+                "Git candidate metadata",
+            )
+            .await;
+        let boundary = self.manager.validate_git_boundary(root);
+        match (output, boundary) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(output), Ok(())) => Ok(output),
+        }
+    }
+
     async fn commit_candidate(&self, expected: &DiffFacts) -> Result<String, AppError> {
+        self.manager.validate_original_state().await?;
         let current = self.diff_facts(&expected.transient_paths).await?;
         if current != *expected {
             return Err(recovery_required());
@@ -1281,25 +2026,27 @@ impl<'a> CandidateRepository<'a> {
             "pinned Git is unavailable",
         ))?;
         let root = self.candidate.try_clone()?;
+        self.manager.validate_git_boundary(&root)?;
         let output = BoundedToolRunner::new(&self.manager.policy, MAX_GIT_OUTPUT_BYTES)
-            .run(
-                anchor.clone(),
-                &root,
-                &working_directory,
-                vec![
-                    OsString::from("git"),
+                .run(
+                    anchor.clone(),
+                    &root,
+                    &working_directory,
+                pinned_git_argv(&[
                     OsString::from("commit-tree"),
                     OsString::from(expected.tree_sha.clone()),
                     OsString::from("-p"),
                     OsString::from(self.manager.base_sha.clone()),
                     OsString::from("-m"),
                     OsString::from("pueue-agent code-change candidate"),
-                ],
+                ]),
                 environment,
                 "Git candidate commit",
             )
             .await?;
+        self.manager.validate_git_boundary(&root)?;
         require_success(&output, "commit candidate tree")?;
+        self.manager.validate_original_state().await?;
         let candidate_sha = canonical_full_sha(bounded_utf8_line(&output.stdout, "candidate commit")?)?;
         let tree = self
             .manager
@@ -1327,8 +2074,11 @@ impl<'a> CandidateRepository<'a> {
         if bounded_utf8_line(&parent.stdout, "candidate parent")? != self.manager.base_sha {
             return Err(recovery_required());
         }
+        self.manager.validate_original_state().await?;
         self.ensure_candidate_ref(&candidate_sha).await?;
         self.verify_candidate_ref(&candidate_sha).await?;
+        self.manager.validate_original_state().await?;
+        self.manager.validate_git_boundary(self.candidate)?;
         let reset = self
             .manager
             .git(
@@ -1352,23 +2102,48 @@ impl<'a> CandidateRepository<'a> {
         if !status.stdout.is_empty() {
             return Err(recovery_required());
         }
+        let head = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&head, "verify final candidate HEAD")?;
+        if bounded_utf8_line(&head.stdout, "final candidate HEAD")? != candidate_sha {
+            return Err(recovery_required());
+        }
+        let final_candidate = self.candidate.anchor.verify_identity()?;
+        self.manager.validate_git_boundary(&final_candidate)?;
+        self.manager.validate_original_state().await?;
         Ok(candidate_sha)
     }
 
     async fn ensure_candidate_ref(&self, candidate_sha: &str) -> Result<(), AppError> {
+        self.manager.validate_original_state().await?;
+        let zero = self.manager.zero_object_id()?;
+        if candidate_sha.len() != zero.len() {
+            return Err(validation(
+                "code_change.sha",
+                "candidate object ID does not match the repository format",
+            ));
+        }
         let reference = format!("refs/heads/{}", candidate_ref(&self.manager.campaign_id, &self.manager.proposal_id)?);
         let output = self
             .manager
             .git(
                 self.candidate,
                 &VerifiedWorkingDirectory::root(self.candidate)?,
-                &["update-ref", &reference, candidate_sha, ZERO_SHA],
+                &["update-ref", &reference, candidate_sha, &zero],
                 MAX_GIT_OUTPUT_BYTES,
             )
-            .await?;
+        .await?;
         if output.success {
-            return Ok(());
+            return self.manager.validate_original_state().await;
         }
+        self.manager.validate_original_state().await?;
         let existing = self
             .manager
             .git(
@@ -1379,6 +2154,7 @@ impl<'a> CandidateRepository<'a> {
             )
             .await?;
         if existing.success && bounded_utf8_line(&existing.stdout, "candidate ref")? == candidate_sha {
+            self.manager.validate_original_state().await?;
             Ok(())
         } else {
             Err(recovery_required())
@@ -1387,6 +2163,7 @@ impl<'a> CandidateRepository<'a> {
 
     #[allow(dead_code)]
     async fn verify_candidate_ref(&self, candidate_sha: &str) -> Result<(), AppError> {
+        self.manager.validate_original_state().await?;
         let reference = format!("refs/heads/{}", candidate_ref(&self.manager.campaign_id, &self.manager.proposal_id)?);
         let output = self
             .manager
@@ -1401,6 +2178,7 @@ impl<'a> CandidateRepository<'a> {
         if bounded_utf8_line(&output.stdout, "candidate ref")? != candidate_sha {
             return Err(recovery_required());
         }
+        self.manager.validate_original_state().await?;
         Ok(())
     }
 
@@ -1410,10 +2188,24 @@ impl<'a> CandidateRepository<'a> {
         new_sha: &str,
         expected_old_sha: Option<&str>,
     ) -> Result<(), AppError> {
+        self.manager.validate_original_state().await?;
         canonical_full_sha(new_sha)?;
-        let expected = expected_old_sha.unwrap_or(ZERO_SHA);
-        if expected != ZERO_SHA {
+        let zero = self.manager.zero_object_id()?;
+        if new_sha.len() != zero.len() {
+            return Err(validation(
+                "code_change.sha",
+                "candidate object ID does not match the repository format",
+            ));
+        }
+        let expected = expected_old_sha.unwrap_or(&zero);
+        if expected != zero.as_str() {
             canonical_full_sha(expected)?;
+            if expected.len() != zero.len() {
+                return Err(validation(
+                    "code_change.sha",
+                    "expected object ID does not match the repository format",
+                ));
+            }
         }
         let reference = format!("refs/heads/{}", best_ref(&self.manager.campaign_id)?);
         let output = self
@@ -1425,10 +2217,16 @@ impl<'a> CandidateRepository<'a> {
                 MAX_GIT_OUTPUT_BYTES,
             )
             .await?;
-        if output.success {
+        let result = if output.success {
             Ok(())
         } else {
             Err(recovery_required())
+        };
+        let boundary = self.manager.validate_original_state().await;
+        match (result, boundary) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
     }
 }
@@ -1636,7 +2434,8 @@ impl BoundedToolRunner {
 /// as soon as the caller has enough information to classify the outcome.
 #[allow(dead_code)]
 struct CheckRunner<'a> {
-    policy: &'a ResolvedExecutionPolicy,
+    manager: &'a WorktreeManager,
+    candidate: &'a VerifiedProjectRoot,
 }
 
 #[allow(dead_code)]
@@ -1646,21 +2445,27 @@ impl<'a> CheckRunner<'a> {
         candidate: &VerifiedProjectRoot,
         checks: &[ProposedCheck],
     ) -> Result<Vec<String>, AppError> {
+        let validator = CandidateValidator::new(self.manager, self.candidate)?;
+        validator.verify().await?;
         let available = [
             CodeChangeTool::Cargo,
             CodeChangeTool::Uv,
             CodeChangeTool::Python,
         ]
         .into_iter()
-        .filter(|tool| self.policy.code_change_tool(*tool).is_some())
+        .filter(|tool| self.manager.policy.code_change_tool(*tool).is_some())
         .collect::<BTreeSet<_>>();
         validate_proposed_checks(
             checks,
-            candidate.anchor.canonical_path.as_path(),
-            &self.policy.campaign_limits,
+            self.candidate.anchor.canonical_path.as_path(),
+            &self.manager.policy.campaign_limits,
             &available,
         )?;
-        let candidate = candidate.anchor.verify_identity()?;
+        if candidate.anchor.canonical_path != self.candidate.anchor.canonical_path {
+            return Err(recovery_required());
+        }
+        let candidate = self.candidate.anchor.verify_identity()?;
+        self.manager.validate_git_boundary(&candidate)?;
         let mut digests = Vec::with_capacity(checks.len());
         for check in checks {
             let tool = tool_for_program(&check.argv[0]).ok_or_else(|| {
@@ -1669,7 +2474,7 @@ impl<'a> CheckRunner<'a> {
                     "must start with a pinned code-change tool",
                 )
             })?;
-            let executable = self.policy.code_change_tool(tool).ok_or_else(|| {
+            let executable = self.manager.policy.code_change_tool(tool).ok_or_else(|| {
                 validation(
                     "code_change_check.argv",
                     "requested tool is not available in the startup policy",
@@ -1679,8 +2484,9 @@ impl<'a> CheckRunner<'a> {
                 &candidate,
                 Path::new(&check.working_directory),
             )?;
-            let environment = SanitizedEnvironment::for_code_change_tool(self.policy)?;
-            let output = BoundedToolRunner::new(self.policy, MAX_CHECK_OUTPUT_BYTES)
+            self.manager.validate_git_boundary(&candidate)?;
+            let environment = SanitizedEnvironment::for_code_change_tool(&self.manager.policy)?;
+            let output = BoundedToolRunner::new(&self.manager.policy, MAX_CHECK_OUTPUT_BYTES)
                 .run(
                     executable.clone(),
                     &candidate,
@@ -1689,7 +2495,14 @@ impl<'a> CheckRunner<'a> {
                     environment,
                     "project check",
                 )
-                .await?;
+                .await;
+            let boundary = self.manager.validate_git_boundary(&candidate);
+            let output = match (output, boundary) {
+                (_, Err(error)) => return Err(error),
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(output), Ok(())) => output,
+            };
+            self.manager.validate_original_state().await?;
             if !output.success {
                 return Err(AppError::Runtime {
                     operation: "code-change project check failed",
@@ -1697,6 +2510,8 @@ impl<'a> CheckRunner<'a> {
             }
             digests.push(output.output_digest);
         }
+        self.manager.validate_git_boundary(&candidate)?;
+        validator.verify().await?;
         Ok(digests)
     }
 }
@@ -1961,6 +2776,347 @@ fn inspect_common_directory<'a>(
         }
         Ok(canonical)
     }
+}
+
+#[cfg(unix)]
+fn open_git_directory(path: &Path) -> Result<GitDirectoryProof, AppError> {
+    if path_has_symlink_component(path)? {
+        return Err(recovery_required());
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| recovery_required())?;
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_dir() || !secure_metadata_for_git(&metadata) {
+        return Err(recovery_required());
+    }
+    Ok(GitDirectoryProof {
+        path: path.to_owned(),
+        identity: executable_identity_from_metadata(&metadata),
+        directory: Arc::new(file),
+    })
+}
+
+#[cfg(unix)]
+fn open_git_file(
+    path: &Path,
+    target_base: Option<&Path>,
+    pointer_kind: Option<GitPointerKind>,
+) -> Result<GitFileProof, AppError> {
+    if path_has_symlink_component(path)? {
+        return Err(recovery_required());
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| recovery_required())?;
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_file() || !secure_metadata_for_git(&metadata) {
+        return Err(recovery_required());
+    }
+    let bytes = read_bounded_descriptor(&file, "git.metadata")?;
+    let target = match (target_base, pointer_kind) {
+        (Some(base), Some(kind)) => Some(parse_git_pointer(&bytes, base, kind)?),
+        (None, None) => None,
+        _ => return Err(recovery_required()),
+    };
+    Ok(GitFileProof {
+        path: path.to_owned(),
+        identity: executable_identity_from_metadata(&metadata),
+        digest: sha256_hex(&bytes),
+        target,
+        target_base: target_base.map(Path::to_owned),
+        pointer_kind,
+        file: Arc::new(file),
+    })
+}
+
+#[cfg(unix)]
+fn secure_metadata_for_git(metadata: &fs::Metadata) -> bool {
+    metadata.uid() == unsafe { libc::geteuid() as u32 } && metadata.mode() & 0o022 == 0
+}
+
+#[cfg(unix)]
+fn read_bounded_descriptor(file: &File, field: &'static str) -> Result<Vec<u8>, AppError> {
+    let copy = file.try_clone().map_err(|_| AppError::Runtime {
+        operation: "read local Git metadata",
+    })?;
+    let mut bytes = Vec::new();
+    copy.take((MAX_GIT_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::Runtime {
+            operation: "read local Git metadata",
+        })?;
+    if bytes.len() > MAX_GIT_OUTPUT_BYTES {
+        return Err(validation(field, "exceeds the bounded Git metadata size"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn parse_git_pointer(
+    bytes: &[u8],
+    base: &Path,
+    kind: GitPointerKind,
+) -> Result<PathBuf, AppError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        validation("git.metadata", "Git metadata pointer must be valid UTF-8")
+    })?;
+    if text.contains('\0') {
+        return Err(validation(
+            "git.metadata",
+            "Git metadata pointer contains NUL",
+        ));
+    }
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.contains(['\r', '\n']) {
+        return Err(validation(
+            "git.metadata",
+            "Git metadata pointer must contain one line",
+        ));
+    }
+    let value = match kind {
+        GitPointerKind::GitDir => text
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                validation(
+                    "git.metadata",
+                    "Git worktree metadata must identify a Git directory",
+                )
+            })?,
+        GitPointerKind::Path => text.trim(),
+    };
+    if value.is_empty() {
+        return Err(validation(
+            "git.metadata",
+            "Git metadata pointer must not be empty",
+        ));
+    }
+    let path = Path::new(value);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        base.join(path)
+    };
+    if path_has_symlink_component_relaxed(&path)? {
+        return Err(recovery_required());
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| recovery_required())?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| recovery_required())?;
+    if !metadata.is_dir() {
+        return Err(recovery_required());
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn revalidate_git_directory(proof: &GitDirectoryProof) -> Result<(), AppError> {
+    let current = open_git_directory(&proof.path)?;
+    let metadata = proof.directory.metadata().map_err(|_| recovery_required())?;
+    if proof.identity != current.identity
+        || proof.identity != executable_identity_from_metadata(&metadata)
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn revalidate_git_file(
+    proof: &GitFileProof,
+    _target_base: Option<&Path>,
+) -> Result<(), AppError> {
+    let current = open_git_file(
+        &proof.path,
+        proof.target_base.as_deref(),
+        proof.pointer_kind,
+    )?;
+    let metadata = proof.file.metadata().map_err(|_| recovery_required())?;
+    if proof.identity != current.identity
+        || proof.identity != executable_identity_from_metadata(&metadata)
+        || proof.digest != current.digest
+        || proof.target != current.target
+    {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn revalidate_git_entry(proof: &GitEntryProof) -> Result<(), AppError> {
+    match proof {
+        GitEntryProof::Directory(directory) => revalidate_git_directory(directory),
+        GitEntryProof::File(file) => revalidate_git_file(file, file.target_base.as_deref()),
+    }
+}
+
+#[cfg(unix)]
+fn existing_regular_path(path: &Path) -> Result<Option<PathBuf>, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(recovery_required()),
+        Ok(metadata) if metadata.is_file() => Ok(Some(path.to_owned())),
+        Ok(_) => Err(validation(
+            "git.config",
+            "Git configuration must be a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(recovery_required()),
+    }
+}
+
+#[cfg(unix)]
+fn validate_git_config_proof(
+    proof: &GitFileProof,
+    expected_worktree: Option<&Path>,
+) -> Result<(), AppError> {
+    let bytes = read_git_file(proof)?;
+    validate_git_config_bytes(
+        &bytes,
+        proof.path.parent().unwrap_or_else(|| Path::new("/")),
+        expected_worktree,
+    )
+}
+
+#[cfg(unix)]
+fn read_git_file(proof: &GitFileProof) -> Result<Vec<u8>, AppError> {
+    read_bounded_descriptor(&proof.file, "git.metadata")
+}
+
+#[cfg(unix)]
+fn validate_git_config_bytes(
+    bytes: &[u8],
+    config_directory: &Path,
+    expected_worktree: Option<&Path>,
+) -> Result<(), AppError> {
+    if bytes.windows(3).any(|window| window == b"\xef\xbb\xbf") {
+        return Err(validation(
+            "git.config",
+            "local Git configuration contains a byte-order mark",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| validation("git.config", "local Git configuration must be UTF-8"))?;
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.ends_with('\\') {
+            return Err(validation(
+                "git.config",
+                "local Git configuration cannot continue a value",
+            ));
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let end = header
+                .find(']')
+                .ok_or_else(|| validation("git.config", "local Git configuration has an invalid section"))?;
+            if !header[end + 1..].trim().is_empty() {
+                return Err(validation(
+                    "git.config",
+                    "local Git configuration has trailing section data",
+                ));
+            }
+            section = header[..end]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(section.as_str(), "filter" | "include" | "includeif") {
+                return Err(validation(
+                    "git.config",
+                    "local Git configuration contains an execution channel",
+                ));
+            }
+            continue;
+        }
+        let key = line
+            .split(['=', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if key.is_empty() {
+            return Err(validation(
+                "git.config",
+                "local Git configuration has an invalid key",
+            ));
+        }
+        let full = if section.is_empty() {
+            key.clone()
+        } else {
+            format!("{section}.{key}")
+        };
+        if full == "core.worktree" {
+            let value = config_value(line).ok_or_else(|| {
+                validation("git.config", "core.worktree must name the exact worktree")
+            })?;
+            let path = Path::new(value);
+            let path = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                config_directory.join(path)
+            };
+            let canonical = fs::canonicalize(&path).map_err(|_| recovery_required())?;
+            if expected_worktree != Some(canonical.as_path()) {
+                return Err(recovery_required());
+            }
+            continue;
+        }
+        if full == "extensions.worktreeconfig" {
+            let value = config_value(line).unwrap_or_default().to_ascii_lowercase();
+            if value != "true" && value != "false" {
+                return Err(validation(
+                    "git.config",
+                    "extensions.worktreeConfig must be boolean",
+                ));
+            }
+            continue;
+        }
+        if full == "core.hookspath"
+            || full == "core.fsmonitor"
+            || full == "core.sshcommand"
+            || full == "core.gitproxy"
+            || full == "core.askpass"
+            || full == "core.pager"
+            || full == "core.editor"
+            || full == "sequence.editor"
+            || full == "commit.gpgsign"
+            || full == "tag.gpgsign"
+            || full == "user.signingkey"
+            || full.starts_with("credential.")
+            || full.starts_with("gpg.")
+            || full.starts_with("pager.")
+            || full.starts_with("mergetool.")
+            || full.starts_with("filter.")
+            || full.starts_with("include")
+            || full.starts_with("diff.")
+                && (full.ends_with(".external")
+                    || full.ends_with(".textconv")
+                    || full.ends_with(".command"))
+            || full.starts_with("submodule.") && full.ends_with(".update")
+            || full.starts_with("http.") && full.contains("extraheader")
+        {
+            return Err(validation(
+                "git.config",
+                "local Git configuration contains an execution or credential channel",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn config_value(line: &str) -> Option<&str> {
+    line.split_once('=')
+        .map(|(_, value)| value.trim())
+        .or_else(|| line.split_whitespace().nth(1))
+        .filter(|value| !value.is_empty())
 }
 
 fn read_bounded_file(path: &Path, field: &'static str) -> Result<Vec<u8>, AppError> {
@@ -2349,6 +3505,40 @@ fn parse_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError> {
     Ok(paths.into_iter().collect())
 }
 
+fn validate_ignored_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError> {
+    if bytes.len() > MAX_GIT_OUTPUT_BYTES {
+        return Err(validation(
+            "code_change.status",
+            "exceeds the bounded Git output size",
+        ));
+    }
+    let mut ignored_paths = Vec::new();
+    for record in bytes.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() < 3 || &record[..3] != b"!! " {
+            continue;
+        }
+        let mut record_paths = BTreeSet::new();
+        insert_status_path(&mut record_paths, &record[3..])?;
+        if record_paths.iter().any(|path| is_protected_path(path)) {
+            return Err(validation(
+                "code_change.diff_paths",
+                "contains an ignored protected service path",
+            ));
+        }
+        ignored_paths.extend(record_paths);
+        if ignored_paths.len() > MAX_STATUS_PATHS {
+            return Err(validation(
+                "code_change.status",
+                "exceeds the bounded ignored-path count",
+            ));
+        }
+    }
+    Ok(ignored_paths)
+}
+
 fn insert_status_path(paths: &mut BTreeSet<PathBuf>, bytes: &[u8]) -> Result<(), AppError> {
     if bytes.is_empty() {
         return Err(validation(
@@ -2423,17 +3613,6 @@ fn validate_no_nested_repositories(root: &Path, paths: &[PathBuf]) -> Result<(),
             }
         }
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_state_worktree_parents(
-    policy: &ResolvedExecutionPolicy,
-    campaign_id: &str,
-) -> Result<(), AppError> {
-    let state = policy.code_change_state_root_directory();
-    let worktrees = open_or_create_directory_at(&state, OsStr::new("worktrees"))?;
-    let _campaign = open_or_create_directory_at(&worktrees, OsStr::new(campaign_id))?;
     Ok(())
 }
 
@@ -2521,17 +3700,10 @@ fn open_existing_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
 
 #[cfg(unix)]
 fn open_worktree_parent(manager: &WorktreeManager) -> Result<Option<File>, AppError> {
-    let state = manager.policy.code_change_state_root_directory();
-    let worktrees = match open_existing_directory_at(&state, OsStr::new("worktrees")) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(recovery_required()),
+    let Some(parents) = manager.worktree_parents.as_ref() else {
+        return Ok(None);
     };
-    match open_existing_directory_at(&worktrees, OsStr::new(&manager.campaign_id)) {
-        Ok(directory) => Ok(Some(directory)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(recovery_required()),
-    }
+    Ok(Some(parents.revalidate(&manager.policy, &manager.campaign_id)?))
 }
 
 #[cfg(unix)]
@@ -2608,13 +3780,22 @@ impl OwnedTemporaryIndex {
                 });
             }
             let file = unsafe { File::from_raw_fd(fd) };
-            let metadata = file.metadata().map_err(|_| AppError::Runtime {
-                operation: "verify code-change temporary index",
-            })?;
+            let metadata = match file.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    drop(file);
+                    remove_owned_temp_entry(&parent, &name, None);
+                    return Err(AppError::Runtime {
+                        operation: "verify code-change temporary index",
+                    });
+                }
+            };
             if !metadata.is_file()
                 || metadata.uid() != unsafe { libc::geteuid() as u32 }
                 || metadata.mode() & 0o077 != 0
             {
+                drop(file);
+                remove_owned_temp_entry(&parent, &name, None);
                 return Err(recovery_required());
             }
             let identity = executable_identity_from_metadata(&metadata);
@@ -2636,36 +3817,70 @@ impl OwnedTemporaryIndex {
 #[cfg(unix)]
 impl Drop for OwnedTemporaryIndex {
     fn drop(&mut self) {
-        let name = match std::ffi::CString::new(self.name.as_bytes()) {
-            Ok(name) => name,
-            Err(_) => return,
-        };
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        let result = unsafe {
-            libc::fstatat(
-                self.parent.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if result < 0 {
-            return;
-        }
-        let stat = unsafe { stat.assume_init() };
-        let current = ExecutableIdentity {
+        remove_owned_temp_entry(&self.parent, &self.name, Some(self.identity));
+        let lock = OsString::from(format!("{}.lock", self.name.to_string_lossy()));
+        remove_owned_temp_entry(&self.parent, &lock, None);
+    }
+}
+
+#[cfg(unix)]
+fn remove_owned_temp_entry(
+    parent: &File,
+    name: &OsStr,
+    initial_identity: Option<ExecutableIdentity>,
+) {
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+        return;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return;
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_type = stat.st_mode as u32 & libc::S_IFMT as u32;
+    if file_type != libc::S_IFREG as u32 || stat.st_uid != unsafe { libc::geteuid() as u32 } {
+        return;
+    }
+    let private_mode = stat.st_mode as u32 & 0o077 == 0;
+    if let Some(initial_identity) = initial_identity {
+        let current_identity = ExecutableIdentity {
             device: stat.st_dev as u64,
             inode: stat.st_ino as u64,
             owner: stat.st_uid,
             mode: stat.st_mode as u32 & 0o7777,
         };
-        if current != self.identity
-            || stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32
-        {
-            return;
+        if current_identity == initial_identity {
+            if !private_mode {
+                return;
+            }
+        } else {
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                )
+            };
+            if fd < 0 {
+                return;
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_err() || magic != *b"DIRC" {
+                return;
+            }
         }
-        let _ = unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
     }
+    let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
 }
 
 fn validate_internal_id(field: &'static str, value: &str) -> Result<(), AppError> {
@@ -2789,6 +4004,9 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     fn tools(tools: &[CodeChangeTool]) -> BTreeSet<CodeChangeTool> {
         tools.iter().copied().collect()
     }
@@ -2898,5 +4116,94 @@ mod tests {
         let limits = CampaignLimits::default();
         assert!(validate_diff_limits(51, 0, &limits).is_err());
         assert!(validate_diff_limits(0, 500_001, &limits).is_err());
+    }
+
+    #[test]
+    fn ignored_status_rejects_protected_paths_with_bounded_records() {
+        assert!(validate_ignored_status_paths(b"!! .env\0").is_err());
+        assert!(validate_ignored_status_paths(b"!! nested/\0").is_ok());
+        assert_eq!(
+            validate_ignored_status_paths(b"!! build/\0M  src/lib.rs\0").unwrap(),
+            vec![PathBuf::from("build/")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_config_proof_rejects_execution_channels_and_wrong_worktree() {
+        let root = tempdir().unwrap();
+        let worktree = root.path().join("candidate");
+        fs::create_dir(&worktree).unwrap();
+        assert!(validate_git_config_bytes(
+            b"[include]\npath = /tmp/config\n",
+            root.path(),
+            None,
+        )
+        .is_err());
+        assert!(validate_git_config_bytes(
+            b"[filter \"smudge\"]\ncommand = /bin/sh\n",
+            root.path(),
+            None,
+        )
+        .is_err());
+        assert!(validate_git_config_bytes(
+            b"[diff \"external\"]\nexternal = /bin/sh\n",
+            root.path(),
+            None,
+        )
+        .is_err());
+        assert!(validate_git_config_bytes(
+            b"[core]\nworktree = /tmp/other\n",
+            root.path(),
+            Some(&worktree),
+        )
+        .is_err());
+        assert!(validate_git_config_bytes(
+            format!("[core]\nworktree = {}\n", worktree.display()).as_bytes(),
+            root.path(),
+            Some(&worktree),
+        )
+        .is_ok());
+        assert!(validate_git_config_bytes(
+            b"[remote \"origin\"]\nurl = https://example.invalid/repo.git\n",
+            root.path(),
+            None,
+        )
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_temporary_index_drop_removes_renamed_index_and_lock() {
+        let root = tempdir().unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let name = OsString::from(".code-change-index-test");
+        let path = root.path().join(&name);
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let identity = executable_identity_from_metadata(&file.metadata().unwrap());
+        let index = OwnedTemporaryIndex {
+            _file: file,
+            parent: Arc::new(parent),
+            name: name.clone(),
+            path: path.clone(),
+            identity,
+        };
+        fs::write(root.path().join(format!("{}.lock", name.to_string_lossy())), b"lock")
+            .unwrap();
+        let replacement = root.path().join("replacement-index");
+        fs::write(&replacement, b"DIRC").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        drop(index);
+        assert!(!path.exists());
+        assert!(!root
+            .path()
+            .join(format!("{}.lock", name.to_string_lossy()))
+            .exists());
     }
 }

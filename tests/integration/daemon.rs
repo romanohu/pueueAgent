@@ -3701,7 +3701,11 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(
+        project_root.join(".gitignore"),
+        ".pueue-agent/\n.env\ncredentials.json\n",
+    )
+    .unwrap();
     fs::write(project_root.join("model.py"), "score = 1\n").unwrap();
     let run_git = |args: &[&str]| {
         let output = Command::new("git")
@@ -3799,8 +3803,54 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
     .await
     .unwrap();
     let candidate_path = candidate_base.path().to_owned();
-    fs::write(candidate_path.join("model.py"), "score = 2\n").unwrap();
+    let candidate_git = candidate_path.join(".git");
+    let candidate_git_backup = candidate_path.join(".git.original");
+    fs::rename(&candidate_git, &candidate_git_backup).unwrap();
+    fs::write(
+        &candidate_git,
+        format!("gitdir: {}\n", project_root.join(".git").display()),
+    )
+    .unwrap();
+    fs::write(candidate_path.join("model.py"), "score = 99\n").unwrap();
     let mut candidate = candidate_base;
+    let redirected = candidate.verify().await;
+    assert!(redirected.is_err(), "candidate admin redirect must be rejected");
+    assert_eq!(
+        String::from_utf8(run_git(&["rev-parse", "refs/heads/main"]).stdout)
+            .unwrap()
+            .trim(),
+        original_main
+    );
+    assert_eq!(
+        fs::read_to_string(project_root.join("model.py")).unwrap(),
+        "score = 1\n"
+    );
+    fs::remove_file(&candidate_git).unwrap();
+    fs::rename(candidate_git_backup, &candidate_git).unwrap();
+    let admin_path = PathBuf::from(
+        String::from_utf8(fs::read(&candidate_git).unwrap())
+            .unwrap()
+            .trim()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim(),
+    );
+    let worktree_config = admin_path.join("config.worktree");
+    fs::write(&worktree_config, "[include]\npath = /tmp/sentinel\n").unwrap();
+    let config_channel = candidate.verify().await;
+    assert!(config_channel.is_err(), "linked worktree config channels must be rejected");
+    fs::remove_file(worktree_config).unwrap();
+    fs::write(candidate_path.join(".env"), "secret=must-not-disappear\n").unwrap();
+    let ignored_secret = candidate.verify().await;
+    assert!(ignored_secret.is_err(), "ignored credentials must be rejected");
+    fs::remove_file(candidate_path.join(".env")).unwrap();
+    fs::create_dir(candidate_path.join(".pueue-agent")).unwrap();
+    fs::write(candidate_path.join(".pueue-agent/state"), "state").unwrap();
+    let ignored_service = candidate.verify().await;
+    assert!(ignored_service.is_err(), "ignored service state must be rejected");
+    fs::remove_file(candidate_path.join(".pueue-agent/state")).unwrap();
+    fs::remove_dir(candidate_path.join(".pueue-agent")).unwrap();
+    fs::write(candidate_path.join("model.py"), "score = 2\n").unwrap();
     let facts = candidate.verify().await.unwrap();
     assert_eq!(facts.file_count, 1);
     assert!(facts.diff_bytes > 0);
@@ -3826,4 +3876,15 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
     assert_eq!(fs::read_to_string(project_root.join("model.py")).unwrap(), "score = 1\n");
     candidate.cleanup().await.unwrap();
     assert!(!candidate_path.exists());
+    let leaked_indexes = fs::read_dir(fixture_root.join("execution-policy-state"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".code-change-index-")
+        })
+        .count();
+    assert_eq!(leaked_indexes, 0, "temporary candidate indexes must be cleaned");
 }

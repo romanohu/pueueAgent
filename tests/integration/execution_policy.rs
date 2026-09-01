@@ -296,7 +296,7 @@ fn code_change_uid_preflight_is_pure_and_rejects_only_root() {
 }
 
 #[test]
-fn code_change_worktree_root_is_rebound_below_the_retained_state_root() {
+fn code_change_worktree_root_rejects_unowned_state_descendant() {
     let harness = PolicyHarness::new();
     let policy = load_or_create_policy(&harness.input()).unwrap();
     let project = harness.project("project-a");
@@ -307,8 +307,9 @@ fn code_change_worktree_root_is_rebound_below_the_retained_state_root() {
     secure_directory(&harness.state_dir.join("worktrees/project-a"));
     secure_directory(&worktree);
     let candidate = ProjectRootAnchor::resolve(&worktree).unwrap().verify_identity().unwrap();
-    let rebound = policy.for_code_change_worktree(&project, &original, &candidate).unwrap();
-    assert_eq!(rebound.root_anchor.canonical_path, fs::canonicalize(worktree).unwrap());
+    assert!(policy
+        .for_code_change_worktree(&project, &original, &candidate)
+        .is_err());
 }
 
 #[test]

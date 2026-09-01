@@ -579,16 +579,66 @@ fn main() {
         assert!(matches!(result, Err(pueue_agent::process::ProcessLaunchError::LauncherRejected)));
     }
 
-    #[test]
-    fn code_change_valid_nested_cwd_is_descriptor_verified() {
+    #[tokio::test]
+    async fn code_change_valid_nested_cwd_is_descriptor_verified() {
         let temporary = tempdir().unwrap();
         let base = fs::canonicalize(temporary.path()).unwrap();
         let nested = base.join("nested");
         fs::create_dir(&nested).unwrap();
+        let source = base.join("cwd-target.rs");
+        let executable = base.join("cwd-target");
+        fs::write(
+            &source,
+            r#"use std::{env, fs};
+fn main() {
+    let output = env::args_os().nth(1).expect("output path");
+    let cwd = env::current_dir().expect("current directory");
+    fs::write(output, cwd.to_string_lossy().as_bytes()).expect("write cwd");
+}"#,
+        )
+        .unwrap();
+        let compile = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "cwd fixture compilation failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let root = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&base).unwrap();
         let verified = root.verify_identity().unwrap();
-        let working = VerifiedWorkingDirectory::open_descendant(&verified, Path::new("nested")).unwrap();
-        assert_eq!(working.canonical_path(), fs::canonicalize(nested).unwrap());
+        let working =
+            VerifiedWorkingDirectory::open_descendant(&verified, Path::new("nested")).unwrap();
+        assert_eq!(working.canonical_path(), fs::canonicalize(&nested).unwrap());
+        let launcher = copy_launcher(&base).0;
+        let target = ExecutableAnchor::from_absolute(&executable, &[]).unwrap();
+        let private_temp = PrivateRunTemp::create(&verified, 91).unwrap();
+        let output = base.join("cwd.txt");
+        let mut child = pueue_agent::process::spawn_verified_command_in_private_temp(
+            VerifiedCommandSpec {
+                launcher,
+                executable: target,
+                argv: vec![OsString::from("cwd-target"), output.as_os_str().to_os_string()],
+                working_directory: Some(working),
+                environment: SanitizedEnvironment::default(),
+                process_group: ProcessGroupRequirement::Required,
+                start_suspended: true,
+                project_root: Some(verified),
+                pueue_config: None,
+                child_io: agent_log_io(&base),
+            },
+            &private_temp,
+        )
+        .unwrap();
+        child.release().unwrap();
+        child.confirm_exec().await.unwrap();
+        child.wait_for_release_ack().await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(fs::canonicalize(fs::read_to_string(output).unwrap()).unwrap(), nested);
     }
 
     #[test]
@@ -632,7 +682,6 @@ fn main() {
 
     #[test]
     fn code_change_cwd_descriptor_matrix() {
-        code_change_valid_nested_cwd_is_descriptor_verified();
         code_change_sibling_cwd_is_rejected();
         code_change_symlink_descendant_is_rejected();
         code_change_replaced_candidate_root_is_rejected();
