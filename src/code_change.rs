@@ -2133,18 +2133,7 @@ impl WorktreeManager {
         }
         verify_durable_run_scope(&authorization.db, run, &self.project)?;
         self.verify_durable_ownership_proof(run, candidate)?;
-        if !matches!(
-            run.state,
-            CodeChangeState::CandidateReady
-                | CodeChangeState::ExperimentSubmitted
-                | CodeChangeState::Evaluated
-                | CodeChangeState::CleanupPending
-                | CodeChangeState::Completed
-                | CodeChangeState::Rejected
-                | CodeChangeState::RecoveryRequired
-        ) {
-            return Err(recovery_required());
-        }
+        validate_cleanup_state_for_mutation(run.state)?;
         if let Some(experiment_id) = run.experiment_id.as_deref() {
             let experiment = crate::db::ExperimentRepository::new(&authorization.db)
                 .find_by_id(experiment_id)?
@@ -3799,6 +3788,21 @@ fn recovery_required() -> AppError {
     AppError::Runtime {
         operation: "recover code-change ownership",
     }
+}
+
+fn validate_cleanup_state_for_mutation(state: CodeChangeState) -> Result<(), AppError> {
+    if !matches!(
+        state,
+        CodeChangeState::CandidateReady
+            | CodeChangeState::ExperimentSubmitted
+            | CodeChangeState::Evaluated
+            | CodeChangeState::CleanupPending
+            | CodeChangeState::Completed
+            | CodeChangeState::Rejected
+    ) {
+        return Err(recovery_required());
+    }
+    Ok(())
 }
 
 fn identity_token(identity: ExecutableIdentity) -> String {
@@ -6482,6 +6486,15 @@ mod tests {
         let db = crate::db::Db::open(&root.path().join("agent.sqlite")).unwrap();
         assert!(CodeChangeCleanupAuthorization::load(&db, "missing-run").is_err());
         assert!(list_recoverable_code_change_runs(&db, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_required_cleanup_state_is_rejected_before_mutation() {
+        let root = tempdir().unwrap();
+        let marker = root.path().join("marker");
+        fs::write(&marker, b"untouched").unwrap();
+        assert!(validate_cleanup_state_for_mutation(CodeChangeState::RecoveryRequired).is_err());
+        assert_eq!(fs::read(&marker).unwrap(), b"untouched");
     }
 
     #[cfg(unix)]
