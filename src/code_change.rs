@@ -37,8 +37,7 @@ use crate::{
 #[cfg(unix)]
 use crate::process::{
     spawn_verified_command_before_classified, terminate_process_group_before,
-    GIT_ADMIN_FD, GIT_COMMON_DIR_FD, GIT_WORKTREE_PARENT_FD, ProcessGroupRequirement,
-    PROJECT_ROOT_FD,
+    GIT_ADMIN_FD, GIT_COMMON_DIR_FD, ProcessGroupRequirement, PROJECT_ROOT_FD,
     VerifiedChildIo, VerifiedCommandSpec, VerifiedGitDirectories,
 };
 
@@ -2308,7 +2307,7 @@ impl WorktreeManager {
     ) -> Result<BoundedToolOutput, AppError> {
         self.validate_git_boundary(root)?;
         let argv = args.to_vec();
-        let mut environment = SanitizedEnvironment::for_code_change_tool(&self.policy)?;
+        let environment = SanitizedEnvironment::for_code_change_tool(&self.policy)?;
         let worktree_administration = is_worktree_administration(args);
         if !worktree_administration && owned_worktree_parent.is_some() {
             return Err(recovery_required());
@@ -2377,7 +2376,7 @@ impl WorktreeManager {
         let anchor = self.policy.code_change_git_anchor().ok_or(validation(
             "code_change.git",
             "pinned Git is unavailable",
-        ))?;
+        ))?.clone();
         apply_git_descriptor_environment(&mut environment);
         let git_directories = self.git_directories(root, worktree_parent)?;
         let result = BoundedToolRunner::new(&self.policy, cap)
@@ -5669,6 +5668,7 @@ fn quarantine_owned_temp_entry(
     }
     let identity = match if directory {
         open_existing_directory_at(parent, &quarantine_name)
+            .map_err(|_| recovery_required())
             .and_then(|entry| directory_identity(&entry))
     } else {
         match temporary_entry_identity(parent, &quarantine_name) {

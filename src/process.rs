@@ -593,12 +593,12 @@ impl ProcessGroupOwnership {
 
 #[cfg(unix)]
 fn signal_owned_process_group(
-    child: &mut VerifiedChild,
+    _child: &mut VerifiedChild,
     group: libc::pid_t,
     signal: libc::c_int,
 ) -> Result<(), AppError> {
     #[cfg(test)]
-    if std::mem::take(&mut child.injected_group_signal_error) {
+    if std::mem::take(&mut _child.injected_group_signal_error) {
         return Err(AppError::Io {
             operation: "signal verified process group",
             source: io::Error::from_raw_os_error(libc::EIO),
@@ -613,7 +613,7 @@ fn signal_owned_process_group(
     }
     #[cfg(target_os = "macos")]
     if source.raw_os_error() == Some(libc::EPERM)
-        && child.terminal_observed()? == TerminalObservation::Terminal
+        && _child.terminal_observed()? == TerminalObservation::Terminal
     {
         return Ok(());
     }
@@ -625,7 +625,7 @@ fn signal_owned_process_group(
 
 #[cfg(unix)]
 fn process_group_exists(
-    child: &mut VerifiedChild,
+    _child: &mut VerifiedChild,
     group: libc::pid_t,
 ) -> Result<bool, AppError> {
     if unsafe { libc::kill(-group, 0) } == 0 {
@@ -637,7 +637,7 @@ fn process_group_exists(
     }
     #[cfg(target_os = "macos")]
     if source.raw_os_error() == Some(libc::EPERM)
-        && child.terminal_observed()? == TerminalObservation::Terminal
+        && _child.terminal_observed()? == TerminalObservation::Terminal
     {
         return Ok(false);
     }

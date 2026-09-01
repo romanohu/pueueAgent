@@ -250,7 +250,7 @@ impl<'db> CodeChangeRepository<'db> {
                 message: "all editor attempts must use the same session",
             });
         }
-        let changed = transaction
+        transaction
             .execute(
                 "INSERT INTO code_change_editor_attempts (
                     code_change_run_id, attempt, agent_run_id, editor_session_id, status,
