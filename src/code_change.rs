@@ -4683,18 +4683,27 @@ fn digest_protected_refs(bytes: &[u8], excluded_refs: &[&str]) -> Result<String,
         ));
     }
     let mut values = Vec::new();
-    let mut fields = bytes.split(|byte| *byte == 0);
-    loop {
-        let Some(reference) = fields.next() else {
-            break;
-        };
-        if reference.is_empty() {
-            continue;
+    let mut start = 0;
+    while start < bytes.len() {
+        let record_end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset)
+            .ok_or_else(|| validation("code_change.git_refs", "Git ref output is malformed"))?;
+        let record = &bytes[start..record_end];
+        if record.is_empty() || record.last() != Some(&0) {
+            return Err(validation(
+                "code_change.git_refs",
+                "Git ref output is malformed",
+            ));
         }
-        let object = fields.next().ok_or_else(|| {
+        let fields = &record[..record.len() - 1];
+        let separator = fields.iter().position(|byte| *byte == 0).ok_or_else(|| {
             validation("code_change.git_refs", "Git ref output is malformed")
         })?;
-        if object.is_empty() {
+        let reference = &fields[..separator];
+        let object = &fields[separator + 1..];
+        if reference.is_empty() || object.is_empty() || object.contains(&0) {
             return Err(validation(
                 "code_change.git_refs",
                 "Git ref output is malformed",
@@ -4716,6 +4725,7 @@ fn digest_protected_refs(bytes: &[u8], excluded_refs: &[&str]) -> Result<String,
         if !excluded_refs.iter().any(|excluded| *excluded == reference) {
             values.push((reference.to_owned(), object.to_owned()));
         }
+        start = record_end + 1;
     }
     values.sort();
     let mut encoded = Vec::new();
@@ -6288,9 +6298,9 @@ mod tests {
 
     #[test]
     fn protected_ref_digest_excludes_only_controlled_candidate_and_best() {
-        let initial = b"refs/heads/campaign/a/candidate/p\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0refs/heads/campaign/a/best\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0refs/heads/main\0cccccccccccccccccccccccccccccccccccccccc\0";
-        let controlled_changed = b"refs/heads/campaign/a/candidate/p\0dddddddddddddddddddddddddddddddddddddddd\0refs/heads/campaign/a/best\0eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\0refs/heads/main\0cccccccccccccccccccccccccccccccccccccccc\0";
-        let unrelated_changed = b"refs/heads/campaign/a/candidate/p\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0refs/heads/campaign/a/best\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0refs/heads/main\0ffffffffffffffffffffffffffffffffffffffff\0";
+        let initial = b"refs/heads/campaign/a/candidate/p\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\nrefs/heads/campaign/a/best\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0\nrefs/heads/main\0cccccccccccccccccccccccccccccccccccccccc\0\n";
+        let controlled_changed = b"refs/heads/campaign/a/candidate/p\0dddddddddddddddddddddddddddddddddddddddd\0\nrefs/heads/campaign/a/best\0eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\0\nrefs/heads/main\0cccccccccccccccccccccccccccccccccccccccc\0\n";
+        let unrelated_changed = b"refs/heads/campaign/a/candidate/p\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\nrefs/heads/campaign/a/best\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0\nrefs/heads/main\0ffffffffffffffffffffffffffffffffffffffff\0\n";
         let excluded = [
             "refs/heads/campaign/a/candidate/p",
             "refs/heads/campaign/a/best",
@@ -6303,6 +6313,25 @@ mod tests {
             digest_protected_refs(initial, &excluded).unwrap(),
             digest_protected_refs(unrelated_changed, &excluded).unwrap()
         );
+    }
+
+    #[test]
+    fn protected_ref_digest_requires_git_for_each_ref_record_framing() {
+        let records = b"refs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\nrefs/heads/dev\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0\n";
+        let reordered = b"refs/heads/dev\0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0\nrefs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\n";
+        assert_eq!(
+            digest_protected_refs(records, &[]).unwrap(),
+            digest_protected_refs(reordered, &[]).unwrap()
+        );
+        for malformed in [
+            b"refs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0".as_slice(),
+            b"refs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".as_slice(),
+            b"refs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\n\n".as_slice(),
+            b"refs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\nextra".as_slice(),
+            b"refs/heads/main\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0\nrefs/heads/dev\0".as_slice(),
+        ] {
+            assert!(digest_protected_refs(malformed, &[]).is_err(), "{malformed:?}");
+        }
     }
 
     #[cfg(unix)]
