@@ -2131,7 +2131,7 @@ impl WorktreeManager {
         }
         verify_durable_run_scope(&authorization.db, run, &self.project)?;
         self.verify_durable_ownership_proof(run, candidate)?;
-        validate_cleanup_state_for_mutation(run.state)?;
+        validate_cleanup_state_for_mutation(run.state, run.cleanup_completed_at)?;
         if let Some(experiment_id) = run.experiment_id.as_deref() {
             let experiment = crate::db::ExperimentRepository::new(&authorization.db)
                 .find_by_id(experiment_id)?
@@ -3823,14 +3823,17 @@ fn validate_disappeared_cleanup_target(_allow_missing_target: bool) -> Result<()
     Err(recovery_required())
 }
 
-fn validate_cleanup_state_for_mutation(state: CodeChangeState) -> Result<(), AppError> {
+fn validate_cleanup_state_for_mutation(
+    state: CodeChangeState,
+    cleanup_completed_at: Option<i64>,
+) -> Result<(), AppError> {
+    if cleanup_completed_at.is_some() {
+        return Err(recovery_required());
+    }
     if !matches!(
         state,
         CodeChangeState::CandidateReady
-            | CodeChangeState::ExperimentSubmitted
-            | CodeChangeState::Evaluated
             | CodeChangeState::CleanupPending
-            | CodeChangeState::Completed
             | CodeChangeState::Rejected
     ) {
         return Err(recovery_required());
@@ -6559,7 +6562,9 @@ mod tests {
         let root = tempdir().unwrap();
         let marker = root.path().join("marker");
         fs::write(&marker, b"untouched").unwrap();
-        assert!(validate_cleanup_state_for_mutation(CodeChangeState::RecoveryRequired).is_err());
+        assert!(
+            validate_cleanup_state_for_mutation(CodeChangeState::RecoveryRequired, None).is_err()
+        );
         assert_eq!(fs::read(&marker).unwrap(), b"untouched");
     }
 
@@ -6574,5 +6579,33 @@ mod tests {
         assert!(process_is_alive(std::process::id() as i64));
         assert!(process_is_alive(0));
         assert!(process_is_alive(-1));
+    }
+
+    #[test]
+    fn cleanup_mutation_authorization_matches_durable_finalizer_matrix() {
+        let cases = [
+            (CodeChangeState::Reserved, None, false),
+            (CodeChangeState::PreparingWorktree, None, false),
+            (CodeChangeState::Editing, None, false),
+            (CodeChangeState::Checking, None, false),
+            (CodeChangeState::Committing, None, false),
+            (CodeChangeState::CandidateReady, None, true),
+            (CodeChangeState::CandidateReady, Some(123), false),
+            (CodeChangeState::ExperimentSubmitted, None, false),
+            (CodeChangeState::Evaluated, None, false),
+            (CodeChangeState::CleanupPending, None, true),
+            (CodeChangeState::Completed, None, false),
+            (CodeChangeState::Completed, Some(123), false),
+            (CodeChangeState::Rejected, None, true),
+            (CodeChangeState::Rejected, Some(123), false),
+            (CodeChangeState::RecoveryRequired, None, false),
+        ];
+        for (state, cleanup_completed_at, expected) in cases {
+            assert_eq!(
+                validate_cleanup_state_for_mutation(state, cleanup_completed_at).is_ok(),
+                expected,
+                "unexpected cleanup authorization for {state:?} with marker {cleanup_completed_at:?}",
+            );
+        }
     }
 }
