@@ -337,6 +337,12 @@ impl<'db> CampaignRepository<'db> {
         limits: &CampaignLimits,
         now: i64,
     ) -> Result<ProposalAcceptance, AppError> {
+        if proposal.kind() == ProposalKind::CodeChange {
+            return Err(validation_error(
+                "proposal.kind",
+                "code-change proposals require an admission outcome",
+            ));
+        }
         self.accept_proposal_inner(
             campaign_id,
             proposal_id,
@@ -348,6 +354,60 @@ impl<'db> CampaignRepository<'db> {
             None,
             None,
         )
+    }
+
+    pub fn reject_orphan_code_change(
+        &self,
+        campaign_id: &str,
+        proposal_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<Proposal, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin orphan code-change normalization"))?;
+        let campaign = read_campaign(&transaction, campaign_id)?;
+        let proposal = read_proposal(&transaction, proposal_id)?;
+        if proposal.campaign_id != campaign_id
+            || proposal.kind != ProposalKind::CodeChange
+            || proposal.status != ProposalStatus::Pending
+        {
+            return Err(validation_error(
+                "proposal",
+                "must be a pending code-change proposal in the campaign",
+            ));
+        }
+        let run_exists: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM code_change_runs
+                 WHERE campaign_id = ?1 AND proposal_id = ?2",
+                params![campaign_id, proposal_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check orphan code-change run"))?;
+        if run_exists != 0 {
+            return Err(validation_error(
+                "code_change.run",
+                "cannot normalize a proposal that has a durable run",
+            ));
+        }
+        reject_code_change_in_transaction(
+            &transaction,
+            campaign_id,
+            proposal_id,
+            &campaign.project_id,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit orphan code-change normalization"))?;
+        let mut rejected = proposal;
+        rejected.status = ProposalStatus::Rejected;
+        rejected.reject_reason = Some(bounded_redacted_text(reason));
+        rejected.updated_at = now;
+        Ok(rejected)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2709,6 +2769,9 @@ fn validate_atomic_code_change_run(
     validate_code_change_identifier("worktree_relative_path", &run.worktree_relative_path)?;
     validate_code_change_identifier("candidate_ref", &run.candidate_ref)?;
     validate_code_change_identifier("best_ref", &run.best_ref)?;
+    if let Some(editor_session_id) = &run.editor_session_id {
+        validate_code_change_identifier("editor_session_id", editor_session_id)?;
+    }
     if run.candidate_ref != code_change::candidate_ref(campaign_id, proposal_id)?
         || run.best_ref != code_change::best_ref(campaign_id)?
         || run.worktree_relative_path

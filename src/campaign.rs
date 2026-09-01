@@ -1,4 +1,9 @@
-use std::{ffi::OsString, path::Path, process::Command};
+use std::{
+    ffi::OsString,
+    path::Path,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -16,8 +21,9 @@ use crate::{
         ResolvedExecutionPolicy, VerifiedProjectRoot,
     },
     models::{
-        Campaign, CodeChangeRun, Experiment, ExperimentStatus, NewCodeChangeRun, ObjectiveMetric,
-        Project, Proposal, ProposalKind, ProposalStatus, Submission,
+        Campaign, CodeChangeRun, CodeChangeState, Experiment, ExperimentStatus,
+        NewCodeChangeRun, ObjectiveMetric, Project, Proposal, ProposalKind, ProposalStatus,
+        Submission,
     },
     output::{
         render_campaign_mutation, render_campaign_status_with_decision,
@@ -39,11 +45,34 @@ const BASELINE_HYPOTHESIS: &str = "Establish the initial campaign baseline";
 const ADD_UNKNOWN_REASON: &str = "pueue_add_unknown";
 const ADD_INTERRUPTED_REASON: &str = "pueue_add_interrupted";
 const ADD_IDENTITY_REASON: &str = "pueue_identity_unresolved";
+const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
+const GIT_RUNTIME: Duration = Duration::from_secs(30);
+const PINNED_GIT_ENVIRONMENT: &[(&str, &str)] = &[
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+    ("GIT_ASKPASS", "/bin/false"),
+    ("SSH_ASKPASS", "/bin/false"),
+    ("GIT_EDITOR", "/bin/false"),
+    ("GIT_SEQUENCE_EDITOR", "/bin/false"),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CampaignSubmission {
     Submitted(Submission),
     Deferred,
+}
+
+enum CodeChangeBaseResolution {
+    Available(String),
+    InvalidBest,
+    Unavailable,
 }
 
 pub fn render_status_for_project(
@@ -286,8 +315,9 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &runtime_argv,
         );
         validate_add_argv(&add_args)?;
-        let base_revision_sha =
-            self.capture_clean_head(&admission.verified_root.anchor.canonical_path);
+        let base_revision_sha = self
+            .capture_clean_head(&admission.verified_root.anchor.canonical_path)
+            .await;
         let intent = CampaignRepository::new(self.db).start_with_baseline_at_revision(
             StartCampaignRequest {
                 campaign_id: &campaign_id,
@@ -346,7 +376,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn admit_proposal(
+    pub(crate) async fn admit_proposal(
         &self,
         project: &Project,
         campaign_id: &str,
@@ -358,16 +388,18 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     ) -> Result<CampaignProposalAdmission, AppError> {
         let admission = self.acquire_admission(project)?;
         if proposal.kind() == ProposalKind::CodeChange {
-            return self.admit_code_change(
-                admission,
-                project,
-                campaign_id,
-                proposal_id,
-                experiment_id,
-                submission_id,
-                proposal,
-                now,
-            );
+            return self
+                .admit_code_change(
+                    admission,
+                    project,
+                    campaign_id,
+                    proposal_id,
+                    experiment_id,
+                    submission_id,
+                    proposal,
+                    now,
+                )
+                .await;
         }
         let runtime_argv = crate::environment::campaign_experiment_runtime_argv(
             &admission.verified_root.anchor.canonical_path,
@@ -413,10 +445,10 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn admit_code_change(
+    async fn admit_code_change(
         &self,
-        _admission: CampaignAdmission,
-        project: &Project,
+        admission: CampaignAdmission,
+        _project: &Project,
         campaign_id: &str,
         proposal_id: &str,
         experiment_id: &str,
@@ -438,7 +470,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                     message: "proposal ID belongs to a non-code proposal",
                 });
             }
-            return self.existing_code_change_outcome(existing);
+            return self.existing_code_change_outcome(existing, now);
         }
         if let Some(existing) =
             proposals_repository.find_by_digest(campaign_id, proposal.canonical_digest())?
@@ -449,7 +481,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                     message: "matches a non-code proposal",
                 });
             }
-            return self.existing_code_change_outcome(existing);
+            return self.existing_code_change_outcome(existing, now);
         }
         let live_code_change: i64 = self
             .db
@@ -470,11 +502,15 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             });
         }
 
+        let project_root = admission.verified_root.anchor.canonical_path.clone();
         let (base_sha, rejection_reason) = match preflight_code_change_runtime() {
             Err(error) => (None, Some(error.code.as_str())),
-            Ok(()) => match self.code_change_base_sha(project, campaign_id) {
-                Some(base_sha) => (Some(base_sha), None),
-                None => (None, Some("base_revision_unavailable")),
+            Ok(()) => match self.code_change_base_sha(&project_root, campaign_id).await {
+                CodeChangeBaseResolution::Available(base_sha) => (Some(base_sha), None),
+                CodeChangeBaseResolution::InvalidBest => (None, Some("best_ref_invalid")),
+                CodeChangeBaseResolution::Unavailable => {
+                    (None, Some("base_revision_unavailable"))
+                }
             },
         };
         let code_change_run = if rejection_reason.is_none() {
@@ -544,6 +580,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     fn existing_code_change_outcome(
         &self,
         proposal: Proposal,
+        now: i64,
     ) -> Result<CampaignProposalAdmission, AppError> {
         if proposal.status == ProposalStatus::Rejected {
             return Ok(CampaignProposalAdmission::CodeChangeRejected(proposal));
@@ -551,12 +588,21 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         if let Some(run) =
             CodeChangeRepository::new(self.db).find_by_proposal(&proposal.proposal_id)?
         {
+            if run.state == CodeChangeState::Rejected {
+                return Ok(CampaignProposalAdmission::CodeChangeRejected(proposal));
+            }
             return Ok(CampaignProposalAdmission::CodeChange(run));
         }
-        Ok(CampaignProposalAdmission::Deferred)
+        let rejected = CampaignRepository::new(self.db).reject_orphan_code_change(
+            &proposal.campaign_id,
+            &proposal.proposal_id,
+            "orphan_code_change_run",
+            now,
+        )?;
+        Ok(CampaignProposalAdmission::CodeChangeRejected(rejected))
     }
 
-    fn capture_clean_head(&self, project_root: &Path) -> Option<String> {
+    async fn capture_clean_head(&self, project_root: &Path) -> Option<String> {
         let anchor = self
             .execution_policy
             .and_then(ResolvedExecutionPolicy::code_change_git_anchor)?;
@@ -565,46 +611,106 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             anchor,
             project_root,
             &["rev-parse", "--verify", "HEAD^{commit}"],
-        )?;
-        let status = run_pinned_git(anchor, project_root, &["status", "--porcelain=v1", "-z"])?;
-        if !status.is_empty() {
+        )
+        .await
+        .ok()?;
+        if !head.status.success() {
             return None;
         }
-        let head = String::from_utf8(head).ok()?;
+        let status = run_pinned_git(
+            anchor,
+            project_root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        .await
+        .ok()?;
+        if !status.status.success() || !status.stdout.is_empty() {
+            return None;
+        }
+        let head = String::from_utf8(head.stdout).ok()?;
         code_change::canonical_full_sha(head.trim()).ok()
     }
 
-    fn code_change_base_sha(&self, project: &Project, campaign_id: &str) -> Option<String> {
+    async fn code_change_base_sha(
+        &self,
+        project_root: &Path,
+        campaign_id: &str,
+    ) -> CodeChangeBaseResolution {
         let anchor = self
             .execution_policy
-            .and_then(ResolvedExecutionPolicy::code_change_git_anchor)?;
-        anchor.verify_identity().ok()?;
-        let best = code_change::best_ref(campaign_id).ok()?;
-        let best_revision = format!("{best}^{{commit}}");
-        if let Some(value) = run_pinned_git(
-            anchor,
-            &project.root_path,
-            &["rev-parse", "--verify", &best_revision],
-        ) {
-            if let Ok(value) = String::from_utf8(value) {
-                if let Ok(value) = code_change::canonical_full_sha(value.trim()) {
-                    return Some(value);
+            .and_then(ResolvedExecutionPolicy::code_change_git_anchor);
+        let Some(anchor) = anchor else {
+            return CodeChangeBaseResolution::Unavailable;
+        };
+        if anchor.verify_identity().is_err() {
+            return CodeChangeBaseResolution::Unavailable;
+        }
+        let Ok(best) = code_change::best_ref(campaign_id) else {
+            return CodeChangeBaseResolution::Unavailable;
+        };
+        let best_presence =
+            run_pinned_git(anchor, project_root, &["rev-parse", "--verify", "--quiet", &best])
+                .await;
+        let best_present = match best_presence {
+            Ok(output) if output.status.success() => true,
+            Ok(_) => {
+                match git_ref_path_present(anchor, project_root, &best).await {
+                    Ok(present) => present,
+                    Err(_) => return CodeChangeBaseResolution::Unavailable,
                 }
             }
+            Err(_) => return CodeChangeBaseResolution::Unavailable,
+        };
+        let best_revision = format!("{best}^{{commit}}");
+        if best_present {
+            match run_pinned_git(
+                anchor,
+                project_root,
+                &["rev-parse", "--verify", &best_revision],
+            )
+            .await
+            {
+                Ok(output) if output.status.success() => {
+                    if let Ok(value) = String::from_utf8(output.stdout) {
+                        if let Ok(value) = code_change::canonical_full_sha(value.trim()) {
+                            return CodeChangeBaseResolution::Available(value);
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {}
+            }
+            return CodeChangeBaseResolution::InvalidBest;
         }
         let campaign = CampaignRepository::new(self.db)
             .find_by_id(campaign_id)
-            .ok()??;
-        let base = campaign.base_revision_sha?;
+            .ok()
+            .flatten();
+        let Some(base) = campaign.and_then(|campaign| campaign.base_revision_sha) else {
+            return CodeChangeBaseResolution::Unavailable;
+        };
         let base_revision = format!("{base}^{{commit}}");
-        let value = run_pinned_git(
+        let Ok(output) = run_pinned_git(
             anchor,
-            &project.root_path,
+            project_root,
             &["rev-parse", "--verify", &base_revision],
-        )?;
-        let value = String::from_utf8(value).ok()?;
-        let value = code_change::canonical_full_sha(value.trim()).ok()?;
-        (value == base).then_some(value)
+        )
+        .await else {
+            return CodeChangeBaseResolution::Unavailable;
+        };
+        if !output.status.success() {
+            return CodeChangeBaseResolution::Unavailable;
+        }
+        let Ok(value) = String::from_utf8(output.stdout) else {
+            return CodeChangeBaseResolution::Unavailable;
+        };
+        let Ok(value) = code_change::canonical_full_sha(value.trim()) else {
+            return CodeChangeBaseResolution::Unavailable;
+        };
+        if value == base {
+            CodeChangeBaseResolution::Available(value)
+        } else {
+            CodeChangeBaseResolution::Unavailable
+        }
     }
 
     pub(crate) async fn submit_admitted_proposal(
@@ -813,23 +919,259 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     }
 }
 
-fn run_pinned_git(
+struct PinnedGitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+async fn git_ref_path_present(
+    anchor: &crate::execution_policy::ExecutableAnchor,
+    project_root: &Path,
+    reference: &str,
+) -> Result<bool, AppError> {
+    let git_path = format!("refs/heads/{reference}");
+    let output = run_pinned_git(
+        anchor,
+        project_root,
+        &["rev-parse", "--git-path", &git_path],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(AppError::Runtime {
+            operation: "resolve pinned Git ref path",
+        });
+    }
+    let path = String::from_utf8(output.stdout).map_err(|_| AppError::Runtime {
+        operation: "read pinned Git ref path",
+    })?;
+    let path = path.trim();
+    if path.is_empty() || path.contains('\0') {
+        return Err(AppError::Runtime {
+            operation: "validate pinned Git ref path",
+        });
+    }
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        project_root.join(path)
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(AppError::Runtime {
+            operation: "inspect pinned Git ref path",
+        }),
+    }
+}
+
+fn pinned_git_argv(argv: &[&str]) -> Vec<OsString> {
+    let mut result = Vec::with_capacity(argv.len() + 20);
+    for argument in [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=",
+        "-c",
+        "core.sshCommand=",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "tag.gpgSign=false",
+        "-c",
+        "user.signingKey=",
+        "--no-pager",
+    ] {
+        result.push(OsString::from(argument));
+    }
+    result.extend(argv.iter().map(OsString::from));
+    result
+}
+
+fn pinned_git_environment() -> &'static [(&'static str, &'static str)] {
+    PINNED_GIT_ENVIRONMENT
+}
+
+fn validate_git_output_len(length: usize) -> Result<(), AppError> {
+    if length <= MAX_GIT_OUTPUT_BYTES {
+        Ok(())
+    } else {
+        Err(AppError::Validation {
+            field: "git.output",
+            message: "exceeds the bounded Git output size",
+        })
+    }
+}
+
+#[cfg(unix)]
+fn verified_git_program(verified: &crate::execution_policy::VerifiedExecutable) -> OsString {
+    if !cfg!(target_os = "linux") {
+        return verified.anchor.canonical_path.as_os_str().to_owned();
+    }
+    OsString::from(format!(
+        "/proc/self/fd/{}",
+        std::os::unix::io::AsRawFd::as_raw_fd(&verified.file)
+    ))
+}
+
+#[cfg(unix)]
+async fn run_pinned_git(
     anchor: &crate::execution_policy::ExecutableAnchor,
     project_root: &Path,
     argv: &[&str],
-) -> Option<Vec<u8>> {
-    let mut command = Command::new(&anchor.canonical_path);
+) -> Result<PinnedGitOutput, AppError> {
+    let verified = anchor.verify_identity().map_err(AppError::from)?;
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(verified_git_program(&verified));
     command
-        .args(argv)
+        .args(pinned_git_argv(argv))
         .current_dir(project_root)
         .env_clear()
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    let output = command.output().ok()?;
-    output.status.success().then_some(output.stdout)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in pinned_git_environment() {
+        command.env(name, value);
+    }
+    command.process_group(0);
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| AppError::Runtime {
+        operation: "spawn pinned Git",
+    })?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return Err(AppError::Runtime {
+            operation: "capture pinned Git stdout",
+        });
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        return Err(AppError::Runtime {
+            operation: "capture pinned Git stderr",
+        });
+    };
+    let mut stdout_task = tokio::spawn(read_bounded_git_output(stdout));
+    let mut stderr_task = tokio::spawn(read_bounded_git_output(stderr));
+    let mut wait = Box::pin(child.wait());
+    let mut timeout = Box::pin(tokio::time::sleep(GIT_RUNTIME));
+    let mut status = None;
+    let mut stdout_bytes = None;
+    let mut stderr_bytes = None;
+    loop {
+        if status.is_some() && stdout_bytes.is_some() && stderr_bytes.is_some() {
+            break;
+        }
+        tokio::select! {
+            result = &mut wait, if status.is_none() => {
+                match result {
+                    Ok(value) => status = Some(value),
+                    Err(_) => {
+                        drop(wait);
+                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        return Err(AppError::Runtime { operation: "wait for pinned Git" });
+                    }
+                }
+            }
+            result = &mut stdout_task, if stdout_bytes.is_none() => {
+                match result {
+                    Ok(Ok(value)) => stdout_bytes = Some(value),
+                    Ok(Err(error)) => {
+                        drop(wait);
+                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        drop(wait);
+                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        return Err(AppError::Runtime { operation: "read pinned Git stdout" });
+                    }
+                }
+            }
+            result = &mut stderr_task, if stderr_bytes.is_none() => {
+                match result {
+                    Ok(Ok(value)) => stderr_bytes = Some(value),
+                    Ok(Err(error)) => {
+                        drop(wait);
+                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        drop(wait);
+                        abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                        return Err(AppError::Runtime { operation: "read pinned Git stderr" });
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                drop(wait);
+                abort_pinned_git(&mut child, &mut stdout_task, &mut stderr_task).await;
+                return Err(AppError::Runtime { operation: "pinned Git timeout" });
+            }
+        }
+    }
+    anchor.verify_identity().map_err(AppError::from)?;
+    Ok(PinnedGitOutput {
+        status: status.expect("Git status was checked"),
+        stdout: stdout_bytes.expect("Git stdout was checked"),
+    })
+}
+
+#[cfg(not(unix))]
+async fn run_pinned_git(
+    _anchor: &crate::execution_policy::ExecutableAnchor,
+    _project_root: &Path,
+    _argv: &[&str],
+) -> Result<PinnedGitOutput, AppError> {
+    Err(AppError::Runtime {
+        operation: "run pinned Git on this platform",
+    })
+}
+
+#[cfg(unix)]
+async fn read_bounded_git_output<R>(mut reader: R) -> Result<Vec<u8>, AppError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::with_capacity(MAX_GIT_OUTPUT_BYTES.min(8192));
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await.map_err(|_| AppError::Runtime {
+            operation: "read pinned Git output",
+        })?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        let next_length = bytes.len().saturating_add(count);
+        validate_git_output_len(next_length)?;
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+#[cfg(unix)]
+async fn abort_pinned_git(
+    child: &mut tokio::process::Child,
+    stdout_task: &mut tokio::task::JoinHandle<Result<Vec<u8>, AppError>>,
+    stderr_task: &mut tokio::task::JoinHandle<Result<Vec<u8>, AppError>>,
+) {
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    stdout_task.abort();
+    stderr_task.abort();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -891,5 +1233,56 @@ fn reconciliation_required() -> AppError {
     AppError::Validation {
         field: "experiment",
         message: "submission may already have reached Pueue; reconciliation is required",
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::execution_policy::ExecutableAnchor;
+
+    #[test]
+    fn pinned_git_invocation_disables_config_auth_and_unbounded_output() {
+        let argv = pinned_git_argv(&["rev-parse", "HEAD"]);
+        let argv = argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(pinned_git_argv(&[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all"
+        ])
+        .iter()
+        .any(|value| value == "--untracked-files=all"));
+        assert!(argv.windows(2).any(|pair| pair == ["-c", "core.hooksPath=/dev/null"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c", "core.fsmonitor=false"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c", "credential.helper="]));
+        assert!(argv.windows(2).any(|pair| pair == ["-c", "commit.gpgSign=false"]));
+        assert!(argv.contains(&"--no-pager".to_owned()));
+        let environment = pinned_git_environment();
+        assert!(environment.contains(&("GIT_CONFIG_NOSYSTEM", "1")));
+        assert!(environment.contains(&("GIT_CONFIG_GLOBAL", "/dev/null")));
+        assert!(environment.contains(&("GIT_TERMINAL_PROMPT", "0")));
+        assert!(environment.contains(&("GIT_ASKPASS", "/bin/false")));
+        assert!(!environment.iter().any(|(name, _)| {
+            matches!(*name, "HOME" | "PATH" | "AWS_SECRET_ACCESS_KEY" | "GITHUB_TOKEN")
+        }));
+        assert!(validate_git_output_len(MAX_GIT_OUTPUT_BYTES).is_ok());
+        assert!(validate_git_output_len(MAX_GIT_OUTPUT_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn pinned_git_program_uses_the_verified_descriptor() {
+        let executable = std::env::current_exe().unwrap();
+        let anchor = ExecutableAnchor::from_absolute(&executable, &[]).unwrap();
+        let verified = anchor.verify_identity().unwrap();
+        let program = verified_git_program(&verified);
+        if cfg!(target_os = "linux") {
+            assert!(program.to_string_lossy().starts_with("/proc/self/fd/"));
+        } else {
+            assert_eq!(program, executable.into_os_string());
+        }
     }
 }

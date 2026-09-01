@@ -229,15 +229,18 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                     let proposal_id = decision_resource_id("proposal", &stored.reservation);
                     let experiment_id = decision_resource_id("experiment", &stored.reservation);
                     let submission_id = decision_resource_id("submission", &stored.reservation);
-                    let admission = match coordinator.admit_proposal(
-                        &project,
-                        &campaign.campaign_id,
-                        &proposal_id,
-                        &experiment_id,
-                        &submission_id,
-                        &proposal,
-                        now,
-                    ) {
+                    let admission = match coordinator
+                        .admit_proposal(
+                            &project,
+                            &campaign.campaign_id,
+                            &proposal_id,
+                            &experiment_id,
+                            &submission_id,
+                            &proposal,
+                            now,
+                        )
+                        .await
+                    {
                         Ok(admission) => admission,
                         Err(AppError::Runtime {
                             operation: "acquire project submission admission lock",

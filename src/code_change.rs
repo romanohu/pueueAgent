@@ -27,6 +27,7 @@ const MAX_CHECK_SOURCE_BYTES: usize = 64;
 const MAX_CHECK_ARG_BYTES: usize = 4 * 1024;
 const MAX_CHECK_ARG_COUNT: usize = 32;
 const MAX_INTERNAL_ID_BYTES: usize = 128;
+const MAX_GIT_REF_COMPONENT_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,15 +67,17 @@ pub fn validate_full_sha(value: &str) -> Result<(), AppError> {
 pub fn candidate_ref(campaign_id: &str, proposal_id: &str) -> Result<String, AppError> {
     validate_internal_id("campaign_id", campaign_id)?;
     validate_internal_id("proposal_id", proposal_id)?;
+    let campaign_component = git_ref_component(campaign_id)?;
+    let proposal_component = git_ref_component(proposal_id)?;
     Ok(format!(
         "campaign/{}/candidate/{}",
-        campaign_id, proposal_id,
+        campaign_component, proposal_component,
     ))
 }
 
 pub fn best_ref(campaign_id: &str) -> Result<String, AppError> {
     validate_internal_id("campaign_id", campaign_id)?;
-    Ok(format!("campaign/{}/best", campaign_id))
+    Ok(format!("campaign/{}/best", git_ref_component(campaign_id)?))
 }
 
 pub fn owned_worktree_relative_path(
@@ -363,6 +366,32 @@ fn validate_internal_id(field: &'static str, value: &str) -> Result<(), AppError
         return Err(validation(field, "must be a safe internal identifier"));
     }
     Ok(())
+}
+
+fn git_ref_component(value: &str) -> Result<String, AppError> {
+    if value
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-'))
+    {
+        return Ok(value.to_owned());
+    }
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('=');
+            encoded.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+            encoded.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+        }
+    }
+    if encoded.is_empty() || encoded.len() > MAX_GIT_REF_COMPONENT_BYTES {
+        return Err(validation(
+            "code_change.ref",
+            "encoded ref component exceeds the bounded size",
+        ));
+    }
+    Ok(encoded)
 }
 
 fn validate_relative_working_directory(value: &str) -> Result<(), AppError> {

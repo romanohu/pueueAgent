@@ -273,6 +273,23 @@ fn optional_code_change_tools_are_absent_without_blocking_policy_load() {
 }
 
 #[test]
+fn optional_code_change_absolute_path_must_be_in_trusted_path() {
+    let harness = PolicyHarness::new();
+    load_or_create_policy(&harness.input()).unwrap();
+    assert!(load_existing_policy(&harness.input()).is_ok());
+    let outside = harness.path("outside-git");
+    fs::write(&outside, b"fixture executable").unwrap();
+    secure_executable(&outside);
+    let out_of_path = fs::read_to_string(harness.policy())
+        .unwrap()
+        .replace("git = \"git\"", &format!("git = {:?}", outside));
+    fs::write(harness.policy(), out_of_path).unwrap();
+    secure_file(&harness.policy());
+
+    assert!(load_existing_policy(&harness.input()).is_err());
+}
+
+#[test]
 fn code_change_uid_preflight_is_pure_and_rejects_only_root() {
     assert!(preflight_code_change_uid(0).is_err());
     assert!(preflight_code_change_uid(501).is_ok());
@@ -302,10 +319,10 @@ fn decision_campaign_limits_reject_values_outside_service_bounds() {
         ("max_decision_attempts_per_cycle", 11),
         ("max_decision_wait_minutes", 0),
         ("max_decision_wait_minutes", 10_081),
-        ("max_code_change_changed_files", 501),
-        ("max_code_change_diff_bytes", 10_000_001),
-        ("max_code_change_checks", 33),
-        ("code_change_check_timeout_minutes", 1_441),
+        ("max_code_change_changed_files", 51),
+        ("max_code_change_diff_bytes", 500_001),
+        ("max_code_change_checks", 9),
+        ("code_change_check_timeout_minutes", 31),
     ] {
         let updated = default_policy.replacen(
             &format!("{field} = {}", campaign_limit_default(field)),

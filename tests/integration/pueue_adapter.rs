@@ -44,6 +44,7 @@ use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     batches::{self, BatchJobResult},
     campaign::CampaignCoordinator,
+    code_change,
     daemon::{Daemon, DaemonConfig},
     decision::DecisionCoordinator,
     decision_evidence::MAX_DECISION_CONTEXT_BYTES,
@@ -97,6 +98,20 @@ fn pueue_process_runner_has_a_fail_closed_non_unix_contract() {
 fn production_pueue_limits_are_exact() {
     assert_eq!(PUEUE_TIMEOUT, std::time::Duration::from_secs(30));
     assert_eq!(MAX_PUEUE_OUTPUT_BYTES, 65_536);
+}
+
+#[cfg(unix)]
+#[test]
+fn production_decision_proposal_id_derives_git_safe_candidate_ref() {
+    let proposal_id = format!("decision-proposal:{}", "a".repeat(64));
+    let candidate = code_change::candidate_ref("decision-campaign", &proposal_id).unwrap();
+    assert!(!candidate.contains(':'));
+    let ref_name = format!("refs/heads/{candidate}");
+    let output = Command::new("/usr/bin/git")
+        .args(["check-ref-format", &ref_name])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "invalid ref {candidate:?}: {output:?}");
 }
 
 #[test]
@@ -2071,6 +2086,98 @@ async fn code_change_admission_releases_lock_without_pueue_add() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn code_change_admission_uses_campaign_base_when_best_ref_is_absent() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    let run = CodeChangeRepository::new(&harness.db)
+        .find_by_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.base_sha, expected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_present_best_ref_rejects_code_change() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let best = code_change::best_ref(&harness.campaign_id).unwrap();
+    let best_path = harness
+        .root
+        .join(".git")
+        .join("refs/heads")
+        .join(best);
+    fs::create_dir_all(best_path.parent().unwrap()).unwrap();
+    fs::write(best_path, b"not-a-ref\n").unwrap();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Rejected);
+    assert_eq!(
+        proposal.reject_reason.as_deref(),
+        Some("best_ref_invalid")
+    );
+    assert!(CodeChangeRepository::new(&harness.db)
+        .find_by_proposal(&proposal.proposal_id)
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn duplicate_code_change_digest_reuses_durable_outcome() {
     let harness = DecisionHarness::with_ready_code_change();
     let expected = initialize_clean_git(&harness.root);
@@ -2142,6 +2249,184 @@ async fn duplicate_code_change_digest_reuses_durable_outcome() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_code_change_replay_is_not_reported_applied() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+
+    let first = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+    assert_eq!(first.proposals_applied, 1);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    let run = CodeChangeRepository::new(&harness.db)
+        .find_by_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap();
+    CodeChangeRepository::new(&harness.db)
+        .reject(&run.code_change_run_id, "check_failed", "checks failed", 350)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles
+             SET state = 'pending', next_wake_at = NULL, consecutive_failed_attempts = 0
+             WHERE cycle_id = ?1",
+            [&harness.cycle_id],
+        )
+        .unwrap();
+    harness.persist_ready_decision(&harness.code_change_decision(), "proposal", 400);
+
+    let second = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(500, 10)
+        .await
+        .unwrap();
+    assert_eq!(second.proposals_applied, 0);
+    assert_eq!(second.deferred, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn orphan_pending_code_change_replay_is_durably_rejected() {
+    let harness = DecisionHarness::with_ready_code_change();
+    let expected = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![expected, harness.campaign_id],
+        )
+        .unwrap();
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+    );
+    DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DELETE FROM code_change_runs WHERE campaign_id = ?1", [&harness.campaign_id])
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE decision_cycles
+             SET state = 'pending', next_wake_at = NULL, consecutive_failed_attempts = 0
+             WHERE cycle_id = ?1",
+            [&harness.cycle_id],
+        )
+        .unwrap();
+    harness.persist_ready_decision(&harness.code_change_decision(), "proposal", 400);
+
+    let second = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(500, 10)
+        .await
+        .unwrap();
+    assert_eq!(second.proposals_applied, 0);
+    assert_eq!(second.deferred, 0);
+    assert_eq!(harness.pueue.add_calls(), 0);
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Rejected);
+    let event = EventRepository::new(&harness.db)
+        .find_by_dedup_key(
+            "decision-project",
+            &format!("code-change-proposal:v1:{}:rejected", proposal.proposal_id),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, EventStatus::Completed);
+}
+
+#[test]
+fn legacy_experiment_acceptance_wrapper_rejects_code_change_without_outcome() {
+    let harness = DecisionHarness::with_terminal_source(ExperimentStatus::Succeeded, None);
+    let proposal = proposals::validate(
+        ProposalInput {
+            kind: ProposalKind::CodeChange,
+            hypothesis: "Change the training implementation".to_owned(),
+            source_experiment_id: Some(harness.source_experiment_id.clone()),
+            argv: vec!["python".to_owned(), "train.py".to_owned()],
+            working_directory: ".".to_owned(),
+            expected_evidence: vec!["validation loss".to_owned()],
+        },
+        &harness.objective_digest(),
+    )
+    .unwrap();
+    let error = CampaignRepository::new(&harness.db)
+        .accept_proposal(
+            &harness.campaign_id,
+            "legacy-code-change-proposal",
+            "legacy-code-change-experiment",
+            "legacy-code-change-submission",
+            &proposal,
+            &CampaignLimits::default(),
+            200,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "proposal.kind",
+            ..
+        }
+    ));
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM proposals WHERE proposal_id = 'legacy-code-change-proposal'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
     );
 }
 
@@ -2265,6 +2550,81 @@ async fn experiment_submit_with_root_anchor_persists_clean_head() {
         campaign.base_revision_sha.as_deref(),
         Some(expected.as_str())
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn experiment_submit_with_root_anchor_dirty_git_preserves_null_base() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    initialize_clean_git(&harness.root);
+    fs::write(
+        harness.root.join(".git/config"),
+        "[status]\n\tshowUntrackedFiles = no\n",
+    )
+    .unwrap();
+    fs::write(harness.root.join("dirty.txt"), "working tree change\n").unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness._temp.path(),
+        &[("project-a", harness.root.as_path(), Path::new("codex"))],
+    );
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let root_anchor = policy
+        .project_root_anchor(&canonical_root)
+        .map_err(AppError::from)
+        .unwrap();
+    let limits = policy.campaign_limits;
+    submit::run_with_options_with_root_anchor(
+        &harness.db,
+        &harness.root,
+        &[OsString::from("python"), OsString::from("train.py")],
+        &submit::SubmitOptions::default(),
+        &limits,
+        &harness.fake,
+        root_anchor,
+        policy,
+    )
+    .await
+    .unwrap();
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_live_by_project("project-a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.base_revision_sha, None);
+    assert_eq!(harness.fake.add_calls(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn experiment_submit_with_root_anchor_non_git_preserves_null_base() {
+    let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
+    let policy = execution_policy_fixture::resolved_policy(
+        harness._temp.path(),
+        &[("project-a", harness.root.as_path(), Path::new("codex"))],
+    );
+    let canonical_root = fs::canonicalize(&harness.root).unwrap();
+    let root_anchor = policy
+        .project_root_anchor(&canonical_root)
+        .map_err(AppError::from)
+        .unwrap();
+    let limits = policy.campaign_limits;
+    submit::run_with_options_with_root_anchor(
+        &harness.db,
+        &harness.root,
+        &[OsString::from("python"), OsString::from("train.py")],
+        &submit::SubmitOptions::default(),
+        &limits,
+        &harness.fake,
+        root_anchor,
+        policy,
+    )
+    .await
+    .unwrap();
+    let campaign = CampaignRepository::new(&harness.db)
+        .find_live_by_project("project-a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(campaign.base_revision_sha, None);
+    assert_eq!(harness.fake.add_calls(), 1);
 }
 
 #[tokio::test]

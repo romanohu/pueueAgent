@@ -1454,6 +1454,35 @@ fn resolve_optional_policy_executable(
     let Some(configured) = configured else {
         return Ok(None);
     };
+    let configured_path = Path::new(configured);
+    if configured_path.is_absolute() {
+        let Some(parent) = configured_path.parent() else {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::AnchorMissing,
+                PolicyViolationStage::Startup,
+            ));
+        };
+        let Some(name) = configured_path.file_name() else {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::AnchorMissing,
+                PolicyViolationStage::Startup,
+            ));
+        };
+        let Some(index) = trusted_path.iter().position(|directory| directory == parent) else {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::AnchorMissing,
+                PolicyViolationStage::Startup,
+            ));
+        };
+        return match open_child_path_nofollow(&trusted_path_descriptors[index], name) {
+            Ok(opened) => ExecutableAnchor::from_opened_executable(opened, roots).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(PolicyViolation::new(
+                PolicyViolationCode::AnchorMissing,
+                PolicyViolationStage::Startup,
+            )),
+        };
+    }
     match resolve_policy_executable(configured, trusted_path_descriptors, trusted_path, roots) {
         Ok(anchor) => Ok(Some(anchor)),
         Err(error) if error.code == PolicyViolationCode::AnchorMissing => Ok(None),
@@ -1605,10 +1634,10 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         || !(1..=1_440).contains(&limits.observer_interval_minutes)
         || !(1..=10).contains(&limits.max_decision_attempts_per_cycle)
         || !(1..=10_080).contains(&limits.max_decision_wait_minutes)
-        || !(1..=500).contains(&limits.max_code_change_changed_files)
-        || !(1..=10_000_000).contains(&limits.max_code_change_diff_bytes)
-        || !(1..=32).contains(&limits.max_code_change_checks)
-        || !(1..=1_440).contains(&limits.code_change_check_timeout_minutes)
+        || !(1..=50).contains(&limits.max_code_change_changed_files)
+        || !(1..=500_000).contains(&limits.max_code_change_diff_bytes)
+        || !(1..=8).contains(&limits.max_code_change_checks)
+        || !(1..=30).contains(&limits.code_change_check_timeout_minutes)
         || limits.max_live_repairs > 8
         || !(1..=20).contains(&limits.plateau_threshold)
     {

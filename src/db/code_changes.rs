@@ -1,4 +1,5 @@
 use crate::{
+    code_change,
     events::new_code_change_transition_event,
     models::{
         CodeChangeCheck, CodeChangeCheckStatus, CodeChangeEditorAttempt, CodeChangeRun,
@@ -1219,8 +1220,8 @@ fn validate_new_run(run: &NewCodeChangeRun) -> Result<(), AppError> {
     validate_owned_path("worktree_relative_path", &run.worktree_relative_path)?;
     validate_owned_ref("candidate_ref", &run.candidate_ref)?;
     validate_owned_ref("best_ref", &run.best_ref)?;
-    if run.candidate_ref != format!("campaign/{}/candidate/{}", run.campaign_id, run.proposal_id)
-        || run.best_ref != format!("campaign/{}/best", run.campaign_id)
+    if run.candidate_ref != code_change::candidate_ref(&run.campaign_id, &run.proposal_id)?
+        || run.best_ref != code_change::best_ref(&run.campaign_id)?
     {
         return Err(AppError::Validation {
             field: "code_change.ref",

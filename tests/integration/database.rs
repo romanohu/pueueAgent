@@ -236,6 +236,40 @@ impl CampaignDbHarness {
         )
     }
 
+    fn accept_code_change_with_run(
+        &self,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &ValidatedProposal,
+        limits: &CampaignLimits,
+        now: i64,
+        run_id: &str,
+    ) -> Result<ProposalAcceptance, AppError> {
+        let run = NewCodeChangeRun::new(
+            run_id,
+            proposal_id,
+            Self::CAMPAIGN_ID,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &format!("campaign/campaign-1/candidate/{proposal_id}"),
+            "campaign/campaign-1/best",
+            &format!("worktree-{run_id}"),
+            &format!(".pueue-agent/worktrees/campaign-1/{proposal_id}"),
+            now,
+        );
+        CampaignRepository::new(&self.test.db).accept_code_change_proposal(
+            Self::CAMPAIGN_ID,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            limits,
+            now,
+            Some(&run),
+            None,
+        )
+    }
+
     fn finish_baseline(&self, task_id: i64, now: i64, outcome: ExperimentTerminalOutcome<'_>) {
         let repository = ExperimentRepository::new(&self.test.db);
         repository
@@ -4418,13 +4452,14 @@ fn campaign_atomic_pending_code_change_does_not_consume_an_accepted_cycle_slot()
     );
     assert!(matches!(
         harness
-        .accept(
+        .accept_code_change_with_run(
             "proposal-code-pending",
             "experiment-code-pending",
             "submission-code-pending",
             &code_change,
             &CampaignLimits::default(),
             120,
+            "code-change-run-pending",
         )
         .unwrap(),
         ProposalAcceptance::PendingCodeChange
@@ -5223,17 +5258,26 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
     );
     assert!(matches!(
         harness
-        .accept(
+        .accept_code_change_with_run(
             "proposal-code-1",
             "experiment-code-1",
             "submission-code-1",
             &first,
             &limits,
             120,
+            "code-change-run-1",
         )
         .unwrap(),
         ProposalAcceptance::PendingCodeChange
     ));
+    CodeChangeRepository::new(&harness.test.db)
+        .reject(
+            "code-change-run-1",
+            "test_replaced",
+            "release the fixture's live-run slot",
+            121,
+        )
+        .unwrap();
     let before_boundary = CampaignDbHarness::proposal(
         ProposalKind::CodeChange,
         "Another code change before expiry",
@@ -5242,13 +5286,14 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
     );
     assert!(matches!(
         harness
-        .accept(
+        .accept_code_change_with_run(
             "proposal-code-2",
             "experiment-code-2",
             "submission-code-2",
             &before_boundary,
             &limits,
             120 + DAY - 1,
+            "code-change-run-2",
         )
         .unwrap(),
         ProposalAcceptance::BudgetWaiting {
@@ -5267,13 +5312,14 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
     );
     assert!(matches!(
         harness
-        .accept(
+        .accept_code_change_with_run(
             "proposal-code-3",
             "experiment-code-3",
             "submission-code-3",
             &at_boundary,
             &limits,
             120 + DAY,
+            "code-change-run-3",
         )
         .unwrap(),
         ProposalAcceptance::PendingCodeChange
@@ -5300,13 +5346,14 @@ fn positive_code_change_budget_exhaustion_enters_a_finite_wait_state() {
         &["python", "train.py", "--implementation", "v2"],
     );
     harness
-        .accept(
+        .accept_code_change_with_run(
             "proposal-code-first",
             "experiment-code-first",
             "submission-code-first",
             &first,
             &limits,
             120,
+            "code-change-run-first",
         )
         .unwrap();
     let second = CampaignDbHarness::proposal(
@@ -5316,13 +5363,14 @@ fn positive_code_change_budget_exhaustion_enters_a_finite_wait_state() {
         &["python", "train.py", "--implementation", "v3"],
     );
 
-    let _ = harness.accept(
+    let _ = harness.accept_code_change_with_run(
         "proposal-code-wait",
         "experiment-code-wait",
         "submission-code-wait",
         &second,
         &limits,
         120 + DAY - 1,
+        "code-change-run-wait",
     );
 
     let campaign = CampaignRepository::new(&harness.test.db)
@@ -14448,29 +14496,21 @@ fn pending_code_change_transition_uses_compare_and_set_and_recovers_in_order() {
     );
     assert!(matches!(
         harness
-            .accept(
+            .accept_code_change_with_run(
                 "proposal-code-change",
                 "experiment-code-change",
                 "submission-code-change",
                 &proposal,
                 &CampaignLimits::default(),
                 120,
+                "code-change-run-1",
             )
             .unwrap(),
         ProposalAcceptance::PendingCodeChange
     ));
     let run = CodeChangeRepository::new(&harness.test.db)
-        .create_pending(&NewCodeChangeRun::new(
-            "code-change-run-1",
-            "proposal-code-change",
-            CampaignDbHarness::CAMPAIGN_ID,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "campaign/campaign-1/candidate/proposal-code-change",
-            "campaign/campaign-1/best",
-            "worktree-1",
-            "code_changes/campaign-1/proposal-code-change",
-            121,
-        ))
+        .find_by_id("code-change-run-1")
+        .unwrap()
         .unwrap();
     assert_eq!(run.state, CodeChangeState::Reserved);
     let preparing = CodeChangeRepository::new(&harness.test.db)
@@ -14525,28 +14565,15 @@ fn pending_code_change_transition_uses_compare_and_set_and_recovers_in_order() {
     assert_eq!(recoverable[0].state, CodeChangeState::PreparingWorktree);
 }
 
-fn accept_code_change_for_test(harness: &CampaignDbHarness) {
+fn prepare_code_change_for_test(harness: &CampaignDbHarness) -> ValidatedProposal {
     harness.start(&CampaignLimits::default(), 100);
     harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
-    let proposal = CampaignDbHarness::proposal(
+    CampaignDbHarness::proposal(
         ProposalKind::CodeChange,
         "Change the training implementation",
         Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
         &["python", "train.py", "--implementation", "v2"],
-    );
-    assert!(matches!(
-        harness
-            .accept(
-                "proposal-code-change",
-                "experiment-code-change",
-                "submission-code-change",
-                &proposal,
-                &CampaignLimits::default(),
-                120,
-            )
-            .unwrap(),
-        ProposalAcceptance::PendingCodeChange
-    ));
+    )
 }
 
 fn create_pending_code_change_for_test(
@@ -14554,7 +14581,7 @@ fn create_pending_code_change_for_test(
     run_id: &str,
     editor_session_id: Option<&str>,
 ) -> pueue_agent::models::CodeChangeRun {
-    accept_code_change_for_test(harness);
+    let proposal = prepare_code_change_for_test(harness);
     let mut new_run = NewCodeChangeRun::new(
         run_id,
         "proposal-code-change",
@@ -14563,12 +14590,26 @@ fn create_pending_code_change_for_test(
         "campaign/campaign-1/candidate/proposal-code-change",
         "campaign/campaign-1/best",
         "worktree-1",
-        "code_changes/campaign-1/proposal-code-change",
+        ".pueue-agent/worktrees/campaign-1/proposal-code-change",
         121,
     );
     new_run.editor_session_id = editor_session_id.map(str::to_owned);
+    CampaignRepository::new(&harness.test.db)
+        .accept_code_change_proposal(
+            CampaignDbHarness::CAMPAIGN_ID,
+            "proposal-code-change",
+            "experiment-code-change",
+            "submission-code-change",
+            &proposal,
+            &CampaignLimits::default(),
+            120,
+            Some(&new_run),
+            None,
+        )
+        .unwrap();
     CodeChangeRepository::new(&harness.test.db)
-        .create_pending(&new_run)
+        .find_by_id(run_id)
+        .unwrap()
         .unwrap()
 }
 
@@ -14742,7 +14783,7 @@ fn code_change_editor_attempts_require_one_session_and_preserve_failed_reservati
 #[test]
 fn code_change_initial_editor_session_is_bounded_and_validated() {
     let harness = CampaignDbHarness::new();
-    accept_code_change_for_test(&harness);
+    let proposal = prepare_code_change_for_test(&harness);
     let mut run = NewCodeChangeRun::new(
         "code-change-invalid-session",
         "proposal-code-change",
@@ -14751,12 +14792,22 @@ fn code_change_initial_editor_session_is_bounded_and_validated() {
         "campaign/campaign-1/candidate/proposal-code-change",
         "campaign/campaign-1/best",
         "worktree-1",
-        "code_changes/campaign-1/proposal-code-change",
+        ".pueue-agent/worktrees/campaign-1/proposal-code-change",
         121,
     );
     run.editor_session_id = Some("bad\nvalue".to_owned());
-    let error = CodeChangeRepository::new(&harness.test.db)
-        .create_pending(&run)
+    let error = CampaignRepository::new(&harness.test.db)
+        .accept_code_change_proposal(
+            CampaignDbHarness::CAMPAIGN_ID,
+            "proposal-code-change",
+            "experiment-code-change",
+            "submission-code-change",
+            &proposal,
+            &CampaignLimits::default(),
+            120,
+            Some(&run),
+            None,
+        )
         .unwrap_err();
     assert!(matches!(
         error,
