@@ -107,6 +107,7 @@ database_enum!(EventKind {
     OperatorWake => "operator_wake",
     CampaignDecision => "campaign_decision",
     HealthDiagnosis => "health_diagnosis",
+    CodeChange => "code_change",
 });
 
 database_enum!(EventStatus {
@@ -214,6 +215,28 @@ database_enum!(ExperimentStatus {
     Succeeded => "succeeded",
     Failed => "failed",
     Cancelled => "cancelled",
+});
+
+database_enum!(CodeChangeState {
+    Reserved => "reserved",
+    PreparingWorktree => "preparing_worktree",
+    Editing => "editing",
+    Checking => "checking",
+    Committing => "committing",
+    CandidateReady => "candidate_ready",
+    ExperimentSubmitted => "experiment_submitted",
+    Evaluated => "evaluated",
+    CleanupPending => "cleanup_pending",
+    Completed => "completed",
+    Rejected => "rejected",
+    RecoveryRequired => "recovery_required",
+});
+
+database_enum!(CodeChangeCheckStatus {
+    Reserved => "reserved",
+    Passed => "passed",
+    Failed => "failed",
+    TimedOut => "timed_out",
 });
 
 database_enum!(DecisionCycleState {
@@ -615,6 +638,7 @@ pub struct Campaign {
     pub state: CampaignState,
     pub state_reason: Option<String>,
     pub baseline_experiment_id: Option<String>,
+    pub base_revision_sha: Option<String>,
     pub next_eligible_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -652,6 +676,110 @@ pub struct Experiment {
     pub failure_fingerprint: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub finished_at: Option<i64>,
+    pub code_change_run_id: Option<String>,
+    pub code_revision_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeChangeRun {
+    pub code_change_run_id: String,
+    pub proposal_id: String,
+    pub campaign_id: String,
+    pub state: CodeChangeState,
+    pub base_sha: String,
+    pub candidate_sha: Option<String>,
+    pub candidate_ref: String,
+    pub best_ref: String,
+    pub worktree_id: String,
+    pub worktree_relative_path: String,
+    pub editor_session_id: Option<String>,
+    pub editor_attempts: i64,
+    pub diff_digest: Option<String>,
+    pub changed_file_count: Option<i64>,
+    pub diff_bytes: Option<i64>,
+    pub experiment_id: Option<String>,
+    pub rejection_code: Option<String>,
+    pub rejection_summary: Option<String>,
+    pub promotion_outcome: Option<String>,
+    pub promotion_expected_best_experiment_id: Option<String>,
+    pub promotion_expected_old_sha: Option<String>,
+    pub promotion_target_sha: Option<String>,
+    pub cleanup_completed_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCodeChangeRun {
+    pub code_change_run_id: String,
+    pub proposal_id: String,
+    pub campaign_id: String,
+    pub base_sha: String,
+    pub candidate_ref: String,
+    pub best_ref: String,
+    pub worktree_id: String,
+    pub worktree_relative_path: String,
+    pub editor_session_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl NewCodeChangeRun {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        code_change_run_id: impl Into<String>,
+        proposal_id: impl Into<String>,
+        campaign_id: impl Into<String>,
+        base_sha: impl Into<String>,
+        candidate_ref: impl Into<String>,
+        best_ref: impl Into<String>,
+        worktree_id: impl Into<String>,
+        worktree_relative_path: impl Into<String>,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            code_change_run_id: code_change_run_id.into(),
+            proposal_id: proposal_id.into(),
+            campaign_id: campaign_id.into(),
+            base_sha: base_sha.into(),
+            candidate_ref: candidate_ref.into(),
+            best_ref: best_ref.into(),
+            worktree_id: worktree_id.into(),
+            worktree_relative_path: worktree_relative_path.into(),
+            editor_session_id: None,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeChangeEditorAttempt {
+    pub code_change_run_id: String,
+    pub attempt: i64,
+    pub agent_run_id: i64,
+    pub editor_session_id: String,
+    pub status: String,
+    pub result_digest: Option<String>,
+    pub failure_code: Option<String>,
+    pub failure_summary: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeChangeCheck {
+    pub code_change_run_id: String,
+    pub attempt: i64,
+    pub ordinal: i64,
+    pub source: String,
+    pub argv: Vec<String>,
+    pub working_directory: String,
+    pub status: CodeChangeCheckStatus,
+    pub output_digest: Option<String>,
+    pub summary: Option<String>,
+    pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
 }
 

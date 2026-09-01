@@ -4,9 +4,11 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 25;
+pub const LATEST_SCHEMA_VERSION: i64 = 26;
 const EVENTS_V23_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis'";
+const EVENTS_V26_KIND_LIST: &str =
+    "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis', 'code_change'";
 const EVENTS_V18_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
 const EVENTS_V17_KIND_LIST: &str =
@@ -309,6 +311,107 @@ const EXPERIMENT_METRICS_V25_TABLE_SQL: &str = r#"
         evaluated_at         TEXT NULL
     );
 "#;
+const CODE_CHANGE_RUNS_V26_TABLE_SQL: &str = r#"
+    CREATE TABLE code_change_runs (
+        code_change_run_id TEXT PRIMARY KEY,
+        proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(proposal_id),
+        campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+        state TEXT NOT NULL CHECK (state IN (
+            'reserved', 'preparing_worktree', 'editing', 'checking', 'committing',
+            'candidate_ready', 'experiment_submitted', 'evaluated',
+            'cleanup_pending', 'completed', 'rejected', 'recovery_required'
+        )),
+        base_sha TEXT NOT NULL CHECK (
+            length(base_sha) IN (40, 64) AND base_sha NOT GLOB '*[^0-9a-f]*'
+        ),
+        candidate_sha TEXT CHECK (
+            candidate_sha IS NULL OR (
+                length(candidate_sha) IN (40, 64) AND candidate_sha NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        candidate_ref TEXT NOT NULL,
+        best_ref TEXT NOT NULL,
+        worktree_id TEXT NOT NULL UNIQUE,
+        worktree_relative_path TEXT NOT NULL UNIQUE,
+        editor_session_id TEXT,
+        editor_attempts INTEGER NOT NULL DEFAULT 0 CHECK (editor_attempts BETWEEN 0 AND 2),
+        diff_digest TEXT,
+        changed_file_count INTEGER CHECK (changed_file_count IS NULL OR changed_file_count >= 0),
+        diff_bytes INTEGER CHECK (diff_bytes IS NULL OR diff_bytes >= 0),
+        experiment_id TEXT UNIQUE REFERENCES experiments(experiment_id),
+        rejection_code TEXT,
+        rejection_summary TEXT,
+        promotion_outcome TEXT,
+        promotion_expected_best_experiment_id TEXT,
+        promotion_expected_old_sha TEXT CHECK (
+            promotion_expected_old_sha IS NULL OR (
+                length(promotion_expected_old_sha) IN (40, 64)
+                AND promotion_expected_old_sha NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        promotion_target_sha TEXT CHECK (
+            promotion_target_sha IS NULL OR (
+                length(promotion_target_sha) IN (40, 64)
+                AND promotion_target_sha NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        cleanup_completed_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (
+            state IN ('reserved', 'preparing_worktree', 'editing', 'checking', 'committing')
+            AND candidate_sha IS NULL
+            OR state IN ('committing', 'candidate_ready', 'experiment_submitted', 'evaluated', 'cleanup_pending', 'completed')
+            AND candidate_sha IS NOT NULL
+            OR state IN ('rejected', 'recovery_required')
+        ),
+        CHECK (
+            state NOT IN ('experiment_submitted', 'evaluated', 'cleanup_pending', 'completed')
+            OR (experiment_id IS NOT NULL OR state = 'recovery_required')
+        )
+    );
+"#;
+const CODE_CHANGE_EDITOR_ATTEMPTS_V26_TABLE_SQL: &str = r#"
+    CREATE TABLE code_change_editor_attempts (
+        code_change_run_id TEXT NOT NULL REFERENCES code_change_runs(code_change_run_id),
+        attempt INTEGER NOT NULL CHECK (attempt IN (1, 2)),
+        agent_run_id INTEGER NOT NULL UNIQUE REFERENCES agent_runs(run_id),
+        editor_session_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'running', 'ready', 'failed')),
+        result_digest TEXT,
+        failure_code TEXT,
+        failure_summary TEXT,
+        started_at INTEGER,
+        finished_at INTEGER,
+        PRIMARY KEY(code_change_run_id, attempt)
+    );
+"#;
+const CODE_CHANGE_CHECKS_V26_TABLE_SQL: &str = r#"
+    CREATE TABLE code_change_checks (
+        code_change_run_id TEXT NOT NULL REFERENCES code_change_runs(code_change_run_id),
+        attempt INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        source TEXT NOT NULL CHECK (source IN ('supervisor', 'discovered', 'editor')),
+        argv_json TEXT NOT NULL,
+        working_directory TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'passed', 'failed', 'timed_out')),
+        output_digest TEXT,
+        summary TEXT,
+        started_at INTEGER,
+        finished_at INTEGER,
+        PRIMARY KEY(code_change_run_id, attempt, ordinal)
+    );
+"#;
+const CODE_CHANGE_ONE_LIVE_PER_CAMPAIGN_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX code_change_one_live_per_campaign
+     ON code_change_runs(campaign_id)
+     WHERE state NOT IN ('completed', 'rejected');";
+const CAMPAIGNS_V26_BASE_REVISION_COLUMN_SQL: &str =
+    "ALTER TABLE campaigns ADD COLUMN base_revision_sha TEXT;";
+const EXPERIMENTS_V26_RUN_COLUMN_SQL: &str =
+    "ALTER TABLE experiments ADD COLUMN code_change_run_id TEXT REFERENCES code_change_runs(code_change_run_id);";
+const EXPERIMENTS_V26_REVISION_COLUMN_SQL: &str =
+    "ALTER TABLE experiments ADD COLUMN code_revision_sha TEXT;";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -329,6 +432,8 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         verify_running_health_schema_v22(connection)?;
         verify_evaluation_schema_v24(connection)?;
         verify_evaluation_schema_v25(connection)?;
+        verify_event_kinds_v26(connection)?;
+        verify_code_change_schema_v26(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -782,6 +887,12 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_evaluation_schema_v25(&transaction)?;
     }
+    if version <= 25 {
+        migrate_code_change_schema_to_v26(&transaction)?;
+    } else {
+        verify_event_kinds_v26(&transaction)?;
+        verify_code_change_schema_v26(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -798,7 +909,9 @@ fn migrate_event_kinds_to_v23(transaction: &rusqlite::Transaction<'_>) -> Result
         )
         .map_err(database_error("read SQLite events schema for v23 migration"))?;
     if !event_kind_list_matches(&event_sql, EVENTS_V23_KIND_LIST) {
-        if !event_kind_list_matches(&event_sql, EVENTS_V18_KIND_LIST) {
+        if !event_kind_list_matches(&event_sql, EVENTS_V18_KIND_LIST)
+            && !event_kind_list_matches(&event_sql, EVENTS_V26_KIND_LIST)
+        {
             return Err(AppError::Runtime {
                 operation: "verify SQLite event kinds before v23 migration",
             });
@@ -849,7 +962,10 @@ fn verify_event_kinds_v23(connection: &Connection) -> Result<(), AppError> {
         .map_err(database_error("read SQLite events schema for v23 verification"))?;
     if event_sql
         .as_deref()
-        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V23_KIND_LIST))
+        .is_some_and(|sql| {
+            event_kind_list_matches(sql, EVENTS_V23_KIND_LIST)
+                || event_kind_list_matches(sql, EVENTS_V26_KIND_LIST)
+        })
     {
         Ok(())
     } else {
@@ -857,6 +973,362 @@ fn verify_event_kinds_v23(connection: &Connection) -> Result<(), AppError> {
             operation: "verify SQLite v23 event kinds",
         })
     }
+}
+
+fn migrate_event_kinds_to_v26(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite events schema for v26 migration"))?;
+    if !event_kind_list_matches(&event_sql, EVENTS_V26_KIND_LIST) {
+        if !event_kind_list_matches(&event_sql, EVENTS_V23_KIND_LIST) {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite event kinds before v26 migration",
+            });
+        }
+        let old_kind_list = event_kind_list(&event_sql).ok_or(AppError::Runtime {
+            operation: "read SQLite event kind list for v26 migration",
+        })?;
+        transaction
+            .execute_batch("PRAGMA writable_schema = ON;")
+            .map_err(database_error("enable SQLite writable schema for v26 event migration"))?;
+        let replaced = transaction.execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'
+                AND sql LIKE '%' || ?1 || '%'",
+            params![old_kind_list, EVENTS_V26_KIND_LIST],
+        );
+        let writable_schema_disabled = transaction
+            .execute_batch("PRAGMA writable_schema = OFF;")
+            .map_err(database_error(
+                "disable SQLite writable schema after v26 event migration",
+            ));
+        let replaced = replaced.map_err(database_error("add code-change event kind"))?;
+        writable_schema_disabled?;
+        if replaced != 1 {
+            return Err(AppError::Runtime {
+                operation: "migrate exactly one SQLite events kind list to v26",
+            });
+        }
+    }
+    verify_event_kinds_v26(transaction)
+}
+
+fn verify_event_kinds_v26(connection: &Connection) -> Result<(), AppError> {
+    let event_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read SQLite events schema for v26 verification"))?;
+    if event_sql
+        .as_deref()
+        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V26_KIND_LIST))
+    {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v26 event kinds",
+        })
+    }
+}
+
+fn migrate_code_change_schema_to_v26(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    migrate_event_kinds_to_v26(transaction)?;
+
+    let already = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'code_change_runs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error("probe SQLite v26 code-change runs"))?;
+    if already == 0 {
+        transaction
+            .execute_batch(CODE_CHANGE_RUNS_V26_TABLE_SQL)
+            .map_err(database_error("create SQLite v26 code-change runs"))?;
+    }
+    let attempts = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'code_change_editor_attempts'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error("probe SQLite v26 editor attempts"))?;
+    if attempts == 0 {
+        transaction
+            .execute_batch(CODE_CHANGE_EDITOR_ATTEMPTS_V26_TABLE_SQL)
+            .map_err(database_error("create SQLite v26 editor attempts"))?;
+    }
+    let checks = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'code_change_checks'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(database_error("probe SQLite v26 code-change checks"))?;
+    if checks == 0 {
+        transaction
+            .execute_batch(CODE_CHANGE_CHECKS_V26_TABLE_SQL)
+            .map_err(database_error("create SQLite v26 code-change checks"))?;
+    }
+    for (name, sql) in [
+        ("base_revision_sha", CAMPAIGNS_V26_BASE_REVISION_COLUMN_SQL),
+    ] {
+        let present = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('campaigns') WHERE name = ?1
+                 )",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error("check SQLite v26 campaign column"))?;
+        if !present {
+            transaction
+                .execute_batch(sql)
+                .map_err(database_error("add SQLite v26 campaign column"))?;
+        }
+    }
+    for (name, sql) in [
+        ("code_change_run_id", EXPERIMENTS_V26_RUN_COLUMN_SQL),
+        ("code_revision_sha", EXPERIMENTS_V26_REVISION_COLUMN_SQL),
+    ] {
+        let present = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('experiments') WHERE name = ?1
+                 )",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error("check SQLite v26 experiment column"))?;
+        if !present {
+            transaction
+                .execute_batch(sql)
+                .map_err(database_error("add SQLite v26 experiment column"))?;
+        }
+    }
+    for (name, sql) in [
+        (
+            "code_change_one_live_per_campaign",
+            CODE_CHANGE_ONE_LIVE_PER_CAMPAIGN_INDEX_SQL,
+        ),
+    ] {
+        ensure_index_definition(transaction, name, sql)?;
+    }
+    verify_code_change_schema_v26(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 26;")
+        .map_err(database_error("set SQLite v26 schema version"))
+}
+
+fn verify_code_change_schema_v26(connection: &Connection) -> Result<(), AppError> {
+    let required_columns = [
+        ("campaigns", "base_revision_sha"),
+        ("experiments", "code_change_run_id"),
+        ("experiments", "code_revision_sha"),
+    ];
+    if required_columns.iter().any(|(table, column)| {
+        connection
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
+                ),
+                [*column],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+            == false
+    }) {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v26 code-change schema",
+        });
+    }
+    for (table, expected_sql) in [
+        ("code_change_runs", CODE_CHANGE_RUNS_V26_TABLE_SQL),
+        (
+            "code_change_editor_attempts",
+            CODE_CHANGE_EDITOR_ATTEMPTS_V26_TABLE_SQL,
+        ),
+        ("code_change_checks", CODE_CHANGE_CHECKS_V26_TABLE_SQL),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read SQLite v26 code-change schema"))?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite v26 code-change schema",
+            });
+        }
+    }
+    let campaign_columns_match = campaign_table_info_matches(
+        connection,
+        "campaigns",
+        &[
+            ("campaign_id", "TEXT", 0, 1),
+            ("project_id", "TEXT", 1, 0),
+            ("objective_text", "TEXT", 1, 0),
+            ("objective_digest", "TEXT", 1, 0),
+            ("initial_argv_json", "TEXT", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("state_reason", "TEXT", 0, 0),
+            ("baseline_experiment_id", "TEXT", 0, 0),
+            ("next_eligible_at", "INTEGER", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("objective_metric_json", "TEXT", 0, 0),
+            ("current_best_experiment_id", "TEXT", 0, 0),
+            ("plateau_count", "INTEGER", 1, 0),
+            ("base_revision_sha", "TEXT", 0, 0),
+        ],
+    )
+    .map_err(database_error("verify SQLite v26 campaign columns"))?;
+    let experiment_columns_match = campaign_table_info_matches(
+        connection,
+        "experiments",
+        &[
+            ("experiment_id", "TEXT", 0, 1),
+            ("campaign_id", "TEXT", 1, 0),
+            ("proposal_id", "TEXT", 1, 0),
+            ("submission_id", "TEXT", 1, 0),
+            ("parent_experiment_id", "TEXT", 0, 0),
+            ("attempt", "INTEGER", 1, 0),
+            ("status", "TEXT", 1, 0),
+            ("pueue_task_id", "INTEGER", 0, 0),
+            ("task_signature", "TEXT", 0, 0),
+            ("failure_code", "TEXT", 0, 0),
+            ("failure_fingerprint", "TEXT", 0, 0),
+            ("created_at", "INTEGER", 1, 0),
+            ("updated_at", "INTEGER", 1, 0),
+            ("finished_at", "INTEGER", 0, 0),
+            ("resume_of_experiment_id", "TEXT", 0, 0),
+            ("checkpoint_note", "TEXT", 0, 0),
+            ("code_change_run_id", "TEXT", 0, 0),
+            ("code_revision_sha", "TEXT", 0, 0),
+        ],
+    )
+    .map_err(database_error("verify SQLite v26 experiment columns"))?;
+    if !campaign_columns_match || !experiment_columns_match {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v26 code-change schema",
+        });
+    }
+    for (name, expected_sql) in [
+        (
+            "code_change_one_live_per_campaign",
+            CODE_CHANGE_ONE_LIVE_PER_CAMPAIGN_INDEX_SQL,
+        ),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read SQLite v26 code-change indexes"))?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite v26 code-change schema",
+            });
+        }
+    }
+    let run_foreign_keys_match = campaign_foreign_keys_match(
+        connection,
+        "code_change_runs",
+        &[
+            ("proposals", "proposal_id", "proposal_id", "NO ACTION"),
+            ("campaigns", "campaign_id", "campaign_id", "NO ACTION"),
+            ("experiments", "experiment_id", "experiment_id", "NO ACTION"),
+        ],
+    )
+    .map_err(database_error("verify SQLite v26 code-change run foreign keys"))?;
+    let attempt_foreign_keys_match = campaign_foreign_keys_match(
+        connection,
+        "code_change_editor_attempts",
+        &[
+            (
+                "code_change_runs",
+                "code_change_run_id",
+                "code_change_run_id",
+                "NO ACTION",
+            ),
+            ("agent_runs", "agent_run_id", "run_id", "NO ACTION"),
+        ],
+    )
+    .map_err(database_error("verify SQLite v26 editor attempt foreign keys"))?;
+    let check_foreign_keys_match = campaign_foreign_keys_match(
+        connection,
+        "code_change_checks",
+        &[(
+            "code_change_runs",
+            "code_change_run_id",
+            "code_change_run_id",
+            "NO ACTION",
+        )],
+    )
+    .map_err(database_error("verify SQLite v26 check foreign keys"))?;
+    let experiment_foreign_keys_match = campaign_foreign_keys_match(
+        connection,
+        "experiments",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("proposals", "proposal_id", "proposal_id", "RESTRICT"),
+            ("submissions", "submission_id", "submission_id", "RESTRICT"),
+            (
+                "experiments",
+                "parent_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+            (
+                "experiments",
+                "resume_of_experiment_id",
+                "experiment_id",
+                "NO ACTION",
+            ),
+            (
+                "code_change_runs",
+                "code_change_run_id",
+                "code_change_run_id",
+                "NO ACTION",
+            ),
+        ],
+    )
+    .map_err(database_error("verify SQLite v26 experiment foreign keys"))?;
+    if !run_foreign_keys_match
+        || !attempt_foreign_keys_match
+        || !check_foreign_keys_match
+        || !experiment_foreign_keys_match
+    {
+        return Err(AppError::Runtime {
+            operation: "verify SQLite v26 code-change schema",
+        });
+    }
+    Ok(())
 }
 
 fn migrate_agent_run_execution_projection_to_v14(
@@ -2715,7 +3187,8 @@ fn event_kind_list_matches(event_sql: &str, canonical_kind_list: &str) -> bool {
 /// Databases mid-migration carry the v18 event kind list; current databases
 /// carry the v23 superset with `health_diagnosis`.
 fn events_kind_list_is_current(event_sql: &str) -> bool {
-    event_kind_list_matches(event_sql, EVENTS_V23_KIND_LIST)
+    event_kind_list_matches(event_sql, EVENTS_V26_KIND_LIST)
+        || event_kind_list_matches(event_sql, EVENTS_V23_KIND_LIST)
         || event_kind_list_matches(event_sql, EVENTS_V18_KIND_LIST)
 }
 
@@ -2751,9 +3224,9 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
             .optional()?;
         let matches = actual_sql.as_deref().is_some_and(|sql| {
             match table {
-                "experiments" => compact_sql_exact(&strip_v22_experiment_additions(sql))
+                "experiments" => compact_sql_exact(&strip_v26_experiment_additions(sql))
                     == compact_sql_exact(expected_sql),
-                "campaigns" => compact_sql_exact(&strip_v24_campaign_additions(sql))
+                "campaigns" => compact_sql_exact(&strip_v26_campaign_additions(sql))
                     == compact_sql_exact(expected_sql),
                 _ => compact_sql_exact(sql) == compact_sql_exact(expected_sql),
             }
@@ -2780,6 +3253,9 @@ fn campaign_schema_v16_is_canonical(connection: &Connection) -> rusqlite::Result
         campaign_columns.push(("objective_metric_json", "TEXT", 0, 0));
         campaign_columns.push(("current_best_experiment_id", "TEXT", 0, 0));
         campaign_columns.push(("plateau_count", "INTEGER", 1, 0));
+    }
+    if campaign_has_v26_additions(connection)? {
+        campaign_columns.push(("base_revision_sha", "TEXT", 0, 0));
     }
     if !campaign_table_info_matches(
         connection,
@@ -2932,6 +3408,10 @@ fn experiments_campaign_columns_match(connection: &Connection) -> rusqlite::Resu
         expected.push(("resume_of_experiment_id", "TEXT", 0, 0));
         expected.push(("checkpoint_note", "TEXT", 0, 0));
     }
+    if experiment_has_v26_additions(connection)? {
+        expected.push(("code_change_run_id", "TEXT", 0, 0));
+        expected.push(("code_revision_sha", "TEXT", 0, 0));
+    }
     campaign_table_info_matches(connection, "experiments", &expected)
 }
 
@@ -2960,6 +3440,14 @@ fn experiments_foreign_keys_match(connection: &Connection) -> rusqlite::Result<b
             "NO ACTION",
         ));
     }
+    if experiment_has_v26_additions(connection)? {
+        expected.push((
+            "code_change_runs",
+            "code_change_run_id",
+            "code_change_run_id",
+            "NO ACTION",
+        ));
+    }
     campaign_foreign_keys_match(connection, "experiments", &expected)
 }
 
@@ -2981,6 +3469,13 @@ fn strip_v22_experiment_additions(sql: &str) -> String {
     )
 }
 
+fn strip_v26_experiment_additions(sql: &str) -> String {
+    strip_v22_experiment_additions(sql).replace(
+        ", code_change_run_id TEXT REFERENCES code_change_runs(code_change_run_id), code_revision_sha TEXT",
+        "",
+    )
+}
+
 fn campaign_has_v24_additions(connection: &Connection) -> rusqlite::Result<bool> {
     connection.query_row(
         "SELECT EXISTS(
@@ -2996,6 +3491,32 @@ fn strip_v24_campaign_additions(sql: &str) -> String {
     sql.replace(
         ", objective_metric_json TEXT, current_best_experiment_id TEXT, plateau_count INTEGER NOT NULL DEFAULT 0",
         "",
+    )
+}
+
+fn strip_v26_campaign_additions(sql: &str) -> String {
+    strip_v24_campaign_additions(sql).replace(", base_revision_sha TEXT", "")
+}
+
+fn campaign_has_v26_additions(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('campaigns')
+             WHERE name = 'base_revision_sha'
+         )",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn experiment_has_v26_additions(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pragma_table_info('experiments')
+             WHERE name = 'code_change_run_id'
+         )",
+        [],
+        |row| row.get(0),
     )
 }
 

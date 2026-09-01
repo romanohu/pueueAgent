@@ -14,7 +14,8 @@ use pueue_agent::{
     },
     db::{
         inferred_pre_binding_policy_code, experiment_metrics::MetricsRepository,
-        AgentDecisionReservation, AgentRunRepository, BatchRepository, CampaignRepository, Db,
+        AgentDecisionReservation, AgentRunRepository, BatchRepository, CampaignRepository,
+        CodeChangeRepository, Db,
         EventRepository, ExperimentRepository, DecisionRepository, IncidentRepository,
         InterventionRepository, ProjectRepository, RunLineageRepository,
         running_health::HealthRepository, ProposalAcceptance, StartCampaignRequest,
@@ -33,10 +34,12 @@ use pueue_agent::{
     models::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
         BudgetReservationStatus, Campaign, CampaignState, DecisionAttemptState,
-        DecisionCycleState, EventKind, EventStatus, ExecutionProjection, Experiment, ExperimentStatus,
+        CodeChangeState, DecisionCycleState, EventKind, EventStatus, ExecutionProjection,
+        Experiment, ExperimentStatus,
         ExperimentTerminalOutcome, ExperimentMetricsRow, HealthState, IncidentStatus,
         IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident,
-        NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest, Proposal,
+        NewCodeChangeRun, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
+        Proposal,
         ProposalKind, ProposalStatus, SignalSummaryEntry, SubmissionKind, SubmissionStatus,
         TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES, MAX_EXECUTABLE_PATH_BYTES,
     },
@@ -3959,14 +3962,16 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         "finished_at INTEGER,",
         "finished_at INTEGER,
         resume_of_experiment_id TEXT REFERENCES experiments(experiment_id),
-        checkpoint_note TEXT,",
+        checkpoint_note TEXT,
+        code_change_run_id TEXT REFERENCES code_change_runs(code_change_run_id),
+        code_revision_sha TEXT,",
         1,
     );
     let campaigns_latest_sql = CAMPAIGNS_V16_SQL.replacen(
         "updated_at INTEGER NOT NULL
 )",
         "updated_at INTEGER NOT NULL
-        , objective_metric_json TEXT, current_best_experiment_id TEXT, plateau_count INTEGER NOT NULL DEFAULT 0)",
+        , objective_metric_json TEXT, current_best_experiment_id TEXT, plateau_count INTEGER NOT NULL DEFAULT 0, base_revision_sha TEXT)",
         1,
     );
     for (table, expected_sql, expected_columns) in [
@@ -3988,6 +3993,7 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 ("objective_metric_json", "TEXT", 0, 0),
                 ("current_best_experiment_id", "TEXT", 0, 0),
                 ("plateau_count", "INTEGER", 1, 0),
+                ("base_revision_sha", "TEXT", 0, 0),
             ],
         ),
         (
@@ -4029,6 +4035,8 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 ("finished_at", "INTEGER", 0, 0),
                 ("resume_of_experiment_id", "TEXT", 0, 0),
                 ("checkpoint_note", "TEXT", 0, 0),
+                ("code_change_run_id", "TEXT", 0, 0),
+                ("code_revision_sha", "TEXT", 0, 0),
             ],
         ),
         (
@@ -4117,6 +4125,12 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 "experiments",
                 "resume_of_experiment_id",
                 "experiment_id",
+                "NO ACTION",
+            ),
+            (
+                "code_change_runs",
+                "code_change_run_id",
+                "code_change_run_id",
                 "NO ACTION",
             ),
         ])
@@ -4239,6 +4253,7 @@ fn campaign_models_use_typed_exact_database_values() {
         state: CampaignState::Active,
         state_reason: None,
         baseline_experiment_id: Some("experiment-1".to_owned()),
+        base_revision_sha: None,
         next_eligible_at: None,
         created_at: 100,
         updated_at: 100,
@@ -4273,6 +4288,8 @@ fn campaign_models_use_typed_exact_database_values() {
         created_at: 100,
         updated_at: 100,
         finished_at: None,
+        code_change_run_id: None,
+        code_revision_sha: None,
     };
     let reservation = BudgetReservation {
         reservation_id: "reservation-1".to_owned(),
@@ -14206,7 +14223,7 @@ fn legacy_marker_v24_preserves_terminal_null_evaluation() {
 }
 
 #[test]
-fn fresh_database_starts_at_schema_v25_with_nullable_evaluation_marker() {
+fn fresh_database_starts_at_schema_v26_with_nullable_evaluation_marker() {
     let temp = tempfile::tempdir().unwrap();
     let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
     let connection = db.connect().unwrap();
@@ -14260,6 +14277,251 @@ fn current_v25_schema_rejects_a_noncanonical_experiment_metrics_check() {
             operation: "verify SQLite v25 evaluation schema"
         }
     ));
+}
+
+#[test]
+fn schema_v26_adds_isolated_code_change_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let db = Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+    let connection = db.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 26);
+    for table in [
+        "code_change_runs",
+        "code_change_editor_attempts",
+        "code_change_checks",
+    ] {
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "{table}");
+    }
+    for (table, column) in [
+        ("campaigns", "base_revision_sha"),
+        ("experiments", "code_change_run_id"),
+        ("experiments", "code_revision_sha"),
+        ("code_change_runs", "promotion_outcome"),
+        ("code_change_runs", "promotion_expected_best_experiment_id"),
+        ("code_change_runs", "promotion_expected_old_sha"),
+        ("code_change_runs", "promotion_target_sha"),
+    ] {
+        let present: i64 = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "{table}.{column}");
+    }
+}
+
+#[test]
+fn v25_fixture_migration_preserves_ordinary_campaign_experiment_and_event() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    let before_campaign = harness.db.clone();
+    let campaign = CampaignRepository::new(&before_campaign)
+        .find_by_id(CampaignDbHarness::CAMPAIGN_ID)
+        .unwrap()
+        .unwrap();
+    let experiment = ExperimentRepository::new(&before_campaign)
+        .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+        .unwrap()
+        .unwrap();
+    let event_id = insert_event(
+        &before_campaign,
+        CampaignDbHarness::PROJECT_ID,
+        "ordinary-v25-event",
+        150,
+    );
+    let event = EventRepository::new(&before_campaign)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
+    let path = harness.test.path.clone();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX code_change_one_live_per_campaign;
+             DROP TABLE code_change_checks;
+             DROP TABLE code_change_editor_attempts;
+             DROP TABLE code_change_runs;
+             PRAGMA writable_schema = ON;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ', base_revision_sha TEXT', '')
+              WHERE type = 'table' AND name = 'campaigns'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(
+                    sql,
+                    ', code_change_run_id TEXT REFERENCES code_change_runs(code_change_run_id), code_revision_sha TEXT',
+                    ''
+                )
+              WHERE type = 'table' AND name = 'experiments'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, '')
+              WHERE type = 'table' AND name = 'events'",
+            [", 'code_change'"],
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA writable_schema = OFF; PRAGMA user_version = 25;")
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&path).unwrap();
+    assert_eq!(
+        CampaignRepository::new(&migrated)
+            .find_by_id(CampaignDbHarness::CAMPAIGN_ID)
+            .unwrap()
+            .unwrap(),
+        campaign
+    );
+    assert_eq!(
+        ExperimentRepository::new(&migrated)
+            .find_by_id(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+            .unwrap()
+            .unwrap(),
+        experiment
+    );
+    assert_eq!(
+        EventRepository::new(&migrated)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap(),
+        event
+    );
+    let connection = migrated.connect().unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT base_revision_sha FROM campaigns WHERE campaign_id = ?1",
+                [CampaignDbHarness::CAMPAIGN_ID],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None
+    );
+    let code_fields: (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT code_change_run_id, code_revision_sha
+             FROM experiments WHERE experiment_id = ?1",
+            [CampaignDbHarness::BASELINE_EXPERIMENT_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(code_fields, (None, None));
+}
+
+#[test]
+fn pending_code_change_transition_uses_compare_and_set_and_recovers_in_order() {
+    let harness = CampaignDbHarness::new();
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Change the training implementation",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v2"],
+    );
+    assert!(matches!(
+        harness
+            .accept(
+                "proposal-code-change",
+                "experiment-code-change",
+                "submission-code-change",
+                &proposal,
+                &CampaignLimits::default(),
+                120,
+            )
+            .unwrap(),
+        ProposalAcceptance::PendingCodeChange
+    ));
+    let run = CodeChangeRepository::new(&harness.test.db)
+        .create_pending(&NewCodeChangeRun::new(
+            "code-change-run-1",
+            "proposal-code-change",
+            CampaignDbHarness::CAMPAIGN_ID,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "campaign/campaign-1/candidate/proposal-code-change",
+            "campaign/campaign-1/best",
+            "worktree-1",
+            "code_changes/campaign-1/proposal-code-change",
+            121,
+        ))
+        .unwrap();
+    assert_eq!(run.state, CodeChangeState::Reserved);
+    let preparing = CodeChangeRepository::new(&harness.test.db)
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Reserved,
+            CodeChangeState::PreparingWorktree,
+            122,
+        )
+        .unwrap();
+    assert_eq!(preparing.state, CodeChangeState::PreparingWorktree);
+    for state in ["reserved", "preparing_worktree"] {
+        let event = EventRepository::new(&harness.test.db)
+            .find_by_dedup_key(
+                CampaignDbHarness::PROJECT_ID,
+                &format!("code-change:v1:{}:{state}:0", run.code_change_run_id),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind, EventKind::CodeChange);
+        assert_eq!(event.status, EventStatus::Completed);
+        let payload = event.payload.as_object().unwrap();
+        assert_eq!(payload.len(), 7);
+        assert_eq!(payload["code_change_run_id"], run.code_change_run_id);
+        assert_eq!(payload["campaign_id"], CampaignDbHarness::CAMPAIGN_ID);
+        assert_eq!(payload["proposal_id"], "proposal-code-change");
+        assert_eq!(payload["state"], state);
+        assert_eq!(payload["attempt"], 0);
+        assert_eq!(payload["reason_code"], serde_json::Value::Null);
+        assert!(payload.get("candidate_sha").is_none());
+    }
+    let error = CodeChangeRepository::new(&harness.test.db)
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Reserved,
+            CodeChangeState::Editing,
+            123,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change.state",
+            ..
+        }
+    ));
+
+    let db = Db::open(harness.test.db.path()).unwrap();
+    let recoverable = CodeChangeRepository::new(&db).list_recoverable(10).unwrap();
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].code_change_run_id, "code-change-run-1");
+    assert_eq!(recoverable[0].state, CodeChangeState::PreparingWorktree);
 }
 
 #[test]

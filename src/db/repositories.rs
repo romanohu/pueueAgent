@@ -64,7 +64,7 @@ fn event_claim_candidate_sql(status: EventStatus) -> String {
          FROM events INDEXED BY events_claimable_idx
          WHERE status IN ('pending', 'retry_wait')
            AND status = '{status}' AND not_before <= ?1
-           AND kind <> 'health_diagnosis'
+           AND kind NOT IN ('health_diagnosis', 'code_change')
          ORDER BY not_before, created_at, event_id
          LIMIT ?2"
     )
@@ -1815,7 +1815,7 @@ impl<'db> EventRepository<'db> {
                 | EventKind::AutoKilled
                 | EventKind::TerminationFailed => count += 1,
                 EventKind::TaskFinished | EventKind::DeepCheck | EventKind::OperatorWake => break,
-                EventKind::CampaignDecision | EventKind::HealthDiagnosis => {}
+                EventKind::CampaignDecision | EventKind::HealthDiagnosis | EventKind::CodeChange => {}
             }
         }
         Ok(count)

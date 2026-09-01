@@ -4,7 +4,10 @@ use uuid::Uuid;
 
 use crate::{
     db::{CampaignRepository, Db, EventRepository, IntegrationEventRepository, ProjectRepository},
-    models::{EventKind, IntegrationEventKind, NewEvent, NewIntegrationEvent},
+    models::{
+        CodeChangeRun, EventKind, IntegrationEventKind, NewEvent, NewIntegrationEvent,
+    },
+    output::bounded_redacted_text,
     paths,
     pueue::PueueTask,
     pueue_security::validate_group,
@@ -14,6 +17,35 @@ use crate::{
 pub type EventId = i64;
 
 const MAX_OPERATOR_WAKE_REASON_BYTES: usize = 1024;
+
+pub(crate) fn new_code_change_transition_event(
+    project_id: impl Into<String>,
+    run: &CodeChangeRun,
+    attempt: i64,
+    reason_code: Option<&str>,
+    event_time: i64,
+) -> NewEvent {
+    NewEvent::new(
+        project_id,
+        EventKind::CodeChange,
+        format!(
+            "code-change:v1:{}:{}:{}",
+            run.code_change_run_id, run.state, attempt
+        ),
+        json!({
+            "code_change_run_id": run.code_change_run_id,
+            "campaign_id": run.campaign_id,
+            "proposal_id": run.proposal_id,
+            "state": run.state,
+            "attempt": attempt,
+            "reason_code": reason_code.map(bounded_redacted_text),
+            "event_time": event_time,
+        }),
+        event_time,
+        event_time,
+    )
+    .with_campaign_lineage(run.campaign_id.clone(), Option::<String>::None)
+}
 
 pub fn record_operator_wake_with(
     db: &Db,

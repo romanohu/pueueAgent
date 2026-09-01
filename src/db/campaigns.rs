@@ -29,7 +29,7 @@ const MAX_STATUS_TASK_IDS: i64 = 100;
 
 const CAMPAIGN_SELECT: &str = "SELECT campaign_id, project_id, objective_text, objective_digest,
         initial_argv_json, state, state_reason, baseline_experiment_id, next_eligible_at,
-        created_at, updated_at
+        created_at, updated_at, base_revision_sha
     FROM campaigns";
 const PROPOSAL_SELECT: &str = "SELECT proposal_id, campaign_id, kind, status, hypothesis,
         source_experiment_id, argv_json, working_directory, expected_evidence_json,
@@ -37,7 +37,8 @@ const PROPOSAL_SELECT: &str = "SELECT proposal_id, campaign_id, kind, status, hy
     FROM proposals";
 const EXPERIMENT_SELECT: &str = "SELECT experiment_id, campaign_id, proposal_id, submission_id,
         parent_experiment_id, attempt, status, pueue_task_id, task_signature, failure_code,
-        failure_fingerprint, created_at, updated_at, finished_at
+        failure_fingerprint, created_at, updated_at, finished_at,
+        code_change_run_id, code_revision_sha
     FROM experiments";
 const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, created_at,
         pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
@@ -139,6 +140,15 @@ impl<'db> CampaignRepository<'db> {
         request: StartCampaignRequest<'_>,
         limits: &CampaignLimits,
     ) -> Result<ManagedSubmissionIntent, AppError> {
+        self.start_with_baseline_at_revision(request, limits, None)
+    }
+
+    pub fn start_with_baseline_at_revision(
+        &self,
+        request: StartCampaignRequest<'_>,
+        limits: &CampaignLimits,
+        base_revision_sha: Option<&str>,
+    ) -> Result<ManagedSubmissionIntent, AppError> {
         if let Some(objective_metric) = request.objective_metric {
             objective_metric.validate()?;
         }
@@ -233,8 +243,8 @@ impl<'db> CampaignRepository<'db> {
                 "INSERT INTO campaigns (
                     campaign_id, project_id, objective_text, objective_digest, initial_argv_json,
                     state, state_reason, baseline_experiment_id, next_eligible_at,
-                    objective_metric_json, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8, ?8)",
+                    objective_metric_json, base_revision_sha, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8, ?9, ?9)",
                 params![
                     request.campaign_id,
                     request.project_id,
@@ -243,6 +253,7 @@ impl<'db> CampaignRepository<'db> {
                     initial_argv_json,
                     CampaignState::Active,
                     objective_metric_json,
+                    base_revision_sha,
                     request.now,
                 ],
             )
@@ -274,6 +285,8 @@ impl<'db> CampaignRepository<'db> {
             request.submission_id,
             None,
             0,
+            None,
+            None,
             None,
             None,
             request.now,
@@ -568,6 +581,8 @@ impl<'db> CampaignRepository<'db> {
             same_spec_count,
             None,
             None,
+            None,
+            None,
             now,
         )?;
         insert_experiment_reservation(
@@ -744,6 +759,8 @@ impl<'db> CampaignRepository<'db> {
             same_spec_count,
             Some(source_experiment_id),
             Some(checkpoint_note),
+            None,
+            None,
             now,
         )?;
         insert_experiment_reservation(
@@ -2498,6 +2515,8 @@ fn insert_experiment(
     attempt: i64,
     resume_of_experiment_id: Option<&str>,
     checkpoint_note: Option<&str>,
+    code_change_run_id: Option<&str>,
+    code_revision_sha: Option<&str>,
     now: i64,
 ) -> Result<(), AppError> {
     transaction
@@ -2506,8 +2525,8 @@ fn insert_experiment(
                 experiment_id, campaign_id, proposal_id, submission_id, parent_experiment_id,
                 attempt, status, pueue_task_id, task_signature, failure_code,
                 failure_fingerprint, created_at, updated_at, finished_at,
-                resume_of_experiment_id, checkpoint_note
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL, ?8, ?8, NULL, ?9, ?10)",
+                resume_of_experiment_id, checkpoint_note, code_change_run_id, code_revision_sha
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL, ?8, ?8, NULL, ?9, ?10, ?11, ?12)",
             params![
                 experiment_id,
                 campaign_id,
@@ -2519,6 +2538,8 @@ fn insert_experiment(
                 now,
                 resume_of_experiment_id,
                 checkpoint_note,
+                code_change_run_id,
+                code_revision_sha,
             ],
         )
         .map_err(database_error("insert reserved campaign experiment"))?;
@@ -2965,6 +2986,7 @@ fn campaign_from_row(row: &Row<'_>) -> rusqlite::Result<Campaign> {
         next_eligible_at: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        base_revision_sha: row.get(11)?,
     })
 }
 
@@ -3002,6 +3024,8 @@ fn experiment_from_row(row: &Row<'_>) -> rusqlite::Result<Experiment> {
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         finished_at: row.get(13)?,
+        code_change_run_id: row.get(14)?,
+        code_revision_sha: row.get(15)?,
     })
 }
 

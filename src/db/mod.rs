@@ -1,4 +1,5 @@
 mod campaigns;
+pub mod code_changes;
 mod decisions;
 pub mod experiment_metrics;
 pub mod migrations;
@@ -10,6 +11,7 @@ pub use campaigns::{
     CampaignStatusProjection, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
     ProposalAcceptance, StartCampaignRequest,
 };
+pub use code_changes::{CodeChangeRepository, NewCodeChangeCheck};
 pub(crate) use campaigns::count_live_repair_descendants;
 pub(crate) use repositories::{insert_event_completed_in_transaction, insert_event_idempotent_in_transaction};
 pub use decisions::{
