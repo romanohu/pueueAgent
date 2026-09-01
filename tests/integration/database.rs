@@ -10444,6 +10444,11 @@ fn schema_v4_migration_preserves_termination_requests_and_adds_dispatching_statu
 fn legacy_migrations_create_active_agent_unique_index() {
     for version in [1, 2] {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let path = temp.path().join(format!("legacy-v{version}.sqlite3"));
         create_legacy_schema_without_active_agent_index(&path, version);
 
@@ -10466,6 +10471,11 @@ fn legacy_migrations_create_active_agent_unique_index() {
 
         let root = temp.path().join("project");
         fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         register_project(&db, "project-a", &root, "pa-project");
         let first_event = insert_event(&db, "project-a", "first-run", 100);
         let second_event = insert_event(&db, "project-a", "second-run", 101);
