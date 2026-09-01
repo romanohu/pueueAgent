@@ -90,6 +90,7 @@ struct PolicyHarness {
 impl PolicyHarness {
     fn new() -> Self {
         let temp = tempdir().unwrap();
+        secure_directory(temp.path());
         let base = fs::canonicalize(temp.path()).unwrap();
         let state_dir = base.join("state");
         let project_root = base.join("project");

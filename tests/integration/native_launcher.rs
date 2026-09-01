@@ -30,6 +30,10 @@ mod unix {
     // does not turn a bounded failure assertion into a scheduling race.
     const MAX_HELPER_WAIT: Duration = Duration::from_secs(6);
 
+    fn secure_directory(path: &Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn identity(metadata: &fs::Metadata) -> ExecutableIdentity {
         ExecutableIdentity {
             device: metadata.dev(),
@@ -57,6 +61,7 @@ mod unix {
 
     fn copy_launcher(directory: &Path) -> (ExecutableAnchor, PathBuf) {
         assert!(!directory.starts_with(env!("CARGO_MANIFEST_DIR")));
+        secure_directory(directory);
         let launcher_path = directory.join("trusted-pueue-agent");
         fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher_path).unwrap();
         fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -588,9 +593,11 @@ fn main() {
     #[tokio::test]
     async fn code_change_valid_nested_cwd_is_descriptor_verified() {
         let temporary = tempdir().unwrap();
+        secure_directory(temporary.path());
         let base = fs::canonicalize(temporary.path()).unwrap();
         let nested = base.join("nested");
         fs::create_dir(&nested).unwrap();
+        secure_directory(&nested);
         let source = base.join("cwd-target.rs");
         let executable = base.join("cwd-target");
         fs::write(
@@ -651,6 +658,7 @@ fn main() {
     #[test]
     fn code_change_sibling_cwd_is_rejected() {
         let temporary = tempdir().unwrap();
+        secure_directory(temporary.path());
         let base = fs::canonicalize(temporary.path()).unwrap();
         let sibling_parent = tempdir().unwrap();
         let sibling = sibling_parent.path().join("sibling-cwd");
@@ -663,6 +671,7 @@ fn main() {
     #[test]
     fn code_change_symlink_descendant_is_rejected() {
         let temporary = tempdir().unwrap();
+        secure_directory(temporary.path());
         let base = fs::canonicalize(temporary.path()).unwrap();
         let target = base.join("target");
         let link = base.join("link");
@@ -676,9 +685,11 @@ fn main() {
     #[test]
     fn code_change_replaced_candidate_root_is_rejected() {
         let temporary = tempdir().unwrap();
+        secure_directory(temporary.path());
         let base = fs::canonicalize(temporary.path()).unwrap();
         let candidate = base.join("candidate");
         fs::create_dir(&candidate).unwrap();
+        secure_directory(&candidate);
         let anchor = pueue_agent::execution_policy::ProjectRootAnchor::resolve(&candidate).unwrap();
         let replacement = base.join("replacement");
         fs::create_dir(&replacement).unwrap();
