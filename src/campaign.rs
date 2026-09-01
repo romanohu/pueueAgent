@@ -1070,20 +1070,12 @@ fn validate_local_git_config_file(path: &Path) -> Result<(), AppError> {
         } else {
             format!("{section}.{key}")
         };
-        let diff_execution_channel = full_key == "diff.external"
-            || (section == "diff"
-                && matches!(key.as_str(), "command" | "textconv" | "trustexitcode"))
-            || (full_key.starts_with("diff.")
-                && matches!(
-                    full_key.rsplit('.').next(),
-                    Some("command" | "textconv" | "trustexitcode")
-                ));
         if section == "filter"
             || key.starts_with("filter.")
             || full_key == "core.worktree"
             || full_key == "include.path"
             || full_key == "includeif.path"
-            || diff_execution_channel
+            || git_config_execution_channel(&full_key)
         {
             return Err(AppError::Validation {
                 field: "git.config",
@@ -1092,6 +1084,18 @@ fn validate_local_git_config_file(path: &Path) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+fn git_config_execution_channel(full_key: &str) -> bool {
+    let normalized = full_key.to_ascii_lowercase();
+    let mut components = normalized.split('.');
+    match components.next() {
+        Some("filter") => true,
+        Some("diff") => components.last().is_some_and(|key| {
+            matches!(key, "command" | "external" | "textconv" | "trustexitcode")
+        }),
+        _ => false,
+    }
 }
 
 fn validate_local_git_config(project_root: &Path) -> Result<(), AppError> {
@@ -1784,6 +1788,51 @@ mod tests {
     }
 
     #[test]
+    fn local_git_config_rejects_dotted_filter_and_diff_execution_keys() {
+        let temporary = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            ("filter-clean", "[filter.foo]\n\tclean = /tmp/sentinel\n"),
+            (
+                "filter-quoted-clean",
+                "[filter \"foo\"]\n\tCLEAN = /tmp/sentinel\n",
+            ),
+            (
+                "filter-dotted-key-clean",
+                "FILTER.foo.CLEAN = /tmp/sentinel\n",
+            ),
+            (
+                "filter-whitespace-smudge",
+                "[ FILTER.foo ]\n\tSmUdGe = /tmp/sentinel\n",
+            ),
+            ("filter-smudge", "[FILTER.foo]\n\tSMUDGE = /tmp/sentinel\n"),
+            ("filter-process", "[filter.foo]\n\tPROCESS = /tmp/sentinel\n"),
+            ("filter-required", "[filter.foo]\n\tREQUIRED = true\n"),
+            ("diff-command", "[diff.foo]\n\tcommand = /tmp/sentinel\n"),
+            ("diff-textconv", "[DIFF.foo]\n\tTEXTCONV = /tmp/sentinel\n"),
+            (
+                "diff-trust-exit-code",
+                "[diff.foo]\n\tTRUSTEXITCODE = true\n",
+            ),
+        ] {
+            let path = temporary.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            assert!(
+                matches!(
+                    validate_local_git_config_file(&path),
+                    Err(AppError::Validation {
+                        field: "git.config",
+                        ..
+                    })
+                ),
+                "configuration {name} must be rejected"
+            );
+        }
+        let safe_diff = temporary.path().join("safe-diff");
+        std::fs::write(&safe_diff, "[diff.foo]\n\talgorithm = histogram\n").unwrap();
+        assert!(validate_local_git_config_file(&safe_diff).is_ok());
+    }
+
+    #[test]
     fn packed_refs_reject_duplicate_targets_and_orphan_peeled_lines() {
         let reference = "refs/heads/campaign/demo/best";
         let sha = "a".repeat(40);
@@ -2003,6 +2052,75 @@ mod tests {
 
         let _ = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"]).await;
 
+        assert!(!marker.exists(), "local clean filter was executed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_git_rejects_dotted_local_clean_filter_without_running_sentinel() {
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.name", "fixture"].as_slice(),
+            ["config", "user.email", "fixture@example.invalid"].as_slice(),
+        ] {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(temporary.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?}: {:?}", args, output);
+        }
+        std::fs::write(temporary.path().join(".gitattributes"), "tracked filter=foo\n")
+            .unwrap();
+        std::fs::write(temporary.path().join("tracked"), "baseline\n").unwrap();
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["add", "."])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git add: {:?}", output);
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["commit", "-qm", "baseline"])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git commit: {:?}", output);
+        let git_path = temporary.path().join("git");
+        std::fs::write(&git_path, b"#!/bin/sh\nexec /usr/bin/git \"$@\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&git_path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&git_path, permissions).unwrap();
+        let git = ExecutableAnchor::from_absolute(&git_path, &[]).unwrap();
+        let marker = temporary.path().join("filter-executed");
+        let filter = temporary.path().join("filter.sh");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\n/bin/touch {}\n/bin/cat\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&filter).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&filter, permissions).unwrap();
+        let config = temporary.path().join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!("\n[filter.foo]\n\tclean = {}\n", filter.display()));
+        std::fs::write(config, contents).unwrap();
+        std::fs::write(temporary.path().join("tracked"), "changed\n").unwrap();
+
+        let result = run_pinned_git(&git, temporary.path(), &["diff", "--quiet"]).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AppError::Validation {
+                    field: "git.config",
+                    ..
+                })
+            ),
+            "dotted local clean filter must fail closed"
+        );
         assert!(!marker.exists(), "local clean filter was executed");
     }
 
