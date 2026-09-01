@@ -80,6 +80,11 @@ impl TestDatabase {
     fn project_root(&self, name: &str) -> PathBuf {
         let root = self._temp.path().join(name);
         fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         root
     }
 }
