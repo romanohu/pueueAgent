@@ -86,6 +86,9 @@ fn validate_pueue_frame(
         pueue_config_identity: Some(identity),
         target_path: Some(target_path),
         private_temp_identity: None,
+        git_admin_identity: None,
+        git_common_identity: None,
+        git_worktree_parent_identity: None,
     }
     .encode()
     .map_err(|_| AppError::Validation {
@@ -276,6 +279,7 @@ impl PueueProcessRunner {
             start_suspended: true,
             project_root: None,
             pueue_config: Some(verified_config),
+            git_directories: None,
             child_io: VerifiedChildIo::Capture,
         }, deadline).await {
             Ok(child) => child,

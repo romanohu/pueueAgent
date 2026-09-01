@@ -279,6 +279,9 @@ fn main() {
             pueue_config_identity: None,
             target_path: None,
             private_temp_identity: Some(identity(&private_temp.metadata().unwrap())),
+            git_admin_identity: None,
+            git_common_identity: None,
+            git_worktree_parent_identity: None,
         }
     }
 
@@ -573,6 +576,9 @@ fn main() {
                 pueue_config_identity: Some(ExecutableIdentity { device: 0, inode: 0, owner: 0, mode: 0 }),
                 target_path: None,
                 private_temp_identity: None,
+                git_admin_identity: None,
+                git_common_identity: None,
+                git_worktree_parent_identity: None,
             },
             Vec::new(),
         );
@@ -629,6 +635,7 @@ fn main() {
                 start_suspended: true,
                 project_root: Some(verified),
                 pueue_config: None,
+                git_directories: None,
                 child_io: agent_log_io(&base),
             },
             &private_temp,
@@ -714,6 +721,7 @@ fn main() {
             start_suspended: true,
             project_root: Some(verified_root),
             pueue_config: None,
+            git_directories: None,
             child_io,
         }, &private_temp)
         .unwrap();
@@ -755,6 +763,7 @@ fn main() {
             start_suspended: true,
             project_root: Some(verified_root),
             pueue_config: None,
+            git_directories: None,
             child_io,
         }, &private_temp)
         .unwrap();
@@ -804,6 +813,7 @@ fn main() {
             start_suspended: true,
             project_root: None,
             pueue_config: Some(verified_config),
+            git_directories: None,
             child_io: VerifiedChildIo::Capture,
         })
         .unwrap();
@@ -844,6 +854,7 @@ fn main() {
             start_suspended: true,
             project_root: Some(verified_root),
             pueue_config: None,
+            git_directories: None,
             child_io,
         }, &private_temp)
         .unwrap();

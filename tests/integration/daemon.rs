@@ -3874,7 +3874,66 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
         original_main
     );
     assert_eq!(fs::read_to_string(project_root.join("model.py")).unwrap(), "score = 1\n");
-    candidate.cleanup().await.unwrap();
+    // Cleanup is authorized only by a fresh durable code-change run row.
+    let cleanup_db = Db::open(&fixture_root.join("cleanup.sqlite3")).unwrap();
+    let cleanup_connection = cleanup_db.connect().unwrap();
+    cleanup_connection
+        .execute(
+            "INSERT INTO projects (project_id, root_path, pueue_group, config_path,
+                                   enabled, paused, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, 1, 1)",
+            rusqlite::params![
+                "project-a",
+                project_root.to_string_lossy(),
+                "pa-test",
+                project_root.join(".pueue-agent/config.toml").to_string_lossy(),
+            ],
+        )
+        .unwrap();
+    cleanup_connection
+        .execute(
+            "INSERT INTO campaigns (campaign_id, project_id, objective_text,
+                                    objective_digest, initial_argv_json, state,
+                                    created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, 1)",
+            rusqlite::params!["campaign-a", "project-a", "cleanup", "digest", "[]"],
+        )
+        .unwrap();
+    cleanup_connection
+        .execute(
+            "INSERT INTO proposals (proposal_id, campaign_id, kind, status,
+                                    hypothesis, argv_json, working_directory,
+                                    expected_evidence_json, canonical_digest,
+                                    created_at, updated_at)
+             VALUES (?1, ?2, 'code_change', 'accepted', ?3, ?4, '.', ?5, ?6, 1, 1)",
+            rusqlite::params!["proposal-a", "campaign-a", "cleanup", "[]", "[]", "proposal"],
+        )
+        .unwrap();
+    cleanup_connection
+        .execute(
+            "INSERT INTO code_change_runs (
+                 code_change_run_id, proposal_id, campaign_id, state, base_sha,
+                 candidate_sha, candidate_ref, best_ref, worktree_id,
+                 worktree_relative_path, editor_attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'candidate_ready', ?4, ?5, ?6, ?7, ?8, ?9, 0, 1, 1)",
+            rusqlite::params![
+                "cleanup-run",
+                "proposal-a",
+                "campaign-a",
+                original_main,
+                candidate_sha,
+                format!("refs/heads/{}", candidate_ref),
+                "refs/heads/campaign/campaign-a/best",
+                "campaign-a/proposal-a",
+                ".pueue-agent/worktrees/campaign-a/proposal-a",
+            ],
+        )
+        .unwrap();
+    drop(cleanup_connection);
+    let authorization =
+        pueue_agent::code_change::CodeChangeCleanupAuthorization::load(&cleanup_db, "cleanup-run")
+            .unwrap();
+    candidate.cleanup(&authorization).await.unwrap();
     assert!(!candidate_path.exists());
     let leaked_indexes = fs::read_dir(fixture_root.join("execution-policy-state"))
         .unwrap()

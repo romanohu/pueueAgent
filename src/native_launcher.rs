@@ -114,6 +114,7 @@ impl NativeLauncher {
                 start_suspended: true,
                 project_root: Some(command_root),
                 pueue_config: None,
+                git_directories: None,
                 child_io: crate::process::VerifiedChildIo::AgentLog {
                     stdout,
                     stderr,

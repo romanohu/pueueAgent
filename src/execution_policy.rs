@@ -220,9 +220,13 @@ pub struct ProjectRootAnchor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodeChangeWorktreeOwnership {
     state_root_identity: ExecutableIdentity,
+    worktrees_identity: ExecutableIdentity,
+    campaign_identity: ExecutableIdentity,
     canonical_path: PathBuf,
+    worktree_relative_path: PathBuf,
     campaign_id: String,
     proposal_id: String,
+    worktree_id: String,
 }
 
 pub struct VerifiedProjectRoot {
@@ -538,9 +542,15 @@ impl ResolvedExecutionPolicy {
             .join("worktrees")
             .join(&ownership.campaign_id)
             .join(&ownership.proposal_id);
+        let expected_relative_path = PathBuf::from(".pueue-agent")
+            .join("worktrees")
+            .join(&ownership.campaign_id)
+            .join(&ownership.proposal_id);
         if ownership.state_root_identity != self.state_root.identity
             || ownership.canonical_path != candidate.anchor.canonical_path
             || ownership.canonical_path != expected_owned_path
+            || ownership.worktree_relative_path != expected_relative_path
+            || ownership.worktree_id.is_empty()
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::RootChanged,
@@ -556,6 +566,49 @@ impl ResolvedExecutionPolicy {
         }
         verify_state_root_identity(self)?;
         let worktrees = self.state_root.canonical_path.join("worktrees");
+        let worktrees_descriptor = open_path_nofollow(&worktrees).map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        let worktrees_metadata = worktrees_descriptor.file.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        if identity(&worktrees_metadata) != ownership.worktrees_identity
+            || !worktrees_metadata.is_dir()
+            || worktrees_descriptor.canonical_path != worktrees
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        let campaign = worktrees.join(&ownership.campaign_id);
+        let campaign_descriptor = open_path_nofollow(&campaign).map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        let campaign_metadata = campaign_descriptor.file.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        if identity(&campaign_metadata) != ownership.campaign_identity
+            || !campaign_metadata.is_dir()
+            || campaign_descriptor.canonical_path != campaign
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
         let candidate_path = &candidate.anchor.canonical_path;
         if candidate_path == worktrees.as_path()
             || candidate_path
@@ -1337,13 +1390,19 @@ impl VerifiedProjectRoot {
     pub(crate) fn mark_code_change_owned(
         mut self,
         state_root_identity: ExecutableIdentity,
+        worktrees_identity: ExecutableIdentity,
+        campaign_identity: ExecutableIdentity,
         expected_path: &Path,
+        worktree_relative_path: &Path,
         campaign_id: &str,
         proposal_id: &str,
+        worktree_id: &str,
     ) -> Result<Self, PolicyViolation> {
         if self.anchor.canonical_path != expected_path
+            || worktree_relative_path != Path::new(".pueue-agent").join("worktrees").join(campaign_id).join(proposal_id)
             || campaign_id.is_empty()
             || proposal_id.is_empty()
+            || worktree_id.is_empty()
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::RootChanged,
@@ -1352,9 +1411,13 @@ impl VerifiedProjectRoot {
         }
         self.code_change_ownership = Some(CodeChangeWorktreeOwnership {
             state_root_identity,
+            worktrees_identity,
+            campaign_identity,
             canonical_path: expected_path.to_owned(),
+            worktree_relative_path: worktree_relative_path.to_owned(),
             campaign_id: campaign_id.to_owned(),
             proposal_id: proposal_id.to_owned(),
+            worktree_id: worktree_id.to_owned(),
         });
         Ok(self)
     }
@@ -1362,9 +1425,13 @@ impl VerifiedProjectRoot {
     pub(crate) fn verify_code_change_ownership(
         &self,
         state_root_identity: ExecutableIdentity,
+        worktrees_identity: ExecutableIdentity,
+        campaign_identity: ExecutableIdentity,
         expected_path: &Path,
+        worktree_relative_path: &Path,
         campaign_id: &str,
         proposal_id: &str,
+        worktree_id: &str,
     ) -> Result<(), PolicyViolation> {
         let ownership = self.code_change_ownership.as_ref().ok_or_else(|| {
             PolicyViolation::new(
@@ -1373,9 +1440,13 @@ impl VerifiedProjectRoot {
             )
         })?;
         if ownership.state_root_identity != state_root_identity
+            || ownership.worktrees_identity != worktrees_identity
+            || ownership.campaign_identity != campaign_identity
             || ownership.canonical_path != expected_path
+            || ownership.worktree_relative_path != worktree_relative_path
             || ownership.campaign_id != campaign_id
             || ownership.proposal_id != proposal_id
+            || ownership.worktree_id != worktree_id
         {
             return Err(PolicyViolation::new(
                 PolicyViolationCode::RootChanged,

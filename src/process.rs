@@ -62,6 +62,13 @@ pub const RELEASE_ACK_FD: RawFd = 10;
 pub use crate::environment::PRIVATE_TEMP_TARGET_FD;
 /// Descriptor carrying the verified working-directory capability.
 pub const WORKING_DIRECTORY_FD: RawFd = 12;
+/// Descriptor carrying the verified Git administration directory capability.
+pub const GIT_ADMIN_FD: RawFd = 13;
+/// Descriptor carrying the verified Git common-directory capability.
+pub const GIT_COMMON_DIR_FD: RawFd = 14;
+/// Descriptor carrying the verified worktree-parent capability for Git
+/// worktree add/remove operations.
+pub const GIT_WORKTREE_PARENT_FD: RawFd = 15;
 /// Compatibility alias for the final acknowledgement descriptor.
 pub const ACK_FD: RawFd = RELEASE_ACK_FD;
 
@@ -83,7 +90,15 @@ const TEST_LIFECYCLE_DELAYS_ENV: &str = "PUEUE_AGENT_TEST_LIFECYCLE_DELAYS_MS";
 const TEST_LIFECYCLE_TRACE_ENV: &str = "PUEUE_AGENT_TEST_LIFECYCLE_TRACE";
 
 const HEADER_SIZE: usize = 12;
-const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT | FLAG_AGENT_LOG | FLAG_PUEUE_CONFIG | FLAG_PROCESS_GROUP | FLAG_LIFECYCLE | FLAG_PRIVATE_TEMP | FLAG_WORKING_DIRECTORY;
+const KNOWN_FLAGS: u16 = FLAG_PROJECT_ROOT
+    | FLAG_AGENT_LOG
+    | FLAG_PUEUE_CONFIG
+    | FLAG_PROCESS_GROUP
+    | FLAG_LIFECYCLE
+    | FLAG_PRIVATE_TEMP
+    | FLAG_WORKING_DIRECTORY
+    | FLAG_GIT_REPOSITORY
+    | FLAG_GIT_WORKTREE_PARENT;
 const FLAG_PROJECT_ROOT: u16 = 1 << 0;
 const FLAG_AGENT_LOG: u16 = 1 << 1;
 const FLAG_PUEUE_CONFIG: u16 = 1 << 2;
@@ -91,6 +106,8 @@ const FLAG_PROCESS_GROUP: u16 = 1 << 3;
 const FLAG_LIFECYCLE: u16 = 1 << 4;
 const FLAG_PRIVATE_TEMP: u16 = 1 << 5;
 const FLAG_WORKING_DIRECTORY: u16 = 1 << 6;
+const FLAG_GIT_REPOSITORY: u16 = 1 << 7;
+const FLAG_GIT_WORKTREE_PARENT: u16 = 1 << 8;
 
 const FIELD_ARGV: u8 = 1;
 const FIELD_ENV: u8 = 2;
@@ -102,6 +119,9 @@ const FIELD_PUEUE_CONFIG_IDENTITY: u8 = 7;
 const FIELD_TARGET_PATH: u8 = 8;
 const FIELD_PRIVATE_TEMP_IDENTITY: u8 = 9;
 const FIELD_WORKING_DIRECTORY_IDENTITY: u8 = 10;
+const FIELD_GIT_ADMIN_IDENTITY: u8 = 11;
+const FIELD_GIT_COMMON_IDENTITY: u8 = 12;
+const FIELD_GIT_WORKTREE_PARENT_IDENTITY: u8 = 13;
 const IDENTITY_SIZE: usize = 8 + 8 + 4 + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +136,9 @@ pub struct FixedFdContract {
     pub release_ack: RawFd,
     pub private_temp: RawFd,
     pub working_directory: RawFd,
+    pub git_admin: RawFd,
+    pub git_common_dir: RawFd,
+    pub git_worktree_parent: RawFd,
 }
 
 impl Default for FixedFdContract {
@@ -131,6 +154,9 @@ impl Default for FixedFdContract {
             release_ack: RELEASE_ACK_FD,
             private_temp: PRIVATE_TEMP_TARGET_FD,
             working_directory: WORKING_DIRECTORY_FD,
+            git_admin: GIT_ADMIN_FD,
+            git_common_dir: GIT_COMMON_DIR_FD,
+            git_worktree_parent: GIT_WORKTREE_PARENT_FD,
         }
     }
 }
@@ -148,6 +174,9 @@ impl FixedFdContract {
             release_ack: RELEASE_ACK_FD,
             private_temp: PRIVATE_TEMP_TARGET_FD,
             working_directory: WORKING_DIRECTORY_FD,
+            git_admin: GIT_ADMIN_FD,
+            git_common_dir: GIT_COMMON_DIR_FD,
+            git_worktree_parent: GIT_WORKTREE_PARENT_FD,
         }
     }
 
@@ -162,6 +191,9 @@ impl FixedFdContract {
             && self.release_ack == RELEASE_ACK_FD
             && self.private_temp == PRIVATE_TEMP_TARGET_FD
             && self.working_directory == WORKING_DIRECTORY_FD
+            && self.git_admin == GIT_ADMIN_FD
+            && self.git_common_dir == GIT_COMMON_DIR_FD
+            && self.git_worktree_parent == GIT_WORKTREE_PARENT_FD
     }
 }
 
@@ -198,6 +230,8 @@ impl LaunchFlags {
     pub const LIFECYCLE: Self = Self(FLAG_LIFECYCLE);
     pub const PRIVATE_TEMP: Self = Self(FLAG_PRIVATE_TEMP);
     pub const WORKING_DIRECTORY: Self = Self(FLAG_WORKING_DIRECTORY);
+    pub const GIT_REPOSITORY: Self = Self(FLAG_GIT_REPOSITORY);
+    pub const GIT_WORKTREE_PARENT: Self = Self(FLAG_GIT_WORKTREE_PARENT);
 
     pub const fn bits(self) -> u16 { self.0 }
     pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
@@ -229,6 +263,9 @@ pub struct ControlFrame {
     pub target_path: Option<OsString>,
     pub private_temp_identity: Option<ExecutableIdentity>,
     pub working_directory_identity: Option<ExecutableIdentity>,
+    pub git_admin_identity: Option<ExecutableIdentity>,
+    pub git_common_identity: Option<ExecutableIdentity>,
+    pub git_worktree_parent_identity: Option<ExecutableIdentity>,
 }
 
 impl fmt::Debug for ControlFrame {
@@ -249,6 +286,12 @@ impl fmt::Debug for ControlFrame {
             .field(
                 "working_directory_identity_present",
                 &self.working_directory_identity.is_some(),
+            )
+            .field("git_admin_identity_present", &self.git_admin_identity.is_some())
+            .field("git_common_identity_present", &self.git_common_identity.is_some())
+            .field(
+                "git_worktree_parent_identity_present",
+                &self.git_worktree_parent_identity.is_some(),
             )
             .finish()
     }
@@ -483,7 +526,21 @@ pub struct VerifiedCommandSpec {
     pub start_suspended: bool,
     pub project_root: Option<VerifiedProjectRoot>,
     pub pueue_config: Option<VerifiedPueueConfig>,
+    pub git_directories: Option<VerifiedGitDirectories>,
     pub child_io: VerifiedChildIo,
+}
+
+/// Descriptor-backed Git administration rights carried through the native
+/// launch boundary. Git receives these descriptors via fixed `/proc`/`/dev`
+/// paths; it never rediscovers a candidate `.git` pathname.
+#[cfg(unix)]
+pub struct VerifiedGitDirectories {
+    pub admin: std::fs::File,
+    pub admin_identity: ExecutableIdentity,
+    pub common: std::fs::File,
+    pub common_identity: ExecutableIdentity,
+    pub worktree_parent: Option<std::fs::File>,
+    pub worktree_parent_identity: Option<ExecutableIdentity>,
 }
 
 #[cfg(unix)]
@@ -1031,7 +1088,7 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
     // Keep a duplicate of stdin solely for the bounded failure record. The
     // fixed-map installer owns and may close fd 0 on an error path.
     let failure_channel = unsafe {
-        libc::fcntl(0, libc::F_DUPFD_CLOEXEC, WORKING_DIRECTORY_FD + 1)
+        libc::fcntl(0, libc::F_DUPFD_CLOEXEC, GIT_WORKTREE_PARENT_FD + 1)
     };
     let result = receive_and_install_bootstrap(libc::STDIN_FILENO);
     let outcome = match result {
@@ -1265,6 +1322,7 @@ impl PlatformTarget {
         }
         let mut config_duplicate = -1;
         let mut private_temp_duplicate = -1;
+        let mut git_duplicates = Vec::new();
         let result = (|| {
             let flags = (libc::POSIX_SPAWN_START_SUSPENDED | libc::POSIX_SPAWN_SETPGROUP) as i16;
             let flags_result = unsafe { libc::posix_spawnattr_setflags(&mut attributes, flags) };
@@ -1347,6 +1405,50 @@ impl PlatformTarget {
                     return Err(classify_target_create_errno(close_result));
                 }
             }
+            if frame.flags.contains(LaunchFlags::GIT_REPOSITORY) {
+                let mut descriptors = vec![
+                    (PROJECT_ROOT_FD, PROJECT_ROOT_FD),
+                    (GIT_ADMIN_FD, GIT_ADMIN_FD),
+                    (GIT_COMMON_DIR_FD, GIT_COMMON_DIR_FD),
+                ];
+                if frame.flags.contains(LaunchFlags::GIT_WORKTREE_PARENT) {
+                    descriptors.push((GIT_WORKTREE_PARENT_FD, GIT_WORKTREE_PARENT_FD));
+                }
+                for (source, destination) in descriptors {
+                    let duplicate = unsafe {
+                        libc::fcntl(
+                            source,
+                            libc::F_DUPFD_CLOEXEC,
+                            GIT_WORKTREE_PARENT_FD + 1,
+                        )
+                    };
+                    if duplicate < 0 {
+                        return Err(classify_target_create_errno(
+                            io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                        ));
+                    }
+                    let duplicate_result = unsafe {
+                        libc::posix_spawn_file_actions_adddup2(
+                            &mut file_actions,
+                            duplicate,
+                            destination,
+                        )
+                    };
+                    if duplicate_result != 0 {
+                        return Err(classify_target_create_errno(duplicate_result));
+                    }
+                    let close_result = unsafe {
+                        libc::posix_spawn_file_actions_addclose(
+                            &mut file_actions,
+                            duplicate,
+                        )
+                    };
+                    if close_result != 0 {
+                        return Err(classify_target_create_errno(close_result));
+                    }
+                    git_duplicates.push(duplicate);
+                }
+            }
             if frame.mode == LaunchMode::Agent {
                 validate_role(PRIVATE_TEMP_TARGET_FD, PRIVATE_TEMP_TARGET_FD, frame)?;
             }
@@ -1375,6 +1477,9 @@ impl PlatformTarget {
         }
         if private_temp_duplicate >= 0 {
             unsafe { libc::close(private_temp_duplicate); }
+        }
+        for duplicate in git_duplicates {
+            unsafe { libc::close(duplicate); }
         }
         unsafe { libc::posix_spawn_file_actions_destroy(&mut file_actions); }
         unsafe { libc::posix_spawnattr_destroy(&mut attributes); }
@@ -1543,6 +1648,39 @@ impl PlatformTarget {
                         )
                     };
                     unsafe { libc::_exit(126); }
+                }
+            }
+            if frame.flags.contains(LaunchFlags::GIT_REPOSITORY) {
+                for descriptor in [
+                    PROJECT_ROOT_FD,
+                    GIT_ADMIN_FD,
+                    GIT_COMMON_DIR_FD,
+                    GIT_WORKTREE_PARENT_FD,
+                ] {
+                    if descriptor == GIT_WORKTREE_PARENT_FD
+                        && !frame.flags.contains(LaunchFlags::GIT_WORKTREE_PARENT)
+                    {
+                        continue;
+                    }
+                    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+                    if descriptor_flags < 0
+                        || unsafe {
+                            libc::fcntl(
+                                descriptor,
+                                libc::F_SETFD,
+                                descriptor_flags & !libc::FD_CLOEXEC,
+                            )
+                        } < 0
+                    {
+                        let _ = unsafe {
+                            libc::write(
+                                exec_write_raw,
+                                EXEC_FAILURE_RECORD.as_ptr().cast(),
+                                EXEC_FAILURE_RECORD.len(),
+                            )
+                        };
+                        unsafe { libc::_exit(126); }
+                    }
                 }
             }
             let empty = b"\0";
@@ -2126,6 +2264,13 @@ fn spawn_verified_command_with_deadlines(
         (None, None, None, VerifiedChildIo::Capture, Some(_)) => LaunchMode::Pueue,
         _ => return Err(native_gate_error(PolicyViolationStage::NativeGate).into()),
     };
+    if spec.git_directories.is_some()
+        && (mode != LaunchMode::OwnedTool
+            || spec.project_root.is_none()
+            || spec.working_directory.is_none())
+    {
+        return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
+    }
     if spec.argv.is_empty() {
         return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
     }
@@ -2152,6 +2297,19 @@ fn spawn_verified_command_with_deadlines(
             mode: working_metadata.mode() & 0o7777,
         };
         if !working_metadata.is_dir() || actual_working_identity != working_directory.identity() {
+            return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
+        }
+    }
+    if let Some(git) = spec.git_directories.as_ref() {
+        if !verify_directory_descriptor(&git.admin, git.admin_identity)
+            || !verify_directory_descriptor(&git.common, git.common_identity)
+            || git
+                .worktree_parent
+                .as_ref()
+                .zip(git.worktree_parent_identity)
+                .is_some_and(|(directory, identity)| !verify_directory_descriptor(directory, identity))
+            || git.worktree_parent.is_some() != git.worktree_parent_identity.is_some()
+        {
             return Err(native_gate_error(PolicyViolationStage::NativeGate).into());
         }
     }
@@ -2182,6 +2340,24 @@ fn spawn_verified_command_with_deadlines(
         flags = flags.union(LaunchFlags::WORKING_DIRECTORY);
         rights.push(duplicate_owned(&working_directory.directory)?);
     }
+
+    let (git_admin_identity, git_common_identity, git_worktree_parent_identity) =
+        if let Some(git) = spec.git_directories.as_ref() {
+            flags = flags.union(LaunchFlags::GIT_REPOSITORY);
+            rights.push(duplicate_owned(&git.admin)?);
+            rights.push(duplicate_owned(&git.common)?);
+            if let Some(parent) = git.worktree_parent.as_ref() {
+                flags = flags.union(LaunchFlags::GIT_WORKTREE_PARENT);
+                rights.push(duplicate_owned(parent)?);
+            }
+            (
+                Some(git.admin_identity),
+                Some(git.common_identity),
+                git.worktree_parent_identity,
+            )
+        } else {
+            (None, None, None)
+        };
 
     let mut agent_log_identity = None;
     let capture = matches!(&spec.child_io, VerifiedChildIo::Capture);
@@ -2230,6 +2406,9 @@ fn spawn_verified_command_with_deadlines(
         target_path: Some(spec.executable.canonical_path.as_os_str().to_os_string()),
         private_temp_identity,
         working_directory_identity,
+        git_admin_identity,
+        git_common_identity,
+        git_worktree_parent_identity,
     };
     frame
         .encode()
@@ -2722,6 +2901,13 @@ pub(crate) fn bootstrap_slots(frame: &ControlFrame) -> Result<Vec<RawFd>, CodecE
     let mut slots = vec![CONTROL_FD, RELEASE_FD, EXEC_STATUS_FD, TARGET_FD];
     if frame.flags.contains(LaunchFlags::PROJECT_ROOT) { slots.push(PROJECT_ROOT_FD); }
     if frame.flags.contains(LaunchFlags::WORKING_DIRECTORY) { slots.push(WORKING_DIRECTORY_FD); }
+    if frame.flags.contains(LaunchFlags::GIT_REPOSITORY) {
+        slots.push(GIT_ADMIN_FD);
+        slots.push(GIT_COMMON_DIR_FD);
+    }
+    if frame.flags.contains(LaunchFlags::GIT_WORKTREE_PARENT) {
+        slots.push(GIT_WORKTREE_PARENT_FD);
+    }
     if frame.flags.contains(LaunchFlags::AGENT_LOG) { slots.push(AGENT_LOG_FD); }
     if frame.flags.contains(LaunchFlags::PUEUE_CONFIG) { slots.push(PUEUE_CONFIG_FD); }
     slots.push(RELEASE_ACK_FD);
@@ -2847,7 +3033,11 @@ fn receive_bootstrap_packet_with_timeout(
     let mut first = [0u8; 1];
     // One extra slot ensures an over-cardinality sender is observed rather
     // than silently accepted at the protocol maximum.
-    let max_rights = 10usize;
+    // The current protocol may carry target/root/working-directory, Git
+    // admin/common/parent, log/config, lifecycle and private-temp rights.
+    // Keep one spare slot so an over-cardinality message is observed rather
+    // than silently accepted at the protocol maximum.
+    let max_rights = 13usize;
     let ancillary_bytes = max_rights * mem::size_of::<RawFd>();
     let control_len = unsafe { libc::CMSG_SPACE(ancillary_bytes as _) } as usize;
     let mut control = vec![0u8; control_len];
@@ -2915,7 +3105,7 @@ fn receive_bootstrap_packet_with_timeout(
         return Err(BootstrapError::UnexpectedAncillary);
     }
     if rights.is_empty() { return Err(BootstrapError::MissingRights); }
-    if rights.len() > 9 { return Err(BootstrapError::WrongRightCount); }
+    if rights.len() > 12 { return Err(BootstrapError::WrongRightCount); }
     for right in &rights {
         let flags = unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
@@ -3095,7 +3285,7 @@ struct FixedSlotTracker {
 #[cfg(unix)]
 impl FixedSlotTracker {
     fn new(expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
-        Self::with_range(CONTROL_FD, WORKING_DIRECTORY_FD, expected, owned)
+        Self::with_range(CONTROL_FD, GIT_WORKTREE_PARENT_FD, expected, owned)
     }
     fn with_range(base: RawFd, end: RawFd, expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
         let states = (base..=end).map(|fd| {
@@ -3169,7 +3359,7 @@ struct TrackedSource {
 fn original_fixed_slots(control: Option<&OwnedFd>, rights: &[OwnedFd]) -> Vec<RawFd> {
     control.into_iter().chain(rights.iter())
         .map(AsRawFd::as_raw_fd)
-        .filter(|fd| (CONTROL_FD..=WORKING_DIRECTORY_FD).contains(fd))
+        .filter(|fd| (CONTROL_FD..=GIT_WORKTREE_PARENT_FD).contains(fd))
         .collect()
 }
 
@@ -3190,7 +3380,7 @@ fn release_original_at(sources: &mut [TrackedSource], destination: RawFd) {
 #[cfg(unix)]
 impl TrackedSource {
     fn move_above_fixed(descriptor: OwnedFd) -> Result<Self, BootstrapError> {
-        Self::move_above_ceiling(descriptor, WORKING_DIRECTORY_FD)
+        Self::move_above_ceiling(descriptor, GIT_WORKTREE_PARENT_FD)
     }
 
     fn move_above_ceiling(
@@ -3325,6 +3515,15 @@ fn validate_role(
         WORKING_DIRECTORY_FD if file_type == libc::S_IFDIR && access == libc::O_RDONLY => {
             frame.working_directory_identity
         }
+        GIT_ADMIN_FD if file_type == libc::S_IFDIR && access == libc::O_RDONLY => {
+            frame.git_admin_identity
+        }
+        GIT_COMMON_DIR_FD if file_type == libc::S_IFDIR && access == libc::O_RDONLY => {
+            frame.git_common_identity
+        }
+        GIT_WORKTREE_PARENT_FD if file_type == libc::S_IFDIR && access == libc::O_RDONLY => {
+            frame.git_worktree_parent_identity
+        }
         AGENT_LOG_FD
             if file_type == libc::S_IFREG
                 && (access == libc::O_WRONLY || access == libc::O_RDWR) =>
@@ -3345,6 +3544,9 @@ fn validate_role(
             slot,
             PROJECT_ROOT_FD
                 | WORKING_DIRECTORY_FD
+                | GIT_ADMIN_FD
+                | GIT_COMMON_DIR_FD
+                | GIT_WORKTREE_PARENT_FD
                 | AGENT_LOG_FD
                 | PUEUE_CONFIG_FD
                 | PRIVATE_TEMP_TARGET_FD
@@ -3362,6 +3564,18 @@ fn validate_role(
     Ok(())
 }
 
+#[cfg(unix)]
+fn verify_directory_descriptor(file: &std::fs::File, expected: ExecutableIdentity) -> bool {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    metadata.is_dir()
+        && metadata.uid() == expected.owner
+        && metadata.dev() == expected.device
+        && metadata.ino() == expected.inode
+        && metadata.mode() & 0o7777 == expected.mode
+}
+
 pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError> {
     validate_frame_shape(frame)?;
     let argv_len = argv_encoded_len(&frame.argv)?;
@@ -3375,7 +3589,10 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
         + usize::from(frame.agent_log_identity.is_some())
         + usize::from(frame.pueue_config_identity.is_some())
         + usize::from(frame.target_path.is_some())
-        + usize::from(frame.private_temp_identity.is_some());
+        + usize::from(frame.private_temp_identity.is_some())
+        + usize::from(frame.git_admin_identity.is_some())
+        + usize::from(frame.git_common_identity.is_some())
+        + usize::from(frame.git_worktree_parent_identity.is_some());
     let mut payload_len = 4usize;
     payload_len = payload_len.checked_add(encoded_field_size(argv_len))
         .and_then(|value| value.checked_add(encoded_field_size(environment_len)))
@@ -3392,6 +3609,17 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     }
     if frame.target_path.is_some() { payload_len = payload_len.checked_add(encoded_field_size(target_path_len)).ok_or(CodecError::LengthOverflow)?; }
     if frame.private_temp_identity.is_some() { payload_len = payload_len.checked_add(encoded_field_size(IDENTITY_SIZE)).ok_or(CodecError::LengthOverflow)?; }
+    for present in [
+        frame.git_admin_identity.is_some(),
+        frame.git_common_identity.is_some(),
+        frame.git_worktree_parent_identity.is_some(),
+    ] {
+        if present {
+            payload_len = payload_len
+                .checked_add(encoded_field_size(IDENTITY_SIZE))
+                .ok_or(CodecError::LengthOverflow)?;
+        }
+    }
     let total = HEADER_SIZE.checked_add(payload_len).ok_or(CodecError::LengthOverflow)?;
     if total > MAX_FRAME_SIZE { return Err(CodecError::FrameTooLarge); }
     let mut output = Vec::with_capacity(total);
@@ -3425,6 +3653,19 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
     if let Some(identity) = frame.working_directory_identity {
         append_identity_field(&mut output, FIELD_WORKING_DIRECTORY_IDENTITY, &identity);
     }
+    if let Some(identity) = frame.git_admin_identity {
+        append_identity_field(&mut output, FIELD_GIT_ADMIN_IDENTITY, &identity);
+    }
+    if let Some(identity) = frame.git_common_identity {
+        append_identity_field(&mut output, FIELD_GIT_COMMON_IDENTITY, &identity);
+    }
+    if let Some(identity) = frame.git_worktree_parent_identity {
+        append_identity_field(
+            &mut output,
+            FIELD_GIT_WORKTREE_PARENT_IDENTITY,
+            &identity,
+        );
+    }
     Ok(output)
 }
 
@@ -3441,7 +3682,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     if bytes.len() > total { return Err(CodecError::TrailingBytes); }
     let mut cursor = Cursor::new(&bytes[HEADER_SIZE..total]);
     let field_count = cursor.u32()? as usize;
-    if field_count > 10 { return Err(CodecError::TooManyFields); }
+    if field_count > 13 { return Err(CodecError::TooManyFields); }
     let mut argv = None;
     let mut environment = None;
     let mut target_identity = None;
@@ -3452,6 +3693,9 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     let mut target_path = None;
     let mut private_temp_identity = None;
     let mut working_directory_identity = None;
+    let mut git_admin_identity = None;
+    let mut git_common_identity = None;
+    let mut git_worktree_parent_identity = None;
     let mut previous_kind = 0;
     for _ in 0..field_count {
         let kind = cursor.u8()?;
@@ -3471,6 +3715,9 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
             FIELD_TARGET_PATH => set_once(&mut target_path, decode_os_field(body), kind)?,
             FIELD_PRIVATE_TEMP_IDENTITY => set_once(&mut private_temp_identity, decode_identity(body), kind)?,
             FIELD_WORKING_DIRECTORY_IDENTITY => set_once(&mut working_directory_identity, decode_identity(body), kind)?,
+            FIELD_GIT_ADMIN_IDENTITY => set_once(&mut git_admin_identity, decode_identity(body), kind)?,
+            FIELD_GIT_COMMON_IDENTITY => set_once(&mut git_common_identity, decode_identity(body), kind)?,
+            FIELD_GIT_WORKTREE_PARENT_IDENTITY => set_once(&mut git_worktree_parent_identity, decode_identity(body), kind)?,
             other => return Err(CodecError::UnknownField(other)),
         }
     }
@@ -3488,6 +3735,9 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
         target_path: target_path.transpose()?,
         private_temp_identity: private_temp_identity.transpose()?,
         working_directory_identity: working_directory_identity.transpose()?,
+        git_admin_identity: git_admin_identity.transpose()?,
+        git_common_identity: git_common_identity.transpose()?,
+        git_worktree_parent_identity: git_worktree_parent_identity.transpose()?,
     };
     validate_frame_shape(&frame)?;
     Ok(frame)
@@ -3503,6 +3753,8 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     let lifecycle = frame.flags.contains(LaunchFlags::LIFECYCLE);
     let private_temp = frame.flags.contains(LaunchFlags::PRIVATE_TEMP);
     let working_directory = frame.flags.contains(LaunchFlags::WORKING_DIRECTORY);
+    let git_repository = frame.flags.contains(LaunchFlags::GIT_REPOSITORY);
+    let git_worktree_parent = frame.flags.contains(LaunchFlags::GIT_WORKTREE_PARENT);
     if !frame.flags.contains(LaunchFlags::PROCESS_GROUP) { return Err(CodecError::MissingProcessGroup); }
     if !private_temp && frame.private_temp_identity.is_some() {
         return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY));
@@ -3510,12 +3762,26 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     if !working_directory && frame.working_directory_identity.is_some() {
         return Err(CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY));
     }
+    if !git_repository
+        && (frame.git_admin_identity.is_some() || frame.git_common_identity.is_some())
+    {
+        return Err(CodecError::UnexpectedField(FIELD_GIT_ADMIN_IDENTITY));
+    }
+    if !git_worktree_parent && frame.git_worktree_parent_identity.is_some() {
+        return Err(CodecError::UnexpectedField(FIELD_GIT_WORKTREE_PARENT_IDENTITY));
+    }
+    if git_worktree_parent && !git_repository {
+        return Err(CodecError::UnexpectedField(FIELD_GIT_WORKTREE_PARENT_IDENTITY));
+    }
     match frame.mode {
         LaunchMode::Agent => {
             if !root { return Err(CodecError::MissingField(FIELD_PROJECT_ROOT_IDENTITY)); }
             if !private_temp { return Err(CodecError::MissingField(FIELD_PRIVATE_TEMP_IDENTITY)); }
             if !lifecycle && !log { return Err(CodecError::MissingField(FIELD_AGENT_LOG_IDENTITY)); }
             if pueue { return Err(CodecError::UnexpectedField(FIELD_PUEUE_CONFIG_IDENTITY)); }
+            if git_repository {
+                return Err(CodecError::UnexpectedField(FIELD_GIT_ADMIN_IDENTITY));
+            }
             if !working_directory {
                 return Err(CodecError::MissingField(FIELD_WORKING_DIRECTORY_IDENTITY));
             }
@@ -3529,6 +3795,9 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
             if log { return Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_IDENTITY)); }
             if private_temp { return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY)); }
             if working_directory { return Err(CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY)); }
+            if git_repository {
+                return Err(CodecError::UnexpectedField(FIELD_GIT_ADMIN_IDENTITY));
+            }
             if frame.cwd.is_some() { return Err(CodecError::UnexpectedField(FIELD_CWD)); }
         }
         LaunchMode::OwnedTool => {
@@ -3560,6 +3829,22 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
             CodecError::MissingField(FIELD_WORKING_DIRECTORY_IDENTITY)
         } else {
             CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY)
+        });
+    }
+    if git_repository
+        != (frame.git_admin_identity.is_some() && frame.git_common_identity.is_some())
+    {
+        return Err(if git_repository {
+            CodecError::MissingField(FIELD_GIT_ADMIN_IDENTITY)
+        } else {
+            CodecError::UnexpectedField(FIELD_GIT_ADMIN_IDENTITY)
+        });
+    }
+    if git_worktree_parent != frame.git_worktree_parent_identity.is_some() {
+        return Err(if git_worktree_parent {
+            CodecError::MissingField(FIELD_GIT_WORKTREE_PARENT_IDENTITY)
+        } else {
+            CodecError::UnexpectedField(FIELD_GIT_WORKTREE_PARENT_IDENTITY)
         });
     }
     if lifecycle != frame.target_path.is_some() {
@@ -3795,6 +4080,9 @@ mod tests {
             pueue_config_identity: None,
             target_path: None,
             private_temp_identity: Some(identity()),
+            git_admin_identity: None,
+            git_common_identity: None,
+            git_worktree_parent_identity: None,
         }
     }
 
@@ -4480,6 +4768,9 @@ mod tests {
             pueue_config_identity: None,
             target_path: Some(executable.into_os_string()),
             private_temp_identity: None,
+            git_admin_identity: None,
+            git_common_identity: None,
+            git_worktree_parent_identity: None,
         }
     }
 
