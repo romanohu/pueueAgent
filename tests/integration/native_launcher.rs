@@ -93,6 +93,7 @@ fn main() {
             "generated fixture compilation failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
     }
 
@@ -157,6 +158,7 @@ fn main() {
             "generated private-temp fixture compilation failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
     }
 
@@ -187,6 +189,7 @@ fn main() {
             "generated Pueue fixture compilation failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
     }
 
@@ -227,6 +230,7 @@ fn main() {
             "generated group fixture compilation failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         ExecutableAnchor::from_absolute(&fs::canonicalize(executable).unwrap(), &[]).unwrap()
     }
 
@@ -310,6 +314,7 @@ fn main() {
     }
 
     fn files(directory: &Path) -> (File, File, File, File) {
+        secure_directory(directory);
         let target_path = directory.join("generated-target");
         fs::write(&target_path, b"generated fixture bytes").unwrap();
         fs::set_permissions(&target_path, fs::Permissions::from_mode(0o700)).unwrap();
