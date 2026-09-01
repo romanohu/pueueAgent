@@ -146,7 +146,8 @@ impl<'db> CodeChangeRepository<'db> {
         let mut statement = connection
             .prepare(&format!(
                 "{CODE_CHANGE_SELECT}
-                 WHERE state NOT IN ('completed', 'rejected')
+                 WHERE state <> 'completed'
+                   AND (state <> 'rejected' OR cleanup_completed_at IS NULL)
                  ORDER BY updated_at, code_change_run_id
                  LIMIT ?1"
             ))
@@ -231,6 +232,16 @@ impl<'db> CodeChangeRepository<'db> {
             return Err(AppError::Validation {
                 field: "code_change.attempt",
                 message: "must advance the editor attempt exactly once",
+            });
+        }
+        if run
+            .editor_session_id
+            .as_deref()
+            .is_some_and(|expected| expected != editor_session_id)
+        {
+            return Err(AppError::Validation {
+                field: "code_change.editor_session_id",
+                message: "all editor attempts must use the same session",
             });
         }
         transaction
@@ -349,13 +360,7 @@ impl<'db> CodeChangeRepository<'db> {
             .map_err(database_error("update code-change editor attempt time"))?;
         let stored = read_editor_attempt(&transaction, run_id, attempt)?;
         let run = read_run(&transaction, run_id)?;
-        insert_lifecycle_event(
-            &transaction,
-            &run,
-            attempt,
-            stored.failure_code.as_deref(),
-            now,
-        )?;
+        insert_lifecycle_event(&transaction, &run, attempt, None, now)?;
         transaction
             .commit()
             .map_err(database_error("commit editor attempt completion"))?;
@@ -480,12 +485,56 @@ impl<'db> CodeChangeRepository<'db> {
         finished_at: i64,
         now: i64,
     ) -> Result<CodeChangeCheck, AppError> {
+        if !matches!(
+            status,
+            CodeChangeCheckStatus::Passed
+                | CodeChangeCheckStatus::Failed
+                | CodeChangeCheckStatus::TimedOut
+        ) {
+            return Err(AppError::Validation {
+                field: "code_change_check.status",
+                message: "must be passed, failed, or timed_out when finished",
+            });
+        }
         validate_optional_digest(output_digest)?;
         validate_optional_text("summary", summary, MAX_CODE_CHANGE_SUMMARY_BYTES)?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin code-change check completion"))?;
+        let persisted_summary = summary.map(bounded_redacted_text);
+        let current = transaction
+            .query_row(
+                &format!(
+                    "{CODE_CHANGE_CHECK_SELECT}
+                     WHERE code_change_run_id = ?1 AND attempt = ?2 AND ordinal = ?3"
+                ),
+                params![run_id, attempt, ordinal],
+                code_change_check_from_row,
+            )
+            .optional()
+            .map_err(database_error("read code-change check before completion"))?;
+        if let Some(current) = current {
+            let started_at_matches =
+                started_at.is_none_or(|started_at| current.started_at == Some(started_at));
+            if current.status == status
+                && current.output_digest.as_deref() == output_digest
+                && current.summary.as_deref() == persisted_summary.as_deref()
+                && started_at_matches
+                && current.finished_at == Some(finished_at)
+            {
+                transaction.commit().map_err(database_error(
+                    "commit idempotent code-change check completion",
+                ))?;
+                return Ok(current);
+            }
+            if current.status != CodeChangeCheckStatus::Reserved {
+                return Err(AppError::Validation {
+                    field: "code_change_check.status",
+                    message: "conflicts with the existing finished check",
+                });
+            }
+        }
         let run = read_run(&transaction, run_id)?;
         if run.state != CodeChangeState::Checking {
             return Err(AppError::Validation {
@@ -503,7 +552,7 @@ impl<'db> CodeChangeRepository<'db> {
                 params![
                     status,
                     output_digest,
-                    summary.map(bounded_redacted_text),
+                    persisted_summary.as_deref(),
                     started_at,
                     finished_at,
                     run_id,
@@ -564,6 +613,22 @@ impl<'db> CodeChangeRepository<'db> {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin code-change candidate recording"))?;
         let run = read_run(&transaction, run_id)?;
+        if let Some(existing_candidate_sha) = run.candidate_sha.as_deref() {
+            if existing_candidate_sha == candidate_sha
+                && run.diff_digest.as_deref() == Some(diff_digest)
+                && run.changed_file_count == Some(changed_file_count)
+                && run.diff_bytes == Some(diff_bytes)
+            {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit idempotent code-change candidate"))?;
+                return Ok(run);
+            }
+            return Err(AppError::Validation {
+                field: "code_change.candidate_sha",
+                message: "conflicts with the existing candidate",
+            });
+        }
         if run.state != CodeChangeState::Committing {
             return Err(AppError::Validation {
                 field: "code_change.state",
@@ -720,6 +785,9 @@ impl<'db> CodeChangeRepository<'db> {
         let run = read_run(&transaction, run_id)?;
         if run.state == CodeChangeState::Evaluated
             && run.promotion_outcome.as_deref() == Some(promotion_outcome)
+            && run.promotion_expected_best_experiment_id.as_deref() == expected_best_experiment_id
+            && run.promotion_expected_old_sha.as_deref() == expected_old_sha
+            && run.promotion_target_sha.as_deref() == target_sha
         {
             transaction
                 .commit()
@@ -824,6 +892,12 @@ impl<'db> CodeChangeRepository<'db> {
         let run = read_run(&transaction, run_id)?;
         let next = match run.state {
             CodeChangeState::CleanupPending => CodeChangeState::Completed,
+            CodeChangeState::Completed if run.cleanup_completed_at.is_some() => {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit idempotent code-change cleanup"))?;
+                return Ok(run);
+            }
             CodeChangeState::Rejected if run.cleanup_completed_at.is_some() => {
                 transaction
                     .commit()
@@ -854,7 +928,13 @@ impl<'db> CodeChangeRepository<'db> {
             });
         }
         let stored = read_run(&transaction, run_id)?;
-        insert_lifecycle_event(&transaction, &stored, stored.editor_attempts, None, now)?;
+        insert_lifecycle_event(
+            &transaction,
+            &stored,
+            stored.editor_attempts,
+            stored.rejection_code.as_deref(),
+            now,
+        )?;
         transaction
             .commit()
             .map_err(database_error("commit code-change cleanup completion"))?;
@@ -1035,20 +1115,28 @@ fn insert_lifecycle_event(
             |row| row.get(0),
         )
         .map_err(database_error("read code-change event project"))?;
-    let event = new_code_change_transition_event(project_id, run, attempt, reason_code, event_time);
-    let already_present: bool = transaction
+    let persisted_event_time: Option<i64> = transaction
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM events
-                 WHERE project_id = ?1 AND dedup_key = ?2
-             )",
-            params![event.project_id.as_str(), event.dedup_key.as_str()],
+            "SELECT created_at FROM events
+             WHERE project_id = ?1 AND dedup_key = ?2",
+            params![
+                project_id.as_str(),
+                format!(
+                    "code-change:v1:{}:{}:{}",
+                    run.code_change_run_id, run.state, attempt
+                )
+            ],
             |row| row.get(0),
         )
-        .map_err(database_error("check code-change audit event"))?;
-    if already_present {
-        return Ok(());
-    }
+        .optional()
+        .map_err(database_error("read existing code-change audit event"))?;
+    let event = new_code_change_transition_event(
+        project_id,
+        run,
+        attempt,
+        reason_code,
+        persisted_event_time.unwrap_or(event_time),
+    );
     insert_event_completed_in_transaction(transaction, &event).map(|_| ())
 }
 
@@ -1125,6 +1213,9 @@ fn validate_new_run(run: &NewCodeChangeRun) -> Result<(), AppError> {
     validate_identifier("worktree_relative_path", &run.worktree_relative_path)?;
     validate_identifier("candidate_ref", &run.candidate_ref)?;
     validate_identifier("best_ref", &run.best_ref)?;
+    if let Some(editor_session_id) = run.editor_session_id.as_deref() {
+        validate_identifier("editor_session_id", editor_session_id)?;
+    }
     validate_owned_path("worktree_relative_path", &run.worktree_relative_path)?;
     validate_owned_ref("candidate_ref", &run.candidate_ref)?;
     validate_owned_ref("best_ref", &run.best_ref)?;
@@ -1183,7 +1274,7 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), AppError>
     Ok(())
 }
 
-fn validate_sha(field: &'static str, value: &str) -> Result<(), AppError> {
+pub(crate) fn validate_sha(field: &'static str, value: &str) -> Result<(), AppError> {
     if (value.len() != 40 && value.len() != 64)
         || value
             .chars()
@@ -1241,7 +1332,7 @@ fn validate_optional_text(
 }
 
 fn validate_attempt_status(value: &str) -> Result<(), AppError> {
-    if matches!(value, "reserved" | "running" | "ready" | "failed") {
+    if matches!(value, "ready" | "failed") {
         Ok(())
     } else {
         Err(AppError::Validation {

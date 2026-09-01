@@ -15,7 +15,7 @@ use pueue_agent::{
     db::{
         inferred_pre_binding_policy_code, experiment_metrics::MetricsRepository,
         AgentDecisionReservation, AgentRunRepository, BatchRepository, CampaignRepository,
-        CodeChangeRepository, Db,
+        CodeChangeRepository, Db, NewCodeChangeCheck,
         EventRepository, ExperimentRepository, DecisionRepository, IncidentRepository,
         InterventionRepository, ProjectRepository, RunLineageRepository,
         running_health::HealthRepository, ProposalAcceptance, StartCampaignRequest,
@@ -34,7 +34,8 @@ use pueue_agent::{
     models::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
         BudgetReservationStatus, Campaign, CampaignState, DecisionAttemptState,
-        CodeChangeState, DecisionCycleState, EventKind, EventStatus, ExecutionProjection,
+        CodeChangeCheckStatus, CodeChangeState, DecisionCycleState, EventKind, EventStatus,
+        ExecutionProjection,
         Experiment, ExperimentStatus,
         ExperimentTerminalOutcome, ExperimentMetricsRow, HealthState, IncidentStatus,
         IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident,
@@ -14522,6 +14523,719 @@ fn pending_code_change_transition_uses_compare_and_set_and_recovers_in_order() {
     assert_eq!(recoverable.len(), 1);
     assert_eq!(recoverable[0].code_change_run_id, "code-change-run-1");
     assert_eq!(recoverable[0].state, CodeChangeState::PreparingWorktree);
+}
+
+fn accept_code_change_for_test(harness: &CampaignDbHarness) {
+    harness.start(&CampaignLimits::default(), 100);
+    harness.finish_baseline(41, 110, ExperimentTerminalOutcome::Succeeded);
+    let proposal = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Change the training implementation",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "v2"],
+    );
+    assert!(matches!(
+        harness
+            .accept(
+                "proposal-code-change",
+                "experiment-code-change",
+                "submission-code-change",
+                &proposal,
+                &CampaignLimits::default(),
+                120,
+            )
+            .unwrap(),
+        ProposalAcceptance::PendingCodeChange
+    ));
+}
+
+fn create_pending_code_change_for_test(
+    harness: &CampaignDbHarness,
+    run_id: &str,
+    editor_session_id: Option<&str>,
+) -> pueue_agent::models::CodeChangeRun {
+    accept_code_change_for_test(harness);
+    let mut new_run = NewCodeChangeRun::new(
+        run_id,
+        "proposal-code-change",
+        CampaignDbHarness::CAMPAIGN_ID,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "campaign/campaign-1/candidate/proposal-code-change",
+        "campaign/campaign-1/best",
+        "worktree-1",
+        "code_changes/campaign-1/proposal-code-change",
+        121,
+    );
+    new_run.editor_session_id = editor_session_id.map(str::to_owned);
+    CodeChangeRepository::new(&harness.test.db)
+        .create_pending(&new_run)
+        .unwrap()
+}
+
+fn code_change_to_editing_for_test(harness: &CampaignDbHarness, run_id: &str, now: i64) {
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .transition(
+            run_id,
+            CodeChangeState::Reserved,
+            CodeChangeState::PreparingWorktree,
+            now,
+        )
+        .unwrap();
+    repository
+        .transition(
+            run_id,
+            CodeChangeState::PreparingWorktree,
+            CodeChangeState::Editing,
+            now + 1,
+        )
+        .unwrap();
+}
+
+fn code_change_to_checking_for_test(harness: &CampaignDbHarness, run_id: &str, now: i64) {
+    code_change_to_editing_for_test(harness, run_id, now);
+    CodeChangeRepository::new(&harness.test.db)
+        .transition(
+            run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            now + 2,
+        )
+        .unwrap();
+}
+
+fn code_change_to_committing_for_test(harness: &CampaignDbHarness, run_id: &str, now: i64) {
+    code_change_to_checking_for_test(harness, run_id, now);
+    CodeChangeRepository::new(&harness.test.db)
+        .transition(
+            run_id,
+            CodeChangeState::Checking,
+            CodeChangeState::Committing,
+            now + 3,
+        )
+        .unwrap();
+}
+
+fn editor_agent_run_for_test(harness: &CampaignDbHarness, ordinal: i64, now: i64) -> i64 {
+    let event = EventRepository::new(&harness.test.db)
+        .insert_idempotent(&NewEvent::new(
+            CampaignDbHarness::PROJECT_ID,
+            EventKind::TaskFinished,
+            format!("code-change-editor-agent-{ordinal}"),
+            json!({}),
+            now,
+            now,
+        ))
+        .unwrap();
+    EventRepository::new(&harness.test.db)
+        .claim_batch(now, now + 60, 1)
+        .unwrap();
+    AgentRunRepository::new(&harness.test.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                CampaignDbHarness::PROJECT_ID,
+                event.event_id,
+                None,
+                AgentRunStatus::Failed,
+                now,
+                harness
+                    .test
+                    .project_root(&format!("code-change-editor-{ordinal}.log")),
+            ),
+            &[event.event_id],
+        )
+        .unwrap()
+        .run_id
+}
+
+#[test]
+fn rejected_code_change_with_pending_cleanup_is_recoverable() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-rejected", None);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let rejected = repository
+        .reject(
+            &run.code_change_run_id,
+            "check_failed",
+            "checks failed",
+            122,
+        )
+        .unwrap();
+    assert_eq!(rejected.state, CodeChangeState::Rejected);
+    assert_eq!(rejected.cleanup_completed_at, None);
+
+    let recoverable = repository.list_recoverable(10).unwrap();
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].code_change_run_id, run.code_change_run_id);
+    assert_eq!(recoverable[0].state, CodeChangeState::Rejected);
+    assert_eq!(recoverable[0].cleanup_completed_at, None);
+
+    repository
+        .finish_cleanup(&run.code_change_run_id, 123)
+        .unwrap();
+    assert!(repository.list_recoverable(10).unwrap().is_empty());
+}
+
+#[test]
+fn code_change_editor_attempts_require_one_session_and_preserve_failed_reservation() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-session", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let first_agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            first_agent_run_id,
+            "session-a",
+            124,
+        )
+        .unwrap();
+
+    let second_agent_run_id = editor_agent_run_for_test(&harness, 2, 125);
+    let error = repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            second_agent_run_id,
+            "session-b",
+            126,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change.editor_session_id",
+            ..
+        }
+    ));
+    let unchanged: (i64, Option<String>, i64) = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT editor_attempts, editor_session_id,
+                    (SELECT COUNT(*) FROM code_change_editor_attempts
+                     WHERE code_change_run_id = ?1)
+             FROM code_change_runs WHERE code_change_run_id = ?1",
+            [&run.code_change_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(unchanged, (1, Some("session-a".to_owned()), 1));
+
+    let second = repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            second_agent_run_id,
+            "session-a",
+            127,
+        )
+        .unwrap();
+    assert_eq!(second.editor_session_id, "session-a");
+    assert_eq!(second.attempt, 2);
+}
+
+#[test]
+fn code_change_initial_editor_session_is_bounded_and_validated() {
+    let harness = CampaignDbHarness::new();
+    accept_code_change_for_test(&harness);
+    let mut run = NewCodeChangeRun::new(
+        "code-change-invalid-session",
+        "proposal-code-change",
+        CampaignDbHarness::CAMPAIGN_ID,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "campaign/campaign-1/candidate/proposal-code-change",
+        "campaign/campaign-1/best",
+        "worktree-1",
+        "code_changes/campaign-1/proposal-code-change",
+        121,
+    );
+    run.editor_session_id = Some("bad\nvalue".to_owned());
+    let error = CodeChangeRepository::new(&harness.test.db)
+        .create_pending(&run)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "editor_session_id",
+            ..
+        }
+    ));
+    assert_eq!(harness.scalar("SELECT COUNT(*) FROM code_change_runs"), 0);
+}
+
+#[test]
+fn campaign_base_revision_sha_rejects_malformed_or_oversized_values_atomically() {
+    for base_revision_sha in ["not-a-sha".to_owned(), "a".repeat(65)] {
+        let harness = CampaignDbHarness::new();
+        let objective = CampaignDbHarness::objective();
+        let baseline = CampaignDbHarness::proposal(
+            ProposalKind::Experiment,
+            "Measure the initial command",
+            None,
+            &["python", "train.py"],
+        );
+        let initial_argv = baseline.argv().to_vec();
+        let error = CampaignRepository::new(&harness.test.db)
+            .start_with_baseline_at_revision(
+                StartCampaignRequest {
+                    campaign_id: CampaignDbHarness::CAMPAIGN_ID,
+                    project_id: CampaignDbHarness::PROJECT_ID,
+                    objective: &objective,
+                    initial_argv: &initial_argv,
+                    baseline: &baseline,
+                    submission_id: "submission-baseline",
+                    experiment_id: CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+                    proposal_id: "proposal-baseline",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+                Some(&base_revision_sha),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "base_revision_sha",
+                ..
+            }
+        ));
+        assert_eq!(harness.count("campaigns"), 0);
+        assert_eq!(harness.count("proposals"), 0);
+        assert_eq!(harness.count("experiments"), 0);
+        assert_eq!(harness.count("submissions"), 0);
+    }
+}
+
+#[test]
+fn code_change_finish_methods_require_terminal_statuses() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-status", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let first_agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            first_agent_run_id,
+            "session-a",
+            124,
+        )
+        .unwrap();
+
+    for status in ["reserved", "running"] {
+        let error = repository
+            .finish_editor_attempt(
+                &run.code_change_run_id,
+                1,
+                status,
+                None,
+                None,
+                None,
+                Some(124),
+                125,
+                125,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "code_change_editor_attempt.status",
+                ..
+            }
+        ));
+    }
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("editor-result"),
+            None,
+            None,
+            Some(124),
+            126,
+            126,
+        )
+        .unwrap();
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            editor_agent_run_for_test(&harness, 2, 127),
+            "session-a",
+            127,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            "failed",
+            None,
+            Some("editor_failed"),
+            Some("editor failed"),
+            Some(127),
+            128,
+            128,
+        )
+        .unwrap();
+
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            129,
+        )
+        .unwrap();
+    repository
+        .replace_attempt_checks(
+            &run.code_change_run_id,
+            1,
+            &[
+                NewCodeChangeCheck::new(1, 0, "supervisor", vec!["cargo".to_owned()], "."),
+                NewCodeChangeCheck::new(1, 1, "supervisor", vec!["cargo".to_owned()], "."),
+                NewCodeChangeCheck::new(1, 2, "supervisor", vec!["cargo".to_owned()], "."),
+            ],
+            130,
+        )
+        .unwrap();
+    let error = repository
+        .finish_check(
+            &run.code_change_run_id,
+            1,
+            0,
+            CodeChangeCheckStatus::Reserved,
+            None,
+            None,
+            Some(130),
+            131,
+            131,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change_check.status",
+            ..
+        }
+    ));
+    for (ordinal, status) in [
+        (0, CodeChangeCheckStatus::Passed),
+        (1, CodeChangeCheckStatus::Failed),
+        (2, CodeChangeCheckStatus::TimedOut),
+    ] {
+        repository
+            .finish_check(
+                &run.code_change_run_id,
+                1,
+                ordinal,
+                status,
+                Some("check-digest"),
+                Some("check finished"),
+                Some(130),
+                132 + ordinal,
+                132 + ordinal,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn conflicting_code_change_lifecycle_event_rolls_back_the_transition() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-event-conflict", None);
+    let dedup_key = format!(
+        "code-change:v1:{}:preparing_worktree:0",
+        run.code_change_run_id
+    );
+    EventRepository::new(&harness.test.db)
+        .insert_idempotent(&NewEvent::new(
+            CampaignDbHarness::PROJECT_ID,
+            EventKind::TaskFinished,
+            dedup_key,
+            json!({"unrelated": true}),
+            122,
+            122,
+        ))
+        .unwrap();
+
+    let error = CodeChangeRepository::new(&harness.test.db)
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Reserved,
+            CodeChangeState::PreparingWorktree,
+            123,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "event.kind",
+            ..
+        }
+    ));
+    assert_eq!(
+        CodeChangeRepository::new(&harness.test.db)
+            .find_by_id(&run.code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        CodeChangeState::Reserved
+    );
+}
+
+#[test]
+fn record_candidate_is_retry_safe_only_for_exact_values() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-candidate-replay", None);
+    code_change_to_committing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let first = repository
+        .record_candidate(
+            &run.code_change_run_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "diff-digest",
+            3,
+            400,
+            126,
+        )
+        .unwrap();
+    let replay = repository
+        .record_candidate(
+            &run.code_change_run_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "diff-digest",
+            3,
+            400,
+            126,
+        )
+        .unwrap();
+    assert_eq!(replay.candidate_sha, first.candidate_sha);
+    let error = repository
+        .record_candidate(
+            &run.code_change_run_id,
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "diff-digest",
+            3,
+            400,
+            127,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change.candidate_sha",
+            ..
+        }
+    ));
+    assert_eq!(
+        repository
+            .find_by_id(&run.code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .candidate_sha
+            .as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+}
+
+#[test]
+fn finish_check_is_retry_safe_only_for_exact_values() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-check-replay", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(&run.code_change_run_id, 1, agent_run_id, "session-a", 124)
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            125,
+        )
+        .unwrap();
+    repository
+        .replace_attempt_checks(
+            &run.code_change_run_id,
+            1,
+            &[NewCodeChangeCheck::new(
+                1,
+                0,
+                "supervisor",
+                vec!["cargo".to_owned()],
+                ".",
+            )],
+            126,
+        )
+        .unwrap();
+    let first = repository
+        .finish_check(
+            &run.code_change_run_id,
+            1,
+            0,
+            CodeChangeCheckStatus::Passed,
+            Some("check-digest"),
+            Some("check finished"),
+            Some(126),
+            126,
+            126,
+        )
+        .unwrap();
+    let replay = repository
+        .finish_check(
+            &run.code_change_run_id,
+            1,
+            0,
+            CodeChangeCheckStatus::Passed,
+            Some("check-digest"),
+            Some("check finished"),
+            Some(126),
+            126,
+            126,
+        )
+        .unwrap();
+    assert_eq!(replay, first);
+    let error = repository
+        .finish_check(
+            &run.code_change_run_id,
+            1,
+            0,
+            CodeChangeCheckStatus::Passed,
+            Some("different-digest"),
+            Some("check finished"),
+            Some(125),
+            126,
+            127,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change_check.status",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn evaluation_requires_exact_replay_and_cleanup_replay_is_idempotent() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-evaluation-replay", None);
+    code_change_to_committing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .record_candidate(
+            &run.code_change_run_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "diff-digest",
+            3,
+            400,
+            126,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Committing,
+            CodeChangeState::CandidateReady,
+            127,
+        )
+        .unwrap();
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE experiments SET proposal_id = ?1 WHERE experiment_id = ?2",
+            params![
+                "proposal-code-change",
+                CampaignDbHarness::BASELINE_EXPERIMENT_ID
+            ],
+        )
+        .unwrap();
+    repository
+        .bind_experiment(
+            &run.code_change_run_id,
+            CampaignDbHarness::BASELINE_EXPERIMENT_ID,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            128,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::CandidateReady,
+            CodeChangeState::ExperimentSubmitted,
+            128,
+        )
+        .unwrap();
+    let first = repository
+        .record_evaluation(
+            &run.code_change_run_id,
+            "promote",
+            Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            129,
+        )
+        .unwrap();
+    let replay = repository
+        .record_evaluation(
+            &run.code_change_run_id,
+            "promote",
+            Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            129,
+        )
+        .unwrap();
+    assert_eq!(replay, first);
+    let error = repository
+        .record_evaluation(
+            &run.code_change_run_id,
+            "promote",
+            Some("different-experiment"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            130,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change.state",
+            ..
+        }
+    ));
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Evaluated,
+            CodeChangeState::CleanupPending,
+            131,
+        )
+        .unwrap();
+    let completed = repository
+        .finish_cleanup(&run.code_change_run_id, 132)
+        .unwrap();
+    let cleanup_replay = repository
+        .finish_cleanup(&run.code_change_run_id, 132)
+        .unwrap();
+    assert_eq!(cleanup_replay, completed);
 }
 
 #[test]

@@ -20,7 +20,7 @@ use crate::{
     AppError,
 };
 
-use super::{database_error, Db};
+use super::{code_changes::validate_sha, database_error, Db};
 
 const ROLLING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const AGENT_RUN_WINDOW_SECONDS: i64 = 60 * 60;
@@ -149,6 +149,9 @@ impl<'db> CampaignRepository<'db> {
         limits: &CampaignLimits,
         base_revision_sha: Option<&str>,
     ) -> Result<ManagedSubmissionIntent, AppError> {
+        if let Some(base_revision_sha) = base_revision_sha {
+            validate_sha("base_revision_sha", base_revision_sha)?;
+        }
         if let Some(objective_metric) = request.objective_metric {
             objective_metric.validate()?;
         }
