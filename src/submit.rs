@@ -15,7 +15,10 @@ use crate::{
     config,
     db::{AgentRunRepository, CampaignRepository, Db, ProjectRepository, SubmissionRepository},
     environment::ProjectAdmissionLock,
-    execution_policy::{load_existing_policy, CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
+    execution_policy::{
+        load_existing_policy, CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy,
+        VerifiedProjectRoot,
+    },
     models::{NewSubmission, ObjectiveMetric, Submission, SubmissionKind},
     output::{bounded_redacted_text, format_state, human_header, human_summary},
     paths, project,
@@ -111,6 +114,7 @@ pub async fn run(project_root: &Path, args: &[OsString]) -> Result<Submission, A
         &limits,
         &pueue,
         root_anchor,
+        policy,
     )
     .await
 }
@@ -141,7 +145,7 @@ pub async fn run_with_options<P: PueueApi + ?Sized>(
     limits: &CampaignLimits,
     pueue: &P,
 ) -> Result<Submission, AppError> {
-    run_with_options_inner(db, project_root, args, options, limits, pueue, None).await
+    run_with_options_inner(db, project_root, args, options, limits, pueue, None, None).await
 }
 
 pub async fn run_with_options_with_root_anchor<P: PueueApi + ?Sized>(
@@ -152,6 +156,7 @@ pub async fn run_with_options_with_root_anchor<P: PueueApi + ?Sized>(
     limits: &CampaignLimits,
     pueue: &P,
     root_anchor: ProjectRootAnchor,
+    policy: Arc<ResolvedExecutionPolicy>,
 ) -> Result<Submission, AppError> {
     run_with_options_inner(
         db,
@@ -161,6 +166,7 @@ pub async fn run_with_options_with_root_anchor<P: PueueApi + ?Sized>(
         limits,
         pueue,
         Some(root_anchor),
+        Some(policy),
     )
     .await
 }
@@ -173,6 +179,7 @@ async fn run_with_options_inner<P: PueueApi + ?Sized>(
     limits: &CampaignLimits,
     pueue: &P,
     root_anchor: Option<ProjectRootAnchor>,
+    policy: Option<Arc<ResolvedExecutionPolicy>>,
 ) -> Result<Submission, AppError> {
     if args.is_empty() {
         return Err(AppError::Configuration {
@@ -240,8 +247,13 @@ async fn run_with_options_inner<P: PueueApi + ?Sized>(
     let created_at = unix_timestamp()?;
     if options.kind == SubmissionKind::Experiment {
         let objective = state::load_objective(&root)?;
-        return CampaignCoordinator::new(db, pueue, *limits)
-            .with_root_anchor(root_anchor)
+        let coordinator =
+            CampaignCoordinator::new(db, pueue, *limits).with_root_anchor(root_anchor);
+        let coordinator = match policy.as_deref() {
+            Some(policy) => coordinator.with_execution_policy(policy),
+            None => coordinator,
+        };
+        return coordinator
             .start_baseline(
                 &registered,
                 &objective,

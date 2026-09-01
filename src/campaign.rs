@@ -1,19 +1,23 @@
-use std::{ffi::OsString, path::Path};
+use std::{ffi::OsString, path::Path, process::Command};
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
+    code_change,
     db::{
-        CampaignRepository, Db, ExperimentRepository, ManagedSubmissionIntent,
-        ProjectRepository, ProposalAcceptance, ProposalRepository, StartCampaignRequest,
-        SubmissionRepository,
+        CampaignRepository, CodeChangeRepository, Db, ExperimentRepository,
+        ManagedSubmissionIntent, ProjectRepository, ProposalAcceptance, ProposalRepository,
+        StartCampaignRequest, SubmissionRepository,
     },
     environment::ProjectAdmissionLock,
-    execution_policy::{CampaignLimits, ProjectRootAnchor, VerifiedProjectRoot},
+    execution_policy::{
+        preflight_code_change_runtime, CampaignLimits, ProjectRootAnchor,
+        ResolvedExecutionPolicy, VerifiedProjectRoot,
+    },
     models::{
-        Campaign, Experiment, ExperimentStatus, ObjectiveMetric, Project, Proposal, ProposalKind,
-        Submission,
+        Campaign, CodeChangeRun, Experiment, ExperimentStatus, NewCodeChangeRun, ObjectiveMetric,
+        Project, Proposal, ProposalKind, ProposalStatus, Submission,
     },
     output::{
         render_campaign_mutation, render_campaign_status_with_decision,
@@ -201,6 +205,7 @@ pub struct CampaignCoordinator<'a, P: PueueApi + ?Sized> {
     pueue: &'a P,
     limits: CampaignLimits,
     root_anchor: Option<ProjectRootAnchor>,
+    execution_policy: Option<&'a ResolvedExecutionPolicy>,
 }
 
 pub(crate) struct CampaignAdmission {
@@ -214,6 +219,13 @@ pub(crate) struct AdmittedCampaignProposal {
     admission: CampaignAdmission,
 }
 
+pub(crate) enum CampaignProposalAdmission {
+    Experiment(AdmittedCampaignProposal),
+    CodeChange(CodeChangeRun),
+    CodeChangeRejected(Proposal),
+    Deferred,
+}
+
 impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
     pub fn new(db: &'a Db, pueue: &'a P, limits: CampaignLimits) -> Self {
         Self {
@@ -221,11 +233,17 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             pueue,
             limits,
             root_anchor: None,
+            execution_policy: None,
         }
     }
 
     pub fn with_root_anchor(mut self, root_anchor: ProjectRootAnchor) -> Self {
         self.root_anchor = Some(root_anchor);
+        self
+    }
+
+    pub fn with_execution_policy(mut self, policy: &'a ResolvedExecutionPolicy) -> Self {
+        self.execution_policy = Some(policy);
         self
     }
 
@@ -268,7 +286,9 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &runtime_argv,
         );
         validate_add_argv(&add_args)?;
-        let intent = CampaignRepository::new(self.db).start_with_baseline(
+        let base_revision_sha =
+            self.capture_clean_head(&admission.verified_root.anchor.canonical_path);
+        let intent = CampaignRepository::new(self.db).start_with_baseline_at_revision(
             StartCampaignRequest {
                 campaign_id: &campaign_id,
                 project_id: &project.project_id,
@@ -284,6 +304,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 now,
             },
             &self.limits,
+            base_revision_sha.as_deref(),
         )?;
         match self
             .submit_accepted_intent_inner(&intent, project, now, Some(admission))
@@ -334,8 +355,20 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         submission_id: &str,
         proposal: &proposals::ValidatedProposal,
         now: i64,
-    ) -> Result<Option<AdmittedCampaignProposal>, AppError> {
+    ) -> Result<CampaignProposalAdmission, AppError> {
         let admission = self.acquire_admission(project)?;
+        if proposal.kind() == ProposalKind::CodeChange {
+            return self.admit_code_change(
+                admission,
+                project,
+                campaign_id,
+                proposal_id,
+                experiment_id,
+                submission_id,
+                proposal,
+                now,
+            );
+        }
         let runtime_argv = crate::environment::campaign_experiment_runtime_argv(
             &admission.verified_root.anchor.canonical_path,
             campaign_id,
@@ -363,18 +396,215 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         )? {
             ProposalAcceptance::Accepted(intent) => {
                 let matches_requested_intent = intent.proposal.proposal_id == proposal_id;
-                Ok(Some(AdmittedCampaignProposal {
-                    intent,
-                    matches_requested_intent,
-                    admission,
-                }))
+                Ok(CampaignProposalAdmission::Experiment(
+                    AdmittedCampaignProposal {
+                        intent,
+                        matches_requested_intent,
+                        admission,
+                    },
+                ))
             }
-            ProposalAcceptance::BudgetWaiting { .. } => Ok(None),
+            ProposalAcceptance::BudgetWaiting { .. } => Ok(CampaignProposalAdmission::Deferred),
             ProposalAcceptance::PendingCodeChange => Err(AppError::Validation {
                 field: "proposal.kind",
-                message: "code_change decisions are not permitted",
+                message: "unexpected code-change acceptance for an experiment proposal",
             }),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_code_change(
+        &self,
+        _admission: CampaignAdmission,
+        project: &Project,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &proposals::ValidatedProposal,
+        now: i64,
+    ) -> Result<CampaignProposalAdmission, AppError> {
+        let proposals_repository = ProposalRepository::new(self.db);
+        if let Some(existing) = proposals_repository.find_for_campaign(campaign_id, proposal_id)? {
+            if existing.canonical_digest != proposal.canonical_digest() {
+                return Err(AppError::Validation {
+                    field: "proposal_id",
+                    message: "conflicts with a different canonical proposal digest",
+                });
+            }
+            if existing.kind != ProposalKind::CodeChange {
+                return Err(AppError::Validation {
+                    field: "proposal.kind",
+                    message: "proposal ID belongs to a non-code proposal",
+                });
+            }
+            return self.existing_code_change_outcome(existing);
+        }
+        if let Some(existing) =
+            proposals_repository.find_by_digest(campaign_id, proposal.canonical_digest())?
+        {
+            if existing.kind != ProposalKind::CodeChange {
+                return Err(AppError::Validation {
+                    field: "proposal.canonical_digest",
+                    message: "matches a non-code proposal",
+                });
+            }
+            return self.existing_code_change_outcome(existing);
+        }
+        let live_code_change: i64 = self
+            .db
+            .connect()?
+            .query_row(
+                "SELECT COUNT(*) FROM code_change_runs
+                 WHERE campaign_id = ?1 AND state NOT IN ('completed', 'rejected')",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(crate::db::database_error(
+                "count live campaign code-change runs",
+            ))?;
+        if live_code_change != 0 {
+            return Err(AppError::Validation {
+                field: "code_change",
+                message: "a live code-change run already exists in the campaign",
+            });
+        }
+
+        let (base_sha, rejection_reason) = match preflight_code_change_runtime() {
+            Err(error) => (None, Some(error.code.as_str())),
+            Ok(()) => match self.code_change_base_sha(project, campaign_id) {
+                Some(base_sha) => (Some(base_sha), None),
+                None => (None, Some("base_revision_unavailable")),
+            },
+        };
+        let code_change_run = if rejection_reason.is_none() {
+            let base_sha = base_sha.clone().ok_or(AppError::Runtime {
+                operation: "read validated code-change base revision",
+            })?;
+            let code_change_run_id = Uuid::new_v4().to_string();
+            Some(NewCodeChangeRun::new(
+                &code_change_run_id,
+                proposal_id,
+                campaign_id,
+                base_sha,
+                code_change::candidate_ref(campaign_id, proposal_id)?,
+                code_change::best_ref(campaign_id)?,
+                &code_change_run_id,
+                code_change::owned_worktree_relative_path(campaign_id, proposal_id)?
+                    .to_string_lossy()
+                    .into_owned(),
+                now,
+            ))
+        } else {
+            None
+        };
+        let accepted = CampaignRepository::new(self.db).accept_code_change_proposal(
+            campaign_id,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            &self.limits,
+            now,
+            code_change_run.as_ref(),
+            rejection_reason,
+        )?;
+        match accepted {
+            ProposalAcceptance::BudgetWaiting { .. } => Ok(CampaignProposalAdmission::Deferred),
+            ProposalAcceptance::Accepted(_) => Err(AppError::Validation {
+                field: "proposal.kind",
+                message: "code-change proposal unexpectedly created an experiment",
+            }),
+            ProposalAcceptance::PendingCodeChange => {
+                if rejection_reason.is_some() {
+                    let rejected = proposals_repository
+                        .find_for_campaign(campaign_id, proposal_id)?
+                        .ok_or(AppError::Runtime {
+                            operation: "read durably rejected code-change proposal",
+                        })?;
+                    Ok(CampaignProposalAdmission::CodeChangeRejected(rejected))
+                } else {
+                    let code_change_run_id = code_change_run
+                        .as_ref()
+                        .map(|run| run.code_change_run_id.as_str())
+                        .ok_or(AppError::Runtime {
+                            operation: "read validated code-change run identity",
+                        })?;
+                    let run = CodeChangeRepository::new(self.db)
+                        .find_by_id(code_change_run_id)?
+                        .ok_or(AppError::Runtime {
+                            operation: "read durably reserved code-change run",
+                        })?;
+                    Ok(CampaignProposalAdmission::CodeChange(run))
+                }
+            }
+        }
+    }
+
+    fn existing_code_change_outcome(
+        &self,
+        proposal: Proposal,
+    ) -> Result<CampaignProposalAdmission, AppError> {
+        if proposal.status == ProposalStatus::Rejected {
+            return Ok(CampaignProposalAdmission::CodeChangeRejected(proposal));
+        }
+        if let Some(run) =
+            CodeChangeRepository::new(self.db).find_by_proposal(&proposal.proposal_id)?
+        {
+            return Ok(CampaignProposalAdmission::CodeChange(run));
+        }
+        Ok(CampaignProposalAdmission::Deferred)
+    }
+
+    fn capture_clean_head(&self, project_root: &Path) -> Option<String> {
+        let anchor = self
+            .execution_policy
+            .and_then(ResolvedExecutionPolicy::code_change_git_anchor)?;
+        anchor.verify_identity().ok()?;
+        let head = run_pinned_git(
+            anchor,
+            project_root,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+        )?;
+        let status = run_pinned_git(anchor, project_root, &["status", "--porcelain=v1", "-z"])?;
+        if !status.is_empty() {
+            return None;
+        }
+        let head = String::from_utf8(head).ok()?;
+        code_change::canonical_full_sha(head.trim()).ok()
+    }
+
+    fn code_change_base_sha(&self, project: &Project, campaign_id: &str) -> Option<String> {
+        let anchor = self
+            .execution_policy
+            .and_then(ResolvedExecutionPolicy::code_change_git_anchor)?;
+        anchor.verify_identity().ok()?;
+        let best = code_change::best_ref(campaign_id).ok()?;
+        let best_revision = format!("{best}^{{commit}}");
+        if let Some(value) = run_pinned_git(
+            anchor,
+            &project.root_path,
+            &["rev-parse", "--verify", &best_revision],
+        ) {
+            if let Ok(value) = String::from_utf8(value) {
+                if let Ok(value) = code_change::canonical_full_sha(value.trim()) {
+                    return Some(value);
+                }
+            }
+        }
+        let campaign = CampaignRepository::new(self.db)
+            .find_by_id(campaign_id)
+            .ok()??;
+        let base = campaign.base_revision_sha?;
+        let base_revision = format!("{base}^{{commit}}");
+        let value = run_pinned_git(
+            anchor,
+            &project.root_path,
+            &["rev-parse", "--verify", &base_revision],
+        )?;
+        let value = String::from_utf8(value).ok()?;
+        let value = code_change::canonical_full_sha(value.trim()).ok()?;
+        (value == base).then_some(value)
     }
 
     pub(crate) async fn submit_admitted_proposal(
@@ -581,6 +811,25 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             _lock: project_lock,
         })
     }
+}
+
+fn run_pinned_git(
+    anchor: &crate::execution_policy::ExecutableAnchor,
+    project_root: &Path,
+    argv: &[&str],
+) -> Option<Vec<u8>> {
+    let mut command = Command::new(&anchor.canonical_path);
+    command
+        .args(argv)
+        .current_dir(project_root)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = command.output().ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 #[allow(clippy::too_many_arguments)]

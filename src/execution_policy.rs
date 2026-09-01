@@ -41,10 +41,18 @@ max_proposals_per_cycle = 1
 observer_interval_minutes = 30
 max_decision_attempts_per_cycle = 3
 max_decision_wait_minutes = 1440
+max_code_change_changed_files = 50
+max_code_change_diff_bytes = 500000
+max_code_change_checks = 8
+code_change_check_timeout_minutes = 30
 
 [executables]
 codex = "codex"
 pueue = "pueue"
+git = "git"
+cargo = "cargo"
+uv = "uv"
+python = "python"
 "#;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -232,6 +240,10 @@ pub struct CampaignLimits {
     pub observer_interval_minutes: u32,
     pub max_decision_attempts_per_cycle: u32,
     pub max_decision_wait_minutes: u32,
+    pub max_code_change_changed_files: u32,
+    pub max_code_change_diff_bytes: u32,
+    pub max_code_change_checks: u32,
+    pub code_change_check_timeout_minutes: u32,
     pub max_live_repairs: u32,
     pub plateau_threshold: u32,
 }
@@ -249,6 +261,10 @@ impl Default for CampaignLimits {
             observer_interval_minutes: 30,
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
+            max_code_change_changed_files: 50,
+            max_code_change_diff_bytes: 500_000,
+            max_code_change_checks: 8,
+            code_change_check_timeout_minutes: 30,
             max_live_repairs: 2,
             plateau_threshold: 3,
         }
@@ -261,6 +277,23 @@ pub enum AgentKind {
     Custom,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CodeChangeTool {
+    Git,
+    Cargo,
+    Uv,
+    Python,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct ServiceStateRootAnchor {
+    canonical_path: PathBuf,
+    identity: ExecutableIdentity,
+    resolution_fingerprint: String,
+    directory: Arc<File>,
+}
+
 #[derive(Clone)]
 pub struct ResolvedExecutionPolicy {
     pub codex_anchor: ExecutableAnchor,
@@ -270,6 +303,7 @@ pub struct ResolvedExecutionPolicy {
     pub project_roots: Vec<PathBuf>,
     project_root_anchors: Vec<ProjectRootAnchor>,
     pub pueue_config_anchor: PueueConfigAnchor,
+    state_root: ServiceStateRootAnchor,
     pub startup_environment: StartupEnvironment,
     pub codex_home: PathBuf,
     pub default_network: NetworkMode,
@@ -278,6 +312,7 @@ pub struct ResolvedExecutionPolicy {
     project_environment_allow: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)>,
     #[allow(dead_code)]
     trusted_path_descriptors: Vec<Arc<File>>,
+    code_change_anchors: BTreeMap<CodeChangeTool, ExecutableAnchor>,
 }
 
 impl fmt::Debug for ResolvedExecutionPolicy {
@@ -290,11 +325,13 @@ impl fmt::Debug for ResolvedExecutionPolicy {
             .field("trusted_path", &self.trusted_path)
             .field("project_roots", &self.project_roots)
             .field("pueue_config_anchor", &self.pueue_config_anchor)
+            .field("state_root", &self.state_root.canonical_path)
             .field("startup_environment", &self.startup_environment)
             .field("codex_home", &self.codex_home)
             .field("default_network", &self.default_network)
             .field("campaign_limits", &self.campaign_limits)
             .field("custom_allowlist", &self.custom_allowlist)
+            .field("code_change_anchors", &self.code_change_anchors)
             .finish()
     }
 }
@@ -314,6 +351,14 @@ impl ResolvedExecutionPolicy {
                     PolicyViolationStage::PreBinding,
                 )
             })
+    }
+
+    pub fn code_change_tool(&self, tool: CodeChangeTool) -> Option<&ExecutableAnchor> {
+        self.code_change_anchors.get(&tool)
+    }
+
+    pub fn code_change_git_anchor(&self) -> Option<&ExecutableAnchor> {
+        self.code_change_tool(CodeChangeTool::Git)
     }
 }
 
@@ -352,6 +397,7 @@ pub enum PolicyViolationCode {
     TempUnsafe,
     SetSidFailed,
     NativeGateFailed,
+    CodeChangePrivileged,
     UnsupportedPlatform,
 }
 
@@ -377,6 +423,7 @@ impl PolicyViolationCode {
             Self::TempUnsafe => "temp_unsafe",
             Self::SetSidFailed => "setsid_failed",
             Self::NativeGateFailed => "native_gate_failed",
+            Self::CodeChangePrivileged => "code_change_privileged",
             Self::UnsupportedPlatform => "unsupported_platform",
         }
     }
@@ -493,6 +540,33 @@ pub fn preflight_decision_runtime() -> Result<(), PolicyViolation> {
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
+    {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::PreBinding,
+        ))
+    }
+}
+
+pub fn preflight_code_change_uid(effective_uid: u32) -> Result<(), PolicyViolation> {
+    if effective_uid == 0 {
+        Err(PolicyViolation::new(
+            PolicyViolationCode::CodeChangePrivileged,
+            PolicyViolationStage::PreBinding,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn preflight_code_change_runtime() -> Result<(), PolicyViolation> {
+    #[cfg(unix)]
+    {
+        // Keep the identity check pure: callers provide the observed UID to
+        // the classifier and no process identity is changed here.
+        return preflight_code_change_uid(unsafe { libc::geteuid() as u32 });
+    }
+    #[cfg(not(unix))]
     {
         Err(PolicyViolation::new(
             PolicyViolationCode::UnsupportedPlatform,
@@ -1299,6 +1373,22 @@ fn load_policy(
         &trusted_path,
         &project_roots,
     )?;
+    let mut code_change_anchors = BTreeMap::new();
+    for (tool, configured) in [
+        (CodeChangeTool::Git, raw.executables.git.as_deref()),
+        (CodeChangeTool::Cargo, raw.executables.cargo.as_deref()),
+        (CodeChangeTool::Uv, raw.executables.uv.as_deref()),
+        (CodeChangeTool::Python, raw.executables.python.as_deref()),
+    ] {
+        if let Some(anchor) = resolve_optional_policy_executable(
+            configured,
+            &trusted_path_descriptors,
+            &trusted_path,
+            &project_roots,
+        )? {
+            code_change_anchors.insert(tool, anchor);
+        }
+    }
     let launcher_anchor = ExecutableAnchor::from_absolute(&input.launcher_path, &project_roots)?;
     let pueue_config_anchor = PueueConfigAnchor::from_absolute(&input.pueue_config, &project_roots)?;
     let default_network = parse_network(raw.defaults.network.as_deref())?;
@@ -1319,6 +1409,18 @@ fn load_policy(
         );
     }
 
+    let state_root = ServiceStateRootAnchor {
+        canonical_path: state_dir.canonical_path,
+        identity: identity(&state_dir.file.metadata().map_err(|_| {
+            PolicyViolation::new(
+                PolicyViolationCode::PolicyUnreadable,
+                PolicyViolationStage::Startup,
+            )
+        })?),
+        resolution_fingerprint: state_dir.resolution_fingerprint,
+        directory: Arc::new(state_dir.file),
+    };
+
     Ok(ResolvedExecutionPolicy {
         codex_anchor,
         pueue_anchor,
@@ -1327,6 +1429,7 @@ fn load_policy(
         project_roots,
         project_root_anchors,
         pueue_config_anchor,
+        state_root,
         startup_environment: input.startup_environment.clone(),
         codex_home,
         default_network,
@@ -1337,7 +1440,25 @@ fn load_policy(
             .into_iter()
             .map(|directory| Arc::new(directory.file))
             .collect(),
+        code_change_anchors,
     })
+}
+
+#[cfg(unix)]
+fn resolve_optional_policy_executable(
+    configured: Option<&str>,
+    trusted_path_descriptors: &[OpenedPath],
+    trusted_path: &[PathBuf],
+    roots: &[PathBuf],
+) -> Result<Option<ExecutableAnchor>, PolicyViolation> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    match resolve_policy_executable(configured, trusted_path_descriptors, trusted_path, roots) {
+        Ok(anchor) => Ok(Some(anchor)),
+        Err(error) if error.code == PolicyViolationCode::AnchorMissing => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1455,6 +1576,18 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         max_decision_wait_minutes: raw
             .max_decision_wait_minutes
             .unwrap_or(defaults.max_decision_wait_minutes),
+        max_code_change_changed_files: raw
+            .max_code_change_changed_files
+            .unwrap_or(defaults.max_code_change_changed_files),
+        max_code_change_diff_bytes: raw
+            .max_code_change_diff_bytes
+            .unwrap_or(defaults.max_code_change_diff_bytes),
+        max_code_change_checks: raw
+            .max_code_change_checks
+            .unwrap_or(defaults.max_code_change_checks),
+        code_change_check_timeout_minutes: raw
+            .code_change_check_timeout_minutes
+            .unwrap_or(defaults.code_change_check_timeout_minutes),
         max_live_repairs: raw
             .max_live_repairs
             .unwrap_or(defaults.max_live_repairs),
@@ -1472,6 +1605,10 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         || !(1..=1_440).contains(&limits.observer_interval_minutes)
         || !(1..=10).contains(&limits.max_decision_attempts_per_cycle)
         || !(1..=10_080).contains(&limits.max_decision_wait_minutes)
+        || !(1..=500).contains(&limits.max_code_change_changed_files)
+        || !(1..=10_000_000).contains(&limits.max_code_change_diff_bytes)
+        || !(1..=32).contains(&limits.max_code_change_checks)
+        || !(1..=1_440).contains(&limits.code_change_check_timeout_minutes)
         || limits.max_live_repairs > 8
         || !(1..=20).contains(&limits.plateau_threshold)
     {
@@ -2012,6 +2149,10 @@ struct RawCampaignLimits {
     observer_interval_minutes: Option<u32>,
     max_decision_attempts_per_cycle: Option<u32>,
     max_decision_wait_minutes: Option<u32>,
+    max_code_change_changed_files: Option<u32>,
+    max_code_change_diff_bytes: Option<u32>,
+    max_code_change_checks: Option<u32>,
+    code_change_check_timeout_minutes: Option<u32>,
     max_live_repairs: Option<u32>,
     plateau_threshold: Option<u32>,
 }
@@ -2021,6 +2162,10 @@ struct RawCampaignLimits {
 struct RawExecutables {
     codex: String,
     pueue: String,
+    git: Option<String>,
+    cargo: Option<String>,
+    uv: Option<String>,
+    python: Option<String>,
 }
 
 impl Default for RawExecutables {
@@ -2028,6 +2173,10 @@ impl Default for RawExecutables {
         Self {
             codex: "codex".to_owned(),
             pueue: "pueue".to_owned(),
+            git: None,
+            cargo: None,
+            uv: None,
+            python: None,
         }
     }
 }

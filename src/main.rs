@@ -402,6 +402,7 @@ mod commands {
             &limits,
             &pueue,
             root_anchor,
+            Arc::clone(&policy),
         )
         .await?;
         println!(

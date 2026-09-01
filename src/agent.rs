@@ -55,7 +55,7 @@ const DECISION_OUTPUT_SCHEMA: &[u8] = br#"{
       "additionalProperties": false,
       "required": ["kind", "hypothesis", "source_experiment_id", "argv", "working_directory", "expected_evidence"],
       "properties": {
-        "kind": {"enum": ["experiment", "repair", "broader_search", "recipe", "data_evaluation"]},
+        "kind": {"enum": ["experiment", "repair", "broader_search", "recipe", "code_change", "data_evaluation"]},
         "hypothesis": {"type": "string"},
         "source_experiment_id": {"type": ["string", "null"]},
         "argv": {"type": "array", "items": {"type": "string"}},

@@ -9,12 +9,15 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    code_change,
     execution_policy::CampaignLimits,
     models::{
         BudgetDimension, BudgetReservation, BudgetReservationStatus, Campaign, CampaignState,
-        Experiment, ExperimentStatus, ExperimentTerminalOutcome, ObjectiveMetric, Proposal,
-        ProposalKind, ProposalStatus, Submission, SubmissionKind, SubmissionStatus,
+        CodeChangeState, EventKind, Experiment, ExperimentStatus, ExperimentTerminalOutcome,
+        NewCodeChangeRun, NewEvent, ObjectiveMetric, Proposal, ProposalKind, ProposalStatus,
+        Submission, SubmissionKind, SubmissionStatus,
     },
+    output::bounded_redacted_text,
     proposals::ValidatedProposal,
     state::ObjectiveSnapshot,
     AppError,
@@ -334,6 +337,70 @@ impl<'db> CampaignRepository<'db> {
         limits: &CampaignLimits,
         now: i64,
     ) -> Result<ProposalAcceptance, AppError> {
+        self.accept_proposal_inner(
+            campaign_id,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            limits,
+            now,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_code_change_proposal(
+        &self,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &ValidatedProposal,
+        limits: &CampaignLimits,
+        now: i64,
+        run: Option<&NewCodeChangeRun>,
+        rejection_reason: Option<&str>,
+    ) -> Result<ProposalAcceptance, AppError> {
+        if proposal.kind() != ProposalKind::CodeChange {
+            return Err(validation_error(
+                "proposal.kind",
+                "must be a code-change proposal",
+            ));
+        }
+        if run.is_none() == rejection_reason.is_none() {
+            return Err(validation_error(
+                "code_change",
+                "must provide exactly one durable outcome",
+            ));
+        }
+        self.accept_proposal_inner(
+            campaign_id,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            limits,
+            now,
+            run,
+            rejection_reason,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_proposal_inner(
+        &self,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &ValidatedProposal,
+        limits: &CampaignLimits,
+        now: i64,
+        code_change_run: Option<&NewCodeChangeRun>,
+        code_change_rejection_reason: Option<&str>,
+    ) -> Result<ProposalAcceptance, AppError> {
         let argv_json = serialize_strings(
             proposal.argv(),
             "serialize campaign proposal arguments",
@@ -468,6 +535,19 @@ impl<'db> CampaignRepository<'db> {
                 now,
                 window_ends_at,
             )?;
+            if let Some(run) = code_change_run {
+                validate_atomic_code_change_run(run, campaign_id, proposal_id)?;
+                insert_code_change_run_in_transaction(&transaction, run, &campaign.project_id)?;
+            } else if let Some(reason) = code_change_rejection_reason {
+                reject_code_change_in_transaction(
+                    &transaction,
+                    campaign_id,
+                    proposal_id,
+                    &campaign.project_id,
+                    reason,
+                    now,
+                )?;
+            }
             transaction
                 .commit()
                 .map_err(database_error("commit pending code-change proposal"))?;
@@ -1908,6 +1988,16 @@ impl<'db> ProposalRepository<'db> {
             .optional()
             .map_err(database_error("find scoped campaign proposal by ID"))
     }
+
+    pub fn find_by_digest(
+        &self,
+        campaign_id: &str,
+        canonical_digest: &str,
+    ) -> Result<Option<Proposal>, AppError> {
+        let connection = self.db.connect()?;
+        find_proposal_by_digest(&connection, campaign_id, canonical_digest)
+    }
+
 }
 
 impl<'db> ExperimentRepository<'db> {
@@ -2600,6 +2690,145 @@ fn insert_code_change_reservation(
             ],
         )
         .map_err(database_error("insert code-change budget reservation"))?;
+    Ok(())
+}
+
+fn validate_atomic_code_change_run(
+    run: &NewCodeChangeRun,
+    campaign_id: &str,
+    proposal_id: &str,
+) -> Result<(), AppError> {
+    if run.campaign_id != campaign_id || run.proposal_id != proposal_id {
+        return Err(validation_error(
+            "code_change.run",
+            "must belong to the accepted campaign proposal",
+        ));
+    }
+    validate_code_change_identifier("code_change_run_id", &run.code_change_run_id)?;
+    validate_code_change_identifier("worktree_id", &run.worktree_id)?;
+    validate_code_change_identifier("worktree_relative_path", &run.worktree_relative_path)?;
+    validate_code_change_identifier("candidate_ref", &run.candidate_ref)?;
+    validate_code_change_identifier("best_ref", &run.best_ref)?;
+    if run.candidate_ref != code_change::candidate_ref(campaign_id, proposal_id)?
+        || run.best_ref != code_change::best_ref(campaign_id)?
+        || run.worktree_relative_path
+            != code_change::owned_worktree_relative_path(campaign_id, proposal_id)?
+                .to_string_lossy()
+    {
+        return Err(validation_error(
+            "code_change.run",
+            "must use campaign-owned refs and worktree path",
+        ));
+    }
+    super::code_changes::validate_sha("base_sha", &run.base_sha)
+}
+
+fn validate_code_change_identifier(field: &'static str, value: &str) -> Result<(), AppError> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(validation_error(
+            field,
+            "must be non-empty bounded text without control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_code_change_run_in_transaction(
+    transaction: &Transaction<'_>,
+    run: &NewCodeChangeRun,
+    project_id: &str,
+) -> Result<(), AppError> {
+    transaction
+        .execute(
+            "INSERT INTO code_change_runs (
+                code_change_run_id, proposal_id, campaign_id, state, base_sha,
+                candidate_sha, candidate_ref, best_ref, worktree_id,
+                worktree_relative_path, editor_session_id, editor_attempts,
+                diff_digest, changed_file_count, diff_bytes, experiment_id,
+                rejection_code, rejection_summary, promotion_outcome,
+                promotion_expected_best_experiment_id, promotion_expected_old_sha,
+                promotion_target_sha, cleanup_completed_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10,
+                       0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, ?11, ?11)",
+            params![
+                run.code_change_run_id,
+                run.proposal_id,
+                run.campaign_id,
+                CodeChangeState::Reserved,
+                run.base_sha,
+                run.candidate_ref,
+                run.best_ref,
+                run.worktree_id,
+                run.worktree_relative_path,
+                run.editor_session_id,
+                run.created_at,
+            ],
+        )
+        .map_err(database_error("insert code-change run"))?;
+    let event = NewEvent::new(
+        project_id.to_owned(),
+        EventKind::CodeChange,
+        format!(
+            "code-change:v1:{}:{}:0",
+            run.code_change_run_id,
+            CodeChangeState::Reserved
+        ),
+        serde_json::json!({
+            "code_change_run_id": run.code_change_run_id,
+            "campaign_id": run.campaign_id,
+            "proposal_id": run.proposal_id,
+            "state": CodeChangeState::Reserved,
+            "attempt": 0,
+            "reason_code": null,
+            "event_time": run.created_at,
+        }),
+        run.created_at,
+        run.created_at,
+    )
+    .with_campaign_lineage(run.campaign_id.clone(), Option::<String>::None);
+    super::insert_event_completed_in_transaction(transaction, &event)?;
+    Ok(())
+}
+
+fn reject_code_change_in_transaction(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    proposal_id: &str,
+    project_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let persisted_reason = bounded_redacted_text(reason);
+    let changed = transaction
+        .execute(
+            "UPDATE proposals SET status = 'rejected', reject_reason = ?1, updated_at = ?2
+             WHERE campaign_id = ?3 AND proposal_id = ?4 AND status = 'pending'",
+            params![persisted_reason, now, campaign_id, proposal_id],
+        )
+        .map_err(database_error("reject code-change proposal"))?;
+    if changed != 1 {
+        return Err(validation_error(
+            "proposal.status",
+            "pending code-change proposal changed concurrently",
+        ));
+    }
+    let event = NewEvent::new(
+        project_id.to_owned(),
+        EventKind::CodeChange,
+        format!("code-change-proposal:v1:{proposal_id}:rejected"),
+        serde_json::json!({
+            "campaign_id": campaign_id,
+            "proposal_id": proposal_id,
+            "state": "rejected",
+            "reason_code": persisted_reason,
+            "event_time": now,
+        }),
+        now,
+        now,
+    )
+    .with_campaign_lineage(campaign_id.to_owned(), Option::<String>::None);
+    super::insert_event_completed_in_transaction(transaction, &event)?;
     Ok(())
 }
 

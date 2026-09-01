@@ -8,8 +8,9 @@ use pueue_agent::{
     db::{Db, ProjectRepository},
     diagnostics::{build_doctor_report_with_policy, DoctorCheckStatus, DoctorExternal},
     execution_policy::{
-        load_existing_policy, load_or_create_policy, resolve_project_policy, AgentKind,
-        CampaignLimits, NetworkMode, PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
+        load_existing_policy, load_or_create_policy, preflight_code_change_uid,
+        resolve_project_policy, AgentKind, CampaignLimits, CodeChangeTool, NetworkMode,
+        PolicyLoadInput, PolicyViolationCode, StartupEnvironment,
     },
     models::{AgentContextMode, NewProject, Project},
     service::{ServicePaths, ServiceStatus},
@@ -100,8 +101,9 @@ impl PolicyHarness {
         }
         let codex = trusted_bin.join("codex");
         let pueue = trusted_bin.join("pueue");
+        let git = trusted_bin.join("git");
         let launcher = trusted_bin.join("launcher-fixture");
-        for executable in [&codex, &pueue, &launcher] {
+        for executable in [&codex, &pueue, &git, &launcher] {
             fs::write(executable, b"fixture executable").unwrap();
             secure_executable(executable);
         }
@@ -228,10 +230,16 @@ fn decision_campaign_limits_have_safe_service_defaults() {
             observer_interval_minutes: 30,
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
+            max_code_change_changed_files: 50,
+            max_code_change_diff_bytes: 500_000,
+            max_code_change_checks: 8,
+            code_change_check_timeout_minutes: 30,
             max_live_repairs: 2,
             plateau_threshold: 3,
         }
     );
+    assert!(policy.code_change_git_anchor().is_some());
+    assert!(policy.code_change_tool(CodeChangeTool::Cargo).is_none());
     assert_eq!(policy.default_network, NetworkMode::Enabled);
 
     let legacy_policy = fs::read_to_string(harness.policy())
@@ -245,6 +253,29 @@ fn decision_campaign_limits_have_safe_service_defaults() {
         .campaign_limits;
     assert_eq!(legacy_limits.max_decision_attempts_per_cycle, 3);
     assert_eq!(legacy_limits.max_decision_wait_minutes, 1_440);
+}
+
+#[test]
+fn optional_code_change_tools_are_absent_without_blocking_policy_load() {
+    let harness = PolicyHarness::new();
+    let policy = load_or_create_policy(&harness.input()).unwrap();
+    assert!(policy.code_change_tool(CodeChangeTool::Cargo).is_none());
+    assert!(policy.code_change_tool(CodeChangeTool::Uv).is_none());
+    assert!(policy.code_change_tool(CodeChangeTool::Python).is_none());
+
+    let without_git = fs::read_to_string(harness.policy())
+        .unwrap()
+        .replace("git = \"git\"\n", "git = \"missing-git\"\n");
+    fs::write(harness.policy(), without_git).unwrap();
+    secure_file(&harness.policy());
+    let absent = load_existing_policy(&harness.input()).unwrap();
+    assert!(absent.code_change_git_anchor().is_none());
+}
+
+#[test]
+fn code_change_uid_preflight_is_pure_and_rejects_only_root() {
+    assert!(preflight_code_change_uid(0).is_err());
+    assert!(preflight_code_change_uid(501).is_ok());
 }
 
 #[test]
@@ -271,6 +302,10 @@ fn decision_campaign_limits_reject_values_outside_service_bounds() {
         ("max_decision_attempts_per_cycle", 11),
         ("max_decision_wait_minutes", 0),
         ("max_decision_wait_minutes", 10_081),
+        ("max_code_change_changed_files", 501),
+        ("max_code_change_diff_bytes", 10_000_001),
+        ("max_code_change_checks", 33),
+        ("code_change_check_timeout_minutes", 1_441),
     ] {
         let updated = default_policy.replacen(
             &format!("{field} = {}", campaign_limit_default(field)),
@@ -813,6 +848,10 @@ fn campaign_limit_default(field: &str) -> u32 {
         "observer_interval_minutes" => 30,
         "max_decision_attempts_per_cycle" => 3,
         "max_decision_wait_minutes" => 1_440,
+        "max_code_change_changed_files" => 50,
+        "max_code_change_diff_bytes" => 500_000,
+        "max_code_change_checks" => 8,
+        "code_change_check_timeout_minutes" => 30,
         _ => unreachable!(),
     }
 }

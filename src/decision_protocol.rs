@@ -3,7 +3,6 @@ use sha2::Digest;
 
 use crate::{
     execution_policy::CampaignLimits,
-    models::ProposalKind,
     proposals::{self, ProposalInput, ValidatedProposal},
     AppError,
 };
@@ -222,12 +221,6 @@ pub fn parse_and_validate_decision(
         } => {
             validate_schema_version(schema_version)?;
             let proposal = proposals::validate(proposal, objective_digest)?;
-            if proposal.kind() == ProposalKind::CodeChange {
-                return Err(validation_error(
-                    "proposal.kind",
-                    "code_change decisions are not permitted",
-                ));
-            }
             Ok(ValidatedDecision::Proposal(proposal))
         }
         DecisionInput::Wait {
@@ -326,7 +319,19 @@ mod tests {
     use crate::{
         decision_protocol::{ValidatedDecision, ValidatedWait, parse_and_validate_decision},
         execution_policy::CampaignLimits,
+        models::ProposalKind,
     };
+
+    #[test]
+    fn decision_protocol_accepts_bounded_code_change() {
+        let bytes = br#"{"schema_version":1,"decision":"proposal","proposal":{"kind":"code_change","hypothesis":"reduce allocator pressure","source_experiment_id":"exp-1","argv":["python","train.py"],"working_directory":".","expected_evidence":["lower peak memory"]}}"#;
+        let decision =
+            parse_and_validate_decision(bytes, "objective", CampaignLimits::default()).unwrap();
+        let ValidatedDecision::Proposal(proposal) = decision else {
+            panic!("expected proposal");
+        };
+        assert_eq!(proposal.kind(), ProposalKind::CodeChange);
+    }
 
     #[test]
     fn decision_protocol_accepts_one_proposal_or_finite_wait() {
@@ -356,8 +361,7 @@ mod tests {
     #[test]
     fn decision_protocol_rejects_code_change_unknown_fields_and_unbounded_wait() {
         let limits = CampaignLimits::default();
-        let rejected: [&[u8]; 6] = [
-            br#"{"schema_version":1,"decision":"proposal","proposal":{"kind":"code_change","hypothesis":"edit source","source_experiment_id":"exp-1","argv":["python","train.py"],"working_directory":".","expected_evidence":[]}}"#,
+        let rejected: [&[u8]; 5] = [
             br#"{"schema_version":1,"decision":"wait","reason":"later","requested_wait_minutes":30,"expected_evidence":[],"extra":true}"#,
             br#"{"schema_version":1,"decision":"wait","reason":"later","requested_wait_minutes":0,"expected_evidence":[]}"#,
             br#"{"schema_version":1,"decision":"wait","reason":"later","requested_wait_minutes":10081,"expected_evidence":[]}"#,

@@ -34,6 +34,11 @@ pub fn resolved_policy(
     }
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))
         .expect("secure launcher fixture");
+    let git = trusted_dir.join("git");
+    if !git.exists() {
+        fs::write(&git, "#!/bin/sh\nexec /usr/bin/git \"$@\"\n").expect("write pinned git fixture");
+    }
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).expect("secure git fixture");
     let pueue_config = fixture_root.join("execution-policy-pueue.yml");
     fs::write(&pueue_config, "fixture: true\n").expect("write pueue fixture config");
     fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600))
@@ -66,10 +71,11 @@ pub fn resolved_policy(
     fs::write(
         state_dir.join("execution-policy.toml"),
         format!(
-            "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n{}",
+            "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\ngit = {:?}\n{}",
             joined_path.to_string_lossy(),
             launcher.display().to_string(),
             launcher.display().to_string(),
+            git.display().to_string(),
             project_entries,
         ),
     )

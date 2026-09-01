@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::{
-    campaign::{CampaignCoordinator, CampaignSubmission},
+    campaign::{CampaignCoordinator, CampaignProposalAdmission, CampaignSubmission},
     db::{
         CampaignRepository, DecisionRepository, DecisionReservation, ExperimentRepository,
         ProjectRepository, ReadyDecision,
@@ -185,7 +185,8 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                         policy
                             .project_root_anchor(&project.root_path)
                             .map_err(AppError::from)?,
-                    ),
+                    )
+                    .with_execution_policy(policy),
                 None => CampaignCoordinator::new(self.db, self.pueue, self.limits),
             };
 
@@ -228,7 +229,7 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                     let proposal_id = decision_resource_id("proposal", &stored.reservation);
                     let experiment_id = decision_resource_id("experiment", &stored.reservation);
                     let submission_id = decision_resource_id("submission", &stored.reservation);
-                    let admitted = match coordinator.admit_proposal(
+                    let admission = match coordinator.admit_proposal(
                         &project,
                         &campaign.campaign_id,
                         &proposal_id,
@@ -237,11 +238,7 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                         &proposal,
                         now,
                     ) {
-                        Ok(Some(admitted)) => admitted,
-                        Ok(None) => {
-                            report.deferred += 1;
-                            continue;
-                        }
+                        Ok(admission) => admission,
                         Err(AppError::Runtime {
                             operation: "acquire project submission admission lock",
                         }) => {
@@ -262,31 +259,51 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                         }
                         Err(error) => return Err(error),
                     };
-                    if !admitted.matches_requested_intent {
-                        record_rejection(
-                            &mut report,
-                            &repository,
-                            &stored.reservation.cycle_id,
-                            stored.reservation.attempt_number,
-                            "persisted proposal duplicates another decision attempt",
-                            self.limits,
-                            now,
-                        )?;
-                        continue;
-                    }
-                    repository.mark_completed(
-                        &stored.reservation.cycle_id,
-                        stored.reservation.attempt_number,
-                        now,
-                    )?;
-                    match coordinator
-                        .submit_admitted_proposal(admitted, &project, now)
-                        .await?
-                    {
-                        CampaignSubmission::Submitted(_) => {
+                    match admission {
+                        CampaignProposalAdmission::Experiment(admitted) => {
+                            if !admitted.matches_requested_intent {
+                                record_rejection(
+                                    &mut report,
+                                    &repository,
+                                    &stored.reservation.cycle_id,
+                                    stored.reservation.attempt_number,
+                                    "persisted proposal duplicates another decision attempt",
+                                    self.limits,
+                                    now,
+                                )?;
+                                continue;
+                            }
+                            repository.mark_completed(
+                                &stored.reservation.cycle_id,
+                                stored.reservation.attempt_number,
+                                now,
+                            )?;
+                            match coordinator
+                                .submit_admitted_proposal(admitted, &project, now)
+                                .await?
+                            {
+                                CampaignSubmission::Submitted(_) => {
+                                    report.proposals_applied += 1;
+                                }
+                                CampaignSubmission::Deferred => report.deferred += 1,
+                            }
+                        }
+                        CampaignProposalAdmission::CodeChange(_run) => {
+                            repository.mark_completed(
+                                &stored.reservation.cycle_id,
+                                stored.reservation.attempt_number,
+                                now,
+                            )?;
                             report.proposals_applied += 1;
                         }
-                        CampaignSubmission::Deferred => report.deferred += 1,
+                        CampaignProposalAdmission::CodeChangeRejected(_proposal) => {
+                            repository.mark_completed(
+                                &stored.reservation.cycle_id,
+                                stored.reservation.attempt_number,
+                                now,
+                            )?;
+                        }
+                        CampaignProposalAdmission::Deferred => report.deferred += 1,
                     }
                 }
                 ValidatedDecision::GoalReached(goal) => {
