@@ -40,6 +40,8 @@ use crate::process::{
     GIT_ADMIN_FD, GIT_COMMON_DIR_FD, ProcessGroupRequirement, PROJECT_ROOT_FD,
     VerifiedChildIo, VerifiedCommandSpec, VerifiedGitDirectories,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::process::GIT_WORKTREE_PARENT_FD;
 
 #[cfg(unix)]
 use std::{
@@ -439,6 +441,27 @@ fn descriptor_worktree_leaf(leaf: &str) -> OsString {
     // only the manager-validated single leaf, so it cannot rediscover a
     // replaceable absolute candidate pathname.
     OsString::from(leaf)
+}
+
+#[cfg(unix)]
+fn verify_cleanup_leaf_identity(
+    parent: &File,
+    leaf: &OsStr,
+    expected: ExecutableIdentity,
+) -> Result<(), AppError> {
+    let current = open_existing_directory_at(parent, leaf).map_err(|_| recovery_required())?;
+    if directory_identity(&current)? != expected {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_cleanup_leaf_absent(parent: &File, leaf: &OsStr) -> Result<(), AppError> {
+    if directory_entry_exists(parent, leaf)? {
+        return Err(recovery_required());
+    }
+    Ok(())
 }
 
 const MAX_EDITOR_OUTPUT_BYTES: usize = 64 * 1024;
@@ -1918,69 +1941,48 @@ impl WorktreeManager {
         if directory_identity(&candidate_directory)? != current_before_remove.anchor.identity {
             return Err(recovery_required());
         }
+        verify_cleanup_leaf_identity(
+            &candidate_parent,
+            OsStr::new(&self.proposal_id),
+            current_before_remove.anchor.identity,
+        )?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let cleanup_path = descriptor_worktree_leaf(&self.proposal_id);
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        let cleanup_path = descriptor_worktree_leaf(&self.proposal_id);
-        #[cfg(not(unix))]
-        let cleanup_path = self.worktree_path.as_os_str().to_os_string();
-        let cleanup_args = vec![
-            OsString::from("worktree"),
-            OsString::from("remove"),
-            OsString::from("--force"),
-            cleanup_path,
-        ];
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let output = self
-            .git_os_with_worktree_parent(
-                &original_root,
-                &working_directory,
-                &cleanup_args,
-                MAX_GIT_OUTPUT_BYTES,
-                Some(candidate_parent.try_clone().map_err(|_| recovery_required())?),
-            )
-            .await?;
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        let output = self
-            .git_os(
-                &original_root,
-                &working_directory,
-                &cleanup_args,
-                MAX_GIT_OUTPUT_BYTES,
-            )
-            .await?;
-        #[cfg(not(unix))]
-        let output = self
-            .git_os(
-                &original_root,
-                &working_directory,
-                &cleanup_args,
-                MAX_GIT_OUTPUT_BYTES,
-            )
-            .await?;
-        if !output.success {
-            return Err(recovery_required());
-        }
-        if let Some(candidate_sha) = expected_candidate_sha {
-            self.remove_candidate_ref(candidate_sha).await?;
-        }
-        self.validate_original_state().await?;
-        #[cfg(unix)]
         {
-            let reopened_parent = open_worktree_parent(self)?
-                .ok_or_else(recovery_required)?;
+            let cleanup_path = OsString::from(git_descriptor_path(GIT_WORKTREE_PARENT_FD));
+            let cleanup_args = vec![
+                OsString::from("worktree"),
+                OsString::from("remove"),
+                OsString::from("--force"),
+                cleanup_path,
+            ];
+            let output = self
+                .git_os_with_worktree_parent_and_descriptor(
+                    &original_root,
+                    &working_directory,
+                    &cleanup_args,
+                    MAX_GIT_OUTPUT_BYTES,
+                    Some(candidate_parent.try_clone().map_err(|_| recovery_required())?),
+                    Some((candidate_directory, current_before_remove.anchor.identity)),
+                )
+                .await?;
+            if !output.success {
+                return Err(recovery_required());
+            }
+            self.validate_original_state().await?;
+            let reopened_parent = open_worktree_parent(self)?.ok_or_else(recovery_required)?;
             if directory_identity(&reopened_parent)? != candidate_parent_identity {
                 return Err(recovery_required());
             }
-            if directory_entry_exists(&reopened_parent, OsStr::new(&self.proposal_id))? {
-                return Err(recovery_required());
+            verify_cleanup_leaf_absent(&reopened_parent, OsStr::new(&self.proposal_id))?;
+            if let Some(candidate_sha) = expected_candidate_sha {
+                self.remove_candidate_ref(candidate_sha).await?;
             }
+            self.validate_original_state().await?;
             Ok(())
         }
-        #[cfg(not(unix))]
-        match fs::symlink_metadata(&self.worktree_path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Ok(_) | Err(_) => Err(recovery_required()),
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        {
+            Err(recovery_required())
         }
     }
 
@@ -2306,11 +2308,33 @@ impl WorktreeManager {
         cap: usize,
         owned_worktree_parent: Option<File>,
     ) -> Result<BoundedToolOutput, AppError> {
+        self.git_os_with_worktree_parent_and_descriptor(
+            root,
+            working_directory,
+            args,
+            cap,
+            owned_worktree_parent,
+            None,
+        )
+        .await
+    }
+
+    async fn git_os_with_worktree_parent_and_descriptor(
+        &self,
+        root: &VerifiedProjectRoot,
+        working_directory: &VerifiedWorkingDirectory,
+        args: &[OsString],
+        cap: usize,
+        owned_worktree_parent: Option<File>,
+        owned_worktree_descriptor: Option<(File, ExecutableIdentity)>,
+    ) -> Result<BoundedToolOutput, AppError> {
         self.validate_git_boundary(root)?;
         let argv = args.to_vec();
         let environment = SanitizedEnvironment::for_code_change_tool(&self.policy)?;
         let worktree_administration = is_worktree_administration(args);
-        if !worktree_administration && owned_worktree_parent.is_some() {
+        if !worktree_administration
+            && (owned_worktree_parent.is_some() || owned_worktree_descriptor.is_some())
+        {
             return Err(recovery_required());
         }
         let parent = if worktree_administration {
@@ -2346,6 +2370,15 @@ impl WorktreeManager {
         } else {
             working_directory.try_clone().map_err(|_| recovery_required())?
         };
+        let worktree_descriptor = match owned_worktree_descriptor {
+            Some((descriptor, expected)) => {
+                if directory_identity(&descriptor)? != expected {
+                    return Err(recovery_required());
+                }
+                Some(descriptor)
+            }
+            None => parent,
+        };
         self.run_git_owned(
             root,
             &command_working_directory,
@@ -2353,7 +2386,7 @@ impl WorktreeManager {
             cap,
             environment,
             None,
-            parent,
+            worktree_descriptor,
             "pinned Git",
         )
         .await
@@ -2367,7 +2400,7 @@ impl WorktreeManager {
         cap: usize,
         mut environment: SanitizedEnvironment,
         temporary_index: Option<Arc<OwnedTemporaryIndex>>,
-        worktree_parent: Option<File>,
+        worktree_descriptor: Option<File>,
         summary: &'static str,
     ) -> Result<BoundedToolOutput, AppError> {
         if let Some(index) = temporary_index.as_ref() {
@@ -2379,7 +2412,7 @@ impl WorktreeManager {
             "pinned Git is unavailable",
         ))?.clone();
         apply_git_descriptor_environment(&mut environment);
-        let git_directories = self.git_directories(root, worktree_parent)?;
+        let git_directories = self.git_directories(root, worktree_descriptor)?;
         let result = BoundedToolRunner::new(&self.policy, cap)
             .run(
                 anchor,
@@ -2409,7 +2442,7 @@ impl WorktreeManager {
     fn git_directories(
         &self,
         root: &VerifiedProjectRoot,
-        worktree_parent: Option<File>,
+        worktree_descriptor: Option<File>,
     ) -> Result<VerifiedGitDirectories, AppError> {
         let proof = if root.anchor.canonical_path == self.project.root_path {
             self.original_repository.as_ref()
@@ -2430,7 +2463,7 @@ impl WorktreeManager {
             .directory
             .try_clone()
             .map_err(|_| recovery_required())?;
-        let worktree_parent_identity = worktree_parent
+        let worktree_parent_identity = worktree_descriptor
             .as_ref()
             .map(directory_identity)
             .transpose()?;
@@ -2439,7 +2472,7 @@ impl WorktreeManager {
             admin_identity: proof.admin.identity,
             common,
             common_identity: proof.common.identity,
-            worktree_parent,
+            worktree_parent: worktree_descriptor,
             worktree_parent_identity,
         })
     }
@@ -6478,6 +6511,39 @@ mod tests {
     #[test]
     fn worktree_administration_uses_only_a_single_relative_leaf() {
         assert_eq!(descriptor_worktree_leaf("proposal"), OsString::from("proposal"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn cleanup_leaf_swap_is_recovery_and_preserves_replacement() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let candidate = root.path().join("proposal");
+        fs::create_dir(&candidate).unwrap();
+        secure_test_directory(&candidate);
+        let candidate_directory = File::open(&candidate).unwrap();
+        let candidate_identity = directory_identity(&candidate_directory).unwrap();
+        let replacement = root.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        secure_test_directory(&replacement);
+        fs::write(replacement.join("marker"), b"replacement").unwrap();
+        let parent = File::open(root.path()).unwrap();
+
+        fs::rename(&candidate, root.path().join("proposal-old")).unwrap();
+        fs::rename(&replacement, &candidate).unwrap();
+
+        assert!(verify_cleanup_leaf_identity(
+            &parent,
+            OsStr::new("proposal"),
+            candidate_identity,
+        )
+        .is_err());
+        assert!(verify_cleanup_leaf_absent(&parent, OsStr::new("proposal")).is_err());
+        assert_eq!(fs::read(candidate.join("marker")).unwrap(), b"replacement");
+        assert_eq!(
+            git_descriptor_path(GIT_WORKTREE_PARENT_FD),
+            "/proc/self/fd/15"
+        );
     }
 
     #[test]
