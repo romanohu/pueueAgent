@@ -4884,6 +4884,100 @@ async fn code_change_editor_post_binding_setup_failure_finishes_reserved_attempt
 }
 
 #[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_post_binding_finalization_failure_retains_cleanup_owner() {
+    let fixture = code_change_editor_fixture("fail");
+    let blocked_service = fixture
+        .candidate_policy
+        .root_anchor
+        .canonical_path
+        .join(".pueue-agent");
+    fs::write(&blocked_service, b"not a directory").unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_editor_agent_finalization
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN OLD.execution_kind = 'code_change_editor' AND NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'injected editor agent-run finalizer failure'); END;",
+        )
+        .unwrap();
+
+    let error = match spawn_editor_fixture_attempt_result(
+        &fixture.runner,
+        &fixture.db,
+        &fixture.project,
+        &fixture.candidate_policy,
+        &fixture.config,
+        &fixture.run_id,
+        &fixture.campaign_id,
+        1,
+        AgentContextMode::Fresh,
+        10,
+    )
+    .await
+    {
+        Ok(_) => panic!("finalization failure should retain cleanup authority"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.stage,
+        pueue_agent::agent::AgentSpawnStage::RunBoundPreMarker {
+            resolved: false,
+            ..
+        }
+    ));
+    let mut cleanup = error
+        .cleanup
+        .expect("editor finalization failure must retain cleanup authority");
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .expect("editor attempt reservation");
+    assert_eq!(attempt.status, "failed");
+    assert_eq!(attempt.failure_code.as_deref(), Some("editor_launch"));
+    let first_failure_code = attempt.failure_code.clone();
+    let first_failure_summary = attempt.failure_summary.clone();
+    let first_finished_at = attempt.finished_at;
+    let agent_run = AgentRunRepository::new(&fixture.db)
+        .find_by_id(attempt.agent_run_id)
+        .unwrap()
+        .expect("bound editor agent run");
+    assert!(matches!(
+        agent_run.status,
+        AgentRunStatus::Starting | AgentRunStatus::Running
+    ));
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_editor_agent_finalization")
+        .unwrap();
+    cleanup.retry(&fixture.db, 12).await.unwrap();
+
+    let finalized_run = AgentRunRepository::new(&fixture.db)
+        .find_by_id(attempt.agent_run_id)
+        .unwrap()
+        .expect("finalized editor agent run");
+    assert_eq!(finalized_run.status, AgentRunStatus::Failed);
+    assert!(AgentRunRepository::new(&fixture.db)
+        .find_active_by_project(&fixture.project.project_id)
+        .unwrap()
+        .is_none());
+    let replayed_attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .expect("replayed editor attempt");
+    assert_eq!(replayed_attempt.status, "failed");
+    assert_eq!(replayed_attempt.failure_code, first_failure_code);
+    assert_eq!(replayed_attempt.failure_summary, first_failure_summary);
+    assert_eq!(replayed_attempt.finished_at, first_finished_at);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
 fn secure_editor_git_fixture_tree(path: &std::path::Path) {
     let metadata = fs::symlink_metadata(path).unwrap();
     let mode = if metadata.is_dir() { 0o700 } else { 0o600 };

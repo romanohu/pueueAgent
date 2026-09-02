@@ -27,7 +27,7 @@ before the GREEN rerun.
 
 Linux/roko focused results (single-threaded unless noted):
 
-- `cargo test --test daemon code_change_editor -- --test-threads=1`: 10 passed.
+- `cargo test --test daemon code_change_editor -- --test-threads=1`: 11 passed.
 - `cargo test --test daemon code_change_editor_is_preserved_from_generic_startup_recovery -- --exact --test-threads=1`: 1 passed.
 - `cargo test --test codex_security code_change_editor -- --test-threads=1`: 3 passed.
 - `cargo test --test database code_change_editor -- --test-threads=1`: 3 passed.
@@ -107,7 +107,7 @@ Latest roko Linux verification after these corrections:
 
 - `cargo check --tests -j1`: passed (pre-existing `EntryMountPrecheck`
   dead-code warning only).
-- `cargo test --test daemon code_change_editor -- --test-threads=1`: 10
+- `cargo test --test daemon code_change_editor -- --test-threads=1`: 11
   passed.
 - `cargo test --test codex_security code_change_editor -- --test-threads=1`:
   3 passed.
@@ -123,3 +123,31 @@ Latest roko Linux verification after these corrections:
 - `git diff --check`: passed.
 
 The macOS host was not used for Cargo/rustc execution.
+
+## Review round 2 correction
+
+The post-binding editor failure path now retains a cleanup owner when the
+editor attempt has been terminalized successfully but the subsequent generic
+agent-run finalizer fails.  `resolve_bound_role_failure` remembers that the
+binding was an editor and preserves the original `BoundFinalizationIntent`;
+an unresolved result with no generic cleanup receives a
+`PendingFinalization` owner with no editor failure context because the attempt
+is already terminal.  Standard, Decision, and Diagnosis results are not
+changed.  A trigger-backed Linux regression test proves the attempt is
+`failed`, the agent run remains active while the trigger is installed, and the
+returned cleanup owner completes finalization after the trigger is removed
+without changing the original attempt failure fields.
+
+Fresh roko Linux evidence for this correction:
+
+- `cargo check --tests -j1`: passed (pre-existing `EntryMountPrecheck`
+  dead-code warning only).
+- `cargo test --test daemon code_change_editor -- --test-threads=1`: 11
+  passed, including the cleanup-owner regression.
+- `cargo test --test daemon code_change_editor_post_binding_finalization_failure_retains_cleanup_owner -- --exact --test-threads=1`:
+  1 passed.
+- `cargo test agent:: -- --test-threads=1`: 11 passed, 2 ignored.
+- `cargo test --test scheduler -- --test-threads=1`: 84 passed.
+- `git diff --check`: passed.
+
+No local Cargo/rustc execution was performed.

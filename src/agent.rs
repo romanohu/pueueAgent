@@ -2070,6 +2070,8 @@ fn resolve_bound_role_failure(
     editor_failure: Option<EditorLaunchFailure>,
     source: AppError,
 ) -> AgentSpawnError {
+    let editor_bound = editor_failure.is_some();
+    let intent = BoundFinalizationIntent::from_failure(&source, policy);
     if let Some(decision_failure) = decision_failure {
         if let Err(error) = decision_failure.persist(db, run_id, finished_at) {
             return pending_decision_finalization_error(
@@ -2115,14 +2117,37 @@ fn resolve_bound_role_failure(
             };
         }
     }
-    resolve_bound_failure(
+    let mut error = resolve_bound_failure(
         repository,
         project,
         run_id,
         finished_at,
         policy,
         source,
-    )
+    );
+    if editor_bound
+        && matches!(
+            error.stage,
+            AgentSpawnStage::RunBoundPreMarker {
+                resolved: false,
+                ..
+            } | AgentSpawnStage::PostMarker {
+                resolved: false,
+                ..
+            }
+        )
+        && error.cleanup.is_none()
+    {
+        error.cleanup = Some(BoundCleanupHandle {
+            project_id: project.project_id.clone(),
+            run_id,
+            intent,
+            kind: BoundCleanupKind::PendingFinalization,
+            decision_failure: None,
+            editor_failure: None,
+        });
+    }
+    error
 }
 
 fn native_spawn_finalization_intent(
