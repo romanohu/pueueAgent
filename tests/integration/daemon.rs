@@ -3994,6 +3994,12 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
     assert!(candidate.update_best_ref_cas(&authorization, None).await.is_err());
     candidate.cleanup(&authorization).await.unwrap();
     assert!(!candidate_path.exists());
+    assert_eq!(
+        String::from_utf8(run_git(&["rev-parse", &format!("refs/heads/{candidate_ref}")]).stdout)
+            .unwrap()
+            .trim(),
+        candidate_sha
+    );
     let leaked_indexes = fs::read_dir(fixture_root.join("execution-policy-state"))
         .unwrap()
         .filter_map(Result::ok)

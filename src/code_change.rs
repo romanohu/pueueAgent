@@ -1802,9 +1802,9 @@ impl WorktreeManager {
                     candidate.ok_or_else(recovery_required)?,
                 )?;
             }
-            if self.candidate_ref_exists().await?
-                || self.candidate_admin_registered_elsewhere()?
-            {
+            let candidate_ref = self.candidate_ref_sha().await?;
+            validate_retained_candidate_ref(candidate_ref.as_deref(), expected_candidate_sha)?;
+            if self.candidate_admin_registered_elsewhere()? {
                 return Err(recovery_required());
             }
             return if allow_missing_target {
@@ -1893,26 +1893,8 @@ impl WorktreeManager {
             if bounded_utf8_line(&actual.stdout, "candidate HEAD")? != expected_sha {
                 return Err(recovery_required());
             }
-            if let Some(candidate_sha) = expected_candidate_sha {
-                let reference = format!(
-                    "refs/heads/{}",
-                    candidate_ref(&self.campaign_id, &self.proposal_id)?
-                );
-                let candidate_ref_output = self
-                    .git(
-                        current,
-                        &VerifiedWorkingDirectory::root(current)?,
-                        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-                        MAX_GIT_OUTPUT_BYTES,
-                    )
-                    .await?;
-                require_success(&candidate_ref_output, "verify candidate ref before cleanup")?;
-                if bounded_utf8_line(&candidate_ref_output.stdout, "candidate ref before cleanup")?
-                    != candidate_sha
-                {
-                    return Err(recovery_required());
-                }
-            }
+            let candidate_ref = self.candidate_ref_sha().await?;
+            validate_retained_candidate_ref(candidate_ref.as_deref(), expected_candidate_sha)?;
         }
         if current.is_none() {
             // The durable parent entry proves that Git still registered a
@@ -1970,9 +1952,8 @@ impl WorktreeManager {
                 return Err(recovery_required());
             }
             verify_cleanup_leaf_absent(&reopened_parent, OsStr::new(&self.proposal_id))?;
-            if let Some(candidate_sha) = expected_candidate_sha {
-                self.remove_candidate_ref(candidate_sha).await?;
-            }
+            let candidate_ref = self.candidate_ref_sha().await?;
+            validate_retained_candidate_ref(candidate_ref.as_deref(), expected_candidate_sha)?;
             self.validate_original_state().await?;
             Ok(())
         }
@@ -1982,58 +1963,39 @@ impl WorktreeManager {
         }
     }
 
-    async fn remove_candidate_ref(&self, expected_sha: &str) -> Result<(), AppError> {
+    async fn candidate_ref_sha(&self) -> Result<Option<String>, AppError> {
         let reference = format!(
             "refs/heads/{}",
             candidate_ref(&self.campaign_id, &self.proposal_id)?
         );
         let original_root = self.original.root_anchor.verify_identity()?;
-        let output = self
+        let working_directory = VerifiedWorkingDirectory::root(&original_root)?;
+        let existing = self
             .git(
                 &original_root,
-                &VerifiedWorkingDirectory::root(&original_root)?,
-                &["update-ref", "-d", &reference, expected_sha],
-                MAX_GIT_OUTPUT_BYTES,
-            )
-            .await?;
-        if !output.success {
-            return Err(recovery_required());
-        }
-        let remaining = self
-            .git(
-                &original_root,
-                &VerifiedWorkingDirectory::root(&original_root)?,
+                &working_directory,
                 &["show-ref", "--verify", "--quiet", &reference],
                 MAX_GIT_OUTPUT_BYTES,
             )
             .await?;
-        if remaining.success || remaining.exit_code != Some(1) {
+        if !existing.success && existing.exit_code == Some(1) {
+            return Ok(None);
+        }
+        if !existing.success {
             return Err(recovery_required());
         }
-        Ok(())
-    }
-
-    async fn candidate_ref_exists(&self) -> Result<bool, AppError> {
-        let reference = format!(
-            "refs/heads/{}",
-            candidate_ref(&self.campaign_id, &self.proposal_id)?
-        );
-        let original_root = self.original.root_anchor.verify_identity()?;
         let output = self
             .git(
                 &original_root,
-                &VerifiedWorkingDirectory::root(&original_root)?,
-                &["show-ref", "--verify", "--quiet", &reference],
+                &working_directory,
+                &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
                 MAX_GIT_OUTPUT_BYTES,
             )
             .await?;
-        if output.success {
-            return Ok(true);
-        }
-        if output.exit_code == Some(1) {
-            return Ok(false);
-        }
-        Err(recovery_required())
+        require_success(&output, "read candidate ref")?;
+        let sha = bounded_utf8_line(&output.stdout, "candidate ref")?;
+        canonical_full_sha(sha)?;
+        Ok(Some(sha.to_owned()))
     }
 
     #[cfg(unix)]
@@ -3821,6 +3783,17 @@ fn recovery_required() -> AppError {
 
 fn validate_disappeared_cleanup_target(_allow_missing_target: bool) -> Result<(), AppError> {
     Err(recovery_required())
+}
+
+fn validate_retained_candidate_ref(
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), AppError> {
+    match (actual, expected) {
+        (None, None) => Ok(()),
+        (Some(actual), Some(expected)) if actual == expected => Ok(()),
+        _ => Err(recovery_required()),
+    }
 }
 
 fn validate_cleanup_state_for_mutation(
@@ -6571,6 +6544,26 @@ mod tests {
     #[test]
     fn cleanup_target_disappearance_after_observation_requires_recovery() {
         assert!(validate_disappeared_cleanup_target(true).is_err());
+    }
+
+    #[test]
+    fn cleanup_retained_candidate_ref_requires_exact_committed_sha() {
+        let candidate_sha = "a".repeat(40);
+        let wrong_sha = "b".repeat(40);
+        assert!(validate_retained_candidate_ref(
+            Some(&candidate_sha),
+            Some(&candidate_sha),
+        )
+        .is_ok());
+        assert!(validate_retained_candidate_ref(None, Some(&candidate_sha)).is_err());
+        assert!(validate_retained_candidate_ref(Some(&wrong_sha), Some(&candidate_sha)).is_err());
+    }
+
+    #[test]
+    fn cleanup_preparation_rollback_requires_absent_candidate_ref() {
+        let candidate_sha = "a".repeat(40);
+        assert!(validate_retained_candidate_ref(None, None).is_ok());
+        assert!(validate_retained_candidate_ref(Some(&candidate_sha), None).is_err());
     }
 
     #[cfg(unix)]
