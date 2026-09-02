@@ -28,15 +28,18 @@ before the GREEN rerun.
 Linux/roko focused results (single-threaded unless noted):
 
 - `cargo test --test daemon code_change_editor -- --test-threads=1`: 8 passed.
-- `cargo test --test daemon code_change_editor_is_preserved_from_generic_startup_recovery -- --exact --test-threads=1`: included in the daemon focus and passed.
+- `cargo test --test daemon code_change_editor_is_preserved_from_generic_startup_recovery -- --exact --test-threads=1`: 1 passed.
 - `cargo test --test codex_security code_change_editor -- --test-threads=1`: 3 passed.
 - `cargo test --test database code_change_editor -- --test-threads=1`: 3 passed.
 - `cargo test --test database code_change_finish_methods_require_terminal_statuses -- --exact --test-threads=1`: 1 passed.
 - `cargo test agent:: -- --test-threads=1`: 11 passed, 2 ignored.
 - `cargo test --test native_agent_gate -- --test-threads=1`: 11 passed.
 - `cargo test --test scheduler -- --test-threads=1`: 84 passed.
-- `cargo test --lib code_change -- --test-threads=1`: 28 passed.
-- `cargo test --test worktree -- --test-threads=1`: 1 passed.
+- `cargo test --lib code_change:: -- --test-threads=1`: 28 passed.
+- `cargo test --test daemon code_change_worktree -- --test-threads=1`: 1 passed.
+- `cargo test --test database -- --test-threads=1`: 239 passed.
+- `cargo check --tests -j1`: passed with the pre-existing
+  `EntryMountPrecheck` dead-code warning only.
 - `git diff --check`: passed.
 
 The process-level editor matrix covers fresh and exact same-session resume,
@@ -68,8 +71,5 @@ inverse contradictions are covered by the focused integration tests.
 - Additional `cfg(test)` directory-mode hardening only addresses the roko
   `umask 0002` fixture environment; production path policy is unchanged.
 
-## Remaining verification
-
-The controller will run the final full database regression and
-`cargo check --tests -j1` on roko after this commit. No local Cargo/rustc run
-is claimed because the macOS host has the known loader stall.
+No local Cargo/rustc run is claimed because the macOS host has the known
+loader stall.
