@@ -104,7 +104,7 @@ impl<'db> CodeChangeRepository<'db> {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10,
                            0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                           NULL, NULL, NULL, NULL, ?11, ?11)",
+                           NULL, NULL, NULL, ?11, ?11)",
                 params![
                     run.code_change_run_id,
                     run.proposal_id,
@@ -144,6 +144,54 @@ impl<'db> CodeChangeRepository<'db> {
             )
             .optional()
             .map_err(database_error("find code-change run by proposal"))
+    }
+
+    pub fn find_editor_attempt(
+        &self,
+        run_id: &str,
+        attempt: i64,
+    ) -> Result<Option<CodeChangeEditorAttempt>, AppError> {
+        validate_identifier("code_change_run_id", run_id)?;
+        if !(1..=2).contains(&attempt) {
+            return Err(AppError::Validation {
+                field: "code_change.attempt",
+                message: "must be one of the two bounded editor attempts",
+            });
+        }
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT code_change_run_id, attempt, agent_run_id, editor_session_id, status,
+                        result_digest, failure_code, failure_summary, started_at, finished_at
+                 FROM code_change_editor_attempts
+                 WHERE code_change_run_id = ?1 AND attempt = ?2",
+                params![run_id, attempt],
+                code_change_editor_attempt_from_row,
+            )
+            .optional()
+            .map_err(database_error("find code-change editor attempt"))
+    }
+
+    pub fn list_editor_attempts(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<CodeChangeEditorAttempt>, AppError> {
+        validate_identifier("code_change_run_id", run_id)?;
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT code_change_run_id, attempt, agent_run_id, editor_session_id, status,
+                        result_digest, failure_code, failure_summary, started_at, finished_at
+                 FROM code_change_editor_attempts
+                 WHERE code_change_run_id = ?1
+                 ORDER BY attempt",
+            )
+            .map_err(database_error("prepare code-change editor attempt list"))?;
+        let rows = statement
+            .query_map([run_id], code_change_editor_attempt_from_row)
+            .map_err(database_error("query code-change editor attempts"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read code-change editor attempts"))
     }
 
     pub fn list_recoverable(&self, limit: usize) -> Result<Vec<CodeChangeRun>, AppError> {
@@ -234,6 +282,26 @@ impl<'db> CodeChangeRepository<'db> {
                 message: "editor attempts require editing state",
             });
         }
+        let project_matches: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM campaigns AS c
+                     JOIN agent_runs AS a ON a.project_id = c.project_id
+                     WHERE c.campaign_id = ?1 AND a.run_id = ?2
+                       AND a.execution_kind = 'code_change_editor'
+                       AND a.status IN ('starting', 'running')
+                 )",
+                params![&run.campaign_id, agent_run_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("validate editor attempt project"))?;
+        if !project_matches {
+            return Err(AppError::Validation {
+                field: "code_change.agent_run_id",
+                message: "must identify an agent run in the code-change project",
+            });
+        }
         if attempt != run.editor_attempts + 1 {
             return Err(AppError::Validation {
                 field: "code_change.attempt",
@@ -282,6 +350,89 @@ impl<'db> CodeChangeRepository<'db> {
         Ok(stored)
     }
 
+    /// Replace the supervisor placeholder with the exact session identity
+    /// proven at editor terminal persistence.  The attempt/run pair is
+    /// updated transactionally and cannot be rebound after it is finished.
+    pub fn bind_editor_session(
+        &self,
+        run_id: &str,
+        attempt: i64,
+        editor_session_id: &str,
+        now: i64,
+    ) -> Result<CodeChangeEditorAttempt, AppError> {
+        validate_identifier("code_change_run_id", run_id)?;
+        validate_identifier("editor_session_id", editor_session_id)?;
+        if !(1..=2).contains(&attempt) {
+            return Err(AppError::Validation {
+                field: "code_change.attempt",
+                message: "must be one of the two bounded editor attempts",
+            });
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin editor session binding"))?;
+        let run = read_run(&transaction, run_id)?;
+        let current = read_editor_attempt(&transaction, run_id, attempt)?;
+        if current.editor_session_id == editor_session_id
+            && run.editor_session_id.as_deref() == Some(editor_session_id)
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit idempotent editor session binding"))?;
+            return Ok(current);
+        }
+        if !matches!(current.status.as_str(), "reserved" | "running") {
+            return Err(AppError::Validation {
+                field: "code_change.editor_session_id",
+                message: "finished editor attempts cannot be rebound",
+            });
+        }
+        if run.editor_session_id.as_deref() != Some(current.editor_session_id.as_str()) {
+            return Err(AppError::Validation {
+                field: "code_change.editor_session_id",
+                message: "editor attempt session disagrees with its run",
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE code_change_editor_attempts
+                 SET editor_session_id = ?1
+                 WHERE code_change_run_id = ?2 AND attempt = ?3
+                   AND editor_session_id = ?4
+                   AND status IN ('reserved', 'running')",
+                params![editor_session_id, run_id, attempt, current.editor_session_id],
+            )
+            .map_err(database_error("bind editor session on attempt"))?;
+        if changed != 1 {
+            return Err(AppError::Validation {
+                field: "code_change.editor_session_id",
+                message: "editor session changed concurrently",
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE code_change_runs
+                 SET editor_session_id = ?1, updated_at = ?2
+                 WHERE code_change_run_id = ?3 AND editor_session_id = ?4",
+                params![editor_session_id, now, run_id, current.editor_session_id],
+            )
+            .map_err(database_error("bind editor session on run"))?;
+        if changed != 1 {
+            return Err(AppError::Validation {
+                field: "code_change.editor_session_id",
+                message: "editor session changed concurrently",
+            });
+        }
+        let stored = read_editor_attempt(&transaction, run_id, attempt)?;
+        let run = read_run(&transaction, run_id)?;
+        insert_lifecycle_event(&transaction, &run, attempt, None, now)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit editor session binding"))?;
+        Ok(stored)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn finish_editor_attempt(
         &self,
@@ -293,6 +444,37 @@ impl<'db> CodeChangeRepository<'db> {
         failure_summary: Option<&str>,
         started_at: Option<i64>,
         finished_at: i64,
+        now: i64,
+    ) -> Result<CodeChangeEditorAttempt, AppError> {
+        self.finish_editor_attempt_with_checks(
+            run_id,
+            attempt,
+            status,
+            result_digest,
+            failure_code,
+            failure_summary,
+            started_at,
+            finished_at,
+            &[],
+            now,
+        )
+    }
+
+    /// Finish an editor attempt and persist its validated check proposals in
+    /// one transaction.  Proposed checks remain reserved until the checking
+    /// stage independently selects and executes them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_editor_attempt_with_checks(
+        &self,
+        run_id: &str,
+        attempt: i64,
+        status: &str,
+        result_digest: Option<&str>,
+        failure_code: Option<&str>,
+        failure_summary: Option<&str>,
+        started_at: Option<i64>,
+        finished_at: i64,
+        checks: &[NewCodeChangeCheck],
         now: i64,
     ) -> Result<CodeChangeEditorAttempt, AppError> {
         validate_attempt_status(status)?;
@@ -307,17 +489,34 @@ impl<'db> CodeChangeRepository<'db> {
             failure_summary,
             MAX_CODE_CHANGE_SUMMARY_BYTES,
         )?;
+        if checks.len() > MAX_CODE_CHANGE_CHECKS {
+            return Err(AppError::Validation {
+                field: "code_change_check",
+                message: "exceeds the bounded check count",
+            });
+        }
+        for check in checks {
+            validate_check(check, attempt)?;
+            if check.source != "editor" || check.status != CodeChangeCheckStatus::Reserved {
+                return Err(AppError::Validation {
+                    field: "code_change_check.source",
+                    message: "editor proposals must be reserved checks with editor source",
+                });
+            }
+        }
         let persisted_failure_summary = failure_summary.map(bounded_redacted_text);
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin editor attempt completion"))?;
         let current = read_editor_attempt(&transaction, run_id, attempt)?;
+        let existing_checks = list_checks(&transaction, run_id, attempt)?;
         if current.status == status
             && current.result_digest.as_deref() == result_digest
             && current.failure_code.as_deref() == failure_code
             && current.failure_summary.as_deref() == persisted_failure_summary.as_deref()
             && current.finished_at == Some(finished_at)
+            && editor_checks_match(&existing_checks, checks)
         {
             transaction.commit().map_err(database_error(
                 "commit idempotent editor attempt completion",
@@ -356,6 +555,44 @@ impl<'db> CodeChangeRepository<'db> {
                 field: "code_change_editor_attempt.status",
                 message: "attempt is already finished or changed concurrently",
             });
+        }
+        if !existing_checks.is_empty() {
+            return Err(AppError::Validation {
+                field: "code_change_check",
+                message: "editor attempt already has different proposed checks",
+            });
+        }
+        for check in checks {
+            let argv_json = serde_json::to_string(&check.argv).map_err(|source| {
+                AppError::Serialization {
+                    operation: "serialize editor-proposed check argv",
+                    source,
+                }
+            })?;
+            if argv_json.len() > MAX_CODE_CHANGE_ARGV_JSON_BYTES {
+                return Err(AppError::Validation {
+                    field: "code_change_check.argv",
+                    message: "serialized argv exceeds the bounded size",
+                });
+            }
+            transaction
+                .execute(
+                    "INSERT INTO code_change_checks (
+                        code_change_run_id, attempt, ordinal, source, argv_json,
+                        working_directory, status, output_digest, summary,
+                        started_at, finished_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL)",
+                    params![
+                        run_id,
+                        check.attempt,
+                        check.ordinal,
+                        check.source,
+                        argv_json,
+                        check.working_directory,
+                        check.status,
+                    ],
+                )
+                .map_err(database_error("insert editor-proposed check"))?;
         }
         transaction
             .execute(
@@ -1232,6 +1469,25 @@ fn list_checks(
         .map_err(database_error("query code-change check list"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(database_error("read code-change check list"))
+}
+
+fn editor_checks_match(
+    existing: &[CodeChangeCheck],
+    expected: &[NewCodeChangeCheck],
+) -> bool {
+    existing.len() == expected.len()
+        && existing.iter().zip(expected).all(|(existing, expected)| {
+            existing.attempt == expected.attempt
+                && existing.ordinal == expected.ordinal
+                && existing.source == expected.source
+                && existing.argv == expected.argv
+                && existing.working_directory == expected.working_directory
+                && existing.status == expected.status
+                && existing.output_digest == expected.output_digest
+                && existing.summary == expected.summary
+                && existing.started_at == expected.started_at
+                && existing.finished_at == expected.finished_at
+        })
 }
 
 fn insert_lifecycle_event(

@@ -413,6 +413,53 @@ impl SanitizedEnvironment {
         Ok(environment)
     }
 
+    /// Environment for a code-change editor.  The editor receives only
+    /// supervisor-generated protocol values in addition to the normal
+    /// built-in/custom baseline; descriptor-relative paths prevent a custom
+    /// editor from selecting an arbitrary output file.
+    pub fn for_code_change_editor(
+        startup: &StartupEnvironment,
+        policy: &ResolvedProjectExecutionPolicy,
+        run_id: i64,
+        session_id: &str,
+        resume: bool,
+    ) -> Result<Self, PolicyViolation> {
+        let mut environment = match policy.agent_kind {
+            crate::execution_policy::AgentKind::BuiltInCodex => {
+                Self::for_codex_agent(startup, policy, run_id)?
+            }
+            crate::execution_policy::AgentKind::Custom => {
+                Self::for_custom_agent(startup, policy, run_id)?
+            }
+        };
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || session_id.chars().any(char::is_control)
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::EnvironmentName,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        environment.insert_generated(
+            "PUEUE_AGENT_EDITOR_MODE",
+            OsStr::new(if resume { "resume" } else { "fresh" }),
+        );
+        environment.insert_generated(
+            "PUEUE_AGENT_EDITOR_SESSION_ID",
+            OsString::from(session_id),
+        );
+        environment.insert_generated(
+            "PUEUE_AGENT_EDITOR_SCHEMA",
+            private_temp_target_path().join("editor-schema.json").into_os_string(),
+        );
+        environment.insert_generated(
+            "PUEUE_AGENT_EDITOR_OUTPUT",
+            private_temp_target_path().join("editor.json").into_os_string(),
+        );
+        Ok(environment)
+    }
+
     pub fn for_pueue(policy: &ResolvedExecutionPolicy) -> Result<Self, PolicyViolation> {
         let environment = Self::default_baseline(
             &policy.startup_environment,
@@ -1024,6 +1071,10 @@ impl PrivateRunTemp {
         )
     }
 
+    pub(crate) fn prepare_editor_schema(&self, schema: &[u8]) -> Result<(), PolicyViolation> {
+        self.prepare_named_output("editor-schema.json", "editor.json", schema)
+    }
+
     fn prepare_named_output(
         &self,
         schema_name: &str,
@@ -1066,6 +1117,10 @@ impl PrivateRunTemp {
 
     pub(crate) fn read_health_diagnosis_output(&self) -> Result<Vec<u8>, PolicyViolation> {
         self.read_named_output("health-diagnosis.json")
+    }
+
+    pub(crate) fn read_editor_output(&self) -> Result<Vec<u8>, PolicyViolation> {
+        self.read_named_output("editor.json")
     }
 
     fn read_named_output(&self, output_name: &str) -> Result<Vec<u8>, PolicyViolation> {

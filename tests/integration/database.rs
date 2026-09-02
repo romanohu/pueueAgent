@@ -14723,16 +14723,36 @@ fn editor_agent_run_for_test(harness: &CampaignDbHarness, ordinal: i64, now: i64
                 CampaignDbHarness::PROJECT_ID,
                 event.event_id,
                 None,
-                AgentRunStatus::Failed,
+                AgentRunStatus::Starting,
                 now,
                 harness
                     .test
                     .project_root(&format!("code-change-editor-{ordinal}.log")),
+            )
+            .with_execution(
+                ExecutionProjection::new(
+                    "code_change_editor",
+                    "/trusted/bin/code-change-editor",
+                    "device=1;inode=2;owner=3;mode=448",
+                )
+                .unwrap(),
             ),
             &[event.event_id],
         )
         .unwrap()
         .run_id
+}
+
+fn finish_editor_agent_run_for_test(harness: &CampaignDbHarness, run_id: i64, now: i64) {
+    AgentRunRepository::new(&harness.test.db)
+        .fail_before_gate_release_with_policy(
+            CampaignDbHarness::PROJECT_ID,
+            run_id,
+            now,
+            "fixture editor run finalized",
+            RetryPolicy { max_retries: 0 },
+        )
+        .unwrap();
 }
 
 #[test]
@@ -14780,12 +14800,11 @@ fn code_change_editor_attempts_require_one_session_and_preserve_failed_reservati
         )
         .unwrap();
 
-    let second_agent_run_id = editor_agent_run_for_test(&harness, 2, 125);
     let error = repository
         .reserve_editor_attempt(
             &run.code_change_run_id,
             2,
-            second_agent_run_id,
+            first_agent_run_id,
             "session-b",
             126,
         )
@@ -14813,13 +14832,15 @@ fn code_change_editor_attempts_require_one_session_and_preserve_failed_reservati
         .unwrap();
     assert_eq!(unchanged, (1, Some("session-a".to_owned()), 1));
 
+    finish_editor_agent_run_for_test(&harness, first_agent_run_id, 127);
+    let second_agent_run_id = editor_agent_run_for_test(&harness, 2, 128);
     let second = repository
         .reserve_editor_attempt(
             &run.code_change_run_id,
             2,
             second_agent_run_id,
             "session-a",
-            127,
+            129,
         )
         .unwrap();
     assert_eq!(second.editor_session_id, "session-a");
@@ -14963,13 +14984,15 @@ fn code_change_finish_methods_require_terminal_statuses() {
             126,
         )
         .unwrap();
+    finish_editor_agent_run_for_test(&harness, first_agent_run_id, 127);
+    let second_agent_run_id = editor_agent_run_for_test(&harness, 2, 128);
     repository
         .reserve_editor_attempt(
             &run.code_change_run_id,
             2,
-            editor_agent_run_for_test(&harness, 2, 127),
+            second_agent_run_id,
             "session-a",
-            127,
+            129,
         )
         .unwrap();
     repository
@@ -15045,6 +15068,159 @@ fn code_change_finish_methods_require_terminal_statuses() {
             )
             .unwrap();
     }
+}
+
+#[test]
+fn code_change_editor_ready_checks_are_durable_and_idempotent_after_restart() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-editor-ready", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(&run.code_change_run_id, 1, agent_run_id, "session-ready", 124)
+        .unwrap();
+    let checks = [NewCodeChangeCheck::new(
+        1,
+        0,
+        "editor",
+        vec!["cargo".to_owned(), "test".to_owned()],
+        ".",
+    )];
+    let first = repository
+        .finish_editor_attempt_with_checks(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("ready-digest"),
+            None,
+            Some("candidate is ready"),
+            Some(124),
+            125,
+            &checks,
+            125,
+        )
+        .unwrap();
+    let replay = CodeChangeRepository::new(&harness.test.db)
+        .finish_editor_attempt_with_checks(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("ready-digest"),
+            None,
+            Some("candidate is ready"),
+            Some(124),
+            125,
+            &checks,
+            126,
+        )
+        .unwrap();
+    assert_eq!(first, replay);
+    let check_count: i64 = harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM code_change_checks
+             WHERE code_change_run_id = ?1 AND attempt = 1",
+            [&run.code_change_run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(check_count, 1);
+    assert_eq!(
+        CodeChangeRepository::new(&harness.test.db)
+            .list_editor_attempts(&run.code_change_run_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn code_change_editor_timeout_and_second_failure_keep_attempts_across_restart() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-editor-timeout", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let first_agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            first_agent_run_id,
+            "session-timeout",
+            124,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            "failed",
+            None,
+            Some("editor_timeout"),
+            Some("editor timed out"),
+            Some(124),
+            125,
+            125,
+        )
+        .unwrap();
+    finish_editor_agent_run_for_test(&harness, first_agent_run_id, 126);
+    let second_agent_run_id = editor_agent_run_for_test(&harness, 2, 127);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            second_agent_run_id,
+            "session-timeout",
+            128,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            "failed",
+            None,
+            Some("editor_exit"),
+            Some("editor exited unsuccessfully"),
+            Some(128),
+            129,
+            129,
+        )
+        .unwrap();
+    let attempts = CodeChangeRepository::new(&harness.test.db)
+        .list_editor_attempts(&run.code_change_run_id)
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].failure_code.as_deref(), Some("editor_timeout"));
+    assert_eq!(attempts[1].failure_code.as_deref(), Some("editor_exit"));
+    assert_eq!(attempts[0].editor_session_id, attempts[1].editor_session_id);
+    let error = CodeChangeRepository::new(&harness.test.db)
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            3,
+            second_agent_run_id,
+            "session-timeout",
+            130,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change.attempt",
+            ..
+        }
+    ));
+    assert_eq!(
+        CodeChangeRepository::new(&harness.test.db)
+            .list_editor_attempts(&run.code_change_run_id)
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]

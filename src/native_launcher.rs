@@ -432,6 +432,9 @@ fn test_native_child(
     };
 
     let temporary = tempfile::tempdir().expect("temporary native-child root");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("secure native-child root");
     let root = std::fs::canonicalize(temporary.path()).expect("canonical native-child root");
     let anchor = ProjectRootAnchor::resolve(&root).expect("native-child root anchor");
     let reader = ProjectRootLogReader::from_verified(
@@ -443,7 +446,15 @@ fn test_native_child(
     let (agent_log, gate_directory) =
         open_agent_log_gate(&reader, &log_path, &marker_path).expect("native-child gate");
     let log_identity = *agent_log.identity();
-    let executable_path = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let source_executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let executable_path = temporary.path().join("native-child-executable");
+    std::fs::copy(&source_executable, &executable_path)
+        .expect("copy native-child executable fixture");
+    std::fs::set_permissions(
+        &executable_path,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("secure native-child executable");
     let executable_anchor = ExecutableAnchor::from_absolute(&executable_path, &[])
         .expect("native-child executable anchor");
     let verified = crate::process::test_running_verified_child(test_name)

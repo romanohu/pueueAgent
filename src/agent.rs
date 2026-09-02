@@ -7,13 +7,18 @@ use std::{
 };
 
 use tokio::time::Instant;
+use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
 use crate::{
     codex_command::{
         probe_installed_codex_capabilities, CodexArgvBuilder, CodexCapabilities,
     },
     config::{AgentConfig, ProjectConfig},
-    db::{AgentRunRepository, DecisionRepository, DecisionReservation, GateFailurePolicy},
+    db::{
+        AgentRunRepository, CampaignRepository, CodeChangeRepository, DecisionRepository,
+        DecisionReservation, GateFailurePolicy, NewCodeChangeCheck,
+    },
     decision_evidence::DecisionContextBundle,
     decision_protocol::{parse_and_validate_decision, ValidatedDecision},
     environment::{
@@ -21,9 +26,9 @@ use crate::{
         TempInventoryReport, VerifiedPrivateTemp,
     },
     execution_policy::{
-        resolve_decision_project_policy, resolve_project_policy, AgentKind, PolicyViolation,
-        CampaignLimits, PolicyViolationCode, PolicyViolationStage, ResolvedExecutionPolicy,
-        ResolvedProjectExecutionPolicy,
+        resolve_decision_project_policy, resolve_project_policy, AgentKind, CodeChangeTool,
+        PolicyViolation, CampaignLimits, PolicyViolationCode, PolicyViolationStage,
+        ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
     },
     interventions::InterventionReservation,
     health_diagnosis::{parse_and_validate_diagnosis, HEALTH_DIAGNOSIS_SCHEMA},
@@ -70,6 +75,19 @@ const DECISION_OUTPUT_SCHEMA: &[u8] = br#"{
       "items": {"type": "string"}
     },
     "evidence_ref": {"type": ["string", "null"], "maxLength": 512}
+  }
+}"#;
+
+const EDITOR_OUTPUT_SCHEMA: &[u8] = br#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "summary", "proposed_checks"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["ready", "cannot_apply"]},
+    "summary": {"type": "string", "maxLength": 65536},
+    "proposed_checks": {"type": "array"}
   }
 }"#;
 
@@ -167,6 +185,7 @@ pub struct AgentHandle {
     role: AgentRunRole,
     decision_persistence: Option<DecisionPersistence>,
     diagnosis_persistence: Option<DiagnosisPersistence>,
+    editor_persistence: Option<EditorPersistence>,
 }
 
 enum RetainedLaunchAuthority {
@@ -458,6 +477,15 @@ enum DecisionPersistence {
 
 enum DiagnosisPersistence {
     Pending,
+    Persisted,
+}
+
+enum EditorPersistence {
+    Pending {
+        code_change_run_id: String,
+        attempt: i64,
+        session_id: String,
+    },
     Persisted,
 }
 
@@ -928,6 +956,100 @@ impl AgentRunner {
         .await
     }
 
+    /// Launch an editor against a candidate worktree whose policy was
+    /// produced by `ResolvedExecutionPolicy::for_code_change_worktree`.
+    /// Attempt/session binding is completed by `spawn_with_role` before any
+    /// native launch gate is released.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_code_change_editor(
+        &self,
+        db: &crate::db::Db,
+        project: &Project,
+        candidate_policy: &ResolvedProjectExecutionPolicy,
+        config: &AgentConfig,
+        retry_policy: RetryPolicy,
+        primary_event_id: i64,
+        event_ids: &[i64],
+        code_change_run_id: &str,
+        attempt: i64,
+        prompt: &str,
+        now: i64,
+        run_id_guard: RunIdAdmissionGuard,
+        project_lock: ProjectAdmissionLock,
+    ) -> Result<AgentHandle, AgentSpawnError> {
+        let code_change = CodeChangeRepository::new(db)
+            .find_by_id(code_change_run_id)
+            .map_err(pre_binding_error)?
+            .ok_or_else(|| {
+                pre_binding_error(AppError::Validation {
+                    field: "code_change_run_id",
+                    message: "must identify an existing code-change run",
+                })
+            })?;
+        let campaign = CampaignRepository::new(db)
+            .find_by_id(&code_change.campaign_id)
+            .map_err(pre_binding_error)?
+            .ok_or_else(|| {
+                pre_binding_error(AppError::Validation {
+                    field: "code_change.campaign_id",
+                    message: "must identify an existing code-change campaign",
+                })
+            })?;
+        let expected_root = self
+            .policy
+            .code_change_state_root_path()
+            .join("worktrees")
+            .join(&code_change.campaign_id)
+            .join(&code_change.proposal_id);
+        if campaign.project_id != project.project_id
+            || candidate_policy.project_id != project.project_id
+            || code_change.state != crate::models::CodeChangeState::Editing
+            || candidate_policy.root_anchor.canonical_path != expected_root
+        {
+            return Err(pre_binding_error(AppError::from(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ))));
+        }
+        candidate_policy
+            .root_anchor
+            .verify_identity()
+            .map_err(|mut violation| {
+                violation.stage = PolicyViolationStage::PreBinding;
+                pre_binding_error(violation.into())
+            })?;
+        let editor_capabilities = match candidate_policy.agent_kind {
+            AgentKind::BuiltInCodex => Some(
+                probe_installed_codex_capabilities(&candidate_policy.agent_anchor)
+                    .await
+                    .map_err(|error| pre_binding_error(error.into()))?,
+            ),
+            AgentKind::Custom => None,
+        };
+        self.spawn_with_role(
+            db,
+            project,
+            candidate_policy,
+            config,
+            retry_policy,
+            primary_event_id,
+            event_ids,
+            None,
+            None,
+            AgentRunRole::CodeChangeEditor {
+                code_change_run_id: code_change_run_id.to_owned(),
+                attempt,
+            },
+            None,
+            editor_capabilities,
+            prompt,
+            now,
+            run_id_guard,
+            project_lock,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn spawn_with_role(
         &self,
@@ -958,6 +1080,21 @@ impl AgentRunner {
                 )
                     .preflight_decision(config, prompt)
             }
+            AgentRunRole::CodeChangeEditor { .. } => match project_policy.agent_kind {
+                AgentKind::BuiltInCodex => CodexArgvBuilder::new(
+                    project_policy.clone(),
+                    decision_capabilities.unwrap_or(self.config.codex_capabilities),
+                )
+                .preflight_editor(config, prompt),
+                AgentKind::Custom
+                    if !prompt.contains('\0')
+                        && config.args.iter().all(|argument| !argument.contains('\0'))
+                        && !matches!(config.context, AgentContextMode::ResumeLatest) => Ok(()),
+                AgentKind::Custom => Err(PolicyViolation::new(
+                    crate::execution_policy::PolicyViolationCode::UnsafeCodexArgument,
+                    PolicyViolationStage::PreBinding,
+                )),
+            },
         }
         .map_err(|error| pre_binding_error(error.into()))?;
         let relative_log_path = relative_log_path(primary_event_id, now);
@@ -974,15 +1111,78 @@ impl AgentRunner {
                 execution.executable_identity(),
             )
             .map_err(pre_binding_error)?,
+            AgentRunRole::CodeChangeEditor { .. } => ExecutionProjection::new(
+                "code_change_editor",
+                execution.executable_path(),
+                execution.executable_identity(),
+            )
+            .map_err(pre_binding_error)?,
             _ => execution,
+        };
+        let editor_session = match &role {
+            AgentRunRole::CodeChangeEditor {
+                code_change_run_id,
+                attempt,
+            } => {
+                let code_change = CodeChangeRepository::new(db)
+                    .find_by_id(code_change_run_id)
+                    .map_err(pre_binding_error)?
+                    .ok_or_else(|| {
+                        pre_binding_error(AppError::Validation {
+                            field: "code_change_run_id",
+                            message: "must identify an existing code-change run",
+                        })
+                    })?;
+                if !(1..=2).contains(attempt) {
+                    return Err(pre_binding_error(AppError::Validation {
+                        field: "code_change.attempt",
+                        message: "must be one of the two bounded editor attempts",
+                    }));
+                }
+                if *attempt == 1 && code_change.editor_attempts == 0 {
+                    Some(
+                        code_change
+                            .editor_session_id
+                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    )
+                } else if *attempt == code_change.editor_attempts + 1 {
+                    Some(code_change.editor_session_id.ok_or_else(|| {
+                        pre_binding_error(AppError::Validation {
+                            field: "code_change.editor_session_id",
+                            message: "resume attempt requires a persisted editor session",
+                        })
+                    })?)
+                } else {
+                    return Err(pre_binding_error(AppError::Validation {
+                        field: "code_change.attempt",
+                        message: "must launch only the next bounded editor attempt",
+                    }));
+                }
+            }
+            _ => None,
         };
         let repository = AgentRunRepository::new(db);
         let run_context = match &role {
-            AgentRunRole::Standard => config.context.clone(),
+            AgentRunRole::Standard | AgentRunRole::CodeChangeEditor { .. } => config.context.clone(),
             AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
                 AgentContextMode::Fresh
             }
         };
+        if let AgentRunRole::CodeChangeEditor { attempt, .. } = &role {
+            let context_matches_attempt = match (*attempt, &run_context, editor_session.as_deref()) {
+                (1, AgentContextMode::Fresh, Some(_)) => true,
+                (2, AgentContextMode::Resume { session_id }, Some(expected)) => {
+                    session_id == expected
+                }
+                _ => false,
+            };
+            if !context_matches_attempt {
+                return Err(pre_binding_error(AppError::Validation {
+                    field: "code_change.editor_context",
+                    message: "editor attempt context must be fresh for attempt one or the exact persisted session for attempt two",
+                }));
+            }
+        }
         let run = repository
             .insert_with_events_and_reservation_with_guard(
                 &NewAgentRun::with_context(
@@ -1002,6 +1202,28 @@ impl AgentRunner {
                 &run_id_guard,
             )
             .map_err(pre_binding_error)?;
+        if let (AgentRunRole::CodeChangeEditor { code_change_run_id, attempt }, Some(session_id)) =
+            (&role, editor_session.as_deref())
+        {
+            if let Err(error) = CodeChangeRepository::new(db).reserve_editor_attempt(
+                code_change_run_id,
+                *attempt,
+                run.run_id,
+                session_id,
+                now,
+            ) {
+                return Err(resolve_bound_role_failure(
+                    db,
+                    None,
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    error,
+                ));
+            }
+        }
         if let Some(decision_reservation) = decision_reservation {
             if let Err(error) =
                 DecisionRepository::new(db).bind_agent_run(decision_reservation, run.run_id, now)
@@ -1090,6 +1312,26 @@ impl AgentRunner {
                 ));
             }
         }
+        if matches!(&role, AgentRunRole::CodeChangeEditor { .. }) {
+            if let Err(error) = temp.prepare_editor_schema(EDITOR_OUTPUT_SCHEMA) {
+                let error = AppError::from(error);
+                return Err(resolve_retained_temp_failure(
+                    db,
+                    project,
+                    run.run_id,
+                    now,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    error,
+                ));
+            }
+        }
         let private_temp_target = match temp.verified_target() {
             Ok(target) => target,
             Err(error) => {
@@ -1131,6 +1373,53 @@ impl AgentRunner {
                 &private_temp_target,
                 decision_capabilities.expect("decision launch capabilities were resolved"),
             ),
+            AgentRunRole::CodeChangeEditor { .. } => {
+                match project_policy.agent_kind {
+                    AgentKind::BuiltInCodex => CodexArgvBuilder::new(
+                        project_policy.clone(),
+                        decision_capabilities.unwrap_or(self.config.codex_capabilities),
+                    )
+                    .build_editor_with_private_temp(config, prompt, &private_temp_target)
+                    .map_err(AppError::from)
+                    .and_then(|arguments| {
+                        let program = project_policy
+                            .agent_anchor
+                            .canonical_path
+                            .to_string_lossy()
+                            .into_owned();
+                        let args = arguments
+                            .into_iter()
+                            .map(|argument| {
+                                argument.into_string().map_err(|_| {
+                                    AppError::Configuration {
+                                        field: "agent.args",
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(AgentCommand { program, args })
+                    }),
+                    AgentKind::Custom => {
+                        let program = project_policy
+                            .agent_anchor
+                            .canonical_path
+                            .to_str()
+                            .ok_or(AppError::Configuration {
+                                field: "agent.program",
+                            })
+                            .map_err(pre_binding_error)?
+                            .to_owned();
+                        Ok(AgentCommand {
+                            program,
+                            args: config
+                                .args
+                                .iter()
+                                .map(|argument| argument.replace("{prompt}", prompt))
+                                .collect(),
+                        })
+                    }
+                }
+            }
         } {
             Ok(command) => command,
             Err(error) => {
@@ -1155,6 +1444,21 @@ impl AgentRunner {
             AgentRunRole::Standard => self.environment_for(project_policy, run.run_id),
             AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
                 self.decision_environment_for(project_policy, run.run_id)
+            }
+            AgentRunRole::CodeChangeEditor { .. } => {
+                let session_id = editor_session.as_deref().ok_or(PolicyViolation::new(
+                    PolicyViolationCode::SessionMissing,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+                session_id.and_then(|session_id| {
+                    SanitizedEnvironment::for_code_change_editor(
+                        &self.policy.startup_environment,
+                        project_policy,
+                        run.run_id,
+                        session_id,
+                        matches!(&run_context, AgentContextMode::Resume { .. }),
+                    )
+                })
             }
         } {
             Ok(environment) => environment,
@@ -1363,6 +1667,20 @@ impl AgentRunner {
             }),
             diagnosis_persistence: match &role {
                 AgentRunRole::Diagnosis { .. } => Some(DiagnosisPersistence::Pending),
+                _ => None,
+            },
+            editor_persistence: match (&role, editor_session) {
+                (
+                    AgentRunRole::CodeChangeEditor {
+                        code_change_run_id,
+                        attempt,
+                    },
+                    Some(session_id),
+                ) => Some(EditorPersistence::Pending {
+                    code_change_run_id: code_change_run_id.clone(),
+                    attempt: *attempt,
+                    session_id,
+                }),
                 _ => None,
             },
             role,
@@ -2033,7 +2351,9 @@ impl AgentHandle {
                 cycle_id,
                 attempt_number,
             } => (cycle_id.clone(), *attempt_number),
-            AgentRunRole::Diagnosis { .. } => return Ok(()),
+            AgentRunRole::Diagnosis { .. } | AgentRunRole::CodeChangeEditor { .. } => {
+                return Ok(())
+            }
         };
         if matches!(self.decision_persistence, Some(DecisionPersistence::Persisted)) {
             return Ok(());
@@ -2171,6 +2491,196 @@ impl AgentHandle {
         Ok(())
     }
 
+    /// Validate and durably persist the bounded editor result before the
+    /// private descriptor is cleaned up.  Only the result digest and bounded
+    /// summary cross the persistence boundary; raw JSON and credentials stay
+    /// in the private run directory until cleanup.
+    fn persist_editor_outcome(
+        &mut self,
+        db: &crate::db::Db,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let (code_change_run_id, attempt, reserved_session) =
+            match self.editor_persistence.as_ref() {
+                Some(EditorPersistence::Pending {
+                    code_change_run_id,
+                    attempt,
+                    session_id,
+                }) => (code_change_run_id.clone(), *attempt, session_id.clone()),
+                Some(EditorPersistence::Persisted) | None => return Ok(()),
+            };
+        let limits = match &self.retained_authority {
+            RetainedLaunchAuthority::Retained { global_policy, .. } => {
+                global_policy.campaign_limits
+            }
+            RetainedLaunchAuthority::Released => {
+                return Err(AppError::Runtime {
+                    operation: "persist editor after releasing private temp",
+                })
+            }
+            #[cfg(test)]
+            RetainedLaunchAuthority::Test => {
+                return Err(AppError::Runtime {
+                    operation: "test editor handle has no private temp",
+                })
+            }
+        };
+        let (project_policy, global_policy) = match &self.retained_authority {
+            RetainedLaunchAuthority::Retained {
+                global_policy,
+                project_policy,
+                ..
+            } => (project_policy, global_policy),
+            _ => unreachable!("editor persistence authority checked above"),
+        };
+
+        let process_completed = self
+            .terminal_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.status == AgentRunStatus::Completed);
+        let mut status = "failed";
+        let mut digest = None;
+        let mut failure_code = None;
+        let mut failure_summary;
+        let mut proposed_checks = Vec::new();
+        let mut resolved_session = reserved_session.clone();
+        if process_completed {
+            let bytes = match &self.retained_authority {
+                RetainedLaunchAuthority::Retained { temp, .. } => temp.read_editor_output(),
+                _ => unreachable!("editor persistence authority checked above"),
+            };
+            let tools = [
+                CodeChangeTool::Git,
+                CodeChangeTool::Cargo,
+                CodeChangeTool::Uv,
+                CodeChangeTool::Python,
+            ]
+            .into_iter()
+            .filter(|tool| global_policy.code_change_tool(*tool).is_some())
+            .collect::<BTreeSet<_>>();
+            let parsed = bytes.ok().and_then(|bytes| {
+                crate::code_change::parse_editor_output(
+                    &bytes,
+                    &project_policy.root_anchor.canonical_path,
+                    &limits,
+                    &tools,
+                )
+                .ok()
+                .map(|output| (bytes, output))
+            });
+            match parsed {
+                Some((bytes, output)) if output.status == "ready" => {
+                    status = "ready";
+                    digest = Some(format!("{:x}", Sha256::digest(&bytes)));
+                    failure_summary = Some(bounded_redacted_text(&output.summary));
+                    proposed_checks = output
+                        .proposed_checks
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, check)| {
+                            NewCodeChangeCheck::new(
+                                attempt,
+                                ordinal as i64,
+                                "editor",
+                                check.argv.clone(),
+                                check.working_directory.clone(),
+                            )
+                        })
+                        .collect();
+                }
+                Some((bytes, output)) => {
+                    digest = Some(format!("{:x}", Sha256::digest(&bytes)));
+                    failure_code = Some("cannot_apply");
+                    failure_summary = Some(bounded_redacted_text(&output.summary));
+                    proposed_checks = output
+                        .proposed_checks
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, check)| {
+                            NewCodeChangeCheck::new(
+                                attempt,
+                                ordinal as i64,
+                                "editor",
+                                check.argv.clone(),
+                                check.working_directory.clone(),
+                            )
+                        })
+                        .collect();
+                }
+                None => {
+                    failure_code = Some("editor_output_invalid");
+                    failure_summary =
+                        Some("editor output was missing or failed secure validation".to_owned());
+                }
+            }
+        } else {
+            let outcome = self
+                .terminal_outcome
+                .as_ref()
+                .expect("terminal outcome checked before editor persistence");
+            failure_code = Some(if outcome.status == AgentRunStatus::TimedOut {
+                "editor_timeout"
+            } else {
+                "editor_exit"
+            });
+            failure_summary = outcome.last_error.clone();
+        }
+
+        // A built-in Codex attempt starts with a supervisor placeholder.  It
+        // may only become a resumable lineage after the terminal pass proves
+        // the newest session is owned by this candidate root.  Without that
+        // proof, a failed first attempt must be rejected rather than retried
+        // as an unowned fresh or guessed session.
+        if attempt == 1 && project_policy.agent_kind == AgentKind::BuiltInCodex {
+            match crate::codex_session::resolve_latest_owned_session(
+                &global_policy.codex_home,
+                &project_policy.root_anchor.canonical_path,
+            ) {
+                Ok(session) => resolved_session = session,
+                Err(_) => {
+                    status = "failed";
+                    failure_code = Some("editor_session_missing");
+                    failure_summary =
+                        Some("no candidate-root-owned Codex session was proven".to_owned());
+                }
+            }
+        }
+
+        let repository = CodeChangeRepository::new(db);
+        if resolved_session != reserved_session {
+            repository.bind_editor_session(&code_change_run_id, attempt, &resolved_session, now)?;
+        }
+        repository.finish_editor_attempt_with_checks(
+            &code_change_run_id,
+            attempt,
+            status,
+            digest.as_deref(),
+            failure_code,
+            failure_summary.as_deref(),
+            self.terminal_outcome.as_ref().map(|_| now),
+            now,
+            &proposed_checks,
+            now,
+        )?;
+        if status == "failed"
+            && (failure_code == Some("cannot_apply")
+                || failure_code == Some("editor_session_missing")
+                || attempt >= 2)
+        {
+            let reason = failure_code.unwrap_or("editor_failed");
+            repository.reject(
+                &code_change_run_id,
+                reason,
+                failure_summary
+                    .as_deref()
+                    .unwrap_or("code-change editor failed"),
+                now,
+            )?;
+        }
+        self.editor_persistence = Some(EditorPersistence::Persisted);
+        Ok(())
+    }
+
     fn persist_terminal_outcome(
         &mut self,
         db: &crate::db::Db,
@@ -2186,6 +2696,7 @@ impl AgentHandle {
         }
         self.persist_decision_outcome(db, now)?;
         self.persist_diagnosis_outcome(db, now)?;
+        self.persist_editor_outcome(db, now)?;
         let outcome = self
             .terminal_outcome
             .as_ref()
@@ -2480,6 +2991,23 @@ fn deadline_scoped_db(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn secure_agent_fixture_root(temporary: &tempfile::TempDir, project_root: &Path) {
+        let service_root = project_root.join(".pueue-agent");
+        let logs_root = service_root.join("logs");
+        for path in [
+            temporary.path(),
+            project_root,
+            service_root.as_path(),
+            logs_root.as_path(),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
     #[test]
     fn decision_output_schema_is_a_supported_strict_root_object() {
         let schema: serde_json::Value = serde_json::from_slice(DECISION_OUTPUT_SCHEMA).unwrap();
@@ -2574,6 +3102,7 @@ mod tests {
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         let root = temporary.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&temporary, &root);
         let project = crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a", &root, "pa-project-a",
@@ -2621,6 +3150,7 @@ mod tests {
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         let root = temporary.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&temporary, &root);
         let project = crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a",
@@ -2799,6 +3329,7 @@ mod tests {
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         let root = temporary.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&temporary, &root);
         crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a",
@@ -2852,6 +3383,7 @@ mod tests {
             role: AgentRunRole::Standard,
             decision_persistence: None,
             diagnosis_persistence: None,
+            editor_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid: child.id(),
@@ -2894,6 +3426,7 @@ mod tests {
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         let root = temporary.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&temporary, &root);
         crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a",
@@ -2948,6 +3481,7 @@ mod tests {
             role: AgentRunRole::Standard,
             decision_persistence: None,
             diagnosis_persistence: None,
+            editor_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid,
@@ -3047,6 +3581,7 @@ mod tests {
         let db = crate::db::Db::open(&project_temp.path().join("state.sqlite3")).unwrap();
         let root = project_temp.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&project_temp, &root);
         crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a",
@@ -3097,6 +3632,7 @@ mod tests {
             role: AgentRunRole::Standard,
             decision_persistence: None,
             diagnosis_persistence: None,
+            editor_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid,
@@ -3232,6 +3768,7 @@ mod tests {
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         let root = temporary.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&temporary, &root);
         crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a",
@@ -3344,6 +3881,7 @@ mod tests {
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         let root = temporary.path().join("project");
         std::fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        secure_agent_fixture_root(&temporary, &root);
         crate::db::ProjectRepository::new(&db)
             .register(&crate::models::NewProject::new(
                 "project-a",
@@ -3397,6 +3935,7 @@ mod tests {
             role: AgentRunRole::Standard,
             decision_persistence: None,
             diagnosis_persistence: None,
+            editor_persistence: None,
             project_id: "project-a".to_owned(),
             run_id: run.run_id,
             pid: child.id(),

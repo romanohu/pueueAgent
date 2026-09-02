@@ -56,6 +56,8 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let temporary = tempdir().expect("temporary project root");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure native launcher fixture root");
         let launcher_path = temporary.path().join("pueue-agent-launcher");
         fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &launcher_path)
             .expect("copy native launcher fixture");
@@ -103,6 +105,8 @@ fn main() {
             "generated fixture failed to compile: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o700))
+            .expect("secure generated fixture executable");
         let target = ExecutableAnchor::from_absolute(
             &fs::canonicalize(&target_path).expect("canonical target"),
             &[],

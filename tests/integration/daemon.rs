@@ -14,10 +14,11 @@ use std::process::Command;
 
 use async_trait::async_trait;
 use pueue_agent::{
-    agent::{AgentRunner, AgentRunnerConfig},
+    agent::{AgentHandle, AgentRunner, AgentRunnerConfig},
     db::{
-        AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
-        ExperimentRepository, InterventionRepository, ProjectRepository, StartCampaignRequest,
+        AgentRunRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
+        EventRepository, ExperimentRepository, InterventionRepository, ProjectRepository,
+        StartCampaignRequest,
     },
     daemon::{Daemon, DaemonConfig, DaemonReport},
     execution_policy::CampaignLimits,
@@ -34,8 +35,14 @@ use pueue_agent::{
 
 #[cfg(target_os = "linux")]
 use pueue_agent::{
-    execution_policy::{resolve_project_policy, NetworkMode},
-    models::Project,
+    code_change::CodeChangeCoordinator,
+    config::{self, AgentConfig},
+    execution_policy::{
+        resolve_project_policy, NetworkMode, ProjectRootAnchor,
+        ResolvedProjectExecutionPolicy,
+    },
+    models::{NewCodeChangeRun, Project},
+    retry::RetryPolicy,
 };
 use sha2::{Digest, Sha256};
 use serde_json::json;
@@ -183,6 +190,8 @@ struct DaemonHarness {
 impl DaemonHarness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         let fake_pueue = FakePueue::with_tasks(vec![running_task()]);
         let harness = Self {
@@ -221,6 +230,14 @@ impl DaemonHarness {
     ) {
         let root = self.root(project_id);
         fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(root.join(".pueue-agent/logs"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fs::set_permissions(root.join(".pueue-agent"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(
             root.join(".pueue-agent/logs/41.log"),
             "CUDA out of memory\n",
@@ -343,7 +360,7 @@ max_agent_runs = 10
         let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
         let config = fs::read_to_string(&config_path).unwrap();
         fs::write(
-            config_path,
+            &config_path,
             config.replace(
                 "deep_check_interval_minutes = 0",
                 &format!("deep_check_interval_minutes = {interval_minutes}"),
@@ -4011,4 +4028,941 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
         })
         .count();
     assert_eq!(leaked_indexes, 0, "temporary candidate indexes must be cleaned");
+}
+
+fn seed_code_change_editor_recovery_fixture(
+    harness: &DaemonHarness,
+    execution_kind: &str,
+    bind_attempt: bool,
+) -> (i64, String, i64) {
+    harness.pause_project("project-a");
+    let event_id = harness.enqueue(EventKind::CodeChange, "project-a", "editor-recovery");
+    harness.claim_with_lease(event_id, harness.now + 600);
+    let log_path = harness
+        .registered_root("project-a")
+        .join(".pueue-agent/logs/editor-recovery.log");
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "project-a",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now - 10,
+                &log_path,
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs
+             SET execution_kind = ?1, executable_path = '/bin/echo',
+                 executable_identity = 'fixture'
+             WHERE run_id = ?2",
+            rusqlite::params![execution_kind, run.run_id],
+        )
+        .unwrap();
+
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO campaigns (
+                 campaign_id, project_id, objective_text, objective_digest,
+                 initial_argv_json, state, created_at, updated_at
+             ) VALUES ('editor-campaign', 'project-a', 'editor', 'editor-digest', '[]', 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis, argv_json,
+                 working_directory, expected_evidence_json, canonical_digest,
+                 created_at, updated_at
+             ) VALUES ('editor-proposal', 'editor-campaign', 'code_change', 'accepted',
+                       'editor', '[]', '.', '[]', 'editor-proposal-digest', 1, 1)",
+            [],
+        )
+        .unwrap();
+    let code_change_run_id = "editor-code-change".to_owned();
+    connection
+        .execute(
+            "INSERT INTO code_change_runs (
+                 code_change_run_id, proposal_id, campaign_id, state, base_sha,
+                 candidate_ref, best_ref, worktree_id, worktree_relative_path,
+                 editor_session_id, editor_attempts, created_at, updated_at
+             ) VALUES (?1, 'editor-proposal', 'editor-campaign', 'editing',
+                       '0000000000000000000000000000000000000000',
+                       'refs/heads/candidate/editor', 'refs/heads/best/editor',
+                       'editor-worktree', '.pueue-agent/worktrees/editor',
+                       'editor-session', 1, 1, 1)",
+            [&code_change_run_id],
+        )
+        .unwrap();
+    if bind_attempt {
+        connection
+            .execute(
+                "INSERT INTO code_change_editor_attempts (
+                     code_change_run_id, attempt, agent_run_id, editor_session_id,
+                     status, started_at
+                 ) VALUES (?1, 1, ?2, 'editor-session', 'reserved', 1)",
+                rusqlite::params![code_change_run_id, run.run_id],
+            )
+            .unwrap();
+    }
+    (run.run_id, code_change_run_id, event_id)
+}
+
+#[tokio::test]
+async fn code_change_editor_is_preserved_from_generic_startup_recovery() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.recovered_agent_runs, 0);
+    assert_eq!(report.preserved_code_change_editors, 1);
+    assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
+    let state: (AgentRunStatus, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, (AgentRunStatus::Starting, "pending".to_owned()));
+    let attempt_status: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM code_change_editor_attempts
+             WHERE code_change_run_id = ?1 AND attempt = 1",
+            [&code_change_run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_status, "reserved");
+}
+
+#[tokio::test]
+async fn code_change_editor_recovery_rejects_unbound_execution_identity() {
+    let harness = DaemonHarness::new();
+    seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", false);
+
+    assert!(harness.daemon().run_once().await.is_err());
+}
+
+#[tokio::test]
+async fn code_change_editor_recovery_rejects_non_editor_execution_identity() {
+    let harness = DaemonHarness::new();
+    seed_code_change_editor_recovery_fixture(&harness, "codex", true);
+
+    assert!(harness.daemon().run_once().await.is_err());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn compile_code_change_editor_fixture(
+    target: &std::path::Path,
+    invocation_log: &std::path::Path,
+    behavior_path: &std::path::Path,
+) {
+    let source = target.with_extension("rs");
+    let state_literal = format!("{:?}", invocation_log.to_string_lossy());
+    let behavior_literal = format!("{:?}", behavior_path.to_string_lossy());
+    let source_body = r##"
+use std::{env, fs, path::Path, process, thread, time::Duration};
+
+fn main() {
+    let state_path = Path::new(__STATE_PATH__);
+    let behavior_path = Path::new(__BEHAVIOR_PATH__);
+    let invocation = fs::read_to_string(state_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    fs::write(state_path, invocation.to_string()).unwrap();
+    let capture_path = state_path.with_extension("log");
+    let mode = env::var("PUEUE_AGENT_EDITOR_MODE").unwrap_or_default();
+    let session = env::var("PUEUE_AGENT_EDITOR_SESSION_ID").unwrap_or_default();
+    let mut capture = fs::read_to_string(&capture_path).unwrap_or_default();
+    capture.push_str(&format!("mode={mode};session={session}\n"));
+    fs::write(capture_path, capture).unwrap();
+    let behavior = fs::read_to_string(behavior_path).unwrap_or_default();
+    match behavior.trim() {
+        "timeout" => {
+            thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        "malformed" => {
+            let output = env::var("PUEUE_AGENT_EDITOR_OUTPUT").unwrap();
+            fs::write(output, br#"{malformed-editor"#).unwrap();
+            return;
+        }
+        "oversized" => {
+            let output = env::var("PUEUE_AGENT_EDITOR_OUTPUT").unwrap();
+            fs::write(output, vec![b'x'; 65 * 1024 + 1]).unwrap();
+            return;
+        }
+        "ready" => {
+            let output = env::var("PUEUE_AGENT_EDITOR_OUTPUT").unwrap();
+            fs::write(
+                output,
+                br#"{"schema_version":1,"status":"ready","summary":"editor prepared candidate","proposed_checks":[{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"."}]}"#,
+            )
+            .unwrap();
+            return;
+        }
+        "fail" => process::exit(17),
+        _ => {}
+    }
+    if invocation == 1 {
+        process::exit(17);
+    }
+    let output = env::var("PUEUE_AGENT_EDITOR_OUTPUT").unwrap();
+    fs::write(
+        output,
+        br#"{"schema_version":1,"status":"cannot_apply","summary":"editor cannot apply","proposed_checks":[]}"#,
+    )
+    .unwrap();
+}
+"##
+    .replace("__STATE_PATH__", &state_literal)
+    .replace("__BEHAVIOR_PATH__", &behavior_literal);
+    fs::write(&source, source_body).unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(target)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated editor fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+struct CodeChangeEditorFixture {
+    _temp: TempDir,
+    db: Db,
+    project: Project,
+    candidate_policy: ResolvedProjectExecutionPolicy,
+    config: AgentConfig,
+    runner: AgentRunner,
+    policy: Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+    campaign_id: String,
+    run_id: String,
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn code_change_editor_fixture(behavior: &str) -> CodeChangeEditorFixture {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture_root = fs::canonicalize(temp.path()).unwrap();
+    let project_root = fixture_root.join("project");
+    let service_dir = project_root.join(".pueue-agent");
+    let trusted_bin = fixture_root.join("trusted-bin");
+    for directory in [&project_root, &service_dir, &trusted_bin] {
+        fs::create_dir_all(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let logs_dir = service_dir.join("logs");
+    fs::create_dir(&logs_dir).unwrap();
+    fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let editor = trusted_bin.join("editor");
+    let invocation_state = fixture_root.join("editor-invocations.state");
+    let behavior_path = fixture_root.join("editor-behavior");
+    fs::write(&behavior_path, behavior).unwrap();
+    compile_code_change_editor_fixture(&editor, &invocation_state, &behavior_path);
+    let config_path = service_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"project_id = "editor-project"
+pueue_group = "editor-project"
+
+[agent]
+program = {:?}
+args = ["{{prompt}}"]
+timeout_minutes = 1
+max_retries = 0
+
+[agent.execution]
+network = "enabled"
+
+[check]
+interval_minutes = 10
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+            editor.display().to_string()
+        ),
+    )
+    .unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        &fixture_root,
+        &[("editor-project", &project_root, &editor)],
+    );
+    let db = Db::open(&fixture_root.join("state.sqlite3")).unwrap();
+    let project = ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            "editor-project",
+            fs::canonicalize(&project_root).unwrap(),
+            "editor-project",
+            &config_path,
+            1,
+        ))
+        .unwrap();
+    let project_config = config::load(&config_path).unwrap();
+    let config = project_config.agent.clone();
+    let original = resolve_project_policy(&policy, &project, &project_config).unwrap();
+    let campaign_id = "editor-campaign".to_owned();
+    let proposal_id = "editor-proposal";
+    let run_id = "editor-run".to_owned();
+    let connection = db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO campaigns (
+                 campaign_id, project_id, objective_text, objective_digest,
+                 initial_argv_json, state, created_at, updated_at
+             ) VALUES (?1, ?2, 'editor objective', 'editor-digest', '[]', 'active', 1, 1)",
+            rusqlite::params![campaign_id, project.project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis, argv_json,
+                 working_directory, expected_evidence_json, canonical_digest,
+                 created_at, updated_at
+             ) VALUES (?1, ?2, 'code_change', 'accepted', 'editor hypothesis',
+                       '[]', '.', '[]', 'editor-proposal-digest', 1, 1)",
+            rusqlite::params![proposal_id, campaign_id],
+        )
+        .unwrap();
+    drop(connection);
+    CodeChangeRepository::new(&db)
+        .create_pending(&NewCodeChangeRun::new(
+            &run_id,
+            proposal_id,
+            &campaign_id,
+            "0000000000000000000000000000000000000000",
+            pueue_agent::code_change::candidate_ref(&campaign_id, proposal_id).unwrap(),
+            pueue_agent::code_change::best_ref(&campaign_id).unwrap(),
+            &run_id,
+            ".pueue-agent/worktrees/editor-campaign/editor-proposal",
+            1,
+        ))
+        .unwrap();
+    CodeChangeRepository::new(&db)
+        .transition(
+            &run_id,
+            pueue_agent::models::CodeChangeState::Reserved,
+            pueue_agent::models::CodeChangeState::PreparingWorktree,
+            2,
+        )
+        .unwrap();
+    CodeChangeRepository::new(&db)
+        .transition(
+            &run_id,
+            pueue_agent::models::CodeChangeState::PreparingWorktree,
+            pueue_agent::models::CodeChangeState::Editing,
+            3,
+        )
+        .unwrap();
+    let candidate_root = fixture_root
+        .join("execution-policy-state/worktrees")
+        .join(&campaign_id)
+        .join(proposal_id);
+    fs::create_dir_all(&candidate_root).unwrap();
+    for directory in [
+        fixture_root.join("execution-policy-state/worktrees"),
+        fixture_root.join("execution-policy-state/worktrees").join(&campaign_id),
+        candidate_root.clone(),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut candidate_policy = original;
+    candidate_policy.root_anchor = ProjectRootAnchor::resolve(&candidate_root).unwrap();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production()
+            .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+        Arc::clone(&policy),
+    );
+    CodeChangeEditorFixture {
+        _temp: temp,
+        db,
+        project,
+        candidate_policy,
+        config,
+        runner,
+        policy,
+        campaign_id,
+        run_id,
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn spawn_editor_fixture_attempt(
+    runner: &AgentRunner,
+    db: &Db,
+    project: &Project,
+    candidate_policy: &ResolvedProjectExecutionPolicy,
+    config: &AgentConfig,
+    code_change_run_id: &str,
+    campaign_id: &str,
+    attempt: i64,
+    context: AgentContextMode,
+    now: i64,
+) -> AgentHandle {
+    let event = EventRepository::new(db)
+        .insert_idempotent(
+            &NewEvent::new(
+                project.project_id.clone(),
+                EventKind::CodeChange,
+                format!("editor-fixture:{code_change_run_id}:{attempt}"),
+                json!({
+                    "code_change_run_id": code_change_run_id,
+                    "attempt": attempt,
+                }),
+                now,
+                now,
+            )
+            .with_campaign_lineage(campaign_id, Option::<String>::None),
+        )
+        .unwrap();
+    let event = EventRepository::new(db)
+        .claim_by_id(&project.project_id, event.event_id, now + 600)
+        .unwrap()
+        .expect("editor fixture event should be claimable");
+    let run_id_guard = runner
+        .try_acquire_run_id_admission_guard(db)
+        .unwrap()
+        .expect("editor fixture run ID guard");
+    let project_lock = runner
+        .try_acquire_project_admission_lock(candidate_policy)
+        .unwrap()
+        .expect("editor fixture candidate lock");
+    let mut config = config.clone();
+    config.context = context;
+    runner
+        .spawn_code_change_editor(
+            db,
+            project,
+            candidate_policy,
+            &config,
+            RetryPolicy { max_retries: 0 },
+            event.event_id,
+            &[event.event_id],
+            code_change_run_id,
+            attempt,
+            "bounded editor fixture prompt",
+            now,
+            run_id_guard,
+            project_lock,
+        )
+        .await
+        .expect("editor fixture launch")
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_public_spawn_binds_fresh_resume_and_rejects_third() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture_root = fs::canonicalize(temp.path()).unwrap();
+    let project_root = fixture_root.join("project");
+    let service_dir = project_root.join(".pueue-agent");
+    let trusted_bin = fixture_root.join("trusted-bin");
+    for directory in [&project_root, &service_dir, &trusted_bin] {
+        fs::create_dir_all(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::create_dir(service_dir.join("logs")).unwrap();
+    fs::set_permissions(service_dir.join("logs"), fs::Permissions::from_mode(0o700)).unwrap();
+    let editor = trusted_bin.join("editor");
+    let invocation_state = fixture_root.join("editor-invocations.state");
+    let behavior_path = fixture_root.join("editor-behavior");
+    fs::write(&behavior_path, b"").unwrap();
+    compile_code_change_editor_fixture(&editor, &invocation_state, &behavior_path);
+    let config_path = service_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"project_id = "editor-project"
+pueue_group = "editor-project"
+
+[agent]
+program = {:?}
+args = ["{{prompt}}"]
+timeout_minutes = 1
+max_retries = 0
+
+[agent.execution]
+network = "enabled"
+
+[check]
+interval_minutes = 10
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#,
+            editor.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let policy = execution_policy_fixture::resolved_policy(
+        &fixture_root,
+        &[("editor-project", &project_root, &editor)],
+    );
+    let db = Db::open(&fixture_root.join("state.sqlite3")).unwrap();
+    let project = ProjectRepository::new(&db)
+        .register(&NewProject::new(
+            "editor-project",
+            fs::canonicalize(&project_root).unwrap(),
+            "editor-project",
+            &config_path,
+            1,
+        ))
+        .unwrap();
+    let project_config = config::load(&config_path).unwrap();
+    let config = project_config.agent.clone();
+    let original = resolve_project_policy(&policy, &project, &project_config).unwrap();
+
+    let campaign_id = "editor-campaign";
+    let proposal_id = "editor-proposal";
+    let run_id = "editor-run";
+    let connection = db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO campaigns (
+                 campaign_id, project_id, objective_text, objective_digest,
+                 initial_argv_json, state, created_at, updated_at
+             ) VALUES (?1, ?2, 'editor objective', 'editor-digest', '[]', 'active', 1, 1)",
+            rusqlite::params![campaign_id, project.project_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis, argv_json,
+                 working_directory, expected_evidence_json, canonical_digest,
+                 created_at, updated_at
+             ) VALUES (?1, ?2, 'code_change', 'accepted', 'editor hypothesis',
+                       '[]', '.', '[]', 'editor-proposal-digest', 1, 1)",
+            rusqlite::params![proposal_id, campaign_id],
+        )
+        .unwrap();
+    drop(connection);
+    CodeChangeRepository::new(&db)
+        .create_pending(&NewCodeChangeRun::new(
+            run_id,
+            proposal_id,
+            campaign_id,
+            "0000000000000000000000000000000000000000",
+            pueue_agent::code_change::candidate_ref(campaign_id, proposal_id).unwrap(),
+            pueue_agent::code_change::best_ref(campaign_id).unwrap(),
+            run_id,
+            ".pueue-agent/worktrees/editor-campaign/editor-proposal",
+            1,
+        ))
+        .unwrap();
+    CodeChangeRepository::new(&db)
+        .transition(run_id, pueue_agent::models::CodeChangeState::Reserved,
+            pueue_agent::models::CodeChangeState::PreparingWorktree, 2)
+        .unwrap();
+    CodeChangeRepository::new(&db)
+        .transition(run_id, pueue_agent::models::CodeChangeState::PreparingWorktree,
+            pueue_agent::models::CodeChangeState::Editing, 3)
+        .unwrap();
+
+    let candidate_root = fixture_root
+        .join("execution-policy-state/worktrees")
+        .join(campaign_id)
+        .join(proposal_id);
+    fs::create_dir_all(&candidate_root).unwrap();
+    for directory in [
+        fixture_root.join("execution-policy-state/worktrees"),
+        fixture_root.join("execution-policy-state/worktrees").join(campaign_id),
+        candidate_root.clone(),
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut candidate_policy = original.clone();
+    candidate_policy.root_anchor = ProjectRootAnchor::resolve(&candidate_root).unwrap();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production()
+            .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+        Arc::clone(&policy),
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET state = 'paused' WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .unwrap();
+    let coordinator_report = CodeChangeCoordinator::new(
+        &db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(4, 10)
+    .await
+    .unwrap();
+    assert_eq!(coordinator_report.deferred, 1);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET state = 'active' WHERE campaign_id = ?1",
+            [campaign_id],
+        )
+        .unwrap();
+
+    let mut first = spawn_editor_fixture_attempt(
+        &runner,
+        &db,
+        &project,
+        &candidate_policy,
+        &config,
+        run_id,
+        campaign_id,
+        1,
+        AgentContextMode::Fresh,
+        10,
+    )
+    .await;
+    assert_eq!(first.wait(&db, 11).await.unwrap(), AgentRunStatus::Failed);
+    let first_run = AgentRunRepository::new(&db)
+        .find_by_id(first.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_run.context_mode, AgentContextMode::Fresh);
+    let run = CodeChangeRepository::new(&db).find_by_id(run_id).unwrap().unwrap();
+    let session = run.editor_session_id.clone().expect("fresh session binding");
+    let first_attempt = CodeChangeRepository::new(&db)
+        .find_editor_attempt(run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_attempt.status, "failed");
+    assert_eq!(first_attempt.editor_session_id, session);
+
+    let mut second = spawn_editor_fixture_attempt(
+        &runner,
+        &db,
+        &project,
+        &candidate_policy,
+        &config,
+        run_id,
+        campaign_id,
+        2,
+        AgentContextMode::Resume {
+            session_id: session.clone(),
+        },
+        12,
+    )
+    .await;
+    let second_run_id = second.run_id;
+    let third_event = EventRepository::new(&db)
+        .insert_idempotent(&NewEvent::new(
+            project.project_id.clone(),
+            EventKind::CodeChange,
+            "editor-fixture:third",
+            json!({}),
+            13,
+            13,
+        ))
+        .unwrap();
+    EventRepository::new(&db)
+        .claim_by_id(&project.project_id, third_event.event_id, 613)
+        .unwrap()
+        .expect("third-launch event should be claimable");
+    let third_guard = runner
+        .try_acquire_run_id_admission_guard(&db)
+        .unwrap()
+        .expect("third-launch run ID guard");
+    let third_lock = runner
+        .try_acquire_project_admission_lock(&candidate_policy)
+        .unwrap()
+        .expect("third-launch candidate lock");
+    let third = runner
+        .spawn_code_change_editor(
+            &db,
+            &project,
+            &candidate_policy,
+            &config,
+            RetryPolicy { max_retries: 0 },
+            third_event.event_id,
+            &[third_event.event_id],
+            run_id,
+            3,
+            "third attempt must be rejected",
+            13,
+            third_guard,
+            third_lock,
+        )
+        .await;
+    assert!(third.is_err(), "the editor attempt bound is exactly two");
+    assert_eq!(
+        AgentRunRepository::new(&db).count_by_project(&project.project_id).unwrap(),
+        2
+    );
+    assert_eq!(
+        CodeChangeRepository::new(&db).list_editor_attempts(run_id).unwrap().len(),
+        2
+    );
+
+    assert_eq!(second.wait(&db, 14).await.unwrap(), AgentRunStatus::Completed);
+    let second_attempt = CodeChangeRepository::new(&db)
+        .find_editor_attempt(run_id, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_attempt.status, "failed");
+    assert_eq!(second_attempt.failure_code.as_deref(), Some("cannot_apply"));
+    assert_eq!(second_attempt.editor_session_id, session);
+    let final_run = CodeChangeRepository::new(&db).find_by_id(run_id).unwrap().unwrap();
+    assert_eq!(final_run.state, pueue_agent::models::CodeChangeState::Rejected);
+    assert_eq!(
+        AgentRunRepository::new(&db)
+            .find_by_id(second_run_id)
+            .unwrap()
+            .unwrap()
+            .context_mode,
+        AgentContextMode::Resume {
+            session_id: session.clone(),
+        }
+    );
+    let capture = fs::read_to_string(invocation_state.with_extension("log")).unwrap();
+    assert!(capture.contains("mode=fresh;session="));
+    assert!(capture.contains(&format!("mode=resume;session={session}")));
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_ready_output_persists_checks_before_cleanup() {
+    let fixture = code_change_editor_fixture("ready");
+    let mut editor = spawn_editor_fixture_attempt(
+        &fixture.runner,
+        &fixture.db,
+        &fixture.project,
+        &fixture.candidate_policy,
+        &fixture.config,
+        &fixture.run_id,
+        &fixture.campaign_id,
+        1,
+        AgentContextMode::Fresh,
+        10,
+    )
+    .await;
+    assert_eq!(editor.wait(&fixture.db, 11).await.unwrap(), AgentRunStatus::Completed);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "ready");
+    assert!(attempt.result_digest.is_some());
+    assert_eq!(attempt.failure_code, None);
+    let check: (String, String) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT source, status FROM code_change_checks
+             WHERE code_change_run_id = ?1 AND attempt = 1 AND ordinal = 0",
+            [&fixture.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(check, ("editor".to_owned(), "reserved".to_owned()));
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(editor.run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Completed
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_timeout_persists_bounded_failure_before_cleanup() {
+    let fixture = code_change_editor_fixture("timeout");
+    let mut editor = spawn_editor_fixture_attempt(
+        &fixture.runner,
+        &fixture.db,
+        &fixture.project,
+        &fixture.candidate_policy,
+        &fixture.config,
+        &fixture.run_id,
+        &fixture.campaign_id,
+        1,
+        AgentContextMode::Fresh,
+        10,
+    )
+    .await;
+    assert_eq!(editor.timeout_now(&fixture.db, 11).await.unwrap(), AgentRunStatus::TimedOut);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "failed");
+    assert_eq!(attempt.failure_code.as_deref(), Some("editor_timeout"));
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        pueue_agent::models::CodeChangeState::Editing
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_malformed_and_oversized_outputs_fail_closed() {
+    for behavior in ["malformed", "oversized"] {
+        let fixture = code_change_editor_fixture(behavior);
+        let mut editor = spawn_editor_fixture_attempt(
+            &fixture.runner,
+            &fixture.db,
+            &fixture.project,
+            &fixture.candidate_policy,
+            &fixture.config,
+            &fixture.run_id,
+            &fixture.campaign_id,
+            1,
+            AgentContextMode::Fresh,
+            10,
+        )
+        .await;
+        assert_eq!(
+            editor.wait(&fixture.db, 11).await.unwrap(),
+            AgentRunStatus::Completed,
+            "editor process should terminate normally for {behavior}"
+        );
+        let attempt = CodeChangeRepository::new(&fixture.db)
+            .find_editor_attempt(&fixture.run_id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(attempt.failure_code.as_deref(), Some("editor_output_invalid"));
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_first_and_second_process_failures_reject_once_and_restart_without_reset() {
+    let fixture = code_change_editor_fixture("fail");
+    let mut first = spawn_editor_fixture_attempt(
+        &fixture.runner,
+        &fixture.db,
+        &fixture.project,
+        &fixture.candidate_policy,
+        &fixture.config,
+        &fixture.run_id,
+        &fixture.campaign_id,
+        1,
+        AgentContextMode::Fresh,
+        10,
+    )
+    .await;
+    assert_eq!(first.wait(&fixture.db, 11).await.unwrap(), AgentRunStatus::Failed);
+    let session = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap()
+        .editor_session_id
+        .unwrap();
+    let mut second = spawn_editor_fixture_attempt(
+        &fixture.runner,
+        &fixture.db,
+        &fixture.project,
+        &fixture.candidate_policy,
+        &fixture.config,
+        &fixture.run_id,
+        &fixture.campaign_id,
+        2,
+        AgentContextMode::Resume {
+            session_id: session.clone(),
+        },
+        12,
+    )
+    .await;
+    assert_eq!(second.wait(&fixture.db, 13).await.unwrap(), AgentRunStatus::Failed);
+    let attempts = CodeChangeRepository::new(&fixture.db)
+        .list_editor_attempts(&fixture.run_id)
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].failure_code.as_deref(), Some("editor_exit"));
+    assert_eq!(attempts[1].failure_code.as_deref(), Some("editor_exit"));
+    assert_eq!(attempts[0].editor_session_id, attempts[1].editor_session_id);
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        pueue_agent::models::CodeChangeState::Rejected
+    );
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(14, 10)
+    .await
+    .unwrap();
+    assert!(report.started.is_empty());
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.db)
+            .list_editor_attempts(&fixture.run_id)
+            .unwrap()
+            .len(),
+        2,
+        "restart must not reset a terminal editor attempt count"
+    );
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(second.run_id)
+            .unwrap()
+            .unwrap()
+            .context_mode,
+        AgentContextMode::Resume { session_id: session }
+    );
 }

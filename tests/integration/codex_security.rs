@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     thread,
@@ -21,7 +21,7 @@ use pueue_agent::{
         MAX_ARTIFACT_HINT_DEPTH, MAX_ARTIFACT_HINT_FIELD_BYTES, MAX_ARTIFACT_HINTS,
     },
     environment::{collect_decision_artifact_hints, PrivateRunTemp, SanitizedEnvironment},
-    models::AgentContextMode,
+    models::{AgentContextMode, ExecutionProjection},
 };
 use tempfile::TempDir;
 
@@ -54,6 +54,98 @@ use rusqlite::params;
 use serde_json::json;
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+
+#[test]
+fn code_change_editor_execution_projection_is_distinct() {
+    let projection = ExecutionProjection::new("code_change_editor", "/usr/bin/codex", "fixture")
+        .expect("editor execution projection should be accepted");
+    assert_eq!(projection.execution_kind(), "code_change_editor");
+}
+
+#[test]
+fn code_change_editor_codex_argv_is_candidate_bound_and_resume_is_exact() {
+    let harness = Harness::new();
+    let fresh = config_with_args(vec!["exec", "{prompt}"]);
+    let argv = harness.builder().build_editor(&fresh, "editor prompt").unwrap();
+    assert!(contains_pair(&argv, "--ask-for-approval", "never"));
+    assert!(contains_pair(&argv, "--sandbox", "workspace-write"));
+    assert!(contains_pair(&argv, "--output-schema", "/dev/fd/11/editor-schema.json"));
+    assert!(contains_pair(&argv, "--output-last-message", "/dev/fd/11/editor.json"));
+    assert!(argv.iter().any(|argument| {
+        argument == &harness.root.as_os_str()
+            || argument.to_string_lossy() == harness.root.to_string_lossy()
+    }));
+    assert!(argv.iter().any(|argument| {
+        argument
+            .to_string_lossy()
+            .contains("writable_roots=")
+            && argument.to_string_lossy().contains("/dev/fd/11")
+    }));
+    assert!(!argv.iter().any(|argument| argument == "--last"));
+
+    let session = harness.id("old");
+    write_session(&harness.home, "old", &harness.root);
+    let resumed = AgentConfig {
+        context: AgentContextMode::Resume {
+            session_id: session.clone(),
+        },
+        ..fresh.clone()
+    };
+    let argv = harness.builder().build_editor(&resumed, "editor prompt").unwrap();
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair[0] == "resume" && pair[1] == OsStr::new(&session)));
+
+    let latest = AgentConfig {
+        context: AgentContextMode::ResumeLatest,
+        ..fresh
+    };
+    assert!(harness.builder().build_editor(&latest, "editor prompt").is_err());
+}
+
+#[test]
+fn code_change_editor_environment_is_default_deny_with_supervisor_transport() {
+    let harness = Harness::new();
+    let startup = StartupEnvironment::from_pairs([
+        ("HOME", "/service/home"),
+        ("PATH", "/ambient/bin"),
+        ("OPENAI_API_KEY", "secret"),
+        ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ("SSH_AUTH_SOCK", "/fixture/ssh-agent.sock"),
+        ("EDITOR_SAFE", "safe"),
+    ]);
+    let mut policy = harness.builder().policy().clone();
+    policy.agent_kind = AgentKind::Custom;
+    policy.agent_environment_allow = ["EDITOR_SAFE".to_owned(), "OPENAI_API_KEY".to_owned()]
+        .into_iter()
+        .collect();
+    let environment = SanitizedEnvironment::for_code_change_editor(
+        &startup,
+        &policy,
+        41,
+        "editor-session",
+        false,
+    )
+    .unwrap();
+    assert_eq!(environment.get("EDITOR_SAFE"), Some(std::ffi::OsStr::new("safe")));
+    for name in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK"] {
+        assert_eq!(environment.get(name), None, "{name}");
+    }
+    assert_eq!(environment.get("PUEUE_AGENT_EDITOR_MODE"), Some(std::ffi::OsStr::new("fresh")));
+    assert_eq!(
+        environment.get("PUEUE_AGENT_EDITOR_SESSION_ID"),
+        Some(std::ffi::OsStr::new("editor-session"))
+    );
+    assert_eq!(
+        environment.get("PUEUE_AGENT_EDITOR_SCHEMA"),
+        Some(std::ffi::OsStr::new("/dev/fd/11/editor-schema.json"))
+    );
+    assert_eq!(
+        environment.get("PUEUE_AGENT_EDITOR_OUTPUT"),
+        Some(std::ffi::OsStr::new("/dev/fd/11/editor.json"))
+    );
+    assert!(!format!("{environment:?}").contains("secret"));
+}
 
 #[path = "../support/execution_policy_fixture.rs"]
 mod execution_policy_fixture;

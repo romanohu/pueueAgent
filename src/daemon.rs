@@ -33,6 +33,9 @@ use crate::{
     AppError,
 };
 
+#[cfg(unix)]
+use crate::code_change::CodeChangeCoordinator;
+
 const DAEMON_RESTART_REASON: &str = "agent run interrupted by daemon restart";
 
 #[derive(Debug, Clone)]
@@ -69,8 +72,19 @@ pub struct DaemonReport {
     pub recovered_agent_runs: usize,
     pub requeued_agent_events: usize,
     pub dead_lettered_agent_events: usize,
+    pub preserved_code_change_editors: usize,
     pub decision_recovery: DecisionRecoveryReport,
     pub decisions: DecisionLoopReport,
+    pub code_changes: CodeChangeLoopReport,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CodeChangeLoopReport {
+    pub started: usize,
+    pub advanced: usize,
+    pub deferred: usize,
+    pub rejected: usize,
+    pub cleanup: usize,
 }
 
 pub struct Daemon<P> {
@@ -160,6 +174,7 @@ where
             report.recovered_agent_runs = recovery.failed_runs;
             report.requeued_agent_events = recovery.requeued_events;
             report.dead_lettered_agent_events = recovery.dead_lettered_events;
+            report.preserved_code_change_editors = recovery.preserved_code_change_editors;
         }
 
         self.dispatch_reserved_campaign_submissions(now).await?;
@@ -187,6 +202,35 @@ where
             .schedule(&reconciliation.observed_tasks)?;
 
         report.finished_agents += self.poll_retained_ownership_at(now).await?;
+        #[cfg(unix)]
+        {
+            let runner = self.runner.as_ref().ok_or(AppError::Runtime {
+                operation: "borrow daemon code-change runner",
+            })?;
+            let mut code_changes = CodeChangeCoordinator::new(
+                &self.db,
+                runner,
+                self.policy.as_ref(),
+                self.policy.campaign_limits,
+            )
+            .with_lease_seconds(self.config.lease_seconds)
+            .advance_ready(now, self.config.claim_limit)
+            .await?;
+            report.code_changes = CodeChangeLoopReport {
+                started: code_changes.started.len(),
+                advanced: code_changes.advanced,
+                deferred: code_changes.deferred,
+                rejected: code_changes.rejected,
+                cleanup: code_changes.cleanup.len(),
+            };
+            self.active_agents.extend(
+                code_changes
+                    .started
+                    .drain(..)
+                    .map(|started| started.handle),
+            );
+            self.active_cleanups.extend(code_changes.cleanup.drain(..));
+        }
         report.decisions = DecisionCoordinator::new(
             &self.db,
             &self.pueue,

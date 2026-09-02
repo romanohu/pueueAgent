@@ -21,6 +21,10 @@ pub(crate) enum AgentRunRole {
     Diagnosis {
         experiment_id: String,
     },
+    CodeChangeEditor {
+        code_change_run_id: String,
+        attempt: i64,
+    },
 }
 
 #[derive(Debug)]
@@ -999,10 +1003,13 @@ impl ExecutionProjection {
         executable_identity: impl AsRef<str>,
     ) -> Result<Self, AppError> {
         let execution_kind = execution_kind.as_ref();
-        if !matches!(execution_kind, "codex" | "custom" | "diagnosis") {
+        if !matches!(
+            execution_kind,
+            "codex" | "custom" | "diagnosis" | "code_change_editor"
+        ) {
             return Err(AppError::Validation {
                 field: "execution_kind",
-                message: "must be codex, custom, or diagnosis",
+                message: "must be codex, custom, diagnosis, or code_change_editor",
             });
         }
 

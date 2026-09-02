@@ -32,7 +32,8 @@ use crate::{
     },
     models::{
         path_text, AgentContextMode, AgentRun, AgentRunEvent, AgentRunStatus, BatchJob,
-        BatchJobStatus, BatchRequest, BatchStatus, CampaignState, DecisionCycleState, Event,
+        BatchJobStatus, BatchRequest, BatchStatus, CampaignState, CodeChangeState,
+        DecisionCycleState, Event,
         EventKind, EventStatus, ExecutionProjection, Incident, IncidentTransition, IncidentUpdate,
         IntegrationEvent, InterventionStatus, NewAgentRun, NewBatchRequest, NewEvent, NewIncident,
         NewIntegrationEvent, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
@@ -3490,6 +3491,10 @@ pub struct AgentRunRecovery {
     pub failed_runs: usize,
     pub requeued_events: usize,
     pub dead_lettered_events: usize,
+    /// Editor-owned runs are deliberately left untouched during generic
+    /// startup recovery.  Their durable attempt binding lets the
+    /// code-change coordinator decide whether to resume or reject them.
+    pub preserved_code_change_editors: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3507,6 +3512,73 @@ enum AgentRunFinalizationPhase {
 pub enum GateFailurePolicy {
     Retry(RetryPolicy),
     Policy(PolicyViolation),
+}
+
+/// Validate the complete durable identity of an active code-change editor.
+/// The first boolean records whether any durable binding exists; the second
+/// records whether the binding is the exact single-row shape.  Keeping those
+/// states distinct lets generic recovery reject a binding attached to a
+/// non-editor execution projection instead of silently treating it as an
+/// ordinary run.
+fn editor_recovery_binding(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    agent_run_id: i64,
+) -> Result<(bool, bool), AppError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT a.code_change_run_id, a.attempt, a.agent_run_id,
+                    a.editor_session_id, a.status,
+                    r.state, r.editor_attempts, r.editor_session_id,
+                    c.project_id
+             FROM code_change_editor_attempts AS a
+             JOIN code_change_runs AS r
+               ON r.code_change_run_id = a.code_change_run_id
+             JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+             WHERE a.agent_run_id = ?1",
+        )
+        .map_err(database_error("prepare code-change editor recovery binding"))?;
+    let rows = statement
+        .query_map([agent_run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, CodeChangeState>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(database_error("query code-change editor recovery binding"))?;
+    let rows = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read code-change editor recovery binding"))?;
+    if rows.len() != 1 {
+        return Ok((!rows.is_empty(), false));
+    }
+    let (
+        _code_change_run_id,
+        attempt,
+        bound_agent_run_id,
+        session_id,
+        attempt_status,
+        state,
+        run_attempts,
+        run_session_id,
+        bound_project_id,
+    ) = &rows[0];
+    let valid = bound_project_id == project_id
+            && *bound_agent_run_id == agent_run_id
+            && matches!(*attempt, 1 | 2)
+            && matches!(attempt_status.as_str(), "reserved" | "running")
+            && *state == CodeChangeState::Editing
+            && *run_attempts == *attempt
+            && run_session_id.as_deref() == Some(session_id.as_str())
+            && !session_id.is_empty();
+    Ok((true, valid))
 }
 
 impl From<RetryPolicy> for GateFailurePolicy {
@@ -3555,6 +3627,18 @@ impl<'db> AgentRunRepository<'db> {
             .commit()
             .map_err(database_error("commit agent run insertion"))?;
         read_agent_run(&connection, run_id)
+    }
+
+    pub fn find_by_id(&self, run_id: i64) -> Result<Option<AgentRun>, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{} WHERE run_id = ?1", AGENT_RUN_SELECT),
+                [run_id],
+                agent_run_from_row,
+            )
+            .optional()
+            .map_err(database_error("find agent run"))
     }
 
     pub fn insert_with_events(
@@ -3710,6 +3794,7 @@ impl<'db> AgentRunRepository<'db> {
                 "SELECT run_id, launch_gate_state, log_path
                  FROM agent_runs
                  WHERE project_id = ?1 AND status IN ('starting', 'running')
+                   AND (execution_kind IS NULL OR execution_kind <> 'code_change_editor')
                    AND (
                        launch_gate_state = 'release_requested'
                        OR (
@@ -3994,7 +4079,8 @@ impl<'db> AgentRunRepository<'db> {
             let active_runs = {
                 let mut statement = transaction
                     .prepare(
-                        "SELECT run_id, status, launch_gate_state, policy_code, failure_stage
+                        "SELECT run_id, status, launch_gate_state, policy_code, failure_stage,
+                                execution_kind
                          FROM agent_runs
                          WHERE project_id = ?1 AND status IN ('starting', 'running')
                          ORDER BY run_id",
@@ -4007,7 +4093,8 @@ impl<'db> AgentRunRepository<'db> {
                             row.get::<_, AgentRunStatus>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
-                            row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<String>>(5)?,
                         ))
                     })
                     .map_err(database_error("query project interrupted agent runs"))?
@@ -4016,7 +4103,38 @@ impl<'db> AgentRunRepository<'db> {
                 rows
             };
 
-            for (run_id, run_status, gate_state, policy_code, failure_stage) in active_runs {
+            // A code-change editor is recoverable only when its execution
+            // projection and durable attempt binding agree exactly.  Do
+            // this validation for every active row before mutating any of
+            // them so a contradiction fails closed without a partial
+            // generic-recovery pass.
+            for (run_id, _run_status, _gate_state, _policy_code, _failure_stage, execution_kind)
+                in &active_runs
+            {
+                let (has_binding, valid_binding) =
+                    editor_recovery_binding(&transaction, &project.project_id, *run_id)?;
+                if execution_kind.as_deref() == Some("code_change_editor") && !valid_binding {
+                    return Err(AppError::Validation {
+                        field: "code_change_editor_attempt",
+                        message: "code-change editor execution has no exact durable attempt binding",
+                    });
+                }
+                if execution_kind.as_deref() != Some("code_change_editor") && has_binding {
+                    return Err(AppError::Validation {
+                        field: "execution_kind",
+                        message: "durable code-change editor binding requires code_change_editor execution kind",
+                    });
+                }
+            }
+
+            for (run_id, run_status, gate_state, policy_code, failure_stage, execution_kind) in active_runs {
+                if execution_kind.as_deref() == Some("code_change_editor") {
+                    // The preflight above established the exact binding.  Do
+                    // not resolve its event, interventions, or agent row as
+                    // generic interrupted work.
+                    recovery.preserved_code_change_editors += 1;
+                    continue;
+                }
                 if confirmed_pending_marker_ids.contains(&run_id)
                     && !(run_status == AgentRunStatus::Starting && gate_state == "pending")
                 {

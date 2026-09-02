@@ -1053,6 +1053,20 @@ impl<'db> CampaignRepository<'db> {
         limits: &CampaignLimits,
         now: i64,
     ) -> Result<AgentDecisionReservation, AppError> {
+        self.reserve_agent_run(campaign_id, decision_key, limits, now)
+    }
+
+    /// Reserve one ordinary agent-run budget slot for a durable owner.  The
+    /// subject key is intentionally caller-supplied so dedicated code-change
+    /// editors consume the same finite hourly budget as decisions without
+    /// changing decision reservation semantics.
+    pub fn reserve_agent_run(
+        &self,
+        campaign_id: &str,
+        decision_key: &str,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> Result<AgentDecisionReservation, AppError> {
         if decision_key.is_empty()
             || decision_key.len() > 256
             || decision_key.chars().any(char::is_control)

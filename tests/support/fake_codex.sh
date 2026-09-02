@@ -75,6 +75,45 @@ fi
 [ -n "$output" ] || exit 0
 [ -n "$prompt" ] || exit 70
 
+# Code-change editor fixture mode: the supervisor supplies a private,
+# descriptor-backed editor output path.  Keep this branch before decision
+# context parsing because editor prompts are not decision-context JSON.
+editor_artifact=0
+case "$output" in
+  */editor.json) editor_artifact=1 ;;
+esac
+if [ "$editor_artifact" -eq 1 ] || [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
+  if [ -n "${PUEUE_AGENT_TEST_EDITOR_CAPTURE:-}" ]; then
+    {
+      printf 'EDITOR_INVOCATION output=%s\n' "$output"
+      if [ -n "${PUEUE_AGENT_EDITOR_SESSION_ID+x}" ]; then
+        printf 'EDITOR_SESSION_ID=%s\n' "$PUEUE_AGENT_EDITOR_SESSION_ID"
+      fi
+    } >> "$PUEUE_AGENT_TEST_EDITOR_CAPTURE"
+  fi
+  case "${PUEUE_AGENT_TEST_EDITOR_OUTPUT_MODE:-ready}" in
+    malformed)
+      printf '%s\n' '{malformed-editor' > "$output"
+      exit 0
+      ;;
+    oversized)
+      head -c 65537 /dev/zero | tr '\0' 'x' > "$output"
+      exit 0
+      ;;
+    cannot_apply)
+      jq -cn '{schema_version:1,status:"cannot_apply",summary:"editor cannot apply the requested change",proposed_checks:[]}' > "$output"
+      exit 0
+      ;;
+    fail)
+      exit 17
+      ;;
+    *)
+      jq -cn '{schema_version:1,status:"ready",summary:"editor prepared candidate",proposed_checks:[{source:"cargo",argv:["cargo","test","--all-targets","--","--test-threads=1"],working_directory:"."}]}' > "$output"
+      exit 0
+      ;;
+  esac
+fi
+
 # Diagnosis-agent fixture mode: triggered by argv containing
 # --output-last-message plus PUEUE_AGENT_TEST_DIAGNOSE_MODE=1, or by a
 # health-diagnosis output artifact because the supervised Codex environment

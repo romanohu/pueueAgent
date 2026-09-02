@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use rusqlite::OptionalExtension;
 
 use crate::{
+    agent::{AgentHandle, AgentRunner, BoundCleanupHandle},
+    config,
     environment::SanitizedEnvironment,
     execution_policy::{
         CampaignLimits, CodeChangeTool, ExecutableAnchor, ExecutableIdentity, ProjectRootAnchor,
@@ -30,8 +32,14 @@ use crate::{
 };
 
 use crate::{
-    db::{CodeChangeRepository, Db},
-    models::{CodeChangeRun, CodeChangeState, ExperimentStatus},
+    db::{
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, CodeChangeRepository, Db,
+        EventRepository, ProjectRepository, ProposalRepository,
+    },
+    models::{AgentContextMode, CampaignState, CodeChangeRun, CodeChangeState, EventKind,
+        EventStatus, NewEvent, ExperimentStatus},
+    retry::RetryPolicy,
+    output::bounded_redacted_text,
 };
 
 #[cfg(unix)]
@@ -202,6 +210,533 @@ impl VerifiedCodeChangeWorktree {
     }
 }
 
+/// One editor launch owned by the daemon.  The worktree capability itself is
+/// deliberately not retained here: the candidate path is durably owned by
+/// the code-change run and is reopened with descriptor checks on the next
+/// coordinator pass.
+pub struct StartedCodeChangeEditor {
+    pub run_id: i64,
+    pub primary_event_id: i64,
+    pub code_change_run_id: String,
+    pub attempt: i64,
+    pub event_ids: Vec<i64>,
+    pub handle: AgentHandle,
+}
+
+/// Bounded accounting for one code-change advancement pass.  Agent handles
+/// and cleanup owners are returned to the daemon so it remains the sole
+/// owner of live native processes and private temporary directories.
+pub struct CodeChangeReport {
+    pub started: Vec<StartedCodeChangeEditor>,
+    pub cleanup: Vec<BoundCleanupHandle>,
+    pub advanced: usize,
+    pub deferred: usize,
+    pub rejected: usize,
+}
+
+impl Default for CodeChangeReport {
+    fn default() -> Self {
+        Self {
+            started: Vec::new(),
+            cleanup: Vec::new(),
+            advanced: 0,
+            deferred: 0,
+            rejected: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for CodeChangeReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodeChangeReport")
+            .field("started", &self.started.len())
+            .field("cleanup", &self.cleanup.len())
+            .field("advanced", &self.advanced)
+            .field("deferred", &self.deferred)
+            .field("rejected", &self.rejected)
+            .finish()
+    }
+}
+
+#[cfg(unix)]
+pub struct CodeChangeCoordinator<'a> {
+    db: &'a Db,
+    runner: &'a AgentRunner,
+    policy: &'a ResolvedExecutionPolicy,
+    limits: CampaignLimits,
+    lease_seconds: i64,
+}
+
+#[cfg(unix)]
+impl<'a> CodeChangeCoordinator<'a> {
+    pub fn new(
+        db: &'a Db,
+        runner: &'a AgentRunner,
+        policy: &'a ResolvedExecutionPolicy,
+        limits: CampaignLimits,
+    ) -> Self {
+        Self {
+            db,
+            runner,
+            policy,
+            limits,
+            lease_seconds: 600,
+        }
+    }
+
+    pub fn with_lease_seconds(mut self, lease_seconds: i64) -> Self {
+        self.lease_seconds = lease_seconds.max(1);
+        self
+    }
+
+    /// Advance only the worktree/editor portion of a code-change run.  Check
+    /// execution, candidate submission, evaluation, and cleanup remain owned
+    /// by later lifecycle stages.  Every external operation is preceded by a
+    /// fresh DB/state-root read and every launch is bound to an attempt before
+    /// native gate release.
+    pub async fn advance_ready(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<CodeChangeReport, AppError> {
+        let repository = CodeChangeRepository::new(self.db);
+        let runs = repository.list_recoverable(limit)?;
+        let mut report = CodeChangeReport::default();
+        for run in runs {
+            if !matches!(
+                run.state,
+                CodeChangeState::Reserved
+                    | CodeChangeState::PreparingWorktree
+                    | CodeChangeState::Editing
+            ) {
+                continue;
+            }
+
+            let Some(campaign) = CampaignRepository::new(self.db).find_by_id(&run.campaign_id)?
+            else {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "campaign_missing",
+                    "code-change campaign is missing",
+                    now,
+                )?;
+                report.rejected += 1;
+                continue;
+            };
+            let Some(project) = ProjectRepository::new(self.db).find_by_id(&campaign.project_id)?
+            else {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "project_missing",
+                    "code-change project is missing",
+                    now,
+                )?;
+                report.rejected += 1;
+                continue;
+            };
+            if campaign.state != CampaignState::Active
+                || !project.enabled
+                || project.paused
+                || project.halted_reason.is_some()
+            {
+                report.deferred += 1;
+                continue;
+            }
+            if AgentRunRepository::new(self.db)
+                .find_active_by_project(&project.project_id)?
+                .is_some()
+            {
+                report.deferred += 1;
+                continue;
+            }
+
+            let project_config = match config::load(&project.config_path) {
+                Ok(config) => config,
+                Err(_) => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "project_config_invalid",
+                        "code-change project configuration could not be loaded",
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    continue;
+                }
+            };
+            let original_policy = match self.runner.resolve_project_policy(&project, &project_config)
+            {
+                Ok(policy) => policy,
+                Err(_) => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "execution_policy_invalid",
+                        "code-change execution policy could not be resolved",
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    continue;
+                }
+            };
+            let proposal = ProposalRepository::new(self.db)
+                .find_for_campaign(&run.campaign_id, &run.proposal_id)?
+                .ok_or(AppError::Validation {
+                    field: "code_change.proposal_id",
+                    message: "code-change proposal is missing from its campaign",
+                })?;
+
+            let candidate = match run.state {
+                CodeChangeState::Reserved | CodeChangeState::PreparingWorktree => {
+                    let Some(project_lock) = self
+                        .runner
+                        .try_acquire_project_admission_lock(&original_policy)
+                        .map_err(AppError::from)?
+                    else {
+                        report.deferred += 1;
+                        continue;
+                    };
+                    if run.state == CodeChangeState::Reserved {
+                        repository.transition(
+                            &run.code_change_run_id,
+                            CodeChangeState::Reserved,
+                            CodeChangeState::PreparingWorktree,
+                            now,
+                        )?;
+                    }
+                    let candidate = prepare_code_change_worktree_for_run(
+                        self.policy,
+                        &project,
+                        &original_policy,
+                        self.db,
+                        &run.code_change_run_id,
+                    )
+                    .await;
+                    drop(project_lock);
+                    match candidate {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            repository.require_recovery(
+                                &run.code_change_run_id,
+                                "worktree_recovery_required",
+                                &bounded_redacted_text(&error.to_string()),
+                                now,
+                            )?;
+                            report.rejected += 1;
+                            continue;
+                        }
+                    }
+                }
+                CodeChangeState::Editing => match reopen_code_change_worktree_for_run(
+                    self.policy,
+                    &project,
+                    &original_policy,
+                    self.db,
+                    &run.code_change_run_id,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        repository.require_recovery(
+                            &run.code_change_run_id,
+                            "worktree_recovery_required",
+                            &bounded_redacted_text(&error.to_string()),
+                            now,
+                        )?;
+                        report.rejected += 1;
+                        continue;
+                    }
+                },
+                _ => continue,
+            };
+
+            if run.state != CodeChangeState::Editing {
+                repository.transition(
+                    &run.code_change_run_id,
+                    CodeChangeState::PreparingWorktree,
+                    CodeChangeState::Editing,
+                    now,
+                )?;
+            }
+            let candidate_policy = match self
+                .policy
+                .for_code_change_worktree(&project, &original_policy, candidate.root())
+            {
+                Ok(policy) => policy,
+                Err(_) => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "candidate_policy_invalid",
+                        "candidate root failed execution-policy rebinding",
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    continue;
+                }
+            };
+
+            let attempts = repository.list_editor_attempts(&run.code_change_run_id)?;
+            if attempts.len() > 2 || run.editor_attempts > 2 {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "editor_attempt_overflow",
+                    "code-change editor attempts exceed the bounded two-attempt policy",
+                    now,
+                )?;
+                report.rejected += 1;
+                continue;
+            }
+            let attempt = match attempts.last() {
+                None if run.editor_attempts == 0 => 1,
+                None => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "editor_attempt_binding_missing",
+                        "editor attempt counter has no durable attempt row",
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    continue;
+                }
+                Some(attempt)
+                    if matches!(attempt.status.as_str(), "reserved" | "running") => {
+                        report.deferred += 1;
+                        continue;
+                    }
+                Some(attempt) if attempt.status == "ready" => {
+                    // Task 4 ends at terminal editor persistence.  Task 5
+                    // consumes the accepted output and advances to checks.
+                    report.deferred += 1;
+                    continue;
+                }
+                Some(attempt) if attempt.status == "failed" && attempt.attempt == 1 => {
+                    if attempt.failure_code.as_deref() == Some("cannot_apply")
+                        || attempt.failure_code.as_deref() == Some("editor_session_missing")
+                    {
+                        repository.reject(
+                            &run.code_change_run_id,
+                            attempt.failure_code.as_deref().unwrap_or("cannot_apply"),
+                            attempt
+                                .failure_summary
+                                .as_deref()
+                                .unwrap_or("editor cannot apply the requested change"),
+                            now,
+                        )?;
+                        report.rejected += 1;
+                        continue;
+                    }
+                    2
+                }
+                Some(attempt) if attempt.status == "failed" && attempt.attempt == 2 => {
+                    repository.reject(
+                        &run.code_change_run_id,
+                        attempt.failure_code.as_deref().unwrap_or("editor_failed"),
+                        attempt
+                            .failure_summary
+                            .as_deref()
+                            .unwrap_or("second editor attempt failed"),
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    continue;
+                }
+                Some(_) => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "editor_attempt_state_invalid",
+                        "code-change editor attempt has an invalid terminal state",
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    continue;
+                }
+            };
+            if attempt == 2 && run.editor_attempts != 1 {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "editor_attempt_counter_mismatch",
+                    "resume attempt does not match the durable attempt counter",
+                    now,
+                )?;
+                report.rejected += 1;
+                continue;
+            }
+            let session_id = if attempt == 2 {
+                run.editor_session_id.clone().ok_or(AppError::Validation {
+                    field: "code_change.editor_session_id",
+                    message: "resume attempt requires one durable session ID",
+                })?
+            } else {
+                run.editor_session_id.clone().unwrap_or_default()
+            };
+            let prompt = editor_prompt(&campaign, &proposal, &run, candidate.path())?;
+            let mut editor_config = project_config.agent.clone();
+            editor_config.context = if attempt == 1 {
+                AgentContextMode::Fresh
+            } else {
+                AgentContextMode::Resume { session_id }
+            };
+
+            let Some(run_id_guard) = self
+                .runner
+                .try_acquire_run_id_admission_guard(self.db)
+                .map_err(AppError::from)?
+            else {
+                report.deferred += 1;
+                continue;
+            };
+            let Some(project_lock) = self
+                .runner
+                .try_acquire_project_admission_lock(&candidate_policy)
+                .map_err(AppError::from)?
+            else {
+                report.deferred += 1;
+                continue;
+            };
+            let event = NewEvent::new(
+                project.project_id.clone(),
+                EventKind::CodeChange,
+                format!(
+                    "code-change-editor:v1:{}:{}",
+                    run.code_change_run_id, attempt
+                ),
+                serde_json::json!({
+                    "code_change_run_id": run.code_change_run_id,
+                    "campaign_id": run.campaign_id,
+                    "proposal_id": run.proposal_id,
+                    "attempt": attempt,
+                }),
+                now,
+                now,
+            )
+            .with_campaign_lineage(run.campaign_id.clone(), Option::<String>::None);
+            let event = EventRepository::new(self.db).insert_idempotent(&event)?;
+            let event = if matches!(event.status, EventStatus::Pending | EventStatus::RetryWait) {
+                EventRepository::new(self.db)
+                    .claim_by_id(
+                        &project.project_id,
+                        event.event_id,
+                        now.checked_add(self.lease_seconds).ok_or(AppError::Validation {
+                            field: "lease_seconds",
+                            message: "cannot represent editor event lease",
+                        })?,
+                    )?
+            } else {
+                None
+            };
+            let Some(event) = event else {
+                drop((run_id_guard, project_lock));
+                report.deferred += 1;
+                continue;
+            };
+            let budget_key = format!(
+                "code-change-editor:v1:{}:{}",
+                run.code_change_run_id, attempt
+            );
+            match CampaignRepository::new(self.db).reserve_agent_run(
+                &run.campaign_id,
+                &budget_key,
+                &self.limits,
+                now,
+            )? {
+                AgentDecisionReservation::Reserved(_) => {}
+                AgentDecisionReservation::BudgetWaiting { next_eligible_at } => {
+                    EventRepository::new(self.db).transition_many(
+                        &[event.event_id],
+                        EventStatus::RetryWait,
+                        now,
+                        Some(next_eligible_at),
+                        None,
+                    )?;
+                    report.deferred += 1;
+                    continue;
+                }
+                AgentDecisionReservation::Deferred { .. } => {
+                    EventRepository::new(self.db).defer_claimed(&[event.event_id])?;
+                    report.deferred += 1;
+                    continue;
+                }
+            }
+            let started = self
+                .runner
+                .spawn_code_change_editor(
+                    self.db,
+                    &project,
+                    &candidate_policy,
+                    &editor_config,
+                    RetryPolicy {
+                        max_retries: project_config.agent.max_retries,
+                    },
+                    event.event_id,
+                    &[event.event_id],
+                    &run.code_change_run_id,
+                    attempt,
+                    &prompt,
+                    now,
+                    run_id_guard,
+                    project_lock,
+                )
+                .await;
+            match started {
+                Ok(handle) => {
+                    report.advanced += 1;
+                    report.started.push(StartedCodeChangeEditor {
+                        run_id: handle.run_id,
+                        primary_event_id: event.event_id,
+                        code_change_run_id: run.code_change_run_id.clone(),
+                        attempt,
+                        event_ids: vec![event.event_id],
+                        handle,
+                    });
+                }
+                Err(error) => {
+                    if let Some(cleanup) = error.cleanup {
+                        report.cleanup.push(cleanup);
+                    }
+                    report.deferred += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+fn editor_prompt(
+    campaign: &crate::models::Campaign,
+    proposal: &crate::models::Proposal,
+    run: &CodeChangeRun,
+    candidate_path: &Path,
+) -> Result<String, AppError> {
+    let candidate_path = candidate_path.to_str().ok_or(AppError::Validation {
+        field: "code_change.worktree",
+        message: "candidate root must be valid UTF-8 for the editor prompt",
+    })?;
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "objective": campaign.objective_text,
+        "hypothesis": proposal.hypothesis,
+        "proposal_id": proposal.proposal_id,
+        "code_change_run_id": run.code_change_run_id,
+        "base_sha": run.base_sha,
+        "candidate_root": candidate_path,
+        "working_directory": proposal.working_directory,
+        "instructions": "Modify only the candidate root. Do not mutate the registered project, protected refs, remotes, or credentials. Return only strict editor JSON with status ready or cannot_apply and bounded proposed checks. Do not commit.",
+    });
+    let json = serde_json::to_string(&payload).map_err(|source| AppError::Serialization {
+        operation: "serialize code-change editor prompt",
+        source,
+    })?;
+    if json.len() > 48 * 1024 {
+        return Err(AppError::Validation {
+            field: "code_change.prompt",
+            message: "editor prompt exceeds the bounded size",
+        });
+    }
+    Ok(format!(
+        "You are the supervisor-owned code-change editor. Follow this request exactly and emit the structured result.\n{json}"
+    ))
+}
+
 /// A durable, one-run cleanup capability.  It intentionally contains a
 /// clone of the database handle rather than a caller-supplied row: cleanup
 /// reloads the row immediately before authorization and therefore cannot be
@@ -311,6 +846,51 @@ pub async fn prepare_code_change_worktree_for_run(
         });
     }
     Ok(candidate)
+}
+
+/// Reopen the candidate worktree retained by an editing code-change run.
+/// Unlike preparation this never creates a second worktree; it revalidates
+/// the original Git boundary and descriptor identities before returning the
+/// same owned candidate capability for a bounded resume attempt.
+#[cfg(unix)]
+pub async fn reopen_code_change_worktree_for_run(
+    policy: &ResolvedExecutionPolicy,
+    project: &Project,
+    original: &ResolvedProjectExecutionPolicy,
+    db: &Db,
+    run_id: &str,
+) -> Result<VerifiedCodeChangeWorktree, AppError> {
+    let run = CodeChangeCleanupAuthorization::load(db, run_id)?.fresh_run()?;
+    verify_durable_run_scope(db, &run, project)?;
+    if run.state != CodeChangeState::Editing {
+        return Err(validation(
+            "code_change.state",
+            "must be editing when reopening an editor worktree",
+        ));
+    }
+    let expected_relative = owned_worktree_relative_path(&run.campaign_id, &run.proposal_id)?;
+    let expected_candidate_ref =
+        format!("refs/heads/{}", candidate_ref(&run.campaign_id, &run.proposal_id)?);
+    let expected_best_ref = format!("refs/heads/{}", best_ref(&run.campaign_id)?);
+    if Path::new(&run.worktree_relative_path) != expected_relative.as_path()
+        || run.worktree_id != run.code_change_run_id
+        || run.candidate_ref != expected_candidate_ref
+        || run.best_ref != expected_best_ref
+    {
+        return Err(recovery_required());
+    }
+    let mut manager = WorktreeManager::new_for_run(
+        policy,
+        project,
+        original,
+        &run.campaign_id,
+        &run.proposal_id,
+        &run.base_sha,
+        &run.worktree_id,
+        &expected_relative,
+    )?;
+    manager.inspect_base().await?;
+    manager.retain_existing_candidate().await
 }
 
 #[cfg(unix)]
@@ -1721,6 +2301,79 @@ impl WorktreeManager {
             Err(error) => return Err(self.cleanup_after_prepare_error(error.into()).await),
         };
         Ok(candidate)
+    }
+
+    async fn retain_existing_candidate(mut self) -> Result<VerifiedCodeChangeWorktree, AppError> {
+        let baseline = self.baseline.clone().ok_or(AppError::Runtime {
+            operation: "reopen code-change worktree before base inspection",
+        })?;
+        self.policy.verify_code_change_state_root()?;
+        self.worktree_parents = Some(WorktreeParentProof::retain(
+            &self.policy,
+            &self.campaign_id,
+        )?);
+        if path_has_symlink_component(&self.worktree_path)? {
+            return Err(recovery_required());
+        }
+        let candidate = ProjectRootAnchor::resolve(&self.worktree_path)
+            .map_err(AppError::from)?
+            .verify_identity()
+            .map_err(AppError::from)?;
+        if candidate.anchor.canonical_path != self.worktree_path {
+            return Err(recovery_required());
+        }
+        let repository = GitRepositoryProof::capture_candidate(
+            &candidate,
+            &baseline.repository,
+        )?;
+        self.candidate_repository = Some(repository);
+        self.candidate_identity = Some(candidate.anchor.identity);
+        let original_root = self.original.root_anchor.verify_identity()?;
+        let working_directory = VerifiedWorkingDirectory::root(&original_root)?;
+        let common_directory = inspect_common_directory(&self, &original_root, &working_directory).await?;
+        if common_directory != baseline.common_directory {
+            return Err(recovery_required());
+        }
+        let owned_ref = format!(
+            "refs/heads/{}",
+            candidate_ref(&self.campaign_id, &self.proposal_id)?,
+        );
+        let best_ref_name = format!("refs/heads/{}", best_ref(&self.campaign_id)?);
+        let protected_ref_digest = self
+            .protected_ref_digest(
+                &original_root,
+                &working_directory,
+                &[owned_ref.as_str(), best_ref_name.as_str()],
+            )
+            .await?;
+        if protected_ref_digest != baseline.protected_ref_digest
+            || self
+                .remote_config_digest(&original_root, &working_directory)
+                .await?
+                != baseline.remote_config_digest
+        {
+            return Err(recovery_required());
+        }
+        let parents = self.worktree_parents.as_ref().ok_or_else(recovery_required)?;
+        let candidate = candidate.mark_code_change_owned(
+            self.policy.code_change_state_root_identity(),
+            parents.worktrees_identity,
+            parents.campaign_identity,
+            parents.state_root.clone(),
+            parents.worktrees.clone(),
+            parents.campaign.clone(),
+            &self.worktree_path,
+            &self.worktree_relative_path,
+            &self.campaign_id,
+            &self.proposal_id,
+            &self.worktree_id,
+        )?;
+        Ok(VerifiedCodeChangeWorktree {
+            manager: self,
+            candidate,
+            diff_facts: None,
+            candidate_sha: None,
+        })
     }
 
     async fn cleanup_after_prepare_error(&self, original: AppError) -> AppError {
@@ -6130,6 +6783,10 @@ mod tests {
             r#"{{"schema_version":1,"status":"ready","summary":"ok","proposed_checks":[{{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"."}}]}}"#
         );
         assert!(parse_editor_output(valid.as_bytes(), root.path(), &limits, &available).is_ok());
+        let cannot_apply =
+            br#"{"schema_version":1,"status":"cannot_apply","summary":"blocked","proposed_checks":[]}"#;
+        assert!(parse_editor_output(cannot_apply, root.path(), &limits, &available).is_ok());
+        assert!(parse_editor_output(br#"{malformed-editor"#, root.path(), &limits, &available).is_err());
         let absolute = format!(
             r#"{{"schema_version":1,"status":"ready","summary":"ok","proposed_checks":[{{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"/tmp"}}]}}"#
         );

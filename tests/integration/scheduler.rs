@@ -206,6 +206,8 @@ struct SchedulerHarness {
 impl SchedulerHarness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         let harness = Self { temp, db, now: 100 };
         harness.register_project("project-a", "pa-project-a", "/bin/echo", "");
@@ -219,6 +221,19 @@ impl SchedulerHarness {
     fn register_project(&self, project_id: &str, group: &str, program: &str, context: &str) {
         let root = self.root(project_id);
         fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        #[cfg(unix)]
+        {
+            let secure_mode = fs::Permissions::from_mode(0o700);
+            let agent_root = root.join(".pueue-agent");
+            let logs_root = agent_root.join("logs");
+            for directory in [
+                root.as_path(),
+                agent_root.as_path(),
+                logs_root.as_path(),
+            ] {
+                fs::set_permissions(directory, secure_mode.clone()).unwrap();
+            }
+        }
         fs::write(root.join(".pueue-agent/STATE.md"), "state reference").unwrap();
         fs::write(
             root.join(".pueue-agent/instructions.md"),

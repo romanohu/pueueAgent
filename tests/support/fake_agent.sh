@@ -24,6 +24,36 @@ for environment_name in HOME PATH TMPDIR; do
   fi
 done
 
+# Code-change editor fixture mode.  The output path is descriptor-backed and
+# supplied by the supervisor, so no project pathname is inferred here.
+if [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
+  printf 'EDITOR_MODE=%s\n' "${PUEUE_AGENT_EDITOR_MODE:-fresh}" >> "$PUEUE_AGENT_TEST_AGENT_LOG"
+  if [ -n "${PUEUE_AGENT_EDITOR_SESSION_ID+x}" ]; then
+    printf 'EDITOR_SESSION_ID=%s\n' "$PUEUE_AGENT_EDITOR_SESSION_ID" >> "$PUEUE_AGENT_TEST_AGENT_LOG"
+  fi
+  case "${PUEUE_AGENT_TEST_EDITOR_OUTPUT_MODE:-ready}" in
+    malformed)
+      printf '%s\n' '{malformed-editor' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      exit 0
+      ;;
+    oversized)
+      head -c 65537 /dev/zero | tr '\0' 'x' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      exit 0
+      ;;
+    cannot_apply)
+      printf '%s\n' '{"schema_version":1,"status":"cannot_apply","summary":"editor cannot apply the requested change","proposed_checks":[]}' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      exit 0
+      ;;
+    fail)
+      exit 17
+      ;;
+    *)
+      printf '%s\n' '{"schema_version":1,"status":"ready","summary":"editor prepared candidate","proposed_checks":[{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"."}]}' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      exit 0
+      ;;
+  esac
+fi
+
 fail_first="${PUEUE_AGENT_TEST_AGENT_FAIL_FIRST:-0}"
 case "$fail_first" in
   ''|*[!0-9]*) exit 64 ;;

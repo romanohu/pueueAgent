@@ -309,6 +309,102 @@ impl CodexArgvBuilder {
         )
     }
 
+    pub fn build_editor(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_editor_for_private_temp_path(config, prompt, private_temp_target_path())
+    }
+
+    pub(crate) fn build_editor_with_private_temp(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_editor_for_private_temp_path(config, prompt, private_tmp.target_path())
+    }
+
+    fn build_editor_for_private_temp_path(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_temp_path: &Path,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.preflight_editor(config, prompt)?;
+
+        let root = path_text(&self.policy.root_anchor.canonical_path)?;
+        let private_tmp = path_text(private_temp_path)?;
+        let schema = path_text(&private_tmp_path(private_tmp.as_str(), "editor-schema.json"))?;
+        let output = path_text(&private_tmp_path(private_tmp.as_str(), "editor.json"))?;
+        let mut argv = vec![
+            OsString::from("--ask-for-approval"),
+            OsString::from("never"),
+            OsString::from("exec"),
+            OsString::from("--ignore-user-config"),
+            OsString::from("--ignore-rules"),
+            OsString::from("--strict-config"),
+            OsString::from("--sandbox"),
+            OsString::from("workspace-write"),
+            OsString::from("-C"),
+            OsString::from(root.clone()),
+            OsString::from("--output-schema"),
+            OsString::from(schema),
+            OsString::from("--output-last-message"),
+            OsString::from(output),
+        ];
+        push_codex_overrides(&mut argv, config)?;
+        push_config(
+            &mut argv,
+            format!(
+                "sandbox_workspace_write.network_access={}",
+                network_mode(self.policy.network)
+            ),
+        );
+        push_config(&mut argv, "sandbox_workspace_write.exclude_slash_tmp=true".to_owned());
+        push_config(
+            &mut argv,
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true".to_owned(),
+        );
+        push_config(
+            &mut argv,
+            format!(
+                "sandbox_workspace_write.writable_roots=[{},{}]",
+                toml_quote(&root),
+                toml_quote(&private_tmp),
+            ),
+        );
+        push_config(
+            &mut argv,
+            format!(
+                "projects={{{}={{trust_level=\"untrusted\"}}}}",
+                toml_quote(&root)
+            ),
+        );
+        push_config(&mut argv, "allow_login_shell=false".to_owned());
+        push_config(
+            &mut argv,
+            format!(
+                "shell_environment_policy={{inherit=\"all\",ignore_default_excludes=false,experimental_use_profile=false,filters={{{}}}}}",
+                environment_filters(&self.policy.task_environment_allow)?
+            ),
+        );
+        if let AgentContextMode::Resume { session_id } = &config.context {
+            let owned = codex_session::verify_project_ownership(
+                &self.policy.codex_home,
+                &self.policy.root_anchor.canonical_path,
+                session_id,
+            )
+            .map_err(map_session_error)?;
+            argv.push(OsString::from("resume"));
+            argv.push(OsString::from(owned));
+        }
+        argv.push(OsString::from("--"));
+        argv.push(OsString::from(prompt));
+        Ok(argv)
+    }
+
     fn build_named_output_with_private_temp(
         &self,
         config: &AgentConfig,
@@ -502,6 +598,40 @@ impl CodexArgvBuilder {
         Ok(())
     }
 
+    pub(crate) fn preflight_editor(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+    ) -> Result<(), PolicyViolation> {
+        if self.policy.agent_kind != AgentKind::BuiltInCodex
+            || config.program != "codex"
+            || !self.capabilities.supports_decision_policy()
+            || !self.capabilities.workspace_write
+            || prompt.contains('\0')
+            || config
+                .codex
+                .model
+                .as_deref()
+                .is_some_and(|model| model.is_empty() || model.contains('\0'))
+        {
+            return Err(unsafe_argument());
+        }
+        validate_compatibility_args(&config.args)?;
+        match &config.context {
+            AgentContextMode::Fresh => {}
+            AgentContextMode::Resume { session_id } => {
+                codex_session::verify_project_ownership(
+                    &self.policy.codex_home,
+                    &self.policy.root_anchor.canonical_path,
+                    session_id,
+                )
+                .map_err(map_session_error)?;
+            }
+            AgentContextMode::ResumeLatest => return Err(unsafe_argument()),
+        }
+        Ok(())
+    }
+
     fn validate_capabilities(&self) -> Result<(), PolicyViolation> {
         self.capabilities
             .supports_forced_policy()
@@ -544,6 +674,10 @@ fn validate_compatibility_args(args: &[String]) -> Result<(), PolicyViolation> {
 
 fn path_text(path: &Path) -> Result<String, PolicyViolation> {
     path.to_str().map(str::to_owned).ok_or_else(unsafe_argument)
+}
+
+fn private_tmp_path(base: &str, name: &str) -> std::path::PathBuf {
+    Path::new(base).join(name)
 }
 
 fn push_config(argv: &mut Vec<OsString>, value: String) {
