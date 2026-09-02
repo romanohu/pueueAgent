@@ -4321,6 +4321,10 @@ max_agent_runs = 10
         ),
     )
     .unwrap();
+    let trusted_git = fixture_root.join("execution-policy-bin/git");
+    fs::create_dir_all(trusted_git.parent().unwrap()).unwrap();
+    fs::copy("/usr/bin/git", &trusted_git).unwrap();
+    fs::set_permissions(&trusted_git, fs::Permissions::from_mode(0o700)).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         &fixture_root,
         &[("editor-project", &project_root, &editor)],
@@ -4437,6 +4441,35 @@ async fn spawn_editor_fixture_attempt(
     context: AgentContextMode,
     now: i64,
 ) -> AgentHandle {
+    spawn_editor_fixture_attempt_result(
+        runner,
+        db,
+        project,
+        candidate_policy,
+        config,
+        code_change_run_id,
+        campaign_id,
+        attempt,
+        context,
+        now,
+    )
+    .await
+    .expect("editor fixture launch")
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn spawn_editor_fixture_attempt_result(
+    runner: &AgentRunner,
+    db: &Db,
+    project: &Project,
+    candidate_policy: &ResolvedProjectExecutionPolicy,
+    config: &AgentConfig,
+    code_change_run_id: &str,
+    campaign_id: &str,
+    attempt: i64,
+    context: AgentContextMode,
+    now: i64,
+) -> Result<AgentHandle, pueue_agent::agent::AgentSpawnError> {
     let event = EventRepository::new(db)
         .insert_idempotent(
             &NewEvent::new(
@@ -4484,7 +4517,6 @@ async fn spawn_editor_fixture_attempt(
             project_lock,
         )
         .await
-        .expect("editor fixture launch")
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -4756,6 +4788,24 @@ max_agent_runs = 10
     assert_eq!(second_attempt.editor_session_id, session);
     let final_run = CodeChangeRepository::new(&db).find_by_id(run_id).unwrap().unwrap();
     assert_eq!(final_run.state, pueue_agent::models::CodeChangeState::Rejected);
+    assert!(final_run.cleanup_completed_at.is_none());
+    assert!(CodeChangeRepository::new(&db)
+        .list_recoverable(100)
+        .unwrap()
+        .iter()
+        .any(|run| {
+            run.code_change_run_id == run_id
+                && run.state == pueue_agent::models::CodeChangeState::Rejected
+                && run.cleanup_completed_at.is_none()
+        }));
+    assert!(EventRepository::new(&db)
+        .recent_events(&project.project_id, 100)
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event.dedup_key == format!("code-change:v1:{run_id}:rejected:2")
+                && event.status == EventStatus::Completed
+        }));
     assert_eq!(
         AgentRunRepository::new(&db)
             .find_by_id(second_run_id)
@@ -4769,6 +4819,225 @@ max_agent_runs = 10
     let capture = fs::read_to_string(invocation_state.with_extension("log")).unwrap();
     assert!(capture.contains("mode=fresh;session="));
     assert!(capture.contains(&format!("mode=resume;session={session}")));
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_post_binding_setup_failure_finishes_reserved_attempt() {
+    let fixture = code_change_editor_fixture("fail");
+    let blocked_service = fixture
+        .candidate_policy
+        .root_anchor
+        .canonical_path
+        .join(".pueue-agent");
+    fs::write(&blocked_service, b"not a directory").unwrap();
+
+    let error = match spawn_editor_fixture_attempt_result(
+        &fixture.runner,
+        &fixture.db,
+        &fixture.project,
+        &fixture.candidate_policy,
+        &fixture.config,
+        &fixture.run_id,
+        &fixture.campaign_id,
+        1,
+        AgentContextMode::Fresh,
+        10,
+    )
+    .await
+    {
+        Ok(_) => panic!("post-binding setup failure should reject the launch"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.stage,
+        pueue_agent::agent::AgentSpawnStage::RunBoundPreMarker {
+            resolved: true,
+            ..
+        }
+    ));
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .expect("editor attempt reservation");
+    assert_eq!(attempt.status, "failed");
+    assert_eq!(attempt.failure_code.as_deref(), Some("editor_launch"));
+    assert!(attempt.finished_at.is_some());
+    let first_failure_code = attempt.failure_code.clone();
+    let first_failure_summary = attempt.failure_summary.clone();
+    let first_finished_at = attempt.finished_at;
+    assert!(!CodeChangeRepository::new(&fixture.db)
+        .fail_editor_attempt_for_agent_run(
+            attempt.agent_run_id,
+            "replayed_editor_launch",
+            "replayed failure must not overwrite the first terminal result",
+            99,
+        )
+        .unwrap());
+    let replayed_attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .expect("replayed editor attempt");
+    assert_eq!(replayed_attempt.failure_code, first_failure_code);
+    assert_eq!(replayed_attempt.failure_summary, first_failure_summary);
+    assert_eq!(replayed_attempt.finished_at, first_finished_at);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn secure_editor_git_fixture_tree(path: &std::path::Path) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            secure_editor_git_fixture_tree(&entry.unwrap().path());
+        }
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_prebinding_failure_resolves_event_without_duplicate_budget() {
+    let fixture = code_change_editor_fixture("fail");
+    let project_root = fixture.project.root_path.clone();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("base.txt"), b"base\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", ".gitignore", "base.txt"]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    secure_editor_git_fixture_tree(&project_root.join(".git"));
+    fs::set_permissions(
+        project_root.join(".gitignore"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(project_root.join("base.txt"), fs::Permissions::from_mode(0o600))
+        .unwrap();
+
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::remove_dir_all(candidate_root).unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'reserved', base_sha = ?1,
+                 candidate_ref = ?2, best_ref = ?3, updated_at = 4
+             WHERE code_change_run_id = ?4",
+            rusqlite::params![
+                base_sha,
+                "refs/heads/campaign/editor-campaign/candidate/editor-proposal",
+                "refs/heads/campaign/editor-campaign/best",
+                &fixture.run_id,
+            ],
+        )
+        .unwrap();
+    let guard_path = fixture
+        .db
+        .path()
+        .parent()
+        .expect("editor fixture state directory")
+        .join("upgrade.lock.guard");
+    let guard_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(guard_path)
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
+            -> std::os::raw::c_int;
+    }
+    assert_eq!(unsafe { flock(guard_file.as_raw_fd(), 2) }, 0);
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(10, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 1);
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        pueue_agent::models::CodeChangeState::RecoveryRequired
+    );
+    let event = EventRepository::new(&fixture.db)
+        .recent_events(&fixture.project.project_id, 100)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.dedup_key == "code-change-editor:v1:editor-run:1")
+        .expect("editor event");
+    assert_eq!(event.status, EventStatus::DeadLetter);
+    assert_eq!(event.attempts, 1);
+    let reservation_count: i64 = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations
+             WHERE campaign_id = ?1 AND dimension = 'agent_run' AND subject_key = ?2",
+            rusqlite::params![&fixture.campaign_id, "code-change-editor:v1:editor-run:1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_count, 1);
+    let second = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(11, 10)
+    .await
+    .unwrap();
+    assert_eq!(second.deferred, 0);
+    let reservation_count_after_retry: i64 = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations
+             WHERE campaign_id = ?1 AND dimension = 'agent_run' AND subject_key = ?2",
+            rusqlite::params![&fixture.campaign_id, "code-change-editor:v1:editor-run:1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservation_count_after_retry, 1);
+    assert!(CodeChangeRepository::new(&fixture.db)
+        .list_editor_attempts(&fixture.run_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[cfg(all(unix, target_os = "linux"))]

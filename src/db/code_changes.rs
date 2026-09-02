@@ -194,6 +194,76 @@ impl<'db> CodeChangeRepository<'db> {
             .map_err(database_error("read code-change editor attempts"))
     }
 
+    /// Finish an editor attempt whose agent run was durably bound but could
+    /// not reach the native-handle boundary.  The lookup and terminal write
+    /// are deliberately idempotent: generic launch cleanup may retry this
+    /// path after the agent run itself has already been finalized.
+    pub fn fail_editor_attempt_for_agent_run(
+        &self,
+        agent_run_id: i64,
+        failure_code: &str,
+        failure_summary: &str,
+        finished_at: i64,
+    ) -> Result<bool, AppError> {
+        if agent_run_id <= 0 {
+            return Err(AppError::Validation {
+                field: "agent_run_id",
+                message: "must be positive",
+            });
+        }
+        let connection = self.db.connect()?;
+        let binding: Option<(String, i64, String)> = connection
+            .query_row(
+                "SELECT code_change_run_id, attempt, status
+                 FROM code_change_editor_attempts
+                 WHERE agent_run_id = ?1",
+                [agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(database_error("find bound editor launch failure"))?;
+        let Some((run_id, attempt, status)) = binding else {
+            return Ok(false);
+        };
+        if !matches!(status.as_str(), "reserved" | "running") {
+            return Ok(false);
+        }
+        let result = self.finish_editor_attempt(
+            &run_id,
+            attempt,
+            "failed",
+            None,
+            Some(failure_code),
+            Some(failure_summary),
+            None,
+            finished_at,
+            finished_at,
+        );
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                // A terminal output path may win the race after the lookup
+                // above.  Preserve that durable winner; a later cleanup
+                // retry must not turn a ready/cannot-apply result back into
+                // a launch failure.
+                let connection = self.db.connect()?;
+                let status: String = connection
+                    .query_row(
+                        "SELECT status FROM code_change_editor_attempts
+                         WHERE code_change_run_id = ?1 AND attempt = ?2",
+                        params![run_id, attempt],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error("recheck editor launch failure"))?;
+                if !matches!(status.as_str(), "reserved" | "running") {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub fn list_recoverable(&self, limit: usize) -> Result<Vec<CodeChangeRun>, AppError> {
         let limit = limit.min(MAX_CODE_CHANGE_LIMIT) as i64;
         let connection = self.db.connect()?;

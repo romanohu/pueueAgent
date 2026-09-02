@@ -303,6 +303,12 @@ pub struct BoundCleanupHandle {
     intent: BoundFinalizationIntent,
     kind: BoundCleanupKind,
     decision_failure: Option<DecisionFailureContext>,
+    editor_failure: Option<EditorLaunchFailure>,
+}
+
+struct EditorLaunchFailure {
+    agent_run_id: i64,
+    summary: String,
 }
 
 enum BoundCleanupKind {
@@ -396,6 +402,19 @@ impl BoundCleanupHandle {
         finished_at: i64,
         deadline: Option<Instant>,
     ) -> Result<(), AppError> {
+        if let Some(editor_failure) = self.editor_failure.take() {
+            if let Err(error) = CodeChangeRepository::new(db)
+                .fail_editor_attempt_for_agent_run(
+                    editor_failure.agent_run_id,
+                    "editor_launch",
+                    &editor_failure.summary,
+                    finished_at,
+                )
+            {
+                self.editor_failure = Some(editor_failure);
+                return Err(error);
+            }
+        }
         let needs_finalization = matches!(
             &self.kind,
             BoundCleanupKind::LiveChild {
@@ -1220,6 +1239,7 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     retry_policy,
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1248,6 +1268,7 @@ impl AgentRunner {
             .root_anchor
             .verify_identity()
             .map_err(|error| {
+                let error = error.into();
                 resolve_bound_role_failure(
                     db,
                     decision_failure.as_ref(),
@@ -1256,11 +1277,13 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     retry_policy,
-                    error.into(),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
+                    error,
                 )
             })?;
         let temp = PrivateRunTemp::create(&verified_root, run.run_id)
             .map_err(|error| {
+                let error = error.into();
                 resolve_bound_role_failure(
                     db,
                     decision_failure.as_ref(),
@@ -1269,7 +1292,8 @@ impl AgentRunner {
                     run.run_id,
                     now,
                     retry_policy,
-                    error.into(),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
+                    error,
                 )
             })?;
         if matches!(&role, AgentRunRole::Decision { .. }) {
@@ -1288,6 +1312,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1308,6 +1333,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1328,6 +1354,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1349,6 +1376,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1436,6 +1464,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1477,6 +1506,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1497,6 +1527,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1542,6 +1573,7 @@ impl AgentRunner {
                     },
                     decision_failure,
                     intent,
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
                 ));
             }
@@ -1567,6 +1599,7 @@ impl AgentRunner {
                 },
                 decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
+                editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
             )
             .await);
@@ -1588,6 +1621,7 @@ impl AgentRunner {
                 },
                 decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
+                editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
             )
             .await);
@@ -1608,6 +1642,7 @@ impl AgentRunner {
                 },
                 decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
+                editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
             )
             .await);
@@ -1628,6 +1663,7 @@ impl AgentRunner {
                 retained_authority,
                 decision_failure.clone(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
+                editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
             )
             .await);
@@ -1644,6 +1680,7 @@ impl AgentRunner {
                 BoundFinalizationIntent::PostMarkerExecutionUnknown {
                     reason: "post_marker_dispatch_ack".to_owned(),
                 },
+                editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
             )
             .await);
@@ -1837,6 +1874,17 @@ fn policy_from_error(source: &AppError) -> Option<PolicyViolation> {
     }
 }
 
+fn editor_launch_failure_for_role(
+    role: &AgentRunRole,
+    run_id: i64,
+    source: &AppError,
+) -> Option<EditorLaunchFailure> {
+    matches!(role, AgentRunRole::CodeChangeEditor { .. }).then(|| EditorLaunchFailure {
+        agent_run_id: run_id,
+        summary: bounded_redacted_text(&source.to_string()),
+    })
+}
+
 fn resolve_bound_failure(
     repository: &AgentRunRepository<'_>,
     project: &Project,
@@ -1910,6 +1958,7 @@ fn resolve_unowned_decision_bind_failure(
             intent,
             kind: BoundCleanupKind::PendingFinalization,
             decision_failure: None,
+            editor_failure: None,
         });
     }
     error
@@ -1943,6 +1992,7 @@ fn pending_decision_finalization_error(
             intent,
             decision_failure: Some(decision_failure),
             kind: BoundCleanupKind::PendingMarker,
+            editor_failure: None,
         }),
     }
 }
@@ -1956,6 +2006,7 @@ fn resolve_retained_temp_failure(
     retained_authority: RetainedLaunchAuthority,
     decision_failure: Option<DecisionFailureContext>,
     intent: BoundFinalizationIntent,
+    editor_failure: Option<EditorLaunchFailure>,
     source: AppError,
 ) -> AgentSpawnError {
     let post_marker = intent.is_post_marker();
@@ -1969,6 +2020,7 @@ fn resolve_retained_temp_failure(
             retained_authority,
             finalized: false,
         },
+        editor_failure,
     };
     match cleanup.retry_finalization_and_cleanup(db, finished_at, None) {
         Ok(()) => AgentSpawnError {
@@ -2015,6 +2067,7 @@ fn resolve_bound_role_failure(
     run_id: i64,
     finished_at: i64,
     policy: RetryPolicy,
+    editor_failure: Option<EditorLaunchFailure>,
     source: AppError,
 ) -> AgentSpawnError {
     if let Some(decision_failure) = decision_failure {
@@ -2026,6 +2079,40 @@ fn resolve_bound_role_failure(
                 BoundFinalizationIntent::from_failure(&source, policy),
                 error,
             );
+        }
+    }
+    if let Some(editor_failure) = editor_failure {
+        if let Err(error) = CodeChangeRepository::new(db).fail_editor_attempt_for_agent_run(
+            editor_failure.agent_run_id,
+            "editor_launch",
+            &editor_failure.summary,
+            finished_at,
+        ) {
+            let intent = BoundFinalizationIntent::from_failure(&source, policy);
+            let post_marker = intent.is_post_marker();
+            return AgentSpawnError {
+                stage: if post_marker {
+                    AgentSpawnStage::PostMarker {
+                        run_id,
+                        resolved: false,
+                    }
+                } else {
+                    AgentSpawnStage::RunBoundPreMarker {
+                        run_id,
+                        resolved: false,
+                    }
+                },
+                policy: policy_from_error(&source),
+                source: error,
+                cleanup: Some(BoundCleanupHandle {
+                    project_id: project.project_id.clone(),
+                    run_id,
+                    intent,
+                    kind: BoundCleanupKind::PendingFinalization,
+                    decision_failure: None,
+                    editor_failure: Some(editor_failure),
+                }),
+            };
         }
     }
     resolve_bound_failure(
@@ -2067,6 +2154,7 @@ async fn resolve_live_child_failure(
     retained_authority: RetainedLaunchAuthority,
     decision_failure: Option<DecisionFailureContext>,
     intent: BoundFinalizationIntent,
+    editor_failure: Option<EditorLaunchFailure>,
     source: AppError,
 ) -> AgentSpawnError {
     let stage = if intent.is_post_marker() {
@@ -2093,6 +2181,7 @@ async fn resolve_live_child_failure(
             terminated,
             finalized: false,
         },
+        editor_failure,
     };
 
     let termination_uncertain = match &cleanup.kind {
@@ -3822,6 +3911,7 @@ mod tests {
                 reason: "original_post_marker_failure".to_owned(),
             },
             decision_failure: None,
+            editor_failure: None,
             kind: BoundCleanupKind::LiveChild {
                 child,
                 retained_authority: RetainedLaunchAuthority::Test,

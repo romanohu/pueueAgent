@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use rusqlite::OptionalExtension;
 
 use crate::{
-    agent::{AgentHandle, AgentRunner, BoundCleanupHandle},
+    agent::{
+        AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle,
+    },
     config,
     environment::SanitizedEnvironment,
     execution_policy::{
@@ -304,6 +306,9 @@ impl<'a> CodeChangeCoordinator<'a> {
         let runs = repository.list_recoverable(limit)?;
         let mut report = CodeChangeReport::default();
         for run in runs {
+            // Rejected runs with a NULL cleanup marker remain recoverable as
+            // the durable Task 6 cleanup schedule.  Task 4 ends after
+            // terminal editor persistence and must not reopen or clean them.
             if !matches!(
                 run.state,
                 CodeChangeState::Reserved
@@ -690,10 +695,76 @@ impl<'a> CodeChangeCoordinator<'a> {
                     });
                 }
                 Err(error) => {
-                    if let Some(cleanup) = error.cleanup {
+                    let AgentSpawnError {
+                        stage,
+                        source,
+                        policy,
+                        cleanup,
+                    } = error;
+                    if let Some(cleanup) = cleanup {
                         report.cleanup.push(cleanup);
                     }
-                    report.deferred += 1;
+                    if matches!(stage, AgentSpawnStage::PreBinding) {
+                        let events = EventRepository::new(self.db);
+                        let retry_policy = RetryPolicy {
+                            max_retries: project_config.agent.max_retries,
+                        };
+                        let terminal_resolution = policy.is_some()
+                            || matches!(
+                                crate::retry::retry_decision(event.attempts, now, retry_policy),
+                                crate::retry::RetryDecision::DeadLetter
+                            );
+                        // Record a terminal code-change state before the
+                        // unbound event is dead-lettered.  If the process
+                        // stops between these independent repository calls,
+                        // startup still sees a terminal run rather than an
+                        // unclaimable editing row.
+                        if terminal_resolution {
+                            repository.require_recovery(
+                                &run.code_change_run_id,
+                                "editor_launch_failed",
+                                &bounded_redacted_text(&source.to_string()),
+                                now,
+                            )?;
+                        }
+                        if let Some(violation) = policy.as_ref() {
+                            events.dead_letter_claimed_without_run(
+                                &project.project_id,
+                                &[event.event_id],
+                                now,
+                                violation,
+                            )?;
+                        } else {
+                            events.resolve_claimed_without_run(
+                                &project.project_id,
+                                &[event.event_id],
+                                now,
+                                &source.to_string(),
+                                retry_policy,
+                            )?;
+                        }
+                        let resolved_event = events
+                            .find_by_id(event.event_id)?
+                            .ok_or(AppError::Validation {
+                                field: "event_id",
+                                message: "editor event disappeared during launch failure resolution",
+                            })?;
+                        if resolved_event.status == EventStatus::DeadLetter {
+                            if !terminal_resolution {
+                                repository.require_recovery(
+                                    &run.code_change_run_id,
+                                    "editor_launch_failed",
+                                    &bounded_redacted_text(&source.to_string()),
+                                    now,
+                                )?;
+                            }
+                            report.rejected += 1;
+                        } else {
+                            report.deferred += 1;
+                        }
+                    } else {
+                        report.deferred += 1;
+                    }
                 }
             }
         }
