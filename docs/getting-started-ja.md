@@ -50,7 +50,7 @@ $EDITOR .pueue-agent/config.toml
 $EDITOR .pueue-agent/STATE.md
 ```
 
-インストール済みの環境で campaign を開始する最短手順は次の4段階です。
+インストール済みの環境で campaign を開始する最短手順は次の4段階です。自動評価まで使う場合は、投入前に後述の[結果出力](#評価結果を出力する)を準備し、`submit` に `--metric-name` / `--metric-direction` を付けてください。
 
 ```bash
 pueue-agent init
@@ -77,7 +77,7 @@ Git project では、`init` が tracked な `.gitignore` を変更せず、Git �
 
 ## Agent context を選ぶ
 
-`agent.context.mode` の既定値は `fresh` です。通常は run ごとに新しい context を使います。
+`agent.context.mode` の既定値は `fresh` です。この設定は通常の agent run と Periodic DeepCheck に適用されます。campaign の decision / diagnosis agent は常に fresh、code-change editor は初回 fresh・修正時に同じ session を一度 resume という別の規則です。
 
 ```toml
 [agent.context]
@@ -147,28 +147,94 @@ pueue-agent submit -- python train.py --lr 0.001
 
 `--` より後ろが実行するコマンドです。ここでは例として `train.py` を実行します。
 
+自動評価を使う場合は、最初の投入時に指標も指定します。`minimize` は小さいほど良い指標、`maximize` は大きいほど良い指標です。
+
+```bash
+pueue-agent submit --metric-name validation_loss --metric-direction minimize --metric-min-delta 0.001 -- python train.py --lr 0.001
+```
+
+`--metric-min-delta` は「改善と認める最小の差」であり、目標値ではありません。「validation_loss が 0.20 未満」などの成功条件は `STATE.md` に書きます。例では、直前の best より **0.001 を超えて** loss が下がった場合に改善と判定します。
+
 目的は最初の `submit` 時に immutable snapshot と digest として固定されます。その後に on-disk の `STATE.md` を編集しても、active campaign の objective snapshot は変更されません。新しい目的を開始するには、現在の experiment がすべて終端・照合済みであることを確認し、`pueue-agent campaign retire` 後に `STATE.md` を編集して、新しい最初の `submit` を実行します。
 
 live campaign 中の追加 `submit` と `submit-batch` は、別 campaign や別 task の重複作成を防ぐため副作用前に拒否されます。現在の目的への追加指示は `pueue-agent steer -- "<MESSAGE>"` を使います。
 
-## Phase 2 で自動化される範囲
+## 評価結果を出力する
 
-上の4コマンド以外に controller script や project 固有 adapter は不要です。Phase 2 は baseline/control plane と安全な復旧に加え、terminal experiment から次の非 code experiment へ進む `terminal completion loop` を提供します。成功・失敗が一意に reconciliation されると decision cycle が作られ、Linux の read-only decision agent が bounded evidence から exactly one structured decision を返します。`proposal` は既存 coordinator と rolling experiment budget を通して投入され、`finite wait` は task を追加せず有限の `next_wake_at` を保存します。
+学習コードは、評価終了時に `PUEUE_AGENT_RESULT_PATH` が指すファイルへ次の JSON を書き、正常終了します。`experiment_id` は必ずその実行の `PUEUE_AGENT_EXPERIMENT_ID`、metric 名は `submit --metric-name` と一致させます。単にログへ loss を print するだけでは、自動 best 更新の根拠になりません。
+
+```json
+{
+  "schema_version": 1,
+  "experiment_id": "実行時の PUEUE_AGENT_EXPERIMENT_ID の値",
+  "metrics": {"validation_loss": 0.18}
+}
+```
+
+Python の例です。`write_result` を学習コードに組み込み、評価で得た実測値を渡してください。これは結果を書くだけの関数で、中間 controller ではありません。
+
+```python
+import json
+import os
+from pathlib import Path
+
+
+def write_result(validation_loss: float) -> None:
+    payload = {
+        "schema_version": 1,
+        "experiment_id": os.environ["PUEUE_AGENT_EXPERIMENT_ID"],
+        "metrics": {"validation_loss": float(validation_loss)},
+    }
+    # NaN / Infinity はファイルを開く前に拒否する。
+    document = json.dumps(payload, allow_nan=False)
+    result_path = Path(os.environ["PUEUE_AGENT_RESULT_PATH"])
+    result_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # 候補実験では service が先に作ったファイルの identity を維持する。
+    fd = os.open(result_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        output.write(document)
+```
+
+- 結果 JSON は **16 KiB 以下**、metric は有限の数値にします。別実験の ID、文字列の数値、NaN / Infinity は受理されません。
+- candidate の結果ファイルは一時ファイルからの rename / replace で差し替えず、既存のファイルへ書きます。チェックポイント等の成果物は `PUEUE_AGENT_ARTIFACT_DIR` を利用し、candidate の tracked source を学習中に変更しないでください。
+- この環境変数は managed experiment に渡されます。手動実行や `--kind control` では存在を前提にできません。
+- 結果の欠損・不正は `result_missing` / `result_invalid` として記録されます。task の正常終了とは別の判定であり、有効な数値がなければ best 更新は行いません。
+
+コード変更も任せる場合は、この結果出力と実行可能な project check を最初の `submit` 前に用意し、Git に commit して clean な状態にします。リポジトリに合わせたテスト・依存関係・データの準備は必要です。「adapter 不要」はこれらが不要という意味ではありません。
+
+## 現在の自動化の範囲
+
+プロジェクト固有の controller script や adapter は不要です。Phase 2〜5 は、実験の終了→結果の検証→次の判断→実験またはコード変更というループを内部で進めます。成功・失敗が一意に照合されると、Linux の read-only decision agent が一つの structured decision を返します。`proposal` は予算を確認して次の処理へ、`wait` は有限の `next_wake_at` まで待機、`goal_reached` は根拠付きで人の承認待ちへ進みます。
 
 decision analysis も agent-run hourly budget を消費します。1 cycle の連続失敗は service-owned `max_decision_attempts_per_cycle`（既定 3）、wait は `max_decision_wait_minutes`（既定 1,440 分）で制限されます。上限まで失敗すると cycle と campaign は `degraded` になり、自動 proposal は止まります。`status --json` の `campaign.decision` で `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、bounded な failure code/summary を確認し、raw evidence や decision body を期待しないでください。
 
-実行中 experiment は periodic observer によって継続評価されます。同じ class の信号が繰り返されるか log が stall すると experiment は `suspicious` になり、1 回の read-only diagnosis agent が bounded な証拠から原因と推奨 action（`continue` / `kill_and_resume` / `kill_and_escalate`）を返します。破壊的な action は確認済みの termination request を必要とし、`kill_and_resume` は live repair 予算が残る場合に限り同一 argv の後継 experiment を 1 つだけ再投入します。diagnosis の試行回数と signal 要約は上限付きで、生の log 行が SQLite に保存されることはありません。現在の状態は `pueue-agent status` の `health:` 行と `status --json` の `health.recent` で確認できます。
+実行中 experiment は既定30分の周期で信号を観測します。毎周期 agent を起動するのではなく、信号の反復やログ停止で `suspicious` になった場合に read-only diagnosis agent を起動します。診断は `continue` / `kill_and_resume` / `kill_and_escalate` を返し、停止確認と予算を満たした場合だけ後継実験を一つ投入します。`kill_and_resume` は同じ argv の再実行であり、自動的な batch size 変更や checkpoint 再開を意味しません。
 
-Phase 3 の running health は、実行中 experiment を `running OOM/stall observer` 付きの `periodic observer` で継続評価します。これは既存の terminal completion loop と併用され、実行中の異常を `suspicious`、diagnosing、action pending として bounded に投影します。
+観測間隔、通常 agent の Periodic DeepCheck、会話の引き継ぎは別の設定です。詳しくは[監視とエージェントの起動](workflows-ja.md#監視とエージェントの起動を区別する)を参照してください。
 
-Phase 4 の evaluation は、campaign が `--metric-name` / `--metric-direction`（任意に `--metric-min-delta`）で宣言した objective metric に対して experiment task の `PUEUE_AGENT_RESULT_PATH` に書き出された result manifest（`schema_version:1`, `experiment_id`, `metrics`）を terminal projection 時に発見・検証し、`experiment_metrics` に永続化します。検証では有限数値のみを受理し、欠損や不一致は `artifact_defect`（`result_missing` / `result_invalid`）として記録して experiment の成否には影響しません。`current_best_experiment_id` と `plateau_count` は promotion で更新され、`minimize` は `value < best - delta`、`maximize` は `value > best + delta` で改善とみなし、改善で best を更新して plateau をリセット、非改善の `succeeded` では plateau をインクリメントし、`plateau_threshold`（既定 3, 1..20）到達で `strategy-refresh` の operator wake を round ごとに一度だけ発火します。決定は `goal_reached`（`evidence_ref` 必須、metrics row を参照）を返すと campaign を `goal_reached_pending_review` に遷移させ、`pueue-agent campaign review accept|reject [--note]` で確定（accept は `retired:goal_accepted`、reject は `active` に戻し該当 `goal_reached` 決定を dead-letter 化）します。いずれも `pueue-agent status` の `best:` / `plateau:` 行と `status --json` の `campaign.best_*` / `plateau_count` / `evaluation.recent`（最大 50 件）で観測できます。Managed experiment の Pueue 追加は `/usr/bin/env` で4つの派生変数（`PUEUE_AGENT_EXPERIMENT_ID` 等）が `NAME=value` 形式で注入された後に user argv が続き、Pueue の生コマンド表示はラップを含みます（direct/control はラップされません）。ログ解析は promotion しません。
+終了後は結果 JSON の数値を評価し、有効な改善なら best を更新します。改善しない成功実験が続くと plateau を数え、閾値（既定3回）で方針の見直しを促します。`goal_reached` の申告には検証済み metrics row を指す根拠が必要で、campaign は `goal_reached_pending_review` になります。人が[goal review を承認または拒否](workflows-ja.md#目標達成を確認する)するまで、最終達成扱いにはしません。
 
 `goal review` は Phase 4 で `goal_reached` 決定を operator が承認/拒否するフローとして提供済みです。隔離された `code worktree` を使う Phase 5 の `code_change` pipeline も実装済みで、通常の decision agent が返した proposal を内部 coordinator が処理します。後続 phase に残るのは trusted native editor の OS レベル containment を扱う Phase 6 です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
+
+## 予算と自動化の上限
+
+予算の正本は SQLite と service-owned `execution-policy.toml` です。`.pueue-agent/state.json` の編集で予算を増やしたり、予約をリセットしたりはできません。新規 service policy の主な既定値は次のとおりです。既存インストールの実効値は設定・予約状況によって異なります。
+
+| 上限 | 既定値 | 消費する処理 |
+| --- | --- | --- |
+| 同時実験 | 1 | managed experiment |
+| 新規実験 / 24時間 | 24 | candidate を含む実験の受理 |
+| agent 起動 / 1時間 | 6 | decision や editor などの agent run |
+| code-change proposal / 24時間 | 10 | code-change の受理。後続失敗でも返却しない |
+| decision の連続失敗 / cycle | 3 | 判断の失敗。上限到達で degraded |
+| decision の有限待機 | 最大1440分 | task を増やさず次の判断を待つ |
+
+project の `guardrails` は別の停止条件で、service の上限を拡大しません。`budget_waiting` は期限後の再開を待つ状態であり、手動で追加 `submit` する必要はありません。`degraded` / `recovery_required` は単なる予算待ちとは異なり、[診断と介入](troubleshooting-ja.md)が必要です。
 
 ## code_change を使う場合の前提と流れ
 
 `code_change` は `pueue-agent submit --kind` の公開 submission kind ではありません。通常の campaign の decision agent が返す proposal kind であり、新しい project 固有 adapter や controller を追加せず、既存の submit、campaign、Pueue、evaluation 経路に接続されます。受理時は code-change budget を 1 slot 消費し、reject になっても戻りません。editor の各 attempt は通常の agent-run hourly budget、candidate experiment は通常の rolling experiment budget と parallelism guardrail を消費し、空きがないと `budget_waiting` になります。
-既定の service policy は `max_code_change_proposals_per_24h=10`、`max_agent_runs_per_hour=6`、`max_new_experiments_per_24h=24`、`max_parallel_experiments=1` です。実効値は immutable execution policy の bounded budget として適用され、proposal、agent run、experiment の reservation を同じ意図で二重作成しません。
+予算の既定値は[予算と自動化の上限](#予算と自動化の上限)を参照してください。
 
 1. admission で project root、Git repository、campaign 開始時の clean な committed `HEAD` を確認します。既存の local best ref があればそれを、なければ `campaign.base_revision_sha` を完全な base SHA として使います。dirty、非 Git、Git executable 不在、legacy campaign に `base_revision_sha` がない、または既存 best ref が不正なら code-change proposal だけを reject します。
 2. service-owned state directory の `.pueue-agent/worktrees/<campaign-id>/<proposal-id>` に detached candidate worktree を作り、editor を起動します。初回は fresh session、editor または必須 check の失敗時だけ同じ session を一度 resume し、最大 **2 attempts / 1 session** です。daemon の再起動はこの上限をリセットしません。

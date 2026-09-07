@@ -3,7 +3,8 @@
 project_id = "{{PROJECT_ID}}"
 pueue_group = "{{PUEUE_GROUP}}"
 
-# supervisor の機械的な状態は .pueue-agent/state.json が canonical です。
+# campaign・予算・実行状態の正本は service の SQLite です。
+# .pueue-agent/state.json は agent 用の bounded scratch projection です。
 # submission は experiment（既定）または control を選びます。
 # control は履歴には残りますが、guardrails.max_experiments を消費しません。
 
@@ -13,7 +14,8 @@ args = ["exec", "{prompt}"]
 timeout_minutes = 60
 max_retries = 2
 
-# 会話コンテキストの継続は opt in。既定値は fresh context。
+# 通常 agent / Periodic DeepCheck の会話継続は opt in（既定 fresh）。
+# decision / diagnosis は常に fresh。code-change editor の継続は別管理。
 [agent.context]
 mode = "fresh" # fresh | resume | resume_latest
 # mode = "resume" の場合だけ、次の session_id が必要。

@@ -1,5 +1,7 @@
 # Continuous ML Experiment Campaign 実装作業まとめ
 
+> これは2026-08-17時点の作業記録です。未実装範囲、network の既定値、commit/test 状態などは当時の記述であり、現行版の仕様ではありません。現在の機能と制約は [README](../../README.md)、実際のセットアップは [導入ガイド](../getting-started-ja.md) を参照してください。
+
 更新日: 2026-08-17<br>
 対象リポジトリ: `romanohu/pueueAgent`<br>
 作業ブランチ: `agent/continuous-campaign-core`<br>

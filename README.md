@@ -2,7 +2,16 @@
 
 ## 何をするツールか
 
-`pueue-agent` は、Pueue で実行する長時間の実験を監視する Rust + SQLite 製の supervisor です。最初の通常 `submit` を managed campaign と baseline experiment として記録し、通常の監視は coding agent を起動せず、永続化された event が処理対象になったときだけ agent を起動します。投入、状態確認、人による介入、停止、診断、更新を一つの CLI から行えます。
+`pueue-agent` は、Pueue 上の長時間の ML 実験を監視し、結果に応じた次の実験や隔離されたコード修正まで進める Rust + SQLite 製の supervisor です。Linux でセットアップし、目標と評価結果の出力を用意すると、最初の `submit` を起点に自律実験を始められます。プロジェクト固有の中間 controller は不要ですが、学習環境・評価指標・結果 JSON の準備は必要です。
+
+## できること・任せないこと
+
+- **実験の反復:** 最初の実験を baseline として記録し、終了後に agent が次の実験、有限の待機、根拠付きの目標達成申告を判断します。
+- **コード改善:** 別の Git worktree で編集・チェック・候補 commit を行い、そのコードで実験します。数値改善を確認した候補は local `best` として次のコード修正の基準にできます。
+- **実行中の異常対応:** Pueue が Running でも、設定された OOM・エラー信号やログ停止を観測し、疑わしい場合に診断 agent を起動します。終了確認と予算の条件を満たした場合だけ後継実験を投入します。
+- **制限と復旧:** 実験・agent 起動・コード変更の予算を管理し、一時停止、再開、再起動時の照合を行います。外部投入の成否が不明なら二重投入せず保留します。
+
+目標達成の最終承認、main への merge/push は人が行います。任意のリポジトリが無変更で動く保証、全異常の検知、目標達成の保証、OS/container による強制隔離はありません。また、定期観測は「30分ごとに同じ会話の研究 agent を起動する」機能ではありません。[監視とセッションの違い](docs/workflows-ja.md#監視とエージェントの起動を区別する)を確認してください。
 
 ## 全体像
 
@@ -29,7 +38,7 @@ SQLite campaign / proposal / experiment
 
 SQLite は project、campaign、proposal、experiment、budget reservation、submission、event、incident、agent run の durable な関連を保持します。Pueue task の実行と agent の判断は分離され、1つの supervisor は1つの Pueue daemon または profile を担当します。
 
-現在の Phase 2 は、campaign、baseline、hard budget、外部投入の復旧境界に加え、実験の成功・失敗を起点にする `terminal completion loop` を持ちます。Linux では supervisor が SQLite の bounded evidence だけを read-only の built-in Codex decision agent に渡し、返された exactly one structured decision を `proposal` または `finite wait` として検証します。proposal は既存の campaign coordinator から次の非 code experiment を投入し、wait は Pueue task を追加せず有限の `next_wake_at` まで待ちます。
+Phase 2〜5 の自律実験ループは実装済みです。Linux では supervisor が範囲を制限した証拠を read-only の built-in Codex decision agent に渡し、一つの structured decision を検証します。`proposal` は次の実験またはコード変更へ、`wait` は有限の待機へ、`goal_reached` は人による達成確認へ進みます。agent 自身が Pueue を直接操作するのではなく、supervisor が予算と状態を検証して投入します。
 
 Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop は実装済みです。同じ class の信号が繰り返されるか log が stall すると experiment は `suspicious` になり、1 回の read-only diagnosis agent が bounded な証拠から原因と推奨 action（`continue` / `kill_and_resume` / `kill_and_escalate`）を返します。破壊的な action は確認済みの termination request を必要とし、`kill_and_resume` は live repair 予算（`max_live_repairs`）が残る場合に限り同一 argv の後継 experiment を再投入します。既存の pattern/stall detector と Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。Phase 4 の evaluation と `goal review` も実装済みです。
 
@@ -64,16 +73,16 @@ custom agent/editor は shell command としてではなく、execution policy �
 
 ## クイックスタート
 
-インストール後、ML リポジトリのルートで次の4段階を実行します。`STATE.md` には具体的な目標、成功条件、変更してよい範囲を書きます。
+インストール後、ML リポジトリのルートで実行します。`STATE.md` には具体的な目標、成功条件、変更してよい範囲を書きます。自動評価には、先に学習コードを[結果 JSON の出力形式](docs/getting-started-ja.md#評価結果を出力する)に合わせてください。コード変更も使う場合は、学習コードとチェックを commit し、clean な Git checkout から始めます。
 
 ```bash
 pueue-agent init
 # edit .pueue-agent/STATE.md
 pueue-agent enable
-pueue-agent submit -- python train.py
+pueue-agent submit --metric-name validation_loss --metric-direction minimize -- python train.py
 ```
 
-現在の完全な設定テンプレートは [`templates/config.toml`](templates/config.toml) です。
+評価指標を指定しない `submit -- python train.py` でも実験は始められますが、数値による自動 best 更新には指標と有効な結果 JSON が必要です。プロジェクト設定は [`templates/config.toml`](templates/config.toml)、service 側の予算と境界は[導入ガイド](docs/getting-started-ja.md#予算と自動化の上限)を参照してください。
 
 ## よく使うコマンド
 

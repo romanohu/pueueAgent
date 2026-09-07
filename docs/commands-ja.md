@@ -55,6 +55,8 @@
 
 `code_change` は `submit --kind` で直接指定する submission kind ではなく、terminal experiment 後の decision agent が返す proposal kind です。通常の `pueue-agent submit` と既存の campaign coordinator がこの proposal を内部の code-change pipeline に渡すため、project 固有 adapter や追加 controller は必要ありません。
 
+`--metric-min-delta` は改善幅であって目標値ではありません。成功条件は最初の投入前に `STATE.md` に記入します。学習コードは `PUEUE_AGENT_RESULT_PATH` に、その実行の ID と有限な metric を含む JSON を出力する必要があります。[出力形式とPython例](getting-started-ja.md#評価結果を出力する)を参照してください。ログへの表示だけでは自動 best 更新の根拠になりません。
+
 ### `pueue-agent submit-batch`
 
 - **構文:** `pueue-agent submit-batch --request-id UUID --manifest PATH [--group GROUP] [--json] [PROJECT_ROOT]`

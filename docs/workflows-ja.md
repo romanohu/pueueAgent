@@ -11,11 +11,13 @@ pueue-agent init
 $EDITOR .pueue-agent/config.toml
 $EDITOR .pueue-agent/STATE.md
 pueue-agent enable
-pueue-agent submit -- python train.py --lr 0.001
+pueue-agent submit --metric-name validation_loss --metric-direction minimize -- python train.py --lr 0.001
 pueue-agent status
 ```
 
 監視対象の job は raw の `pueue add` ではなく `pueue-agent submit` で投入します。最初の通常 `submit` は Pueue へ追加する前に campaign、baseline proposal、experiment、budget reservation、submission intent を SQLite に一度だけ記録します。live campaign 中の二回目の `submit` と `submit-batch` は副作用前に拒否されるため、追加指示には `steer` を使います。
+
+上の例は、学習コードに[結果 JSON の出力](getting-started-ja.md#評価結果を出力する)を組み込んだ前提です。コード変更も使う場合は、最初の投入前にテスト・結果出力を commit して clean な Git checkout にします。
 
 Phase 2 はこの baseline/control plane と安全な復旧に加え、terminal experiment 後の `terminal completion loop` を提供します。Linux の decision agent は bounded evidence から `proposal` または `finite wait` を一つ返し、proposal は既存 coordinator から次の非 code experiment へ進みます。Phase 3 の `running OOM/stall observer` と実行中の `periodic observer` による campaign health-decision loop、Phase 4 の evaluation と `goal review` は実装済みです。隔離された `code worktree` を使う Phase 5 の `code_change` pipeline も実装済みで、後続 phase に残るのは trusted native editor の OS レベル containment を扱う Phase 6 です。
 
@@ -33,6 +35,30 @@ Phase 2 はこの baseline/control plane と安全な復旧に加え、terminal 
 candidate experiment の OOM、internal failure、timeout、cancel、tracked file mutation、result/metric 不備は promotion 不可です。best ref はそのまま残り、merge、rebase、push、PR 作成、remote ref の変更は行いません。candidate worktree は実験が live の間と cleanup が完了するまで保持されます。custom editor は shell command ではなく policy に登録・identity 検証された trusted native executable ですが、Phase 5 は OS namespace/container/VM 等の強制 containment ではありません。editor/check/candidate は root で実行せず、強制 containment は Phase 6 の境界です。
 
 候補を確認するときは、まず `pueue-agent status --json` の `code_changes`、`proposal inspect <proposal-id> --json`、`experiment inspect <experiment-id> --json`、`events --kind code_change --json`、`doctor --json` を使います。必要な場合だけ、status の SHA と所有 path を照合する読み取り専用 Git 操作（`git -C <candidate-root> status --short`、`git -C <candidate-root> rev-parse --verify HEAD^{commit}`、`git -C <candidate-root> diff --check <base-sha> --`、`git -C <project-root> show-ref --verify refs/heads/campaign/<campaign-id>/candidate/<proposal-id>`、`git -C <project-root> show-ref --verify refs/heads/campaign/<campaign-id>/best`、`git -C <project-root> worktree list --porcelain`）に限定します。`update-ref`、checkout、merge、rebase、push、`worktree prune`、未知 path の削除は行いません。
+
+## 目標達成を確認する
+
+agent が検証済み metric の根拠とともに `goal_reached` を返すと、campaign は `goal_reached_pending_review` になります。単に実験が exit 0 になったことや best が更新されたことは、目標達成の確定ではありません。
+
+```bash
+pueue-agent campaign status --json
+pueue-agent experiment list --json
+pueue-agent experiment inspect <experiment-id> --json
+```
+
+`STATE.md` から固定した成功条件、指標、成果物を確認し、達成を認める場合は承認します。
+
+```bash
+pueue-agent campaign review accept --note "評価結果と成功条件を確認した"
+```
+
+未達なら拒否して campaign を active に戻します。
+
+```bash
+pueue-agent campaign review reject --note "成功条件の確認が不足している"
+```
+
+承認は `retired:goal_accepted` への遷移であり、候補コードを main に merge/push する操作ではありません。live / 未照合 experiment や予約が残る場合は、まず `status` / `doctor` の状態を確認してください。
 
 ## Campaign を retire して新しい目的を開始する
 
@@ -102,13 +128,27 @@ pueue-agent doctor --json
 
 `degraded` と `decision_attempts_exhausted` が表示された場合、`pueue-agent campaign pause` で自律動作を保持し、`status --json` と `doctor --json` の bounded failure facts を確認します。`campaign resume` は exhausted decision cycle を消去せず、SQLite を直接編集して retry してはいけません。継続を断念する場合は nonterminal/unreconciled experiment と reservation がないことを確認し、paused campaign を `campaign retire` してから、新しい objective と baseline を開始します。
 
+## 監視とエージェントの起動を区別する
+
+| 処理 | 起動・観測の条件 | 会話 context |
+| --- | --- | --- |
+| pattern / stall detector | `config.toml` の `[check]`。ログ信号や出力停止を機械的に確認 | 観測自体は agent を起動しない。action により event / termination request を作る |
+| running-health observer / diagnosis | service policy の `observer_interval_minutes`（既定30分）で観測し、疑わしい場合だけ診断 | diagnosis は常に fresh |
+| terminal decision | 実験の終了・照合後、または有限待機の期限後 | decision は常に fresh。SQLite 由来の証拠を渡す |
+| Periodic DeepCheck（通常 agent） | `[check].deep_check_interval_minutes` を正の値に設定した場合。既定0は無効 | `[agent.context]` の fresh / resume / resume_latest に従う |
+| code-change editor | code-change proposal の受理後 | 初回 fresh、修正時だけ同じ session を一度 resume（合計最大2 attempts） |
+
+SQLite に履歴が残ることと、agent の会話 session が継続することは別です。`agent.context.mode = "resume_latest"` を指定しても、decision / diagnosis が同じ会話を引き継ぐようにはなりません。
+
+running health は OOM・エラー信号やログ停止の診断であり、毎30分に同じ研究 agent が収束見込みを判断して新しい設定へ切り替える機能ではありません。`kill_and_resume` は終了確認後の同一 argv の後継実験です。checkpoint から再開できるかどうかは、その学習コマンドと保存済み成果物次第です。
+
 ## Periodic DeepCheck を有効化する
 
 `.pueue-agent/config.toml` で明示的に opt-in します。
 
 ```toml
 [check]
-deep_check_interval_minutes = 60
+deep_check_interval_minutes = 30
 ```
 
 `0`（既定値）は無効です。正の値では、通常の reconciliation が周期条件を確認し、必要なときだけ設定済みの `agent.context.mode` を使う新しい agent run を起動します。`fresh` は既定値ですが、明示的に設定した `resume` / `resume_latest` もそのまま適用されます。正常な tick の確認や異常検知だけでは agent token を消費しません。Periodic DeepCheck event が dispatch されたときだけ token を消費します。

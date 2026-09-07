@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | submit 経路 | project と argv の検証、submission intent の先行永続化、Pueue add 結果の記録 | Pueue の task 実行 | [`submit.rs`](../src/submit.rs), [`pueue.rs`](../src/pueue.rs) |
 | campaign coordinator | 最初の submit と accepted decision proposal を durable intent に変換し、commit 後の Pueue add と accepted/unreconciled 遷移を調停 | decision evidence の構築や agent 実行 | [`campaign.rs`](../src/campaign.rs), [`db/campaigns.rs`](../src/db/campaigns.rs) |
-| decision coordinator | terminal experiment の decision cycle、bounded evidence、read-only analysis、proposal/finite wait の適用と再起動復旧 | running health/OOM の継続観測、code change | [`decision.rs`](../src/decision.rs), [`decision_evidence.rs`](../src/decision_evidence.rs), [`db/decisions.rs`](../src/db/decisions.rs) |
+| decision coordinator | terminal experiment の decision cycle、bounded evidence、read-only analysis、proposal / finite wait / goal_reached の適用と再起動復旧 | running health/OOM の継続観測、コード編集自体（専用 coordinator へ渡す） | [`decision.rs`](../src/decision.rs), [`decision_evidence.rs`](../src/decision_evidence.rs), [`db/decisions.rs`](../src/db/decisions.rs) |
 | code-change coordinator | `code_change` proposal の admission、Git candidate worktree、editor attempt/session、check、candidate commit/ref、候補 experiment、promotion、cleanup、restart recovery | main/checkout 中の source branch、remote、無関係な worktree、raw Pueue 操作 | [`code_change.rs`](../src/code_change.rs), [`db/code_changes.rs`](../src/db/code_changes.rs), [`campaign.rs`](../src/campaign.rs), [`promotion.rs`](../src/promotion.rs) |
 | Pueue adapter | 許可済み operation の argv 組み立て、検証済み Pueue/config の利用、timeout と stdout/stderr 上限 | event の永続化や retry 判定 | [`pueue.rs`](../src/pueue.rs), [`pueue_process.rs`](../src/pueue_process.rs) |
 | callback / reconciliation | callback の idempotent 取り込み、Pueue status の観測、terminal event の正規化、submission の突合 | agent dispatch | [`events.rs`](../src/events.rs), [`reconcile.rs`](../src/reconcile.rs) |
@@ -35,6 +35,8 @@
 | agent log、authorization marker、private temp generation | project root からの descriptor-relative な `.pueue-agent/` 配下 | SQLite の絶対パスは相対名との一致検証用であり、startup recovery でそのパスを直接 reopen しない |
 
 SQLite は durable lifecycle の source of truth ですが、「process が実際に動いたか」の proof そのものではありません。その境界は launch marker、exec-status pipe、release ack、および所有する child/process group の観測で補います。
+
+会話 session も durable state とは別です。`AgentRunner` は decision / diagnosis role を常に `Fresh` にし、通常 agent のみ project の context 設定を使います。code-change editor は proposal ごとに初回 fresh、二回目は保存済み session ID の resume を検証します。履歴の受け渡しは [role 別の起動条件](workflows-ja.md#監視とエージェントの起動を区別する)に従い、SQLite の履歴保存を全 role の session 継続とみなしません。
 
 ## Submission から event まで
 
@@ -70,11 +72,13 @@ flowchart TD
     C --> D["SQLite + metadata から bounded evidence"]
     D --> E["Linux built-in Codex / read-only project"]
     E --> F{"strict decision JSON"}
-    F -->|"proposal"| G["existing campaign coordinator へ durable intent"]
+    F -->|"非 code proposal"| G["existing campaign coordinator へ durable intent"]
+    F -->|"code_change proposal"| CC["code-change coordinator へ"]
     G --> H["verified Pueue add"]
     H --> I["completed"]
     F -->|"finite wait"| J["waiting + next_wake_at"]
     J -->|"deadline"| C
+    F -->|"goal_reached + metric evidence"| R["goal_reached_pending_review: 人の承認/拒否"]
     E -->|"bounded failures exhausted"| K["degraded"]
 ```
 
@@ -127,6 +131,8 @@ code-change proposal の受理は code-change budget を 1 slot 消費し、reje
 ### Recovery と cleanup
 
 再起動・定期 recovery は durable state、worktree descriptor、candidate/best ref、Pueue submission identity を照合し、同じ editor/commit/task を重複作成しません。publication 前に owned worktree が無ければ再作成できますが、予期しない path/identity、競合 candidate ref、差し替えられた tracked file は `recovery_required` です。editor は同じ session の attempt 状態を再利用し、二回目の失敗後に retry budget をリセットしません。
+
+予約済み candidate の再投入では、project admission lock を保持した状態で campaign / project の現在の実行可否を確認します。一時停止等で権限がなくなっていれば runtime directory を作る前に defer し、同じ Reserved / Pending の予約を保持します。再開後は同じ意図から投入でき、投入直前の transaction による再確認も残します。外部 add が不明な状態や所有権不明の runtime scope を、この通常の defer と混同して再利用しません。
 
 terminal experiment 後は live process/task がないこと、candidate HEAD/index と tracked source が不変であること、ownership proof が一致することを確認してから cleanup を行います。失敗した cleanup は `cleanup_pending` として残り、未知 path の削除、follow-symlink、全体 `git worktree prune` はしません。`evaluated` / `cleanup_pending` / `rejected` の run は cleanup 完了まで status に残ります。
 

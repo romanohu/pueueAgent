@@ -122,6 +122,23 @@ daemon を再起動した後も `status --json` の `code_changes[].state`、`at
 
 custom agent/editor は execution policy に登録・検証された trusted native executable ですが、Phase 5 は OS sandbox/container/VM の強制 containment を提供しません。editor/check/candidate は root で実行せず、強制 containment は Phase 6 の境界です。
 
+## 実験は成功したのに評価や best が更新されない
+
+Pueue task の正常終了と、評価指標の検証成功は別です。まず `pueue-agent status --json` の `evaluation.recent` / `campaign` と、対象の `experiment inspect <experiment-id> --json` を確認します。
+
+- 指標を指定していない: objective metric は最初の `submit --metric-name ... --metric-direction ...` で宣言します。live campaign 中の追加 submit で後付けせず、必要なら安全に retire して新しい目的・baseline を開始します。
+- `result_missing`: 学習コードが環境変数 `PUEUE_AGENT_RESULT_PATH` のファイルへ結果を書いているか確認します。ログへの print だけでは不足します。
+- `result_invalid`: 実行 ID、`schema_version: 1`、metric 名、有限な数値、16 KiB 上限、ファイルの所有権・権限を確認します。candidate の事前作成された結果ファイルを rename / replace で差し替えないでください。
+- 有効な結果だが非改善: `minimize` / `maximize` の方向と `min_delta` を確認します。`min_delta` と同じ差だけの変化は改善ではありません。非改善の候補を手動で best ref に設定しないでください。
+
+[結果出力のPython例](getting-started-ja.md#評価結果を出力する)を参照してください。保存済み metrics row や SQLite を書き換えて改善を作り出してはいけません。
+
+## 30分経っても agent が起動しない・会話を引き継がない
+
+running-health observer の既定30分は信号の観測間隔で、毎回 agent を起動する約束ではありません。diagnosis は異常が疑われた場合に起動します。通常 agent の定期実行には、別途 `[check].deep_check_interval_minutes` の opt-in が必要です（既定0）。予算、一時停止、既存の実行や待機 event により dispatch は遅れることがあります。
+
+`[agent.context]` は通常 agent / Periodic DeepCheck の設定です。decision / diagnosis は常に fresh、code-change editor の修正は同じ session を一度だけ継続します。[起動条件とcontextの対応表](workflows-ja.md#監視とエージェントの起動を区別する)で対象を確認してください。`resume` / `resume_latest` で継続対象の session がない場合、自動で fresh には切り替わりません。
+
 ## Execution policy を読み込めない
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |
