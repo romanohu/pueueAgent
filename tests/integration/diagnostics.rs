@@ -1,14 +1,15 @@
 use std::fs;
 
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 use pueue_agent::{
+    code_change::{best_ref, candidate_ref},
     cli::Cli,
     db::{
-        AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
-        ExperimentRepository, HealthRepository, IncidentRepository, InterventionRepository,
-        ProjectRepository, StartCampaignRequest, TaskObservationRepository,
+        AgentRunRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
+        EventRepository, ExperimentRepository, HealthRepository, IncidentRepository,
+        InterventionRepository, ProjectRepository, StartCampaignRequest, TaskObservationRepository,
         TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
@@ -23,8 +24,8 @@ use pueue_agent::{
     },
     models::{
         AgentRunStatus, EventKind, EventStatus, ExecutionProjection, HealthState, NewAgentRun,
-        NewEvent, NewIncident, NewProject, NewTaskObservation, NewTerminationRequest,
-        ProposalKind, SignalSummaryEntry, TerminationRequestStatus,
+        NewCodeChangeRun, NewEvent, NewIncident, NewProject, NewTaskObservation,
+        NewTerminationRequest, ProposalKind, SignalSummaryEntry, TerminationRequestStatus,
     },
     output::redact_sensitive_text,
     pueue::PueueTask,
@@ -179,6 +180,8 @@ fn doctor_rejects_a_pueue_config_inside_another_registered_project() {
     let harness = DiagnosticsHarness::new();
     let other_root = harness._temp.path().join("other-project");
     fs::create_dir_all(&other_root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&other_root, fs::Permissions::from_mode(0o700)).unwrap();
     let other_config = other_root.join("pueue.yml");
     fs::write(&other_config, "fixture: true\n").unwrap();
     ProjectRepository::new(&harness.db)
@@ -822,8 +825,12 @@ struct DiagnosticsHarness {
 impl DiagnosticsHarness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let root = temp.path().join("project");
         fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         ProjectRepository::new(&db)
             .register(&NewProject::new(
@@ -997,6 +1004,855 @@ impl DiagnosticsHarness {
             );
         fs::write(self.project().config_path, config).unwrap();
     }
+}
+
+fn seed_code_change_doctor_row(harness: &DiagnosticsHarness) {
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis,
+                 source_experiment_id, argv_json, working_directory,
+                 expected_evidence_json, canonical_digest, reject_reason,
+                 created_at, updated_at
+             ) VALUES (
+                 'doctor-code-proposal', 'diagnostics-campaign', 'code_change', 'accepted',
+                 'doctor fixture', 'diagnostics-campaign-experiment', '[\"python\",\"train.py\"]', '.',
+                 '[]', 'doctor-code-proposal-digest', 'SECRET_REJECTION', 101, 101
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let base_sha = "a".repeat(40);
+    let run = CodeChangeRepository::new(&harness.db)
+        .create_pending(
+            &NewCodeChangeRun::new(
+                "doctor-code-run",
+                "doctor-code-proposal",
+                "diagnostics-campaign",
+                base_sha.clone(),
+                candidate_ref("diagnostics-campaign", "doctor-code-proposal").unwrap(),
+                best_ref("diagnostics-campaign").unwrap(),
+                "doctor-code-worktree",
+                ".pueue-agent/worktrees/diagnostics-campaign/doctor-code-proposal",
+                102,
+            ),
+        )
+        .unwrap();
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET proposal_id = 'diagnostics-campaign-proposal', updated_at = 103
+             WHERE code_change_run_id = ?1",
+            [run.code_change_run_id],
+        )
+        .unwrap();
+
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA ignore_check_constraints = ON;
+             DROP INDEX code_change_one_live_per_campaign;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET editor_attempts = 9, worktree_relative_path = '../escape',
+                 candidate_ref = '/untrusted/ref', best_ref = 'bad-ref',
+                 experiment_id = 'missing-experiment', updated_at = 1
+             WHERE code_change_run_id = 'doctor-code-run'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis,
+                 source_experiment_id, argv_json, working_directory,
+                 expected_evidence_json, canonical_digest, reject_reason,
+                 created_at, updated_at
+             ) VALUES
+                 ('doctor-live-proposal', 'diagnostics-campaign', 'code_change', 'accepted',
+                  'live fixture', 'diagnostics-campaign-experiment', '[\"python\"]', '.',
+                  '[]', 'doctor-live-digest', NULL, 104, 104),
+                 ('doctor-cleanup-proposal', 'diagnostics-campaign', 'code_change', 'accepted',
+                  'cleanup fixture', 'diagnostics-campaign-experiment', '[\"python\"]', '.',
+                  '[]', 'doctor-cleanup-digest', NULL, 105, 105)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let live_run = CodeChangeRepository::new(&harness.db)
+        .create_pending(
+            &NewCodeChangeRun::new(
+                "doctor-live-run",
+                "doctor-live-proposal",
+                "diagnostics-campaign",
+                "a".repeat(40),
+                candidate_ref("diagnostics-campaign", "doctor-live-proposal").unwrap(),
+                best_ref("diagnostics-campaign").unwrap(),
+                "doctor-live-worktree",
+                ".pueue-agent/worktrees/diagnostics-campaign/doctor-live-proposal",
+                104,
+            ),
+        )
+        .unwrap();
+    let cleanup_run = CodeChangeRepository::new(&harness.db)
+        .create_pending(
+            &NewCodeChangeRun::new(
+                "doctor-cleanup-run",
+                "doctor-cleanup-proposal",
+                "diagnostics-campaign",
+                "a".repeat(40),
+                candidate_ref("diagnostics-campaign", "doctor-cleanup-proposal").unwrap(),
+                best_ref("diagnostics-campaign").unwrap(),
+                "doctor-cleanup-worktree",
+                ".pueue-agent/worktrees/diagnostics-campaign/doctor-cleanup-proposal",
+                105,
+            ),
+        )
+        .unwrap();
+
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs SET state = 'editing' WHERE code_change_run_id = ?1",
+            [live_run.code_change_run_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'completed', candidate_sha = ?1,
+                 experiment_id = 'diagnostics-campaign-experiment',
+                 cleanup_completed_at = NULL
+             WHERE code_change_run_id = ?2",
+            rusqlite::params!["b".repeat(40), cleanup_run.code_change_run_id],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = OFF;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn code_change_doctor_reports_bounded_read_only_checks() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    seed_code_change_doctor_row(&harness);
+    let project = harness.project();
+    let before = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT proposal_id, state, updated_at FROM code_change_runs
+             WHERE code_change_run_id = 'doctor-code-run'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let report = build_doctor_report(
+        &harness.db,
+        &project,
+        &doctor_paths(&harness),
+        doctor_external(),
+        500,
+    )
+    .unwrap();
+    let checks = report
+        .checks
+        .iter()
+        .filter(|check| check.name.starts_with("code_change."))
+        .collect::<Vec<_>>();
+    let names = checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "code_change.cleanup",
+            "code_change.experiments",
+            "code_change.lineage",
+            "code_change.refs",
+            "code_change.rows",
+            "code_change.single_live",
+            "code_change.stale",
+            "code_change.worktrees",
+        ]
+    );
+
+    let lineage = checks
+        .iter()
+        .find(|check| check.name == "code_change.lineage")
+        .unwrap();
+    assert_eq!(lineage.status, DoctorCheckStatus::Error);
+    assert!(lineage.summary.contains("lineage"), "{}", lineage.summary);
+    for check in checks {
+        assert_ne!(check.status, DoctorCheckStatus::Ok, "{}", check.name);
+        assert!(check.summary.len() <= 240, "{}", check.summary);
+        assert!(check.remediation.len() <= 240, "{}", check.remediation);
+        assert!(!check.summary.contains("SECRET_REJECTION"));
+        assert!(!check.remediation.contains("SECRET_REJECTION"));
+    }
+
+    let after = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT proposal_id, state, updated_at FROM code_change_runs
+             WHERE code_change_run_id = 'doctor-code-run'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(before, after);
+    assert!(!serde_json::to_string(&report)
+        .unwrap()
+        .contains("SECRET_REJECTION"));
+}
+
+#[test]
+fn code_change_doctor_counts_reciprocal_experiment_links_and_recovery_live_rows() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    let connection = harness.db.connect().unwrap();
+    for (proposal_id, hypothesis) in [
+        ("doctor-reciprocal-proposal", "reciprocal fixture"),
+        ("doctor-reverse-proposal", "reverse fixture"),
+        ("doctor-recovery-a-proposal", "recovery fixture a"),
+        ("doctor-recovery-b-proposal", "recovery fixture b"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO proposals (
+                     proposal_id, campaign_id, kind, status, hypothesis,
+                     source_experiment_id, argv_json, working_directory,
+                     expected_evidence_json, canonical_digest, reject_reason,
+                     created_at, updated_at
+                 ) VALUES (?1, 'diagnostics-campaign', 'code_change', 'accepted', ?2,
+                           'diagnostics-campaign-experiment', '[\"python\"]', '.',
+                           '[]', ?3, NULL, 101, 101)",
+                params![proposal_id, hypothesis, format!("{proposal_id}-digest")],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let reciprocal_run = CodeChangeRepository::new(&harness.db)
+        .create_pending(&NewCodeChangeRun::new(
+            "doctor-reciprocal-run",
+            "doctor-reciprocal-proposal",
+            "diagnostics-campaign",
+            "a".repeat(40),
+            candidate_ref("diagnostics-campaign", "doctor-reciprocal-proposal").unwrap(),
+            best_ref("diagnostics-campaign").unwrap(),
+            "doctor-reciprocal-worktree",
+            ".pueue-agent/worktrees/diagnostics-campaign/doctor-reciprocal-proposal",
+            102,
+        ))
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX code_change_one_live_per_campaign", [])
+        .unwrap();
+    let reverse_run = CodeChangeRepository::new(&harness.db)
+        .create_pending(&NewCodeChangeRun::new(
+            "doctor-reverse-run",
+            "doctor-reverse-proposal",
+            "diagnostics-campaign",
+            "a".repeat(40),
+            candidate_ref("diagnostics-campaign", "doctor-reverse-proposal").unwrap(),
+            best_ref("diagnostics-campaign").unwrap(),
+            "doctor-reverse-worktree",
+            ".pueue-agent/worktrees/diagnostics-campaign/doctor-reverse-proposal",
+            103,
+        ))
+        .unwrap();
+    let recovery_a = CodeChangeRepository::new(&harness.db)
+        .create_pending(&NewCodeChangeRun::new(
+            "doctor-recovery-a-run",
+            "doctor-recovery-a-proposal",
+            "diagnostics-campaign",
+            "a".repeat(40),
+            candidate_ref("diagnostics-campaign", "doctor-recovery-a-proposal").unwrap(),
+            best_ref("diagnostics-campaign").unwrap(),
+            "doctor-recovery-a-worktree",
+            ".pueue-agent/worktrees/diagnostics-campaign/doctor-recovery-a-proposal",
+            104,
+        ))
+        .unwrap();
+    let recovery_b = CodeChangeRepository::new(&harness.db)
+        .create_pending(&NewCodeChangeRun::new(
+            "doctor-recovery-b-run",
+            "doctor-recovery-b-proposal",
+            "diagnostics-campaign",
+            "a".repeat(40),
+            candidate_ref("diagnostics-campaign", "doctor-recovery-b-proposal").unwrap(),
+            best_ref("diagnostics-campaign").unwrap(),
+            "doctor-recovery-b-worktree",
+            ".pueue-agent/worktrees/diagnostics-campaign/doctor-recovery-b-proposal",
+            105,
+        ))
+        .unwrap();
+
+    let connection = harness.db.connect().unwrap();
+    for submission_id in ["doctor-reciprocal-submission", "doctor-reverse-submission"] {
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                     submission_id, project_id, argv_json, created_at, pueue_task_id,
+                     task_signature, status, kind, metadata_json, origin_agent_run_id
+                 ) VALUES (?1, 'project-a', '[\"python\"]', 106, NULL, NULL,
+                           'accepted', 'code_change', '{}', NULL)",
+                [submission_id],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO experiments (
+                 experiment_id, campaign_id, proposal_id, submission_id,
+                 parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                 failure_code, failure_fingerprint, created_at, updated_at, finished_at,
+                 code_change_run_id, code_revision_sha
+             ) VALUES (
+                 'doctor-reciprocal-experiment', 'diagnostics-campaign',
+                 'doctor-reciprocal-proposal', 'doctor-reciprocal-submission',
+                 NULL, 1, 'succeeded', NULL, NULL, NULL, NULL, 106, 106, 106,
+                 NULL, ?1
+             )",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO experiments (
+                 experiment_id, campaign_id, proposal_id, submission_id,
+                 parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                 failure_code, failure_fingerprint, created_at, updated_at, finished_at,
+                 code_change_run_id, code_revision_sha
+             ) VALUES (
+                 'doctor-reverse-experiment', 'diagnostics-campaign',
+                 'doctor-reverse-proposal', 'doctor-reverse-submission',
+                 NULL, 1, 'succeeded', NULL, NULL, NULL, NULL, 107, 107, 107,
+                 ?1, NULL
+             )",
+            [reverse_run.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'rejected', candidate_sha = ?1, experiment_id = ?2
+             WHERE code_change_run_id = ?3",
+            params![
+                "a".repeat(40),
+                "doctor-reciprocal-experiment",
+                reciprocal_run.code_change_run_id.as_str()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs SET state = 'rejected'
+             WHERE code_change_run_id = ?1",
+            [reverse_run.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs SET state = 'recovery_required', updated_at = 500
+             WHERE code_change_run_id IN (?1, ?2)",
+            params![recovery_a.code_change_run_id, recovery_b.code_change_run_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        500,
+    )
+    .unwrap();
+    let check = |name: &str| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("missing doctor check {name}"))
+    };
+    assert_eq!(
+        check("code_change.experiments").summary,
+        "2 code-change experiments relation(s) require inspection"
+    );
+    assert_eq!(
+        check("code_change.single_live").summary,
+        "1 code-change single_live relation(s) require inspection"
+    );
+}
+
+#[test]
+fn code_change_doctor_cleanup_matrix_distinguishes_missing_and_unexpected_markers() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    let connection = harness.db.connect().unwrap();
+    for (proposal_id, hypothesis) in [
+        ("doctor-evaluated-proposal", "evaluated fixture"),
+        ("doctor-cleanup-pending-proposal", "cleanup pending fixture"),
+        ("doctor-rejected-proposal", "rejected fixture"),
+        ("doctor-live-marker-proposal", "live marker fixture"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO proposals (
+                     proposal_id, campaign_id, kind, status, hypothesis,
+                     source_experiment_id, argv_json, working_directory,
+                     expected_evidence_json, canonical_digest, reject_reason,
+                     created_at, updated_at
+                 ) VALUES (?1, 'diagnostics-campaign', 'code_change', 'accepted', ?2,
+                           'diagnostics-campaign-experiment', '[\"python\"]', '.',
+                           '[]', ?3, NULL, 101, 101)",
+                params![proposal_id, hypothesis, format!("{proposal_id}-digest")],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let create_run = |run_id: &str, proposal_id: &str, worktree: &str, now: i64| {
+        CodeChangeRepository::new(&harness.db)
+            .create_pending(&NewCodeChangeRun::new(
+                run_id,
+                proposal_id,
+                "diagnostics-campaign",
+                "a".repeat(40),
+                candidate_ref("diagnostics-campaign", proposal_id).unwrap(),
+                best_ref("diagnostics-campaign").unwrap(),
+                worktree,
+                format!(
+                    ".pueue-agent/worktrees/diagnostics-campaign/{proposal_id}"
+                ),
+                now,
+            ))
+            .unwrap()
+    };
+    let evaluated = create_run(
+        "doctor-evaluated-run",
+        "doctor-evaluated-proposal",
+        "doctor-evaluated-worktree",
+        102,
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX code_change_one_live_per_campaign", [])
+        .unwrap();
+    let cleanup_pending = create_run(
+        "doctor-cleanup-pending-run",
+        "doctor-cleanup-pending-proposal",
+        "doctor-cleanup-pending-worktree",
+        103,
+    );
+    let rejected = create_run(
+        "doctor-rejected-run",
+        "doctor-rejected-proposal",
+        "doctor-rejected-worktree",
+        104,
+    );
+    let live_marker = create_run(
+        "doctor-live-marker-run",
+        "doctor-live-marker-proposal",
+        "doctor-live-marker-worktree",
+        105,
+    );
+
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA ignore_check_constraints = ON;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'evaluated', candidate_sha = ?1,
+                 experiment_id = 'missing-evaluated-experiment', updated_at = 500
+             WHERE code_change_run_id = ?2",
+            params!["b".repeat(40), evaluated.code_change_run_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'cleanup_pending', candidate_sha = ?1,
+                 experiment_id = 'missing-cleanup-pending-experiment', updated_at = 500
+             WHERE code_change_run_id = ?2",
+            params!["c".repeat(40), cleanup_pending.code_change_run_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'rejected', candidate_sha = NULL, experiment_id = NULL,
+                 cleanup_completed_at = NULL, updated_at = 500
+             WHERE code_change_run_id = ?1",
+            [rejected.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'editing', cleanup_completed_at = 777, updated_at = 500
+             WHERE code_change_run_id = ?1",
+            [live_marker.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = OFF;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+    let before = connection
+        .query_row(
+            "SELECT state, cleanup_completed_at FROM code_change_runs
+             WHERE code_change_run_id = ?1",
+            [live_marker.code_change_run_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap();
+    drop(connection);
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        500,
+    )
+    .unwrap();
+    let cleanup = report
+        .checks
+        .iter()
+        .find(|check| check.name == "code_change.cleanup")
+        .unwrap();
+    assert_eq!(
+        cleanup.summary,
+        "1 code-change cleanup relation(s) require inspection"
+    );
+
+    let after = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, cleanup_completed_at FROM code_change_runs
+             WHERE code_change_run_id = ?1",
+            [live_marker.code_change_run_id.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn code_change_doctor_validates_complete_worktree_ownership_matrix() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    let connection = harness.db.connect().unwrap();
+    for (proposal_id, hypothesis) in [
+        ("doctor-missing-proof-proposal", "missing proof fixture"),
+        ("doctor-wrong-worktree-proposal", "worktree id fixture"),
+        ("doctor-submitted-boundary-proposal", "submitted boundary fixture"),
+        ("doctor-evaluated-proof-proposal", "evaluated proof fixture"),
+        ("doctor-rejected-no-proof-proposal", "rejected no proof fixture"),
+        (
+            "doctor-rejected-partial-proof-proposal",
+            "rejected partial proof fixture",
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO proposals (
+                     proposal_id, campaign_id, kind, status, hypothesis,
+                     source_experiment_id, argv_json, working_directory,
+                     expected_evidence_json, canonical_digest, reject_reason,
+                     created_at, updated_at
+                 ) VALUES (?1, 'diagnostics-campaign', 'code_change', 'accepted', ?2,
+                           'diagnostics-campaign-experiment', '[\"python\"]', '.',
+                           '[]', ?3, NULL, 101, 101)",
+                params![proposal_id, hypothesis, format!("{proposal_id}-digest")],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let create_run = |run_id: &str, proposal_id: &str, now: i64| {
+        CodeChangeRepository::new(&harness.db)
+            .create_pending(&NewCodeChangeRun::new(
+                run_id,
+                proposal_id,
+                "diagnostics-campaign",
+                "a".repeat(40),
+                candidate_ref("diagnostics-campaign", proposal_id).unwrap(),
+                best_ref("diagnostics-campaign").unwrap(),
+                run_id,
+                format!(
+                    ".pueue-agent/worktrees/diagnostics-campaign/{proposal_id}"
+                ),
+                now,
+            ))
+            .unwrap()
+    };
+    let missing_proof = create_run(
+        "doctor-missing-proof-run",
+        "doctor-missing-proof-proposal",
+        102,
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute("DROP INDEX code_change_one_live_per_campaign", [])
+        .unwrap();
+    let wrong_worktree = create_run(
+        "doctor-wrong-worktree-run",
+        "doctor-wrong-worktree-proposal",
+        103,
+    );
+    let submitted_boundary = create_run(
+        "doctor-submitted-boundary-run",
+        "doctor-submitted-boundary-proposal",
+        104,
+    );
+    let evaluated_proof = create_run(
+        "doctor-evaluated-proof-run",
+        "doctor-evaluated-proof-proposal",
+        105,
+    );
+    let rejected_no_proof = create_run(
+        "doctor-rejected-no-proof-run",
+        "doctor-rejected-no-proof-proposal",
+        106,
+    );
+    let rejected_partial_proof = create_run(
+        "doctor-rejected-partial-proof-run",
+        "doctor-rejected-partial-proof-proposal",
+        107,
+    );
+
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA ignore_check_constraints = ON;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state_root_identity = 'state-root',
+                 worktrees_identity = 'worktrees', campaign_identity = 'campaign',
+                 candidate_root_identity = 'candidate-root',
+                 candidate_admin_identity = 'candidate-admin',
+                 candidate_common_identity = 'candidate-common',
+                 candidate_admin_path = 'candidate-admin-path',
+                 candidate_common_path = 'candidate-common-path',
+                 protected_ref_digest = ?1, remote_config_digest = ?2,
+                 updated_at = 500
+             WHERE code_change_run_id IN (?3, ?4, ?5, ?6)",
+            params![
+                "p".repeat(64),
+                "r".repeat(64),
+                missing_proof.code_change_run_id,
+                wrong_worktree.code_change_run_id,
+                submitted_boundary.code_change_run_id,
+                evaluated_proof.code_change_run_id,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'editing', state_root_identity = '', updated_at = 500
+             WHERE code_change_run_id = ?1",
+            [missing_proof.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'editing', worktree_id = 'wrong-worktree-id', updated_at = 500
+             WHERE code_change_run_id = ?1",
+            [wrong_worktree.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'experiment_submitted', candidate_sha = ?1,
+                 experiment_id = 'submitted-boundary-experiment', updated_at = 500
+             WHERE code_change_run_id = ?2",
+            params!["b".repeat(40), submitted_boundary.code_change_run_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'evaluated', candidate_sha = ?1,
+                 experiment_id = 'evaluated-proof-experiment', updated_at = 500
+             WHERE code_change_run_id = ?2",
+            params!["c".repeat(40), evaluated_proof.code_change_run_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'rejected', candidate_sha = NULL, experiment_id = NULL,
+                 updated_at = 500
+             WHERE code_change_run_id = ?1",
+            [rejected_no_proof.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'rejected', candidate_sha = NULL, experiment_id = NULL,
+                 state_root_identity = 'partial-rejected-proof', updated_at = 500
+             WHERE code_change_run_id = ?1",
+            [rejected_partial_proof.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO submissions (
+                 submission_id, project_id, argv_json, created_at, pueue_task_id,
+                 task_signature, status, kind, metadata_json, origin_agent_run_id
+             ) VALUES
+                 ('doctor-submitted-boundary-submission', 'project-a', '[\"python\"]',
+                  500, NULL, NULL, 'pending', 'code_change', '{}', NULL),
+                 ('doctor-evaluated-proof-submission', 'project-a', '[\"python\"]',
+                  500, 42, 'doctor-evaluated-signature', 'accepted', 'code_change', '{}', NULL)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO experiments (
+                 experiment_id, campaign_id, proposal_id, submission_id,
+                 parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                 failure_code, failure_fingerprint, created_at, updated_at, finished_at,
+                 code_change_run_id, code_revision_sha
+             ) VALUES
+                 ('submitted-boundary-experiment', 'diagnostics-campaign',
+                  'doctor-submitted-boundary-proposal',
+                  'doctor-submitted-boundary-submission', NULL, 1, 'reserved',
+                  NULL, NULL, NULL, NULL, 500, 500, NULL,
+                  ?1, ?2),
+                 ('evaluated-proof-experiment', 'diagnostics-campaign',
+                  'doctor-evaluated-proof-proposal',
+                  'doctor-evaluated-proof-submission', NULL, 1, 'accepted',
+                  42, 'doctor-evaluated-signature', NULL, NULL, 500, 500, NULL,
+                  ?3, ?4)",
+            params![
+                submitted_boundary.code_change_run_id,
+                "b".repeat(40),
+                evaluated_proof.code_change_run_id,
+                "c".repeat(40),
+            ],
+        )
+        .unwrap();
+    let before = connection
+        .query_row(
+            "SELECT state, worktree_id, state_root_identity,
+                    candidate_working_directory_identity
+             FROM code_change_runs WHERE code_change_run_id = ?1",
+            [wrong_worktree.code_change_run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    drop(connection);
+
+    let report = build_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        500,
+    )
+    .unwrap();
+    let worktrees = report
+        .checks
+        .iter()
+        .find(|check| check.name == "code_change.worktrees")
+        .unwrap();
+    assert_eq!(
+        worktrees.summary,
+        "4 code-change worktrees relation(s) require inspection"
+    );
+    assert!(worktrees.summary.len() <= 240);
+    assert!(worktrees.remediation.len() <= 240);
+
+    let after = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, worktree_id, state_root_identity,
+                    candidate_working_directory_identity
+             FROM code_change_runs WHERE code_change_run_id = ?1",
+            [wrong_worktree.code_change_run_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(before, after);
 }
 
 fn unix_now() -> i64 {
@@ -3523,6 +4379,8 @@ fn latest_run_id_is_project_scoped_and_deterministic() {
     let harness = DiagnosticsHarness::new();
     let foreign_root = harness._temp.path().join("project-b");
     fs::create_dir_all(&foreign_root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&foreign_root, fs::Permissions::from_mode(0o700)).unwrap();
     ProjectRepository::new(&harness.db)
         .register(&NewProject::new(
             "project-b",
@@ -3683,6 +4541,8 @@ fn task_inspection_stays_project_scoped_and_keeps_stable_signature_history_toget
         .unwrap();
     let foreign_root = harness._temp.path().join("project-b");
     fs::create_dir_all(&foreign_root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&foreign_root, fs::Permissions::from_mode(0o700)).unwrap();
     ProjectRepository::new(&harness.db)
         .register(&NewProject::new(
             "project-b",
@@ -3818,6 +4678,8 @@ fn incident_explanation_is_deterministic_and_rejects_unknown_incidents() {
 
     let foreign_root = harness._temp.path().join("project-b");
     fs::create_dir_all(&foreign_root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&foreign_root, fs::Permissions::from_mode(0o700)).unwrap();
     ProjectRepository::new(&harness.db)
         .register(&NewProject::new(
             "project-b",
@@ -4159,6 +5021,8 @@ fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
     let harness = DiagnosticsHarness::new();
     let foreign_root = harness._temp.path().join("project-b");
     fs::create_dir_all(&foreign_root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&foreign_root, fs::Permissions::from_mode(0o700)).unwrap();
     ProjectRepository::new(&harness.db)
         .register(&NewProject::new(
             "project-b",

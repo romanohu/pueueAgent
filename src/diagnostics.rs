@@ -11,9 +11,9 @@ use crate::{
     config,
     db::{
         inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
-        CampaignStatusProjection, Db, EventExecutionProjection, EventRepository,
-        HealthRepository, IncidentRepository, InterventionRepository, ProjectRepository,
-        SubmissionRepository, TaskObservationRepository,
+        CampaignStatusProjection, CodeChangeRepository, Db, EventExecutionProjection,
+        EventRepository, HealthRepository, IncidentRepository, InterventionRepository,
+        ProjectRepository, SubmissionRepository, TaskObservationRepository,
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
@@ -24,7 +24,8 @@ use crate::{
     },
     environment::MAX_PRIVATE_TEMP_RUN_ID,
     models::{
-        AgentRun, AgentRunStatus, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
+        AgentRun, AgentRunStatus, CodeChangeCheck, CodeChangeCheckStatus, CodeChangeRun,
+        CodeChangeState, Event, EventKind, EventStatus, Incident, IncidentStatus, Project,
         Submission, TaskObservation, TerminationRequest, TerminationRequestStatus,
     },
     output::{
@@ -52,6 +53,8 @@ const MAX_TASK_AGENT_RUNS: usize = 64;
 const MAX_RESTART_UNCERTAIN_SAMPLES: i64 = 3;
 const MAX_DECISION_DOCTOR_PAYLOAD_BYTES: i64 = 128 * 1024;
 const MAX_DECISION_DOCTOR_DIGEST_BYTES: i64 = 256;
+const MAX_CODE_CHANGE_DOCTOR_COUNT: i64 = 1_000;
+const CODE_CHANGE_STALE_AFTER_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFilter {
@@ -783,6 +786,7 @@ pub fn build_doctor_report_with_policy_and_roots(
         });
     }
     checks.extend(decision_doctor_checks(db, project, &connection, now, policy)?);
+    checks.extend(code_change_doctor_checks(&connection, &project.project_id, now)?);
 
     let required_tables = [
         "projects",
@@ -1361,6 +1365,334 @@ pub fn build_doctor_report_with_policy_and_roots(
         status,
         checks,
     })
+}
+
+fn code_change_doctor_checks(
+    connection: &rusqlite::Connection,
+    project_id: &str,
+    now: i64,
+) -> Result<Vec<DoctorCheck>, AppError> {
+    let rows = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM code_change_runs AS r
+         JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+         WHERE c.project_id = ?1
+           AND (
+               r.state NOT IN (
+                   'reserved', 'preparing_worktree', 'editing', 'checking',
+                   'committing', 'candidate_ready', 'experiment_submitted',
+                   'evaluated', 'cleanup_pending', 'completed', 'rejected',
+                   'recovery_required'
+               )
+               OR r.editor_attempts NOT BETWEEN 0 AND 2
+               OR length(r.base_sha) NOT IN (40, 64)
+               OR r.base_sha GLOB '*[^0-9a-f]*'
+               OR (
+                   r.candidate_sha IS NOT NULL
+                   AND (
+                       length(r.candidate_sha) NOT IN (40, 64)
+                       OR r.candidate_sha GLOB '*[^0-9a-f]*'
+                   )
+               )
+               OR (
+                   r.state IN ('reserved', 'preparing_worktree', 'editing', 'checking')
+                   AND r.candidate_sha IS NOT NULL
+               )
+               OR (
+                   r.state IN (
+                       'candidate_ready', 'experiment_submitted', 'evaluated',
+                       'cleanup_pending', 'completed'
+                   )
+                   AND r.candidate_sha IS NULL
+               )
+               OR (
+                   r.state IN ('experiment_submitted', 'evaluated', 'cleanup_pending', 'completed')
+                   AND r.experiment_id IS NULL
+               )
+           )",
+        project_id,
+        None,
+        "query doctor code-change rows",
+    )?;
+
+    let experiments = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM (
+             SELECT 'run:' || r.code_change_run_id AS relation_id
+             FROM code_change_runs AS r
+             JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+             LEFT JOIN experiments AS e ON e.experiment_id = r.experiment_id
+             WHERE c.project_id = ?1
+               AND r.experiment_id IS NOT NULL
+               AND (
+                   e.experiment_id IS NULL
+                   OR e.campaign_id IS NOT r.campaign_id
+                   OR e.proposal_id IS NOT r.proposal_id
+                   OR e.code_change_run_id IS NOT r.code_change_run_id
+                   OR e.code_revision_sha IS NULL
+                   OR e.code_revision_sha IS NOT r.candidate_sha
+               )
+             UNION
+             SELECT 'experiment:' || e.experiment_id AS relation_id
+             FROM experiments AS e
+             JOIN campaigns AS c ON c.campaign_id = e.campaign_id
+             LEFT JOIN code_change_runs AS r
+                 ON r.code_change_run_id = e.code_change_run_id
+             WHERE c.project_id = ?1
+               AND e.code_change_run_id IS NOT NULL
+               AND (
+                   r.code_change_run_id IS NULL
+                   OR r.experiment_id IS NULL
+                   OR r.experiment_id IS NOT e.experiment_id
+                   OR r.campaign_id IS NOT e.campaign_id
+                   OR r.proposal_id IS NOT e.proposal_id
+                   OR e.code_revision_sha IS NULL
+                   OR e.code_revision_sha IS NOT r.candidate_sha
+               )
+         )",
+        project_id,
+        None,
+        "query doctor code-change experiments",
+    )?;
+
+    let lineage = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM code_change_runs AS r
+         JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+         LEFT JOIN proposals AS p ON p.proposal_id = r.proposal_id
+         WHERE c.project_id = ?1
+           AND (
+               p.proposal_id IS NULL
+               OR p.campaign_id <> r.campaign_id
+               OR p.kind <> 'code_change'
+               OR p.source_experiment_id IS NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM experiments AS source
+                   WHERE source.experiment_id = p.source_experiment_id
+                     AND source.campaign_id = r.campaign_id
+               )
+           )",
+        project_id,
+        None,
+        "query doctor code-change lineage",
+    )?;
+
+    let refs = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM code_change_runs AS r
+         JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+         WHERE c.project_id = ?1
+           AND (
+               r.candidate_ref <> 'campaign/' || r.campaign_id || '/candidate/' || r.proposal_id
+               OR r.best_ref <> 'campaign/' || r.campaign_id || '/best'
+           )",
+        project_id,
+        None,
+        "query doctor code-change refs",
+    )?;
+
+    let single_live = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM (
+             SELECT r.campaign_id
+             FROM code_change_runs AS r
+             JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+             WHERE c.project_id = ?1
+               AND r.state NOT IN ('completed', 'rejected')
+             GROUP BY r.campaign_id
+             HAVING COUNT(*) > 1
+         )",
+        project_id,
+        None,
+        "query doctor code-change live rows",
+    )?;
+
+    let stale = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM code_change_runs AS r
+         JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+         WHERE c.project_id = ?1
+           AND r.state NOT IN ('completed', 'rejected', 'recovery_required')
+           AND r.updated_at < ?2 - ?3",
+        project_id,
+        Some(now),
+        "query doctor stale code-change rows",
+    )?;
+
+    let cleanup = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM code_change_runs AS r
+         JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+         WHERE c.project_id = ?1
+           AND (
+               (r.state = 'completed' AND r.cleanup_completed_at IS NULL)
+               OR (
+                   r.cleanup_completed_at IS NOT NULL
+                   AND (
+                       r.state IS NULL
+                       OR r.state NOT IN ('candidate_ready', 'completed', 'rejected')
+                   )
+               )
+           )",
+        project_id,
+        None,
+        "query doctor code-change cleanup",
+    )?;
+
+    let worktrees = code_change_doctor_count(
+        connection,
+        "SELECT COUNT(*) FROM code_change_runs AS r
+         JOIN campaigns AS c ON c.campaign_id = r.campaign_id
+         WHERE c.project_id = ?1
+           AND r.state IN (
+               'editing', 'checking', 'committing', 'candidate_ready',
+               'experiment_submitted', 'evaluated', 'cleanup_pending', 'completed',
+               'rejected'
+           )
+           AND (
+               r.worktree_id IS NOT r.code_change_run_id
+               OR r.worktree_relative_path IS NOT
+                   ('.pueue-agent/worktrees/' || r.campaign_id || '/' || r.proposal_id)
+               OR (
+                   (r.state <> 'rejected' OR r.candidate_sha IS NOT NULL)
+                   AND (
+                       NULLIF(r.state_root_identity, '') IS NULL
+                       OR NULLIF(r.worktrees_identity, '') IS NULL
+                       OR NULLIF(r.campaign_identity, '') IS NULL
+                       OR NULLIF(r.candidate_root_identity, '') IS NULL
+                       OR NULLIF(r.candidate_admin_identity, '') IS NULL
+                       OR NULLIF(r.candidate_common_identity, '') IS NULL
+                       OR NULLIF(r.candidate_admin_path, '') IS NULL
+                       OR NULLIF(r.candidate_common_path, '') IS NULL
+                       OR NULLIF(r.protected_ref_digest, '') IS NULL
+                       OR NULLIF(r.remote_config_digest, '') IS NULL
+                       OR (
+                           NULLIF(r.candidate_working_directory_identity, '') IS NULL
+                           AND EXISTS (
+                               SELECT 1
+                               FROM experiments AS e
+                               WHERE e.experiment_id = r.experiment_id
+                                 AND e.status <> 'reserved'
+                           )
+                       )
+                   )
+               )
+               OR (
+                   r.state = 'rejected'
+                   AND r.candidate_sha IS NULL
+                   AND (
+                       NULLIF(r.state_root_identity, '') IS NOT NULL
+                       OR NULLIF(r.worktrees_identity, '') IS NOT NULL
+                       OR NULLIF(r.campaign_identity, '') IS NOT NULL
+                       OR NULLIF(r.candidate_root_identity, '') IS NOT NULL
+                       OR NULLIF(r.candidate_admin_identity, '') IS NOT NULL
+                       OR NULLIF(r.candidate_common_identity, '') IS NOT NULL
+                       OR NULLIF(r.candidate_admin_path, '') IS NOT NULL
+                       OR NULLIF(r.candidate_common_path, '') IS NOT NULL
+                       OR NULLIF(r.candidate_working_directory_identity, '') IS NOT NULL
+                       OR NULLIF(r.protected_ref_digest, '') IS NOT NULL
+                       OR NULLIF(r.remote_config_digest, '') IS NOT NULL
+                   )
+               )
+           )",
+        project_id,
+        None,
+        "query doctor code-change worktrees",
+    )?;
+
+    Ok(vec![
+        code_change_doctor_check(
+            "code_change.cleanup",
+            cleanup,
+            "code-change cleanup markers are consistent",
+            "inspect cleanup state and use the supported cleanup coordinator",
+            true,
+        ),
+        code_change_doctor_check(
+            "code_change.experiments",
+            experiments,
+            "code-change experiment links are reciprocal and immutable",
+            "inspect experiment lineage without repairing it from doctor",
+            true,
+        ),
+        code_change_doctor_check(
+            "code_change.lineage",
+            lineage,
+            "code-change proposal lineage is consistent",
+            "inspect campaign, proposal, and source experiment lineage",
+            true,
+        ),
+        code_change_doctor_check(
+            "code_change.refs",
+            refs,
+            "code-change refs use the campaign-owned names",
+            "inspect candidate and best refs without rewriting them from doctor",
+            true,
+        ),
+        code_change_doctor_check(
+            "code_change.rows",
+            rows,
+            "code-change rows satisfy bounded state and field invariants",
+            "inspect code-change rows through supported recovery",
+            true,
+        ),
+        code_change_doctor_check(
+            "code_change.single_live",
+            single_live,
+            "each campaign has at most one live code-change run",
+            "quarantine duplicate live code-change rows before continuing",
+            true,
+        ),
+        code_change_doctor_check(
+            "code_change.stale",
+            stale,
+            "no live code-change row is stale",
+            "inspect stale code-change work without automatic recovery",
+            false,
+        ),
+        code_change_doctor_check(
+            "code_change.worktrees",
+            worktrees,
+            "code-change worktree paths retain their durable ownership proof",
+            "inspect worktree ownership and identities without deleting paths",
+            true,
+        ),
+    ])
+}
+
+fn code_change_doctor_count(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    project_id: &str,
+    now: Option<i64>,
+    operation: &'static str,
+) -> Result<i64, AppError> {
+    let count: i64 = match now {
+        Some(now) => connection.query_row(sql, params![project_id, now, CODE_CHANGE_STALE_AFTER_SECONDS], |row| row.get(0)),
+        None => connection.query_row(sql, params![project_id], |row| row.get(0)),
+    }
+    .map_err(|source| AppError::Database { operation, source })?;
+    Ok(count.clamp(0, MAX_CODE_CHANGE_DOCTOR_COUNT))
+}
+
+fn code_change_doctor_check(
+    name: &'static str,
+    count: i64,
+    ok_summary: &'static str,
+    remediation: &'static str,
+    error: bool,
+) -> DoctorCheck {
+    if count == 0 {
+        doctor_ok(name, ok_summary, "none")
+    } else {
+        let relation = name.strip_prefix("code_change.").unwrap_or("state");
+        let summary = format!("{count} code-change {relation} relation(s) require inspection");
+        if error {
+            doctor_error(name, &summary, remediation)
+        } else {
+            doctor_warning(name, &summary, remediation)
+        }
+    }
 }
 
 fn decision_doctor_checks(
@@ -2258,6 +2590,7 @@ pub fn render_project_status_json(
         .list_by_project(&project.project_id, DEFAULT_SUMMARY_LIMIT)?;
     let agent_runs =
         AgentRunRepository::new(db).list_by_project(&project.project_id, DEFAULT_SUMMARY_LIMIT)?;
+    let code_changes = code_change_status_summaries(db, &project.project_id)?;
     let campaign_projection = CampaignRepository::new(db)
         .status_projection_for_project(&project.project_id, crate::status::status_timestamp()?)?;
     let campaign = match campaign_projection.as_ref() {
@@ -2299,6 +2632,7 @@ pub fn render_project_status_json(
             counts: agent_run_counts(db, &project.project_id)?,
             recent: agent_runs.iter().map(AgentRunSummary::from).collect(),
         },
+        code_changes,
         interventions: InterventionStatusProjection {
             counts: intervention_counts(db, &project.project_id)?,
         },
@@ -2349,6 +2683,7 @@ struct ProjectStatusReport {
     incidents: IncidentSection,
     termination: TerminationSection,
     agent_runs: AgentRunSection,
+    code_changes: Vec<CodeChangeStatusSummary>,
     interventions: InterventionStatusProjection,
     health: HealthSection,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2357,6 +2692,191 @@ struct ProjectStatusReport {
     campaign: Option<CampaignStatusSummary>,
     policy: FutureSection,
     resource: FutureSection,
+}
+
+#[derive(Serialize)]
+struct CodeChangeStatusSummary {
+    state: &'static str,
+    attempts: i64,
+    base_sha: String,
+    candidate_sha: Option<String>,
+    experiment_id: Option<String>,
+    task_id: Option<i64>,
+    failed_check: Option<CodeChangeCheckStatusSummary>,
+    next_action: &'static str,
+    cleanup_pending: bool,
+    transitions: Vec<CodeChangeTransitionSummary>,
+}
+
+#[derive(Serialize)]
+struct CodeChangeCheckStatusSummary {
+    status: &'static str,
+    summary: String,
+}
+
+#[derive(Serialize)]
+struct CodeChangeTransitionSummary {
+    stage: &'static str,
+    reason: &'static str,
+}
+
+fn code_change_status_summaries(
+    db: &Db,
+    project_id: &str,
+) -> Result<Vec<CodeChangeStatusSummary>, AppError> {
+    let repository = CodeChangeRepository::new(db);
+    let runs = repository.list_by_project(project_id, DEFAULT_SUMMARY_LIMIT)?;
+    let event_repository = EventRepository::new(db);
+    runs.into_iter()
+        .map(|run| {
+            let failed_check = if (1..=2).contains(&run.editor_attempts) {
+                repository
+                    .list_checks(&run.code_change_run_id, run.editor_attempts)?
+                    .into_iter()
+                    .rev()
+                    .find(|check| {
+                        matches!(
+                            check.status,
+                            CodeChangeCheckStatus::Failed | CodeChangeCheckStatus::TimedOut
+                        )
+                    })
+                    .map(CodeChangeCheckStatusSummary::from)
+            } else {
+                None
+            };
+            let transitions = event_repository
+                .list_completed_code_change_events_for_run(
+                    project_id,
+                    &run.code_change_run_id,
+                    DEFAULT_SUMMARY_LIMIT,
+                )?
+                .iter()
+                .map(CodeChangeTransitionSummary::from_event)
+                .collect();
+            let cleanup_pending = matches!(
+                run.state,
+                CodeChangeState::Evaluated
+                    | CodeChangeState::CleanupPending
+                    | CodeChangeState::Rejected
+            ) && run.cleanup_completed_at.is_none();
+            Ok(CodeChangeStatusSummary {
+                state: run.state.as_str(),
+                attempts: run.editor_attempts,
+                base_sha: abbreviated_sha(&run.base_sha),
+                candidate_sha: run.candidate_sha.as_deref().map(abbreviated_sha),
+                experiment_id: run.experiment_id.as_deref().map(bounded_summary),
+                task_id: code_change_task_id(db, &run)?,
+                failed_check,
+                next_action: code_change_next_action(run.state, cleanup_pending),
+                cleanup_pending,
+                transitions,
+            })
+        })
+        .collect()
+}
+
+impl From<CodeChangeCheck> for CodeChangeCheckStatusSummary {
+    fn from(check: CodeChangeCheck) -> Self {
+        Self {
+            status: check.status.as_str(),
+            summary: check
+                .summary
+                .as_deref()
+                .map(bounded_summary)
+                .unwrap_or_else(|| "none".to_owned()),
+        }
+    }
+}
+
+impl CodeChangeTransitionSummary {
+    fn from_event(event: &Event) -> Self {
+        let stage = event
+            .payload
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<CodeChangeState>().ok())
+            .map(CodeChangeState::as_str)
+            .unwrap_or("unknown");
+        let reason = event
+            .payload
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str)
+            .map(code_change_reason)
+            .unwrap_or("none");
+        Self { stage, reason }
+    }
+}
+
+fn code_change_reason(value: &str) -> &'static str {
+    match value {
+        "cannot_apply" => "cannot_apply",
+        "candidate_policy_invalid" => "candidate_policy_invalid",
+        "check_failed" => "check_failed",
+        "editor_attempt_binding_missing" => "editor_attempt_binding_missing",
+        "editor_attempt_counter_mismatch" => "editor_attempt_counter_mismatch",
+        "editor_attempt_overflow" => "editor_attempt_overflow",
+        "editor_attempt_state_invalid" => "editor_attempt_state_invalid",
+        "editor_failed" => "editor_failed",
+        "editor_launch_failed" => "editor_launch_failed",
+        "editor_session_missing" => "editor_session_missing",
+        "project_check_missing" => "project_check_missing",
+        "promotion_best_ref_conflict" => "promotion_best_ref_conflict",
+        "promotion_best_ref_invalid" => "promotion_best_ref_invalid",
+        "promotion_candidate_invalid" => "promotion_candidate_invalid",
+        "promotion_finalize_failed" => "promotion_finalize_failed",
+        "promotion_intent_invalid" => "promotion_intent_invalid",
+        "promotion_prepare_failed" => "promotion_prepare_failed",
+        "promotion_source_invalid" => "promotion_source_invalid",
+        "promotion_target_invalid" => "promotion_target_invalid",
+        "worktree_recovery_required" => "worktree_recovery_required",
+        _ => "unknown",
+    }
+}
+
+fn code_change_next_action(state: CodeChangeState, cleanup_pending: bool) -> &'static str {
+    match state {
+        CodeChangeState::Reserved
+        | CodeChangeState::PreparingWorktree
+        | CodeChangeState::Editing
+        | CodeChangeState::Checking
+        | CodeChangeState::Committing
+        | CodeChangeState::CandidateReady
+        | CodeChangeState::ExperimentSubmitted => "advance",
+        CodeChangeState::Evaluated | CodeChangeState::CleanupPending => "cleanup",
+        CodeChangeState::Completed => "completed",
+        CodeChangeState::Rejected => {
+            if cleanup_pending {
+                "cleanup"
+            } else {
+                "completed"
+            }
+        }
+        CodeChangeState::RecoveryRequired => "recovery_required",
+    }
+}
+
+fn code_change_task_id(db: &Db, run: &CodeChangeRun) -> Result<Option<i64>, AppError> {
+    let Some(experiment_id) = run.experiment_id.as_deref() else {
+        return Ok(None);
+    };
+    let connection = db.connect()?;
+    connection
+        .query_row(
+            "SELECT pueue_task_id FROM experiments
+             WHERE experiment_id = ?1 AND code_change_run_id = ?2
+               AND campaign_id = ?3 AND pueue_task_id IS NOT NULL",
+            params![experiment_id, run.code_change_run_id, run.campaign_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| AppError::Database {
+            operation: "query code-change task id",
+            source,
+        })
+}
+
+fn abbreviated_sha(value: &str) -> String {
+    value.chars().take(8).collect()
 }
 
 #[derive(Serialize)]

@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     path::PathBuf,
@@ -14,9 +15,9 @@ use std::process::Command;
 
 use async_trait::async_trait;
 use pueue_agent::{
-    agent::{AgentHandle, AgentRunner, AgentRunnerConfig},
+    agent::{AgentRunner, AgentRunnerConfig},
     db::{
-        AgentRunRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
+        AgentRunRepository, CampaignRepository, Db, DecisionRepository,
         EventRepository, ExperimentRepository, InterventionRepository, ProjectRepository,
         StartCampaignRequest,
     },
@@ -30,19 +31,29 @@ use pueue_agent::{
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
+    retry::RetryPolicy,
     AppError,
 };
 
 #[cfg(target_os = "linux")]
 use pueue_agent::{
-    code_change::CodeChangeCoordinator,
+    agent::AgentHandle,
+    db::CodeChangeRepository,
+    models::CodeChangeCheckStatus,
+};
+
+#[cfg(target_os = "linux")]
+use pueue_agent::{
+    code_change::{
+        prepare_code_change_worktree_for_run, reopen_code_change_worktree_for_run,
+        CodeChangeCoordinator, ProposedCheck, PYTHON_PYTEST_CHECK, RUST_CHECK, UV_PYTEST_CHECK,
+    },
     config::{self, AgentConfig},
     execution_policy::{
         resolve_project_policy, NetworkMode, ProjectRootAnchor,
         ResolvedProjectExecutionPolicy,
     },
     models::{NewCodeChangeRun, Project},
-    retry::RetryPolicy,
 };
 use sha2::{Digest, Sha256};
 use serde_json::json;
@@ -3831,9 +3842,16 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
         .execute(
             "INSERT INTO campaigns (campaign_id, project_id, objective_text,
                                     objective_digest, initial_argv_json, state,
-                                    created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, 1)",
-            rusqlite::params!["campaign-a", "project-a", "cleanup", "digest", "[]"],
+                                    base_revision_sha, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, 1, 1)",
+            rusqlite::params![
+                "campaign-a",
+                "project-a",
+                "cleanup",
+                "digest",
+                "[]",
+                &original_main,
+            ],
         )
         .unwrap();
     cleanup_connection
@@ -3859,12 +3877,8 @@ async fn code_change_worktree_lifecycle_preserves_original_and_cleans_owned_cand
                 "proposal-a",
                 "campaign-a",
                 original_main,
-                format!(
-                    "refs/heads/{}",
-                    pueue_agent::code_change::candidate_ref("campaign-a", "proposal-a")
-                        .unwrap()
-                ),
-                "refs/heads/campaign/campaign-a/best",
+                pueue_agent::code_change::candidate_ref("campaign-a", "proposal-a").unwrap(),
+                "campaign/campaign-a/best",
                 run_id,
                 ".pueue-agent/worktrees/campaign-a/proposal-a",
             ],
@@ -4097,7 +4111,8 @@ fn seed_code_change_editor_recovery_fixture(
                  editor_session_id, editor_attempts, created_at, updated_at
              ) VALUES (?1, 'editor-proposal', 'editor-campaign', 'editing',
                        '0000000000000000000000000000000000000000',
-                       'refs/heads/candidate/editor', 'refs/heads/best/editor',
+                       'campaign/editor-campaign/candidate/editor-proposal',
+                       'campaign/editor-campaign/best',
                        'editor-worktree', '.pueue-agent/worktrees/editor',
                        'editor-session', 1, 1, 1)",
             [&code_change_run_id],
@@ -4123,10 +4138,24 @@ async fn code_change_editor_is_preserved_from_generic_startup_recovery() {
     let (run_id, code_change_run_id, event_id) =
         seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
 
-    let report = harness.daemon().run_once().await.unwrap();
+    let policies = BTreeMap::from([(
+        "project-a".to_owned(),
+        RetryPolicy { max_retries: 1 },
+    )]);
+    let recovery = AgentRunRepository::new(&harness.db)
+        .recover_interrupted_with_marker_evidence(
+            harness.now,
+            "daemon restart",
+            &policies,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
-    assert_eq!(report.recovered_agent_runs, 0);
-    assert_eq!(report.preserved_code_change_editors, 1);
+    assert_eq!(recovery.failed_runs, 0);
+    assert_eq!(recovery.preserved_code_change_editors, 1);
     assert_eq!(harness.event_status(event_id), EventStatus::InFlight);
     let state: (AgentRunStatus, String) = harness
         .db
@@ -4151,6 +4180,822 @@ async fn code_change_editor_is_preserved_from_generic_startup_recovery() {
         )
         .unwrap();
     assert_eq!(attempt_status, "reserved");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn startup_editor_runner(
+    harness: &DaemonHarness,
+) -> (
+    Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+    AgentRunner,
+) {
+    let policy = harness.policy();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production().with_codex_capabilities(
+            pueue_agent::codex_command::CodexCapabilities::all(),
+        ),
+        Arc::clone(&policy),
+    );
+    (policy, runner)
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn startup_editor_retry_policies(max_retries: u32) -> BTreeMap<String, RetryPolicy> {
+    BTreeMap::from([(
+        "project-a".to_owned(),
+        RetryPolicy { max_retries },
+    )])
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+const VALID_EDITOR_RESULT_DIGEST: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[cfg(all(unix, target_os = "linux"))]
+fn update_startup_editor_fixture(
+    harness: &DaemonHarness,
+    run_id: i64,
+    code_change_run_id: &str,
+    event_id: i64,
+    agent_status: &str,
+    launch_gate_state: &str,
+    event_status: &str,
+    attempt_status: &str,
+    failure_code: Option<&str>,
+) {
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE agent_runs
+             SET status = ?1, pid = 4242, launch_gate_state = ?2
+             WHERE run_id = ?3",
+            rusqlite::params![agent_status, launch_gate_state, run_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE events SET status = ?1, lease_until = NULL WHERE event_id = ?2",
+            rusqlite::params![event_status, event_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_editor_attempts
+             SET status = ?1, result_digest = CASE WHEN ?1 = 'ready' THEN ?4 ELSE NULL END,
+                 failure_code = ?2,
+                 failure_summary = CASE WHEN ?1 = 'failed' THEN COALESCE(?2, 'startup fixture failure') ELSE NULL END,
+                 finished_at = CASE WHEN ?1 IN ('ready', 'failed') THEN 199 ELSE NULL END
+             WHERE code_change_run_id = ?3 AND attempt = 1",
+            rusqlite::params![
+                attempt_status,
+                failure_code,
+                code_change_run_id,
+                VALID_EDITOR_RESULT_DIGEST,
+            ],
+        )
+        .unwrap();
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_reuses_terminal_validated_output_without_new_agent() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "released",
+        "dispatched",
+        "ready",
+        None,
+    );
+    let before_agent_runs = harness.count("agent_runs");
+    let (policy, runner) = startup_editor_runner(&harness);
+
+    let report = CodeChangeCoordinator::new(
+        &harness.db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .recover_startup_editors(
+        harness.now,
+        &[run_id],
+        &startup_editor_retry_policies(1),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(harness.count("agent_runs"), before_agent_runs);
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Completed
+    );
+    let attempt = CodeChangeRepository::new(&harness.db)
+        .find_editor_attempt(&code_change_run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "ready");
+    assert_eq!(
+        attempt.result_digest.as_deref(),
+        Some(VALID_EDITOR_RESULT_DIGEST)
+    );
+    assert_eq!(
+        CodeChangeRepository::new(&harness.db)
+            .find_by_id(&code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .editor_attempts,
+        1
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_recovery_runs_before_normal_dispatch() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "released",
+        "dispatched",
+        "ready",
+        None,
+    );
+    let before_agent_runs = harness.count("agent_runs");
+
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.preserved_code_change_editors, 1);
+    assert_eq!(report.code_changes.started, 0);
+    assert_eq!(report.code_changes.advanced, 1);
+    assert_eq!(harness.count("agent_runs"), before_agent_runs);
+    assert!(harness.fake_pueue.add_calls().is_empty());
+    assert_eq!(harness.event_status(event_id), EventStatus::Completed);
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(
+        CodeChangeRepository::new(&harness.db)
+            .find_editor_attempt(&code_change_run_id, 1)
+            .unwrap()
+            .unwrap()
+            .status,
+        "ready"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_finishes_certain_pre_marker_failure_once() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+    let (policy, runner) = startup_editor_runner(&harness);
+
+    let first = CodeChangeCoordinator::new(
+        &harness.db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .recover_startup_editors(
+        harness.now,
+        &[run_id],
+        &startup_editor_retry_policies(1),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.started.len(), 0);
+    let after_first = CodeChangeRepository::new(&harness.db)
+        .find_editor_attempt(&code_change_run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_first.status, "failed");
+    assert_eq!(
+        CodeChangeRepository::new(&harness.db)
+            .find_by_id(&code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .editor_attempts,
+        1
+    );
+    let first_finished_at = after_first.finished_at;
+    let first_event_status = harness.event_status(event_id);
+
+    let second = CodeChangeCoordinator::new(
+        &harness.db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .recover_startup_editors(
+        harness.now + 1,
+        &[run_id],
+        &startup_editor_retry_policies(1),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.started.len(), 0);
+    let after_second = CodeChangeRepository::new(&harness.db)
+        .find_editor_attempt(&code_change_run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_second.status, "failed");
+    assert_eq!(after_second.finished_at, first_finished_at);
+    assert_eq!(harness.event_status(event_id), first_event_status);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_quarantines_post_release_uncertainty_without_output() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "released",
+        "dispatched",
+        "running",
+        None,
+    );
+    let (policy, runner) = startup_editor_runner(&harness);
+
+    let report = CodeChangeCoordinator::new(
+        &harness.db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .recover_startup_editors(
+        harness.now,
+        &[run_id],
+        &startup_editor_retry_policies(1),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(
+        CodeChangeRepository::new(&harness.db)
+            .find_by_id(&code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        pueue_agent::models::CodeChangeState::RecoveryRequired
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Failed
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_quarantines_indeterminate_pending_without_output() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "pending",
+        "in_flight",
+        "running",
+        None,
+    );
+    let (policy, runner) = startup_editor_runner(&harness);
+    let indeterminate = BTreeSet::from([run_id]);
+
+    let report = CodeChangeCoordinator::new(
+        &harness.db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .recover_startup_editors(
+        harness.now,
+        &[run_id],
+        &startup_editor_retry_policies(1),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &indeterminate,
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(
+        CodeChangeRepository::new(&harness.db)
+            .find_by_id(&code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        pueue_agent::models::CodeChangeState::RecoveryRequired
+    );
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_recovers_uncertain_crash_prefixes() {
+    const UNCERTAIN_RECOVERY_CODE: &str = "editor_startup_uncertain";
+    const UNCERTAIN_RECOVERY_SUMMARY: &str =
+        "editor startup execution outcome is unknown after restart";
+
+    {
+        let harness = DaemonHarness::new();
+        let (run_id, code_change_run_id, event_id) =
+            seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+        update_startup_editor_fixture(
+            &harness,
+            run_id,
+            &code_change_run_id,
+            event_id,
+            "running",
+            "released",
+            "dispatched",
+            "failed",
+            Some(UNCERTAIN_RECOVERY_CODE),
+        );
+        let before_agent_runs = harness.count("agent_runs");
+        let (policy, runner) = startup_editor_runner(&harness);
+
+        let report = CodeChangeCoordinator::new(
+            &harness.db,
+            &runner,
+            &policy,
+            CampaignLimits::default(),
+        )
+        .recover_startup_editors(
+            harness.now,
+            &[run_id],
+            &startup_editor_retry_policies(1),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.started.len(), 0);
+        assert_eq!(harness.count("agent_runs"), before_agent_runs);
+        assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+        assert_eq!(
+            CodeChangeRepository::new(&harness.db)
+                .find_by_id(&code_change_run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            pueue_agent::models::CodeChangeState::RecoveryRequired
+        );
+        assert_eq!(
+            AgentRunRepository::new(&harness.db)
+                .find_by_id(run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Failed
+        );
+        assert_eq!(
+            CodeChangeRepository::new(&harness.db)
+                .find_editor_attempt(&code_change_run_id, 1)
+                .unwrap()
+                .unwrap()
+                .failure_code
+                .as_deref(),
+            Some(UNCERTAIN_RECOVERY_CODE)
+        );
+    }
+
+    {
+        let harness = DaemonHarness::new();
+        let (run_id, code_change_run_id, event_id) =
+            seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+        update_startup_editor_fixture(
+            &harness,
+            run_id,
+            &code_change_run_id,
+            event_id,
+            "running",
+            "released",
+            "dispatched",
+            "failed",
+            Some(UNCERTAIN_RECOVERY_CODE),
+        );
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE code_change_runs
+                 SET state = 'recovery_required', rejection_code = ?1,
+                     rejection_summary = ?2
+                 WHERE code_change_run_id = ?3",
+                rusqlite::params![
+                    UNCERTAIN_RECOVERY_CODE,
+                    UNCERTAIN_RECOVERY_SUMMARY,
+                    code_change_run_id,
+                ],
+            )
+            .unwrap();
+        let policies = BTreeMap::from([(
+            "project-a".to_owned(),
+            RetryPolicy { max_retries: 1 },
+        )]);
+        let recovery = AgentRunRepository::new(&harness.db)
+            .recover_interrupted_with_marker_evidence(
+                harness.now,
+                "daemon restart",
+                &policies,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(recovery.preserved_code_change_editors, 1);
+        assert_eq!(recovery.preserved_code_change_editor_run_ids, vec![run_id]);
+        assert_eq!(harness.event_status(event_id), EventStatus::Dispatched);
+        let before_agent_runs = harness.count("agent_runs");
+        let (policy, runner) = startup_editor_runner(&harness);
+
+        let report = CodeChangeCoordinator::new(
+            &harness.db,
+            &runner,
+            &policy,
+            CampaignLimits::default(),
+        )
+        .recover_startup_editors(
+            harness.now,
+            &recovery.preserved_code_change_editor_run_ids,
+            &startup_editor_retry_policies(1),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.started.len(), 0);
+        assert_eq!(harness.count("agent_runs"), before_agent_runs);
+        assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+        assert_eq!(
+            CodeChangeRepository::new(&harness.db)
+                .find_by_id(&code_change_run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            pueue_agent::models::CodeChangeState::RecoveryRequired
+        );
+        assert_eq!(
+            AgentRunRepository::new(&harness.db)
+                .find_by_id(run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Failed
+        );
+        let attempt = CodeChangeRepository::new(&harness.db)
+            .find_editor_attempt(&code_change_run_id, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(
+            attempt.failure_code.as_deref(),
+            Some(UNCERTAIN_RECOVERY_CODE)
+        );
+    }
+
+    {
+        let harness = DaemonHarness::new();
+        let (run_id, code_change_run_id, event_id) =
+            seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+        update_startup_editor_fixture(
+            &harness,
+            run_id,
+            &code_change_run_id,
+            event_id,
+            "running",
+            "released",
+            "dispatched",
+            "failed",
+            Some("editor_exit"),
+        );
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events SET attempts = 1 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+        let attempts: i64 = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT attempts FROM events WHERE event_id = ?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+        let before_agent_runs = harness.count("agent_runs");
+        let (policy, runner) = startup_editor_runner(&harness);
+
+        let report = CodeChangeCoordinator::new(
+            &harness.db,
+            &runner,
+            &policy,
+            CampaignLimits::default(),
+        )
+        .recover_startup_editors(
+            harness.now,
+            &[run_id],
+            &startup_editor_retry_policies(1),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.started.len(), 0);
+        assert_eq!(harness.count("agent_runs"), before_agent_runs);
+        assert_eq!(harness.event_status(event_id), EventStatus::RetryWait);
+        assert_eq!(
+            CodeChangeRepository::new(&harness.db)
+                .find_by_id(&code_change_run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            pueue_agent::models::CodeChangeState::Editing
+        );
+        assert_eq!(
+            AgentRunRepository::new(&harness.db)
+                .find_by_id(run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentRunStatus::Failed
+        );
+        assert_eq!(
+            CodeChangeRepository::new(&harness.db)
+                .find_editor_attempt(&code_change_run_id, 1)
+                .unwrap()
+                .unwrap()
+                .failure_code
+                .as_deref(),
+            Some("editor_exit")
+        );
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editor_startup_dead_letters_after_configured_retry_budget() {
+    let harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "released",
+        "dispatched",
+        "failed",
+        Some("editor_exit"),
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET attempts = 1 WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+    let attempts: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT attempts FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1);
+    let (policy, runner) = startup_editor_runner(&harness);
+
+    let report = CodeChangeCoordinator::new(
+        &harness.db,
+        &runner,
+        &policy,
+        CampaignLimits::default(),
+    )
+    .recover_startup_editors(
+        harness.now,
+        &[run_id],
+        &startup_editor_retry_policies(0),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(harness.event_status(event_id), EventStatus::DeadLetter);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn code_change_editor_recovery_binding_rejects_incoherent_terminal_payloads() {
+    let ready_harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&ready_harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &ready_harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "released",
+        "dispatched",
+        "ready",
+        None,
+    );
+    ready_harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_editor_attempts
+             SET result_digest = 'not-a-sha256-digest'
+             WHERE code_change_run_id = ?1 AND attempt = 1",
+            [&code_change_run_id],
+        )
+        .unwrap();
+    let ready_error = AgentRunRepository::new(&ready_harness.db)
+        .recover_interrupted_with_marker_evidence(
+            ready_harness.now,
+            "daemon restart",
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 })]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("ready attempt without a result digest must fail closed");
+    assert!(matches!(
+        ready_error,
+        AppError::Validation {
+            field: "code_change_editor_attempt",
+            ..
+        }
+    ));
+
+    let failed_harness = DaemonHarness::new();
+    let (run_id, code_change_run_id, event_id) =
+        seed_code_change_editor_recovery_fixture(&failed_harness, "code_change_editor", true);
+    update_startup_editor_fixture(
+        &failed_harness,
+        run_id,
+        &code_change_run_id,
+        event_id,
+        "running",
+        "released",
+        "dispatched",
+        "failed",
+        Some("editor_exit"),
+    );
+    failed_harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_editor_attempts
+             SET failure_summary = NULL
+             WHERE code_change_run_id = ?1 AND attempt = 1",
+            [&code_change_run_id],
+        )
+        .unwrap();
+    let failed_error = AgentRunRepository::new(&failed_harness.db)
+        .recover_interrupted_with_marker_evidence(
+            failed_harness.now,
+            "daemon restart",
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 })]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("failed attempt without failure metadata must fail closed");
+    assert!(matches!(
+        failed_error,
+        AppError::Validation {
+            field: "code_change_editor_attempt",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn startup_recovery_reconciles_submission_boundary_before_normal_dispatch() {
+    let harness = DaemonHarness::new();
+    let experiment_id = harness.campaign_experiment();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE experiments
+             SET status = 'submitting', pueue_task_id = NULL, task_signature = NULL
+             WHERE experiment_id = ?1",
+            [&experiment_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE submissions
+             SET status = 'pending', pueue_task_id = NULL, task_signature = NULL
+             WHERE submission_id = (SELECT submission_id FROM experiments WHERE experiment_id = ?1)",
+            [&experiment_id],
+        )
+        .unwrap();
+    let report = harness.daemon().run_once().await.unwrap();
+
+    assert_eq!(report.scheduler.started.len(), 0);
+    assert!(harness.fake_pueue.add_calls().is_empty());
+    let statuses: (String, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT experiments.status, submissions.status
+             FROM experiments JOIN submissions USING (submission_id)
+             WHERE experiments.experiment_id = ?1",
+            [&experiment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(statuses, ("unreconciled".to_owned(), "unreconciled".to_owned()));
 }
 
 #[tokio::test]
@@ -4221,6 +5066,15 @@ fn main() {
             .unwrap();
             return;
         }
+        "ready-two" => {
+            let output = env::var("PUEUE_AGENT_EDITOR_OUTPUT").unwrap();
+            fs::write(
+                output,
+                br#"{"schema_version":1,"status":"ready","summary":"editor prepared candidate","proposed_checks":[{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"."},{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"nested"}]}"#,
+            )
+            .unwrap();
+            return;
+        }
         "fail" => process::exit(17),
         _ => {}
     }
@@ -4253,6 +5107,57 @@ fn main() {
 }
 
 #[cfg(all(unix, target_os = "linux"))]
+fn compile_code_change_check_fixture(
+    target: &std::path::Path,
+    invocation_state: &std::path::Path,
+    behavior_path: &std::path::Path,
+) {
+    let source = target.with_extension("rs");
+    let state_literal = format!("{:?}", invocation_state.to_string_lossy());
+    let behavior_literal = format!("{:?}", behavior_path.to_string_lossy());
+    let source_body = r##"
+use std::{env, fs, path::Path, process, thread, time::Duration};
+
+fn main() {
+    let state_path = Path::new(__STATE_PATH__);
+    let behavior_path = Path::new(__BEHAVIOR_PATH__);
+    let invocation = fs::read_to_string(state_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    fs::write(state_path, invocation.to_string()).unwrap();
+    match fs::read_to_string(behavior_path).unwrap().trim() {
+        "fail-first" if invocation == 1 => process::exit(17),
+        "timeout" => thread::sleep(Duration::from_secs(30)),
+        "overflow" => {
+            let output = vec![b'x'; 33 * 1024];
+            print!("{}", String::from_utf8(output.clone()).unwrap());
+            eprintln!("{}", String::from_utf8(output).unwrap());
+        }
+        "mutate" => fs::write("base.txt", b"check-mutated\n").unwrap(),
+        _ => {}
+    }
+}
+"##
+    .replace("__STATE_PATH__", &state_literal)
+    .replace("__BEHAVIOR_PATH__", &behavior_literal);
+    fs::write(&source, source_body).unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(target)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated check fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(all(unix, target_os = "linux"))]
 struct CodeChangeEditorFixture {
     _temp: TempDir,
     db: Db,
@@ -4267,6 +5172,14 @@ struct CodeChangeEditorFixture {
 
 #[cfg(all(unix, target_os = "linux"))]
 fn code_change_editor_fixture(behavior: &str) -> CodeChangeEditorFixture {
+    code_change_editor_fixture_with_check_behavior(behavior, None)
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn code_change_editor_fixture_with_check_behavior(
+    behavior: &str,
+    check_behavior: Option<&str>,
+) -> CodeChangeEditorFixture {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let fixture_root = fs::canonicalize(temp.path()).unwrap();
@@ -4325,9 +5238,77 @@ max_agent_runs = 10
     fs::create_dir_all(trusted_git.parent().unwrap()).unwrap();
     fs::copy("/usr/bin/git", &trusted_git).unwrap();
     fs::set_permissions(&trusted_git, fs::Permissions::from_mode(0o700)).unwrap();
-    let policy = execution_policy_fixture::resolved_policy(
+    let mut real_toolchain_bin = None;
+    if let Some(check_behavior) = check_behavior {
+        if check_behavior == "real-profiles" {
+            let locate = |names: &[&str]| {
+                names
+                    .iter()
+                    .find_map(|name| {
+                        let output = Command::new("/bin/sh")
+                            .args(["-c", &format!("command -v {name}")])
+                            .output()
+                            .expect("locate real code-change profile tool");
+                        output.status.success().then(|| {
+                            fs::canonicalize(
+                                String::from_utf8(output.stdout)
+                                    .expect("tool path must be UTF-8")
+                                    .trim(),
+                            )
+                            .expect("real code-change profile tool must resolve")
+                        })
+                    })
+                    .unwrap_or_else(|| panic!("required code-change profile tool is missing: {names:?}"))
+            };
+            let cargo_source = locate(&["cargo"]);
+            real_toolchain_bin = Some(
+                cargo_source
+                    .parent()
+                    .expect("real Cargo must have a toolchain bin directory")
+                    .to_owned(),
+            );
+            let python_source = locate(&["python", "python3"]);
+            for (target, source) in [
+                ("cargo", cargo_source.clone()),
+                ("uv", locate(&["uv"])),
+                ("python", python_source.clone()),
+            ] {
+                let target = fixture_root.join("execution-policy-bin").join(target);
+                fs::copy(source, &target).expect("copy real profile tool anchor");
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+                    .expect("secure real profile tool anchor");
+            }
+            let python3 = fixture_root.join("execution-policy-bin/python3");
+            fs::copy(python_source, &python3).expect("copy real Python 3 tool");
+            fs::set_permissions(&python3, fs::Permissions::from_mode(0o700))
+                .expect("secure real Python 3 tool");
+            let cc_source = locate(&["cc"]);
+            let cc_source = cc_source
+                .to_str()
+                .expect("real native compiler path must be UTF-8")
+                .replace('"', "\\\"");
+            let cc = fixture_root.join("execution-policy-bin/cc");
+            fs::write(&cc, format!("#!/bin/sh\nexec \"{cc_source}\" \"$@\"\n"))
+                .expect("write native compiler forwarder");
+            fs::set_permissions(&cc, fs::Permissions::from_mode(0o700))
+                .expect("secure native compiler forwarder");
+        } else {
+            let check = fixture_root.join("execution-policy-bin/cargo");
+            let check_invocation_state = fixture_root.join("check-invocations.state");
+            let check_behavior_path = fixture_root.join("check-behavior");
+            fs::write(&check_behavior_path, check_behavior).unwrap();
+            compile_code_change_check_fixture(
+                &check,
+                &check_invocation_state,
+                &check_behavior_path,
+            );
+        }
+    }
+    let extra_trusted_paths = real_toolchain_bin.as_deref().into_iter().collect::<Vec<_>>();
+    let policy = execution_policy_fixture::resolved_policy_with_trusted_paths(
         &fixture_root,
         &[("editor-project", &project_root, &editor)],
+        &extra_trusted_paths,
     );
     let db = Db::open(&fixture_root.join("state.sqlite3")).unwrap();
     let project = ProjectRepository::new(&db)
@@ -4825,12 +5806,12 @@ max_agent_runs = 10
 #[tokio::test]
 async fn code_change_editor_post_binding_setup_failure_finishes_reserved_attempt() {
     let fixture = code_change_editor_fixture("fail");
-    let blocked_service = fixture
-        .candidate_policy
-        .root_anchor
-        .canonical_path
-        .join(".pueue-agent");
-    fs::write(&blocked_service, b"not a directory").unwrap();
+    let blocked_tmp = fixture
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp");
+    fs::write(&blocked_tmp, b"not a directory").unwrap();
 
     let error = match spawn_editor_fixture_attempt_result(
         &fixture.runner,
@@ -4887,12 +5868,12 @@ async fn code_change_editor_post_binding_setup_failure_finishes_reserved_attempt
 #[tokio::test]
 async fn code_change_editor_post_binding_finalization_failure_retains_cleanup_owner() {
     let fixture = code_change_editor_fixture("fail");
-    let blocked_service = fixture
-        .candidate_policy
-        .root_anchor
-        .canonical_path
-        .join(".pueue-agent");
-    fs::write(&blocked_service, b"not a directory").unwrap();
+    let blocked_tmp = fixture
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp");
+    fs::write(&blocked_tmp, b"not a directory").unwrap();
     fixture
         .db
         .connect()
@@ -5021,6 +6002,15 @@ async fn code_change_editor_prebinding_failure_resolves_event_without_duplicate_
         .unwrap()
         .trim()
         .to_owned();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![&base_sha, &fixture.campaign_id],
+        )
+        .unwrap();
     secure_editor_git_fixture_tree(&project_root.join(".git"));
     fs::set_permissions(
         project_root.join(".gitignore"),
@@ -5043,8 +6033,8 @@ async fn code_change_editor_prebinding_failure_resolves_event_without_duplicate_
              WHERE code_change_run_id = ?4",
             rusqlite::params![
                 base_sha,
-                "refs/heads/campaign/editor-campaign/candidate/editor-proposal",
-                "refs/heads/campaign/editor-campaign/best",
+                "campaign/editor-campaign/candidate/editor-proposal",
+                "campaign/editor-campaign/best",
                 &fixture.run_id,
             ],
         )
@@ -5179,6 +6169,1584 @@ async fn code_change_editor_ready_output_persists_checks_before_cleanup() {
             .status,
         AgentRunStatus::Completed
     );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn git_diff_only_is_rejected() {
+    let fixture = code_change_editor_fixture("ready");
+    let project_root = fixture.project.root_path.clone();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("base.txt"), b"base\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", ".gitignore", "base.txt"]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![&base_sha, &fixture.campaign_id],
+        )
+        .unwrap();
+    secure_editor_git_fixture_tree(&project_root.join(".git"));
+    fs::set_permissions(
+        project_root.join(".gitignore"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(project_root.join("base.txt"), fs::Permissions::from_mode(0o600))
+        .unwrap();
+
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::remove_dir_all(candidate_root).unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'reserved', base_sha = ?1,
+                 candidate_ref = ?2, best_ref = ?3, updated_at = 4
+             WHERE code_change_run_id = ?4",
+            rusqlite::params![
+                base_sha,
+                "campaign/editor-campaign/candidate/editor-proposal",
+                "campaign/editor-campaign/best",
+                &fixture.run_id,
+            ],
+        )
+        .unwrap();
+
+    let mut report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(10, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.started.len(), 1);
+    let mut started = report.started.pop().unwrap();
+    assert_eq!(
+        started.handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    drop(started);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "ready");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "DELETE FROM code_change_checks
+             WHERE code_change_run_id = ?1 AND attempt = 1",
+            [&fixture.run_id],
+        )
+        .unwrap();
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(12, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 1);
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Rejected);
+    assert_eq!(run.candidate_sha, None);
+
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        &fixture.campaign_id,
+        "editor-proposal",
+    )
+    .unwrap();
+    let candidate_ref_check = Command::new("/usr/bin/git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{candidate_ref}"),
+        ])
+        .current_dir(&project_root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(!candidate_ref_check.status.success());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn prepared_code_change_reopen_fixture() -> (
+    CodeChangeEditorFixture,
+    ResolvedProjectExecutionPolicy,
+    PathBuf,
+    String,
+) {
+    prepared_code_change_reopen_fixture_with_behaviors("ready", None).await
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn prepared_code_change_reopen_fixture_with_check_behavior(
+    check_behavior: Option<&str>,
+) -> (
+    CodeChangeEditorFixture,
+    ResolvedProjectExecutionPolicy,
+    PathBuf,
+    String,
+) {
+    prepared_code_change_reopen_fixture_with_behaviors("ready-two", check_behavior).await
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn prepared_code_change_reopen_fixture_with_behaviors(
+    editor_behavior: &str,
+    check_behavior: Option<&str>,
+) -> (
+    CodeChangeEditorFixture,
+    ResolvedProjectExecutionPolicy,
+    PathBuf,
+    String,
+) {
+    let fixture = code_change_editor_fixture_with_check_behavior(editor_behavior, check_behavior);
+    let project_root = fixture.project.root_path.clone();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("base.txt"), b"base\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", ".gitignore", "base.txt"]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![&base_sha, &fixture.campaign_id],
+        )
+        .unwrap();
+    secure_editor_git_fixture_tree(&project_root.join(".git"));
+    fs::set_permissions(
+        project_root.join(".gitignore"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(project_root.join("base.txt"), fs::Permissions::from_mode(0o600))
+        .unwrap();
+
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::remove_dir_all(&candidate_root).unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'reserved', base_sha = ?1,
+                 candidate_ref = ?2, best_ref = ?3, updated_at = 4
+             WHERE code_change_run_id = ?4",
+            rusqlite::params![
+                base_sha,
+                "campaign/editor-campaign/candidate/editor-proposal",
+                "campaign/editor-campaign/best",
+                &fixture.run_id,
+            ],
+        )
+        .unwrap();
+    let project_config = config::load(&fixture.project.config_path).unwrap();
+    let original_policy = resolve_project_policy(&fixture.policy, &fixture.project, &project_config)
+        .unwrap();
+    let repository = CodeChangeRepository::new(&fixture.db);
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Reserved,
+            pueue_agent::models::CodeChangeState::PreparingWorktree,
+            5,
+        )
+        .unwrap();
+    let candidate = prepare_code_change_worktree_for_run(
+        &fixture.policy,
+        &fixture.project,
+        &original_policy,
+        &fixture.db,
+        &fixture.run_id,
+    )
+    .await
+    .unwrap();
+    drop(candidate);
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::PreparingWorktree,
+            pueue_agent::models::CodeChangeState::Editing,
+            6,
+        )
+        .unwrap();
+    (fixture, original_policy, project_root, base_sha)
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_check_stops_after_first_project_failure() {
+    let (fixture, _original_policy, _project_root, _base_sha) =
+        prepared_code_change_reopen_fixture_with_check_behavior(Some("fail-first")).await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    fs::create_dir(candidate_root.join("nested")).unwrap();
+    fs::set_permissions(
+        candidate_root.join("nested"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let coordinator = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    );
+    let mut started = coordinator.advance_ready(10, 10).await.unwrap().started;
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started.pop().unwrap().handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let report = coordinator.advance_ready(12, 10).await.unwrap();
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(report.advanced, 1);
+    assert_eq!(report.rejected, 0);
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Editing);
+    assert_eq!(run.candidate_sha, None);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "ready");
+    assert_eq!(attempt.failure_code.as_deref(), Some("check_failed"));
+    let checks = CodeChangeRepository::new(&fixture.db)
+        .list_checks(&fixture.run_id, 1)
+        .unwrap();
+    assert_eq!(checks.len(), 3);
+    assert_eq!(checks[0].status, pueue_agent::models::CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].status, pueue_agent::models::CodeChangeCheckStatus::Failed);
+    assert_eq!(checks[2].status, pueue_agent::models::CodeChangeCheckStatus::Reserved);
+    assert_eq!(checks[1].summary.as_deref(), Some("check returned non-zero"));
+    assert_eq!(checks[2].summary, None);
+    assert_eq!(checks[2].started_at, None);
+    let invocation_count = fs::read_to_string(fixture._temp.path().join("check-invocations.state"))
+        .unwrap();
+    assert_eq!(invocation_count.trim(), "1");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_check_timeout_is_persisted_without_waiting_a_minute() {
+    let (fixture, _original_policy, _project_root, _base_sha) =
+        prepared_code_change_reopen_fixture_with_check_behavior(Some("fail-first")).await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    fs::create_dir(candidate_root.join("nested")).unwrap();
+    fs::set_permissions(
+        candidate_root.join("nested"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let coordinator = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    );
+    let mut started = coordinator.advance_ready(10, 10).await.unwrap().started;
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started.pop().unwrap().handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let first_round = coordinator.advance_ready(12, 10).await.unwrap();
+    assert_eq!(first_round.advanced, 1);
+
+    // The first ordinary round leaves the supervisor result durable. Reset
+    // only the project rows so a short in-memory CheckRunner timeout can
+    // exercise the timeout branch without re-running the supervisor check.
+    fs::write(fixture._temp.path().join("check-behavior"), "timeout").unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_checks
+             SET status = 'reserved', output_digest = NULL, summary = NULL,
+                 started_at = NULL, finished_at = NULL
+             WHERE code_change_run_id = ?1 AND attempt = 1 AND ordinal = 1",
+            [&fixture.run_id],
+        )
+        .unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_editor_attempts
+             SET failure_code = NULL, failure_summary = NULL
+             WHERE code_change_run_id = ?1 AND attempt = 1",
+            [&fixture.run_id],
+        )
+        .unwrap();
+    CodeChangeRepository::new(&fixture.db)
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Editing,
+            pueue_agent::models::CodeChangeState::Checking,
+            13,
+        )
+        .unwrap();
+
+    let short_coordinator = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .with_code_change_check_timeout_for_test(Duration::from_millis(500));
+    let report = short_coordinator.advance_ready(14, 10).await.unwrap();
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(report.advanced, 1);
+    assert_eq!(report.rejected, 0);
+
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Editing);
+    assert_eq!(run.candidate_sha, None);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.failure_code.as_deref(), Some("check_failed"));
+    let checks = CodeChangeRepository::new(&fixture.db)
+        .list_checks(&fixture.run_id, 1)
+        .unwrap();
+    assert_eq!(checks.len(), 3);
+    assert_eq!(checks[0].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].status, CodeChangeCheckStatus::TimedOut);
+    assert_eq!(checks[1].summary.as_deref(), Some("check timed out"));
+    assert_eq!(checks[1].output_digest, None);
+    assert_eq!(checks[2].status, CodeChangeCheckStatus::Reserved);
+    assert_eq!(checks[2].started_at, None);
+    assert_eq!(checks[2].finished_at, None);
+    assert_eq!(
+        fs::read_to_string(fixture._temp.path().join("check-invocations.state"))
+            .unwrap()
+            .trim(),
+        "2"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_check_rejects_combined_output_overflow() {
+    let (fixture, _original_policy, _project_root, _base_sha) =
+        prepared_code_change_reopen_fixture_with_check_behavior(Some("overflow")).await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    fs::create_dir(candidate_root.join("nested")).unwrap();
+    fs::set_permissions(
+        candidate_root.join("nested"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let coordinator = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    );
+    let mut started = coordinator.advance_ready(10, 10).await.unwrap().started;
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started.pop().unwrap().handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let report = coordinator.advance_ready(12, 10).await.unwrap();
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(report.advanced, 1);
+    assert_eq!(report.rejected, 0);
+
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Editing);
+    assert_eq!(run.candidate_sha, None);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.failure_code.as_deref(), Some("check_failed"));
+    let checks = CodeChangeRepository::new(&fixture.db)
+        .list_checks(&fixture.run_id, 1)
+        .unwrap();
+    assert_eq!(checks.len(), 3);
+    assert_eq!(checks[0].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].status, CodeChangeCheckStatus::Failed);
+    assert_eq!(
+        checks[1].summary.as_deref(),
+        Some("check output exceeded limit")
+    );
+    assert_eq!(checks[1].output_digest, None);
+    assert_eq!(checks[2].status, CodeChangeCheckStatus::Reserved);
+    assert_eq!(checks[2].started_at, None);
+    assert_eq!(checks[2].finished_at, None);
+    assert_eq!(
+        fs::read_to_string(fixture._temp.path().join("check-invocations.state"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_check_rejects_tracked_file_mutation_after_project_check() {
+    let (fixture, _original_policy, project_root, _base_sha) =
+        prepared_code_change_reopen_fixture_with_behaviors("ready", Some("mutate")).await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    let original_candidate = b"candidate\n";
+    fs::write(candidate_root.join("base.txt"), original_candidate).unwrap();
+
+    let coordinator = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    );
+    let mut started = coordinator.advance_ready(10, 10).await.unwrap().started;
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started.pop().unwrap().handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let report = coordinator.advance_ready(12, 10).await.unwrap();
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(report.advanced, 1);
+    assert_eq!(report.rejected, 0);
+
+    let mutated = fs::read(candidate_root.join("base.txt")).unwrap();
+    assert_ne!(mutated, original_candidate);
+    assert_eq!(mutated, b"check-mutated\n");
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Editing);
+    assert_eq!(run.candidate_sha, None);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.failure_code.as_deref(), Some("check_failed"));
+    let checks = CodeChangeRepository::new(&fixture.db)
+        .list_checks(&fixture.run_id, 1)
+        .unwrap();
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].summary.as_deref(), Some("check passed"));
+    assert!(checks[1].output_digest.is_some());
+
+    for reference in [
+        pueue_agent::code_change::candidate_ref(&fixture.campaign_id, "editor-proposal")
+            .unwrap(),
+        pueue_agent::code_change::best_ref(&fixture.campaign_id).unwrap(),
+    ] {
+        let reference_check = Command::new("/usr/bin/git")
+            .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{reference}")])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(!reference_check.status.success(), "unexpected ref: {reference}");
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_editing_passed_checks_commits_candidate() {
+    let (fixture, _original_policy, project_root, base_sha) =
+        prepared_code_change_reopen_fixture_with_behaviors("ready", Some("pass")).await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+
+    let coordinator = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    );
+    let mut report = coordinator.advance_ready(10, 10).await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    let mut started = report.started.pop().unwrap();
+    assert_eq!(
+        started.handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    drop(started);
+
+    let report = coordinator.advance_ready(12, 10).await.unwrap();
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.advanced, 1);
+
+    let repository = CodeChangeRepository::new(&fixture.db);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        pueue_agent::models::CodeChangeState::CandidateReady
+    );
+    let candidate_sha = run.candidate_sha.clone().unwrap();
+    let checks = repository.list_checks(&fixture.run_id, 1).unwrap();
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].source, "supervisor");
+    assert_eq!(checks[0].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].source, "editor");
+    assert_eq!(checks[1].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(
+        fs::read_to_string(fixture._temp.path().join("check-invocations.state"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+
+    let candidate_ref = "refs/heads/campaign/editor-campaign/candidate/editor-proposal";
+    let ref_sha = String::from_utf8(
+        Command::new("/usr/bin/git")
+            .args(["rev-parse", candidate_ref])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_eq!(ref_sha, candidate_sha);
+    let parent_sha = String::from_utf8(
+        Command::new("/usr/bin/git")
+            .args(["rev-parse", &format!("{candidate_sha}^")])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_eq!(parent_sha, base_sha);
+    let main_head = String::from_utf8(
+        Command::new("/usr/bin/git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_eq!(main_head, base_sha);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+#[ignore = "requires real Cargo, uv, Python, and pytest installations"]
+async fn code_change_supported_profiles_run_with_owned_outputs() {
+    let (fixture, original_policy, _project_root, _base_sha) =
+        prepared_code_change_reopen_fixture_with_behaviors("ready", Some("real-profiles")).await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    fs::create_dir(candidate_root.join("src")).unwrap();
+    fs::write(
+        candidate_root.join("Cargo.toml"),
+        r#"[package]
+name = "phase5-profile-fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    fs::write(candidate_root.join("src/lib.rs"), "pub fn profile_fixture() {}\n").unwrap();
+    let lock = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&candidate_root)
+        .output()
+        .expect("real Cargo is required for the supported-profile regression");
+    assert!(
+        lock.status.success(),
+        "cargo generate-lockfile failed: {}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    fs::create_dir(candidate_root.join("tests")).unwrap();
+    fs::write(
+        candidate_root.join("tests/profile_test.py"),
+        "def test_profile():\n    assert True\n",
+    )
+    .unwrap();
+    fs::write(
+        candidate_root.join("pyproject.toml"),
+        r#"[project]
+name = "phase5-profile-fixture"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["pytest==8.4.2"]
+
+[tool.uv]
+package = false
+"#,
+    )
+    .unwrap();
+    let lock = Command::new("uv")
+        .arg("lock")
+        .current_dir(&candidate_root)
+        .output()
+        .expect("real uv is required for the supported-profile regression");
+    assert!(
+        lock.status.success(),
+        "uv lock failed: {}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+
+    let mut candidate = reopen_code_change_worktree_for_run(
+        &fixture.policy,
+        &fixture.project,
+        &original_policy,
+        &fixture.db,
+        &fixture.run_id,
+    )
+    .await
+    .unwrap();
+    let before = candidate.verify().await.unwrap();
+    let checks = [
+        ("cargo", RUST_CHECK),
+        ("uv", UV_PYTEST_CHECK),
+        ("python", PYTHON_PYTEST_CHECK),
+    ]
+    .into_iter()
+    .map(|(source, argv)| ProposedCheck {
+        source: source.to_owned(),
+        argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+        working_directory: ".".to_owned(),
+    })
+    .collect::<Vec<_>>();
+    let mut digests = Vec::with_capacity(checks.len());
+    for check in &checks {
+        let profile_digest = match candidate
+            .run_checks(std::slice::from_ref(check))
+            .await
+        {
+            Ok(digest) => digest,
+            Err(error) => {
+                let preserved_root = fixture._temp.keep();
+                panic!(
+                    "{} profile failed ({error:?}); fixture root preserved at {}",
+                    check.source,
+                    preserved_root.display()
+                );
+            }
+        };
+        digests.extend(profile_digest);
+    }
+    assert_eq!(digests.len(), checks.len());
+    assert!(digests.iter().all(|digest| !digest.is_empty()));
+    assert_eq!(candidate.verify().await.unwrap(), before);
+
+    for path in ["target", ".venv", ".pytest_cache", "__pycache__"] {
+        assert!(
+            !candidate_root.join(path).exists(),
+            "supported profile left candidate output at {path}"
+        );
+    }
+    let check_root = fixture
+        ._temp
+        .path()
+        .join("execution-policy-state/code-change-checks/adhoc/attempt-1");
+    assert!(
+        !check_root.join("check-1").exists(),
+        "check output scope was not cleaned"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_reopen_rejects_tampered_persisted_git_baseline() {
+    for mutation in ["protected-ref", "remote-config", "missing-baseline"] {
+        let (fixture, original_policy, project_root, base_sha) =
+            prepared_code_change_reopen_fixture().await;
+        match mutation {
+            "protected-ref" => {
+                let output = Command::new("git")
+                    .args(["update-ref", "refs/heads/uncontrolled", &base_sha])
+                    .current_dir(&project_root)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            }
+            "remote-config" => {
+                let output = Command::new("git")
+                    .args(["config", "remote.origin.url", "https://example.invalid/repo"])
+                    .current_dir(&project_root)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            }
+            "missing-baseline" => {
+                fixture
+                    .db
+                    .connect()
+                    .unwrap()
+                    .execute(
+                        "UPDATE code_change_runs SET protected_ref_digest = NULL
+                         WHERE code_change_run_id = ?1",
+                        [&fixture.run_id],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let reopened = reopen_code_change_worktree_for_run(
+            &fixture.policy,
+            &fixture.project,
+            &original_policy,
+            &fixture.db,
+            &fixture.run_id,
+        )
+        .await;
+        assert!(reopened.is_err(), "{mutation} must fail closed");
+        let run = CodeChangeRepository::new(&fixture.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.state, pueue_agent::models::CodeChangeState::Editing);
+        assert_eq!(run.candidate_sha, None);
+        assert!(fixture.candidate_policy.root_anchor.canonical_path.is_dir());
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_checking_restart_resumes_persisted_plan_without_duplicate_rows() {
+    let fixture = code_change_editor_fixture("ready");
+    let project_root = fixture.project.root_path.clone();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("base.txt"), b"base\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", ".gitignore", "base.txt"]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![&base_sha, &fixture.campaign_id],
+        )
+        .unwrap();
+    secure_editor_git_fixture_tree(&project_root.join(".git"));
+    fs::set_permissions(
+        project_root.join(".gitignore"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(project_root.join("base.txt"), fs::Permissions::from_mode(0o600))
+        .unwrap();
+
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::remove_dir_all(&candidate_root).unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'reserved', base_sha = ?1,
+                 candidate_ref = ?2, best_ref = ?3, updated_at = 4
+             WHERE code_change_run_id = ?4",
+            rusqlite::params![
+                base_sha,
+                "campaign/editor-campaign/candidate/editor-proposal",
+                "campaign/editor-campaign/best",
+                &fixture.run_id,
+            ],
+        )
+        .unwrap();
+
+    let mut report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(10, 10)
+    .await
+    .unwrap();
+    let mut started = report.started.pop().unwrap();
+    assert_eq!(
+        started.handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    drop(started);
+    let attempt = CodeChangeRepository::new(&fixture.db)
+        .find_editor_attempt(&fixture.run_id, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.status, "ready");
+
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    let project_config = config::load(&fixture.project.config_path).unwrap();
+    let original_policy = resolve_project_policy(&fixture.policy, &fixture.project, &project_config)
+        .unwrap();
+    let mut candidate = reopen_code_change_worktree_for_run(
+        &fixture.policy,
+        &fixture.project,
+        &original_policy,
+        &fixture.db,
+        &fixture.run_id,
+    )
+    .await
+    .unwrap();
+    let facts = candidate.verify().await.unwrap();
+    drop(candidate);
+    let repository = CodeChangeRepository::new(&fixture.db);
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Editing,
+            pueue_agent::models::CodeChangeState::Checking,
+            12,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &fixture.run_id,
+            facts.persisted_digest(),
+            i64::try_from(facts.file_count).unwrap(),
+            i64::try_from(facts.diff_bytes).unwrap(),
+            12,
+        )
+        .unwrap();
+    let before = repository.list_checks(&fixture.run_id, 1).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].source, "editor");
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(13, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.started.len(), 0);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Editing);
+    assert_eq!(run.diff_digest, None);
+    assert_eq!(run.changed_file_count, None);
+    assert_eq!(run.diff_bytes, None);
+    let checks = repository.list_checks(&fixture.run_id, 1).unwrap();
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].ordinal, 0);
+    assert_eq!(checks[0].status, pueue_agent::models::CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].ordinal, 1);
+    assert_eq!(checks[1].status, pueue_agent::models::CodeChangeCheckStatus::Failed);
+    assert_eq!(
+        checks[1].summary.as_deref(),
+        Some("check returned non-zero")
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_committing_restart_recommits_dirty_candidate_without_ref() {
+    let fixture = code_change_editor_fixture("ready");
+    let project_root = fixture.project.root_path.clone();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("base.txt"), b"base\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", ".gitignore", "base.txt"]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![&base_sha, &fixture.campaign_id],
+        )
+        .unwrap();
+    secure_editor_git_fixture_tree(&project_root.join(".git"));
+    fs::set_permissions(
+        project_root.join(".gitignore"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(project_root.join("base.txt"), fs::Permissions::from_mode(0o600))
+        .unwrap();
+
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::remove_dir_all(&candidate_root).unwrap();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'reserved', base_sha = ?1,
+                 candidate_ref = ?2, best_ref = ?3, updated_at = 4
+             WHERE code_change_run_id = ?4",
+            rusqlite::params![
+                base_sha,
+                "campaign/editor-campaign/candidate/editor-proposal",
+                "campaign/editor-campaign/best",
+                &fixture.run_id,
+            ],
+        )
+        .unwrap();
+
+    let mut report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(10, 10)
+    .await
+    .unwrap();
+    let mut started = report.started.pop().unwrap();
+    assert_eq!(
+        started.handle.wait(&fixture.db, 11).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    drop(started);
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.db)
+            .find_editor_attempt(&fixture.run_id, 1)
+            .unwrap()
+            .unwrap()
+            .status,
+        "ready"
+    );
+
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    let project_config = config::load(&fixture.project.config_path).unwrap();
+    let original_policy = resolve_project_policy(&fixture.policy, &fixture.project, &project_config)
+        .unwrap();
+    let mut candidate = reopen_code_change_worktree_for_run(
+        &fixture.policy,
+        &fixture.project,
+        &original_policy,
+        &fixture.db,
+        &fixture.run_id,
+    )
+    .await
+    .unwrap();
+    let facts = candidate.verify().await.unwrap();
+    drop(candidate);
+    let repository = CodeChangeRepository::new(&fixture.db);
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Editing,
+            pueue_agent::models::CodeChangeState::Checking,
+            12,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &fixture.run_id,
+            facts.persisted_digest(),
+            i64::try_from(facts.file_count).unwrap(),
+            i64::try_from(facts.diff_bytes).unwrap(),
+            12,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Checking,
+            pueue_agent::models::CodeChangeState::Committing,
+            13,
+        )
+        .unwrap();
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(14, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.advanced, 1);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        pueue_agent::models::CodeChangeState::CandidateReady
+    );
+    let candidate_sha = run.candidate_sha.clone().unwrap();
+    assert_eq!(run.diff_digest.as_deref(), Some(facts.persisted_digest()));
+    assert_eq!(run.changed_file_count, Some(facts.file_count as i64));
+    assert_eq!(run.diff_bytes, Some(facts.diff_bytes as i64));
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        &fixture.campaign_id,
+        "editor-proposal",
+    )
+    .unwrap();
+    let ref_sha = String::from_utf8(
+        run_git(&["rev-parse", &format!("refs/heads/{candidate_ref}")]).stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    assert_eq!(ref_sha, candidate_sha);
+    assert_eq!(
+        String::from_utf8(run_git(&["rev-parse", &format!("{candidate_sha}^")]).stdout)
+            .unwrap()
+            .trim(),
+        base_sha
+    );
+    let checks = repository.list_checks(&fixture.run_id, 1).unwrap();
+    assert_eq!(checks.len(), 1);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn committed_code_change_restart_fixture() -> (
+    CodeChangeEditorFixture,
+    PathBuf,
+    String,
+    String,
+    i64,
+    i64,
+) {
+    let (fixture, original_policy, project_root, _base_sha) =
+        prepared_code_change_reopen_fixture().await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    let mut candidate = reopen_code_change_worktree_for_run(
+        &fixture.policy,
+        &fixture.project,
+        &original_policy,
+        &fixture.db,
+        &fixture.run_id,
+    )
+    .await
+    .unwrap();
+    let facts = candidate.verify().await.unwrap();
+    let digest = facts.persisted_digest().to_owned();
+    let file_count = i64::try_from(facts.file_count).unwrap();
+    let diff_bytes = i64::try_from(facts.diff_bytes).unwrap();
+    let repository = CodeChangeRepository::new(&fixture.db);
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Editing,
+            pueue_agent::models::CodeChangeState::Checking,
+            12,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &fixture.run_id,
+            &digest,
+            file_count,
+            diff_bytes,
+            12,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Checking,
+            pueue_agent::models::CodeChangeState::Committing,
+            13,
+        )
+        .unwrap();
+    let candidate_sha = candidate.commit().await.unwrap();
+    drop(candidate);
+    (
+        fixture,
+        project_root,
+        candidate_sha,
+        digest,
+        file_count,
+        diff_bytes,
+    )
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_candidate_commit_uses_fixed_identity_and_message() {
+    let (fixture, project_root, candidate_sha, _digest, _file_count, _diff_bytes) =
+        committed_code_change_restart_fixture().await;
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let metadata = String::from_utf8(
+        run_git(&[
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%B",
+            &candidate_sha,
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let fields = metadata.trim_end().split('\0').collect::<Vec<_>>();
+    assert_eq!(
+        fields,
+        [
+            "pueue-agent",
+            "pueue-agent@localhost",
+            "2000-01-01T00:00:00+00:00",
+            "pueue-agent",
+            "pueue-agent@localhost",
+            "2000-01-01T00:00:00+00:00",
+            "pueue-agent code-change candidate",
+            "pueue-agent code-change candidate",
+        ]
+    );
+
+    let parent = String::from_utf8(
+        run_git(&["rev-parse", &format!("{candidate_sha}^")]).stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(parent, base_sha);
+    let candidate_tree = String::from_utf8(
+        run_git(&["rev-parse", &format!("{candidate_sha}^{{tree}}")]).stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let base_tree = String::from_utf8(run_git(&["rev-parse", &format!("{base_sha}^{{tree}}")]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_ne!(candidate_tree, base_tree);
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.candidate_sha, None);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_committing_restart_rejects_competing_candidate_ref() {
+    let (fixture, original_policy, project_root, base_sha) =
+        prepared_code_change_reopen_fixture().await;
+    let candidate_root = fixture.candidate_policy.root_anchor.canonical_path.clone();
+    fs::write(candidate_root.join("base.txt"), b"candidate\n").unwrap();
+    let mut candidate = reopen_code_change_worktree_for_run(
+        &fixture.policy,
+        &fixture.project,
+        &original_policy,
+        &fixture.db,
+        &fixture.run_id,
+    )
+    .await
+    .unwrap();
+    let facts = candidate.verify().await.unwrap();
+    drop(candidate);
+    let repository = CodeChangeRepository::new(&fixture.db);
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Editing,
+            pueue_agent::models::CodeChangeState::Checking,
+            12,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &fixture.run_id,
+            facts.persisted_digest(),
+            i64::try_from(facts.file_count).unwrap(),
+            i64::try_from(facts.diff_bytes).unwrap(),
+            12,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &fixture.run_id,
+            pueue_agent::models::CodeChangeState::Checking,
+            pueue_agent::models::CodeChangeState::Committing,
+            13,
+        )
+        .unwrap();
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        &fixture.campaign_id,
+        "editor-proposal",
+    )
+    .unwrap();
+    let candidate_ref = format!("refs/heads/{candidate_ref}");
+    // Install a competing ref before the commit/publish attempt. The
+    // committing path must fail closed without replacing this existing ref.
+    run_git(&["update-ref", &candidate_ref, &base_sha]);
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(14, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 1);
+    let run = CodeChangeRepository::new(&fixture.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::RecoveryRequired);
+    assert_eq!(run.rejection_code.as_deref(), Some("worktree_recovery_required"));
+    assert_eq!(run.candidate_sha, None);
+    let preserved_ref = String::from_utf8(run_git(&["rev-parse", &candidate_ref]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(preserved_ref, base_sha);
+    let base_after = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(base_after, base_sha);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_committing_restart_recovers_existing_ref_before_record() {
+    let (fixture, project_root, candidate_sha, digest, file_count, diff_bytes) =
+        committed_code_change_restart_fixture().await;
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        &fixture.campaign_id,
+        "editor-proposal",
+    )
+    .unwrap();
+    let candidate_ref = format!("refs/heads/{candidate_ref}");
+    let read_ref = || {
+        let output = Command::new("git")
+            .args(["rev-parse", candidate_ref.as_str()])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(read_ref(), candidate_sha);
+    let repository = CodeChangeRepository::new(&fixture.db);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(run.state, pueue_agent::models::CodeChangeState::Committing);
+    assert_eq!(run.candidate_sha, None);
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(14, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.advanced, 1);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        pueue_agent::models::CodeChangeState::CandidateReady
+    );
+    assert_eq!(run.candidate_sha.as_deref(), Some(candidate_sha.as_str()));
+    assert_eq!(run.diff_digest.as_deref(), Some(digest.as_str()));
+    assert_eq!(run.changed_file_count, Some(file_count));
+    assert_eq!(run.diff_bytes, Some(diff_bytes));
+    assert_eq!(read_ref(), candidate_sha);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_committing_restart_after_candidate_record_is_idempotent() {
+    let (fixture, project_root, candidate_sha, digest, file_count, diff_bytes) =
+        committed_code_change_restart_fixture().await;
+    let repository = CodeChangeRepository::new(&fixture.db);
+    repository
+        .record_candidate(
+            &fixture.run_id,
+            &candidate_sha,
+            &digest,
+            file_count,
+            diff_bytes,
+            14,
+        )
+        .unwrap();
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        &fixture.campaign_id,
+        "editor-proposal",
+    )
+    .unwrap();
+    let candidate_ref = format!("refs/heads/{candidate_ref}");
+    let read_ref = || {
+        let output = Command::new("git")
+            .args(["rev-parse", candidate_ref.as_str()])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let ref_before = read_ref();
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(15, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.advanced, 1);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        pueue_agent::models::CodeChangeState::CandidateReady
+    );
+    assert_eq!(run.candidate_sha.as_deref(), Some(candidate_sha.as_str()));
+    assert_eq!(read_ref(), ref_before);
+
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(16, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.started.len(), 0);
+    assert_eq!(report.advanced, 0);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(read_ref(), ref_before);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_committing_restart_rejects_persisted_diff_mismatch() {
+    let (fixture, project_root, candidate_sha, _digest, _file_count, _diff_bytes) =
+        committed_code_change_restart_fixture().await;
+    let repository = CodeChangeRepository::new(&fixture.db);
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs SET diff_digest = ?1
+             WHERE code_change_run_id = ?2",
+            rusqlite::params!["f".repeat(64), &fixture.run_id],
+        )
+        .unwrap();
+    let candidate_ref = pueue_agent::code_change::candidate_ref(
+        &fixture.campaign_id,
+        "editor-proposal",
+    )
+    .unwrap();
+    let candidate_ref = format!("refs/heads/{candidate_ref}");
+    let read_ref = || {
+        let output = Command::new("git")
+            .args(["rev-parse", candidate_ref.as_str()])
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(read_ref(), candidate_sha);
+    let report = CodeChangeCoordinator::new(
+        &fixture.db,
+        &fixture.runner,
+        &fixture.policy,
+        CampaignLimits::default(),
+    )
+    .advance_ready(15, 10)
+    .await
+    .unwrap();
+    assert_eq!(report.rejected, 1);
+    let run = repository.find_by_id(&fixture.run_id).unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        pueue_agent::models::CodeChangeState::RecoveryRequired
+    );
+    assert_eq!(run.candidate_sha, None);
+    assert_eq!(read_ref(), candidate_sha);
 }
 
 #[cfg(all(unix, target_os = "linux"))]

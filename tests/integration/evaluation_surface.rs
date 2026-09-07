@@ -1,10 +1,14 @@
 use std::fs;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use pueue_agent::{
-    db::{CampaignRepository, Db, ProjectRepository, StartCampaignRequest},
+    code_change::{best_ref, candidate_ref},
+    db::{CampaignRepository, CodeChangeRepository, Db, ProjectRepository, StartCampaignRequest},
     diagnostics::render_project_status_json,
     execution_policy::CampaignLimits,
-    models::{MetricDirection, ObjectiveMetric, ProposalKind},
+    models::{MetricDirection, NewCodeChangeRun, ObjectiveMetric, ProposalKind},
     proposals::{self, ProposalInput},
     service::ServiceStatus,
     status::{render_project_status, PueueSnapshot, StatusInput},
@@ -14,8 +18,16 @@ use tempfile::TempDir;
 
 fn harness_with_metric() -> (TempDir, Db) {
     let temp = TempDir::new().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let root = temp.path().join("project");
     fs::create_dir_all(&root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let state_dir = root.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
     ProjectRepository::new(&db)
         .register(&pueue_agent::models::NewProject::new(
@@ -26,8 +38,6 @@ fn harness_with_metric() -> (TempDir, Db) {
             100,
         ))
         .unwrap();
-    let state_dir = root.join(".pueue-agent");
-    fs::create_dir_all(&state_dir).unwrap();
     fs::write(state_dir.join("STATE.md"), "Reach loss below 0.2\n").unwrap();
     let objective = pueue_agent::state::load_objective(&root).unwrap();
     let argv = vec!["python".to_owned(), "train.py".to_owned()];
@@ -72,8 +82,16 @@ fn harness_with_metric() -> (TempDir, Db) {
 
 fn harness_without_metric() -> (TempDir, Db) {
     let temp = TempDir::new().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let root = temp.path().join("project");
     fs::create_dir_all(&root).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let state_dir = root.join(".pueue-agent");
+    fs::create_dir_all(&state_dir).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
     ProjectRepository::new(&db)
         .register(&pueue_agent::models::NewProject::new(
@@ -84,8 +102,6 @@ fn harness_without_metric() -> (TempDir, Db) {
             100,
         ))
         .unwrap();
-    let state_dir = root.join(".pueue-agent");
-    fs::create_dir_all(&state_dir).unwrap();
     fs::write(state_dir.join("STATE.md"), "Reach loss below 0.2\n").unwrap();
     let objective = pueue_agent::state::load_objective(&root).unwrap();
     let argv = vec!["python".to_owned(), "train.py".to_owned()];
@@ -121,6 +137,321 @@ fn harness_without_metric() -> (TempDir, Db) {
         )
         .unwrap();
     (temp, db)
+}
+
+fn seed_code_change_status_projection(db: &Db) {
+    let connection = db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis,
+                 source_experiment_id, argv_json, working_directory,
+                 expected_evidence_json, canonical_digest, reject_reason,
+                 created_at, updated_at
+             ) VALUES (
+                 'status-code-proposal', 'campaign-eval', 'code_change', 'accepted',
+                 'bounded status fixture', 'exp-baseline', '[\"python\",\"train.py\"]', '.',
+                 '[]', 'status-code-proposal-digest', NULL, 101, 101
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let base_sha = "a".repeat(40);
+    let candidate_sha = "b".repeat(40);
+    let run = CodeChangeRepository::new(db)
+        .create_pending(
+            &NewCodeChangeRun::new(
+                "status-code-run",
+                "status-code-proposal",
+                "campaign-eval",
+                base_sha.clone(),
+                candidate_ref("campaign-eval", "status-code-proposal").unwrap(),
+                best_ref("campaign-eval").unwrap(),
+                "status-code-worktree",
+                ".pueue-agent/worktrees/campaign-eval/status-code-proposal",
+                102,
+            ),
+        )
+        .unwrap();
+
+    let connection = db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO submissions (
+                 submission_id, project_id, argv_json, created_at, pueue_task_id,
+                 task_signature, status, kind, metadata_json, origin_agent_run_id
+             ) VALUES (
+                 'status-code-submission', 'project-a', '[\"python\",\"train.py\"]',
+                 103, 77, 'status-code-task-signature', 'accepted', 'code_change', '{}', NULL
+             )",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO experiments (
+                 experiment_id, campaign_id, proposal_id, submission_id, parent_experiment_id,
+                 attempt, status, pueue_task_id, task_signature, failure_code,
+                 failure_fingerprint, created_at, updated_at, finished_at,
+                 code_change_run_id, code_revision_sha
+             ) VALUES (
+                 'status-code-experiment', 'campaign-eval', 'status-code-proposal',
+                 'status-code-submission', NULL, 1, 'succeeded', 77,
+                 'status-code-task-signature', NULL, NULL, 103, 200, 200, ?1, ?2
+             )",
+            rusqlite::params![run.code_change_run_id, candidate_sha],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'evaluated', candidate_sha = ?1, experiment_id = ?2,
+                 editor_attempts = 2, diff_digest = ?3, changed_file_count = 1,
+                 diff_bytes = 42, updated_at = 201
+             WHERE code_change_run_id = ?4",
+            rusqlite::params![candidate_sha, "status-code-experiment", "d".repeat(64), run.code_change_run_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO code_change_checks (
+                 code_change_run_id, attempt, ordinal, source, argv_json,
+                 working_directory, status, output_digest, summary, started_at, finished_at
+             ) VALUES (?1, 2, 0, 'discovered', '[\"pytest\",\"tests/smoke\"]', '.',
+                       'failed', ?2, 'project check failed', 180, 181)",
+            rusqlite::params![run.code_change_run_id.as_str(), "e".repeat(64)],
+        )
+        .unwrap();
+
+    let states = [
+        "reserved",
+        "preparing_worktree",
+        "editing",
+        "checking",
+        "committing",
+        "candidate_ready",
+        "experiment_submitted",
+        "evaluated",
+        "cleanup_pending",
+        "completed",
+    ];
+    for (index, state) in states.into_iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO events (
+                     project_id, campaign_id, experiment_id, kind, dedup_key,
+                     payload_json, status, attempts, not_before, lease_until,
+                     created_at, completed_at, last_error
+                 ) VALUES (
+                     'project-a', 'campaign-eval', NULL, 'code_change', ?1, ?2,
+                     'completed', 0, ?3, NULL, ?3, ?3, NULL
+                 )",
+                rusqlite::params![
+                    format!("status-code-transition-{index}"),
+                    serde_json::json!({
+                        "code_change_run_id": run.code_change_run_id.as_str(),
+                        "state": state,
+                        "attempt": index,
+                        "reason_code": "check_failed",
+                        "raw_diff": "SECRET_RAW_DIFF",
+                        "prompt": "SECRET_PROMPT"
+                    })
+                    .to_string(),
+                    300 + index as i64,
+                ],
+            )
+            .unwrap();
+    }
+}
+
+fn seed_newer_code_change_status_events(db: &Db) {
+    let connection = db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'completed', cleanup_completed_at = 310, updated_at = 310
+             WHERE code_change_run_id = 'status-code-run'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO proposals (
+                 proposal_id, campaign_id, kind, status, hypothesis,
+                 source_experiment_id, argv_json, working_directory,
+                 expected_evidence_json, canonical_digest, reject_reason,
+                 created_at, updated_at
+             ) VALUES (
+                 'status-code-newer-proposal', 'campaign-eval', 'code_change', 'accepted',
+                 'newer bounded status fixture', 'exp-baseline', '[\"python\",\"train.py\"]', '.',
+                 '[]', 'status-code-newer-proposal-digest', NULL, 399, 399
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let run = CodeChangeRepository::new(db)
+        .create_pending(&NewCodeChangeRun::new(
+            "status-code-newer-run",
+            "status-code-newer-proposal",
+            "campaign-eval",
+            "c".repeat(40),
+            candidate_ref("campaign-eval", "status-code-newer-proposal").unwrap(),
+            best_ref("campaign-eval").unwrap(),
+            "status-code-newer-worktree",
+            ".pueue-agent/worktrees/campaign-eval/status-code-newer-proposal",
+            400,
+        ))
+        .unwrap();
+
+    let connection = db.connect().unwrap();
+    for index in 1..=9 {
+        connection
+            .execute(
+                "INSERT INTO events (
+                     project_id, campaign_id, experiment_id, kind, dedup_key,
+                     payload_json, status, attempts, not_before, lease_until,
+                     created_at, completed_at, last_error
+                 ) VALUES (
+                     'project-a', 'campaign-eval', NULL, 'code_change', ?1, ?2,
+                     'completed', 0, ?3, NULL, ?3, ?3, NULL
+                 )",
+                rusqlite::params![
+                    format!("status-code-newer-transition-{index}"),
+                    serde_json::json!({
+                        "code_change_run_id": run.code_change_run_id.as_str(),
+                        "state": "checking",
+                        "reason_code": "check_failed",
+                        "raw_diff": "SECRET_NEWER_RAW_DIFF",
+                        "prompt": "SECRET_NEWER_PROMPT"
+                    })
+                    .to_string(),
+                    400 + index as i64,
+                ],
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn status_json_projects_bounded_code_change_without_sensitive_fields() {
+    let (_temp, db) = harness_with_metric();
+    seed_code_change_status_projection(&db);
+    let project = ProjectRepository::new(&db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+
+    let json = render_project_status_json(
+        &db,
+        &project,
+        &StatusInput {
+            daemon_health: ServiceStatus::Running,
+            pueue: PueueSnapshot::Tasks(vec![]),
+            now_override: Some(500),
+        },
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let run = &value["code_changes"][0];
+    assert_eq!(run["state"], "evaluated");
+    assert_eq!(run["attempts"], 2);
+    assert_eq!(run["base_sha"], "aaaaaaaa");
+    assert_eq!(run["candidate_sha"], "bbbbbbbb");
+    assert_eq!(run["experiment_id"], "status-code-experiment");
+    assert_eq!(run["task_id"], 77);
+    assert_eq!(run["failed_check"]["status"], "failed");
+    assert_eq!(run["failed_check"]["summary"], "project check failed");
+    assert_eq!(run["next_action"], "cleanup");
+    assert_eq!(run["cleanup_pending"], true);
+    assert_eq!(run["transitions"].as_array().unwrap().len(), 8);
+    assert_eq!(run["transitions"][0]["stage"], "completed");
+    assert_eq!(run["transitions"][0]["reason"], "check_failed");
+
+    let raw_argv = "pytest";
+    let base_sha = "a".repeat(40);
+    let candidate_sha = "b".repeat(40);
+    let diff_digest = "d".repeat(64);
+    let output_digest = "e".repeat(64);
+    for secret in [
+        "SECRET_RAW_DIFF",
+        "SECRET_PROMPT",
+        raw_argv,
+        diff_digest.as_str(),
+        output_digest.as_str(),
+        base_sha.as_str(),
+        candidate_sha.as_str(),
+    ] {
+        assert!(!json.contains(secret), "status leaked {secret}: {json}");
+    }
+}
+
+#[test]
+fn status_json_keeps_bounded_transitions_per_code_change_run() {
+    let (_temp, db) = harness_with_metric();
+    seed_code_change_status_projection(&db);
+    seed_newer_code_change_status_events(&db);
+    let project = ProjectRepository::new(&db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+
+    let json = render_project_status_json(
+        &db,
+        &project,
+        &StatusInput {
+            daemon_health: ServiceStatus::Running,
+            pueue: PueueSnapshot::Tasks(vec![]),
+            now_override: Some(500),
+        },
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let older_run = value["code_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["candidate_sha"] == "bbbbbbbb")
+        .unwrap();
+    assert_eq!(older_run["transitions"].as_array().unwrap().len(), 8);
+    assert_eq!(older_run["transitions"][0]["stage"], "completed");
+}
+
+#[test]
+fn status_json_surfaces_timed_out_code_change_check() {
+    let (_temp, db) = harness_with_metric();
+    seed_code_change_status_projection(&db);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_checks
+             SET status = 'timed_out', summary = 'project check timed out'
+             WHERE code_change_run_id = 'status-code-run' AND attempt = 2 AND ordinal = 0",
+            [],
+        )
+        .unwrap();
+    let project = ProjectRepository::new(&db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+
+    let json = render_project_status_json(
+        &db,
+        &project,
+        &StatusInput {
+            daemon_health: ServiceStatus::Running,
+            pueue: PueueSnapshot::Tasks(vec![]),
+            now_override: Some(500),
+        },
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let run = &value["code_changes"][0];
+    assert_eq!(run["failed_check"]["status"], "timed_out");
+    assert_eq!(run["failed_check"]["summary"], "project check timed out");
 }
 
 #[test]

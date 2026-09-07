@@ -12,31 +12,46 @@ use std::{
     time::Duration,
 };
 
+#[cfg(all(unix, target_os = "linux"))]
+use std::{path::Path, process::Command as ProcessCommand};
+
+#[cfg(all(unix, target_os = "linux"))]
+#[path = "../support/execution_policy_fixture.rs"]
+mod execution_policy_fixture;
+
 use async_trait::async_trait;
 use clap::Parser as _;
 use pueue_agent::{
     campaign::CampaignCoordinator,
     cli::{Cli, Command},
     db::{
-        CampaignRepository, Db, EventRepository, ExperimentRepository, ManagedSubmissionIntent,
-        MetricsRepository, ProjectRepository, StartCampaignRequest, SubmissionRepository,
-        TaskObservationRepository,
+        CampaignRepository, Db, EventRepository, ExperimentRepository,
+        ManagedSubmissionIntent, MetricsRepository, ProjectRepository, StartCampaignRequest,
+        SubmissionRepository, TaskObservationRepository,
     },
     environment,
     events::{
         callback_group_for_task, record_callback_with, CallbackMetadata, CallbackRecordResult,
     },
-    execution_policy::{CampaignLimits, ProjectRootAnchor},
+    execution_policy::{
+        CampaignLimits, ProjectRootAnchor,
+    },
     models::{
-        BudgetReservationStatus, EventKind, EventStatus, ExperimentMetricsRow, ExperimentStatus,
-        MetricDirection, NewProject, NewSubmission, NewTaskObservation, ObjectiveMetric,
-        ProposalKind, SubmissionStatus,
+        BudgetReservationStatus, EventKind, EventStatus, ExperimentMetricsRow,
+        ExperimentStatus, MetricDirection, NewProject, NewSubmission,
+        NewTaskObservation, ObjectiveMetric, ProposalKind, SubmissionStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueError, PueueTask},
     reconcile::{managed_task_run_signature, task_signature, Reconciler},
     state::ObjectiveSnapshot,
     AppError,
+};
+#[cfg(all(unix, target_os = "linux"))]
+use pueue_agent::{
+    code_change::prepare_code_change_worktree_for_run, config,
+    execution_policy::{resolve_project_policy, VerifiedWorkingDirectory},
+    models::NewCodeChangeRun,
 };
 use serde_json::json;
 
@@ -118,8 +133,12 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let root = temp.path().join("project");
         fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         ProjectRepository::new(&db)
             .register(&NewProject::new(
@@ -271,11 +290,36 @@ impl Harness {
         experiment_id
     }
 
-    fn write_result_manifest(&self, file_stem: &str, content: &str) -> PathBuf {
-        let results = self.root().join(".pueue-agent/results");
+    #[cfg(unix)]
+    fn result_service_directory(&self) -> PathBuf {
+        let service = self.root().join(".pueue-agent");
+        fs::create_dir_all(&service).unwrap();
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+        service
+    }
+
+    #[cfg(not(unix))]
+    fn result_service_directory(&self) -> PathBuf {
+        let service = self.root().join(".pueue-agent");
+        fs::create_dir_all(&service).unwrap();
+        service
+    }
+
+    fn result_directory(&self) -> PathBuf {
+        let service = self.result_service_directory();
+        let results = service.join("results");
         fs::create_dir_all(&results).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&results, fs::Permissions::from_mode(0o700)).unwrap();
+        results
+    }
+
+    fn write_result_manifest(&self, file_stem: &str, content: &str) -> PathBuf {
+        let results = self.result_directory();
         let path = results.join(format!("{file_stem}.json"));
         fs::write(&path, content).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
 
@@ -452,6 +496,318 @@ impl Harness {
                 },
             )
             .unwrap()
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+struct CodeChangeTerminalFixture {
+    policy: Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+    experiment_id: String,
+    task: PueueTask,
+    candidate_root: PathBuf,
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn code_change_terminal_fixture(harness: &Harness) -> CodeChangeTerminalFixture {
+    let project_root = harness.root();
+    let service = project_root.join(".pueue-agent");
+    fs::create_dir_all(&service).unwrap();
+    fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        service.join("config.toml"),
+        r#"project_id = "project-a"
+pueue_group = "pa-project"
+
+[agent]
+program = "codex"
+args = ["{prompt}"]
+timeout_minutes = 1
+max_retries = 0
+
+[agent.execution]
+network = "enabled"
+
+[check]
+interval_minutes = 1
+deep_check_interval_minutes = 0
+stall_minutes = 1
+log_tail_bytes = 1024
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 1
+max_experiments = 10
+max_agent_runs = 10
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        service.join("config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(project_root.join(".gitignore"), ".pueue-agent/\n").unwrap();
+    fs::write(project_root.join("base.txt"), b"base\n").unwrap();
+    let run_git = |args: &[&str]| {
+        let output = ProcessCommand::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "fixture"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["add", ".gitignore", "base.txt"]);
+    run_git(&["commit", "-q", "-m", "base"]);
+    let base_sha = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let trusted_git = harness._temp.path().join("execution-policy-bin/git");
+    fs::create_dir_all(trusted_git.parent().unwrap()).unwrap();
+    fs::copy("/usr/bin/git", &trusted_git).unwrap();
+    fs::set_permissions(&trusted_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness._temp.path(),
+        &[("project-a", &project_root, Path::new("codex"))],
+    );
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+    let project_config = config::load(&project.config_path).unwrap();
+    let original_policy = resolve_project_policy(&policy, &project, &project_config).unwrap();
+
+    let objective = objective_metric();
+    let baseline_id = harness.accepted_campaign_experiment_with_objective(
+        40,
+        "100",
+        Some(&objective),
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![&base_sha, "campaign-reconciliation"],
+        )
+        .unwrap();
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: baseline_id.clone(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(1.0),
+            metrics_json: r#"{"loss":1.0}"#.to_owned(),
+            artifact_defect: None,
+            created_at: 103,
+            updated_at: 103,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .project_terminal_submission(
+            &baseline_id,
+            40,
+            pueue_agent::models::ExperimentTerminalOutcome::Succeeded,
+            104,
+        )
+        .unwrap();
+
+    let proposal_id = "code-change-terminal-proposal";
+    let run_id = "code-change-terminal-run";
+    let proposal = proposals::validate(
+        ProposalInput {
+            kind: ProposalKind::CodeChange,
+            hypothesis: "Edit the training source".to_owned(),
+            source_experiment_id: Some(baseline_id),
+            argv: vec![
+                "python".to_owned(),
+                "train.py".to_owned(),
+                "--name".to_owned(),
+                "experiment".to_owned(),
+            ],
+            working_directory: ".".to_owned(),
+            expected_evidence: Vec::new(),
+        },
+        "objective-digest",
+    )
+    .unwrap();
+    let candidate_ref =
+        pueue_agent::code_change::candidate_ref("campaign-reconciliation", proposal_id).unwrap();
+    let best_ref = pueue_agent::code_change::best_ref("campaign-reconciliation").unwrap();
+    let worktree_relative_path = pueue_agent::code_change::owned_worktree_relative_path(
+        "campaign-reconciliation",
+        proposal_id,
+    )
+    .unwrap();
+    CampaignRepository::new(&harness.db)
+        .accept_code_change_proposal(
+            "campaign-reconciliation",
+            proposal_id,
+            "code-change-terminal-experiment",
+            "code-change-terminal-submission",
+            &proposal,
+            &CampaignLimits::default(),
+            106,
+            Some(&NewCodeChangeRun::new(
+                run_id,
+                proposal_id,
+                "campaign-reconciliation",
+                &base_sha,
+                &candidate_ref,
+                &best_ref,
+                run_id,
+                worktree_relative_path.to_string_lossy().to_string(),
+                106,
+            )),
+            None,
+        )
+        .unwrap();
+    let repository = pueue_agent::db::CodeChangeRepository::new(&harness.db);
+    repository
+        .transition(
+            run_id,
+            pueue_agent::models::CodeChangeState::Reserved,
+            pueue_agent::models::CodeChangeState::PreparingWorktree,
+            107,
+        )
+        .unwrap();
+    let mut candidate = prepare_code_change_worktree_for_run(
+        &policy,
+        &project,
+        &original_policy,
+        &harness.db,
+        run_id,
+    )
+    .await
+    .unwrap();
+    repository
+        .transition(
+            run_id,
+            pueue_agent::models::CodeChangeState::PreparingWorktree,
+            pueue_agent::models::CodeChangeState::Editing,
+            108,
+        )
+        .unwrap();
+    fs::write(candidate.path().join("base.txt"), b"candidate\n").unwrap();
+    let facts = candidate.verify().await.unwrap();
+    repository
+        .transition(
+            run_id,
+            pueue_agent::models::CodeChangeState::Editing,
+            pueue_agent::models::CodeChangeState::Checking,
+            109,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            run_id,
+            facts.persisted_digest(),
+            facts.file_count as i64,
+            facts.diff_bytes as i64,
+            109,
+        )
+        .unwrap();
+    repository
+        .transition(
+            run_id,
+            pueue_agent::models::CodeChangeState::Checking,
+            pueue_agent::models::CodeChangeState::Committing,
+            110,
+        )
+        .unwrap();
+    let candidate_sha = candidate.commit().await.unwrap();
+    repository
+        .record_candidate(
+            run_id,
+            &candidate_sha,
+            facts.persisted_digest(),
+            facts.file_count as i64,
+            facts.diff_bytes as i64,
+            111,
+        )
+        .unwrap();
+    repository
+        .transition(
+            run_id,
+            pueue_agent::models::CodeChangeState::Committing,
+            pueue_agent::models::CodeChangeState::CandidateReady,
+            112,
+        )
+        .unwrap();
+    let candidate_root = candidate.path().to_owned();
+    let candidate_working_directory_identity =
+        VerifiedWorkingDirectory::root(candidate.root()).unwrap().identity();
+    drop(candidate);
+
+    CampaignRepository::new(&harness.db)
+        .accept_code_change_candidate(
+            run_id,
+            "code-change-terminal-experiment",
+            "code-change-terminal-submission",
+            113,
+            &CampaignLimits::default(),
+        )
+        .unwrap();
+    repository
+        .record_candidate_working_directory_identity(
+            run_id,
+            "code-change-terminal-experiment",
+            candidate_working_directory_identity,
+            113,
+        )
+        .unwrap();
+    let task = terminal_task(41, "100", json!("Success"));
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting("code-change-terminal-experiment", 114)
+        .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .mark_accepted(
+            "code-change-terminal-experiment",
+            task.id,
+            &managed_task_run_signature(&task).unwrap(),
+            115,
+        )
+        .unwrap();
+
+    let candidate_service = candidate_root.join(".pueue-agent");
+    let candidate_results = candidate_service.join("results");
+    let candidate_artifacts = candidate_service.join("artifacts");
+    let artifact_run = candidate_artifacts.join("code-change-terminal-experiment");
+    fs::create_dir_all(&artifact_run).unwrap();
+    fs::create_dir_all(&candidate_results).unwrap();
+    for directory in [
+        &candidate_service,
+        &candidate_results,
+        &candidate_artifacts,
+        &artifact_run,
+    ] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    CodeChangeTerminalFixture {
+        policy,
+        experiment_id: "code-change-terminal-experiment".to_owned(),
+        task,
+        candidate_root,
     }
 }
 
@@ -1679,8 +2035,7 @@ async fn terminal_projection_rejects_symlink_manifest() {
     let harness = Harness::new();
     let experiment_id =
         harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
-    let results = harness.root().join(".pueue-agent/results");
-    fs::create_dir_all(&results).unwrap();
+    let results = harness.result_directory();
     let target = harness._temp.path().join("valid-result.json");
     fs::write(
         &target,
@@ -1718,15 +2073,17 @@ async fn terminal_projection_rejects_results_parent_symlink_outside_pinned_root(
 
     let outside = harness._temp.path().join("outside-results");
     fs::create_dir_all(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    let outside_manifest = outside.join(format!("{experiment_id}.json"));
     fs::write(
-        outside.join(format!("{experiment_id}.json")),
+        &outside_manifest,
         format!(
             r#"{{"schema_version":1,"experiment_id":"{experiment_id}","metrics":{{"loss":0.01}}}}"#
         ),
     )
     .unwrap();
-    let service = harness.root().join(".pueue-agent");
-    fs::create_dir_all(&service).unwrap();
+    fs::set_permissions(&outside_manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    let service = harness.result_service_directory();
     symlink(&outside, service.join("results")).unwrap();
 
     let result = Reconciler::new(
@@ -1754,8 +2111,7 @@ async fn terminal_projection_rejects_fifo_manifest_without_blocking() {
     let harness = Harness::new();
     let experiment_id =
         harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
-    let results = harness.root().join(".pueue-agent/results");
-    fs::create_dir_all(&results).unwrap();
+    let results = harness.result_directory();
     let fifo = results.join(format!("{experiment_id}.json"));
     let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
@@ -1807,8 +2163,7 @@ async fn terminal_projection_rejects_nonregular_manifest_when_open_denied() {
     let harness = Harness::new();
     let experiment_id =
         harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
-    let results = harness.root().join(".pueue-agent/results");
-    fs::create_dir_all(&results).unwrap();
+    let results = harness.result_directory();
     let candidate = results.join(format!("{experiment_id}.json"));
     fs::create_dir(&candidate).unwrap();
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o000)).unwrap();
@@ -1835,8 +2190,7 @@ async fn terminal_projection_rejects_active_fifo_manifest_before_reading() {
     let harness = Harness::new();
     let experiment_id =
         harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
-    let results = harness.root().join(".pueue-agent/results");
-    fs::create_dir_all(&results).unwrap();
+    let results = harness.result_directory();
     let fifo = results.join(format!("{experiment_id}.json"));
     let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
@@ -2058,13 +2412,262 @@ async fn successful_baseline_promotes_itself_as_current_best() {
     assert_eq!(plateau, 0);
 }
 
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_terminal_missing_manifest_projects_result_missing() {
+    let harness = Harness::new();
+    let fixture = code_change_terminal_fixture(&harness).await;
+
+    Reconciler::new(&harness.db, FakePueue::with_tasks(vec![fixture.task]))
+        .with_execution_policy(fixture.policy)
+        .run_once_at(200)
+        .await
+        .unwrap();
+
+    let metrics = harness
+        .metrics_row(&fixture.experiment_id)
+        .expect("code-change defect metrics row");
+    assert_eq!(metrics.artifact_defect.as_deref(), Some("result_missing"));
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&fixture.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Succeeded
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_terminal_removed_results_directory_projects_result_invalid() {
+    let harness = Harness::new();
+    let fixture = code_change_terminal_fixture(&harness).await;
+    fs::remove_dir(fixture.candidate_root.join(".pueue-agent/results")).unwrap();
+
+    Reconciler::new(&harness.db, FakePueue::with_tasks(vec![fixture.task]))
+        .with_execution_policy(fixture.policy)
+        .run_once_at(200)
+        .await
+        .unwrap();
+
+    let metrics = harness
+        .metrics_row(&fixture.experiment_id)
+        .expect("code-change defect metrics row");
+    assert_eq!(metrics.artifact_defect.as_deref(), Some("result_invalid"));
+    assert_eq!(
+        ExperimentRepository::new(&harness.db)
+            .find_by_id(&fixture.experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Succeeded
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn code_change_terminal_result_ingestion_does_not_mutate_promotion_state() {
+    let harness = Harness::new();
+
+    let objective = objective_metric();
+    let baseline_id = harness.accepted_campaign_experiment_with_objective(
+        40,
+        "100",
+        Some(&objective),
+    );
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: baseline_id.clone(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(1.0),
+            metrics_json: r#"{"loss":1.0}"#.to_owned(),
+            artifact_defect: None,
+            created_at: 103,
+            updated_at: 103,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .project_terminal_submission(
+            &baseline_id,
+            40,
+            pueue_agent::models::ExperimentTerminalOutcome::Succeeded,
+            104,
+        )
+        .unwrap();
+    pueue_agent::promotion::evaluate(
+        &harness.db,
+        "campaign-reconciliation",
+        &baseline_id,
+        ExperimentStatus::Succeeded,
+        &CampaignLimits::default(),
+        105,
+    )
+    .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET plateau_count = 2 WHERE campaign_id = 'campaign-reconciliation'",
+            [],
+        )
+        .unwrap();
+
+    let proposal_id = "code-change-terminal-proposal";
+    let run_id = "code-change-terminal-run";
+    let proposal = proposals::validate(
+        ProposalInput {
+            kind: ProposalKind::CodeChange,
+            hypothesis: "Edit the training source".to_owned(),
+            source_experiment_id: Some(baseline_id.clone()),
+            argv: vec!["python".to_owned(), "train.py".to_owned()],
+            working_directory: ".".to_owned(),
+            expected_evidence: Vec::new(),
+        },
+        "objective-digest",
+    )
+    .unwrap();
+    let candidate_ref =
+        pueue_agent::code_change::candidate_ref("campaign-reconciliation", proposal_id).unwrap();
+    let best_ref = pueue_agent::code_change::best_ref("campaign-reconciliation").unwrap();
+    let worktree_relative_path = pueue_agent::code_change::owned_worktree_relative_path(
+        "campaign-reconciliation",
+        proposal_id,
+    )
+    .unwrap();
+    CampaignRepository::new(&harness.db)
+        .accept_code_change_proposal(
+            "campaign-reconciliation",
+            proposal_id,
+            "code-change-terminal-experiment",
+            "code-change-terminal-submission",
+            &proposal,
+            &CampaignLimits::default(),
+            106,
+            Some(&NewCodeChangeRun::new(
+                run_id,
+                proposal_id,
+                "campaign-reconciliation",
+                "0000000000000000000000000000000000000000",
+                &candidate_ref,
+                &best_ref,
+                run_id,
+                worktree_relative_path.to_string_lossy().to_string(),
+                106,
+            )),
+            None,
+        )
+        .unwrap();
+
+    let experiment_id = "code-change-terminal-experiment";
+    let candidate_sha = "1111111111111111111111111111111111111111";
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs
+             SET state = 'candidate_ready', candidate_sha = ?1,
+                 diff_digest = ?2, changed_file_count = 0, diff_bytes = 0
+             WHERE code_change_run_id = ?3",
+            rusqlite::params![candidate_sha, "candidate-diff", run_id],
+        )
+        .unwrap();
+    CampaignRepository::new(&harness.db)
+        .accept_code_change_candidate(
+            run_id,
+            experiment_id,
+            "code-change-terminal-submission",
+            112,
+            &CampaignLimits::default(),
+        )
+        .unwrap();
+    let task = terminal_task(41, "100", json!("Success"));
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(experiment_id, 114)
+        .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .mark_accepted(
+            experiment_id,
+            task.id,
+            &managed_task_run_signature(&task).unwrap(),
+            115,
+        )
+        .unwrap();
+    MetricsRepository::upsert(
+        &harness.db,
+        &ExperimentMetricsRow {
+            experiment_id: experiment_id.to_owned(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(0.5),
+            metrics_json: r#"{"loss":0.5}"#.to_owned(),
+            artifact_defect: None,
+            created_at: 115,
+            updated_at: 115,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .project_terminal_submission(
+            experiment_id,
+            task.id,
+            pueue_agent::models::ExperimentTerminalOutcome::Succeeded,
+            116,
+        )
+        .unwrap();
+
+    Reconciler::new(&harness.db, FakePueue::with_tasks(vec![task]))
+        .run_once_at(116)
+        .await
+        .unwrap();
+
+    let metrics = MetricsRepository::get(&harness.db, experiment_id)
+        .unwrap()
+        .expect("code-change terminal result should be ingested");
+    assert_eq!(metrics.primary_metric_value, Some(0.5));
+    assert_eq!(
+        (
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT current_best_experiment_id FROM campaigns
+                     WHERE campaign_id = 'campaign-reconciliation'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT plateau_count FROM campaigns
+                     WHERE campaign_id = 'campaign-reconciliation'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            metrics.evaluated_at,
+        ),
+        (Some(baseline_id), 2, None),
+    );
+}
+
 #[tokio::test]
 async fn terminal_ingest_io_failure_recovers_on_the_next_cycle() {
     let harness = Harness::new();
     let experiment_id =
         harness.accepted_campaign_experiment_with_objective(41, "100", Some(&objective_metric()));
-    let service = harness.root().join(".pueue-agent");
-    fs::create_dir_all(&service).unwrap();
+    let service = harness.result_service_directory();
     // Replace the results directory with a plain file so opening the manifest
     // path fails with a non-NotFound IO error.
     fs::write(service.join("results"), b"not-a-directory").unwrap();

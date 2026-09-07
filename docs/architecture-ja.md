@@ -9,6 +9,7 @@
 | submit 経路 | project と argv の検証、submission intent の先行永続化、Pueue add 結果の記録 | Pueue の task 実行 | [`submit.rs`](../src/submit.rs), [`pueue.rs`](../src/pueue.rs) |
 | campaign coordinator | 最初の submit と accepted decision proposal を durable intent に変換し、commit 後の Pueue add と accepted/unreconciled 遷移を調停 | decision evidence の構築や agent 実行 | [`campaign.rs`](../src/campaign.rs), [`db/campaigns.rs`](../src/db/campaigns.rs) |
 | decision coordinator | terminal experiment の decision cycle、bounded evidence、read-only analysis、proposal/finite wait の適用と再起動復旧 | running health/OOM の継続観測、code change | [`decision.rs`](../src/decision.rs), [`decision_evidence.rs`](../src/decision_evidence.rs), [`db/decisions.rs`](../src/db/decisions.rs) |
+| code-change coordinator | `code_change` proposal の admission、Git candidate worktree、editor attempt/session、check、candidate commit/ref、候補 experiment、promotion、cleanup、restart recovery | main/checkout 中の source branch、remote、無関係な worktree、raw Pueue 操作 | [`code_change.rs`](../src/code_change.rs), [`db/code_changes.rs`](../src/db/code_changes.rs), [`campaign.rs`](../src/campaign.rs), [`promotion.rs`](../src/promotion.rs) |
 | Pueue adapter | 許可済み operation の argv 組み立て、検証済み Pueue/config の利用、timeout と stdout/stderr 上限 | event の永続化や retry 判定 | [`pueue.rs`](../src/pueue.rs), [`pueue_process.rs`](../src/pueue_process.rs) |
 | callback / reconciliation | callback の idempotent 取り込み、Pueue status の観測、terminal event の正規化、submission の突合 | agent dispatch | [`events.rs`](../src/events.rs), [`reconcile.rs`](../src/reconcile.rs) |
 | repository 層 | SQLite の制約、lease、状態遷移、run/event 結合、終端処理の transaction | OS process の生死 | [`db/repositories.rs`](../src/db/repositories.rs), [`models.rs`](../src/models.rs) |
@@ -27,6 +28,7 @@
 | agent、check、guardrail、Pueue group | project の `.pueue-agent/config.toml` | submit と daemon startup recovery は DB 登録の project ID/group と一致を検証する |
 | campaign、immutable objective snapshot、proposal、experiment、rolling budget reservation、submission/task lineage | service state directory の SQLite `state.sqlite3` | repository と coordinator が transaction 内で状態遷移する |
 | decision cycle、attempt、bounded context/output digest、finite wake | service state directory の SQLite `state.sqlite3` | decision repository/coordinator だけが遷移し、raw payload は status/doctor に投影しない |
+| code-change run、editor attempt/check、base/candidate SHA、candidate/best ref、worktree ownership、experiment linkage、cleanup marker | service state directory の SQLite `state.sqlite3` と検証済み local Git object/ref | code-change coordinator と status/doctor projection。raw prompt/diff/output は保存・投影しない |
 | current/historical facts、active lineage の bounded scratch projection | `.pueue-agent/state.json` | agent の補助 context。objective/budget/lineage の authority にはしない |
 | 人間が定める campaign objective と制約 | `.pueue-agent/STATE.md` | 最初の submit で bounded snapshot 化する。active campaign 中の編集で SQLite objective を上書きしない |
 | 起動時の executable、trusted path、Pueue config、network/environment policy | service state directory の `execution-policy.toml` を検証して作る immutable anchor/capability | daemon 起動後は ambient `PATH` で実行ファイルを再解決せず、使用直前に identity を再検証する |
@@ -80,7 +82,53 @@ decision runner は startup-pinned built-in Codex だけを使い、project root
 
 proposal は supervisor-owned ID と idempotency key で既存 coordinator に渡され、SQLite の accepted intent が外部 add より先です。finite wait は Pueue task を作らず、service-owned 上限内の絶対 `next_wake_at` だけを保存します。analysis は hourly agent-run budget、proposal は rolling experiment budget を消費します。連続失敗が `max_decision_attempts_per_cycle` に達すると cycle/campaign は `degraded` になり、自動 replay しません。
 
-Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop はこの terminal loop に含まれません。`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。
+Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop は terminal loop と併用される別経路として実装済みです。Phase 4 の evaluation と `goal review` も実装済みで、隔離された `code worktree` を使う Phase 5 pipeline は次の code-change coordinator が所有します。後続 phase に残るのは trusted native editor を OS レベルで containment する Phase 6 です。
+
+## 隔離された code-change pipeline
+
+`code_change` は `submit --kind` で指定する submission kind ではなく、terminal experiment 後の decision agent が返す proposal kind です。decision coordinator は proposal を受理して SQLite の code-change run と code-change budget reservation を作り、candidate の編集・検証・実験・promotion を `CodeChangeCoordinator` に渡します。通常の project 固有 adapter、controller、Pueue の直接呼び出しはありません。
+
+```mermaid
+flowchart TD
+    A["decision: code_change proposal"] --> B["admission: Git / clean base / policy"]
+    B --> C["reserved → preparing_worktree"]
+    C --> D["detached candidate worktree"]
+    D --> E["editing: fresh editor session"]
+    E -->|"editor/check failure"| F["same session resume once"]
+    F --> E
+    E --> G["checking: diff check + discovered checks"]
+    G --> H["committing: candidate SHA + local ref"]
+    H --> I["candidate_ready → experiment_submitted"]
+    I --> J["terminal reconciliation + Phase 4 evaluation"]
+    J --> K["best ref CAS or no promotion"]
+    K --> L["cleanup_pending → completed"]
+```
+
+### Admission と base
+
+campaign 開始時に service が保存した clean な committed `HEAD`（`campaign.base_revision_sha`）が code-change の基準です。既に存在する `campaign/<campaign-id>/best` があれば、まずその local ref が指す完全な commit SHA を検証して使います。Git executable、project root、base object、ref identity のいずれかを検証できない場合は code-change proposal だけを reject し、通常の非 code campaign を再投入しません。campaign 開始時の dirty worktree、非 Git project、Git 不在、legacy schema/campaign の `base_revision_sha` 欠落、不正な best ref はいずれも fail closed です。
+
+Git project の `init` は tracked な `.gitignore` を変更せず、Git common `info/exclude` に setup-owned の `/.pueue-agent/` rule を追加します。check と candidate runtime の生成物は固定した service-owned scope に限定し、未証明の残存 scope は削除・再利用せず recovery として保全します。
+
+元の project root は起動時に pin された anchor として read-only に扱います。candidate は service state directory の `.pueue-agent/worktrees/<campaign-id>/<proposal-id>` に、完全な base SHA の detached worktree として作ります。作成・cleanup は descriptor と durable ownership proof を使い、未知 path、symlink、無関係な worktree、source branch を追跡しません。
+
+### Editor、check、commit
+
+editor は policy で許可し identity を検証した native executable を candidate root に起動し、結果 JSON は strict schema で受理します。初回は fresh session、editor または required check の失敗時だけ同じ session を一度 resume し、最大 **2 editor attempts / 1 session**です。restart recovery で attempt counter を戻すことはありません。空 argv、shell、絶対/parent traversal cwd、未許可 executable、未知 output field、`cannot_apply` は候補を進めません。
+
+supervisor は常に `git diff --check` を行い、構成を発見した project check を editor 提案 check と併せて実行します。Rust は `Cargo.toml` があれば `cargo test --all-targets -- --test-threads=1`、Python は `pytest.ini` または `pyproject.toml` の `[tool.pytest.ini_options]` を検出し、`uv.lock` があれば `uv run pytest`、なければ `python -m pytest` を使います。discovered check は editor の提案で削除できず、check argv は固定 profile だけを許可します。上限は変更ファイル **50**、diff bytes **500000**、check **8**、各 check **30 分**、combined check output **64 KiB**です。check/runtime の service-owned output audit は深さ **32**、entry **16,384**、割当済み bytes **8 GiB**で有限に検証します（これは OS の書き込み quota ではありません）。最終 diff digest の再検証に成功した場合だけ固定 service identity で commit し、candidate ref `campaign/<campaign-id>/candidate/<proposal-id>` を local に作ります。
+
+### Candidate experiment、promotion、予算
+
+candidate ref と best ref `campaign/<campaign-id>/best` は local ref であり、merge、rebase、push、PR、remote ref の変更を行いません。candidate SHA と worktree identity を再検証してから、candidate worktree を cwd とする通常の Pueue experiment を一度だけ durable intent 化します。experiment row は `code_change_run_id` と `code_revision_sha` を保持し、task が live の間は candidate HEAD と tracked source tree を immutable に維持します（result/artifact の untracked 出力は別です）。
+
+code-change proposal の受理は code-change budget を 1 slot 消費し、reject/失敗でも返却しません。editor の各 attempt は通常の agent-run hourly budget、candidate experiment は通常の rolling experiment budget と parallelism guardrail を使うため `budget_waiting` があり得ます。Phase 3 health と terminal reconciliation が候補 experiment の OOM、internal failure、timeout、cancel を terminal failure として扱い、tracked source mutation、欠損/不正 result、metric の非改善も含めて候補を promotion 不可にします。metric の有効な改善時だけ best ref を expected-old/new SHA の local CAS で進め、競合や invalid evidence では best を変更しません。
+
+### Recovery と cleanup
+
+再起動・定期 recovery は durable state、worktree descriptor、candidate/best ref、Pueue submission identity を照合し、同じ editor/commit/task を重複作成しません。publication 前に owned worktree が無ければ再作成できますが、予期しない path/identity、競合 candidate ref、差し替えられた tracked file は `recovery_required` です。editor は同じ session の attempt 状態を再利用し、二回目の失敗後に retry budget をリセットしません。
+
+terminal experiment 後は live process/task がないこと、candidate HEAD/index と tracked source が不変であること、ownership proof が一致することを確認してから cleanup を行います。失敗した cleanup は `cleanup_pending` として残り、未知 path の削除、follow-symlink、全体 `git worktree prune` はしません。`evaluated` / `cleanup_pending` / `rejected` の run は cleanup 完了まで status に残ります。
 
 service policy の network default は `enabled` ですが、sanitized environment は別の allowlist 境界です。network を利用可能にしても、allowlist 外の credential/environment value を agent または agent task に継承しません。
 
@@ -245,6 +293,8 @@ active run と linked event は project ごとの immediate transaction で回�
 
 現在の decision status は cycle を最大1件だけ投影し、`cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、bounded failure code/summary を含みます。doctor は project/campaign scoped の indexed query で lineage、single-owner attempt/binding、overdue run、finite wake、digest、degraded diagnostics を読み取り専用で検査します。malformed row は typed error check であり、migration/repair を起こしません。context/decision JSON、digest 自体、prompt、transcript、environment、完全な argv、log excerpt、raw objective はどちらにも出しません。
 
+code-change の status projection は `code_changes` を最大 8 run に限定し、`state`、`attempts`（最大 2）、省略 base/candidate SHA、experiment/task ID、`failed_check` の status/summary、`next_action`、`cleanup_pending`、最大 8 件の transition stage/reason を返します。doctor の code-change checks は `code_change.cleanup`、`code_change.experiments`、`code_change.lineage`、`code_change.refs`、`code_change.rows`、`code_change.single_live`、`code_change.stale`、`code_change.worktrees` です。count は bounded で、`stale` は warning として診断するだけです。operator が candidate を調べる場合は、`status --json`、proposal/experiment `inspect --json`、`events --kind code_change --json`、`doctor --json` と、`git status --short`、`git rev-parse --verify HEAD^{commit}`、`git diff --check <base-sha> --`、`git show-ref --verify <refs/heads/campaign/...>`、`git worktree list --porcelain` の読み取り専用操作だけを使います。
+
 user-facing な error/reason は control/ANSI 文字を除去し、パス、credential 形式、機密に見える token を redaction して 240 bytes に制限します。native control frame の `Debug` は argv/environment の個数だけ、sanitized environment の `Debug` は変数名だけを出します。Pueue の captured stdout/stderr は上限付きで回収しますが、error の `Debug` は内容ではなく byte 数を出します。
 
 ただし、redaction は access control の代わりではありません。submission の argv、Pueue observation/event payload、agent log など、実行と監査に必要な情報を所有する保存先には、service/project の filesystem 権限が必要です。
@@ -252,6 +302,7 @@ user-facing な error/reason は control/ANSI 文字を除去し、パス、cred
 ## セキュリティ境界
 
 - **Immutable policy boundary:** executable は startup で canonical path、device/inode、owner、mode を anchor 化し、launch 直前も identity を再検証します。custom agent は policy の allowlist への明示登録が必要です。
+- **Code-change editor boundary:** custom editor は policy に登録された trusted native executable として候補 worktree にだけ起動します。Phase 5 は argv、cwd、identity、credential/environment 継承を検証しますが、namespace、container、VM、cgroup/seccomp などの強制 containment は提供しません。editor、check、candidate experiment は root で起動せず、OS containment は Phase 6 の境界です。
 - **Environment boundary:** child の inherited environment は一度 clear し、固定 baseline、生成値、および agent 種別ごとの allowlist だけを再構成します。汎用 allowlist は auth/proxy/certificate 名を通さず、Codex 認証値は built-in Codex agent にだけ明示的に渡します。
 - **Descriptor boundary:** project root、agent log、Pueue config、private temp は検証済み descriptor/capability と identity で渡し、検証後の ambient path lookup を減らします。symlink、所有者/mode 違反、identity 変化、mount 境界の不明は fail closed です。
 - **Durable authorization boundary:** marker は owner-only の新規 file として排他作成し、file と parent を sync します。この layer は marker を削除も置換もしません。marker なしの release は protocol 上拒否されます。
@@ -275,6 +326,8 @@ Linux private temp の mount 境界検証は `openat2(RESOLVE_NO_XDEV)` と `sta
 - callback の idempotency: [`events.rs`](../src/events.rs)
 - status reconciliation、terminal event、submission recovery: [`reconcile.rs`](../src/reconcile.rs)
 - terminal decision evidence、適用、復旧: [`decision_evidence.rs`](../src/decision_evidence.rs), [`decision.rs`](../src/decision.rs), [`db/decisions.rs`](../src/db/decisions.rs)
+- code-change admission、worktree/editor/check/commit、candidate/base ref: [`code_change.rs`](../src/code_change.rs), [`db/code_changes.rs`](../src/db/code_changes.rs)
+- candidate experiment の submission、promotion、cleanup、recovery: [`campaign.rs`](../src/campaign.rs), [`promotion.rs`](../src/promotion.rs), [`reconcile.rs`](../src/reconcile.rs), [`daemon.rs`](../src/daemon.rs)
 - claim、policy preflight、project 単位 dispatch: [`scheduler.rs`](../src/scheduler.rs)
 - agent run bind 後の起動と terminal/private-temp 順序: [`agent.rs`](../src/agent.rs)
 - marker/release adapter: [`native_launcher.rs`](../src/native_launcher.rs)

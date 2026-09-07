@@ -1,23 +1,33 @@
-use std::{collections::BTreeMap, ffi::OsString, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, ffi::OsString, path::Path, sync::Arc, time::SystemTime};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+use crate::{
+    code_change::reopen_code_change_result_for_run,
+    config,
+    execution_policy::{resolve_project_policy, VerifiedWorkingDirectory},
+};
+
 use crate::{
     db::{
-        database_error, Db, DecisionRepository, EventRepository, ExperimentRepository,
-        HealthRepository, ProjectRepository, SubmissionRepository, TaskObservationRepository,
+        database_error, CodeChangeRepository, Db, DecisionRepository, EventRepository,
+        ExperimentRepository, HealthRepository, ProjectRepository, ProposalRepository,
+        SubmissionRepository, TaskObservationRepository,
     },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
-    execution_policy::{CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy},
+    execution_policy::{
+        executable_identity_token, CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy,
+    },
     incidents::IncidentStore,
     models::{
         EventKind, Experiment, ExperimentStatus, ExperimentTerminalOutcome, NewEvent,
         NewTaskObservation, Submission, SubmissionStatus,
     },
-    pueue::{PueueApi, PueueTask},
     project_logs::ProjectRootLogReader,
+    pueue::{PueueApi, PueueTask},
     termination::{
         auto_kill_request_for_terminal_task, confirm_auto_kill_terminal_observation,
         AutoKillConfirmation,
@@ -80,6 +90,147 @@ where
         };
         let verified_root = root_anchor.verify_identity().map_err(AppError::from)?;
         Ok(ProjectRootLogReader::from_verified(verified_root))
+    }
+
+    async fn ingest_terminal_result(
+        &self,
+        project: &crate::models::Project,
+        experiment: &Experiment,
+        pueue_task_id: i64,
+        objective: &crate::models::ObjectiveMetric,
+        now: i64,
+    ) -> Result<(), AppError> {
+        #[cfg(unix)]
+        if let Some(code_change_run_id) = experiment.code_change_run_id.as_deref() {
+            let policy = self
+                .execution_policy
+                .as_deref()
+                .ok_or(AppError::Validation {
+                    field: "code_change.policy",
+                    message: "startup execution policy is required for candidate result ingestion",
+                })?;
+            let project_config = config::load(&project.config_path)?;
+            let original_policy =
+                resolve_project_policy(policy, project, &project_config).map_err(AppError::from)?;
+            let run = CodeChangeRepository::new(self.db)
+                .find_by_id(code_change_run_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "read code-change run before candidate result ingestion",
+                })?;
+            if run.experiment_id.as_deref() != Some(experiment.experiment_id.as_str()) {
+                return Err(AppError::Validation {
+                    field: "code_change.experiment_id",
+                    message: "candidate run is not bound to the terminal experiment",
+                });
+            }
+            let proposal = ProposalRepository::new(self.db)
+                .find_for_campaign(&experiment.campaign_id, &experiment.proposal_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "read code-change proposal before candidate result ingestion",
+                })?;
+            let candidate = reopen_code_change_result_for_run(
+                policy,
+                project,
+                &original_policy,
+                self.db,
+                code_change_run_id,
+                &experiment.experiment_id,
+            )
+            .await?;
+            let working_directory = VerifiedWorkingDirectory::open_descendant(
+                candidate.root(),
+                Path::new(&proposal.working_directory),
+            )
+            .map_err(AppError::from)?;
+            let stored_identity =
+                run.candidate_working_directory_identity
+                    .as_deref()
+                    .ok_or(AppError::Runtime {
+                        operation: "read durable candidate working-directory identity",
+                    })?;
+            if executable_identity_token(working_directory.identity()) != stored_identity {
+                return Err(AppError::Validation {
+                    field: "code_change.working_directory",
+                    message: "candidate working-directory identity changed",
+                });
+            }
+            let initial_result_status = candidate
+                .terminal_result_output_status()
+                .ok_or(AppError::Runtime {
+                    operation: "recover code-change ownership",
+                })?;
+            let before_result_status = candidate
+                .reverify_result_ingestion_boundary(&working_directory, &experiment.experiment_id)
+                .await?;
+            if before_result_status != initial_result_status {
+                return Err(AppError::Runtime {
+                    operation: "recover code-change ownership",
+                });
+            }
+            let root = ProjectRootLogReader::from_verified(candidate.root().try_clone()?);
+            root.revalidate_root_path_identity()?;
+            let staged = match initial_result_status {
+                crate::code_change::TerminalResultOutputStatus::Missing => {
+                    crate::result_manifest::stage_defect(
+                        &experiment.experiment_id,
+                        "result_missing",
+                        now,
+                    )?
+                }
+                crate::code_change::TerminalResultOutputStatus::Invalid => {
+                    crate::result_manifest::stage_defect(
+                        &experiment.experiment_id,
+                        "result_invalid",
+                        now,
+                    )?
+                }
+                crate::code_change::TerminalResultOutputStatus::Ready => {
+                    let manifest = candidate
+                        .terminal_result_manifest_bytes()
+                        .ok_or(AppError::Runtime {
+                            operation: "recover code-change ownership",
+                        })?;
+                    crate::result_manifest::stage_from_bound_manifest(
+                        manifest,
+                        &project.project_id,
+                        &experiment.experiment_id,
+                        pueue_task_id,
+                        Some(objective),
+                        now,
+                    )?
+                }
+            };
+            root.revalidate_root_path_identity()?;
+            let after_result_status = candidate
+                .reverify_result_ingestion_boundary(&working_directory, &experiment.experiment_id)
+                .await?;
+            if after_result_status != initial_result_status {
+                return Err(AppError::Runtime {
+                    operation: "recover code-change ownership",
+                });
+            }
+            staged.persist(self.db)?;
+            return Ok(());
+        }
+
+        #[cfg(not(unix))]
+        if experiment.code_change_run_id.is_some() {
+            return Err(AppError::Validation {
+                field: "code_change.platform",
+                message: "candidate result ingestion requires a supported platform",
+            });
+        }
+
+        let root = self.project_root_reader(project)?;
+        crate::result_manifest::ingest_from_verified_root(
+            self.db,
+            &root,
+            &project.project_id,
+            &experiment.experiment_id,
+            pueue_task_id,
+            Some(objective),
+            now,
+        )
     }
 
     pub async fn run_once(&mut self) -> Result<ReconcileReport, AppError> {
@@ -153,13 +304,8 @@ where
                     | Some(AutoKillConfirmation::AlreadyConfirmed) => EventKind::AutoKilled,
                     Some(AutoKillConfirmation::NotSent) | None => terminal_event_kind(task),
                 };
-                let experiment = resolve_terminal_experiment(
-                    self.db,
-                    &project.project_id,
-                    task,
-                    &tasks,
-                    now,
-                )?;
+                let experiment =
+                    resolve_terminal_experiment(self.db, &project.project_id, task, &tasks, now)?;
                 if let Some(experiment) = experiment.as_ref() {
                     // Ingestion must precede the terminal projection: a failure
                     // here has to leave the experiment resolvable so the next
@@ -169,22 +315,20 @@ where
                         self.db,
                         &experiment.campaign_id,
                     )?;
-                    let has_frozen_terminal_evidence = matches!(
-                        experiment.status,
-                        ExperimentStatus::Succeeded | ExperimentStatus::Failed | ExperimentStatus::Cancelled
-                    ) && crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?.is_some();
+                    let has_frozen_terminal_evidence =
+                        matches!(
+                            experiment.status,
+                            ExperimentStatus::Succeeded
+                                | ExperimentStatus::Failed
+                                | ExperimentStatus::Cancelled
+                        ) && crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?
+                            .is_some();
                     if !has_frozen_terminal_evidence {
                         if let Some(objective) = objective.as_ref() {
-                            let root = self.project_root_reader(project)?;
-                            crate::result_manifest::ingest_from_verified_root(
-                                self.db,
-                                &root,
-                                &project.project_id,
-                                &experiment.experiment_id,
-                                task.id,
-                                Some(objective),
-                                now,
-                            )?;
+                            self.ingest_terminal_result(
+                                project, experiment, task.id, objective, now,
+                            )
+                            .await?;
                         }
                     }
                     let projected_status = project_terminal_experiment(
@@ -199,7 +343,7 @@ where
                     // row is frozen on first ingest and carries a durable
                     // evaluated_at marker; retries evaluate whenever that
                     // marker is absent, even if finished_at is already set.
-                    if objective.is_some() {
+                    if objective.is_some() && experiment.code_change_run_id.is_none() {
                         let needs_evaluation =
                             crate::db::MetricsRepository::get(self.db, &experiment.experiment_id)?
                                 .as_ref()
@@ -297,7 +441,7 @@ fn resolve_terminal_experiment(
     let connection = db.connect()?;
     let mut statement = connection
         .prepare(
-             "SELECT submission_id FROM submissions
+            "SELECT submission_id FROM submissions
              WHERE project_id = ?1 AND pueue_task_id = ?2
                AND status = 'accepted'
              ORDER BY created_at, submission_id",
@@ -324,7 +468,12 @@ fn resolve_terminal_experiment(
 
     let submissions = SubmissionRepository::new(db);
     let experiments = ExperimentRepository::new(db);
-    if tasks.iter().filter(|candidate| candidate.id == task.id).count() != 1 {
+    if tasks
+        .iter()
+        .filter(|candidate| candidate.id == task.id)
+        .count()
+        != 1
+    {
         let mut ambiguous_experiment_ids = Vec::new();
         for submission_id in submission_ids {
             if let Some(experiment) = experiments.find_by_submission_id(&submission_id)? {
@@ -364,7 +513,9 @@ fn resolve_terminal_experiment(
     if matches.len() != 1 {
         let mut ambiguous_experiment_ids = Vec::new();
         for submission in matches {
-            if let Some(experiment) = experiments.find_by_submission_id(&submission.submission_id)? {
+            if let Some(experiment) =
+                experiments.find_by_submission_id(&submission.submission_id)?
+            {
                 ambiguous_experiment_ids.push(experiment.experiment_id);
             }
         }
@@ -492,9 +643,7 @@ fn failure_fingerprint(task: &PueueTask, failure_code: &str) -> String {
     });
     format!(
         "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&cause).expect("failure cause JSON is serializable")
-        )
+        Sha256::digest(serde_json::to_vec(&cause).expect("failure cause JSON is serializable"))
     )
 }
 
@@ -728,12 +877,10 @@ pub(crate) fn canonical_command_display(argv: &[String]) -> String {
 pub(crate) fn try_canonical_command_display_os(argv: &[OsString]) -> Result<String, AppError> {
     let mut parts = Vec::with_capacity(argv.len());
     for arg in argv {
-        let s = arg
-            .to_str()
-            .ok_or(AppError::Validation {
-                field: "argv",
-                message: "must be valid UTF-8 for display",
-            })?;
+        let s = arg.to_str().ok_or(AppError::Validation {
+            field: "argv",
+            message: "must be valid UTF-8 for display",
+        })?;
         parts.push(shell_quote(s));
     }
     Ok(parts.join(" "))
@@ -853,7 +1000,10 @@ mod display_tests {
             OsString::from("hi"),
         ];
         let display = try_canonical_command_display_os(&argv).unwrap();
-        assert_eq!(display, "/usr/bin/env PUEUE_AGENT_EXPERIMENT_ID=exp-1 echo hi");
+        assert_eq!(
+            display,
+            "/usr/bin/env PUEUE_AGENT_EXPERIMENT_ID=exp-1 echo hi"
+        );
     }
 
     #[test]

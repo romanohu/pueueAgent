@@ -38,6 +38,337 @@ pub enum PromotionOutcome {
     SkippedNoObjective,
 }
 
+impl PromotionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Improved => "improved",
+            Self::BaselineEstablished => "baseline_established",
+            Self::NotImproved => "not_improved",
+            Self::SkippedNoMetric => "skipped_no_metric",
+            Self::SkippedNoObjective => "skipped_no_objective",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self, AppError> {
+        match value {
+            "improved" => Ok(Self::Improved),
+            "baseline_established" => Ok(Self::BaselineEstablished),
+            "not_improved" => Ok(Self::NotImproved),
+            "skipped_no_metric" => Ok(Self::SkippedNoMetric),
+            "skipped_no_objective" => Ok(Self::SkippedNoObjective),
+            _ => Err(AppError::Validation {
+                field: "promotion_outcome",
+                message: "is not a recognized code-change promotion outcome",
+            }),
+        }
+    }
+}
+
+/// The immutable comparison decision persisted around the Git ref boundary.
+/// The target is present only for an improvement; all other outcomes retain
+/// the candidate run's revision in the run row while leaving the best ref
+/// untouched.  Campaign and experiment IDs are retained privately so the
+/// finalize API cannot be redirected to another lineage by a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodePromotionPlan {
+    pub outcome: PromotionOutcome,
+    pub expected_current_best_experiment_id: Option<String>,
+    pub expected_old_sha: Option<String>,
+    pub candidate_sha: Option<String>,
+    pub(crate) campaign_id: String,
+    pub(crate) experiment_id: String,
+}
+
+impl CodePromotionPlan {
+    /// Reconstruct the exact plan persisted by a code-change promotion intent.
+    /// The candidate revision is supplied by the immutable run lineage; the
+    /// four remaining values are the only durable promotion inputs.
+    pub(crate) fn from_persisted(
+        campaign_id: String,
+        experiment_id: String,
+        candidate_sha: &str,
+        promotion_outcome: Option<&str>,
+        expected_current_best_experiment_id: Option<String>,
+        expected_old_sha: Option<String>,
+        promotion_target_sha: Option<String>,
+    ) -> Result<Self, AppError> {
+        let outcome = promotion_outcome.ok_or(AppError::Validation {
+            field: "promotion_outcome",
+            message: "is required before code-change promotion finalization",
+        })?;
+        let outcome = PromotionOutcome::from_str(outcome)?;
+        validate_code_candidate_sha(candidate_sha)?;
+        validate_optional_code_sha(expected_old_sha.as_deref())?;
+        match outcome {
+            PromotionOutcome::Improved => {
+                let target = promotion_target_sha.as_deref().ok_or(AppError::Validation {
+                    field: "promotion_target_sha",
+                    message: "improved code-change plan requires a candidate target SHA",
+                })?;
+                validate_code_candidate_sha(target)?;
+                if target != candidate_sha {
+                    return Err(AppError::Validation {
+                        field: "promotion_target_sha",
+                        message: "must match the immutable candidate SHA",
+                    });
+                }
+            }
+            _ if promotion_target_sha.is_some() => {
+                return Err(AppError::Validation {
+                    field: "promotion_target_sha",
+                    message: "non-improved code-change plan cannot carry a target SHA",
+                });
+            }
+            _ => {}
+        }
+        Ok(Self {
+            outcome,
+            expected_current_best_experiment_id,
+            expected_old_sha,
+            candidate_sha: promotion_target_sha,
+            campaign_id,
+            experiment_id,
+        })
+    }
+}
+
+fn validate_code_candidate_sha(value: &str) -> Result<(), AppError> {
+    if (value.len() != 40 && value.len() != 64)
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return Err(AppError::Validation {
+            field: "code_change.candidate_sha",
+            message: "must be a lowercase full object ID",
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_code_sha(value: Option<&str>) -> Result<(), AppError> {
+    if let Some(value) = value {
+        validate_code_candidate_sha(value)?;
+    }
+    Ok(())
+}
+
+/// Compare a terminal code-change experiment without changing campaign,
+/// metric, or audit state.  The caller holds the same IMMEDIATE transaction
+/// that will persist the returned intent, so the comparison snapshot and
+/// durable promotion fields share one SQLite boundary.
+pub fn preview_code_candidate(
+    connection: &Transaction<'_>,
+    campaign_id: &str,
+    experiment_id: &str,
+    terminal_status: ExperimentStatus,
+    limits: &CampaignLimits,
+    expected_old_sha: Option<&str>,
+    candidate_sha: &str,
+) -> Result<CodePromotionPlan, AppError> {
+    validate_code_candidate_sha(candidate_sha)?;
+    validate_optional_code_sha(expected_old_sha)?;
+    let campaign = read_campaign_promotion_state(connection, campaign_id)?
+        .ok_or(AppError::Validation {
+            field: "campaign_id",
+            message: "does not identify a campaign",
+        })?;
+    if let Some(objective) = campaign.objective.as_ref() {
+        objective.validate()?;
+    }
+    validate_experiment_campaign(connection, campaign_id, experiment_id, "experiment_id")?;
+    for (field, comparison_id) in [
+        (
+            "current_best_experiment_id",
+            campaign.current_best_experiment_id.as_deref(),
+        ),
+        (
+            "baseline_experiment_id",
+            campaign.baseline_experiment_id.as_deref(),
+        ),
+    ] {
+        if let Some(comparison_id) = comparison_id {
+            validate_experiment_campaign(connection, campaign_id, comparison_id, field)?;
+        }
+    }
+    if !metrics_row_exists(connection, experiment_id)? {
+        return Err(AppError::Validation {
+            field: "experiment_id",
+            message: "missing experiment_metrics row; evaluation aborted",
+        });
+    }
+
+    let outcome = if campaign.state != CampaignState::Active || campaign.objective.is_none() {
+        PromotionOutcome::SkippedNoObjective
+    } else if terminal_status != ExperimentStatus::Succeeded {
+        PromotionOutcome::SkippedNoMetric
+    } else {
+        match primary_metric_value(connection, campaign_id, experiment_id)? {
+            None => PromotionOutcome::NotImproved,
+            Some(candidate_value) => match campaign.current_best_experiment_id.as_deref() {
+                Some(best_id) if best_id == experiment_id => {
+                    if campaign.baseline_experiment_id.as_deref() == Some(experiment_id) {
+                        PromotionOutcome::BaselineEstablished
+                    } else {
+                        PromotionOutcome::Improved
+                    }
+                }
+                Some(best_id) => compare_preview(
+                    connection,
+                    campaign_id,
+                    candidate_value,
+                    best_id,
+                    campaign.objective.as_ref().expect("objective checked above"),
+                    limits,
+                )?,
+                None => match campaign.baseline_experiment_id.as_deref() {
+                    Some(baseline_id) if baseline_id == experiment_id => {
+                        PromotionOutcome::BaselineEstablished
+                    }
+                    Some(baseline_id) => compare_preview(
+                        connection,
+                        campaign_id,
+                        candidate_value,
+                        baseline_id,
+                        campaign.objective.as_ref().expect("objective checked above"),
+                        limits,
+                    )?,
+                    None => PromotionOutcome::SkippedNoMetric,
+                },
+            },
+        }
+    };
+    Ok(CodePromotionPlan {
+        outcome,
+        expected_current_best_experiment_id: campaign.current_best_experiment_id,
+        expected_old_sha: expected_old_sha.map(str::to_owned),
+        candidate_sha: (outcome == PromotionOutcome::Improved).then(|| candidate_sha.to_owned()),
+        campaign_id: campaign_id.to_owned(),
+        experiment_id: experiment_id.to_owned(),
+    })
+}
+
+fn compare_preview(
+    connection: &Transaction<'_>,
+    campaign_id: &str,
+    candidate_value: f64,
+    best_experiment_id: &str,
+    objective: &ObjectiveMetric,
+    _limits: &CampaignLimits,
+) -> Result<PromotionOutcome, AppError> {
+    let Some(best_value) = primary_metric_value(connection, campaign_id, best_experiment_id)? else {
+        return Ok(PromotionOutcome::SkippedNoMetric);
+    };
+    let delta = objective.min_delta.unwrap_or(0.0);
+    let improved = match objective.direction {
+        MetricDirection::Minimize => candidate_value < best_value - delta,
+        MetricDirection::Maximize => candidate_value > best_value + delta,
+    };
+    Ok(if improved {
+        PromotionOutcome::Improved
+    } else {
+        PromotionOutcome::NotImproved
+    })
+}
+
+/// Apply a previously persisted code-candidate comparison inside the caller's
+/// IMMEDIATE transaction.  The expected current-best predicate is checked
+/// before any campaign, plateau, or audit mutation; callers persist the
+/// metric evaluated marker in the same transaction after this returns.
+pub fn finalize_code_candidate(
+    connection: &Transaction<'_>,
+    plan: &CodePromotionPlan,
+    limits: &CampaignLimits,
+    now: i64,
+) -> Result<PromotionOutcome, AppError> {
+    match plan.outcome {
+        PromotionOutcome::Improved => {
+            let target = plan.candidate_sha.as_deref().ok_or(AppError::Validation {
+                field: "promotion_target_sha",
+                message: "improved code-change plan requires a candidate target SHA",
+            })?;
+            validate_code_candidate_sha(target)?;
+        }
+        _ if plan.candidate_sha.is_some() => {
+            return Err(AppError::Validation {
+                field: "promotion_target_sha",
+                message: "non-improved code-change plan cannot carry a target SHA",
+            });
+        }
+        _ => {}
+    }
+    validate_optional_code_sha(plan.expected_old_sha.as_deref())?;
+    let campaign = read_campaign_promotion_state(connection, &plan.campaign_id)?
+        .ok_or(AppError::Validation {
+            field: "campaign_id",
+            message: "does not identify a campaign",
+        })?;
+    validate_experiment_campaign(
+        connection,
+        &plan.campaign_id,
+        &plan.experiment_id,
+        "experiment_id",
+    )?;
+    if let Some(expected_best) = plan.expected_current_best_experiment_id.as_deref() {
+        validate_experiment_campaign(
+            connection,
+            &plan.campaign_id,
+            expected_best,
+            "current_best_experiment_id",
+        )?;
+    }
+    if campaign.current_best_experiment_id != plan.expected_current_best_experiment_id {
+        return Err(AppError::Validation {
+            field: "current_best_experiment_id",
+            message: "changed since the code-change promotion preview",
+        });
+    }
+    if !metrics_row_exists(connection, &plan.experiment_id)? {
+        return Err(AppError::Validation {
+            field: "experiment_id",
+            message: "missing experiment_metrics row; finalization aborted",
+        });
+    }
+    if is_already_evaluated(connection, &plan.experiment_id)? {
+        return Ok(plan.outcome);
+    }
+    match plan.outcome {
+        PromotionOutcome::Improved => {
+            let campaign = read_campaign_promotion_state(connection, &plan.campaign_id)?
+                .ok_or(AppError::Validation {
+                    field: "campaign_id",
+                    message: "does not identify a campaign",
+                })?;
+            promote_challenger(
+                connection,
+                &plan.campaign_id,
+                &campaign.project_id,
+                &plan.experiment_id,
+                now,
+            )?;
+        }
+        PromotionOutcome::BaselineEstablished => {
+            promote_baseline(connection, &plan.campaign_id, &plan.experiment_id, now)?;
+        }
+        PromotionOutcome::NotImproved => {
+            campaign.objective.as_ref().ok_or(AppError::Validation {
+                field: "objective_metric",
+                message: "not-improved code-change plan requires an objective",
+            })?;
+            increment_plateau(
+                connection,
+                &plan.campaign_id,
+                &campaign.project_id,
+                &plan.experiment_id,
+                limits,
+                now,
+            )?;
+        }
+        PromotionOutcome::SkippedNoMetric | PromotionOutcome::SkippedNoObjective => {}
+    }
+    Ok(plan.outcome)
+}
+
 pub fn evaluate(
     db: &Db,
     campaign_id: &str,
@@ -441,7 +772,7 @@ fn metrics_row_exists(
     Ok(exists.is_some())
 }
 
-fn mark_evaluated(
+pub(crate) fn mark_evaluated(
     connection: &Connection,
     experiment_id: &str,
     now: i64,

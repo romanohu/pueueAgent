@@ -206,6 +206,7 @@ impl NativeFakePueue {
         let previous_lifecycle_trace = None;
         let temp = TempDir::new().expect("create native Pueue fixture root");
         let base = fs::canonicalize(temp.path()).expect("canonicalize fixture root");
+        secure_directory(&base);
         let state_dir = base.join("state");
         let project_root = base.join("project");
         let trusted_dir = base.join("trusted");

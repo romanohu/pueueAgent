@@ -83,9 +83,12 @@ case "$output" in
   */editor.json) editor_artifact=1 ;;
 esac
 if [ "$editor_artifact" -eq 1 ] || [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
+  editor_output="$output"
+  [ -n "$editor_output" ] || editor_output="${PUEUE_AGENT_EDITOR_OUTPUT:-}"
+  [ -n "$editor_output" ] || exit 70
   if [ -n "${PUEUE_AGENT_TEST_EDITOR_CAPTURE:-}" ]; then
     {
-      printf 'EDITOR_INVOCATION output=%s\n' "$output"
+      printf 'EDITOR_INVOCATION output=%s\n' "$editor_output"
       if [ -n "${PUEUE_AGENT_EDITOR_SESSION_ID+x}" ]; then
         printf 'EDITOR_SESSION_ID=%s\n' "$PUEUE_AGENT_EDITOR_SESSION_ID"
       fi
@@ -93,22 +96,44 @@ if [ "$editor_artifact" -eq 1 ] || [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
   fi
   case "${PUEUE_AGENT_TEST_EDITOR_OUTPUT_MODE:-ready}" in
     malformed)
-      printf '%s\n' '{malformed-editor' > "$output"
+      printf '%s\n' '{malformed-editor' > "$editor_output"
       exit 0
       ;;
     oversized)
-      head -c 65537 /dev/zero | tr '\0' 'x' > "$output"
+      head -c 65537 /dev/zero | tr '\0' 'x' > "$editor_output"
       exit 0
       ;;
     cannot_apply)
-      jq -cn '{schema_version:1,status:"cannot_apply",summary:"editor cannot apply the requested change",proposed_checks:[]}' > "$output"
+      jq -cn '{schema_version:1,status:"cannot_apply",summary:"editor cannot apply the requested change",proposed_checks:[]}' > "$editor_output"
       exit 0
       ;;
     fail)
       exit 17
       ;;
     *)
-      jq -cn '{schema_version:1,status:"ready",summary:"editor prepared candidate",proposed_checks:[{source:"cargo",argv:["cargo","test","--all-targets","--","--test-threads=1"],working_directory:"."}]}' > "$output"
+      editor_scenario=""
+      case "$prompt" in
+        *PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS*) editor_scenario="success" ;;
+        *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) editor_scenario="second_check_fail" ;;
+        *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) editor_scenario="runtime_oom" ;;
+        *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) editor_scenario="runtime_internal" ;;
+      esac
+      case "$editor_scenario:${PUEUE_AGENT_EDITOR_MODE:-fresh}" in
+        success:fresh|second_check_fail:fresh|second_check_fail:resume)
+          printf '%s\n' 'def score():' '    return 2' > model.py
+          ;;
+        success:resume|runtime_oom:fresh|runtime_internal:fresh)
+          printf '%s\n' 'def score():' '    return 1' > model.py
+          if [ "$editor_scenario" = "success" ] && [ "${PUEUE_AGENT_EDITOR_MODE:-fresh}" = "resume" ]; then
+            printf '%s\n' '# corrected candidate' >> model.py
+          fi
+          ;;
+      esac
+      if [ -n "$editor_scenario" ]; then
+        jq -cn '{schema_version:1,status:"ready",summary:"editor prepared Python candidate",proposed_checks:[{source:"python",argv:["python","-m","pytest"],working_directory:"."}]}' > "$editor_output"
+      else
+        jq -cn '{schema_version:1,status:"ready",summary:"editor prepared candidate",proposed_checks:[{source:"cargo",argv:["cargo","test","--all-targets","--","--test-threads=1"],working_directory:"."}]}' > "$editor_output"
+      fi
       exit 0
       ;;
   esac
@@ -194,6 +219,23 @@ case "$objective" in
     exit 0
     ;;
 esac
+
+code_change_argv='["python","train.py"]'
+case "$objective" in
+  *PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS*) ;;
+  *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) ;;
+  *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) code_change_argv='["python","train_oom.py"]' ;;
+  *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) code_change_argv='["python","train_internal.py"]' ;;
+  *) code_change_argv="" ;;
+esac
+if [ -n "$code_change_argv" ]; then
+  jq -cn \
+    --arg source_experiment_id "$source_experiment_id" \
+    --argjson argv "$code_change_argv" \
+    '{schema_version:1,decision:"proposal",proposal:{kind:"code_change",hypothesis:"make the deterministic smoke check pass",source_experiment_id:$source_experiment_id,argv:$argv,working_directory:".",expected_evidence:["loss"]},reason:null,requested_wait_minutes:null,expected_evidence:null,evidence_ref:null}' \
+    > "$output"
+  exit 0
+fi
 
 proposal_kind="experiment"
 hypothesis="Run one bounded follow-up experiment"

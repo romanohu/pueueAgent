@@ -21,9 +21,9 @@ use crate::{
 #[cfg(unix)]
 use crate::project_logs::{open_agent_log_gate, AgentGateDirectory};
 
-/// All paths in this specification are already service-resolved except for
-/// the two project-relative log paths.  Keeping those paths relative is
-/// important: the log reader is the authority that validates and opens them.
+/// Command/cwd authority and the service log authority are kept separate:
+/// candidate commands run against `project_root`, while logs and the launch
+/// gate are opened relative to `log_root`.
 ///
 /// This type deliberately has no `Debug` implementation.  The environment
 /// and argv can contain task data and must not accidentally enter diagnostics.
@@ -35,6 +35,7 @@ pub struct NativeLaunchSpec {
     pub cwd: Option<PathBuf>,
     pub environment: SanitizedEnvironment,
     pub project_root: VerifiedProjectRoot,
+    pub log_root: VerifiedProjectRoot,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
 }
@@ -49,6 +50,7 @@ pub struct NativeLaunchSpec {
     pub cwd: Option<PathBuf>,
     pub environment: SanitizedEnvironment,
     pub project_root: VerifiedProjectRoot,
+    pub log_root: VerifiedProjectRoot,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
 }
@@ -81,7 +83,7 @@ impl NativeLauncher {
     ) -> Result<NativeAgentChild, AppError> {
         let working_directory = verified_working_directory(&spec.project_root, spec.cwd.as_deref())?;
         let command_root = spec.project_root.try_clone()?;
-        let reader = ProjectRootLogReader::from_verified(spec.project_root);
+        let reader = ProjectRootLogReader::from_verified(spec.log_root);
 
         // Ensure the fixed project-owned log directory before validating the
         // marker.  Both operations remain descriptor-relative; no ambient

@@ -53,6 +53,8 @@
 
 `experiment` は既定の submission kind で、live campaign がなければ managed campaign と baseline を開始します。`control` は campaign 外の bootstrap、診断、後片付け用の direct submission です。どちらも live campaign 中は拒否され、追加指示には `steer` を使います。`control` も SQLite と Pueue task に記録され、guardrail や group 制約を迂回しません。argv と任意 metadata は SQLite に保存されるため、credential や secret を含めないでください。Managed experiment の Pueue 追加は `/usr/bin/env` でラップされ、4つの派生変数（`PUEUE_AGENT_EXPERIMENT_ID`、`PUEUE_AGENT_CAMPAIGN_ID`、`PUEUE_AGENT_RESULT_PATH`、`PUEUE_AGENT_ARTIFACT_DIR`）が `NAME=value` 形式で付与された後に durable な user argv が続きます。Direct/control 投入はラップされず、Pueue の生コマンド表示はラップされた形式を含みます。
 
+`code_change` は `submit --kind` で直接指定する submission kind ではなく、terminal experiment 後の decision agent が返す proposal kind です。通常の `pueue-agent submit` と既存の campaign coordinator がこの proposal を内部の code-change pipeline に渡すため、project 固有 adapter や追加 controller は必要ありません。
+
 ### `pueue-agent submit-batch`
 
 - **構文:** `pueue-agent submit-batch --request-id UUID --manifest PATH [--group GROUP] [--json] [PROJECT_ROOT]`
@@ -105,6 +107,35 @@ active campaign の実行中 experiment がある場合、`status` は experimen
 `status --json` の `health.recent` は `running_health` 行を `updated_at` の降順で最大 50 件列挙します。各行には state、観測回数、最終観測・更新時刻、bounded な signal 要約（class / source / evidence digest / 観測時刻）、推奨 action（格納されていれば）が含まれます。raw log 行は含まれません。
 
 campaign が objective metric を宣言している場合、`status` の人間向け出力には `best:` 行（current_best experiment ID と primary metric 値、存在すれば metric 名）と `plateau:` 行（plateau counter）が表示されます。`status --json` の `campaign` には `best_experiment_id`、`best_metric_name`、`best_metric_value`、`plateau_count` が、`evaluation.recent` には直近の `experiment_metrics` 行が `updated_at` 降順で最大 50 件含まれます。
+
+#### `status --json` の code-change projection
+
+`status --json` には live/最近の code-change run を最大 8 件投影する `code_changes` 配列があります。各要素は `state`、`attempts`、8 文字に省略した `base_sha` と任意の `candidate_sha`、`experiment_id`、`task_id`、失敗した check の `failed_check`（`status`、bounded `summary`）、`next_action`、`cleanup_pending`、最大 8 件の `transitions`（`stage`、`reason`）を含みます。`state` は `reserved`、`preparing_worktree`、`editing`、`checking`、`committing`、`candidate_ready`、`experiment_submitted`、`evaluated`、`cleanup_pending`、`completed`、`rejected`、`recovery_required` のいずれかです。attempt は最大 2 で、raw prompt、diff、argv、environment、credential、full SHA、check output は表示されません。
+
+#### 候補を調べる読み取り専用コマンド
+
+candidate worktree は service-owned state directory にあり、cleanup 後は存在しないことがあります。まず状態投影を確認し、live と示された場合だけ次を使います。
+
+```bash
+pueue-agent status --json
+pueue-agent proposal inspect <proposal-id> --json
+pueue-agent experiment inspect <experiment-id> --json
+pueue-agent events --kind code_change --limit 20 --json
+pueue-agent doctor --json
+```
+
+管理者が status の SHA と所有 path を照合する必要がある場合の Git 操作も読み取り専用に限ります。
+
+```bash
+git -C <candidate-root> status --short
+git -C <candidate-root> rev-parse --verify HEAD^{commit}
+git -C <candidate-root> diff --check <base-sha> --
+git -C <project-root> show-ref --verify refs/heads/campaign/<campaign-id>/candidate/<proposal-id>
+git -C <project-root> show-ref --verify refs/heads/campaign/<campaign-id>/best
+git -C <project-root> worktree list --porcelain
+```
+
+`update-ref`、`checkout`、`merge`、`rebase`、`push`、`worktree prune`、未知 path の削除は候補調査には使いません。candidate ref と best ref は local ref で、サービスが main、checkout 中の source branch、remote、無関係な worktree を変更することはありません。
 
 ### `pueue-agent campaign`
 
@@ -210,6 +241,8 @@ pueue-agent experiment inspect <experiment-id>
 - **失敗時の確認:** 出力の各チェックの remediation を実行し、実行ポリシーとサービス状態を再確認します。
 
 decision 診断は live campaign に限定した policy 上限 + 1 の read-only probe です。`decision.rows` は cycle / attempt の件数上限、SQLite storage class、payload byte 上限を、`decision.lineage` は terminal source experiment との同一 campaign lineage を確認します。`decision.active_attempts` は active attempt と agent binding の単一 owner、`decision.running_attempts` は run ownership と timeout、`decision.wait_wake` は有限 wake、`decision.digests` は current cycle の bounded payload digest、`decision.degraded_diagnostics` は degraded cycle の bounded failure facts を確認します。doctor は row を移行、削除、修復せず、raw prompt、objective、decision body を出力しません。
+
+code-change の read-only probe は次の8 checksです: `code_change.cleanup`、`code_change.experiments`、`code_change.lineage`、`code_change.refs`、`code_change.rows`、`code_change.single_live`、`code_change.stale`、`code_change.worktrees`。各件数は上限付きで、doctor は cleanup、ref、worktree、lineage、single-live invariant を修復・削除しません。`code_change.stale` は stale row の有無を知らせる warning check であり、検出しただけで自動 recovery や editor 再起動を行いません。
 
 ## 運用制御
 

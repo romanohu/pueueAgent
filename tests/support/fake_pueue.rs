@@ -272,6 +272,7 @@ impl FakePueueCommand {
     ) -> Self {
         let temp = TempDir::new().unwrap();
         let base = fs::canonicalize(temp.path()).unwrap();
+        set_mode(&base, 0o700);
         let state_dir = base.join("state");
         let project_root = base.join("project");
         let trusted_dir = base.join("trusted");

@@ -435,7 +435,7 @@ database_enum!(TerminationRequestStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub project_id: String,
-pub root_path: PathBuf,
+    pub root_path: PathBuf,
     pub pueue_group: String,
     pub config_path: PathBuf,
     pub enabled: bool,
@@ -722,6 +722,9 @@ pub struct CodeChangeRun {
     pub candidate_common_identity: Option<String>,
     pub candidate_admin_path: Option<String>,
     pub candidate_common_path: Option<String>,
+    pub candidate_working_directory_identity: Option<String>,
+    pub protected_ref_digest: Option<String>,
+    pub remote_config_digest: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

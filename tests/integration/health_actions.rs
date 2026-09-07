@@ -3,6 +3,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use async_trait::async_trait;
 use pueue_agent::{
     db::{
@@ -131,6 +134,8 @@ fn killed_task(group: &str, id: i64, enqueued_at: &str) -> PueueTask {
 impl Harness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         let harness = Self {
             _temp: temp,
@@ -154,6 +159,20 @@ impl Harness {
     fn setup_project(&self, project_id: &str, group: &str) {
         let root = self.root(project_id);
         fs::create_dir_all(root.join(".pueue-agent/logs")).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(
+                root.join(".pueue-agent/logs"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(
+                root.join(".pueue-agent"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(
             root.join(".pueue-agent/config.toml"),
             PROJECT_CONFIG_TOML

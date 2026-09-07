@@ -12,6 +12,7 @@ calls=$((calls + 1))
 printf '%s\n' "$calls" > "$state_file"
 
 printf 'CALL %s\n' "$calls" >> "$PUEUE_AGENT_TEST_AGENT_LOG"
+printf 'PROJECT_ID=%s\n' "${PUEUE_AGENT_PROJECT_ID:-unknown}" >> "$PUEUE_AGENT_TEST_AGENT_LOG"
 printf 'ARGC=%s\n' "$#" >> "$PUEUE_AGENT_TEST_AGENT_LOG"
 index=1
 for argument in "$@"; do
@@ -48,7 +49,29 @@ if [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
       exit 17
       ;;
     *)
-      printf '%s\n' '{"schema_version":1,"status":"ready","summary":"editor prepared candidate","proposed_checks":[{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"."}]}' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      editor_scenario=""
+      case "$*" in
+        *PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS*) editor_scenario="success" ;;
+        *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) editor_scenario="second_check_fail" ;;
+        *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) editor_scenario="runtime_oom" ;;
+        *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) editor_scenario="runtime_internal" ;;
+      esac
+      case "$editor_scenario:${PUEUE_AGENT_EDITOR_MODE:-fresh}" in
+        success:fresh|second_check_fail:fresh|second_check_fail:resume)
+          printf '%s\n' 'def score():' '    return 2' > model.py
+          ;;
+        success:resume|runtime_oom:fresh|runtime_internal:fresh)
+          printf '%s\n' 'def score():' '    return 1' > model.py
+          if [ "$editor_scenario" = "success" ] && [ "${PUEUE_AGENT_EDITOR_MODE:-fresh}" = "resume" ]; then
+            printf '%s\n' '# corrected candidate' >> model.py
+          fi
+          ;;
+      esac
+      if [ -n "$editor_scenario" ]; then
+        printf '%s\n' '{"schema_version":1,"status":"ready","summary":"editor prepared Python candidate","proposed_checks":[{"source":"python","argv":["python","-m","pytest"],"working_directory":"."}]}' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      else
+        printf '%s\n' '{"schema_version":1,"status":"ready","summary":"editor prepared candidate","proposed_checks":[{"source":"cargo","argv":["cargo","test","--all-targets","--","--test-threads=1"],"working_directory":"."}]}' > "$PUEUE_AGENT_EDITOR_OUTPUT"
+      fi
       exit 0
       ;;
   esac

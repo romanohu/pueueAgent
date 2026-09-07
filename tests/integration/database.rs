@@ -8,24 +8,23 @@ use std::{
 
 use pueue_agent::{
     batches::BatchJobResult,
+    db::{
+        experiment_metrics::MetricsRepository, inferred_pre_binding_policy_code,
+        running_health::HealthRepository, AgentDecisionReservation, AgentRunRepository,
+        BatchRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
+        EventRepository, ExperimentRepository, IncidentRepository, InterventionRepository,
+        NewCodeChangeCheck, ProjectRepository, ProposalAcceptance, ProposalRepository,
+        RunLineageRepository, StartCampaignRequest, SubmissionRepository,
+        TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
+    },
     decision_evidence::{
         DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
         MAX_DECISION_CONTEXT_BYTES,
     },
-    db::{
-        inferred_pre_binding_policy_code, experiment_metrics::MetricsRepository,
-        AgentDecisionReservation, AgentRunRepository, BatchRepository, CampaignRepository,
-        CodeChangeRepository, Db, NewCodeChangeCheck,
-        EventRepository, ExperimentRepository, DecisionRepository, IncidentRepository,
-        InterventionRepository, ProjectRepository, RunLineageRepository,
-        running_health::HealthRepository, ProposalAcceptance, StartCampaignRequest,
-        SubmissionRepository, TaskObservationRepository, TerminationRequestRepository,
-        LATEST_SCHEMA_VERSION,
-    },
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
-        CampaignLimits, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
-        ProjectRootAnchor,
+        CampaignLimits, ExecutableIdentity, PolicyViolation, PolicyViolationCode,
+        PolicyViolationStage, ProjectRootAnchor,
     },
     interventions::{
         InterventionStatus, MAX_INTERVENTIONS_PER_RUN, MAX_INTERVENTION_BYTES,
@@ -33,20 +32,19 @@ use pueue_agent::{
     },
     models::{
         AgentRunStatus, BatchJobStatus, BatchStatus, BudgetDimension, BudgetReservation,
-        BudgetReservationStatus, Campaign, CampaignState, DecisionAttemptState,
-        CodeChangeCheckStatus, CodeChangeState, DecisionCycleState, EventKind, EventStatus,
-        ExecutionProjection,
-        Experiment, ExperimentStatus,
-        ExperimentTerminalOutcome, ExperimentMetricsRow, HealthState, IncidentStatus,
-        IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest, NewEvent, NewIncident,
-        NewCodeChangeRun, NewProject, NewSubmission, NewTaskObservation, NewTerminationRequest,
-        Proposal,
-        ProposalKind, ProposalStatus, SignalSummaryEntry, SubmissionKind, SubmissionStatus,
-        TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES, MAX_EXECUTABLE_PATH_BYTES,
+        BudgetReservationStatus, Campaign, CampaignState, CodeChangeCheckStatus, CodeChangeState,
+        DecisionAttemptState, DecisionCycleState, EventKind, EventStatus, ExecutionProjection,
+        Experiment, ExperimentMetricsRow, ExperimentStatus, ExperimentTerminalOutcome, HealthState,
+        IncidentStatus, IncidentTransition, NewAgentRun, NewBatchJob, NewBatchRequest,
+        NewCodeChangeRun, NewEvent, NewIncident, NewProject, NewSubmission, NewTaskObservation,
+        NewTerminationRequest, Proposal, ProposalKind, ProposalStatus, SignalSummaryEntry,
+        SubmissionKind, SubmissionStatus, TerminationRequestStatus, MAX_EXECUTABLE_IDENTITY_BYTES,
+        MAX_EXECUTABLE_PATH_BYTES,
     },
     proposals::{self, ProposalInput, ValidatedProposal},
-    runs::{collect_fresh, FollowCursor},
+    promotion::PromotionOutcome,
     retry::{EventResolution, RetryPolicy},
+    runs::{collect_fresh, FollowCursor},
     state::ObjectiveSnapshot,
     AppError,
 };
@@ -301,6 +299,44 @@ impl CampaignDbHarness {
                 now + 2,
             )
             .unwrap();
+    }
+
+    fn campaign_promotion_state(&self) -> (Option<String>, i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT current_best_experiment_id, plateau_count
+                 FROM campaigns WHERE campaign_id = ?1",
+                [Self::CAMPAIGN_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn set_campaign_promotion_state(&self, current_best: Option<&str>, plateau_count: i64) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaigns
+                 SET current_best_experiment_id = ?1, plateau_count = ?2
+                 WHERE campaign_id = ?3",
+                params![current_best, plateau_count, Self::CAMPAIGN_ID],
+            )
+            .unwrap();
+    }
+
+    fn evaluated_at(&self, experiment_id: &str) -> Option<String> {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT evaluated_at FROM experiment_metrics WHERE experiment_id = ?1",
+                [experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn with_experiment(status: ExperimentStatus) -> Self {
@@ -2721,8 +2757,7 @@ mod decision_cycle {
 
     #[test]
     fn reserved_attempt_cannot_complete_without_a_proposal_decision() {
-        let harness =
-            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let (cycle, attempt) = harness.reserved_decision_attempt();
 
         let error = DecisionRepository::new(&harness.db)
@@ -2795,13 +2830,19 @@ mod decision_context {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let (_cycle, reservation) = harness.reserved_decision_attempt();
         let repository = DecisionRepository::new(&harness.db);
-        assert!(repository.validate_launch_authority("different-project", &reservation).is_err());
+        assert!(repository
+            .validate_launch_authority("different-project", &reservation)
+            .is_err());
         let mut wrong_campaign = reservation.clone();
         wrong_campaign.campaign_id = "different-campaign".to_owned();
-        assert!(repository.validate_launch_authority(&harness.project_id, &wrong_campaign).is_err());
+        assert!(repository
+            .validate_launch_authority(&harness.project_id, &wrong_campaign)
+            .is_err());
         let mut wrong_source = reservation.clone();
         wrong_source.source_experiment_id = "different-experiment".to_owned();
-        assert!(repository.validate_launch_authority(&harness.project_id, &wrong_source).is_err());
+        assert!(repository
+            .validate_launch_authority(&harness.project_id, &wrong_source)
+            .is_err());
         assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 0);
     }
 
@@ -2810,7 +2851,9 @@ mod decision_context {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let (_cycle, reservation) = harness.reserved_decision_attempt();
         let campaign = CampaignRepository::new(&harness.db)
-            .find_by_id(&harness.campaign_id).unwrap().unwrap();
+            .find_by_id(&harness.campaign_id)
+            .unwrap()
+            .unwrap();
         let valid = serde_json::json!({
             "schema_version": 1,
             "objective": {"text": campaign.objective_text, "digest": campaign.objective_digest},
@@ -2832,47 +2875,88 @@ mod decision_context {
             "intervention": {"pending": []}, "artifact_hints": []
         });
         let valid_json = serde_json::to_string(&valid).unwrap();
-        let valid_digest = format!("{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(valid_json.as_bytes()));
+        let valid_digest = format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(valid_json.as_bytes())
+        );
         let repository = DecisionRepository::new(&harness.db);
-        repository.store_evidence(&reservation, &valid_json, &valid_digest, 201).unwrap();
-        assert_eq!(repository.validate_launch_context(
-            &harness.project_id, &reservation, &valid_json, &valid_digest,
-        ).unwrap(), valid["objective"]["digest"].as_str().unwrap());
+        repository
+            .store_evidence(&reservation, &valid_json, &valid_digest, 201)
+            .unwrap();
+        assert_eq!(
+            repository
+                .validate_launch_context(
+                    &harness.project_id,
+                    &reservation,
+                    &valid_json,
+                    &valid_digest,
+                )
+                .unwrap(),
+            valid["objective"]["digest"].as_str().unwrap()
+        );
 
         let stale_json = valid_json.replace("command-digest", "stale-command-digest");
-        let stale_digest = format!("{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(stale_json.as_bytes()));
-        assert!(repository.validate_launch_context(
-            &harness.project_id, &reservation, &stale_json, &stale_digest,
-        ).is_err());
+        let stale_digest = format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(stale_json.as_bytes())
+        );
+        assert!(repository
+            .validate_launch_context(
+                &harness.project_id,
+                &reservation,
+                &stale_json,
+                &stale_digest,
+            )
+            .is_err());
 
         let mut unknown = valid.clone();
-        unknown.as_object_mut().unwrap().insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
         let mut control = valid.clone();
         control["objective"]["text"] = serde_json::Value::String("bad\u{0}text".to_owned());
         let mut wrong_schema = valid.clone();
         wrong_schema["schema_version"] = serde_json::Value::from(2);
         let mut wrong_objective = valid.clone();
-        wrong_objective["objective"]["digest"] = serde_json::Value::String("different-objective".to_owned());
+        wrong_objective["objective"]["digest"] =
+            serde_json::Value::String("different-objective".to_owned());
         let rejected = [
-            serde_json::to_string(&unknown).unwrap(), serde_json::to_string(&control).unwrap(),
+            serde_json::to_string(&unknown).unwrap(),
+            serde_json::to_string(&control).unwrap(),
             serde_json::to_string(&wrong_schema).unwrap(),
             serde_json::to_string(&wrong_objective).unwrap(),
             "x".repeat(MAX_DECISION_CONTEXT_BYTES + 1),
         ];
         for context_json in rejected {
-            let context_digest = format!("{:x}",
-                <sha2::Sha256 as sha2::Digest>::digest(context_json.as_bytes()));
-            harness.db.connect().unwrap().execute(
-                "UPDATE decision_attempts SET context_schema_version = 1,
+            let context_digest = format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(context_json.as_bytes())
+            );
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE decision_attempts SET context_schema_version = 1,
                  context_json = ?1, context_digest = ?2
                  WHERE cycle_id = ?3 AND attempt_number = ?4",
-                params![context_json, context_digest, reservation.cycle_id, reservation.attempt_number],
-            ).unwrap();
-            assert!(repository.validate_launch_context(
-                &harness.project_id, &reservation, &context_json, &context_digest,
-            ).is_err());
+                    params![
+                        context_json,
+                        context_digest,
+                        reservation.cycle_id,
+                        reservation.attempt_number
+                    ],
+                )
+                .unwrap();
+            assert!(repository
+                .validate_launch_context(
+                    &harness.project_id,
+                    &reservation,
+                    &context_json,
+                    &context_digest,
+                )
+                .is_err());
         }
         assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 0);
     }
@@ -2882,52 +2966,97 @@ mod decision_context {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let (_cycle, reservation) = harness.reserved_decision_attempt();
         let decisions = DecisionRepository::new(&harness.db);
-        decisions.store_evidence(&reservation, "{}", "context-digest", 200).unwrap();
+        decisions
+            .store_evidence(&reservation, "{}", "context-digest", 200)
+            .unwrap();
         let events = EventRepository::new(&harness.db);
-        let first_event = events.insert_idempotent(&NewEvent::new(
-            &harness.project_id, EventKind::CampaignDecision, "decision-owner-first",
-            serde_json::json!({}), 200, 200,
-        )).unwrap();
+        let first_event = events
+            .insert_idempotent(&NewEvent::new(
+                &harness.project_id,
+                EventKind::CampaignDecision,
+                "decision-owner-first",
+                serde_json::json!({}),
+                200,
+                200,
+            ))
+            .unwrap();
         events.claim_batch(200, 300, 10).unwrap();
         let runs = AgentRunRepository::new(&harness.db);
         let root = harness.test.project_root("campaign-project");
-        let first_run = runs.insert_with_events(&NewAgentRun::new(
-            &harness.project_id, first_event.event_id, None, AgentRunStatus::Starting,
-            200, root.join("first.log"),
-        ), &[first_event.event_id]).unwrap();
-        decisions.bind_agent_run(&reservation, first_run.run_id, 201).unwrap();
-        harness.db.connect().unwrap().execute(
-            "UPDATE agent_runs SET status = 'failed', finished_at = 202 WHERE run_id = ?1",
-            [first_run.run_id],
-        ).unwrap();
-        let second_event = events.insert_idempotent(&NewEvent::new(
-            &harness.project_id, EventKind::CampaignDecision, "decision-owner-second",
-            serde_json::json!({}), 203, 203,
-        )).unwrap();
+        let first_run = runs
+            .insert_with_events(
+                &NewAgentRun::new(
+                    &harness.project_id,
+                    first_event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    200,
+                    root.join("first.log"),
+                ),
+                &[first_event.event_id],
+            )
+            .unwrap();
+        decisions
+            .bind_agent_run(&reservation, first_run.run_id, 201)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE agent_runs SET status = 'failed', finished_at = 202 WHERE run_id = ?1",
+                [first_run.run_id],
+            )
+            .unwrap();
+        let second_event = events
+            .insert_idempotent(&NewEvent::new(
+                &harness.project_id,
+                EventKind::CampaignDecision,
+                "decision-owner-second",
+                serde_json::json!({}),
+                203,
+                203,
+            ))
+            .unwrap();
         events.claim_batch(203, 303, 10).unwrap();
-        let second_run = runs.insert_with_events(&NewAgentRun::new(
-            &harness.project_id, second_event.event_id, None, AgentRunStatus::Starting,
-            203, root.join("second.log"),
-        ), &[second_event.event_id]).unwrap();
-        assert!(decisions.bind_agent_run(&reservation, second_run.run_id, 204).is_err());
+        let second_run = runs
+            .insert_with_events(
+                &NewAgentRun::new(
+                    &harness.project_id,
+                    second_event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    203,
+                    root.join("second.log"),
+                ),
+                &[second_event.event_id],
+            )
+            .unwrap();
+        assert!(decisions
+            .bind_agent_run(&reservation, second_run.run_id, 204)
+            .is_err());
         assert!(decisions
             .try_requeue_unbound_attempt(&reservation, 205)
             .unwrap()
             .is_none());
-        let (state, owner): (String, Option<i64>) = harness.db.connect().unwrap().query_row(
-            "SELECT state, agent_run_id FROM decision_attempts
+        let (state, owner): (String, Option<i64>) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state, agent_run_id FROM decision_attempts
              WHERE cycle_id = ?1 AND attempt_number = ?2",
-            params![reservation.cycle_id, reservation.attempt_number],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
+                params![reservation.cycle_id, reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(state, "running");
         assert_eq!(owner, Some(first_run.run_id));
     }
 
     #[test]
     fn decision_context_is_deterministic_bounded_and_uses_persisted_objective() {
-        let harness =
-            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let project = ProjectRepository::new(&harness.db)
             .find_by_id(&harness.project_id)
             .unwrap()
@@ -3019,8 +3148,7 @@ mod decision_context {
 
     #[test]
     fn decision_context_uses_the_newest_finished_terminal_experiments() {
-        let harness =
-            CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let connection = harness.db.connect().unwrap();
         for index in 0..97_i64 {
             let submission_id = format!("submission-history-{index:03}");
@@ -3108,9 +3236,7 @@ mod decision_context {
             })
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&bundle.json).unwrap();
-        let outcomes = value["recent_outcomes"]["experiments"]
-            .as_array()
-            .unwrap();
+        let outcomes = value["recent_outcomes"]["experiments"].as_array().unwrap();
 
         assert_eq!(outcomes.len(), 32);
         assert_eq!(
@@ -4108,7 +4234,10 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(compact_schema_sql(&actual_sql), compact_schema_sql(expected_sql));
+        assert_eq!(
+            compact_schema_sql(&actual_sql),
+            compact_schema_sql(expected_sql)
+        );
         assert_eq!(
             table_columns(&connection, table),
             expected_columns
@@ -4154,12 +4283,7 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         expected_foreign_keys(&[
             ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
             ("proposals", "proposal_id", "proposal_id", "RESTRICT"),
-            (
-                "submissions",
-                "submission_id",
-                "submission_id",
-                "RESTRICT",
-            ),
+            ("submissions", "submission_id", "submission_id", "RESTRICT",),
             (
                 "experiments",
                 "parent_experiment_id",
@@ -4184,12 +4308,7 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         table_foreign_keys(&connection, "budget_reservations"),
         expected_foreign_keys(&[
             ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
-            (
-                "experiments",
-                "experiment_id",
-                "experiment_id",
-                "RESTRICT",
-            ),
+            ("experiments", "experiment_id", "experiment_id", "RESTRICT",),
         ])
     );
     assert_eq!(
@@ -4197,12 +4316,7 @@ fn latest_campaign_schema_installs_exact_tables_constraints_indexes_and_foreign_
         expected_foreign_keys(&[
             ("projects", "project_id", "project_id", "CASCADE"),
             ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
-            (
-                "experiments",
-                "experiment_id",
-                "experiment_id",
-                "SET NULL",
-            ),
+            ("experiments", "experiment_id", "experiment_id", "SET NULL",),
         ])
     );
     let event_columns = table_columns(&connection, "events");
@@ -4462,16 +4576,16 @@ fn campaign_atomic_pending_code_change_does_not_consume_an_accepted_cycle_slot()
     );
     assert!(matches!(
         harness
-        .accept_code_change_with_run(
-            "proposal-code-pending",
-            "experiment-code-pending",
-            "submission-code-pending",
-            &code_change,
-            &CampaignLimits::default(),
-            120,
-            "code-change-run-pending",
-        )
-        .unwrap(),
+            .accept_code_change_with_run(
+                "proposal-code-pending",
+                "experiment-code-pending",
+                "submission-code-pending",
+                &code_change,
+                &CampaignLimits::default(),
+                120,
+                "code-change-run-pending",
+            )
+            .unwrap(),
         ProposalAcceptance::PendingCodeChange
     ));
     let code_change_reservations: i64 = harness
@@ -4628,15 +4742,15 @@ fn rolling_budget_reopens_at_exact_24_hour_boundary() {
 
     assert!(matches!(
         harness
-        .accept(
-            "proposal-before-boundary",
-            "experiment-before-boundary",
-            "submission-before-boundary",
-            &proposal,
-            &limits,
-            100 + DAY - 1,
-        )
-        .unwrap(),
+            .accept(
+                "proposal-before-boundary",
+                "experiment-before-boundary",
+                "submission-before-boundary",
+                &proposal,
+                &limits,
+                100 + DAY - 1,
+            )
+            .unwrap(),
         ProposalAcceptance::BudgetWaiting {
             next_eligible_at: 86_500
         }
@@ -4736,8 +4850,14 @@ fn campaign_atomic_duplicate_digest_returns_existing_intent_without_new_rows() {
         .unwrap();
 
     assert_eq!(duplicate.proposal.proposal_id, first.proposal.proposal_id);
-    assert_eq!(duplicate.experiment.experiment_id, first.experiment.experiment_id);
-    assert_eq!(duplicate.submission.submission_id, first.submission.submission_id);
+    assert_eq!(
+        duplicate.experiment.experiment_id,
+        first.experiment.experiment_id
+    );
+    assert_eq!(
+        duplicate.submission.submission_id,
+        first.submission.submission_id
+    );
     assert_eq!(harness.count("proposals"), 2);
     assert_eq!(harness.count("experiments"), 2);
     assert_eq!(harness.count("budget_reservations"), 2);
@@ -5268,16 +5388,16 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
     );
     assert!(matches!(
         harness
-        .accept_code_change_with_run(
-            "proposal-code-1",
-            "experiment-code-1",
-            "submission-code-1",
-            &first,
-            &limits,
-            120,
-            "code-change-run-1",
-        )
-        .unwrap(),
+            .accept_code_change_with_run(
+                "proposal-code-1",
+                "experiment-code-1",
+                "submission-code-1",
+                &first,
+                &limits,
+                120,
+                "code-change-run-1",
+            )
+            .unwrap(),
         ProposalAcceptance::PendingCodeChange
     ));
     CodeChangeRepository::new(&harness.test.db)
@@ -5296,16 +5416,16 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
     );
     assert!(matches!(
         harness
-        .accept_code_change_with_run(
-            "proposal-code-2",
-            "experiment-code-2",
-            "submission-code-2",
-            &before_boundary,
-            &limits,
-            120 + DAY - 1,
-            "code-change-run-2",
-        )
-        .unwrap(),
+            .accept_code_change_with_run(
+                "proposal-code-2",
+                "experiment-code-2",
+                "submission-code-2",
+                &before_boundary,
+                &limits,
+                120 + DAY - 1,
+                "code-change-run-2",
+            )
+            .unwrap(),
         ProposalAcceptance::BudgetWaiting {
             next_eligible_at: 86_520
         }
@@ -5322,16 +5442,16 @@ fn rolling_budget_code_change_pending_proposals_consume_exact_window_slots() {
     );
     assert!(matches!(
         harness
-        .accept_code_change_with_run(
-            "proposal-code-3",
-            "experiment-code-3",
-            "submission-code-3",
-            &at_boundary,
-            &limits,
-            120 + DAY,
-            "code-change-run-3",
-        )
-        .unwrap(),
+            .accept_code_change_with_run(
+                "proposal-code-3",
+                "experiment-code-3",
+                "submission-code-3",
+                &at_boundary,
+                &limits,
+                120 + DAY,
+                "code-change-run-3",
+            )
+            .unwrap(),
         ProposalAcceptance::PendingCodeChange
     ));
     assert_eq!(harness.count("proposals"), 3);
@@ -5530,7 +5650,10 @@ fn campaign_atomic_terminal_projection_consumes_reservation_and_rejects_conflict
         .unwrap();
 
     assert_eq!(terminal.status, ExperimentStatus::Failed);
-    assert_eq!(terminal.failure_fingerprint.as_deref(), Some("failure-fingerprint"));
+    assert_eq!(
+        terminal.failure_fingerprint.as_deref(),
+        Some("failure-fingerprint")
+    );
     assert_eq!(replay.updated_at, terminal.updated_at);
     assert!(experiments
         .project_terminal_submission(
@@ -6110,12 +6233,15 @@ fn latest_schema_rejects_agent_run_sequence_below_existing_runs() {
         )
         .unwrap();
     let error = Db::open(&test.path).unwrap_err();
-    assert!(matches!(
-        error,
-        AppError::Runtime {
-            operation: "validate SQLite agent run ID sequence"
-        }
-    ), "unexpected error: {error:?}");
+    assert!(
+        matches!(
+            error,
+            AppError::Runtime {
+                operation: "validate SQLite agent run ID sequence"
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]
@@ -6177,18 +6303,32 @@ fn operator_log_migration_preserves_rows_and_allows_cancel() {
              ORDER BY created_at, log_id",
         )
         .unwrap()
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(
         rows,
         vec![
-            ("pause".to_owned(), r#"{"legacy_action":"pause"}"#.to_owned()),
-            ("resume".to_owned(), r#"{"legacy_action":"resume"}"#.to_owned()),
+            (
+                "pause".to_owned(),
+                r#"{"legacy_action":"pause"}"#.to_owned()
+            ),
+            (
+                "resume".to_owned(),
+                r#"{"legacy_action":"resume"}"#.to_owned()
+            ),
             ("halt".to_owned(), r#"{"legacy_action":"halt"}"#.to_owned()),
-            ("disable".to_owned(), r#"{"legacy_action":"disable"}"#.to_owned()),
-            ("remove".to_owned(), r#"{"legacy_action":"remove"}"#.to_owned()),
+            (
+                "disable".to_owned(),
+                r#"{"legacy_action":"disable"}"#.to_owned()
+            ),
+            (
+                "remove".to_owned(),
+                r#"{"legacy_action":"remove"}"#.to_owned()
+            ),
         ]
     );
 
@@ -6233,16 +6373,18 @@ fn task_cancellation_log_persists_bounded_redacted_details() {
             "Running --token REQUESTED_SECRET",
             "kill",
             "Canceled --token FINAL_SECRET",
-            &format!(
-                "operator request --token REASON_SECRET {}",
-                "x".repeat(400)
-            ),
+            &format!("operator request --token REASON_SECRET {}", "x".repeat(400)),
             200,
         )
         .unwrap();
 
-    let (stored_project, stored_group, action, details_json, created_at):
-        (String, String, String, String, i64) = test
+    let (stored_project, stored_group, action, details_json, created_at): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+    ) = test
         .db
         .connect()
         .unwrap()
@@ -6273,7 +6415,10 @@ fn task_cancellation_log_persists_bounded_redacted_details() {
         let value = details[key].as_str().unwrap();
         assert!(value.len() <= 240, "{key} was not bounded: {value}");
         assert!(!value.contains("SECRET"), "{key} leaked a secret: {value}");
-        assert!(value.contains("[REDACTED]"), "{key} was not redacted: {value}");
+        assert!(
+            value.contains("[REDACTED]"),
+            "{key} was not redacted: {value}"
+        );
     }
 }
 
@@ -6359,28 +6504,32 @@ fn schema_v12_migration_adds_event_run_ack_states_and_rejects_unknown_status() {
         .execute_batch("PRAGMA writable_schema = OFF; PRAGMA user_version = 12;")
         .unwrap();
     drop(connection);
-    let before = test.db.connect().unwrap().query_row(
-        "SELECT project_id, kind, dedup_key, payload_json, status, attempts,
+    let before = test
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT project_id, kind, dedup_key, payload_json, status, attempts,
                 not_before, lease_until, created_at, completed_at, last_error
          FROM events WHERE event_id = ?1",
-        [event_id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-            ))
-        },
-    )
-    .unwrap();
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .unwrap();
     let before_version: i64 = test
         .db
         .connect()
@@ -6538,7 +6687,10 @@ fn v14_adds_projection_and_preserves_v13_rows() {
         "policy_code",
         "failure_stage",
     ] {
-        assert!(columns.iter().any(|column| column == name), "missing {name}");
+        assert!(
+            columns.iter().any(|column| column == name),
+            "missing {name}"
+        );
     }
     for forbidden in ["prompt", "argv", "environment", "credentials"] {
         assert!(
@@ -6546,7 +6698,14 @@ fn v14_adds_projection_and_preserves_v13_rows() {
             "unexpected secret-bearing column {forbidden}"
         );
     }
-    let preserved: (i64, String, i64, Option<String>, Option<String>, Option<String>) = connection
+    let preserved: (
+        i64,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = connection
         .query_row(
             "SELECT run_id, status, started_at,
                     execution_kind, executable_path, executable_identity
@@ -6575,10 +6734,7 @@ fn v14_adds_projection_and_preserves_v13_rows() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(
-        preserved_link,
-        ("v13-projection-project".to_owned(), 9, 7)
-    );
+    assert_eq!(preserved_link, ("v13-projection-project".to_owned(), 9, 7));
     let foreign_key_violations: i64 = connection
         .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
             row.get(0)
@@ -6687,7 +6843,9 @@ fn execution_projection_round_trips_through_binding_transaction_and_legacy_runs_
     let root = test.project_root("projection-round-trip");
     register_project(&test.db, "project-a", &root, "pa-projection-round-trip");
     let event_id = insert_event(&test.db, "project-a", "projection-round-trip", 100);
-    EventRepository::new(&test.db).claim_batch(100, 200, 1).unwrap();
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
     let projection = ExecutionProjection::new(
         "codex",
         "/trusted/bin/codex",
@@ -6710,7 +6868,10 @@ fn execution_projection_round_trips_through_binding_transaction_and_legacy_runs_
         .unwrap();
     assert_eq!(run.execution_kind.as_deref(), Some("codex"));
     assert_eq!(run.executable_path.as_deref(), Some("/trusted/bin/codex"));
-    assert_eq!(run.executable_identity.as_deref(), Some("device=1;inode=2;owner=3;mode=493"));
+    assert_eq!(
+        run.executable_identity.as_deref(),
+        Some("device=1;inode=2;owner=3;mode=493")
+    );
     let linked = AgentRunRepository::new(&test.db)
         .find_by_event("project-a", event_id, 4)
         .unwrap();
@@ -6734,7 +6895,10 @@ fn execution_projection_round_trips_through_binding_transaction_and_legacy_runs_
         .find(|lineage| lineage.run_id == Some(run.run_id))
         .unwrap();
     assert_eq!(lineage.execution_kind.as_deref(), Some("codex"));
-    assert_eq!(lineage.executable_path.as_deref(), Some("/trusted/bin/codex"));
+    assert_eq!(
+        lineage.executable_path.as_deref(),
+        Some("/trusted/bin/codex")
+    );
     assert_eq!(
         lineage.executable_identity.as_deref(),
         Some("device=1;inode=2;owner=3;mode=493")
@@ -6777,7 +6941,10 @@ fn execution_projection_round_trips_through_binding_transaction_and_legacy_runs_
         )
         .unwrap();
     assert_eq!(direct.execution_kind.as_deref(), Some("custom"));
-    assert_eq!(direct.executable_path.as_deref(), Some("/trusted/bin/custom"));
+    assert_eq!(
+        direct.executable_path.as_deref(),
+        Some("/trusted/bin/custom")
+    );
     assert_eq!(
         direct.executable_identity.as_deref(),
         Some("device=4;inode=5;owner=6;mode=493")
@@ -6844,7 +7011,10 @@ fn policy_blocked_counts_are_project_scoped_and_exclude_other_errors() {
         .find(|lineage| lineage.event_id == Some(project_a_policy))
         .unwrap();
     assert_eq!(pre_binding.run_id, None);
-    assert_eq!(pre_binding.policy_code.as_deref(), Some("unsafe_codex_argument"));
+    assert_eq!(
+        pre_binding.policy_code.as_deref(),
+        Some("unsafe_codex_argument")
+    );
     assert_eq!(pre_binding.failure_stage.as_deref(), Some("pre_binding"));
 }
 
@@ -6855,11 +7025,17 @@ fn bounded_run_lineages_do_not_infer_pre_binding_for_linked_older_runs() {
     register_project(&test.db, "project-a", &root, "pa-linked-older-run");
     let linked_event = insert_event(&test.db, "project-a", "linked-policy-event", 300);
     let newer_run_event = insert_event(&test.db, "project-a", "newer-run-event", 200);
-    EventRepository::new(&test.db).claim_batch(400, 500, 8).unwrap();
+    EventRepository::new(&test.db)
+        .claim_batch(400, 500, 8)
+        .unwrap();
     let runs = AgentRunRepository::new(&test.db);
     runs.insert_with_events(
         &NewAgentRun::new(
-            "project-a", linked_event, None, AgentRunStatus::Completed, 100,
+            "project-a",
+            linked_event,
+            None,
+            AgentRunStatus::Completed,
+            100,
             root.join(".pueue-agent/logs/linked.log"),
         ),
         &[linked_event],
@@ -6867,7 +7043,11 @@ fn bounded_run_lineages_do_not_infer_pre_binding_for_linked_older_runs() {
     .unwrap();
     runs.insert_with_events(
         &NewAgentRun::new(
-            "project-a", newer_run_event, None, AgentRunStatus::Starting, 200,
+            "project-a",
+            newer_run_event,
+            None,
+            AgentRunStatus::Starting,
+            200,
             root.join(".pueue-agent/logs/newer.log"),
         ),
         &[newer_run_event],
@@ -6893,7 +7073,9 @@ fn bounded_run_lineages_do_not_infer_pre_binding_for_linked_older_runs() {
     let lineages = RunLineageRepository::new(&test.db)
         .list_by_project("project-a", 1)
         .unwrap();
-    assert!(lineages.iter().all(|lineage| lineage.event_id != Some(linked_event)));
+    assert!(lineages
+        .iter()
+        .all(|lineage| lineage.event_id != Some(linked_event)));
 }
 
 #[test]
@@ -6912,16 +7094,8 @@ fn execution_projection_rejects_ambiguous_or_oversized_audit_facts() {
         ExecutionProjection::new("unknown", "/trusted/bin/agent", "identity"),
         ExecutionProjection::new("codex", "relative/agent", "identity"),
         ExecutionProjection::new("codex", "", "identity"),
-        ExecutionProjection::new(
-            "codex",
-            format!("{exact_path}x"),
-            exact_identity.clone(),
-        ),
-        ExecutionProjection::new(
-            "codex",
-            exact_path.clone(),
-            format!("{exact_identity}x"),
-        ),
+        ExecutionProjection::new("codex", format!("{exact_path}x"), exact_identity.clone()),
+        ExecutionProjection::new("codex", exact_path.clone(), format!("{exact_identity}x")),
         ExecutionProjection::new("codex", "/trusted/bin/agent\0spoofed", "identity"),
         ExecutionProjection::new("codex", "/trusted/bin/agent", "identity\nspoofed"),
     ] {
@@ -6933,9 +7107,16 @@ fn execution_projection_rejects_ambiguous_or_oversized_audit_facts() {
 fn policy_finalization_persists_only_bounded_policy_fields_and_preserves_projection() {
     let test = TestDatabase::new();
     let root = test.project_root("projection-policy-finalization");
-    register_project(&test.db, "project-a", &root, "pa-projection-policy-finalization");
+    register_project(
+        &test.db,
+        "project-a",
+        &root,
+        "pa-projection-policy-finalization",
+    );
     let event_id = insert_event(&test.db, "project-a", "projection-policy-finalization", 100);
-    EventRepository::new(&test.db).claim_batch(100, 200, 1).unwrap();
+    EventRepository::new(&test.db)
+        .claim_batch(100, 200, 1)
+        .unwrap();
     let run = AgentRunRepository::new(&test.db)
         .insert_with_events(
             &NewAgentRun::new(
@@ -7145,13 +7326,7 @@ fn transition_many_rejects_ack_owned_states_before_sql_and_redacts_legacy_errors
         "detail ".repeat(100)
     );
     repository
-        .transition_many(
-            &[event_id],
-            EventStatus::Failed,
-            101,
-            None,
-            Some(&reason),
-        )
+        .transition_many(&[event_id], EventStatus::Failed, 101, None, Some(&reason))
         .unwrap();
     let stored = repository
         .find_by_id(event_id)
@@ -7210,9 +7385,10 @@ fn reservation_token_attachment_requires_unbound_rows_and_attaches_all_rows() {
              WHERE intervention_id IN (?1, ?2) ORDER BY intervention_id",
         )
         .unwrap()
-        .query_map(params![first.intervention_id, second.intervention_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+        .query_map(
+            params![first.intervention_id, second.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -7405,7 +7581,9 @@ fn readonly_open_rejects_write_pragmas_and_statements() {
     let readonly = Db::open_read_only(&test.path).unwrap();
     let connection = readonly.connect().unwrap();
 
-    assert!(connection.execute("UPDATE projects SET paused = 1", []).is_err());
+    assert!(connection
+        .execute("UPDATE projects SET paused = 1", [])
+        .is_err());
     assert!(connection
         .execute("CREATE TABLE should_not_exist (id INTEGER)", [])
         .is_err());
@@ -9196,15 +9374,14 @@ fn pre_release_gate_failure_requeues_applied_interventions() {
     runs.mark_gate_release_requested("project-a", run.run_id)
         .unwrap();
 
-    runs
-        .fail_before_gate_release_with_policy(
-            "project-a",
-            run.run_id,
-            140,
-            "gate EOF",
-            RetryPolicy { max_retries: 2 },
-        )
-        .unwrap();
+    runs.fail_before_gate_release_with_policy(
+        "project-a",
+        run.run_id,
+        140,
+        "gate EOF",
+        RetryPolicy { max_retries: 2 },
+    )
+    .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
         .db
@@ -9280,8 +9457,14 @@ fn pre_marker_policy_failure_dead_letters_and_releases_applied_interventions() {
         PolicyViolationCode::UnsafeCodexArgument,
         PolicyViolationStage::RunBoundPreMarker,
     );
-    runs.fail_before_gate_release_with_policy("project-a", run.run_id, 140, "ignored detail", &violation)
-        .unwrap();
+    runs.fail_before_gate_release_with_policy(
+        "project-a",
+        run.run_id,
+        140,
+        "ignored detail",
+        &violation,
+    )
+    .unwrap();
 
     let state: (AgentRunStatus, EventStatus, Option<String>) = test
         .db
@@ -9307,10 +9490,13 @@ fn pre_marker_policy_failure_dead_letters_and_releases_applied_interventions() {
             Some("policy_blocked:unsafe_codex_argument".to_owned()),
         )
     );
-    assert_eq!(intervention.intervention_id, interventions
-        .list("project-a", InterventionStatus::Pending, 8)
-        .unwrap()[0]
-        .intervention_id);
+    assert_eq!(
+        intervention.intervention_id,
+        interventions
+            .list("project-a", InterventionStatus::Pending, 8)
+            .unwrap()[0]
+            .intervention_id
+    );
 }
 
 #[test]
@@ -9355,7 +9541,12 @@ fn post_marker_policy_failure_dead_letters_and_retains_applied_interventions() {
     runs.finish_after_marker_policy_failure("project-a", run.run_id, 140, &violation)
         .unwrap();
 
-    let state: (AgentRunStatus, EventStatus, InterventionStatus, Option<String>) = test
+    let state: (
+        AgentRunStatus,
+        EventStatus,
+        InterventionStatus,
+        Option<String>,
+    ) = test
         .db
         .connect()
         .unwrap()
@@ -9381,10 +9572,13 @@ fn post_marker_policy_failure_dead_letters_and_retains_applied_interventions() {
             Some("policy_blocked:anchor_replaced".to_owned()),
         )
     );
-    assert_eq!(intervention.intervention_id, interventions
-        .list("project-a", InterventionStatus::Applied, 8)
-        .unwrap()[0]
-        .intervention_id);
+    assert_eq!(
+        intervention.intervention_id,
+        interventions
+            .list("project-a", InterventionStatus::Applied, 8)
+            .unwrap()[0]
+            .intervention_id
+    );
 }
 
 #[test]
@@ -9633,13 +9827,15 @@ fn startup_recovery_preserves_durable_pending_marker_policy_evidence() {
         PolicyViolationStage::PostMarker,
     );
     assert!(runs
-        .record_pending_marker_policy_evidence(
-            "project-a",
-            run.run_id,
-            &different_violation,
-        )
+        .record_pending_marker_policy_evidence("project-a", run.run_id, &different_violation,)
         .is_err());
-    let durable_state: (AgentRunStatus, String, EventStatus, Option<String>, Option<String>) = test
+    let durable_state: (
+        AgentRunStatus,
+        String,
+        EventStatus,
+        Option<String>,
+        Option<String>,
+    ) = test
         .db
         .connect()
         .unwrap()
@@ -9717,10 +9913,7 @@ fn startup_recovery_rejects_marker_evidence_for_the_wrong_gate_phase_atomically(
     let test = TestDatabase::new();
     let (run_id, event_id) = bind_starting_run(&test, "startup-marker-phase-mismatch");
     let runs = AgentRunRepository::new(&test.db);
-    let policies = BTreeMap::from([(
-        "project-a".to_owned(),
-        RetryPolicy { max_retries: 2 },
-    )]);
+    let policies = BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 2 })]);
 
     assert!(runs
         .recover_interrupted(
@@ -9794,16 +9987,19 @@ fn startup_recovery_rejects_partial_pending_marker_policy_evidence_atomically() 
         .recover_interrupted(
             140,
             "daemon restarted",
-            &BTreeMap::from([(
-                "project-a".to_owned(),
-                RetryPolicy { max_retries: 2 },
-            )]),
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 2 },)]),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .is_err());
 
-    let state: (AgentRunStatus, String, Option<String>, Option<String>, EventStatus) = test
+    let state: (
+        AgentRunStatus,
+        String,
+        Option<String>,
+        Option<String>,
+        EventStatus,
+    ) = test
         .db
         .connect()
         .unwrap()
@@ -9879,14 +10075,11 @@ fn startup_recovery_requeues_applied_interventions_after_release_request_before_
     runs.recover_interrupted(
         140,
         "daemon restarted before launch gate acknowledgement",
-        &BTreeMap::from([(
-            "project-a".to_owned(),
-            RetryPolicy { max_retries: 1 },
-        )]),
+        &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 })]),
         &BTreeSet::new(),
         &BTreeSet::new(),
     )
-        .unwrap();
+    .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
         .db
@@ -9922,10 +10115,7 @@ fn startup_recovery_retries_pre_marker_inflight_events() {
         .recover_interrupted(
             140,
             "daemon restarted",
-            &BTreeMap::from([(
-                "project-a".to_owned(),
-                RetryPolicy { max_retries: 2 },
-            )]),
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 2 })]),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
@@ -9949,7 +10139,10 @@ fn startup_recovery_retries_pre_marker_inflight_events() {
             .query_row(
                 "SELECT status, finished_at FROM agent_runs WHERE run_id = ?1",
                 [run_id],
-                |row| Ok((row.get::<_, AgentRunStatus>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| Ok((
+                    row.get::<_, AgentRunStatus>(0)?,
+                    row.get::<_, Option<i64>>(1)?
+                )),
             )
             .unwrap(),
         (AgentRunStatus::Failed, Some(140))
@@ -9961,17 +10154,15 @@ fn startup_recovery_dead_letters_marker_released_and_dispatched_events() {
     let test = TestDatabase::new();
     let (run_id, event_id) = bind_starting_run(&test, "startup-dispatched-unknown");
     let runs = AgentRunRepository::new(&test.db);
-    runs.mark_gate_release_requested("project-a", run_id).unwrap();
+    runs.mark_gate_release_requested("project-a", run_id)
+        .unwrap();
     runs.acknowledge_dispatch("project-a", run_id).unwrap();
 
     let recovery = runs
         .recover_interrupted(
             140,
             "restart_interruption: execution outcome unknown",
-            &BTreeMap::from([(
-                "project-a".to_owned(),
-                RetryPolicy { max_retries: 99 },
-            )]),
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 99 })]),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
@@ -9979,7 +10170,14 @@ fn startup_recovery_dead_letters_marker_released_and_dispatched_events() {
 
     assert_eq!(recovery.dead_lettered_events, 1);
     assert_eq!(recovery.requeued_events, 0);
-    assert_eq!(EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap().status, EventStatus::DeadLetter);
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::DeadLetter
+    );
     assert_eq!(
         test.db
             .connect()
@@ -10003,21 +10201,24 @@ fn startup_recovery_leaves_unexpired_unbound_claim_until_lease_expiry() {
     EventRepository::new(&test.db)
         .claim_batch(100, 200, 1)
         .unwrap();
-    let before = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    let before = EventRepository::new(&test.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
 
     AgentRunRepository::new(&test.db)
         .recover_interrupted(
             140,
             "restart_interruption: execution outcome unknown",
-            &BTreeMap::from([(
-                "project-a".to_owned(),
-                RetryPolicy { max_retries: 0 },
-            )]),
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 0 })]),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .unwrap();
-    let during = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    let during = EventRepository::new(&test.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(during.status, EventStatus::Claimed);
     assert_eq!(during.attempts, before.attempts);
     assert_eq!(during.lease_until, Some(200));
@@ -10025,7 +10226,10 @@ fn startup_recovery_leaves_unexpired_unbound_claim_until_lease_expiry() {
     EventRepository::new(&test.db)
         .recover_expired_claims(201)
         .unwrap();
-    let after = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    let after = EventRepository::new(&test.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(after.status, EventStatus::Pending);
     assert_eq!(after.attempts, 0);
     assert_eq!(after.lease_until, None);
@@ -10063,16 +10267,16 @@ fn startup_recovery_never_infers_marker_evidence_from_an_ambient_path() {
     runs.recover_interrupted(
         140,
         "daemon restarted",
-        &BTreeMap::from([(
-            "project-a".to_owned(),
-            RetryPolicy { max_retries: 99 },
-        )]),
+        &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 99 })]),
         &BTreeSet::new(),
         &BTreeSet::new(),
     )
     .unwrap();
 
-    let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    let event = EventRepository::new(&test.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(event.status, EventStatus::RetryWait);
     assert!(event.not_before > 100);
     let reason = event.last_error.unwrap();
@@ -10105,19 +10309,22 @@ fn startup_recovery_rejects_unexpected_linked_claimed_state_atomically() {
         .recover_interrupted(
             140,
             "daemon restarted",
-            &BTreeMap::from([(
-                "project-a".to_owned(),
-                RetryPolicy { max_retries: 1 },
-            )]),
+            &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 },)]),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .is_err());
-    let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+    let event = EventRepository::new(&test.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(event.status, EventStatus::Claimed);
     assert_eq!(event.lease_until, Some(200));
     assert_eq!(
-        runs.find_active_by_project("project-a").unwrap().unwrap().status,
+        runs.find_active_by_project("project-a")
+            .unwrap()
+            .unwrap()
+            .status,
         AgentRunStatus::Starting
     );
 }
@@ -10164,14 +10371,11 @@ fn startup_recovery_promotes_marker_confirmed_release_request_and_retains_applie
     runs.recover_interrupted(
         140,
         "daemon restarted after child spawn",
-        &BTreeMap::from([(
-            "project-a".to_owned(),
-            RetryPolicy { max_retries: 1 },
-        )]),
+        &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 })]),
         &BTreeSet::new(),
         &BTreeSet::from([run.run_id]),
     )
-        .unwrap();
+    .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
         .db
@@ -10269,14 +10473,11 @@ fn startup_recovery_requeues_an_applied_intervention_before_gate_release() {
     runs.recover_interrupted(
         140,
         "daemon restarted before gate release",
-        &BTreeMap::from([(
-            "project-a".to_owned(),
-            RetryPolicy { max_retries: 1 },
-        )]),
+        &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 })]),
         &BTreeSet::new(),
         &BTreeSet::new(),
     )
-        .unwrap();
+    .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
         .db
@@ -10342,14 +10543,11 @@ fn confirmed_gate_release_does_not_requeue_applied_interventions_on_recovery() {
     runs.recover_interrupted(
         140,
         "daemon restarted after gate release",
-        &BTreeMap::from([(
-            "project-a".to_owned(),
-            RetryPolicy { max_retries: 1 },
-        )]),
+        &BTreeMap::from([("project-a".to_owned(), RetryPolicy { max_retries: 1 })]),
         &BTreeSet::new(),
         &BTreeSet::new(),
     )
-        .unwrap();
+    .unwrap();
 
     let intervention_state: (InterventionStatus, Option<i64>) = test
         .db
@@ -10778,7 +10976,12 @@ fn expired_unbound_claim_is_requeued_without_consuming_an_attempt() {
         .claim_batch(100, 110, 1)
         .unwrap();
     assert_eq!(event[0].attempts, 1);
-    assert_eq!(EventRepository::new(&test.db).recover_expired_claims(110).unwrap(), 1);
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .recover_expired_claims(110)
+            .unwrap(),
+        1
+    );
     let state: (EventStatus, i64, Option<i64>) = test
         .db
         .connect()
@@ -10801,7 +11004,12 @@ fn unexpired_unbound_claim_is_left_for_lease_owner() {
     EventRepository::new(&test.db)
         .claim_batch(100, 110, 1)
         .unwrap();
-    assert_eq!(EventRepository::new(&test.db).recover_expired_claims(109).unwrap(), 0);
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .recover_expired_claims(109)
+            .unwrap(),
+        0
+    );
     let state: (EventStatus, i64, Option<i64>) = test
         .db
         .connect()
@@ -10873,10 +11081,16 @@ fn policy_blocked_claim_dead_letters_without_retry_or_run() {
         .unwrap();
     assert_eq!(changed, 2);
     for event_id in [first, second] {
-        let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+        let event = EventRepository::new(&test.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(event.status, EventStatus::DeadLetter);
         assert_eq!(event.lease_until, None);
-        assert_eq!(event.last_error.as_deref(), Some("policy_blocked:unsafe_codex_argument"));
+        assert_eq!(
+            event.last_error.as_deref(),
+            Some("policy_blocked:unsafe_codex_argument")
+        );
     }
     assert!(AgentRunRepository::new(&test.db)
         .find_active_by_project("project-a")
@@ -10917,7 +11131,10 @@ fn policy_blocked_claim_validation_is_atomic_for_grouped_and_foreign_inputs() {
     test.db
         .connect()
         .unwrap()
-        .execute("UPDATE events SET not_before = 999 WHERE event_id = ?1", [pending])
+        .execute(
+            "UPDATE events SET not_before = 999 WHERE event_id = ?1",
+            [pending],
+        )
         .unwrap();
     assert!(EventRepository::new(&test.db)
         .dead_letter_claimed_without_run("project-a", &[pending], 200, &violation)
@@ -10974,7 +11191,10 @@ fn policy_blocked_claim_rejects_expired_or_boundary_lease_atomically() {
     test.db
         .connect()
         .unwrap()
-        .execute("UPDATE events SET lease_until = 199 WHERE event_id = ?1", [expired])
+        .execute(
+            "UPDATE events SET lease_until = 199 WHERE event_id = ?1",
+            [expired],
+        )
         .unwrap();
 
     let violation = PolicyViolation::new(
@@ -10985,7 +11205,10 @@ fn policy_blocked_claim_rejects_expired_or_boundary_lease_atomically() {
         .dead_letter_claimed_without_run("project-a", &[expired, valid], 200, &violation)
         .is_err());
     for event_id in [expired, valid] {
-        let event = EventRepository::new(&test.db).find_by_id(event_id).unwrap().unwrap();
+        let event = EventRepository::new(&test.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(event.status, EventStatus::Claimed);
     }
 
@@ -10996,7 +11219,10 @@ fn policy_blocked_claim_rejects_expired_or_boundary_lease_atomically() {
     test.db
         .connect()
         .unwrap()
-        .execute("UPDATE events SET lease_until = 200 WHERE event_id = ?1", [exact])
+        .execute(
+            "UPDATE events SET lease_until = 200 WHERE event_id = ?1",
+            [exact],
+        )
         .unwrap();
     assert!(EventRepository::new(&test.db)
         .dead_letter_claimed_without_run("project-a", &[exact], 200, &violation)
@@ -11025,7 +11251,10 @@ fn policy_blocked_claim_rejects_null_lease_before_mutation() {
         .execute_batch("PRAGMA ignore_check_constraints = ON;")
         .unwrap();
     connection
-        .execute("UPDATE events SET lease_until = NULL WHERE event_id = ?1", [event_id])
+        .execute(
+            "UPDATE events SET lease_until = NULL WHERE event_id = ?1",
+            [event_id],
+        )
         .unwrap();
     let violation = PolicyViolation::new(
         PolicyViolationCode::UnsafeCodexArgument,
@@ -11059,8 +11288,12 @@ fn event_repository_rejects_oversized_claim_and_policy_batches() {
     );
     let ids = vec![1_i64; MAX_EVENT_LIST_LIMIT + 1];
     assert!(matches!(
-        EventRepository::new(&test.db)
-            .dead_letter_claimed_without_run("project-a", &ids, 200, &violation),
+        EventRepository::new(&test.db).dead_letter_claimed_without_run(
+            "project-a",
+            &ids,
+            200,
+            &violation
+        ),
         Err(AppError::Validation {
             field: "event_ids",
             ..
@@ -11137,7 +11370,12 @@ fn recover_expired_claims_leaves_an_expired_claim_linked_to_a_run_untouched() {
         .attach_event(run.run_id, event_id)
         .unwrap();
 
-    assert_eq!(EventRepository::new(&test.db).recover_expired_claims(111).unwrap(), 0);
+    assert_eq!(
+        EventRepository::new(&test.db)
+            .recover_expired_claims(111)
+            .unwrap(),
+        0
+    );
     let state: (EventStatus, i64, Option<i64>) = test
         .db
         .connect()
@@ -11308,7 +11546,14 @@ fn generic_finalizer_requires_released_gate_and_dispatched_events() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched, "release_requested".to_owned()));
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            EventStatus::Dispatched,
+            "release_requested".to_owned()
+        )
+    );
 }
 
 #[test]
@@ -11359,7 +11604,14 @@ fn marker_failure_finalizer_requires_release_requested_gate_and_inflight_events(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched, "release_requested".to_owned()));
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            EventStatus::Dispatched,
+            "release_requested".to_owned()
+        )
+    );
 }
 
 #[test]
@@ -11411,7 +11663,14 @@ fn pre_release_policy_finalizer_requires_inflight_events() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::Dispatched, "release_requested".to_owned()));
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            EventStatus::Dispatched,
+            "release_requested".to_owned()
+        )
+    );
 }
 
 #[test]
@@ -11537,12 +11796,7 @@ fn agent_run_binding_moves_claimed_events_to_in_flight_atomically() {
 
     let rollback_test = TestDatabase::new();
     let rollback_root = rollback_test.project_root("project");
-    register_project(
-        &rollback_test.db,
-        "project-a",
-        &rollback_root,
-        "pa-project",
-    );
+    register_project(&rollback_test.db, "project-a", &rollback_root, "pa-project");
     let first_event = insert_event(
         &rollback_test.db,
         "project-a",
@@ -11663,7 +11917,11 @@ fn dispatch_ack_moves_only_project_owned_inflight_events() {
     runs.mark_gate_release_requested("project-b", run_b.run_id)
         .unwrap();
 
-    assert_eq!(runs.acknowledge_dispatch("project-a", run_a.run_id).unwrap(), 1);
+    assert_eq!(
+        runs.acknowledge_dispatch("project-a", run_a.run_id)
+            .unwrap(),
+        1
+    );
     let own_state: (EventStatus, String) = test
         .db
         .connect()
@@ -11696,7 +11954,10 @@ fn dispatch_ack_moves_only_project_owned_inflight_events() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(foreign_state, (EventStatus::InFlight, "release_requested".to_owned()));
+    assert_eq!(
+        foreign_state,
+        (EventStatus::InFlight, "release_requested".to_owned())
+    );
 }
 
 #[test]
@@ -11856,7 +12117,10 @@ fn finish_and_resolve_events_completes_only_after_run_success() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(committed, (AgentRunStatus::Completed, EventStatus::Completed));
+    assert_eq!(
+        committed,
+        (AgentRunStatus::Completed, EventStatus::Completed)
+    );
     let intervention_states: Vec<(String, InterventionStatus, Option<i64>)> = test
         .db
         .connect()
@@ -11866,9 +12130,10 @@ fn finish_and_resolve_events_completes_only_after_run_success() {
              WHERE intervention_id IN (?1, ?2) ORDER BY intervention_id",
         )
         .unwrap()
-        .query_map(params![applied.intervention_id, reserved.intervention_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+        .query_map(
+            params![applied.intervention_id, reserved.intervention_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -11991,7 +12256,10 @@ fn post_marker_finalizer_dead_letters_without_consuming_attempts() {
     test.db
         .connect()
         .unwrap()
-        .execute("UPDATE events SET attempts = 3 WHERE event_id = ?1", [event_id])
+        .execute(
+            "UPDATE events SET attempts = 3 WHERE event_id = ?1",
+            [event_id],
+        )
         .unwrap();
     let runs = AgentRunRepository::new(&test.db);
     let run = runs
@@ -12033,7 +12301,13 @@ fn post_marker_finalizer_dead_letters_without_consuming_attempts() {
 
     runs.finish_after_marker_failure("project-a", run.run_id, 200, "post_marker_dispatch_ack")
         .unwrap();
-    let state: (AgentRunStatus, EventStatus, i64, InterventionStatus, Option<i64>) = test
+    let state: (
+        AgentRunStatus,
+        EventStatus,
+        i64,
+        InterventionStatus,
+        Option<i64>,
+    ) = test
         .db
         .connect()
         .unwrap()
@@ -12051,7 +12325,15 @@ fn post_marker_finalizer_dead_letters_without_consuming_attempts() {
               AND interventions.agent_run_id = agent_runs.run_id
              WHERE agent_runs.run_id = ?1 AND interventions.intervention_id = ?2",
             params![run.run_id, intervention.intervention_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(
@@ -12126,7 +12408,14 @@ fn cross_project_dispatch_and_finish_are_rejected() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(state, (AgentRunStatus::Starting, EventStatus::InFlight, "release_requested".to_owned()));
+    assert_eq!(
+        state,
+        (
+            AgentRunStatus::Starting,
+            EventStatus::InFlight,
+            "release_requested".to_owned()
+        )
+    );
 }
 
 #[test]
@@ -13965,11 +14254,9 @@ fn health_repository_lifecycle_is_bounded_and_resumable() {
     assert_eq!(row.signal_summary_json, "[]");
     assert_eq!(row.diagnosis_json, None);
 
-    assert!(
-        HealthRepository::due_observations(&harness.db, 250, 10, 8)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(HealthRepository::due_observations(&harness.db, 250, 10, 8)
+        .unwrap()
+        .is_empty());
 
     HealthRepository::record_observation(
         &harness.db,
@@ -14003,8 +14290,7 @@ fn health_repository_lifecycle_is_bounded_and_resumable() {
         .unwrap();
     assert_eq!(row.observation_count, 33);
     assert_eq!(row.last_observed_at, 242);
-    let summary: Vec<SignalSummaryEntry> =
-        serde_json::from_str(&row.signal_summary_json).unwrap();
+    let summary: Vec<SignalSummaryEntry> = serde_json::from_str(&row.signal_summary_json).unwrap();
     assert_eq!(summary.len(), 32);
     assert_eq!(summary[0].evidence_digest, "digest-0");
     assert_eq!(summary[31].evidence_digest, "digest-31");
@@ -14064,13 +14350,8 @@ fn health_repository_lifecycle_is_bounded_and_resumable() {
         .is_none());
     HealthRepository::delete_for_experiment(&harness.db, experiment_id).unwrap();
 
-    let error = HealthRepository::set_state(
-        &harness.db,
-        experiment_id,
-        HealthState::Healthy,
-        909,
-    )
-    .unwrap_err();
+    let error = HealthRepository::set_state(&harness.db, experiment_id, HealthState::Healthy, 909)
+        .unwrap_err();
     assert!(matches!(
         error,
         AppError::Validation {
@@ -14300,7 +14581,11 @@ fn fresh_database_starts_at_schema_v26_with_nullable_evaluation_marker() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, LATEST_SCHEMA_VERSION);
-    for column in ["objective_metric_json", "current_best_experiment_id", "plateau_count"] {
+    for column in [
+        "objective_metric_json",
+        "current_best_experiment_id",
+        "plateau_count",
+    ] {
         let hit: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('campaigns') WHERE name=?1",
@@ -14405,6 +14690,7 @@ fn code_change_run_persists_exact_cleanup_identity_proof_columns() {
         "candidate_common_identity",
         "candidate_admin_path",
         "candidate_common_path",
+        "candidate_working_directory_identity",
     ] {
         let present: i64 = connection
             .query_row(
@@ -14415,6 +14701,245 @@ fn code_change_run_persists_exact_cleanup_identity_proof_columns() {
             .unwrap();
         assert_eq!(present, 1, "code_change_runs.{column}");
     }
+}
+
+#[test]
+fn schema_v27_migration_adds_nullable_code_change_git_baseline_digests() {
+    let harness = CampaignDbHarness::new();
+    let before = create_pending_code_change_for_test(&harness, "code-change-v27", None);
+    let path = harness.test.path.clone();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE code_change_runs DROP COLUMN protected_ref_digest;
+             ALTER TABLE code_change_runs DROP COLUMN remote_config_digest;
+             PRAGMA user_version = 27;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&path).unwrap();
+    let after = CodeChangeRepository::new(&migrated)
+        .find_by_id(&before.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.protected_ref_digest, None);
+    assert_eq!(after.remote_config_digest, None);
+    let connection = migrated.connect().unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, LATEST_SCHEMA_VERSION);
+    for column in ["protected_ref_digest", "remote_config_digest"] {
+        let nullable: (String, i64) = connection
+            .query_row(
+                "SELECT type, \"notnull\" FROM pragma_table_info('code_change_runs')
+                 WHERE name = ?1",
+                [column],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(nullable, ("TEXT".to_owned(), 0), "{column}");
+    }
+}
+
+#[test]
+fn code_change_worktree_ownership_persists_git_baseline_digests_write_once() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-baseline", None);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let proof = ("a".repeat(64), "b".repeat(64));
+    let stored = repository
+        .record_worktree_ownership(
+            &run.code_change_run_id,
+            "state-root",
+            "worktrees",
+            "campaign",
+            "candidate-root",
+            "candidate-admin",
+            "candidate-common",
+            ".pueue-agent/worktrees/campaign-1/proposal-code-change",
+            ".git/worktrees/proposal-code-change",
+            &proof.0,
+            &proof.1,
+            122,
+        )
+        .unwrap();
+    assert_eq!(
+        stored.protected_ref_digest.as_deref(),
+        Some(proof.0.as_str())
+    );
+    assert_eq!(
+        stored.remote_config_digest.as_deref(),
+        Some(proof.1.as_str())
+    );
+
+    let replay = repository
+        .record_worktree_ownership(
+            &run.code_change_run_id,
+            "state-root",
+            "worktrees",
+            "campaign",
+            "candidate-root",
+            "candidate-admin",
+            "candidate-common",
+            ".pueue-agent/worktrees/campaign-1/proposal-code-change",
+            ".git/worktrees/proposal-code-change",
+            &proof.0,
+            &proof.1,
+            123,
+        )
+        .unwrap();
+    assert_eq!(replay, stored);
+
+    let mismatch = repository.record_worktree_ownership(
+        &run.code_change_run_id,
+        "state-root",
+        "worktrees",
+        "campaign",
+        "candidate-root",
+        "candidate-admin",
+        "candidate-common",
+        ".pueue-agent/worktrees/campaign-1/proposal-code-change",
+        ".git/worktrees/proposal-code-change",
+        &proof.0,
+        &"c".repeat(64),
+        124,
+    );
+    assert!(mismatch.is_err());
+
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs SET remote_config_digest = NULL
+             WHERE code_change_run_id = ?1",
+            [&run.code_change_run_id],
+        )
+        .unwrap();
+    let partial = repository.record_worktree_ownership(
+        &run.code_change_run_id,
+        "state-root",
+        "worktrees",
+        "campaign",
+        "candidate-root",
+        "candidate-admin",
+        "candidate-common",
+        ".pueue-agent/worktrees/campaign-1/proposal-code-change",
+        ".git/worktrees/proposal-code-change",
+        &proof.0,
+        &proof.1,
+        125,
+    );
+    assert!(partial.is_err());
+}
+
+#[test]
+fn candidate_working_directory_identity_is_write_once_and_pre_submission_only() {
+    let harness = CampaignDbHarness::new();
+    let run =
+        code_change_to_candidate_ready_for_test(&harness, "code-change-working-directory-proof");
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let identity = ExecutableIdentity {
+        device: 1,
+        inode: 2,
+        owner: 3,
+        mode: 0o700,
+    };
+    let experiment_id = "experiment-working-directory-proof";
+    let submission_id = "submission-working-directory-proof";
+    CampaignRepository::new(&harness.test.db)
+        .accept_code_change_candidate(
+            &run.code_change_run_id,
+            experiment_id,
+            submission_id,
+            140,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+
+    let stored = repository
+        .record_candidate_working_directory_identity(
+            &run.code_change_run_id,
+            experiment_id,
+            identity,
+            141,
+        )
+        .unwrap();
+    assert_eq!(
+        stored.candidate_working_directory_identity.as_deref(),
+        Some("1:2:3:448")
+    );
+    assert_eq!(
+        repository
+            .record_candidate_working_directory_identity(
+                &run.code_change_run_id,
+                experiment_id,
+                identity,
+                142,
+            )
+            .unwrap(),
+        stored
+    );
+    let mismatch = repository.record_candidate_working_directory_identity(
+        &run.code_change_run_id,
+        experiment_id,
+        ExecutableIdentity {
+            inode: 9,
+            ..identity
+        },
+        143,
+    );
+    assert!(matches!(
+        mismatch,
+        Err(AppError::Validation {
+            field: "code_change.working_directory",
+            ..
+        })
+    ));
+
+    let harness = CampaignDbHarness::new();
+    let run =
+        code_change_to_candidate_ready_for_test(&harness, "code-change-working-directory-task");
+    let experiment_id = "experiment-working-directory-task";
+    let submission_id = "submission-working-directory-task";
+    CampaignRepository::new(&harness.test.db)
+        .accept_code_change_candidate(
+            &run.code_change_run_id,
+            experiment_id,
+            submission_id,
+            140,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    ExperimentRepository::new(&harness.test.db)
+        .mark_submitting(experiment_id, 141)
+        .unwrap();
+    ExperimentRepository::new(&harness.test.db)
+        .mark_accepted(experiment_id, 41, "task-signature", 142)
+        .unwrap();
+    let after_task = CodeChangeRepository::new(&harness.test.db)
+        .record_candidate_working_directory_identity(
+            &run.code_change_run_id,
+            experiment_id,
+            identity,
+            143,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        after_task,
+        AppError::Validation {
+            field: "code_change.working_directory",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -14701,6 +15226,127 @@ fn code_change_to_committing_for_test(harness: &CampaignDbHarness, run_id: &str,
             now + 3,
         )
         .unwrap();
+}
+
+fn code_change_to_candidate_ready_for_test(
+    harness: &CampaignDbHarness,
+    run_id: &str,
+) -> pueue_agent::models::CodeChangeRun {
+    create_pending_code_change_for_test(harness, run_id, None);
+    code_change_to_committing_for_test(harness, run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .record_candidate(
+            run_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "diff-digest",
+            3,
+            400,
+            126,
+        )
+        .unwrap();
+    repository
+        .transition(
+            run_id,
+            CodeChangeState::Committing,
+            CodeChangeState::CandidateReady,
+            127,
+        )
+        .unwrap();
+    repository.find_by_id(run_id).unwrap().unwrap()
+}
+
+fn submitted_code_change_for_promotion_test(
+    harness: &CampaignDbHarness,
+    run_id: &str,
+    experiment_id: &str,
+    candidate_value: Option<f64>,
+    current_best: Option<&str>,
+    plateau_count: i64,
+) -> pueue_agent::models::CodeChangeRun {
+    let run = code_change_to_candidate_ready_for_test(harness, run_id);
+    CampaignRepository::new(&harness.test.db)
+        .accept_code_change_candidate(
+            run_id,
+            experiment_id,
+            &format!("{experiment_id}-submission"),
+            140,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    let experiments = ExperimentRepository::new(&harness.test.db);
+    experiments.mark_submitting(experiment_id, 141).unwrap();
+    experiments
+        .mark_accepted(experiment_id, 42, &format!("{experiment_id}-task"), 142)
+        .unwrap();
+    experiments
+        .project_terminal_submission(
+            experiment_id,
+            42,
+            ExperimentTerminalOutcome::Succeeded,
+            143,
+        )
+        .unwrap();
+
+    let objective_metric = json!({
+        "name": "loss",
+        "direction": "minimize",
+        "min_delta": 0.01,
+    });
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns
+             SET objective_metric_json = ?1, current_best_experiment_id = ?2,
+                 plateau_count = ?3
+             WHERE campaign_id = ?4",
+            params![
+                objective_metric.to_string(),
+                current_best,
+                plateau_count,
+                CampaignDbHarness::CAMPAIGN_ID,
+            ],
+        )
+        .unwrap();
+    MetricsRepository::upsert(
+        &harness.test.db,
+        &ExperimentMetricsRow {
+            experiment_id: CampaignDbHarness::BASELINE_EXPERIMENT_ID.to_owned(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: Some(1.0),
+            metrics_json: "{}".to_owned(),
+            artifact_defect: None,
+            created_at: 144,
+            updated_at: 144,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+    MetricsRepository::upsert(
+        &harness.test.db,
+        &ExperimentMetricsRow {
+            experiment_id: experiment_id.to_owned(),
+            source: "manifest".to_owned(),
+            primary_metric_name: Some("loss".to_owned()),
+            primary_metric_value: candidate_value,
+            metrics_json: "{}".to_owned(),
+            artifact_defect: None,
+            created_at: 144,
+            updated_at: 144,
+            evaluated_at: None,
+        },
+    )
+    .unwrap();
+    CodeChangeRepository::new(&harness.test.db)
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap()
 }
 
 fn editor_agent_run_for_test(harness: &CampaignDbHarness, ordinal: i64, now: i64) -> i64 {
@@ -15071,6 +15717,527 @@ fn code_change_finish_methods_require_terminal_statuses() {
 }
 
 #[test]
+fn code_change_first_failed_check_round_returns_to_editing_with_feedback() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-check-retry", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            agent_run_id,
+            "session-check-retry",
+            124,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("editor-ready"),
+            None,
+            None,
+            Some(124),
+            125,
+            125,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            126,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &run.code_change_run_id,
+            "checked-digest-first",
+            2,
+            123,
+            127,
+        )
+        .unwrap();
+    repository
+        .replace_attempt_checks(
+            &run.code_change_run_id,
+            1,
+            &[
+                NewCodeChangeCheck::new(
+                    1,
+                    0,
+                    "supervisor",
+                    vec!["git".to_owned(), "diff".to_owned()],
+                    ".",
+                ),
+                NewCodeChangeCheck::new(
+                    1,
+                    1,
+                    "discovered",
+                    vec!["cargo".to_owned(), "test".to_owned()],
+                    ".",
+                ),
+            ],
+            127,
+        )
+        .unwrap();
+    repository
+        .finish_check(
+            &run.code_change_run_id,
+            1,
+            0,
+            CodeChangeCheckStatus::Passed,
+            Some("supervisor-digest"),
+            Some("check passed"),
+            Some(127),
+            128,
+            128,
+        )
+        .unwrap();
+    repository
+        .finish_check(
+            &run.code_change_run_id,
+            1,
+            1,
+            CodeChangeCheckStatus::Failed,
+            Some("project-digest"),
+            Some("check returned non-zero"),
+            Some(127),
+            129,
+            129,
+        )
+        .unwrap();
+
+    repository
+        .retry_after_failed_checks(&run.code_change_run_id, 1, "project check failed", 130)
+        .unwrap();
+    let retried = repository
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.state, CodeChangeState::Editing);
+    assert_eq!(retried.diff_digest, None);
+    assert_eq!(retried.changed_file_count, None);
+    assert_eq!(retried.diff_bytes, None);
+    let attempt = repository
+        .list_editor_attempts(&run.code_change_run_id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(attempt.status, "ready");
+    assert_eq!(attempt.failure_code.as_deref(), Some("check_failed"));
+    assert_eq!(
+        attempt.failure_summary.as_deref(),
+        Some("project check failed")
+    );
+    let checks = repository.list_checks(&run.code_change_run_id, 1).unwrap();
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0].status, CodeChangeCheckStatus::Passed);
+    assert_eq!(checks[1].status, CodeChangeCheckStatus::Failed);
+    assert!(repository
+        .retry_after_failed_checks(&run.code_change_run_id, 1, "project check failed", 131,)
+        .is_err());
+
+    finish_editor_agent_run_for_test(&harness, agent_run_id, 132);
+    let second_agent_run_id = editor_agent_run_for_test(&harness, 2, 133);
+    let second = repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            second_agent_run_id,
+            "session-check-retry",
+            134,
+        )
+        .unwrap();
+    assert_eq!(second.attempt, 2);
+    repository
+        .bind_editor_session(
+            &run.code_change_run_id,
+            2,
+            "session-check-retry",
+            135,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            2,
+            "ready",
+            Some("editor-ready-second"),
+            None,
+            None,
+            Some(135),
+            136,
+            136,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            137,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &run.code_change_run_id,
+            "checked-digest-second",
+            3,
+            456,
+            138,
+        )
+        .unwrap();
+    repository
+        .replace_attempt_checks(
+            &run.code_change_run_id,
+            2,
+            &[NewCodeChangeCheck::new(
+                2,
+                0,
+                "supervisor",
+                vec!["git".to_owned(), "diff".to_owned()],
+                ".",
+            )],
+            139,
+        )
+        .unwrap();
+    repository
+        .finish_check(
+            &run.code_change_run_id,
+            2,
+            0,
+            CodeChangeCheckStatus::Passed,
+            Some("supervisor-digest-second"),
+            Some("check passed"),
+            Some(139),
+            140,
+            140,
+        )
+        .unwrap();
+    let lifecycle = EventRepository::new(&harness.test.db)
+        .find_by_dedup_key(
+            CampaignDbHarness::PROJECT_ID,
+            &format!("code-change:v1:{}:editing:2", run.code_change_run_id),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.payload["reason_code"], "check_failed");
+}
+
+#[test]
+fn code_change_changed_checked_diff_invalidates_into_the_bounded_retry_path() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-diff-change", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            agent_run_id,
+            "session-diff-change",
+            124,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("editor-ready"),
+            None,
+            None,
+            Some(124),
+            125,
+            125,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            126,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &run.code_change_run_id,
+            "checked-digest-old",
+            2,
+            123,
+            127,
+        )
+        .unwrap();
+    repository
+        .replace_attempt_checks(
+            &run.code_change_run_id,
+            1,
+            &[
+                NewCodeChangeCheck::new(
+                    1,
+                    0,
+                    "supervisor",
+                    vec!["git".to_owned(), "diff".to_owned()],
+                    ".",
+                ),
+                NewCodeChangeCheck::new(
+                    1,
+                    1,
+                    "discovered",
+                    vec!["cargo".to_owned(), "test".to_owned()],
+                    ".",
+                ),
+            ],
+            127,
+        )
+        .unwrap();
+    for ordinal in [0, 1] {
+        repository
+            .finish_check(
+                &run.code_change_run_id,
+                1,
+                ordinal,
+                CodeChangeCheckStatus::Passed,
+                Some("check-digest"),
+                Some("check passed"),
+                Some(127),
+                128 + ordinal,
+                128 + ordinal,
+            )
+            .unwrap();
+    }
+
+    let invalidated = repository
+        .record_checked_diff_for_round(
+            &run.code_change_run_id,
+            1,
+            "checked-digest-new",
+            3,
+            456,
+            130,
+        )
+        .unwrap();
+    assert_eq!(invalidated.state, CodeChangeState::Editing);
+    assert_eq!(invalidated.diff_digest, None);
+    assert_eq!(invalidated.changed_file_count, None);
+    assert_eq!(invalidated.diff_bytes, None);
+    let attempt = repository
+        .list_editor_attempts(&run.code_change_run_id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(attempt.failure_code.as_deref(), Some("check_failed"));
+    assert_eq!(
+        attempt.failure_summary.as_deref(),
+        Some("candidate diff changed during checks")
+    );
+    assert!(repository
+        .record_checked_diff_for_round(
+            &run.code_change_run_id,
+            1,
+            "checked-digest-new",
+            3,
+            456,
+            131,
+        )
+        .is_err());
+}
+
+#[test]
+fn code_change_checked_diff_is_persisted_before_candidate_commit() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-checked-diff", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            agent_run_id,
+            "session-checked-diff",
+            124,
+        )
+        .unwrap();
+    repository
+        .finish_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("editor-ready"),
+            None,
+            None,
+            Some(124),
+            125,
+            125,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            126,
+        )
+        .unwrap();
+
+    let checked = repository
+        .record_checked_diff(&run.code_change_run_id, "checked-digest", 2, 123, 127)
+        .unwrap();
+    assert_eq!(checked.state, CodeChangeState::Checking);
+    assert_eq!(checked.candidate_sha, None);
+    assert_eq!(checked.diff_digest.as_deref(), Some("checked-digest"));
+    assert_eq!(checked.changed_file_count, Some(2));
+    assert_eq!(checked.diff_bytes, Some(123));
+    repository
+        .record_checked_diff(&run.code_change_run_id, "checked-digest", 2, 123, 128)
+        .unwrap();
+    assert!(repository
+        .record_checked_diff(&run.code_change_run_id, "other-digest", 2, 123, 129)
+        .is_err());
+    assert!(repository
+        .record_checked_diff(&run.code_change_run_id, "checked-digest", 3, 123, 130)
+        .is_err());
+}
+
+#[test]
+fn code_change_check_stage_allows_eight_project_checks_plus_supervisor() {
+    let harness = CampaignDbHarness::new();
+    let run = create_pending_code_change_for_test(&harness, "code-change-check-limit", None);
+    code_change_to_editing_for_test(&harness, &run.code_change_run_id, 122);
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
+    repository
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            agent_run_id,
+            "session-check-limit",
+            124,
+        )
+        .unwrap();
+
+    let editor_checks = (0..8)
+        .map(|ordinal| {
+            NewCodeChangeCheck::new(
+                1,
+                ordinal,
+                "editor",
+                vec!["cargo".to_owned(), "test".to_owned()],
+                ".",
+            )
+        })
+        .collect::<Vec<_>>();
+    let too_many_editor_checks = (0..=8)
+        .map(|ordinal| {
+            NewCodeChangeCheck::new(
+                1,
+                ordinal,
+                "editor",
+                vec!["cargo".to_owned(), "test".to_owned()],
+                ".",
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(repository
+        .finish_editor_attempt_with_checks(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("editor-ready"),
+            None,
+            None,
+            Some(124),
+            125,
+            &too_many_editor_checks,
+            125,
+        )
+        .is_err());
+    repository
+        .finish_editor_attempt_with_checks(
+            &run.code_change_run_id,
+            1,
+            "ready",
+            Some("editor-ready"),
+            None,
+            None,
+            Some(124),
+            125,
+            &editor_checks,
+            125,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            126,
+        )
+        .unwrap();
+
+    let checks = std::iter::once(NewCodeChangeCheck::new(
+        1,
+        0,
+        "supervisor",
+        vec!["git".to_owned(), "diff".to_owned()],
+        ".",
+    ))
+    .chain((1..=8).map(|ordinal| {
+        NewCodeChangeCheck::new(
+            1,
+            ordinal,
+            "discovered",
+            vec!["cargo".to_owned(), "test".to_owned()],
+            ".",
+        )
+    }))
+    .collect::<Vec<_>>();
+    let stored = repository
+        .replace_attempt_checks(&run.code_change_run_id, 1, &checks, 127)
+        .unwrap();
+    assert_eq!(stored.len(), 9);
+    assert_eq!(stored[0].source, "supervisor");
+    assert_eq!(
+        stored[1..]
+            .iter()
+            .filter(|check| check.source == "discovered")
+            .count(),
+        8
+    );
+
+    let too_many_checks = std::iter::once(NewCodeChangeCheck::new(
+        1,
+        0,
+        "supervisor",
+        vec!["git".to_owned(), "diff".to_owned()],
+        ".",
+    ))
+    .chain((1..=9).map(|ordinal| {
+        NewCodeChangeCheck::new(
+            1,
+            ordinal,
+            "discovered",
+            vec!["cargo".to_owned(), "test".to_owned()],
+            ".",
+        )
+    }))
+    .collect::<Vec<_>>();
+    assert!(repository
+        .replace_attempt_checks(&run.code_change_run_id, 1, &too_many_checks, 128)
+        .is_err());
+}
+
+#[test]
 fn code_change_editor_ready_checks_are_durable_and_idempotent_after_restart() {
     let harness = CampaignDbHarness::new();
     let run = create_pending_code_change_for_test(&harness, "code-change-editor-ready", None);
@@ -15078,7 +16245,13 @@ fn code_change_editor_ready_checks_are_durable_and_idempotent_after_restart() {
     let repository = CodeChangeRepository::new(&harness.test.db);
     let agent_run_id = editor_agent_run_for_test(&harness, 1, 123);
     repository
-        .reserve_editor_attempt(&run.code_change_run_id, 1, agent_run_id, "session-ready", 124)
+        .reserve_editor_attempt(
+            &run.code_change_run_id,
+            1,
+            agent_run_id,
+            "session-ready",
+            124,
+        )
         .unwrap();
     let checks = [NewCodeChangeCheck::new(
         1,
@@ -15323,6 +16496,229 @@ fn record_candidate_is_retry_safe_only_for_exact_values() {
 }
 
 #[test]
+fn candidate_ready_code_change_acceptance_pins_revision_and_preserves_argv() {
+    let harness = CampaignDbHarness::new();
+    let run = code_change_to_candidate_ready_for_test(&harness, "code-change-candidate-accept");
+    let accepted = CampaignRepository::new(&harness.test.db)
+        .accept_code_change_candidate(
+            &run.code_change_run_id,
+            "experiment-code-change-candidate",
+            "submission-code-change-candidate",
+            140,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+
+    assert_eq!(accepted.proposal.status, ProposalStatus::Accepted);
+    assert_eq!(accepted.experiment.status, ExperimentStatus::Reserved);
+    assert_eq!(
+        accepted.experiment.code_change_run_id.as_deref(),
+        Some(run.code_change_run_id.as_str())
+    );
+    assert_eq!(
+        accepted.experiment.code_revision_sha.as_deref(),
+        run.candidate_sha.as_deref()
+    );
+    assert_eq!(accepted.submission.argv, accepted.proposal.argv);
+    assert_eq!(accepted.submission.status, SubmissionStatus::Pending);
+    let stored_run = CodeChangeRepository::new(&harness.test.db)
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_run.state, CodeChangeState::ExperimentSubmitted);
+    assert_eq!(
+        stored_run.experiment_id.as_deref(),
+        Some("experiment-code-change-candidate")
+    );
+    assert_eq!(harness.count("experiments"), 2);
+    assert_eq!(harness.count("submissions"), 2);
+    assert_eq!(harness.count("budget_reservations"), 3);
+}
+
+#[test]
+fn incomplete_candidate_diff_evidence_cannot_be_accepted() {
+    let harness = CampaignDbHarness::new();
+    let run = code_change_to_candidate_ready_for_test(&harness, "code-change-candidate-incomplete");
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs SET diff_digest = NULL
+             WHERE code_change_run_id = ?1",
+            [&run.code_change_run_id],
+        )
+        .unwrap();
+
+    let error = CampaignRepository::new(&harness.test.db)
+        .accept_code_change_candidate(
+            &run.code_change_run_id,
+            "experiment-code-change-incomplete",
+            "submission-code-change-incomplete",
+            140,
+            &CampaignLimits::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "code_change.diff",
+            ..
+        }
+    ));
+    let stored_run = CodeChangeRepository::new(&harness.test.db)
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_run.state, CodeChangeState::CandidateReady);
+    assert_eq!(stored_run.experiment_id, None);
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("submissions"), 1);
+    assert_eq!(harness.count("budget_reservations"), 2);
+}
+
+#[test]
+fn candidate_ready_code_change_acceptance_waits_without_mutating_candidate() {
+    const DAY: i64 = 24 * 60 * 60;
+    let harness = CampaignDbHarness::new();
+    let run = code_change_to_candidate_ready_for_test(&harness, "code-change-candidate-wait");
+    let mut limits = CampaignLimits::default();
+    limits.max_new_experiments_per_24h = 1;
+
+    assert_eq!(
+        CampaignRepository::new(&harness.test.db)
+            .accept_code_change_candidate(
+                &run.code_change_run_id,
+                "experiment-code-change-wait",
+                "submission-code-change-wait",
+                120,
+                &limits,
+            )
+            .unwrap(),
+        ProposalAcceptance::BudgetWaiting {
+            next_eligible_at: 100 + DAY,
+        }
+    );
+    let stored_run = CodeChangeRepository::new(&harness.test.db)
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_run.state, CodeChangeState::CandidateReady);
+    assert_eq!(stored_run.experiment_id, None);
+    assert_eq!(
+        ProposalRepository::new(&harness.test.db)
+            .find_for_campaign(CampaignDbHarness::CAMPAIGN_ID, &run.proposal_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ProposalStatus::Pending
+    );
+    assert_eq!(harness.count("experiments"), 1);
+    assert_eq!(harness.count("submissions"), 1);
+    assert_eq!(harness.count("budget_reservations"), 2);
+}
+
+#[test]
+fn candidate_ready_code_change_acceptance_defers_when_parallel_capacity_is_full() {
+    let harness = CampaignDbHarness::new();
+    let run = code_change_to_candidate_ready_for_test(&harness, "code-change-candidate-capacity");
+    let mut limits = CampaignLimits::default();
+    limits.max_proposals_per_cycle = 2;
+    let seed = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Fill the parallel experiment capacity",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--capacity", "full"],
+    );
+    harness
+        .accept(
+            "proposal-parallel-capacity",
+            "experiment-parallel-capacity",
+            "submission-parallel-capacity",
+            &seed,
+            &limits,
+            130,
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    let experiments = harness.count("experiments");
+    let submissions = harness.count("submissions");
+    let reservations = harness.count("budget_reservations");
+
+    assert_eq!(
+        CampaignRepository::new(&harness.test.db)
+            .accept_code_change_candidate(
+                &run.code_change_run_id,
+                "experiment-code-change-capacity",
+                "submission-code-change-capacity",
+                140,
+                &limits,
+            )
+            .unwrap(),
+        ProposalAcceptance::CapacityDeferred
+    );
+    let stored_run = CodeChangeRepository::new(&harness.test.db)
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_run.state, CodeChangeState::CandidateReady);
+    assert_eq!(stored_run.experiment_id, None);
+    assert_eq!(
+        ProposalRepository::new(&harness.test.db)
+            .find_for_campaign(CampaignDbHarness::CAMPAIGN_ID, &run.proposal_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ProposalStatus::Pending
+    );
+    assert_eq!(harness.count("experiments"), experiments);
+    assert_eq!(harness.count("submissions"), submissions);
+    assert_eq!(harness.count("budget_reservations"), reservations);
+}
+
+#[test]
+fn candidate_ready_code_change_acceptance_replay_is_idempotent() {
+    let harness = CampaignDbHarness::new();
+    let run = code_change_to_candidate_ready_for_test(&harness, "code-change-candidate-replay");
+    let repository = CampaignRepository::new(&harness.test.db);
+    let first = repository
+        .accept_code_change_candidate(
+            &run.code_change_run_id,
+            "experiment-code-change-replay",
+            "submission-code-change-replay",
+            140,
+            &CampaignLimits::default(),
+        )
+        .unwrap();
+    let replay = repository
+        .accept_code_change_candidate(
+            &run.code_change_run_id,
+            "experiment-code-change-replay",
+            "submission-code-change-replay",
+            141,
+            &CampaignLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(harness.count("experiments"), 2);
+    assert_eq!(harness.count("submissions"), 2);
+    assert_eq!(harness.count("budget_reservations"), 3);
+    let stored_run = CodeChangeRepository::new(&harness.test.db)
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_run.state, CodeChangeState::ExperimentSubmitted);
+    assert_eq!(
+        stored_run.experiment_id.as_deref(),
+        Some("experiment-code-change-replay")
+    );
+}
+
+#[test]
 fn finish_check_is_retry_safe_only_for_exact_values() {
     let harness = CampaignDbHarness::new();
     let run = create_pending_code_change_for_test(&harness, "code-change-check-replay", None);
@@ -15509,6 +16905,320 @@ fn evaluation_requires_exact_replay_and_cleanup_replay_is_idempotent() {
         .finish_cleanup(&run.code_change_run_id, 132)
         .unwrap();
     assert_eq!(cleanup_replay, completed);
+}
+
+#[test]
+fn code_change_prepare_promotion_is_side_effect_free_and_replay_safe() {
+    let harness = CampaignDbHarness::new();
+    let run = submitted_code_change_for_promotion_test(
+        &harness,
+        "code-change-promotion-prepare",
+        "experiment-code-change-promotion-prepare",
+        Some(0.5),
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        2,
+    );
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    let before_promotion = harness.campaign_promotion_state();
+    let before_evaluated_at = harness.evaluated_at(
+        run.experiment_id
+            .as_deref()
+            .expect("submitted code-change experiment"),
+    );
+    let old_sha = "cccccccccccccccccccccccccccccccccccccccc";
+
+    let prepared = repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            Some(old_sha),
+            150,
+        )
+        .unwrap();
+
+    assert_eq!(prepared.state, CodeChangeState::ExperimentSubmitted);
+    assert_eq!(prepared.promotion_outcome.as_deref(), Some("improved"));
+    assert_eq!(
+        prepared.promotion_expected_best_experiment_id.as_deref(),
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID)
+    );
+    assert_eq!(prepared.promotion_expected_old_sha.as_deref(), Some(old_sha));
+    assert_eq!(
+        prepared.promotion_target_sha.as_deref(),
+        run.candidate_sha.as_deref()
+    );
+    assert_eq!(harness.campaign_promotion_state(), before_promotion);
+    assert_eq!(
+        harness.evaluated_at(
+            run.experiment_id
+                .as_deref()
+                .expect("submitted code-change experiment")
+        ),
+        before_evaluated_at
+    );
+
+    let replay = repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            Some(old_sha),
+            151,
+        )
+        .unwrap();
+    assert_eq!(replay, prepared);
+}
+
+#[test]
+fn code_change_finalize_improved_is_atomic_and_idempotent() {
+    let harness = CampaignDbHarness::new();
+    let run = submitted_code_change_for_promotion_test(
+        &harness,
+        "code-change-promotion-improved",
+        "experiment-code-change-promotion-improved",
+        Some(0.5),
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        2,
+    );
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            Some("cccccccccccccccccccccccccccccccccccccccc"),
+            150,
+        )
+        .unwrap();
+
+    let finalized = repository
+        .finalize_code_promotion(&run.code_change_run_id, &CampaignLimits::default(), 151)
+        .unwrap();
+    assert_eq!(finalized.state, CodeChangeState::Evaluated);
+    assert_eq!(
+        finalized.promotion_outcome.as_deref(),
+        Some(PromotionOutcome::Improved.as_str())
+    );
+    assert_eq!(
+        harness.campaign_promotion_state(),
+        (
+            Some("experiment-code-change-promotion-improved".to_owned()),
+            0
+        )
+    );
+    assert_eq!(
+        harness.evaluated_at(
+            run.experiment_id
+                .as_deref()
+                .expect("submitted code-change experiment")
+        ),
+        Some("151".to_owned())
+    );
+
+    let replay = repository
+        .finalize_code_promotion(&run.code_change_run_id, &CampaignLimits::default(), 152)
+        .unwrap();
+    assert_eq!(replay, finalized);
+}
+
+#[test]
+fn code_change_finalize_non_improved_increments_plateau_without_moving_best() {
+    let harness = CampaignDbHarness::new();
+    let run = submitted_code_change_for_promotion_test(
+        &harness,
+        "code-change-promotion-not-improved",
+        "experiment-code-change-promotion-not-improved",
+        Some(2.0),
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        1,
+    );
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            Some("cccccccccccccccccccccccccccccccccccccccc"),
+            150,
+        )
+        .unwrap();
+
+    let finalized = repository
+        .finalize_code_promotion(&run.code_change_run_id, &CampaignLimits::default(), 151)
+        .unwrap();
+    assert_eq!(finalized.state, CodeChangeState::Evaluated);
+    assert_eq!(
+        finalized.promotion_outcome.as_deref(),
+        Some(PromotionOutcome::NotImproved.as_str())
+    );
+    assert_eq!(
+        harness.campaign_promotion_state(),
+        (Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID.to_owned()), 2)
+    );
+    assert_eq!(
+        harness.evaluated_at(
+            run.experiment_id
+                .as_deref()
+                .expect("submitted code-change experiment")
+        ),
+        Some("151".to_owned())
+    );
+}
+
+#[test]
+fn code_change_finalize_rejects_expected_best_mismatch_including_null() {
+    let harness = CampaignDbHarness::new();
+    let run = submitted_code_change_for_promotion_test(
+        &harness,
+        "code-change-promotion-best-mismatch",
+        "experiment-code-change-promotion-best-mismatch",
+        Some(0.5),
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        2,
+    );
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            Some("cccccccccccccccccccccccccccccccccccccccc"),
+            150,
+        )
+        .unwrap();
+    harness.set_campaign_promotion_state(None, 2);
+
+    let error = repository
+        .finalize_code_promotion(&run.code_change_run_id, &CampaignLimits::default(), 151)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "current_best_experiment_id",
+            ..
+        }
+    ));
+    assert_eq!(harness.campaign_promotion_state(), (None, 2));
+    assert_eq!(
+        harness.evaluated_at(
+            run.experiment_id
+                .as_deref()
+                .expect("submitted code-change experiment")
+        ),
+        None
+    );
+
+    let harness = CampaignDbHarness::new();
+    let run = submitted_code_change_for_promotion_test(
+        &harness,
+        "code-change-promotion-null-best",
+        "experiment-code-change-promotion-null-best",
+        Some(0.5),
+        None,
+        2,
+    );
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            None,
+            150,
+        )
+        .unwrap();
+    assert_eq!(
+        repository
+            .find_by_id(&run.code_change_run_id)
+            .unwrap()
+            .unwrap()
+            .promotion_expected_best_experiment_id,
+        None
+    );
+    harness.set_campaign_promotion_state(Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID), 2);
+
+    let error = repository
+        .finalize_code_promotion(&run.code_change_run_id, &CampaignLimits::default(), 151)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "current_best_experiment_id",
+            ..
+        }
+    ));
+    assert_eq!(
+        harness.campaign_promotion_state(),
+        (Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID.to_owned()), 2)
+    );
+    assert_eq!(
+        harness.evaluated_at(
+            run.experiment_id
+                .as_deref()
+                .expect("submitted code-change experiment")
+        ),
+        None
+    );
+}
+
+#[test]
+fn code_change_finalize_rejects_impossible_persisted_promotion_fields() {
+    let harness = CampaignDbHarness::new();
+    let run = submitted_code_change_for_promotion_test(
+        &harness,
+        "code-change-promotion-impossible",
+        "experiment-code-change-promotion-impossible",
+        Some(0.5),
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        2,
+    );
+    let repository = CodeChangeRepository::new(&harness.test.db);
+    repository
+        .prepare_code_promotion(
+            &run.code_change_run_id,
+            ExperimentStatus::Succeeded,
+            &CampaignLimits::default(),
+            Some("cccccccccccccccccccccccccccccccccccccccc"),
+            150,
+        )
+        .unwrap();
+    harness
+        .test
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE code_change_runs SET promotion_target_sha = NULL
+             WHERE code_change_run_id = ?1",
+            [&run.code_change_run_id],
+        )
+        .unwrap();
+
+    let error = repository
+        .finalize_code_promotion(&run.code_change_run_id, &CampaignLimits::default(), 151)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation {
+            field: "promotion_target_sha",
+            ..
+        }
+    ));
+    let stored = repository
+        .find_by_id(&run.code_change_run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, CodeChangeState::ExperimentSubmitted);
+    assert_eq!(harness.campaign_promotion_state().1, 2);
+    assert_eq!(
+        harness.evaluated_at(
+            run.experiment_id
+                .as_deref()
+                .expect("submitted code-change experiment")
+        ),
+        None
+    );
 }
 
 #[test]

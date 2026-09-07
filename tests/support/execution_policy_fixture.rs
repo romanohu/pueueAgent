@@ -34,6 +34,14 @@ pub fn resolved_policy(
     fixture_root: &Path,
     projects: &[(&str, &Path, &Path)],
 ) -> Arc<ResolvedExecutionPolicy> {
+    resolved_policy_with_trusted_paths(fixture_root, projects, &[])
+}
+
+pub fn resolved_policy_with_trusted_paths(
+    fixture_root: &Path,
+    projects: &[(&str, &Path, &Path)],
+    extra_trusted_paths: &[&Path],
+) -> Arc<ResolvedExecutionPolicy> {
     fs::set_permissions(fixture_root, fs::Permissions::from_mode(0o700))
         .expect("secure policy fixture root");
     let fixture_root = fs::canonicalize(fixture_root).expect("canonical fixture root");
@@ -76,6 +84,11 @@ pub fn resolved_policy(
         .expect("secure pueue fixture config");
 
     let mut trusted_path = BTreeSet::from([trusted_dir.clone()]);
+    trusted_path.extend(
+        extra_trusted_paths
+            .iter()
+            .map(|path| fs::canonicalize(path).expect("canonical extra trusted path")),
+    );
     let mut project_entries = String::new();
     let mut project_roots = Vec::new();
     for (project_id, root, program) in projects {
@@ -105,15 +118,29 @@ pub fn resolved_policy(
     } else {
         String::new()
     };
+    let uv = trusted_dir.join("uv");
+    let uv_entry = if uv.is_file() {
+        format!("uv = {:?}\n", uv.display().to_string())
+    } else {
+        String::new()
+    };
+    let python = trusted_dir.join("python");
+    let python_entry = if python.is_file() {
+        format!("python = {:?}\n", python.display().to_string())
+    } else {
+        String::new()
+    };
     fs::write(
         state_dir.join("execution-policy.toml"),
         format!(
-            "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\ngit = {:?}\n{}{}",
+            "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\ngit = {:?}\n{}{}{}{}",
             joined_path.to_string_lossy(),
             launcher.display().to_string(),
             launcher.display().to_string(),
             git.display().to_string(),
             cargo_entry,
+            uv_entry,
+            python_entry,
             project_entries,
         ),
     )

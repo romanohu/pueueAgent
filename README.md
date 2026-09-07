@@ -31,7 +31,26 @@ SQLite は project、campaign、proposal、experiment、budget reservation、sub
 
 現在の Phase 2 は、campaign、baseline、hard budget、外部投入の復旧境界に加え、実験の成功・失敗を起点にする `terminal completion loop` を持ちます。Linux では supervisor が SQLite の bounded evidence だけを read-only の built-in Codex decision agent に渡し、返された exactly one structured decision を `proposal` または `finite wait` として検証します。proposal は既存の campaign coordinator から次の非 code experiment を投入し、wait は Pueue task を追加せず有限の `next_wake_at` まで待ちます。
 
-Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop は実装済みです。同じ class の信号が繰り返されるか log が stall すると experiment は `suspicious` になり、1 回の read-only diagnosis agent が bounded な証拠から原因と推奨 action（`continue` / `kill_and_resume` / `kill_and_escalate`）を返します。破壊的な action は確認済みの termination request を必要とし、`kill_and_resume` は live repair 予算（`max_live_repairs`）が残る場合に限り同一 argv の後継 experiment を再投入します。既存の pattern/stall detector と Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。`goal review` は後続 phase、隔離された `code worktree` は Phase 5 の範囲です。
+Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop は実装済みです。同じ class の信号が繰り返されるか log が stall すると experiment は `suspicious` になり、1 回の read-only diagnosis agent が bounded な証拠から原因と推奨 action（`continue` / `kill_and_resume` / `kill_and_escalate`）を返します。破壊的な action は確認済みの termination request を必要とし、`kill_and_resume` は live repair 予算（`max_live_repairs`）が残る場合に限り同一 argv の後継 experiment を再投入します。既存の pattern/stall detector と Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。Phase 4 の evaluation と `goal review` も実装済みです。
+
+Phase 5 の隔離された `code worktree` は、`code_change` proposal を専用 coordinator が受け取り、固定した Git base から候補を作り、editor、check、candidate commit、candidate experiment、evaluation、cleanup までを内部で進める zero-adapter pipeline です。通常の `submit` に新しい adapter や controller を追加する必要はなく、main、checkout 中の source branch、remote、無関係な worktree を merge、push、書き換えません。後続 phase に残るのは、trusted native editor を OS レベルで containment する Phase 6 です。
+
+## code_change proposal の動作（Phase 5）
+
+通常の campaign の decision agent が `code_change` proposal を返すと、SQLite の durable state を起点に次の順序で処理します。最初の admission で Git executable、project root、campaign 開始時の clean な committed `HEAD` または local `campaign/<campaign-id>/best` ref を検証します。dirty、非 Git、Git が利用できない、legacy campaign に `base_revision_sha` がない、または存在する best ref が不正な場合は code-change だけを fail closed で reject し、通常の非 code workflow はこの判定から推測して再投入しません。
+
+1. service-owned state directory の `.pueue-agent/worktrees/<campaign-id>/<proposal-id>` に、完全な base SHA の detached candidate worktree を作ります。
+2. 許可済みの native editor を candidate root に対して起動します。初回は fresh session、editor または必須 check の失敗時だけ同じ session を一度 resume し、合計 **2 回**を超えません。再起動しても attempt counter はリセットされません。
+3. `git diff --check` と発見した project check を実行し、候補の変更ファイル **50 以下**、diff bytes **500000 以下**、check **8 以下**、各 check の timeout **30 分以下**、check 出力合計 **64 KiB 以下**を検証します。
+4. 最終 diff の digest が一致したときだけ service identity で candidate commit を作り、candidate ref を durable にしてから、その commit SHA と candidate worktree を実験へ渡します。experiment の通常の Pueue task / evaluation / promotion 経路が成功し、objective metric の改善が確認できたときだけ best ref を local CAS で更新します。
+
+`code_change` proposal の受理は code-change budget reservation を 1 つ消費します。reject や後続失敗でその slot は戻りません。editor の各 attempt は通常の agent-run hourly budget を消費し、candidate experiment は通常の rolling experiment budget と parallelism guardrail を使うため、`budget_waiting` になることがあります。候補を作る前の admission、editor、check、commit、experiment、promotion の各段階は一つの durable run として status/doctor から追跡できます。
+
+project check は Rust の `Cargo.toml` があれば `cargo test --all-targets -- --test-threads=1`、Python の `pytest.ini` または `pyproject.toml` の `[tool.pytest.ini_options]` があれば pytest を発見します。`uv.lock` がある場合は `uv run pytest`、それ以外は `python -m pytest` を使います（対応する executable が policy にない場合は check を作れません）。editor が提案する check は発見済み check を削除できず、argv 配列でのみ追加できます。
+
+候補 ref は `campaign/<campaign-id>/candidate/<proposal-id>`、best ref は `campaign/<campaign-id>/best` で、いずれも local ref です。自動 merge、rebase、push、PR 作成、remote ref の変更は行いません。candidate worktree は実験と cleanup が終わるまで保持され、tracked file の mutation、OOM、internal failure、timeout、cancel、無効な結果は候補を promotion 可能にしません。
+
+custom agent/editor は shell command としてではなく、execution policy に登録・検証された trusted native executable として扱います。Phase 5 は argv、cwd、identity、credential 継承を検証しますが、OS namespace/container/VM/cgroup などの強制 containment は提供しません。editor、check、candidate experiment は root で起動せず、強い OS containment は Phase 6 の境界です。
 
 ## 対応環境
 
@@ -85,6 +104,7 @@ pueue-agent submit -- python train.py
 - 最初の通常 `submit` は campaign と baseline を作ります。live campaign 中の二回目の `submit` / `submit-batch` は拒否されるため、追加指示は `steer` を使います。
 - campaign の objective は最初の `submit` 時の `STATE.md` snapshot で固定されます。新しい目的へ移るときは既存 campaign を安全に `retire` してから `STATE.md` を編集し、新しい最初の `submit` を実行します。
 - Pueue add の結果が不明な experiment は `unreconciled` のまま隔離され、自動で同じ task を追加しません。`campaign status` と `doctor` で確認してください。
+- code-change の candidate は local ref と service-owned worktree に閉じ、main、source branch、remote、無関係な worktree を変更しません。候補の状態、abbreviated SHA、attempt、experiment/task ID、failed check、cleanup は `status --json` の `code_changes` で確認し、整合性は `doctor --json` の `code_change.*` checks で読み取り専用に診断します。
 - execution policy、実行ファイル、project root、Pueue config、agent log、private temp の検証に失敗した場合は安全側に起動を拒否します。検証を弱めて通さないでください。
 - service policy の network 既定値は enabled ですが、network 利用許可と credential 継承許可は別です。allowlist にない credential/environment value は agent や agent task へ継承されません。
 - `status`、`events`、`runs`、`doctor` などの診断投影は bounded / redacted です。ただし、SQLite には submission の argv と任意 metadata、`steer` の intervention message が保存されます。これらの入力に credential や secret を含めないでください。

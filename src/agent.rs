@@ -842,6 +842,7 @@ impl AgentRunner {
             db,
             project,
             project_policy,
+            project_policy,
             config,
             retry_policy,
             primary_event_id,
@@ -900,6 +901,7 @@ impl AgentRunner {
             db,
             project,
             &decision_policy,
+            &decision_policy,
             config,
             retry_policy,
             primary_event_id,
@@ -955,6 +957,7 @@ impl AgentRunner {
         self.spawn_with_role(
             db,
             project,
+            &decision_policy,
             &decision_policy,
             config,
             retry_policy,
@@ -1037,6 +1040,10 @@ impl AgentRunner {
                 violation.stage = PolicyViolationStage::PreBinding;
                 pre_binding_error(violation.into())
             })?;
+        let service_config = crate::config::load(&project.config_path).map_err(pre_binding_error)?;
+        let service_policy = self
+            .resolve_project_policy(project, &service_config)
+            .map_err(|error| pre_binding_error(error.into()))?;
         let editor_capabilities = match candidate_policy.agent_kind {
             AgentKind::BuiltInCodex => Some(
                 probe_installed_codex_capabilities(&candidate_policy.agent_anchor)
@@ -1049,6 +1056,7 @@ impl AgentRunner {
             db,
             project,
             candidate_policy,
+            &service_policy,
             config,
             retry_policy,
             primary_event_id,
@@ -1075,6 +1083,7 @@ impl AgentRunner {
         db: &crate::db::Db,
         project: &Project,
         project_policy: &ResolvedProjectExecutionPolicy,
+        service_policy: &ResolvedProjectExecutionPolicy,
         config: &AgentConfig,
         retry_policy: RetryPolicy,
         primary_event_id: i64,
@@ -1118,7 +1127,7 @@ impl AgentRunner {
         .map_err(|error| pre_binding_error(error.into()))?;
         let relative_log_path = relative_log_path(primary_event_id, now);
         let relative_marker_path = launch_gate_marker_path(&relative_log_path);
-        let log_path = project_policy
+        let log_path = service_policy
             .root_anchor
             .canonical_path
             .join(&relative_log_path);
@@ -1281,7 +1290,24 @@ impl AgentRunner {
                     error,
                 )
             })?;
-        let temp = PrivateRunTemp::create(&verified_root, run.run_id)
+        let service_root = service_policy
+            .root_anchor
+            .verify_identity()
+            .map_err(|error| {
+                let error = error.into();
+                resolve_bound_role_failure(
+                    db,
+                    decision_failure.as_ref(),
+                    &repository,
+                    project,
+                    run.run_id,
+                    now,
+                    retry_policy,
+                    editor_launch_failure_for_role(&role, run.run_id, &error),
+                    error,
+                )
+            })?;
+        let temp = PrivateRunTemp::create(&service_root, run.run_id)
             .map_err(|error| {
                 let error = error.into();
                 resolve_bound_role_failure(
@@ -1552,6 +1578,7 @@ impl AgentRunner {
                 cwd: Some(project_policy.root_anchor.canonical_path.clone()),
                 environment,
                 project_root: verified_root,
+                log_root: service_root,
                 relative_log_path,
                 relative_marker_path,
             },

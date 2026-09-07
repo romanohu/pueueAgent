@@ -1,14 +1,14 @@
-#[path = "../support/fake_pueue.rs"]
-mod fake_pueue;
 #[cfg(unix)]
 #[path = "../support/config_read_barrier.rs"]
 mod config_read_barrier;
-#[cfg(all(unix, debug_assertions))]
-#[path = "../support/native_process_fixture.rs"]
-mod native_process_fixture;
 #[cfg(unix)]
 #[path = "../support/execution_policy_fixture.rs"]
 mod execution_policy_fixture;
+#[path = "../support/fake_pueue.rs"]
+mod fake_pueue;
+#[cfg(all(unix, debug_assertions))]
+#[path = "../support/native_process_fixture.rs"]
+mod native_process_fixture;
 
 use std::{
     ffi::OsString,
@@ -31,30 +31,47 @@ use std::process::Command;
 
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+#[cfg(all(unix, target_os = "linux"))]
+use std::os::unix::fs::MetadataExt;
 
-use fake_pueue::{FakePueue, FakePueueCommand};
 #[cfg(unix)]
 use config_read_barrier::ConfigReadBarrier;
+use fake_pueue::{FakePueue, FakePueueCommand};
 #[cfg(all(unix, debug_assertions))]
 use native_process_fixture::{
     NativeBehavior, NativeFakePueue, OUTPUT_SENTINEL, OVERFLOW_SENTINEL_REPETITIONS,
     TIMEOUT_SENTINEL_REPETITIONS,
 };
+#[cfg(all(unix, target_os = "linux"))]
+use pueue_agent::campaign::CampaignSubmission;
+#[cfg(all(unix, target_os = "linux"))]
+use pueue_agent::execution_policy::resolve_project_policy;
+#[cfg(unix)]
+use pueue_agent::execution_policy::{
+    load_or_create_policy, PolicyLoadInput, PolicyViolation, PolicyViolationCode,
+    PolicyViolationStage, StartupEnvironment,
+};
+#[cfg(all(unix, target_os = "linux"))]
+use pueue_agent::models::{MetricDirection, ObjectiveMetric};
+use pueue_agent::process::MAX_FIELD_SIZE;
+#[cfg(all(unix, debug_assertions))]
+use pueue_agent::pueue_process::PueueProcessRunner;
+#[cfg(all(unix, target_os = "linux"))]
+use pueue_agent::reconcile::Reconciler;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     batches::{self, BatchJobResult},
     campaign::CampaignCoordinator,
     code_change,
     daemon::{Daemon, DaemonConfig},
+    db::{
+        AgentRunRepository, BatchRepository, CampaignRepository, CodeChangeRepository, Db,
+        DecisionRepository, EventRepository, ExperimentRepository, ManagedSubmissionIntent,
+        ProjectRepository, ProposalRepository, StartCampaignRequest, SubmissionRepository,
+    },
     decision::DecisionCoordinator,
     decision_evidence::MAX_DECISION_CONTEXT_BYTES,
     decision_protocol::parse_and_validate_decision,
-    db::{
-        AgentRunRepository, BatchRepository, CampaignRepository, CodeChangeRepository, Db,
-        DecisionRepository,
-        EventRepository, ExperimentRepository, ManagedSubmissionIntent, ProjectRepository,
-        ProposalRepository, StartCampaignRequest, SubmissionRepository,
-    },
     execution_policy::{CampaignLimits, ProjectRootAnchor},
     models::{
         AgentRunStatus, CampaignState, CodeChangeState, DecisionAttemptState, DecisionCycleState,
@@ -68,16 +85,8 @@ use pueue_agent::{
     state::{self, ObjectiveSnapshot},
     submit, AppError,
 };
-use pueue_agent::process::MAX_FIELD_SIZE;
-#[cfg(all(unix, debug_assertions))]
-use pueue_agent::pueue_process::PueueProcessRunner;
-#[cfg(unix)]
-use pueue_agent::execution_policy::{
-    load_or_create_policy, PolicyLoadInput, PolicyViolation, PolicyViolationCode,
-    PolicyViolationStage, StartupEnvironment,
-};
-use sha2::{Digest, Sha256};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn accepts_api<P: PueueApi>(_api: &P) {}
@@ -111,7 +120,10 @@ fn production_decision_proposal_id_derives_git_safe_candidate_ref() {
         .args(["check-ref-format", &ref_name])
         .output()
         .unwrap();
-    assert!(output.status.success(), "invalid ref {candidate:?}: {output:?}");
+    assert!(
+        output.status.success(),
+        "invalid ref {candidate:?}: {output:?}"
+    );
 }
 
 #[test]
@@ -136,9 +148,8 @@ fn native_add_preflight_accepts_the_last_conservative_frame_and_rejects_the_next
 }
 
 fn native_add_byte_boundary() -> (usize, usize) {
-    let add_args = |prefix_bytes, tail_bytes| {
-        native_add_byte_boundary_args(prefix_bytes, tail_bytes)
-    };
+    let add_args =
+        |prefix_bytes, tail_bytes| native_add_byte_boundary_args(prefix_bytes, tail_bytes);
     let mut low = 0;
     let mut high = MAX_FIELD_SIZE;
     while low < high {
@@ -209,10 +220,22 @@ fn pueue_control_sources_forbid_bare_and_shell_execution() {
             "pueue_security",
             source_before_test_module(include_str!("../../src/pueue_security.rs")),
         ),
-        ("main", source_before_test_module(include_str!("../../src/main.rs"))),
-        ("submit", source_before_test_module(include_str!("../../src/submit.rs"))),
-        ("batches", source_before_test_module(include_str!("../../src/batches.rs"))),
-        ("cancel", source_before_test_module(include_str!("../../src/cancel.rs"))),
+        (
+            "main",
+            source_before_test_module(include_str!("../../src/main.rs")),
+        ),
+        (
+            "submit",
+            source_before_test_module(include_str!("../../src/submit.rs")),
+        ),
+        (
+            "batches",
+            source_before_test_module(include_str!("../../src/batches.rs")),
+        ),
+        (
+            "cancel",
+            source_before_test_module(include_str!("../../src/cancel.rs")),
+        ),
         (
             "reconcile",
             source_before_test_module(include_str!("../../src/reconcile.rs")),
@@ -276,8 +299,7 @@ fn pueue_control_sources_forbid_bare_and_shell_execution() {
 }
 
 #[cfg(all(unix, debug_assertions))]
-static NATIVE_PROCESS_FIXTURE_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+static NATIVE_PROCESS_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(all(unix, debug_assertions))]
 #[tokio::test]
@@ -310,7 +332,10 @@ async fn ambient_path_replacement_cannot_override_the_pinned_pueue_executable() 
     let source = ambient.path().join("replacement.rs");
     fs::write(
         &source,
-        format!("fn main() {{ std::fs::write({:?}, b\"ran\").unwrap(); }}", marker),
+        format!(
+            "fn main() {{ std::fs::write({:?}, b\"ran\").unwrap(); }}",
+            marker
+        ),
     )
     .unwrap();
     let replacement = ambient.path().join("pueue");
@@ -320,7 +345,11 @@ async fn ambient_path_replacement_cannot_override_the_pinned_pueue_executable() 
         .arg(&source)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
     let fixture = NativeFakePueue::new_with_ambient_path(
         NativeBehavior::ExactLimitSuccess,
@@ -391,10 +420,7 @@ async fn run_native_failure(
         runner
             .run(
                 policy.as_ref(),
-                &[
-                    OsString::from("status"),
-                    OsString::from("--json"),
-                ],
+                &[OsString::from("status"), OsString::from("--json")],
             )
             .await
     });
@@ -536,10 +562,22 @@ fn assert_native_error_does_not_render_fixture_output(
 
     assert!(fixture_output.len() > 256);
     assert!(display.contains(expected), "unexpected display: {display}");
-    assert!(!display.contains(OUTPUT_SENTINEL), "display leaked fixture marker: {display}");
-    assert!(!debug.contains(OUTPUT_SENTINEL), "debug leaked fixture marker: {debug}");
-    assert!(!display.contains(&fixture_output), "display leaked fixture output");
-    assert!(!debug.contains(&fixture_output), "debug leaked fixture output");
+    assert!(
+        !display.contains(OUTPUT_SENTINEL),
+        "display leaked fixture marker: {display}"
+    );
+    assert!(
+        !debug.contains(OUTPUT_SENTINEL),
+        "debug leaked fixture marker: {debug}"
+    );
+    assert!(
+        !display.contains(&fixture_output),
+        "display leaked fixture output"
+    );
+    assert!(
+        !debug.contains(&fixture_output),
+        "debug leaked fixture output"
+    );
 }
 
 #[cfg(all(unix, debug_assertions))]
@@ -548,18 +586,13 @@ async fn cancelling_the_caller_still_terminates_and_reaps_the_process_group() {
     let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = NativeFakePueue::new(NativeBehavior::Hold);
     let policy = fixture.policy();
-    let runner = PueueProcessRunner::with_limits(
-        std::time::Duration::from_secs(8),
-        MAX_PUEUE_OUTPUT_BYTES,
-    );
+    let runner =
+        PueueProcessRunner::with_limits(std::time::Duration::from_secs(8), MAX_PUEUE_OUTPUT_BYTES);
     let caller = tokio::spawn(async move {
         runner
             .run(
                 policy.as_ref(),
-                &[
-                    OsString::from("status"),
-                    OsString::from("--json"),
-                ],
+                &[OsString::from("status"), OsString::from("--json")],
             )
             .await
     });
@@ -567,12 +600,10 @@ async fn cancelling_the_caller_still_terminates_and_reaps_the_process_group() {
     fixture.assert_started_processes_alive().await;
 
     caller.abort();
-    assert!(
-        caller
-            .await
-            .expect_err("caller abort unexpectedly completed")
-            .is_cancelled()
-    );
+    assert!(caller
+        .await
+        .expect_err("caller abort unexpectedly completed")
+        .is_cancelled());
 
     assert_native_cleanup_contract(&fixture).await;
 }
@@ -610,14 +641,11 @@ async fn verified_runner_accepts_both_streams_at_the_exact_limit() {
     let policy = fixture.policy();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        PueueProcessRunner::with_limits(
-            std::time::Duration::from_secs(2),
-            MAX_PUEUE_OUTPUT_BYTES,
-        )
-        .run(
-            policy.as_ref(),
-            &[OsString::from("status"), OsString::from("--json")],
-        ),
+        PueueProcessRunner::with_limits(std::time::Duration::from_secs(2), MAX_PUEUE_OUTPUT_BYTES)
+            .run(
+                policy.as_ref(),
+                &[OsString::from("status"), OsString::from("--json")],
+            ),
     )
     .await
     .expect("exact-limit runner exceeded outer test bound")
@@ -638,14 +666,11 @@ async fn verified_runner_returns_bounded_output_for_nonzero_status() {
     let policy = fixture.policy();
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        PueueProcessRunner::with_limits(
-            std::time::Duration::from_secs(2),
-            MAX_PUEUE_OUTPUT_BYTES,
-        )
-        .run(
-            policy.as_ref(),
-            &[OsString::from("status"), OsString::from("--json")],
-        ),
+        PueueProcessRunner::with_limits(std::time::Duration::from_secs(2), MAX_PUEUE_OUTPUT_BYTES)
+            .run(
+                policy.as_ref(),
+                &[OsString::from("status"), OsString::from("--json")],
+            ),
     )
     .await
     .expect("nonzero runner exceeded outer test bound")
@@ -700,7 +725,10 @@ fn pueue_error_display_and_debug_redact_captured_bytes_and_spawn_sources() {
         source_chain.push_str(&format!("{error} {error:?}"));
         source = error.source();
     }
-    assert!(source_chain.is_empty(), "unexpected source chain: {source_chain}");
+    assert!(
+        source_chain.is_empty(),
+        "unexpected source chain: {source_chain}"
+    );
     assert!(
         !source_chain.contains(SENTINEL),
         "Error::source leaked: {source_chain}"
@@ -745,6 +773,7 @@ impl CorePolicyHarness {
     fn new(config_under_project_root: bool, weak_config: bool) -> Self {
         let temp = TempDir::new().unwrap();
         let base = fs::canonicalize(temp.path()).unwrap();
+        secure_directory(&base);
         let state_dir = base.join("state");
         let project_root = base.join("project");
         let trusted_dir = base.join("trusted");
@@ -904,9 +933,16 @@ struct SubmitHarness {
 impl SubmitHarness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        secure_directory(temp.path());
         let root = temp.path().join("project");
         let config_dir = root.join(".pueue-agent");
         fs::create_dir_all(&config_dir).unwrap();
+        #[cfg(unix)]
+        {
+            secure_directory(&root);
+            secure_directory(&config_dir);
+        }
         let config_path = config_dir.join("config.toml");
         fs::write(
             &config_path,
@@ -936,6 +972,8 @@ max_experiments = 20
 "#,
         )
         .unwrap();
+        #[cfg(unix)]
+        secure_file(&config_path);
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         ProjectRepository::new(&db)
             .register(&NewProject::new(
@@ -989,7 +1027,10 @@ max_experiments = 20
 
     fn reserve_baseline(&self, argv: &[&str]) -> ManagedSubmissionIntent {
         let objective = self.objective();
-        let argv = argv.iter().map(|argument| (*argument).to_owned()).collect::<Vec<_>>();
+        let argv = argv
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect::<Vec<_>>();
         let baseline = proposals::validate_initial_baseline(
             ProposalInput {
                 kind: ProposalKind::Experiment,
@@ -1037,15 +1078,14 @@ max_experiments = 20
     }
 
     async fn submit_from_agent_run(&self, argv: &[&str]) -> Result<Submission, AppError> {
-        let event = EventRepository::new(&self.db)
-            .insert_idempotent(&NewEvent::new(
-                "project-a",
-                EventKind::TaskFinished,
-                format!("campaign-submit-origin-{}", uuid::Uuid::new_v4()),
-                json!({}),
-                101,
-                101,
-            ))?;
+        let event = EventRepository::new(&self.db).insert_idempotent(&NewEvent::new(
+            "project-a",
+            EventKind::TaskFinished,
+            format!("campaign-submit-origin-{}", uuid::Uuid::new_v4()),
+            json!({}),
+            101,
+            101,
+        ))?;
         let run = pueue_agent::db::AgentRunRepository::new(&self.db).insert(&NewAgentRun::new(
             "project-a",
             event.event_id,
@@ -1082,12 +1122,372 @@ max_experiments = 20
         self.db
             .connect()
             .unwrap()
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap()
     }
 
     fn pueue_add_calls(&self) -> usize {
         self.fake.add_calls()
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+struct CandidateSubmissionFixture {
+    harness: DecisionHarness,
+    policy: Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+    project: pueue_agent::models::Project,
+    run_id: String,
+    candidate_root: PathBuf,
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+struct CandidateTerminalPueue {
+    task: PueueTask,
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[async_trait]
+impl PueueApi for CandidateTerminalPueue {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        Ok(vec![self.task.clone()])
+    }
+
+    async fn add(&self, _args: &[OsString]) -> Result<i64, AppError> {
+        panic!("candidate reconciliation must not add Pueue tasks")
+    }
+
+    async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("candidate reconciliation must not kill Pueue tasks")
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("candidate reconciliation must not remove Pueue tasks")
+    }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        panic!("candidate reconciliation must not provision Pueue groups")
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn shell_quote(argument: &str) -> String {
+    if !argument.is_empty()
+        && argument.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'@'
+                    | b'%'
+                    | b'_'
+                    | b'+'
+                    | b'='
+                    | b','
+                    | b'.'
+                    | b'/'
+                    | b'-'
+            )
+        })
+    {
+        return argument.to_owned();
+    }
+    format!("'{}'", argument.replace('\'', r"'\''"))
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn candidate_submission_fixture(working_directory: &str) -> CandidateSubmissionFixture {
+    candidate_submission_fixture_with_runtime_git(working_directory, false).await
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn candidate_submission_fixture_with_runtime_git(
+    working_directory: &str,
+    install_runtime_git_wrapper: bool,
+) -> CandidateSubmissionFixture {
+    let harness = DecisionHarness::with_ready_code_change();
+    let config_path = harness.root.join(".pueue-agent/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace("program = \"/bin/echo\"", "program = \"codex\""),
+    )
+    .unwrap();
+    fs::write(
+        harness.root.join(".gitignore"),
+        ".pueue-agent/\n.pytest_cache/\n__pycache__/\n",
+    )
+    .unwrap();
+    let base_sha = initialize_clean_git(&harness.root);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET base_revision_sha = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![base_sha, harness.campaign_id],
+        )
+        .unwrap();
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_root(&harness.root)
+        .unwrap()
+        .unwrap();
+    let trusted_git = harness.temp.path().join("execution-policy-bin/git");
+    fs::create_dir_all(trusted_git.parent().unwrap()).unwrap();
+    if install_runtime_git_wrapper {
+        let count_file = harness.temp.path().join("git-wrapper-count");
+        let experiment_file = harness.temp.path().join("git-wrapper-experiment-id");
+        let injection_status_file = harness.temp.path().join("git-wrapper-injection-status");
+        let source_path = harness.temp.path().join("git-wrapper.rs");
+        let source = r##"
+use std::{env, fs, path::PathBuf, process::Command};
+use std::os::unix::fs::PermissionsExt;
+
+fn main() {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    if args
+        .iter()
+        .any(|argument| argument == std::ffi::OsStr::new("--ignored=matching"))
+    {
+        let mut count = fs::read_to_string(__COUNT_FILE__)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        count += 1;
+        fs::write(__COUNT_FILE__, count.to_string()).expect("write Git wrapper count");
+        if count == 3 {
+            let injection_status = match fs::read_to_string(__EXPERIMENT_FILE__) {
+                Ok(experiment_id) => {
+                    let experiment_id = experiment_id.trim();
+                    let root = PathBuf::from(".");
+                    let service = root.join(".pueue-agent");
+                    let results = service.join("results");
+                    let artifacts = service.join("artifacts");
+                    let artifact = artifacts.join(experiment_id);
+                    let manifest = results.join(format!("{experiment_id}.json"));
+                    let setup = (|| -> std::io::Result<()> {
+                        fs::create_dir_all(&results)?;
+                        fs::create_dir_all(&artifact)?;
+                        for directory in [&service, &results, &artifacts, &artifact] {
+                            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+                        }
+                        fs::write(
+                            &manifest,
+                            format!(r#"{{"experiment_id":"{}"}}\n"#, experiment_id),
+                        )?;
+                        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600))?;
+                        Ok(())
+                    })();
+                    match setup {
+                        Ok(()) => "ok".to_owned(),
+                        Err(error) => format!("setup_error kind={:?}", error.kind()),
+                    }
+                }
+                Err(error) => format!("experiment_error kind={:?}", error.kind()),
+            };
+            let _ = fs::write(__INJECTION_STATUS_FILE__, injection_status);
+        }
+    }
+    let status = Command::new("/usr/bin/git")
+        .args(&args)
+        .status()
+        .expect("delegate pinned Git fixture");
+    std::process::exit(status.code().unwrap_or(1));
+}
+"##
+        .replace(
+            "__COUNT_FILE__",
+            &format!("{:?}", count_file.display().to_string()),
+        )
+        .replace(
+            "__EXPERIMENT_FILE__",
+            &format!("{:?}", experiment_file.display().to_string()),
+        )
+        .replace(
+            "__INJECTION_STATUS_FILE__",
+            &format!("{:?}", injection_status_file.display().to_string()),
+        );
+        fs::write(&source_path, source).unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-O", "-o"])
+            .arg(&trusted_git)
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated native Git fixture failed to compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        fs::copy("/usr/bin/git", &trusted_git).unwrap();
+    }
+    secure_directory(trusted_git.parent().unwrap());
+    fs::set_permissions(&trusted_git, fs::Permissions::from_mode(0o700)).unwrap();
+    let policy = execution_policy_fixture::resolved_policy(
+        harness.temp.path(),
+        &[("decision-project", &project.root_path, Path::new("codex"))],
+    );
+    DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
+        .with_policy(&policy)
+        .apply_ready(300, 10)
+        .await
+        .unwrap();
+    let proposal = ProposalRepository::new(&harness.db)
+        .list_for_campaign(&harness.campaign_id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|proposal| proposal.kind == ProposalKind::CodeChange)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE proposals SET working_directory = ?1 WHERE proposal_id = ?2",
+            rusqlite::params![working_directory, proposal.proposal_id],
+        )
+        .unwrap();
+    let run = CodeChangeRepository::new(&harness.db)
+        .find_by_proposal(&proposal.proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        project.root_path,
+        fs::canonicalize(&harness.root).unwrap(),
+        "registered project root must be canonical"
+    );
+    assert_eq!(
+        run.base_sha, base_sha,
+        "candidate run must retain the clean Git HEAD"
+    );
+    assert_eq!(
+        run.candidate_ref,
+        code_change::candidate_ref(&run.campaign_id, &run.proposal_id).unwrap(),
+        "candidate ref must use the campaign-owned bare ref"
+    );
+    assert_eq!(
+        run.best_ref,
+        code_change::best_ref(&run.campaign_id).unwrap(),
+        "best ref must use the campaign-owned bare ref"
+    );
+    assert_eq!(
+        run.worktree_relative_path,
+        code_change::owned_worktree_relative_path(&run.campaign_id, &run.proposal_id)
+            .unwrap()
+            .to_string_lossy(),
+        "candidate worktree path must be derived from campaign and proposal"
+    );
+    let git_head = Command::new("/usr/bin/git")
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(git_head.status.success());
+    assert_eq!(
+        String::from_utf8(git_head.stdout).unwrap().trim(),
+        base_sha,
+        "fixture Git HEAD must match the persisted base"
+    );
+    let git_status = Command::new("/usr/bin/git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(&harness.root)
+        .output()
+        .unwrap();
+    assert!(git_status.status.success());
+    assert!(
+        git_status.stdout.is_empty(),
+        "fixture Git worktree must be clean before preparation"
+    );
+    let project_config = pueue_agent::config::load(&project.config_path).unwrap();
+    let original_policy = resolve_project_policy(&policy, &project, &project_config).unwrap();
+    let repository = CodeChangeRepository::new(&harness.db);
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Reserved,
+            CodeChangeState::PreparingWorktree,
+            301,
+        )
+        .unwrap();
+    let mut candidate = code_change::prepare_code_change_worktree_for_run(
+        &policy,
+        &project,
+        &original_policy,
+        &harness.db,
+        &run.code_change_run_id,
+    )
+    .await
+    .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::PreparingWorktree,
+            CodeChangeState::Editing,
+            302,
+        )
+        .unwrap();
+    let candidate_root = candidate.path().to_owned();
+    if working_directory != "." {
+        let nested = candidate_root.join(working_directory);
+        fs::create_dir_all(&nested).unwrap();
+        secure_directory(&nested);
+    }
+    fs::write(candidate_root.join("model.py"), b"candidate = 1\n").unwrap();
+    let facts = candidate.verify().await.unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Editing,
+            CodeChangeState::Checking,
+            303,
+        )
+        .unwrap();
+    repository
+        .record_checked_diff(
+            &run.code_change_run_id,
+            facts.persisted_digest(),
+            i64::try_from(facts.file_count).unwrap(),
+            i64::try_from(facts.diff_bytes).unwrap(),
+            303,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Checking,
+            CodeChangeState::Committing,
+            304,
+        )
+        .unwrap();
+    let candidate_sha = candidate.commit().await.unwrap();
+    repository
+        .record_candidate(
+            &run.code_change_run_id,
+            &candidate_sha,
+            facts.persisted_digest(),
+            i64::try_from(facts.file_count).unwrap(),
+            i64::try_from(facts.diff_bytes).unwrap(),
+            305,
+        )
+        .unwrap();
+    repository
+        .transition(
+            &run.code_change_run_id,
+            CodeChangeState::Committing,
+            CodeChangeState::CandidateReady,
+            305,
+        )
+        .unwrap();
+    drop(candidate);
+    CandidateSubmissionFixture {
+        harness,
+        policy,
+        project,
+        run_id: run.code_change_run_id,
+        candidate_root,
     }
 }
 
@@ -1191,10 +1591,7 @@ impl DecisionHarness {
         Self::with_ready_repair_source(ExperimentStatus::Failed, fingerprint)
     }
 
-    fn with_ready_repair_source(
-        status: ExperimentStatus,
-        fingerprint: Option<&str>,
-    ) -> Self {
+    fn with_ready_repair_source(status: ExperimentStatus, fingerprint: Option<&str>) -> Self {
         let mut harness = Self::with_terminal_source(status, fingerprint);
         let decision = json!({
             "schema_version": 1,
@@ -1287,6 +1684,16 @@ max_experiments = 20
         )
         .unwrap();
         fs::write(root.join(".pueue-agent/instructions.md"), "instructions\n").unwrap();
+        #[cfg(unix)]
+        {
+            secure_directory(temp.path());
+            secure_directory(&root);
+            secure_directory(&root.join(".pueue-agent"));
+            secure_directory(&root.join(".pueue-agent/logs"));
+            secure_file(&root.join(".pueue-agent/config.toml"));
+            secure_file(&root.join(".pueue-agent/STATE.md"));
+            secure_file(&root.join(".pueue-agent/instructions.md"));
+        }
         let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
         ProjectRepository::new(&db)
             .register(&NewProject::new(
@@ -1713,7 +2120,11 @@ max_experiments = 20
         );
         let policy = execution_policy_fixture::resolved_policy(
             self.temp.path(),
-            &[("decision-project", self.root.as_path(), configured_program.as_path())],
+            &[(
+                "decision-project",
+                self.root.as_path(),
+                configured_program.as_path(),
+            )],
         );
         let runner = AgentRunner::new(
             AgentRunnerConfig::production()
@@ -1819,8 +2230,7 @@ async fn failed_terminal_decision_allows_trusted_repair_and_rejects_untrusted_re
 #[tokio::test]
 async fn repair_decision_rejects_nonfailed_sources_even_with_a_stale_fingerprint() {
     for status in [ExperimentStatus::Succeeded, ExperimentStatus::Cancelled] {
-        let harness =
-            DecisionHarness::with_ready_repair_source(status, Some("stale-fingerprint"));
+        let harness = DecisionHarness::with_ready_repair_source(status, Some("stale-fingerprint"));
 
         let report = harness.coordinator().apply_ready(300, 10).await.unwrap();
 
@@ -1842,8 +2252,10 @@ async fn decision_application_rejects_tampered_context_before_project_admission(
     harness.overwrite_decision_context(1, &format!("{original} "), &digest_text(&original));
     let guard = fs::File::open(&harness.root).unwrap();
     unsafe extern "C" {
-        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
-            -> std::os::raw::c_int;
+        fn flock(
+            file_descriptor: std::os::raw::c_int,
+            operation: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
     }
     assert_eq!(unsafe { flock(guard.as_raw_fd(), 2) }, 0);
 
@@ -1932,12 +2344,10 @@ async fn wait_decision_adds_no_task_and_wakes_same_cycle_at_the_finite_deadline(
         1
     );
     assert_eq!(harness.pueue.add_calls(), 0);
-    assert!(
-        DecisionRepository::new(&harness.db)
-            .due_cycles(359, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(DecisionRepository::new(&harness.db)
+        .due_cycles(359, 10)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         harness.event_status_and_attempts(event_id),
         (EventStatus::Completed, 1)
@@ -1961,8 +2371,10 @@ async fn wait_decision_defers_while_project_admission_is_locked() {
     let harness = DecisionHarness::with_ready_wait(1);
     let guard = fs::File::open(&harness.root).unwrap();
     unsafe extern "C" {
-        fn flock(file_descriptor: std::os::raw::c_int, operation: std::os::raw::c_int)
-            -> std::os::raw::c_int;
+        fn flock(
+            file_descriptor: std::os::raw::c_int,
+            operation: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
     }
     assert_eq!(unsafe { flock(guard.as_raw_fd(), 2) }, 0);
 
@@ -2101,7 +2513,11 @@ async fn code_change_admission_uses_campaign_base_when_best_ref_is_absent() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2138,17 +2554,17 @@ async fn invalid_present_best_ref_rejects_code_change() {
         )
         .unwrap();
     let best = code_change::best_ref(&harness.campaign_id).unwrap();
-    let best_path = harness
-        .root
-        .join(".git")
-        .join("refs/heads")
-        .join(best);
+    let best_path = harness.root.join(".git").join("refs/heads").join(best);
     fs::create_dir_all(best_path.parent().unwrap()).unwrap();
     fs::write(best_path, b"not-a-ref\n").unwrap();
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2166,10 +2582,7 @@ async fn invalid_present_best_ref_rejects_code_change() {
         .find(|proposal| proposal.kind == ProposalKind::CodeChange)
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Rejected);
-    assert_eq!(
-        proposal.reject_reason.as_deref(),
-        Some("best_ref_invalid")
-    );
+    assert_eq!(proposal.reject_reason.as_deref(), Some("best_ref_invalid"));
     assert!(CodeChangeRepository::new(&harness.db)
         .find_by_proposal(&proposal.proposal_id)
         .unwrap()
@@ -2202,7 +2615,11 @@ async fn symlinked_best_ref_parent_rejects_code_change() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2220,10 +2637,7 @@ async fn symlinked_best_ref_parent_rejects_code_change() {
         .find(|proposal| proposal.kind == ProposalKind::CodeChange)
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Rejected);
-    assert_eq!(
-        proposal.reject_reason.as_deref(),
-        Some("best_ref_invalid")
-    );
+    assert_eq!(proposal.reject_reason.as_deref(), Some("best_ref_invalid"));
 }
 
 #[cfg(unix)]
@@ -2265,7 +2679,11 @@ async fn same_name_best_tag_is_ignored_for_code_change_base_resolution() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2352,7 +2770,11 @@ async fn packed_best_branch_is_selected_for_code_change_base_resolution() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2398,7 +2820,11 @@ async fn corrupt_packed_best_ref_rejects_without_campaign_base_fallback() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2417,10 +2843,7 @@ async fn corrupt_packed_best_ref_rejects_without_campaign_base_fallback() {
         .find(|proposal| proposal.kind == ProposalKind::CodeChange)
         .unwrap();
     assert_eq!(proposal.status, ProposalStatus::Rejected);
-    assert_eq!(
-        proposal.reject_reason.as_deref(),
-        Some("best_ref_invalid")
-    );
+    assert_eq!(proposal.reject_reason.as_deref(), Some("best_ref_invalid"));
 }
 
 #[cfg(unix)]
@@ -2448,7 +2871,11 @@ async fn duplicate_orphan_packed_best_ref_records_reject_without_campaign_base_f
         let canonical_root = fs::canonicalize(&harness.root).unwrap();
         let policy = execution_policy_fixture::resolved_policy(
             harness.temp.path(),
-            &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+            &[(
+                "decision-project",
+                canonical_root.as_path(),
+                Path::new("codex"),
+            )],
         );
 
         let report = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2465,7 +2892,11 @@ async fn duplicate_orphan_packed_best_ref_records_reject_without_campaign_base_f
             .into_iter()
             .find(|proposal| proposal.kind == ProposalKind::CodeChange)
             .unwrap();
-        assert_eq!(proposal.status, ProposalStatus::Rejected, "record: {record}");
+        assert_eq!(
+            proposal.status,
+            ProposalStatus::Rejected,
+            "record: {record}"
+        );
         assert_eq!(
             proposal.reject_reason.as_deref(),
             Some("best_ref_invalid"),
@@ -2567,7 +2998,11 @@ async fn rejected_code_change_replay_is_not_reported_applied() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
 
     let first = DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
@@ -2587,7 +3022,12 @@ async fn rejected_code_change_replay_is_not_reported_applied() {
         .unwrap()
         .unwrap();
     CodeChangeRepository::new(&harness.db)
-        .reject(&run.code_change_run_id, "check_failed", "checks failed", 350)
+        .reject(
+            &run.code_change_run_id,
+            "check_failed",
+            "checks failed",
+            350,
+        )
         .unwrap();
     harness
         .db
@@ -2629,7 +3069,11 @@ async fn orphan_pending_code_change_replay_is_durably_rejected() {
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let policy = execution_policy_fixture::resolved_policy(
         harness.temp.path(),
-        &[("decision-project", canonical_root.as_path(), Path::new("codex"))],
+        &[(
+            "decision-project",
+            canonical_root.as_path(),
+            Path::new("codex"),
+        )],
     );
     DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
         .with_policy(&policy)
@@ -2640,7 +3084,10 @@ async fn orphan_pending_code_change_replay_is_durably_rejected() {
         .db
         .connect()
         .unwrap()
-        .execute("DELETE FROM code_change_runs WHERE campaign_id = ?1", [&harness.campaign_id])
+        .execute(
+            "DELETE FROM code_change_runs WHERE campaign_id = ?1",
+            [&harness.campaign_id],
+        )
         .unwrap();
     harness
         .db
@@ -2771,13 +3218,19 @@ async fn campaign_submit_first_experiment_creates_baseline_and_one_pueue_task() 
         .find_by_id(&result.submission_id)
         .unwrap()
         .unwrap();
-    assert_eq!(stored.argv, vec!["python".to_owned(), "train.py".to_owned()]);
+    assert_eq!(
+        stored.argv,
+        vec!["python".to_owned(), "train.py".to_owned()]
+    );
     let add_args = harness.fake.last_add_args();
     let sep = add_args.iter().position(|a| a == "--").unwrap();
     let runtime = &add_args[sep + 1..];
     assert_eq!(runtime[0], OsString::from("/usr/bin/env"));
     assert_eq!(runtime.len(), 1 + 4 + 2);
-    assert_eq!(&runtime[5..], &[OsString::from("python"), OsString::from("train.py")]);
+    assert_eq!(
+        &runtime[5..],
+        &[OsString::from("python"), OsString::from("train.py")]
+    );
     // verify durable group/root still used (not caller mutated) – wrapper correctness is covered by dedicated test
     assert_eq!(add_args[1], OsString::from("pa-project"));
 }
@@ -2926,10 +3379,7 @@ async fn experiment_submit_with_root_anchor_does_not_execute_a_local_clean_filte
     let filter = harness._temp.path().join("clean-filter.sh");
     fs::write(
         &filter,
-        format!(
-            "#!/bin/sh\n/bin/touch {}\n/bin/cat\n",
-            marker.display()
-        ),
+        format!("#!/bin/sh\n/bin/touch {}\n/bin/cat\n", marker.display()),
     )
     .unwrap();
     let mut permissions = fs::metadata(&filter).unwrap().permissions();
@@ -3221,7 +3671,13 @@ async fn experiment_admission_holds_lock_until_pueue_add() {
     .await
     .unwrap_err();
 
-    assert!(matches!(control, AppError::Validation { field: "submit", .. }));
+    assert!(matches!(
+        control,
+        AppError::Validation {
+            field: "submit",
+            ..
+        }
+    ));
     assert!(matches!(
         batch,
         AppError::Validation {
@@ -3392,11 +3848,8 @@ async fn campaign_submit_control_remains_a_legacy_one_off_without_a_live_campaig
 async fn campaign_submit_reserved_intent_resumes_with_exactly_one_add() {
     let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
     let intent = harness.reserve_baseline(&["python", "train.py"]);
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    );
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default());
 
     let result = coordinator
         .submit_accepted_intent(&intent, &harness.project(), 101)
@@ -3415,6 +3868,828 @@ async fn campaign_submit_reserved_intent_resumes_with_exactly_one_add() {
     );
 }
 
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_uses_nested_candidate_cwd_and_durable_argv() {
+    let fixture = candidate_submission_fixture("nested").await;
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+
+    let submission = match coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 306)
+        .await
+        .unwrap()
+    {
+        CampaignSubmission::Submitted(submission) => submission,
+        CampaignSubmission::Deferred => panic!("candidate submission unexpectedly deferred"),
+    };
+
+    assert_eq!(submission.argv, vec!["python", "train.py"]);
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+    let add_args = fixture.harness.pueue.last_add_args();
+    assert_eq!(add_args[0], OsString::from("-g"));
+    assert_eq!(add_args[1], OsString::from("decision-group"));
+    assert_eq!(add_args[2], OsString::from("--working-directory"));
+    assert_eq!(
+        PathBuf::from(&add_args[3]),
+        fixture.candidate_root.join("nested")
+    );
+    let separator = add_args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap();
+    let runtime = &add_args[separator + 1..];
+    assert_eq!(runtime[0], OsString::from("/usr/bin/env"));
+    assert_eq!(
+        &runtime[runtime.len() - 2..],
+        &[OsString::from("python"), OsString::from("train.py")]
+    );
+    let candidate_root = fixture.candidate_root.to_string_lossy().into_owned();
+    for name in [
+        "PUEUE_AGENT_EXPERIMENT_ID=",
+        "PUEUE_AGENT_CAMPAIGN_ID=",
+        "PUEUE_AGENT_RESULT_PATH=",
+        "PUEUE_AGENT_ARTIFACT_DIR=",
+    ] {
+        assert!(runtime[1..5].iter().any(|value| {
+            value.to_string_lossy().starts_with(name)
+                && (name.ends_with("ID=")
+                    || value.to_string_lossy().contains(candidate_root.as_str()))
+        }));
+    }
+    for name in [
+        "TMPDIR=",
+        "TMP=",
+        "TEMP=",
+        "CARGO_TARGET_DIR=",
+        "UV_PROJECT_ENVIRONMENT=",
+        "UV_CACHE_DIR=",
+        "UV_PYTHON_INSTALL_DIR=",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PYTEST_ADDOPTS=-o \"cache_dir=",
+    ] {
+        assert!(runtime[5..runtime.len() - 2].iter().any(|value| {
+            value.to_string_lossy().starts_with(name)
+                && (name == "PYTHONDONTWRITEBYTECODE=1"
+                    || value.to_string_lossy().contains(candidate_root.as_str()))
+        }), "missing runtime output assignment {name}: {runtime:?}");
+    }
+    let run = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, CodeChangeState::ExperimentSubmitted);
+    assert!(run.candidate_working_directory_identity.is_some());
+    let experiment_id = run.experiment_id.clone().unwrap();
+    let service_root = fixture.candidate_root.join(".pueue-agent");
+    let results_root = service_root.join("results");
+    let artifacts_root = service_root.join("artifacts");
+    let artifact_run = artifacts_root.join(&experiment_id);
+    let result_manifest = results_root.join(format!("{experiment_id}.json"));
+    for directory in [&service_root, &results_root, &artifacts_root, &artifact_run] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+            0o700,
+            "runtime directory must be private: {}",
+            directory.display()
+        );
+    }
+    assert_eq!(
+        fs::metadata(&result_manifest)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert!(result_manifest.is_file());
+    let experiment = ExperimentRepository::new(&fixture.harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        experiment.code_change_run_id.as_deref(),
+        Some(fixture.run_id.as_str())
+    );
+    assert_eq!(experiment.code_revision_sha, run.candidate_sha);
+    assert_eq!(
+        SubmissionRepository::new(&fixture.harness.db)
+            .find_by_id(&submission.submission_id)
+            .unwrap()
+            .unwrap()
+            .argv,
+        vec!["python", "train.py"]
+    );
+
+    let replay = match coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 307)
+        .await
+        .unwrap()
+    {
+        CampaignSubmission::Submitted(replay) => replay,
+        CampaignSubmission::Deferred => panic!("accepted candidate replay unexpectedly deferred"),
+    };
+    assert_eq!(replay.submission_id, submission.submission_id);
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_defers_paused_replay_without_runtime_side_effects() {
+    let fixture = candidate_submission_fixture("nested").await;
+    let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
+    let submission_id = format!("code-change-submission:{}", fixture.run_id);
+    let intent = CampaignRepository::new(&fixture.harness.db)
+        .accept_code_change_candidate(
+            &fixture.run_id,
+            &experiment_id,
+            &submission_id,
+            306,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    assert_eq!(intent.experiment.status, ExperimentStatus::Reserved);
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.harness.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        CodeChangeState::ExperimentSubmitted
+    );
+
+    let stale_intent = CampaignRepository::new(&fixture.harness.db)
+        .list_reserved_submission_intents(100)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.experiment.experiment_id == experiment_id)
+        .expect("accepted candidate must be visible before the pause");
+    let experiment_count: i64 = fixture
+        .harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM experiments", [], |row| row.get(0))
+        .unwrap();
+    let budget_before = CampaignRepository::new(&fixture.harness.db)
+        .status_projection_for_project("decision-project", 306)
+        .unwrap()
+        .unwrap();
+    let service_root = fixture.candidate_root.join(".pueue-agent");
+    assert!(!service_root.exists());
+
+    ProjectRepository::new(&fixture.harness.db)
+        .pause("decision-project", 307)
+        .unwrap();
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+
+    for now in [308, 309] {
+        assert!(matches!(
+            coordinator
+                .submit_reserved_intent(&stale_intent, &fixture.project, now)
+                .await
+                .unwrap(),
+            CampaignSubmission::Deferred
+        ));
+        assert_eq!(fixture.harness.pueue.add_calls(), 0);
+        assert!(!service_root.exists());
+        assert_eq!(
+            fixture
+                .harness
+                .db
+                .connect()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM experiments", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            experiment_count
+        );
+        let experiment = ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(experiment.status, ExperimentStatus::Reserved);
+        assert_eq!(experiment.submission_id, submission_id);
+        assert_eq!(
+            SubmissionRepository::new(&fixture.harness.db)
+                .find_by_id(&submission_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SubmissionStatus::Pending
+        );
+        assert_eq!(
+            CampaignRepository::new(&fixture.harness.db)
+                .status_projection_for_project("decision-project", now)
+                .unwrap()
+                .unwrap(),
+            budget_before
+        );
+        let run = CodeChangeRepository::new(&fixture.harness.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.state, CodeChangeState::ExperimentSubmitted);
+        assert_eq!(run.experiment_id.as_deref(), Some(experiment_id.as_str()));
+    }
+
+    ProjectRepository::new(&fixture.harness.db)
+        .resume("decision-project", 310)
+        .unwrap();
+    assert!(matches!(
+        coordinator
+            .submit_reserved_intent(&stale_intent, &fixture.project, 311)
+            .await
+            .unwrap(),
+        CampaignSubmission::Submitted(_)
+    ));
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+    let run = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.experiment_id.as_deref(), Some(experiment_id.as_str()));
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .submission_id,
+        submission_id
+    );
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_defers_campaign_paused_replay_before_runtime() {
+    let fixture = candidate_submission_fixture("nested").await;
+    let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
+    let submission_id = format!("code-change-submission:{}", fixture.run_id);
+    CampaignRepository::new(&fixture.harness.db)
+        .accept_code_change_candidate(
+            &fixture.run_id,
+            &experiment_id,
+            &submission_id,
+            306,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    let stale_intent = CampaignRepository::new(&fixture.harness.db)
+        .list_reserved_submission_intents(100)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.experiment.experiment_id == experiment_id)
+        .expect("accepted candidate must be visible before campaign pause");
+    let rolling_usage_before = CampaignRepository::new(&fixture.harness.db)
+        .status_projection_for_project("decision-project", 306)
+        .unwrap()
+        .unwrap()
+        .rolling_usage;
+    let service_root = fixture.candidate_root.join(".pueue-agent");
+    assert!(!service_root.exists());
+
+    CampaignRepository::new(&fixture.harness.db)
+        .pause("decision-project", 307)
+        .unwrap();
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+    assert!(matches!(
+        coordinator
+            .submit_reserved_intent(&stale_intent, &fixture.project, 308)
+            .await
+            .unwrap(),
+        CampaignSubmission::Deferred
+    ));
+    assert_eq!(fixture.harness.pueue.add_calls(), 0);
+    assert!(!service_root.exists());
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
+    );
+    assert_eq!(
+        SubmissionRepository::new(&fixture.harness.db)
+            .find_by_id(&submission_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SubmissionStatus::Pending
+    );
+    assert_eq!(
+        CampaignRepository::new(&fixture.harness.db)
+            .status_projection_for_project("decision-project", 308)
+            .unwrap()
+            .unwrap()
+            .rolling_usage,
+        rolling_usage_before
+    );
+
+    CampaignRepository::new(&fixture.harness.db)
+        .resume("decision-project", 309)
+        .unwrap();
+    assert!(matches!(
+        coordinator
+            .submit_reserved_intent(&stale_intent, &fixture.project, 310)
+            .await
+            .unwrap(),
+        CampaignSubmission::Submitted(_)
+    ));
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_allows_ignored_python_check_caches() {
+    let fixture = candidate_submission_fixture("nested").await;
+    let pytest_cache = fixture.candidate_root.join(".pytest_cache");
+    let pycache = fixture.candidate_root.join("nested/__pycache__");
+    fs::create_dir_all(&pytest_cache).unwrap();
+    fs::create_dir_all(&pycache).unwrap();
+    secure_directory(&pytest_cache);
+    secure_directory(&pycache);
+    fs::write(pytest_cache.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172\n").unwrap();
+    fs::write(pycache.join("train.cpython-311.pyc"), b"cache\n").unwrap();
+    secure_file(&pytest_cache.join("CACHEDIR.TAG"));
+    secure_file(&pycache.join("train.cpython-311.pyc"));
+
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+
+    let submission = coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 306)
+        .await
+        .expect("ignored check caches must not make candidate submission unreconciled");
+    assert!(matches!(submission, CampaignSubmission::Submitted(_)));
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+    let experiment_id = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap()
+        .experiment_id
+        .unwrap();
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Accepted
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn candidate_terminal_result_is_ingested_from_candidate_worktree() {
+    let fixture = candidate_submission_fixture("nested").await;
+    let objective_metric = ObjectiveMetric {
+        name: "validation_loss".to_owned(),
+        direction: MetricDirection::Minimize,
+        min_delta: Some(0.01),
+    };
+    fixture
+        .harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET objective_metric_json = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&objective_metric).unwrap(),
+                fixture.harness.campaign_id
+            ],
+        )
+        .unwrap();
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+
+    let submission = match coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 306)
+        .await
+        .unwrap()
+    {
+        CampaignSubmission::Submitted(submission) => submission,
+        CampaignSubmission::Deferred => panic!("candidate submission unexpectedly deferred"),
+    };
+    let experiment_id = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap()
+        .experiment_id
+        .unwrap();
+    let result_path = fixture
+        .candidate_root
+        .join(".pueue-agent/results")
+        .join(format!("{experiment_id}.json"));
+    fs::create_dir_all(result_path.parent().unwrap()).unwrap();
+    fs::write(
+        &result_path,
+        json!({
+            "schema_version": 1,
+            "experiment_id": experiment_id,
+            "metrics": {"validation_loss": 0.1}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let pytest_cache = fixture.candidate_root.join(".pytest_cache");
+    let pycache = fixture.candidate_root.join("nested/__pycache__");
+    fs::create_dir_all(&pytest_cache).unwrap();
+    fs::create_dir_all(&pycache).unwrap();
+    secure_directory(&pytest_cache);
+    secure_directory(&pycache);
+    fs::write(pytest_cache.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172\n").unwrap();
+    fs::write(pycache.join("train.cpython-311.pyc"), b"cache\n").unwrap();
+    secure_file(&pytest_cache.join("CACHEDIR.TAG"));
+    secure_file(&pycache.join("train.cpython-311.pyc"));
+
+    let add_args = fixture.harness.pueue.last_add_args();
+    let separator = add_args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap();
+    let command = add_args[separator + 1..]
+        .iter()
+        .map(|argument| shell_quote(&argument.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let task_id = submission.pueue_task_id.unwrap();
+    let task = PueueTask {
+        id: task_id,
+        group: "decision-group".to_owned(),
+        command,
+        state: "Done".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: Some("102".to_owned()),
+        result: Some(json!("Success")),
+    };
+    Reconciler::new(&fixture.harness.db, CandidateTerminalPueue { task })
+        .with_execution_policy(Arc::clone(&fixture.policy))
+        .run_once_at(400)
+        .await
+        .unwrap();
+
+    let metrics = pueue_agent::db::MetricsRepository::get(&fixture.harness.db, &experiment_id)
+        .unwrap()
+        .expect("candidate result manifest should be ingested");
+    assert_eq!(metrics.artifact_defect, None);
+    assert_eq!(
+        metrics.primary_metric_name.as_deref(),
+        Some("validation_loss")
+    );
+    assert_eq!(metrics.primary_metric_value, Some(0.1));
+    assert_eq!(metrics.metrics_json, r#"{"validation_loss":0.1}"#);
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Succeeded
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn candidate_terminal_result_rejects_replaced_nested_working_directory() {
+    let fixture = candidate_submission_fixture("nested").await;
+    let objective_metric = ObjectiveMetric {
+        name: "validation_loss".to_owned(),
+        direction: MetricDirection::Minimize,
+        min_delta: Some(0.01),
+    };
+    fixture
+        .harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET objective_metric_json = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&objective_metric).unwrap(),
+                fixture.harness.campaign_id
+            ],
+        )
+        .unwrap();
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+    let submission = match coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 306)
+        .await
+        .unwrap()
+    {
+        CampaignSubmission::Submitted(submission) => submission,
+        CampaignSubmission::Deferred => panic!("candidate submission unexpectedly deferred"),
+    };
+
+    let nested = fixture.candidate_root.join("nested");
+    let replacement = fixture.candidate_root.join("nested-replaced");
+    fs::rename(&nested, &replacement).unwrap();
+    fs::create_dir(&nested).unwrap();
+    secure_directory(&nested);
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o750)).unwrap();
+    let stored_identity = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap()
+        .candidate_working_directory_identity
+        .unwrap();
+    let replacement_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o7777;
+    assert!(!stored_identity.ends_with(&format!(":{replacement_mode}")));
+
+    let add_args = fixture.harness.pueue.last_add_args();
+    let separator = add_args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap();
+    let command = add_args[separator + 1..]
+        .iter()
+        .map(|argument| shell_quote(&argument.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let task = PueueTask {
+        id: submission.pueue_task_id.unwrap(),
+        group: "decision-group".to_owned(),
+        command,
+        state: "Done".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: Some("102".to_owned()),
+        result: Some(json!("Success")),
+    };
+    let error = Reconciler::new(&fixture.harness.db, CandidateTerminalPueue { task })
+        .with_execution_policy(Arc::clone(&fixture.policy))
+        .run_once_at(400)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("working-directory"));
+    assert!(pueue_agent::db::MetricsRepository::get(
+        &fixture.harness.db,
+        &CodeChangeRepository::new(&fixture.harness.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .experiment_id
+            .unwrap(),
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_rejects_unsafe_cwd_before_pueue_add() {
+    for (working_directory, symlink_target, replace_root) in [
+        ("/tmp", None, false),
+        ("../sibling", None, false),
+        ("link", Some("../sibling"), false),
+        (".", None, true),
+    ] {
+        let fixture = candidate_submission_fixture(".").await;
+        let run = CodeChangeRepository::new(&fixture.harness.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap();
+        if replace_root {
+            fs::remove_dir_all(&fixture.candidate_root).unwrap();
+            fs::create_dir_all(&fixture.candidate_root).unwrap();
+            secure_directory(&fixture.candidate_root);
+        }
+        if let Some(target) = symlink_target {
+            let sibling = fixture.candidate_root.parent().unwrap().join("sibling");
+            fs::create_dir_all(&sibling).unwrap();
+            secure_directory(&sibling);
+            std::os::unix::fs::symlink(target, fixture.candidate_root.join("link")).unwrap();
+        }
+        fixture
+            .harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE proposals SET working_directory = ?1 WHERE proposal_id = ?2",
+                rusqlite::params![working_directory, run.proposal_id],
+            )
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+        let coordinator = CampaignCoordinator::new(
+            &fixture.harness.db,
+            &fixture.harness.pueue,
+            CampaignLimits::default(),
+        )
+        .with_root_anchor(root_anchor)
+        .with_execution_policy(&fixture.policy);
+
+        assert!(coordinator
+            .submit_candidate_intent(&fixture.run_id, &fixture.project, 306)
+            .await
+            .is_err());
+        assert_eq!(fixture.harness.pueue.add_calls(), 0);
+        assert_eq!(
+            CodeChangeRepository::new(&fixture.harness.db)
+                .find_by_id(&fixture.run_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            CodeChangeState::CandidateReady
+        );
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_rejects_precreated_runtime_tree_before_pueue_add() {
+    let fixture = candidate_submission_fixture_with_runtime_git(".", true).await;
+    let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
+    let service_root = fixture.candidate_root.join(".pueue-agent");
+    let results_root = service_root.join("results");
+    let result_manifest = results_root.join(format!("{experiment_id}.json"));
+
+    let git_wrapper_count = fixture.harness.temp.path().join("git-wrapper-count");
+    let git_wrapper_experiment = fixture
+        .harness
+        .temp
+        .path()
+        .join("git-wrapper-experiment-id");
+    let git_wrapper_injection_status = fixture
+        .harness
+        .temp
+        .path()
+        .join("git-wrapper-injection-status");
+    fs::write(&git_wrapper_count, b"0").unwrap();
+    fs::write(&git_wrapper_experiment, &experiment_id).unwrap();
+
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+
+    let result = coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 306)
+        .await;
+    let observed_count = fs::read_to_string(&git_wrapper_count).unwrap();
+    let observed_count_number = observed_count.trim().parse::<usize>().unwrap();
+    let injection_status = fs::read_to_string(&git_wrapper_injection_status)
+        .unwrap_or_else(|error| format!("missing status: {error}"));
+    assert!(
+        result.is_err(),
+        "precreated runtime tree unexpectedly passed; ignored-status count={observed_count:?}"
+    );
+    assert!(
+        observed_count_number >= 3,
+        "runtime fixture was not reached; status={injection_status:?}, ignored-status count={observed_count:?}"
+    );
+    assert!(
+        result_manifest.is_file(),
+        "runtime fixture was not created; status={injection_status:?}, ignored-status count={observed_count:?}"
+    );
+    assert_eq!(fixture.harness.pueue.add_calls(), 0);
+    assert_eq!(
+        CodeChangeRepository::new(&fixture.harness.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        CodeChangeState::RecoveryRequired
+    );
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Reserved
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_candidate_restart_reuses_submission_reconciliation_without_duplicate_add()
+{
+    let fixture = candidate_submission_fixture("nested").await;
+    let run = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
+    let submission_id = format!("code-change-submission:{}", fixture.run_id);
+    let intent = CampaignRepository::new(&fixture.harness.db)
+        .accept_code_change_candidate(
+            &fixture.run_id,
+            &experiment_id,
+            &submission_id,
+            306,
+            &CampaignLimits::default(),
+        )
+        .unwrap()
+        .accepted()
+        .unwrap();
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+    let nested_metadata = fs::metadata(fixture.candidate_root.join("nested")).unwrap();
+    let nested_identity = pueue_agent::execution_policy::ExecutableIdentity {
+        device: nested_metadata.dev(),
+        inode: nested_metadata.ino(),
+        owner: nested_metadata.uid(),
+        mode: nested_metadata.mode() & 0o7777,
+    };
+    CodeChangeRepository::new(&fixture.harness.db)
+        .record_candidate_working_directory_identity(
+            &fixture.run_id,
+            &experiment_id,
+            nested_identity,
+            307,
+        )
+        .unwrap();
+    ExperimentRepository::new(&fixture.harness.db)
+        .mark_submitting(&experiment_id, 307)
+        .unwrap();
+    assert!(coordinator
+        .submit_reserved_intent(&intent, &fixture.project, 307)
+        .await
+        .is_err());
+    assert_eq!(fixture.harness.pueue.add_calls(), 0);
+    assert_eq!(
+        ExperimentRepository::new(&fixture.harness.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        ExperimentStatus::Unreconciled
+    );
+    assert_eq!(
+        run.candidate_sha,
+        CodeChangeRepository::new(&fixture.harness.db)
+            .find_by_id(&fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .candidate_sha
+    );
+}
+
 #[tokio::test]
 async fn campaign_submit_reserved_intent_stays_reserved_after_campaign_pause() {
     let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
@@ -3422,11 +4697,8 @@ async fn campaign_submit_reserved_intent_stays_reserved_after_campaign_pause() {
     CampaignRepository::new(&harness.db)
         .pause("project-a", 101)
         .unwrap();
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    );
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default());
 
     assert!(coordinator
         .submit_accepted_intent(&intent, &harness.project(), 102)
@@ -3456,12 +4728,9 @@ async fn campaign_submit_rejects_a_replaced_startup_pinned_root_before_add() {
         .with_file_name("project-before-replacement");
     fs::rename(&project.root_path, &replaced_root).unwrap();
     fs::create_dir(&project.root_path).unwrap();
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    )
-    .with_root_anchor(root_anchor);
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default())
+            .with_root_anchor(root_anchor);
 
     let error = coordinator
         .submit_accepted_intent(&intent, &project, 101)
@@ -3492,19 +4761,12 @@ async fn campaign_submit_rejects_a_replaced_startup_pinned_root_before_add() {
 async fn campaign_submit_mutated_values_cannot_change_the_durable_pueue_add() {
     let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
     let mut intent = harness.reserve_baseline(&["python", "train.py"]);
-    intent.submission.argv = vec![
-        "sh".to_owned(),
-        "-c".to_owned(),
-        "echo changed".to_owned(),
-    ];
+    intent.submission.argv = vec!["sh".to_owned(), "-c".to_owned(), "echo changed".to_owned()];
     let mut caller_project = harness.project();
     caller_project.pueue_group = "changed-group".to_owned();
     caller_project.root_path = harness.root.join("changed-root");
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    );
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default());
 
     let result = coordinator
         .submit_accepted_intent(&intent, &caller_project, 101)
@@ -3518,7 +4780,10 @@ async fn campaign_submit_mutated_values_cannot_change_the_durable_pueue_add() {
     let sep = add_args.iter().position(|a| a == "--").unwrap();
     let runtime = &add_args[sep + 1..];
     assert_eq!(runtime[0], OsString::from("/usr/bin/env"));
-    assert_eq!(&runtime[5..], &[OsString::from("python"), OsString::from("train.py")]);
+    assert_eq!(
+        &runtime[5..],
+        &[OsString::from("python"), OsString::from("train.py")]
+    );
     assert_eq!(add_args[1], OsString::from("pa-project"));
     assert_eq!(
         add_args[3],
@@ -3531,11 +4796,8 @@ async fn campaign_submit_conflicting_intent_identity_fails_before_pueue_add() {
     let harness = SubmitHarness::with_objective("Reach validation loss below 0.20");
     let mut intent = harness.reserve_baseline(&["python", "train.py"]);
     intent.submission.submission_id = "conflicting-submission".to_owned();
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    );
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default());
 
     let error = coordinator
         .submit_accepted_intent(&intent, &harness.project(), 101)
@@ -3567,11 +4829,8 @@ async fn campaign_submit_restart_after_submitting_before_add_never_readds() {
     ExperimentRepository::new(&harness.db)
         .mark_submitting(&intent.experiment.experiment_id, 101)
         .unwrap();
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    );
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default());
 
     assert!(coordinator
         .submit_accepted_intent(&intent, &harness.project(), 102)
@@ -3597,11 +4856,8 @@ async fn campaign_submit_restart_after_success_before_acceptance_never_readds() 
         .mark_submitting(&intent.experiment.experiment_id, 101)
         .unwrap();
     assert_eq!(harness.fake.add(&[]).await.unwrap(), 41);
-    let coordinator = CampaignCoordinator::new(
-        &harness.db,
-        &harness.fake,
-        CampaignLimits::default(),
-    );
+    let coordinator =
+        CampaignCoordinator::new(&harness.db, &harness.fake, CampaignLimits::default());
 
     assert!(coordinator
         .submit_accepted_intent(&intent, &harness.project(), 102)
@@ -3651,7 +4907,14 @@ fn pueue_group_accepts_bounded_grammar_and_rejects_shell_text() {
     for value in ["pa-project", "A9._-x"] {
         validate_group(value).unwrap();
     }
-    for value in ["", "-bad", "pa project", "pa/project", "pa;touch-x", &"a".repeat(129)] {
+    for value in [
+        "",
+        "-bad",
+        "pa project",
+        "pa/project",
+        "pa;touch-x",
+        &"a".repeat(129),
+    ] {
         assert!(validate_group(value).is_err(), "accepted {value:?}");
     }
 }
@@ -3754,23 +5017,14 @@ async fn command_adapter_provisions_group_without_shell() {
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
-    adapter
-        .ensure_group("pa-project")
-        .await
-        .unwrap();
+    adapter.ensure_group("pa-project").await.unwrap();
 
     assert_eq!(
         fixture.captured_args(),
-        vec![
-            "--config",
-            "/dev/fd/9",
-            "group",
-            "add",
-            "pa-project",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>()
+        vec!["--config", "/dev/fd/9", "group", "add", "pa-project",]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -3801,10 +5055,7 @@ async fn command_adapter_skips_group_add_when_group_already_exists() {
     );
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
-    adapter
-        .ensure_group("pa-project")
-        .await
-        .unwrap();
+    adapter.ensure_group("pa-project").await.unwrap();
 
     assert_eq!(
         fixture.captured_invocations(),
@@ -3825,10 +5076,7 @@ async fn command_adapter_adds_missing_group_after_json_list_check() {
     );
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
-    adapter
-        .ensure_group("pa-project")
-        .await
-        .unwrap();
+    adapter.ensure_group("pa-project").await.unwrap();
 
     assert_eq!(
         fixture.captured_invocations(),
@@ -3837,16 +5085,10 @@ async fn command_adapter_adds_missing_group_after_json_list_check() {
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>(),
-            vec![
-                "--config",
-                "/dev/fd/9",
-                "group",
-                "add",
-                "pa-project",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
+            vec!["--config", "/dev/fd/9", "group", "add", "pa-project",]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
         ]
     );
 }
@@ -3854,12 +5096,7 @@ async fn command_adapter_adds_missing_group_after_json_list_check() {
 #[tokio::test]
 async fn command_adapter_rejects_non_object_group_json() {
     for groups in ["[]", "null", "\"pa-project\""] {
-        let fixture = FakePueueCommand::new_with_group_lists(
-            STATUS_JSON,
-            "73\n",
-            &[groups],
-            None,
-        );
+        let fixture = FakePueueCommand::new_with_group_lists(STATUS_JSON, "73\n", &[groups], None);
         let adapter = configured_pueue(fixture.policy()).unwrap();
 
         let error = adapter.ensure_group("pa-project").await.unwrap_err();
@@ -4145,9 +5382,11 @@ async fn oversized_native_add_argv_is_rejected_before_submission_insert() {
     let fake = FakePueue::new().with_add_task_id(73);
     let command = vec![OsString::from("x"); max_user_add_args + 1];
 
-    assert!(submit_legacy_control(&harness.db, &harness.root, &command, &fake)
-        .await
-        .is_err());
+    assert!(
+        submit_legacy_control(&harness.db, &harness.root, &command, &fake)
+            .await
+            .is_err()
+    );
     assert!(SubmissionRepository::new(&harness.db)
         .find_unreconciled("project-a")
         .unwrap()
@@ -4694,8 +5933,18 @@ async fn campaign_submit_managed_wraps_with_env_and_preserves_durable_argv() {
         "durable argv must remain original user argv"
     );
 
-    let exp_id = stored.metadata.get("experiment_id").and_then(|v| v.as_str()).unwrap().to_owned();
-    let camp_id = stored.metadata.get("campaign_id").and_then(|v| v.as_str()).unwrap().to_owned();
+    let exp_id = stored
+        .metadata
+        .get("experiment_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_owned();
+    let camp_id = stored
+        .metadata
+        .get("campaign_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_owned();
     let experiment = ExperimentRepository::new(&harness.db)
         .find_by_id(&exp_id)
         .unwrap()
@@ -4704,7 +5953,10 @@ async fn campaign_submit_managed_wraps_with_env_and_preserves_durable_argv() {
         .find_by_id(&experiment.proposal_id)
         .unwrap()
         .unwrap();
-    assert_eq!(proposal.argv, expected_user, "proposal argv must remain original user argv");
+    assert_eq!(
+        proposal.argv, expected_user,
+        "proposal argv must remain original user argv"
+    );
     let objective = pueue_agent::state::load_objective(&harness.root).unwrap();
     let expected_proposal = pueue_agent::proposals::validate_initial_baseline(
         pueue_agent::proposals::ProposalInput {
@@ -4719,19 +5971,29 @@ async fn campaign_submit_managed_wraps_with_env_and_preserves_durable_argv() {
     )
     .unwrap();
     assert_eq!(
-        proposal.canonical_digest, expected_proposal.canonical_digest(),
+        proposal.canonical_digest,
+        expected_proposal.canonical_digest(),
         "proposal canonical digest must match original user argv"
     );
 
     let add_args = harness.fake.last_add_args();
-    let sep = add_args.iter().position(|a| a == "--").expect("missing -- separator");
+    let sep = add_args
+        .iter()
+        .position(|a| a == "--")
+        .expect("missing -- separator");
     let runtime = &add_args[sep + 1..];
     let canonical_root = fs::canonicalize(&harness.root).unwrap();
     let expected_runtime: Vec<OsString> = {
         let mut v = Vec::with_capacity(7);
         v.push(OsString::from("/usr/bin/env"));
-        v.push(OsString::from(format!("PUEUE_AGENT_EXPERIMENT_ID={}", exp_id)));
-        v.push(OsString::from(format!("PUEUE_AGENT_CAMPAIGN_ID={}", camp_id)));
+        v.push(OsString::from(format!(
+            "PUEUE_AGENT_EXPERIMENT_ID={}",
+            exp_id
+        )));
+        v.push(OsString::from(format!(
+            "PUEUE_AGENT_CAMPAIGN_ID={}",
+            camp_id
+        )));
         let mut result_path = OsString::from("PUEUE_AGENT_RESULT_PATH=");
         result_path.push(canonical_root.as_os_str().to_owned());
         result_path.push("/.pueue-agent/results/");
@@ -4747,7 +6009,8 @@ async fn campaign_submit_managed_wraps_with_env_and_preserves_durable_argv() {
         v
     };
     assert_eq!(
-        runtime, expected_runtime.as_slice(),
+        runtime,
+        expected_runtime.as_slice(),
         "complete runtime vector must match hand-built expectations"
     );
 }
@@ -4805,7 +6068,11 @@ async fn campaign_submit_post_add_identity_expects_runtime_command() {
                     .iter()
                     .map(|s| {
                         let s = s.to_string_lossy();
-                        if s.contains(' ') { format!("'{}'", s) } else { s.into_owned() }
+                        if s.contains(' ') {
+                            format!("'{}'", s)
+                        } else {
+                            s.into_owned()
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -4836,8 +6103,7 @@ async fn campaign_submit_post_add_identity_expects_runtime_command() {
         inner: FakePueue::new(),
         expected_original: vec![OsString::from("python"), OsString::from("train.py")],
     };
-    let coordinator =
-        CampaignCoordinator::new(&harness.db, &mismatched, CampaignLimits::default());
+    let coordinator = CampaignCoordinator::new(&harness.db, &mismatched, CampaignLimits::default());
     let result = coordinator
         .submit_accepted_intent(&intent, &project, 101)
         .await;

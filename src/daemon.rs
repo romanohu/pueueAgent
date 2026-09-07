@@ -34,7 +34,9 @@ use crate::{
 };
 
 #[cfg(unix)]
-use crate::code_change::CodeChangeCoordinator;
+use crate::code_change::{list_recoverable_code_change_runs, CodeChangeCoordinator};
+#[cfg(unix)]
+use crate::models::CodeChangeState;
 
 const DAEMON_RESTART_REASON: &str = "agent run interrupted by daemon restart";
 
@@ -168,8 +170,74 @@ where
                     &indeterminate_pending_marker_ids,
                     &indeterminate_release_requested_ids,
                 )?;
+
+            #[cfg(unix)]
+            {
+                let runner = self.runner.as_ref().ok_or(AppError::Runtime {
+                    operation: "borrow daemon code-change runner for startup recovery",
+                })?;
+                let mut code_changes = CodeChangeCoordinator::new(
+                    &self.db,
+                    runner,
+                    self.policy.as_ref(),
+                    self.policy.campaign_limits,
+                )
+                .with_lease_seconds(self.config.lease_seconds)
+                .recover_startup_editors(
+                    now,
+                    &recovery.preserved_code_change_editor_run_ids,
+                    &policies,
+                    &confirmed_pending_marker_ids,
+                    &confirmed_release_requested_ids,
+                    &indeterminate_pending_marker_ids,
+                    &indeterminate_release_requested_ids,
+                )
+                .await?;
+                report.code_changes.started += code_changes.started.len();
+                report.code_changes.advanced += code_changes.advanced;
+                report.code_changes.deferred += code_changes.deferred;
+                report.code_changes.rejected += code_changes.rejected;
+                report.code_changes.cleanup += code_changes.cleanup.len();
+                self.active_agents.extend(
+                    code_changes
+                        .started
+                        .drain(..)
+                        .map(|started| started.handle),
+                );
+                self.active_cleanups.extend(code_changes.cleanup.drain(..));
+            }
+
             let campaigns = CampaignRepository::new(&self.db);
             campaigns.recover_submission_boundaries(now)?;
+
+            #[cfg(unix)]
+            {
+                let runner = self.runner.as_ref().ok_or(AppError::Runtime {
+                    operation: "borrow daemon code-change runner for interrupted recovery",
+                })?;
+                let mut code_changes = CodeChangeCoordinator::new(
+                    &self.db,
+                    runner,
+                    self.policy.as_ref(),
+                    self.policy.campaign_limits,
+                )
+                .with_lease_seconds(self.config.lease_seconds)
+                .recover_interrupted(now, self.config.claim_limit)
+                .await?;
+                report.code_changes.started += code_changes.started.len();
+                report.code_changes.advanced += code_changes.advanced;
+                report.code_changes.deferred += code_changes.deferred;
+                report.code_changes.rejected += code_changes.rejected;
+                report.code_changes.cleanup += code_changes.cleanup.len();
+                self.active_agents.extend(
+                    code_changes
+                        .started
+                        .drain(..)
+                        .map(|started| started.handle),
+                );
+                self.active_cleanups.extend(code_changes.cleanup.drain(..));
+            }
+
             self.startup_recovery_pending = false;
             report.recovered_agent_runs = recovery.failed_runs;
             report.requeued_agent_events = recovery.requeued_events;
@@ -216,13 +284,11 @@ where
             .with_lease_seconds(self.config.lease_seconds)
             .advance_ready(now, self.config.claim_limit)
             .await?;
-            report.code_changes = CodeChangeLoopReport {
-                started: code_changes.started.len(),
-                advanced: code_changes.advanced,
-                deferred: code_changes.deferred,
-                rejected: code_changes.rejected,
-                cleanup: code_changes.cleanup.len(),
-            };
+            report.code_changes.started += code_changes.started.len();
+            report.code_changes.advanced += code_changes.advanced;
+            report.code_changes.deferred += code_changes.deferred;
+            report.code_changes.rejected += code_changes.rejected;
+            report.code_changes.cleanup += code_changes.cleanup.len();
             self.active_agents.extend(
                 code_changes
                     .started
@@ -304,6 +370,46 @@ where
 
     async fn dispatch_reserved_campaign_submissions(&self, now: i64) -> Result<(), AppError> {
         let campaigns = CampaignRepository::new(&self.db);
+        #[cfg(unix)]
+        for run in list_recoverable_code_change_runs(&self.db, 100)?
+            .into_iter()
+            .filter(|run| run.state == CodeChangeState::CandidateReady)
+        {
+            let Some(campaign) = campaigns.find_by_id(&run.campaign_id)? else {
+                continue;
+            };
+            if campaign.state != crate::models::CampaignState::Active {
+                continue;
+            }
+            let project = ProjectRepository::new(&self.db)
+                .find_by_id(&campaign.project_id)?
+                .ok_or(AppError::Runtime {
+                    operation: "read candidate project during reserved submission dispatch",
+                })?;
+            if !project.enabled || project.paused || project.halted_reason.is_some() {
+                continue;
+            }
+            let root_anchor = self
+                .policy
+                .project_root_anchor(&project.root_path)
+                .map_err(AppError::from)?;
+            let result = CampaignCoordinator::new(
+                &self.db,
+                &self.pueue,
+                self.policy.campaign_limits,
+            )
+            .with_root_anchor(root_anchor)
+            .with_execution_policy(self.policy.as_ref())
+            .submit_candidate_intent(&run.code_change_run_id, &project, now)
+            .await;
+            match result {
+                Ok(CampaignSubmission::Submitted(_)) | Ok(CampaignSubmission::Deferred) => {}
+                Err(AppError::Runtime {
+                    operation: "acquire project submission admission lock",
+                }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
         let intents = campaigns.list_reserved_submission_intents(100)?;
         for intent in intents {
             let project = ProjectRepository::new(&self.db)
@@ -321,6 +427,7 @@ where
                 self.policy.campaign_limits,
             )
             .with_root_anchor(root_anchor)
+            .with_execution_policy(self.policy.as_ref())
             .submit_reserved_intent(&intent, &project, now)
             .await;
             match result {

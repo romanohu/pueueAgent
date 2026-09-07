@@ -15,6 +15,8 @@
 - Linux の systemd user service または macOS の launchd user service を利用できるユーザー環境
 - `agent.program` に設定する agent executable。既定テンプレートでは `codex` が利用でき、`CODEX_HOME`（未指定時は `$HOME/.codex`）に必要な Codex 環境が用意されていること
 - 実験を実行するプロジェクトディレクトリ
+- `code_change` を使う場合は、clean な committed `HEAD` を持つ Git project と、execution policy から検証できる Git executable。Rust/Python の project check は、検出された構成に応じて `cargo`、`uv`、または `python` が必要です。
+- `code_change` の editor/check/candidate experiment は root で実行できません。custom editor を指定する場合は、execution policy に登録した trusted native executable を用意してください。
 
 ## インストール
 
@@ -66,6 +68,8 @@ pueue-agent submit -- python train.py
 - `.pueue-agent/state.json`: agent 用の bounded scratch projection。campaign、objective、budget、lineage の正本は SQLite
 - `.pueue-agent/instructions.md`: agent に渡すプロジェクト指示のテンプレート
 - `.pueue-agent/logs/`: プロジェクトログのディレクトリ
+
+Git project では、`init` が tracked な `.gitignore` を変更せず、Git の common `info/exclude` に `/.pueue-agent/` を追加します。これにより service state が code-change の clean な基準に混ざりません。check と candidate runtime の生成物は service-owned な bounded scope に置かれ、再起動時に所有権を証明できない残存 scope は再利用せず保全して停止します。
 
 既存の `config.toml` があるプロジェクトでは、初期化は上書きせず失敗します。
 
@@ -155,11 +159,27 @@ decision analysis も agent-run hourly budget を消費します。1 cycle の�
 
 実行中 experiment は periodic observer によって継続評価されます。同じ class の信号が繰り返されるか log が stall すると experiment は `suspicious` になり、1 回の read-only diagnosis agent が bounded な証拠から原因と推奨 action（`continue` / `kill_and_resume` / `kill_and_escalate`）を返します。破壊的な action は確認済みの termination request を必要とし、`kill_and_resume` は live repair 予算が残る場合に限り同一 argv の後継 experiment を 1 つだけ再投入します。diagnosis の試行回数と signal 要約は上限付きで、生の log 行が SQLite に保存されることはありません。現在の状態は `pueue-agent status` の `health:` 行と `status --json` の `health.recent` で確認できます。
 
-Phase 3 の running health は、実行中 experiment を `running OOM/stall observer` 付きの `periodic observer` で継続評価します。
+Phase 3 の running health は、実行中 experiment を `running OOM/stall observer` 付きの `periodic observer` で継続評価します。これは既存の terminal completion loop と併用され、実行中の異常を `suspicious`、diagnosing、action pending として bounded に投影します。
 
 Phase 4 の evaluation は、campaign が `--metric-name` / `--metric-direction`（任意に `--metric-min-delta`）で宣言した objective metric に対して experiment task の `PUEUE_AGENT_RESULT_PATH` に書き出された result manifest（`schema_version:1`, `experiment_id`, `metrics`）を terminal projection 時に発見・検証し、`experiment_metrics` に永続化します。検証では有限数値のみを受理し、欠損や不一致は `artifact_defect`（`result_missing` / `result_invalid`）として記録して experiment の成否には影響しません。`current_best_experiment_id` と `plateau_count` は promotion で更新され、`minimize` は `value < best - delta`、`maximize` は `value > best + delta` で改善とみなし、改善で best を更新して plateau をリセット、非改善の `succeeded` では plateau をインクリメントし、`plateau_threshold`（既定 3, 1..20）到達で `strategy-refresh` の operator wake を round ごとに一度だけ発火します。決定は `goal_reached`（`evidence_ref` 必須、metrics row を参照）を返すと campaign を `goal_reached_pending_review` に遷移させ、`pueue-agent campaign review accept|reject [--note]` で確定（accept は `retired:goal_accepted`、reject は `active` に戻し該当 `goal_reached` 決定を dead-letter 化）します。いずれも `pueue-agent status` の `best:` / `plateau:` 行と `status --json` の `campaign.best_*` / `plateau_count` / `evaluation.recent`（最大 50 件）で観測できます。Managed experiment の Pueue 追加は `/usr/bin/env` で4つの派生変数（`PUEUE_AGENT_EXPERIMENT_ID` 等）が `NAME=value` 形式で注入された後に user argv が続き、Pueue の生コマンド表示はラップを含みます（direct/control はラップされません）。ログ解析は promotion しません。
 
-`goal review` は Phase 4 で `goal_reached` 決定を operator が承認/拒否するフローとして提供され、後続 phase の隔離された `code worktree` は Phase 5 の範囲です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
+`goal review` は Phase 4 で `goal_reached` 決定を operator が承認/拒否するフローとして提供済みです。隔離された `code worktree` を使う Phase 5 の `code_change` pipeline も実装済みで、通常の decision agent が返した proposal を内部 coordinator が処理します。後続 phase に残るのは trusted native editor の OS レベル containment を扱う Phase 6 です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
+
+## code_change を使う場合の前提と流れ
+
+`code_change` は `pueue-agent submit --kind` の公開 submission kind ではありません。通常の campaign の decision agent が返す proposal kind であり、新しい project 固有 adapter や controller を追加せず、既存の submit、campaign、Pueue、evaluation 経路に接続されます。受理時は code-change budget を 1 slot 消費し、reject になっても戻りません。editor の各 attempt は通常の agent-run hourly budget、candidate experiment は通常の rolling experiment budget と parallelism guardrail を消費し、空きがないと `budget_waiting` になります。
+既定の service policy は `max_code_change_proposals_per_24h=10`、`max_agent_runs_per_hour=6`、`max_new_experiments_per_24h=24`、`max_parallel_experiments=1` です。実効値は immutable execution policy の bounded budget として適用され、proposal、agent run、experiment の reservation を同じ意図で二重作成しません。
+
+1. admission で project root、Git repository、campaign 開始時の clean な committed `HEAD` を確認します。既存の local best ref があればそれを、なければ `campaign.base_revision_sha` を完全な base SHA として使います。dirty、非 Git、Git executable 不在、legacy campaign に `base_revision_sha` がない、または既存 best ref が不正なら code-change proposal だけを reject します。
+2. service-owned state directory の `.pueue-agent/worktrees/<campaign-id>/<proposal-id>` に detached candidate worktree を作り、editor を起動します。初回は fresh session、editor または必須 check の失敗時だけ同じ session を一度 resume し、最大 **2 attempts / 1 session** です。daemon の再起動はこの上限をリセットしません。
+3. `git diff --check` を常に実行し、Cargo/Python の構成を発見して project check を追加します。`Cargo.toml` は `cargo test --all-targets -- --test-threads=1`、`pytest.ini` または `pyproject.toml` の `[tool.pytest.ini_options]` は pytest を対象にし、`uv.lock` があれば `uv run pytest`、なければ `python -m pytest` を選びます。editor の提案 check は発見済み check を削除できず、argv 配列でのみ追加されます。
+4. 変更ファイルは **50 以下**、diff bytes は **500000 以下**、check は **8 以下**、各 check は **30 分以下**、check 出力合計は **64 KiB 以下**です。最終 diff が同じ digest のまま通過した場合だけ candidate commit と local candidate ref を確定し、その commit SHA の worktree を通常の experiment として Pueue に投入します。
+
+candidate ref は `campaign/<campaign-id>/candidate/<proposal-id>`、best ref は `campaign/<campaign-id>/best` です。どちらも local ref であり、main、checkout 中の source branch、remote、無関係な worktree に merge、rebase、push、削除、書き換えを行いません。candidate experiment の OOM、internal failure、timeout、cancel、tracked file mutation、無効な result は promotion 不可で、best ref は変更されません。objective metric の改善が確認できた場合だけ best ref を local CAS で更新します。
+
+custom agent/editor は trusted native executable として execution policy に登録し、argv、candidate cwd、実行ファイル identity、credential 継承を検証します。Phase 5 は process が OS の外へ逃げないことを保証する sandbox ではなく、namespace/container/VM 等の強制 containment は後続の Phase 6 の範囲です。
+
+候補が live の間は、まず `pueue-agent status --json` の `code_changes`、`pueue-agent proposal inspect <proposal-id> --json`、`pueue-agent experiment inspect <experiment-id> --json`、`pueue-agent events --kind code_change --json`、`pueue-agent doctor --json` を読み取り専用で確認します。candidate worktree を直接調べる必要がある場合も、表示済みの base/candidate SHA と照合し、`git status --short`、`git rev-parse --verify HEAD^{commit}`、`git diff --check <base-sha> --`、`git show-ref --verify <campaign-ref>`、`git worktree list --porcelain` の読み取りだけを使います。`git update-ref`、`git checkout`、`git merge`、`git push`、`git worktree prune` や、未知の path の削除は行わないでください。
 
 service-owned execution policy では network が既定で enabled です。ただし network access と credential access は別の権限であり、明示 allowlist にない credential/environment value は agent や agent task に継承されません。
 

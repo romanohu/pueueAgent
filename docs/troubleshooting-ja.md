@@ -51,7 +51,76 @@ CLI ごとに別の profile を混在させないでください。profile の�
 | campaign が `degraded`、reason が `decision_attempts_exhausted` | `status --json` の bounded `failure_code` / `failure_summary` と `doctor --json` | malformed output、launch/output policy failure、または proposal 適用拒否が連続上限に達した | `pueue-agent campaign pause` を実行して原因を確認する。`campaign resume` は exhausted cycle を消去しない。安全に終了できる場合だけ paused campaign を retire し、新しい objective/baseline を開始する |
 | `decision.digests`、`decision.lineage`、`decision.active_attempts` が error | 該当する doctor check 名と件数だけを確認 | stored payload digest、terminal lineage、single-owner attempt の durable invariant が壊れている | campaign を pause し、raw context/decision body を表示・共有・書換えしない。bounded report を管理者へ渡し、doctor から migration/repair を試みない |
 
-decision の status/doctor projection は `cycle_id`、source experiment、state、attempt count、wake、bounded failure facts に限定されます。raw prompt、objective、decision JSON、environment、argv、log excerpt が表示されないことは意図した安全境界です。Phase 3 の running OOM/stall observer は未実装なので、terminal loop の状態だけから実行中 experiment の健康性を推測しないでください。
+decision の status/doctor projection は `cycle_id`、source experiment、state、attempt count、wake、bounded failure facts に限定されます。raw prompt、objective、decision JSON、environment、argv、log excerpt が表示されないことは意図した安全境界です。Phase 3 の `running OOM/stall observer` は実装済みですが、terminal loop の状態とは別に `status` の `health:` 行と `health.recent` で確認します。candidate の code-change 状態も同様に専用の bounded projection で確認します。
+
+## code_change proposal が reject された
+
+`code_change` は `submit --kind` で直接作る submission ではなく、decision agent が返す proposal kind です。まず次の読み取り専用投影を同じ project/profile で確認します。
+
+```bash
+pueue-agent status --json
+pueue-agent proposal list --json
+pueue-agent proposal inspect <proposal-id> --json
+pueue-agent doctor --json
+```
+
+| status / reason | 想定原因 | 安全な対応 |
+| --- | --- | --- |
+| `rejected`、dirty/non-Git/Git 不在 | campaign 開始時に clean な committed `HEAD` を確定できない、または policy の Git executable が利用できない | source project の状態を保存して確認する。通常の非 code campaign は継続できるが、code-change のために作業ツリーを自動 clean したり Git を差し替えたりしない |
+| `base_revision_sha` がない、`best_ref_invalid` | legacy campaign、または存在する `campaign/<campaign-id>/best` が不正 | legacy row を SQL で補わず、既存 campaign の履歴を保持したまま supported な新しい campaign の開始条件を管理者と確認する。不正 best ref に campaign base を暗黙 fallback しない |
+| `code_change.single_live` または同一 proposal の既存 run | campaign に live code-change run が既にある、または durable intent の再送 | 同じ proposal/run の `status` と `events` を確認し、同じ意図を手動で作らない。single-live の解除を SQL で行わない |
+| privileged/root、policy block | code-change editor/check/candidate を root で実行しようとした、または trusted executable/anchor が変化した | root での実行を許可せず、管理者が execution policy と user service を復元して `doctor` を再実行する |
+
+reject 後に code-change budget slot は返却されません。dirty 状態を勝手に commit、stash、reset して base を作ることや、remote から ref を取得して補うことは行わないでください。
+
+## editor、check、candidate の失敗
+
+`status --json` の `code_changes` には `state`、`attempts`、省略 `base_sha`/`candidate_sha`、`experiment_id`/`task_id`、`failed_check`、`next_action`、`cleanup_pending`、bounded `transitions` が表示されます。editor の初回は fresh session で、editor または required check の失敗時だけ同じ session を一度 resume します。合計 **2 attempts / 1 session**で、daemon restart では上限を戻しません。二回目の失敗後は `rejected` になり、同じ session をさらに起動しません。
+
+| 症状 | 想定原因 | 安全な対応 |
+| --- | --- | --- |
+| `editor_launch_failed`、`editor_session_missing`、不正な output | trusted native executable の起動/identity、session binding、strict output schema、`cannot_apply`、空 argv、shell、cwd の absolute/parent traversal | `proposal inspect` と `status --json` の bounded reason だけを確認し、editor output/prompt を SQL や log から再利用しない。policy を弱めず、必要なら管理者が executable を復元する |
+| `failed_check` が `failed` または `timed_out` | project check、`git diff --check`、提案 check の failure/timeout | first failure なら同じ session の一回限りの correction に任せ、second failure は `rejected` として扱う。check output 合計は 64 KiB に制限されるため、raw output を共有しない |
+| candidate policy/limit error | 変更ファイルが 50 超、diff bytes が 500000 超、check が 8 超、check timeout が 30 分超 | candidate を手動で縮小・編集して上限を迂回しない。reject と bounded reason を記録し、必要なら新しい判断を待つ |
+| `candidate_policy_invalid`、tracked mutation | check/commit 前後で candidate root、HEAD、index、tracked source が durable identity と一致しない | candidate/ref を手動修復・更新しない。`recovery_required` または reject として `doctor --json` の worktree/ref check を確認する |
+
+候補を読み取る場合は、まず次のコマンドだけを使います。
+
+```bash
+pueue-agent status --json
+pueue-agent events --kind code_change --limit 20 --json
+pueue-agent experiment inspect <experiment-id> --json
+pueue-agent doctor --json
+git -C <candidate-root> status --short
+git -C <candidate-root> rev-parse --verify HEAD^{commit}
+git -C <candidate-root> diff --check <base-sha> --
+git -C <project-root> show-ref --verify refs/heads/campaign/<campaign-id>/candidate/<proposal-id>
+git -C <project-root> show-ref --verify refs/heads/campaign/<campaign-id>/best
+git -C <project-root> worktree list --porcelain
+```
+
+`git` の読み取り以外、`update-ref`、`checkout`、`merge`、`rebase`、`push`、`worktree prune`、未知 path の削除は候補の復旧操作ではありません。candidate ref と best ref は local ref で、main、checkout 中の source branch、remote、無関係な worktree は変更されません。
+
+## candidate experiment が失敗または promotion されない
+
+candidate commit ができても、candidate SHA の worktree を cwd として投入された通常の experiment が成功し、result manifest と objective metric が有効で改善している場合にだけ best ref が更新されます。OOM、internal failure、Pueue failure、timeout、cancel、tracked mutation、`result_missing`/`result_invalid`、metric の非改善では candidate は promotion 不可で、既存の best ref は変わりません。
+
+```bash
+pueue-agent status --json
+pueue-agent experiment inspect <experiment-id> --json
+pueue-agent events --kind code_change --limit 50 --json
+pueue-agent doctor --json
+```
+
+`status --json` の `next_action` と `cleanup_pending` を確認し、candidate SHA や best ref を手動で書き換えて再評価しないでください。evaluation の metric authority は result manifest の検証済み row であり、log の見た目や raw stdout/stderr は promotion の証拠ではありません。
+
+## restart、recovery、cleanup
+
+daemon を再起動した後も `status --json` の `code_changes[].state`、`attempts`、`candidate_sha`、`experiment_id`、`next_action`、`cleanup_pending` と、`doctor --json` の `code_change.cleanup`、`code_change.refs`、`code_change.worktrees`、`code_change.single_live` を確認します。recovery は durable editor session/attempt、candidate commit/ref、Pueue submission identity を再利用し、editor、commit、task を重複作成しません。publication 前に owned worktree が無ければ bounded に再作成しますが、予期しない path/ref/identity の置換は `recovery_required` で停止します。
+
+`evaluated`、`cleanup_pending`、`rejected` で cleanup marker が残る場合は、live process/task がないことと ownership proof を coordinator が確認してから service-owned cleanup を行います。`cleanup_pending` の間は status に残るのが正常です。`code_change.stale` は stale row の warning であり、自動 retry・editor 再起動・path 削除を意味しません。手動削除、symlink 経由の削除、全体 `git worktree prune`、SQLite の直接更新は行わず、service が running であることを確認して bounded recovery を待ちます。
+
+custom agent/editor は execution policy に登録・検証された trusted native executable ですが、Phase 5 は OS sandbox/container/VM の強制 containment を提供しません。editor/check/candidate は root で実行せず、強制 containment は Phase 6 の境界です。
 
 ## Execution policy を読み込めない
 

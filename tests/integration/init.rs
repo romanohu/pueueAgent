@@ -43,6 +43,155 @@ fn init_creates_toml_state_and_instructions() {
     assert_eq!(loaded.agent.context, AgentContextMode::Fresh);
 }
 
+#[cfg(unix)]
+#[test]
+fn init_anchors_service_state_in_git_info_exclude() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("README.md"), "project\n").unwrap();
+
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "pueue-agent test"],
+        vec!["add", "README.md"],
+        vec!["commit", "--quiet", "-m", "initial"],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let exclude = root.join(".git/info/exclude");
+    fs::write(&exclude, b"# caller-owned rule\n*.local").unwrap();
+    let before = fs::read(&exclude).unwrap();
+    let output = init(&root);
+    assert!(output.status.success());
+
+    let after = fs::read(&exclude).unwrap();
+    assert!(after.starts_with(&before));
+    assert!(
+        after
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == b"/.pueue-agent/")
+    );
+    assert_eq!(
+        after
+            .split(|byte| *byte == b'\n')
+            .filter(|line| *line == b"/.pueue-agent/")
+            .count(),
+        1
+    );
+    assert!(!root.join(".gitignore").is_file());
+    let status = std::process::Command::new("git")
+        .current_dir(&root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(status.stdout.is_empty(), "init left Git changes: {:?}", status.stdout);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_uses_linked_worktree_common_git_exclude() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("main");
+    let linked = temp.path().join("linked");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("README.md"), "project\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "pueue-agent test"],
+        vec!["add", "README.md"],
+        vec!["commit", "--quiet", "-m", "initial"],
+        vec!["worktree", "add", "--quiet", "--detach", linked.to_str().unwrap(), "HEAD"],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(linked.join(".git").is_file());
+
+    let output = init(&linked);
+    assert!(output.status.success());
+    let exclude = root.join(".git/info/exclude");
+    let contents = fs::read(&exclude).unwrap();
+    assert!(contents.split(|byte| *byte == b'\n').any(|line| line == b"/.pueue-agent/"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_git_exclude_symlink_and_hardlink() {
+    use std::os::unix::fs::symlink;
+
+    for hardlink in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let output = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["init", "--quiet"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let exclude = root.join(".git/info/exclude");
+        let external = temp.path().join("external-exclude");
+        fs::write(&external, b"caller-owned\n").unwrap();
+        fs::remove_file(&exclude).unwrap();
+        if hardlink {
+            fs::hard_link(&external, &exclude).unwrap();
+        } else {
+            symlink(&external, &exclude).unwrap();
+        }
+
+        let output = init(&root);
+        assert!(!output.status.success());
+        assert_eq!(fs::read(&external).unwrap(), b"caller-owned\n");
+        assert!(!root.join(".pueue-agent/config.toml").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_fake_git_pointer_before_touching_exclude() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    let fake_common = temp.path().join("fake-common");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir_all(fake_common.join("info")).unwrap();
+    fs::write(fake_common.join("info/exclude"), b"caller-owned\n").unwrap();
+    fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", fake_common.display()),
+    )
+    .unwrap();
+
+    let output = init(&root);
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read(fake_common.join("info/exclude")).unwrap(), b"caller-owned\n");
+    assert!(!root.join(".pueue-agent/config.toml").exists());
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn ordinary_init_container_allows_private_temp_inventory_create_and_removal() {

@@ -186,6 +186,16 @@ pub struct ExecutableIdentity {
     pub mode: u32,
 }
 
+/// Return the bounded, descriptor-derived token used for durable identity
+/// proofs.  Callers must compare this token exactly; it is not a pathname or
+/// a capability that can be reconstructed from one.
+pub(crate) fn executable_identity_token(identity: ExecutableIdentity) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        identity.device, identity.inode, identity.owner, identity.mode
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutableAnchor {
     pub canonical_path: PathBuf,
@@ -408,6 +418,36 @@ impl VerifiedWorkingDirectory {
             identity: self.identity,
             root_identity: self.root_identity,
         })
+    }
+
+    /// Reopen this directory beneath the supplied verified root and require
+    /// the same canonical path and descriptor identity.  A retained
+    /// descriptor alone cannot prove that a pathname passed to an external
+    /// API still names the same directory after a concurrent replacement.
+    pub(crate) fn reverify_under_root(
+        &self,
+        root: &VerifiedProjectRoot,
+    ) -> Result<(), PolicyViolation> {
+        let relative = self
+            .canonical_path
+            .strip_prefix(&root.anchor.canonical_path)
+            .map_err(|_| {
+                PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::NativeGate,
+                )
+            })?;
+        let reopened = Self::open_descendant(root, relative)?;
+        if reopened.canonical_path != self.canonical_path
+            || reopened.identity != self.identity
+            || reopened.root_identity != self.root_identity
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::NativeGate,
+            ));
+        }
+        Ok(())
     }
 }
 

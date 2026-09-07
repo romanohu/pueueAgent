@@ -11,6 +11,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PA_BIN="$REPO_ROOT/bin/pueue-agent"
 REAL_PUEUE="$(command -v pueue)"
 REAL_PUEUED="$(command -v pueued)"
+REAL_GIT="$(command -v git || true)"
+REAL_PYTHON="$(command -v python3 || command -v python || true)"
 ORIGINAL_HOME="${HOME:?HOME is required}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 case "$CARGO_TARGET_DIR" in
@@ -27,6 +29,8 @@ fail() {
   echo "Rust E2E FAIL: $*" >&2
   exit 1
 }
+
+source "$REPO_ROOT/tests/support/agent_call_count.sh"
 
 cleanup() {
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
@@ -99,14 +103,12 @@ wait_for_sql() {
 }
 
 wait_for_agent_calls() {
-  expected="$1"
-  label="$2"
+  project_id="$1"
+  expected="$2"
+  label="$3"
   local deadline=$(( $(date +%s) + 600 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    actual=0
-    if [ -f "$PUEUE_AGENT_TEST_AGENT_LOG" ]; then
-      actual="$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG" || true)"
-    fi
+    actual="$(agent_call_count_for_project "$project_id")"
     if [ "$actual" = "$expected" ]; then
       return 0
     fi
@@ -227,6 +229,32 @@ decision_call_count() {
     "$PUEUE_AGENT_TEST_CODEX_LOG" || true
 }
 
+git_ref_sha() {
+  repo="$1"
+  reference="$2"
+  git -C "$repo" rev-parse --verify "$reference" 2>/dev/null || true
+}
+
+git_diff_digest() {
+  repo="$1"
+  base_sha="$2"
+  candidate_sha="$3"
+  diff_path="$WORK/code-change-diff-$candidate_sha"
+  git -C "$repo" diff-tree --binary "$base_sha" "$candidate_sha" > "$diff_path"
+  "$REAL_PYTHON" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$diff_path"
+}
+
+assert_ml_original_unchanged() {
+  [ "$(git -C "$PROJECT_M" rev-parse refs/heads/main)" = "$ML_MAIN_SHA" ] \
+    || fail "code-change scenario changed original main SHA"
+  [ "$(git -C "$PROJECT_M" hash-object "$PROJECT_M/model.py")" = "$ML_FILE_DIGEST" ] \
+    || fail "code-change scenario changed original model.py"
+  [ "$(git -C "$PROJECT_M" config --local --get-regexp '^remote\.' || true)" = "$ML_REMOTE_CONFIG" ] \
+    || fail "code-change scenario changed remote configuration"
+  [ "$(git -C "$PROJECT_M" worktree list --porcelain)" = "$ML_WORKTREES_BEFORE" ] \
+    || fail "code-change scenario changed unrelated worktree registrations"
+}
+
 insert_campaign_boundary() {
   project_id="$1"
   campaign_id="$2"
@@ -337,6 +365,8 @@ EOF
 
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required"
+[ -n "$REAL_GIT" ] || fail "git is required"
+[ -n "$REAL_PYTHON" ] || fail "python is required"
 
 export HOME="$WORK/home"
 export CARGO_HOME="${CARGO_HOME:-$ORIGINAL_HOME/.cargo}"
@@ -353,6 +383,10 @@ export OPENAI_API_KEY="campaign-openai-key-must-not-reach-decision"
 export AWS_SECRET_ACCESS_KEY="campaign-credential-must-not-reach-agent"
 export WANDB_API_KEY="campaign-wandb-key-must-not-reach-agent"
 export SSH_AUTH_SOCK="campaign-ssh-socket-must-not-reach-agent"
+# Keep interpreter caches out of the immutable candidate worktree.  The
+# candidate boundary permits only the supervisor-owned result/artifact tree;
+# Python bytecode is an incidental fixture output, not experiment evidence.
+export PYTHONDONTWRITEBYTECODE=1
 mkdir -p "$HOME" "$CODEX_HOME" "$XDG_RUNTIME_DIR" "$WORK/bin" "$WORK/pueue"
 chmod 700 "$XDG_RUNTIME_DIR"
 : > "$WORK/defer-kill"
@@ -426,6 +460,8 @@ EOF
 cp "$REPO_ROOT/tests/support/fake_agent.sh" "$WORK/bin/fake-agent.sh"
 cp "$REPO_ROOT/tests/support/fake_codex.sh" "$WORK/bin/codex.sh"
 cp "$(command -v jq)" "$WORK/bin/jq"
+cp "$REAL_GIT" "$WORK/bin/git"
+cp "$REAL_PYTHON" "$WORK/bin/python"
 cat > "$WORK/bin/native-script-runner.rs" <<'EOF'
 use std::{env, os::unix::process::CommandExt, path::PathBuf, process::Command};
 
@@ -467,6 +503,7 @@ esac
 exit 0
 EOF
 chmod +x "$WORK/bin/pueue" "$WORK/bin/bash" "$WORK/bin/cat" "$WORK/bin/dirname" "$WORK/bin/mkdir" "$WORK/bin/sleep" \
+  "$WORK/bin/git" "$WORK/bin/python" \
   "$WORK/bin/jq" "$WORK/bin/fake-agent" "$WORK/bin/capture-agent-environment" "$WORK/bin/codex" \
   "$WORK/bin/launchctl" "$WORK/bin/systemctl"
 export PATH="$WORK/bin:$PATH"
@@ -512,8 +549,9 @@ PROJECT_I="$WORK/i/running-health"
 PROJECT_J="$WORK/j/restart-diagnosis"
 PROJECT_K="$WORK/k/manifest-promotion"
 PROJECT_L="$WORK/l/goal-review"
+PROJECT_M="$WORK/m/python-ml-code-change"
 mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D" \
-  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H" "$PROJECT_I" "$PROJECT_J" "$PROJECT_K" "$PROJECT_L"
+  "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H" "$PROJECT_I" "$PROJECT_J" "$PROJECT_K" "$PROJECT_L" "$PROJECT_M"
 PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_A"
 "$PA_BIN" init "$PROJECT_B"
@@ -527,6 +565,7 @@ PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_J"
 "$PA_BIN" init "$PROJECT_K"
 "$PA_BIN" init "$PROJECT_L"
+"$PA_BIN" init "$PROJECT_M"
 
 CONFIG_A="$PROJECT_A/.pueue-agent/config.toml"
 CONFIG_B="$PROJECT_B/.pueue-agent/config.toml"
@@ -540,9 +579,11 @@ CONFIG_I="$PROJECT_I/.pueue-agent/config.toml"
 CONFIG_J="$PROJECT_J/.pueue-agent/config.toml"
 CONFIG_K="$PROJECT_K/.pueue-agent/config.toml"
 CONFIG_L="$PROJECT_L/.pueue-agent/config.toml"
+CONFIG_M="$PROJECT_M/.pueue-agent/config.toml"
 [ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] && [ -f "$CONFIG_C" ] && [ -f "$CONFIG_D" ] \
   && [ -f "$CONFIG_E" ] && [ -f "$CONFIG_F" ] && [ -f "$CONFIG_G" ] && [ -f "$CONFIG_H" ] \
   && [ -f "$CONFIG_I" ] && [ -f "$CONFIG_J" ] && [ -f "$CONFIG_K" ] && [ -f "$CONFIG_L" ] \
+  && [ -f "$CONFIG_M" ] \
   || fail "init did not create TOML configuration"
 PROJECT_ID_A="$(toml_value project_id "$CONFIG_A")"
 PROJECT_ID_B="$(toml_value project_id "$CONFIG_B")"
@@ -556,6 +597,7 @@ PROJECT_ID_I="$(toml_value project_id "$CONFIG_I")"
 PROJECT_ID_J="$(toml_value project_id "$CONFIG_J")"
 PROJECT_ID_K="$(toml_value project_id "$CONFIG_K")"
 PROJECT_ID_L="$(toml_value project_id "$CONFIG_L")"
+PROJECT_ID_M="$(toml_value project_id "$CONFIG_M")"
 GROUP_A="$(toml_value pueue_group "$CONFIG_A")"
 GROUP_B="$(toml_value pueue_group "$CONFIG_B")"
 GROUP_C="$(toml_value pueue_group "$CONFIG_C")"
@@ -568,6 +610,7 @@ GROUP_I="$(toml_value pueue_group "$CONFIG_I")"
 GROUP_J="$(toml_value pueue_group "$CONFIG_J")"
 GROUP_K="$(toml_value pueue_group "$CONFIG_K")"
 GROUP_L="$(toml_value pueue_group "$CONFIG_L")"
+GROUP_M="$(toml_value pueue_group "$CONFIG_M")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
@@ -583,6 +626,7 @@ write_config "$PROJECT_I" "$PROJECT_ID_I" "$GROUP_I" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_J" "$PROJECT_ID_J" "$GROUP_J" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_K" "$PROJECT_ID_K" "$GROUP_K" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_L" "$PROJECT_ID_L" "$GROUP_L" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_M" "$PROJECT_ID_M" "$GROUP_M" "$WORK/bin/fake-agent" 20
 printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
   > "$PROJECT_A/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
@@ -604,6 +648,7 @@ printf '%s\n' 'Keep the restart-diagnosis experiment observable across daemon re
 printf '%s\n' 'Reach validation loss below 0.20 with promotion' \
   > "$PROJECT_K/.pueue-agent/STATE.md"
 printf '%s\n' 'PUEUE_AGENT_E2E_GOAL' > "$PROJECT_L/.pueue-agent/STATE.md"
+printf '%s\n' 'PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS' > "$PROJECT_M/.pueue-agent/STATE.md"
 
 mkdir -p "$XDG_STATE_HOME"
 chmod 700 "$XDG_STATE_HOME"
@@ -630,6 +675,8 @@ max_decision_wait_minutes = 1440
 [executables]
 codex = "codex"
 pueue = "pueue"
+git = "git"
+python = "python"
 
 [projects."$PROJECT_ID_A"]
 custom_agent = "$WORK/bin/fake-agent"
@@ -677,6 +724,10 @@ agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT
 [projects."$PROJECT_ID_L"]
 custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_M"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 EOF
 chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 
@@ -692,8 +743,82 @@ chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_J"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_K"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_L"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_M"
 STATE_DB="$XDG_STATE_HOME/pueue-agent/state.sqlite3"
-[ "$(sql 'SELECT COUNT(*) FROM projects')" = "12" ] || fail "projects were not registered"
+[ "$(sql 'SELECT COUNT(*) FROM projects')" = "13" ] || fail "projects were not registered"
+
+# The code-change gate uses one disposable Git/Python repository.  Its local
+# bare remote is only metadata for the protected-remote invariant; no command
+# below pushes or mutates it.
+ML_REMOTE="$WORK/m/python-ml-remote.git"
+ML_UNRELATED="$WORK/m/python-ml-unrelated"
+cat > "$PROJECT_M/.gitignore" <<'EOF'
+.pueue-agent/
+__pycache__/
+.pytest_cache/
+EOF
+cat > "$PROJECT_M/model.py" <<'EOF'
+def score():
+    return 0
+EOF
+cat > "$PROJECT_M/test_model.py" <<'EOF'
+from model import score
+
+
+def test_smoke():
+    assert score() == 1
+EOF
+cat > "$PROJECT_M/pytest.ini" <<'EOF'
+[pytest]
+addopts = -q
+EOF
+cat > "$PROJECT_M/train.py" <<'EOF'
+import json
+import os
+
+from model import score
+
+
+loss = 0.25 if score() == 1 else 1.0
+result_path = os.environ["PUEUE_AGENT_RESULT_PATH"]
+os.makedirs(os.path.dirname(result_path), exist_ok=True)
+with open(result_path, "w", encoding="utf-8") as result_file:
+    json.dump(
+        {
+            "schema_version": 1,
+            "experiment_id": os.environ["PUEUE_AGENT_EXPERIMENT_ID"],
+            "metrics": {"loss": loss},
+        },
+        result_file,
+    )
+print(f"loss={loss}")
+EOF
+cat > "$PROJECT_M/train_oom.py" <<'EOF'
+import sys
+
+
+print("CUDA out of memory", file=sys.stderr)
+sys.exit(137)
+EOF
+cat > "$PROJECT_M/train_internal.py" <<'EOF'
+import sys
+
+
+print("internal error in candidate runtime", file=sys.stderr)
+sys.exit(70)
+EOF
+git init --quiet -b main "$PROJECT_M"
+git -C "$PROJECT_M" config user.name "Pueue Agent E2E"
+git -C "$PROJECT_M" config user.email "pueue-agent-e2e@example.invalid"
+git init --quiet --bare "$ML_REMOTE"
+git -C "$PROJECT_M" remote add origin "$ML_REMOTE"
+git -C "$PROJECT_M" add .gitignore model.py test_model.py pytest.ini train.py train_oom.py train_internal.py
+git -C "$PROJECT_M" commit --quiet -m "baseline ML fixture"
+git -C "$PROJECT_M" worktree add --quiet --detach "$ML_UNRELATED" HEAD
+ML_MAIN_SHA="$(git -C "$PROJECT_M" rev-parse refs/heads/main)"
+ML_FILE_DIGEST="$(git -C "$PROJECT_M" hash-object "$PROJECT_M/model.py")"
+ML_REMOTE_CONFIG="$(git -C "$PROJECT_M" config --local --get-regexp '^remote\.' || true)"
+ML_WORKTREES_BEFORE="$(git -C "$PROJECT_M" worktree list --porcelain)"
 
 # Healthy monitoring performs reconciliation without spending agent tokens.
 start_daemon
@@ -943,6 +1068,200 @@ stop_daemon
 "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_K" >/dev/null
 [ "$(sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_K'")" = "retired" ] \
   || fail "metric promotion retire did not retire campaign"
+
+# Task 7: a real-Pueue code-change campaign edits a detached candidate, retries
+# one failed pytest round in the same editor session, evaluates the candidate
+# manifest, and cleans up without touching the original checkout.  The same
+# durable coordinator is reused for the rejection and runtime-failure cases.
+run_code_change_case() {
+  marker="$1"
+  expected_argv_json="$2"
+  outcome="$3"
+  printf '%s\n' "$marker" > "$PROJECT_M/.pueue-agent/STATE.md"
+
+  baseline_summary="$(cd "$PROJECT_M" && "$PA_BIN" submit --metric-name loss --metric-direction minimize -- python train.py)"
+  baseline_task="$(submission_task_id "$baseline_summary")"
+  record_task_id "code-change-$outcome-source" "$baseline_task"
+  wait_for_task_terminal "$baseline_task"
+  campaign_id="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $baseline_task")"
+  source_experiment_id="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $baseline_task")"
+  [ -n "$campaign_id" ] && [ -n "$source_experiment_id" ] \
+    || fail "$outcome fixture did not create its baseline campaign"
+  candidate_add_before="$(pueue_add_call_count)"
+  best_before="$(git_ref_sha "$PROJECT_M" "refs/heads/campaign/$campaign_id/best")"
+  [ -z "$best_before" ] || fail "$outcome campaign unexpectedly had a best ref before code change"
+
+  # Keep the source projection and its decision agent in one daemon lifetime.
+  # Restarting immediately after the source metric can reuse a same-second
+  # gate path while the decision child is still in flight.
+  start_daemon
+  wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$source_experiment_id'" "succeeded" \
+    "$outcome baseline was not projected succeeded"
+  wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$source_experiment_id' AND artifact_defect IS NULL" "1" \
+    "$outcome baseline did not persist its metric"
+  wait_for_sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$campaign_id' AND kind = 'code_change' AND status = 'pending'" "1" \
+    "$outcome did not expose one pending code-change proposal"
+  stop_daemon
+  [ "$(sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$campaign_id' AND kind = 'code_change'")" = "1" ] \
+    || fail "$outcome created more than one code-change proposal"
+  run_id="$(sql "SELECT code_change_run_id FROM code_change_runs WHERE campaign_id = '$campaign_id'")"
+  proposal_id="$(sql "SELECT proposal_id FROM code_change_runs WHERE code_change_run_id = '$run_id'")"
+  [ -n "$run_id" ] && [ -n "$proposal_id" ] \
+    || fail "$outcome pending proposal did not reserve one code-change run"
+  [ "$(sql "SELECT state FROM code_change_runs WHERE code_change_run_id = '$run_id'")" = "reserved" ] \
+    || fail "$outcome pending proposal was not durably reserved"
+  [ "$(sql "SELECT argv_json FROM proposals WHERE proposal_id = '$proposal_id'")" = "$expected_argv_json" ] \
+    || fail "$outcome proposal argv was not pinned to the expected candidate runtime"
+
+  start_daemon
+  if [ "$outcome" = "success" ] || [ "$outcome" = "second-check-fail" ]; then
+    wait_for_sql "SELECT COUNT(*) FROM code_change_editor_attempts WHERE code_change_run_id = '$run_id' AND attempt = 1 AND status = 'ready' AND failure_code = 'check_failed'" "1" \
+      "$outcome did not record the first failed pytest round"
+  fi
+  if [ "$outcome" = "second-check-fail" ]; then
+    wait_for_sql "SELECT COUNT(*) FROM code_change_editor_attempts WHERE code_change_run_id = '$run_id'" "2" \
+      "second-check-fail did not use exactly two editor attempts"
+    wait_for_sql "SELECT state FROM code_change_runs WHERE code_change_run_id = '$run_id'" "rejected" \
+      "second-check-fail did not reject after its second failed check"
+    wait_for_sql "SELECT cleanup_completed_at IS NOT NULL FROM code_change_runs WHERE code_change_run_id = '$run_id'" "1" \
+      "second-check-fail did not complete owned-worktree cleanup"
+    stop_daemon
+    [ "$(sql "SELECT status FROM proposals WHERE proposal_id = '$proposal_id'")" = "pending" ] \
+      || fail "second-check-fail changed its pending proposal unexpectedly"
+    [ "$(sql "SELECT COUNT(*) FROM experiments WHERE code_change_run_id = '$run_id'")" = "0" ] \
+      || fail "second-check-fail created a candidate experiment"
+    [ -z "$(sql "SELECT candidate_sha FROM code_change_runs WHERE code_change_run_id = '$run_id'")" ] \
+      || fail "second-check-fail created a candidate commit"
+    candidate_ref="$(sql "SELECT candidate_ref FROM code_change_runs WHERE code_change_run_id = '$run_id'")"
+    [ -z "$(git_ref_sha "$PROJECT_M" "refs/heads/$candidate_ref")" ] \
+      || fail "second-check-fail created a candidate ref"
+    [ -z "$(git_ref_sha "$PROJECT_M" "refs/heads/campaign/$campaign_id/best")" ] \
+      || fail "second-check-fail created or moved best"
+    [ "$(sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$campaign_id'")" = "$source_experiment_id" ] \
+      || fail "second-check-fail changed current_best"
+    [ "$(sql "SELECT COUNT(DISTINCT editor_session_id) FROM code_change_editor_attempts WHERE code_change_run_id = '$run_id'")" = "1" ] \
+      || fail "second-check-fail did not resume one editor session"
+    assert_ml_original_unchanged
+    "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_M" >/dev/null
+    return
+  fi
+
+  wait_for_sql "SELECT COUNT(*) FROM code_change_editor_attempts WHERE code_change_run_id = '$run_id'" \
+    "$([ "$outcome" = "success" ] && printf 2 || printf 1)" \
+    "$outcome did not use the expected number of editor attempts"
+  wait_for_sql "SELECT COUNT(*) FROM experiments WHERE code_change_run_id = '$run_id' AND pueue_task_id IS NOT NULL" "1" \
+    "$outcome did not submit exactly one candidate experiment"
+  stop_daemon
+  "$PA_BIN" pause --pueue-config "$WORK/pueue.yml" "$PROJECT_M" >/dev/null
+
+  candidate_experiment_id="$(sql "SELECT experiment_id FROM experiments WHERE code_change_run_id = '$run_id'")"
+  candidate_task="$(sql "SELECT pueue_task_id FROM experiments WHERE experiment_id = '$candidate_experiment_id'")"
+  record_task_id "code-change-$outcome-candidate" "$candidate_task"
+  [ "$(pueue_add_call_count)" = "$((candidate_add_before + 1))" ] \
+    || fail "$outcome did not perform exactly one candidate Pueue add"
+  candidate_worktree_relative_path="$(sql "SELECT worktree_relative_path FROM code_change_runs WHERE code_change_run_id = '$run_id'")"
+  case "$candidate_worktree_relative_path" in
+    .pueue-agent/worktrees/*)
+      candidate_worktree_relative_path="${candidate_worktree_relative_path#.pueue-agent/}"
+      ;;
+    *)
+      fail "$outcome persisted an unexpected candidate worktree namespace"
+      ;;
+  esac
+  candidate_path="$PUEUE_AGENT_STATE_DIR/$candidate_worktree_relative_path"
+  candidate_cwd_count="$(awk -v path="$candidate_path" '
+    /^ADD_BEGIN$/ { in_block = 1; expect_path = 0; next }
+    /^ADD_END$/ { in_block = 0; expect_path = 0; next }
+    !in_block { next }
+    {
+      if (expect_path) {
+        split($0, current_parts, "=")
+        split(current_parts[1], current_index_parts, "_")
+        if (current_index_parts[3] == cwd_index + 1 && current_parts[2] == path) {
+          count++
+        }
+        expect_path = 0
+      }
+      if ($0 ~ /^ADD_ARG_[0-9]+=--working-directory$/) {
+        split($0, cwd_parts, "=")
+        split(cwd_parts[1], cwd_index_parts, "_")
+        cwd_index = cwd_index_parts[3]
+        expect_path = 1
+      }
+    }
+    END { print count + 0 }
+  ' "$WORK/pueue-add-argv.log")"
+  [ "$candidate_cwd_count" = "1" ] \
+    || fail "$outcome candidate Pueue add did not use its persisted candidate cwd"
+  [ "$(sql "SELECT code_revision_sha = (SELECT candidate_sha FROM code_change_runs WHERE code_change_run_id = '$run_id') FROM experiments WHERE experiment_id = '$candidate_experiment_id'")" = "1" ] \
+    || fail "$outcome candidate experiment was not pinned to the persisted candidate SHA"
+  [ "$(sql "SELECT argv_json FROM submissions WHERE submission_id = (SELECT submission_id FROM experiments WHERE experiment_id = '$candidate_experiment_id')")" = "$expected_argv_json" ] \
+    || fail "$outcome candidate submission changed the proposal argv"
+  wait_for_task_terminal "$candidate_task"
+
+  start_daemon
+  if [ "$outcome" = "success" ]; then
+    wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$candidate_experiment_id'" "succeeded" \
+      "successful candidate was not projected succeeded"
+    wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$candidate_experiment_id' AND primary_metric_name = 'loss' AND primary_metric_value = 0.25 AND artifact_defect IS NULL" "1" \
+      "successful candidate did not persist its improved manifest metric"
+    wait_for_sql "SELECT COUNT(*) FROM code_change_checks WHERE code_change_run_id = '$run_id' AND attempt = 2 AND source = 'discovered' AND status = 'passed' AND output_digest IS NOT NULL" "1" \
+      "successful candidate did not pass exactly one Python project check"
+    wait_for_sql "SELECT CASE WHEN diff_digest IS NOT NULL AND length(diff_digest) = 64 THEN 1 ELSE 0 END FROM code_change_runs WHERE code_change_run_id = '$run_id'" "1" \
+      "successful candidate did not persist its final checked diff digest"
+  else
+    wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$candidate_experiment_id'" "failed" \
+      "$outcome candidate runtime failure was not projected"
+    wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$candidate_experiment_id' AND artifact_defect IS NOT NULL" "1" \
+      "$outcome runtime failure did not persist a terminal result defect"
+  fi
+  wait_for_sql "SELECT state FROM code_change_runs WHERE code_change_run_id = '$run_id'" "completed" \
+    "$outcome code-change run did not reach completed state"
+  wait_for_sql "SELECT cleanup_completed_at IS NOT NULL FROM code_change_runs WHERE code_change_run_id = '$run_id'" "1" \
+    "$outcome did not complete owned-worktree cleanup"
+  stop_daemon
+
+  [ "$(sql "SELECT status FROM proposals WHERE proposal_id = '$proposal_id'")" = "accepted" ] \
+    || fail "$outcome code-change proposal was not accepted exactly once"
+  [ "$(sql "SELECT COUNT(*) FROM code_change_editor_attempts WHERE code_change_run_id = '$run_id'")" = "$([ "$outcome" = "success" ] && printf 2 || printf 1)" ] \
+    || fail "$outcome editor attempt count changed after completion"
+  [ "$(sql "SELECT COUNT(DISTINCT editor_session_id) FROM code_change_editor_attempts WHERE code_change_run_id = '$run_id'")" = "1" ] \
+    || fail "$outcome editor attempts did not share one session ID"
+  candidate_sha="$(sql "SELECT candidate_sha FROM code_change_runs WHERE code_change_run_id = '$run_id'")"
+  candidate_ref="$(sql "SELECT candidate_ref FROM code_change_runs WHERE code_change_run_id = '$run_id'")"
+  [ -n "$candidate_sha" ] && [ "$(git_ref_sha "$PROJECT_M" "refs/heads/$candidate_ref")" = "$candidate_sha" ] \
+    || fail "$outcome candidate commit/ref was not persisted exactly once"
+  if [ "$outcome" = "success" ]; then
+    [ "$(git_diff_digest "$PROJECT_M" "$ML_MAIN_SHA" "$candidate_sha")" = "$(sql "SELECT diff_digest FROM code_change_runs WHERE code_change_run_id = '$run_id'")" ] \
+      || fail "successful candidate diff digest was not bound to its final committed diff"
+  fi
+  [ "$(git -C "$PROJECT_M" rev-list --count "$ML_MAIN_SHA..$candidate_sha")" = "1" ] \
+    || fail "$outcome created more than one candidate commit"
+  [ -d "$candidate_path" ] && fail "$outcome left its owned candidate worktree behind" || true
+  if [ "$outcome" = "success" ]; then
+    best_after="$(git_ref_sha "$PROJECT_M" "refs/heads/campaign/$campaign_id/best")"
+    [ "$best_after" = "$candidate_sha" ] \
+      || fail "successful improvement did not move best to the candidate"
+    [ "$(sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$campaign_id'")" = "$candidate_experiment_id" ] \
+      || fail "successful improvement did not update current_best"
+    [ "$(sql "SELECT promotion_outcome FROM code_change_runs WHERE code_change_run_id = '$run_id'")" = "improved" ] \
+      || fail "successful improvement did not persist improved promotion outcome"
+  else
+    [ -z "$(git_ref_sha "$PROJECT_M" "refs/heads/campaign/$campaign_id/best")" ] \
+      || fail "$outcome created or moved best after an invalid runtime result"
+    [ "$(sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$campaign_id'")" = "$source_experiment_id" ] \
+      || fail "$outcome changed current_best after an invalid runtime result"
+  fi
+  assert_ml_original_unchanged
+  "$PA_BIN" resume --pueue-config "$WORK/pueue.yml" "$PROJECT_M" >/dev/null
+  "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_M" >/dev/null
+}
+
+run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS" '["python","train.py"]' "success"
+run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL" '["python","train.py"]' "second-check-fail"
+run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM" '["python","train_oom.py"]' "runtime-oom"
+run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL" '["python","train_internal.py"]' "runtime-internal"
+assert_ml_original_unchanged
 
 # Scenario D: goal_reached decision parks campaign pending review, operator accept retires.
 goal_summary="$(cd "$PROJECT_L" && "$PA_BIN" submit --metric-name loss --metric-direction minimize -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_metrics.sh")"
@@ -1202,13 +1521,13 @@ stop_daemon
 "$REAL_PUEUE" --config "$WORK/pueue.yml" kill "$task_bad" >/dev/null
 wait_for_task_terminal "$task_bad"
 start_daemon
-wait_for_agent_calls "1" "auto-kill event did not launch the agent"
+wait_for_agent_calls "$PROJECT_ID_A" "1" "auto-kill event did not launch the agent"
 wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'" "1" \
   "auto-kill agent did not finish before shutdown"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'")" = "1" ] \
   || fail "auto-kill agent run was not completed during shutdown drain"
-[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" -ge 1 ] \
+[ "$(agent_call_count_for_project "$PROJECT_ID_A")" -ge 1 ] \
   || fail "auto-kill produced no agent invocation"
 
 # The full running-health acceptance scenarios (OOM escalation ->
@@ -1364,17 +1683,17 @@ sql "UPDATE events SET not_before = 0 WHERE dedup_key = 'pueue-callback:v1:group
 # generation out of the previous attempt's second.
 sleep 2
 start_daemon
-wait_for_agent_calls "3" "retry event was not recoverable"
+wait_for_agent_calls "$PROJECT_ID_A" "3" "retry event was not recoverable"
 wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'" "2" \
   "retried agent did not finish before shutdown"
 stop_daemon
 [ "$(sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID_A' AND status = 'completed'")" = "2" ] \
   || fail "retried agent run was not completed during shutdown drain"
-[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" -ge 3 ] \
+[ "$(agent_call_count_for_project "$PROJECT_ID_A")" -ge 3 ] \
   || fail "retry did not execute the fake agent after spawn recovery"
 
 # max_agent_runs halts scheduling; resume clears the halt after policy adjustment.
-calls_before_halt="$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG" || true)"
+calls_before_halt="$(agent_call_count_for_project "$PROJECT_ID_A")"
 write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 3
 "$PA_BIN" event callback --group "$GROUP_A" --task-id 901 \
   --metadata '{"state":"Failed","result":"Failed"}' >/dev/null
@@ -1389,7 +1708,7 @@ while [ "$(date +%s)" -lt "$halt_deadline" ]; do
 done
 stop_daemon
 [ "$halted" = "1" ] || fail "max_agent_runs did not halt the project"
-[ "$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG")" = "$calls_before_halt" ] \
+[ "$(agent_call_count_for_project "$PROJECT_ID_A")" = "$calls_before_halt" ] \
   || fail "halted project launched an agent"
 
 write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 20
@@ -1400,9 +1719,9 @@ write_config "$PROJECT_A" "$PROJECT_ID_A" "$GROUP_A" "$WORK/bin/fake-agent" 20
   --metadata '{"state":"Done","result":"Success"}' >/dev/null
 sql "UPDATE events SET campaign_id = '$CAMPAIGN_A'
      WHERE dedup_key = 'pueue-callback:v1:group=$GROUP_A:task-id=902'"
-calls_before_resume="$(grep -c '^CALL ' "$PUEUE_AGENT_TEST_AGENT_LOG" || true)"
+calls_before_resume="$(agent_call_count_for_project "$PROJECT_ID_A")"
 start_daemon
-wait_for_agent_calls "$((calls_before_resume + 1))" "resumed project did not schedule a new event"
+wait_for_agent_calls "$PROJECT_ID_A" "$((calls_before_resume + 1))" "resumed project did not schedule a new event"
 stop_daemon
 
 # Resuming the other project releases its preserved callback work.

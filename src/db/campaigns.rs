@@ -67,13 +67,14 @@ pub enum ProposalAcceptance {
     Accepted(ManagedSubmissionIntent),
     PendingCodeChange,
     BudgetWaiting { next_eligible_at: i64 },
+    CapacityDeferred,
 }
 
 impl ProposalAcceptance {
     pub fn accepted(self) -> Option<ManagedSubmissionIntent> {
         match self {
             Self::Accepted(intent) => Some(intent),
-            Self::PendingCodeChange | Self::BudgetWaiting { .. } => None,
+            Self::PendingCodeChange | Self::BudgetWaiting { .. } | Self::CapacityDeferred => None,
         }
     }
 }
@@ -446,6 +447,360 @@ impl<'db> CampaignRepository<'db> {
             run,
             rejection_reason,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_code_change_candidate(
+        &self,
+        run_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        now: i64,
+        limits: &CampaignLimits,
+    ) -> Result<ProposalAcceptance, AppError> {
+        validate_code_change_identifier("code_change_run_id", run_id)?;
+        validate_code_change_identifier("experiment_id", experiment_id)?;
+        validate_code_change_identifier("submission_id", submission_id)?;
+        let window_ends_at = rolling_window_end(now)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin code-change candidate acceptance"))?;
+
+        let (
+            run_campaign_id,
+            run_proposal_id,
+            run_state,
+            candidate_sha,
+            candidate_ref,
+            bound_experiment_id,
+            editor_attempts,
+            run_diff_digest,
+            run_changed_file_count,
+            run_diff_bytes,
+        ): (
+            String,
+            String,
+            CodeChangeState,
+            Option<String>,
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = transaction
+            .query_row(
+                "SELECT campaign_id, proposal_id, state, candidate_sha, candidate_ref,
+                        experiment_id, editor_attempts, diff_digest,
+                        changed_file_count, diff_bytes
+                 FROM code_change_runs WHERE code_change_run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("read code-change candidate run"))?
+            .ok_or_else(|| {
+                validation_error(
+                    "code_change_run_id",
+                    "does not identify a persisted code-change run",
+                )
+            })?;
+        let campaign = read_campaign(&transaction, &run_campaign_id)?;
+        let proposal = read_proposal(&transaction, &run_proposal_id)?;
+        if proposal.campaign_id != run_campaign_id || proposal.kind != ProposalKind::CodeChange {
+            return Err(validation_error(
+                "code_change.run",
+                "must belong to a code-change proposal in the campaign",
+            ));
+        }
+        let expected_candidate_ref =
+            code_change::candidate_ref(&run_campaign_id, &run_proposal_id)?;
+        if candidate_ref != expected_candidate_ref {
+            return Err(validation_error(
+                "code_change.candidate_ref",
+                "must be the exact campaign-owned candidate ref",
+            ));
+        }
+        let candidate_sha = candidate_sha.ok_or_else(|| {
+            validation_error(
+                "code_change.candidate_sha",
+                "must be persisted before candidate acceptance",
+            )
+        })?;
+        validate_sha("candidate_sha", &candidate_sha)?;
+        validate_code_change_candidate_diff(
+            run_diff_digest.as_deref(),
+            run_changed_file_count,
+            run_diff_bytes,
+        )?;
+
+        if run_state == CodeChangeState::ExperimentSubmitted {
+            if bound_experiment_id.as_deref() != Some(experiment_id)
+                || proposal.status != ProposalStatus::Accepted
+            {
+                return Err(validation_error(
+                    "code_change.experiment_id",
+                    "does not match the persisted submitted candidate intent",
+                ));
+            }
+            let experiment = read_experiment(&transaction, experiment_id)?;
+            let submission = read_submission(&transaction, &experiment.submission_id)?;
+            if experiment.campaign_id != run_campaign_id
+                || experiment.proposal_id != run_proposal_id
+                || experiment.submission_id != submission_id
+                || experiment.code_change_run_id.as_deref() != Some(run_id)
+                || experiment.code_revision_sha.as_deref() != Some(candidate_sha.as_str())
+            {
+                return Err(validation_error(
+                    "code_change.experiment_id",
+                    "does not match the persisted submitted candidate intent",
+                ));
+            }
+            if submission.submission_id != submission_id {
+                return Err(validation_error(
+                    "submission_id",
+                    "does not match the persisted submitted candidate intent",
+                ));
+            }
+            let intent = read_intent_by_experiment(&transaction, experiment_id)?;
+            transaction
+                .commit()
+                .map_err(database_error("commit idempotent code-change candidate acceptance"))?;
+            return Ok(ProposalAcceptance::Accepted(intent));
+        }
+        if run_state != CodeChangeState::CandidateReady
+            || bound_experiment_id.is_some()
+            || proposal.status != ProposalStatus::Pending
+        {
+            return Err(validation_error(
+                "code_change.state",
+                "candidate acceptance requires an unbound candidate-ready run",
+            ));
+        }
+        if campaign.state == CampaignState::BudgetWaiting {
+            let next_eligible_at = campaign.next_eligible_at.ok_or_else(|| {
+                validation_error(
+                    "campaign.next_eligible_at",
+                    "budget-waiting campaign must have a finite wake time",
+                )
+            })?;
+            transaction
+                .commit()
+                .map_err(database_error("commit waiting code-change candidate acceptance"))?;
+            return Ok(ProposalAcceptance::BudgetWaiting { next_eligible_at });
+        }
+        if campaign.state != CampaignState::Active {
+            return Err(validation_error(
+                "campaign",
+                "must be active to accept a candidate",
+            ));
+        }
+        validate_project_available(&transaction, &campaign.project_id)?;
+        let source_experiment_id = proposal.source_experiment_id.as_deref().ok_or_else(|| {
+            validation_error(
+                "source_experiment_id",
+                "is required outside baseline campaign creation",
+            )
+        })?;
+        let source = read_experiment(&transaction, source_experiment_id)?;
+        if source.campaign_id != run_campaign_id {
+            return Err(validation_error(
+                "source_experiment_id",
+                "must belong to the same campaign",
+            ));
+        }
+        if !is_terminal(source.status) {
+            return Err(validation_error(
+                "source_experiment_id",
+                "must reference a terminal experiment",
+            ));
+        }
+        let parallel_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                 WHERE campaign_id = ?1
+                   AND status IN ('reserved','submitting','accepted','unreconciled')",
+                [&run_campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count parallel candidate experiments"))?;
+        if parallel_count >= i64::from(limits.max_parallel_experiments) {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred code-change candidate acceptance"))?;
+            return Ok(ProposalAcceptance::CapacityDeferred);
+        }
+        let cycle_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM proposals
+                 WHERE campaign_id = ?1 AND source_experiment_id = ?2 AND status = 'accepted'",
+                params![run_campaign_id, source_experiment_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count candidate decision-cycle proposals"))?;
+        if cycle_count >= i64::from(limits.max_proposals_per_cycle) {
+            return Err(validation_error(
+                "campaign_limits.max_proposals_per_cycle",
+                "the source decision cycle has no proposal slots",
+            ));
+        }
+        let rolling_count = count_live_reservations(
+            &transaction,
+            &run_campaign_id,
+            BudgetDimension::Experiment,
+            now,
+        )?;
+        if rolling_count >= i64::from(limits.max_new_experiments_per_24h) {
+            return enter_proposal_budget_wait(
+                transaction,
+                &run_campaign_id,
+                BudgetDimension::Experiment,
+                "experiment_budget_exhausted",
+                now,
+            );
+        }
+        let argv_json = serialize_strings(
+            &proposal.argv,
+            "serialize code-change candidate arguments",
+        )?;
+        let same_spec_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM experiments AS experiment
+                 JOIN proposals AS candidate ON candidate.proposal_id = experiment.proposal_id
+                 WHERE experiment.campaign_id = ?1
+                   AND candidate.argv_json = ?2
+                   AND candidate.working_directory = ?3",
+                params![run_campaign_id, argv_json, proposal.working_directory],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count same-spec candidate experiments"))?;
+        if same_spec_count > i64::from(limits.max_same_spec_retries) {
+            return Err(validation_error(
+                "campaign_limits.max_same_spec_retries",
+                "the same experiment specification exhausted its retries",
+            ));
+        }
+        let metadata_json = serialize_submission_metadata(
+            None,
+            &run_campaign_id,
+            &run_proposal_id,
+            experiment_id,
+        )?;
+        let proposal_changed = transaction
+            .execute(
+                "UPDATE proposals
+                 SET status = ?1, reject_reason = NULL, updated_at = ?2
+                 WHERE campaign_id = ?3 AND proposal_id = ?4 AND status = ?5",
+                params![
+                    ProposalStatus::Accepted,
+                    now,
+                    run_campaign_id,
+                    run_proposal_id,
+                    ProposalStatus::Pending,
+                ],
+            )
+            .map_err(database_error("accept code-change candidate proposal"))?;
+        if proposal_changed != 1 {
+            return Err(validation_error(
+                "proposal.status",
+                "candidate proposal changed concurrently",
+            ));
+        }
+        insert_submission(
+            &transaction,
+            submission_id,
+            &campaign.project_id,
+            &argv_json,
+            &metadata_json,
+            None,
+            now,
+        )?;
+        insert_experiment(
+            &transaction,
+            experiment_id,
+            &run_campaign_id,
+            &run_proposal_id,
+            submission_id,
+            Some(source_experiment_id),
+            same_spec_count,
+            None,
+            None,
+            Some(run_id),
+            Some(&candidate_sha),
+            now,
+        )?;
+        insert_experiment_reservation(
+            &transaction,
+            &run_campaign_id,
+            experiment_id,
+            now,
+            window_ends_at,
+        )?;
+        let run_changed = transaction
+            .execute(
+                "UPDATE code_change_runs
+                 SET experiment_id = ?1, state = ?2, updated_at = ?3
+                 WHERE code_change_run_id = ?4 AND state = ?5
+                   AND candidate_sha = ?6 AND experiment_id IS NULL",
+                params![
+                    experiment_id,
+                    CodeChangeState::ExperimentSubmitted,
+                    now,
+                    run_id,
+                    CodeChangeState::CandidateReady,
+                    candidate_sha,
+                ],
+            )
+            .map_err(database_error("bind code-change candidate experiment"))?;
+        if run_changed != 1 {
+            return Err(validation_error(
+                "code_change.state",
+                "candidate changed concurrently while being accepted",
+            ));
+        }
+        let event = NewEvent::new(
+            campaign.project_id.clone(),
+            EventKind::CodeChange,
+            format!(
+                "code-change:v1:{}:{}:{}",
+                run_id,
+                CodeChangeState::ExperimentSubmitted,
+                editor_attempts
+            ),
+            serde_json::json!({
+                "code_change_run_id": run_id,
+                "campaign_id": run_campaign_id,
+                "proposal_id": run_proposal_id,
+                "state": CodeChangeState::ExperimentSubmitted,
+                "attempt": editor_attempts,
+                "reason_code": null,
+                "event_time": now,
+            }),
+            now,
+            now,
+        )
+        .with_campaign_lineage(run_campaign_id.clone(), Option::<String>::None);
+        super::insert_event_completed_in_transaction(&transaction, &event)?;
+        let intent = read_intent_by_experiment(&transaction, experiment_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit code-change candidate acceptance"))?;
+        Ok(ProposalAcceptance::Accepted(intent))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2805,6 +3160,34 @@ fn validate_code_change_identifier(field: &'static str, value: &str) -> Result<(
         return Err(validation_error(
             field,
             "must be non-empty bounded text without control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_code_change_candidate_diff(
+    digest: Option<&str>,
+    changed_file_count: Option<i64>,
+    diff_bytes: Option<i64>,
+) -> Result<(), AppError> {
+    let Some(digest) = digest else {
+        return Err(validation_error(
+            "code_change.diff",
+            "candidate diff evidence must be complete",
+        ));
+    };
+    if digest.is_empty() || digest.len() > 128 || digest.chars().any(char::is_control) {
+        return Err(validation_error(
+            "code_change.diff",
+            "candidate diff digest is invalid",
+        ));
+    }
+    if changed_file_count.is_none_or(|count| count < 0)
+        || diff_bytes.is_none_or(|bytes| bytes < 0)
+    {
+        return Err(validation_error(
+            "code_change.diff",
+            "candidate diff counts must be complete and non-negative",
         ));
     }
     Ok(())

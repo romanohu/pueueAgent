@@ -4,7 +4,7 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 27;
+pub const LATEST_SCHEMA_VERSION: i64 = 28;
 const EVENTS_V23_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis'";
 const EVENTS_V26_KIND_LIST: &str =
@@ -422,6 +422,11 @@ const CODE_CHANGE_V27_PROOF_COLUMNS: &[&str] = &[
     "candidate_admin_path",
     "candidate_common_path",
 ];
+const CODE_CHANGE_V28_BASELINE_COLUMNS: &[&str] = &[
+    "candidate_working_directory_identity",
+    "protected_ref_digest",
+    "remote_config_digest",
+];
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -445,6 +450,7 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         verify_event_kinds_v26(connection)?;
         verify_code_change_schema_v26(connection)?;
         verify_code_change_schema_v27(connection)?;
+        verify_code_change_schema_v28(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -909,6 +915,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_code_change_schema_v27(&transaction)?;
     }
+    if version <= 27 {
+        migrate_code_change_schema_to_v28(&transaction)?;
+    } else {
+        verify_code_change_schema_v28(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -954,6 +965,50 @@ fn verify_code_change_schema_v27(connection: &Connection) -> Result<(), AppError
         if !exists {
             return Err(AppError::Runtime {
                 operation: "verify SQLite v27 code-change schema",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn migrate_code_change_schema_to_v28(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    for column in CODE_CHANGE_V28_BASELINE_COLUMNS {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('code_change_runs') WHERE name = ?1)",
+                [*column],
+                |row| row.get(0),
+            )
+            .map_err(database_error("inspect SQLite v28 code-change baseline column"))?;
+        if !exists {
+            transaction
+                .execute(
+                    &format!("ALTER TABLE code_change_runs ADD COLUMN {column} TEXT"),
+                    [],
+                )
+                .map_err(database_error("add SQLite v28 code-change baseline column"))?;
+        }
+    }
+    verify_code_change_schema_v28(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 28;")
+        .map_err(database_error("set SQLite v28 schema version"))
+}
+
+fn verify_code_change_schema_v28(connection: &Connection) -> Result<(), AppError> {
+    for column in CODE_CHANGE_V28_BASELINE_COLUMNS {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('code_change_runs') WHERE name = ?1)",
+                [*column],
+                |row| row.get(0),
+            )
+            .map_err(database_error("inspect SQLite v28 code-change baseline column"))?;
+        if !exists {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite v28 code-change schema",
             });
         }
     }
@@ -1234,7 +1289,7 @@ fn verify_code_change_schema_v26(connection: &Connection) -> Result<(), AppError
             .map_err(database_error("read SQLite v26 code-change schema"))?;
         if !actual_sql.as_deref().is_some_and(|sql| {
             let sql = if table == "code_change_runs" {
-                strip_v27_code_change_additions(sql)
+                strip_post_v26_code_change_additions(sql)
             } else {
                 sql.to_owned()
             };
@@ -1396,11 +1451,14 @@ fn verify_code_change_schema_v26(connection: &Connection) -> Result<(), AppError
     Ok(())
 }
 
-fn strip_v27_code_change_additions(sql: &str) -> String {
-    CODE_CHANGE_V27_PROOF_COLUMNS.iter().fold(compact_sql_exact(sql), |sql, column| {
-        sql.replace(&format!(", {column} TEXT"), "")
-            .replace(&format!(",{column}TEXT"), "")
-    })
+fn strip_post_v26_code_change_additions(sql: &str) -> String {
+    CODE_CHANGE_V27_PROOF_COLUMNS
+        .iter()
+        .chain(CODE_CHANGE_V28_BASELINE_COLUMNS)
+        .fold(compact_sql_exact(sql), |sql, column| {
+            sql.replace(&format!(", {column} TEXT"), "")
+                .replace(&format!(",{column}TEXT"), "")
+        })
 }
 
 fn migrate_agent_run_execution_projection_to_v14(
@@ -3834,8 +3892,8 @@ mod v23_event_kind_tests {
                         SET sql = replace(sql, ?1, ?2)
                       WHERE type = 'table' AND name = 'events'",
                     params![
-                        ", 'health_diagnosis'",
-                        ""
+                        EVENTS_V26_KIND_LIST,
+                        EVENTS_V18_KIND_LIST,
                     ],
                 )
                 .unwrap();

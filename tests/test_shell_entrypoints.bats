@@ -109,6 +109,48 @@ setup() {
   ! grep -q 'OPENAI_API_KEY\|never-record-this\|/fixture/home' "$log"
 }
 
+@test "project-scoped agent call counting handles interleaving and exact IDs" {
+  source "$REPO_ROOT/tests/support/agent_call_count.sh"
+  mixed_log="$BATS_TEST_TMPDIR/mixed-agent-calls.log"
+  cat > "$mixed_log" <<'EOF'
+CALL 1
+CALL 2
+PROJECT_ID=project-a
+RUN_ID=run-a
+EDITOR_MODE=fresh
+PROJECT_ID=project-b
+RUN_ID=run-b
+CALL 3
+PROJECT_ID=project-ab
+RUN_ID=run-ab
+CALL 4
+PROJECT_ID=project-a
+RUN_ID=run-a2
+CALL 5
+PROJECT_ID=project-a
+RUN_ID=run-a3
+EOF
+  PUEUE_AGENT_TEST_AGENT_LOG="$mixed_log"
+  [ "$(agent_call_count_for_project project-a)" = "3" ]
+  [ "$(agent_call_count_for_project project-ab)" = "1" ]
+  [ "$(agent_call_count_for_project project-b)" = "1" ]
+  PUEUE_AGENT_TEST_AGENT_LOG="$BATS_TEST_TMPDIR/missing-agent-calls.log"
+  [ "$(agent_call_count_for_project project-a)" = "0" ]
+
+  fake_log="$BATS_TEST_TMPDIR/fake-agent-project.log"
+  if env PUEUE_AGENT_TEST_AGENT_LOG="$fake_log" \
+    PUEUE_AGENT_PROJECT_ID=project-a PUEUE_AGENT_RUN_ID=run-a \
+    OPENAI_API_KEY=secret-value \
+    "$REPO_ROOT/tests/support/fake_agent.sh" "editor-marker"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^PROJECT_ID=project-a$' "$fake_log")" = "1" ]
+  ! grep -Eq 'secret-value|OPENAI_API_KEY' "$fake_log"
+}
+
 @test "fake Codex records safe argv only and no environment values or prompt" {
   log="$BATS_TEST_TMPDIR/fake-codex.log"
   env_names="$BATS_TEST_TMPDIR/fake-codex-env-names.log"

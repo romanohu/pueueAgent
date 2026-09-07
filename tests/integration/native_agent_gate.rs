@@ -165,6 +165,7 @@ fn main() {
             cwd: Some(self.root.anchor.canonical_path.clone()),
             environment,
             project_root: self.root.try_clone().expect("clone verified root"),
+            log_root: self.root.try_clone().expect("clone verified log root"),
             relative_log_path: PathBuf::from(LOG),
             relative_marker_path: PathBuf::from(MARKER),
         }

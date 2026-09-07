@@ -1630,6 +1630,34 @@ impl<'db> EventRepository<'db> {
             .map_err(database_error("read filtered events"))
     }
 
+    pub fn list_completed_code_change_events_for_run(
+        &self,
+        project_id: &str,
+        code_change_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE project_id = ?1
+                 AND kind = 'code_change'
+                 AND status = 'completed'
+                 AND json_extract(payload_json, '$.code_change_run_id') = ?2
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT ?3",
+                EVENT_SELECT
+            ))
+            .map_err(database_error("prepare code-change transition query"))?;
+        let rows = statement
+            .query_map(
+                params![project_id, code_change_run_id, bounded_diagnostic_limit(limit)],
+                event_from_row,
+            )
+            .map_err(database_error("query code-change transitions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read code-change transitions"))
+    }
+
     /// Return one deterministic latest run per requested event in one bounded query.
     pub fn latest_run_ids(
         &self,
@@ -3486,7 +3514,7 @@ impl From<&Submission> for SubmissionLineage {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRunRecovery {
     pub failed_runs: usize,
     pub requeued_events: usize,
@@ -3495,6 +3523,10 @@ pub struct AgentRunRecovery {
     /// startup recovery.  Their durable attempt binding lets the
     /// code-change coordinator decide whether to resume or reject them.
     pub preserved_code_change_editors: usize,
+    /// Exact active editor rows preserved by generic startup recovery.  The
+    /// code-change coordinator consumes this bounded identity list before
+    /// ordinary dispatch resumes.
+    pub preserved_code_change_editor_run_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3520,6 +3552,15 @@ pub enum GateFailurePolicy {
 /// states distinct lets generic recovery reject a binding attached to a
 /// non-editor execution projection instead of silently treating it as an
 /// ordinary run.
+fn canonical_editor_result_digest(value: Option<&str>) -> bool {
+    value.is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    })
+}
+
 fn editor_recovery_binding(
     transaction: &Transaction<'_>,
     project_id: &str,
@@ -3529,6 +3570,7 @@ fn editor_recovery_binding(
         .prepare(
             "SELECT a.code_change_run_id, a.attempt, a.agent_run_id,
                     a.editor_session_id, a.status,
+                    a.result_digest, a.failure_code, a.failure_summary, a.finished_at,
                     r.state, r.editor_attempts, r.editor_session_id,
                     c.project_id
              FROM code_change_editor_attempts AS a
@@ -3546,10 +3588,14 @@ fn editor_recovery_binding(
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, CodeChangeState>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
-                row.get::<_, String>(8)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, CodeChangeState>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, String>(12)?,
             ))
         })
         .map_err(database_error("query code-change editor recovery binding"))?;
@@ -3565,16 +3611,50 @@ fn editor_recovery_binding(
         bound_agent_run_id,
         session_id,
         attempt_status,
+        result_digest,
+        failure_code,
+        failure_summary,
+        finished_at,
         state,
         run_attempts,
         run_session_id,
         bound_project_id,
     ) = &rows[0];
+    let state_matches = if matches!(attempt_status.as_str(), "reserved" | "running") {
+        *state == CodeChangeState::Editing
+    } else {
+        matches!(
+            *state,
+            CodeChangeState::Editing
+                | CodeChangeState::Rejected
+                | CodeChangeState::RecoveryRequired
+        )
+    };
+    let terminal_payload_matches = match attempt_status.as_str() {
+        "ready" => {
+            canonical_editor_result_digest(result_digest.as_deref())
+                && failure_code.is_none()
+                && failure_summary.is_none()
+                && finished_at.is_some()
+        }
+        "failed" => {
+            result_digest.is_none()
+                && failure_code
+                    .as_deref()
+                    .is_some_and(|code| !code.is_empty())
+                && failure_summary
+                    .as_deref()
+                    .is_some_and(|summary| !summary.is_empty())
+                && finished_at.is_some()
+        }
+        _ => true,
+    };
     let valid = bound_project_id == project_id
             && *bound_agent_run_id == agent_run_id
             && matches!(*attempt, 1 | 2)
-            && matches!(attempt_status.as_str(), "reserved" | "running")
-            && *state == CodeChangeState::Editing
+            && matches!(attempt_status.as_str(), "reserved" | "running" | "ready" | "failed")
+            && state_matches
+            && terminal_payload_matches
             && *run_attempts == *attempt
             && run_session_id.as_deref() == Some(session_id.as_str())
             && !session_id.is_empty();
@@ -3794,7 +3874,6 @@ impl<'db> AgentRunRepository<'db> {
                 "SELECT run_id, launch_gate_state, log_path
                  FROM agent_runs
                  WHERE project_id = ?1 AND status IN ('starting', 'running')
-                   AND (execution_kind IS NULL OR execution_kind <> 'code_change_editor')
                    AND (
                        launch_gate_state = 'release_requested'
                        OR (
@@ -4133,6 +4212,7 @@ impl<'db> AgentRunRepository<'db> {
                     // not resolve its event, interventions, or agent row as
                     // generic interrupted work.
                     recovery.preserved_code_change_editors += 1;
+                    recovery.preserved_code_change_editor_run_ids.push(run_id);
                     continue;
                 }
                 if confirmed_pending_marker_ids.contains(&run_id)
@@ -4703,6 +4783,110 @@ impl<'db> AgentRunRepository<'db> {
             false,
             AgentRunFinalizationPhase::MarkerFailure,
         )
+    }
+
+    /// Finalize an editor run after its terminal result was durably persisted
+    /// but before the daemon could finish the generic agent row.  The gate
+    /// phase is selected from the durable row so an acknowledged dispatch is
+    /// never mistaken for a pre-release failure.
+    pub fn finish_code_change_editor_startup_terminal(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+        retry_policy: RetryPolicy,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_code_change_editor_startup_with_resolution(
+            project_id,
+            run_id,
+            status,
+            finished_at,
+            exit_code,
+            last_error,
+            EventResolution::RetryPolicy(retry_policy),
+        )
+    }
+
+    /// Finalize an editor run whose post-release outcome cannot be proven.
+    /// Linked code-change work is dead-lettered and the coordinator records
+    /// `recovery_required`; no ordinary retry or Standard event is created.
+    pub fn finish_code_change_editor_startup_uncertain(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        finished_at: i64,
+        reason: &str,
+    ) -> Result<AgentRun, AppError> {
+        self.finish_code_change_editor_startup_with_resolution(
+            project_id,
+            run_id,
+            AgentRunStatus::Failed,
+            finished_at,
+            None,
+            Some(reason),
+            EventResolution::ExecutionUnknown {
+                reason: reason.to_owned(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_code_change_editor_startup_with_resolution(
+        &self,
+        project_id: &str,
+        run_id: i64,
+        status: AgentRunStatus,
+        finished_at: i64,
+        exit_code: Option<i64>,
+        last_error: Option<&str>,
+        resolution: EventResolution,
+    ) -> Result<AgentRun, AppError> {
+        let connection = self.db.connect()?;
+        let gate_state: Option<String> = connection
+            .query_row(
+                "SELECT launch_gate_state FROM agent_runs
+                 WHERE project_id = ?1 AND run_id = ?2
+                   AND status IN ('starting', 'running')",
+                params![project_id, run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read code-change editor startup gate"))?;
+        match gate_state.as_deref() {
+            Some("released") => self.finish_and_resolve_events(
+                project_id,
+                run_id,
+                status,
+                finished_at,
+                exit_code,
+                last_error,
+                resolution,
+            ),
+            Some("pending") | Some("release_requested") => {
+                self.finish_and_resolve_events_inner(
+                    project_id,
+                    run_id,
+                    status,
+                    finished_at,
+                    exit_code,
+                    last_error,
+                    resolution,
+                    false,
+                    AgentRunFinalizationPhase::PreRelease,
+                )
+            }
+            Some(_) => Err(AppError::Validation {
+                field: "launch_gate_state",
+                message: "code-change editor startup recovery requires an active gate",
+            }),
+            None => Err(AppError::Validation {
+                field: "run_id",
+                message: "code-change editor startup recovery run is not active",
+            }),
+        }
     }
 
     /// Finalize a run after the durable launch marker when a policy violation

@@ -5,8 +5,8 @@
 //! deterministic so it can be validated before any child process is started.
 
 use std::{
-    collections::BTreeSet,
-    ffi::{OsStr, OsString},
+    collections::{BTreeMap, BTreeSet},
+    ffi::{CStr, OsStr, OsString},
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -36,13 +36,21 @@ use crate::{
 use crate::{
     db::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, CodeChangeRepository, Db,
-        EventRepository, ProjectRepository, ProposalRepository,
+        EventRepository, ExperimentRepository, NewCodeChangeCheck, ProjectRepository,
+        ProposalRepository, SubmissionRepository, TaskObservationRepository,
     },
-    models::{AgentContextMode, CampaignState, CodeChangeRun, CodeChangeState, EventKind,
-        EventStatus, NewEvent, ExperimentStatus},
+    models::{
+        AgentContextMode, AgentRunStatus, CampaignState, CodeChangeCheck, CodeChangeCheckStatus,
+        CodeChangeRun, CodeChangeState, EventKind, EventStatus, NewEvent, ExperimentStatus,
+        TaskObservation,
+    },
+    pueue::PueueTask,
+    reconcile::{managed_task_run_signature, parse_timestamp, task_signature},
     retry::RetryPolicy,
     output::bounded_redacted_text,
 };
+
+use crate::promotion::PromotionOutcome;
 
 #[cfg(unix)]
 use crate::process::{
@@ -66,12 +74,45 @@ use crate::execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolat
 const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 #[allow(dead_code)]
 const MAX_CHECK_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_CHECK_OUTPUT_DEPTH: usize = 32;
+// Supported Cargo all-target and uv project profiles can retain several build
+// products and environments. Keep each service-owned scope bounded while
+// allowing those profiles to complete; this is still an explicit finite cap,
+// not an ignored-path allowlist.
+const MAX_CHECK_OUTPUT_ENTRIES: usize = 16_384;
+const MAX_CHECK_OUTPUT_ALLOCATED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_RUNTIME_OUTPUT_ENTRIES: usize = 16_384;
+const MAX_RUNTIME_OUTPUT_ALLOCATED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_WORKTREE_ID_BYTES: usize = 128;
 const MAX_STATUS_PATHS: usize = 50;
+const MAX_CLEANUP_TASK_OBSERVATIONS: usize = 128;
 const MAX_IGNORED_SCAN_ENTRIES: usize = 512;
 const MAX_IGNORED_SCAN_DEPTH: usize = 32;
 const MAX_IGNORED_SCAN_BYTES: u64 = 500_000;
+const MAX_TERMINAL_RESULT_MANIFEST_BYTES: u64 = 16 * 1024;
+const RUNTIME_SERVICE_DIRECTORY: &str = ".pueue-agent";
+const RUNTIME_RESULTS_DIRECTORY: &str = "results";
+const RUNTIME_ARTIFACTS_DIRECTORY: &str = "artifacts";
+const RUNTIME_OUTPUTS_DIRECTORY: &str = "runtime";
+const RUNTIME_OUTPUT_DIRECTORY_NAMES: &[&str] = &[
+    "tmp",
+    "cargo-target",
+    "uv-venv",
+    "uv-cache",
+    "uv-python",
+    "pytest-cache",
+];
+const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
+const RUNTIME_MANIFEST_MODE: u32 = 0o600;
 static TEMP_INDEX_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalResultOutputStatus {
+    Ready,
+    Missing,
+    Invalid,
+}
 
 /// The only candidate-change facts that are eligible for durable projection.
 /// Paths are retained only in the in-memory validation operation; callers must
@@ -112,6 +153,7 @@ pub struct VerifiedCodeChangeWorktree {
     candidate: VerifiedProjectRoot,
     diff_facts: Option<DiffFacts>,
     candidate_sha: Option<String>,
+    terminal_result_outputs: Option<BoundTerminalResultOutputs>,
 }
 
 #[cfg(unix)]
@@ -139,6 +181,32 @@ impl VerifiedCodeChangeWorktree {
         self.diff_facts.as_ref()
     }
 
+    pub fn candidate_sha(&self) -> Option<&str> {
+        self.candidate_sha.as_deref()
+    }
+
+    pub(crate) fn terminal_result_output_status(&self) -> Option<TerminalResultOutputStatus> {
+        self.terminal_result_outputs
+            .as_ref()
+            .map(BoundTerminalResultOutputs::status)
+    }
+
+    pub(crate) fn terminal_result_manifest_bytes(&self) -> Option<&[u8]> {
+        self.terminal_result_outputs
+            .as_ref()
+            .and_then(BoundTerminalResultOutputs::manifest_bytes)
+    }
+
+    /// Prepare the exact runtime output tree used by a submitted candidate.
+    /// The retained descriptors and identities are held across the external
+    /// Pueue boundary so path replacements are detected before acceptance.
+    pub(crate) fn prepare_runtime_outputs(
+        &self,
+        experiment_id: &str,
+    ) -> Result<PreparedRuntimeOutputs, AppError> {
+        PreparedRuntimeOutputs::prepare(&self.candidate, experiment_id)
+    }
+
     pub async fn verify(&mut self) -> Result<DiffFacts, AppError> {
         let facts = self.manager.verify(&self.candidate).await?;
         self.diff_facts = Some(facts.clone());
@@ -152,8 +220,58 @@ impl VerifiedCodeChangeWorktree {
         let runner = CheckRunner {
             manager: &self.manager,
             candidate: &self.candidate,
+            check_timeout_override: None,
         };
         runner.run(&self.candidate, checks).await
+    }
+
+    async fn run_check_round(
+        &mut self,
+        db: &Db,
+        run_id: &str,
+        attempt: i64,
+        editor_checks: &[ProposedCheck],
+        check_timeout_override: Option<Duration>,
+    ) -> Result<Option<CheckRoundResult>, AppError> {
+        let expected = self.verify().await?;
+        let checked_file_count = i64::try_from(expected.file_count).map_err(|_| {
+            AppError::Validation {
+                field: "code_change.diff",
+                message: "counts cannot be represented",
+            }
+        })?;
+        let checked_diff_bytes = i64::try_from(expected.diff_bytes).map_err(|_| {
+            AppError::Validation {
+                field: "code_change.diff",
+                message: "counts cannot be represented",
+            }
+        })?;
+        let reconciled = CodeChangeRepository::new(db).record_checked_diff_for_round(
+            run_id,
+            attempt,
+            expected.persisted_digest(),
+            checked_file_count,
+            checked_diff_bytes,
+            unix_timestamp()?,
+        )?;
+        if reconciled.state == CodeChangeState::Editing {
+            return Ok(None);
+        }
+        let runner = CheckRunner {
+            manager: &self.manager,
+            candidate: &self.candidate,
+            check_timeout_override,
+        };
+        runner
+            .run_all(
+                db,
+                run_id,
+                attempt,
+                &expected,
+                editor_checks,
+            )
+            .await
+            .map(Some)
     }
 
     pub async fn commit(&mut self) -> Result<String, AppError> {
@@ -210,6 +328,633 @@ impl VerifiedCodeChangeWorktree {
             )
             .await
     }
+
+    async fn update_best_ref_cas_for_promotion(
+        &mut self,
+        db: &Db,
+        run_id: &str,
+        expected_old_sha: Option<&str>,
+        test_replacement_sha: Option<&str>,
+        test_attempt_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<(), AppError> {
+        let candidate_sha = self.candidate_sha.clone().ok_or(AppError::Validation {
+            field: "code_change.candidate_sha",
+            message: "must commit the candidate before updating best",
+        })?;
+        let authorization = CodeChangeCleanupAuthorization::load(db, run_id)?;
+        let run = authorization.fresh_run()?;
+        if run.state != CodeChangeState::ExperimentSubmitted
+            || run.code_change_run_id != run_id
+            || run.candidate_sha.as_deref() != Some(candidate_sha.as_str())
+            || run.cleanup_completed_at.is_some()
+        {
+            return Err(recovery_required());
+        }
+        verify_durable_run_scope(db, &run, &self.manager.project)?;
+        self.manager
+            .verify_durable_ownership_proof(&run, Some(&self.candidate))?;
+        CandidateRepository::new(&self.manager, &self.candidate)?
+            .update_best_ref_cas_for_promotion(
+                &candidate_sha,
+                expected_old_sha,
+                test_replacement_sha,
+                test_attempt_counter,
+            )
+            .await
+    }
+
+    async fn best_ref_sha(&self) -> Result<Option<String>, AppError> {
+        self.manager.validate_original_state().await?;
+        let original_root = self.manager.original.root_anchor.verify_identity()?;
+        let original_cwd = VerifiedWorkingDirectory::root(&original_root)?;
+        let reference = format!("refs/heads/{}", best_ref(&self.manager.campaign_id)?);
+        CandidateRepository::new(&self.manager, &self.candidate)?
+            .read_ref(&original_root, &original_cwd, &reference)
+            .await
+    }
+
+    async fn verify_promotion_candidate(
+        &self,
+        run: &CodeChangeRun,
+        experiment_id: &str,
+    ) -> Result<(), AppError> {
+        let candidate_sha = self
+            .candidate_sha
+            .as_deref()
+            .ok_or_else(recovery_required)?;
+        self.manager.validate_original_state().await?;
+        if self.manager.candidate_ref_sha().await?.as_deref() != Some(candidate_sha) {
+            return Err(recovery_required());
+        }
+        let (facts, _) = CandidateRepository::new(&self.manager, &self.candidate)?
+            .committed_diff_facts_for_result(candidate_sha, experiment_id)
+            .await?;
+        let changed_file_count = i64::try_from(facts.file_count).map_err(|_| {
+            AppError::Validation {
+                field: "code_change.diff",
+                message: "counts cannot be represented",
+            }
+        })?;
+        let diff_bytes = i64::try_from(facts.diff_bytes).map_err(|_| AppError::Validation {
+            field: "code_change.diff",
+            message: "counts cannot be represented",
+        })?;
+        if run.diff_digest.as_deref() != Some(facts.persisted_digest())
+            || run.changed_file_count != Some(changed_file_count)
+            || run.diff_bytes != Some(diff_bytes)
+        {
+            return Err(recovery_required());
+        }
+        self.manager.validate_original_state().await
+    }
+
+    /// Revalidate the candidate root, its immutable revision, and the
+    /// descriptor-bound proposal cwd immediately before or after a Pueue
+    /// add.  The pathname is reopened after the external boundary so a
+    /// replacement cannot be mistaken for the directory held by this
+    /// capability.
+    #[cfg(unix)]
+    pub async fn reverify_submission_boundary(
+        &self,
+        working_directory: &VerifiedWorkingDirectory,
+    ) -> Result<(), AppError> {
+        let candidate = self.candidate.anchor.verify_identity()?;
+        if candidate.anchor.identity != self.candidate.anchor.identity
+            || candidate.anchor.canonical_path != self.manager.worktree_path
+        {
+            return Err(recovery_required());
+        }
+        working_directory.reverify_under_root(&candidate)?;
+        self.manager.validate_git_boundary(&self.candidate)?;
+        self.manager.validate_original_state().await?;
+        let candidate_sha = self.candidate_sha.as_deref().ok_or_else(recovery_required)?;
+        if self.manager.candidate_ref_sha().await?.as_deref() != Some(candidate_sha) {
+            return Err(recovery_required());
+        }
+        let facts = CandidateRepository::new(&self.manager, &self.candidate)?
+            .committed_diff_facts(candidate_sha)
+            .await?;
+        if self.diff_facts.as_ref().is_some_and(|expected| expected != &facts) {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
+    /// Revalidate a candidate immediately after the Pueue add while the
+    /// supervisor-owned runtime tree is still in its pre-result state.  This
+    /// boundary must not require the terminal-result binding retained during
+    /// later ingestion, but it permits only descriptor-bound runtime output
+    /// and known verified Python check caches before rechecking the committed
+    /// candidate facts.
+    pub(crate) async fn reverify_submission_runtime_boundary(
+        &self,
+        working_directory: &VerifiedWorkingDirectory,
+        runtime: &PreparedRuntimeOutputs,
+    ) -> Result<(), AppError> {
+        let candidate = self.candidate.anchor.verify_identity()?;
+        if candidate.anchor.identity != self.candidate.anchor.identity
+            || candidate.anchor.canonical_path != self.manager.worktree_path
+        {
+            return Err(recovery_required());
+        }
+        working_directory.reverify_under_root(&candidate)?;
+        self.manager.validate_git_boundary(&candidate)?;
+        self.manager.validate_original_state().await?;
+        let candidate_sha = self
+            .candidate_sha
+            .as_deref()
+            .ok_or_else(recovery_required)?;
+        if self.manager.candidate_ref_sha().await?.as_deref() != Some(candidate_sha) {
+            return Err(recovery_required());
+        }
+        let facts = CandidateRepository::new(&self.manager, &self.candidate)?
+            .committed_diff_facts_for_submission_runtime(candidate_sha)
+            .await?;
+        if self
+            .diff_facts
+            .as_ref()
+            .is_some_and(|expected| expected != &facts)
+        {
+            return Err(recovery_required());
+        }
+        runtime.reverify(&candidate)?;
+        Ok(())
+    }
+
+    /// Revalidate a submitted candidate immediately around terminal-result
+    /// ingestion.  Runtime output is handled by a separate, narrower
+    /// allowlist; the ordinary submission boundary remains strict so a
+    /// candidate cannot acquire service files before it is submitted.
+    pub(crate) async fn reverify_result_ingestion_boundary(
+        &self,
+        working_directory: &VerifiedWorkingDirectory,
+        experiment_id: &str,
+    ) -> Result<TerminalResultOutputStatus, AppError> {
+        let candidate = self.candidate.anchor.verify_identity()?;
+        if candidate.anchor.identity != self.candidate.anchor.identity
+            || candidate.anchor.canonical_path != self.manager.worktree_path
+        {
+            return Err(recovery_required());
+        }
+        working_directory.reverify_under_root(&candidate)?;
+        self.manager.validate_git_boundary(&candidate)?;
+        self.manager.validate_original_state().await?;
+        let candidate_sha = self.candidate_sha.as_deref().ok_or_else(recovery_required)?;
+        if self.manager.candidate_ref_sha().await?.as_deref() != Some(candidate_sha) {
+            return Err(recovery_required());
+        }
+        let (facts, terminal_result_outputs) =
+            CandidateRepository::new(&self.manager, &self.candidate)?
+                .committed_diff_facts_for_result(candidate_sha, experiment_id)
+                .await?;
+        if self.diff_facts.as_ref().is_some_and(|expected| expected != &facts) {
+            return Err(recovery_required());
+        }
+        let bound = self
+            .terminal_result_outputs
+            .as_ref()
+            .ok_or_else(recovery_required)?;
+        if bound.status() != terminal_result_outputs.status()
+            || bound.reverify(&self.candidate.directory).is_err()
+        {
+            return Err(recovery_required());
+        }
+        Ok(terminal_result_outputs.status())
+    }
+}
+
+/// Descriptor-bound runtime output locations for one accepted experiment.
+/// The result manifest is created before Pueue starts the task so a task using
+/// ordinary file creation APIs cannot inherit a group-writable umask mode.
+#[cfg(unix)]
+pub(crate) struct PreparedRuntimeOutputs {
+    _service: File,
+    _results: File,
+    _artifacts: File,
+    runtime: File,
+    _runtime_experiment: File,
+    artifact_directory: File,
+    result_manifest: File,
+    service_identity: ExecutableIdentity,
+    results_identity: ExecutableIdentity,
+    artifacts_identity: ExecutableIdentity,
+    runtime_identity: ExecutableIdentity,
+    runtime_experiment_identity: ExecutableIdentity,
+    artifact_identity: ExecutableIdentity,
+    result_manifest_identity: ExecutableIdentity,
+    experiment_id: String,
+    runtime_path: PathBuf,
+}
+
+#[cfg(unix)]
+struct BoundTerminalResultOutputs {
+    root_identity: ExecutableIdentity,
+    service: File,
+    service_identity: ExecutableIdentity,
+    results: BoundTerminalResults,
+    artifacts: File,
+    artifacts_identity: ExecutableIdentity,
+    artifact_directory: File,
+    artifact_identity: ExecutableIdentity,
+    experiment_id: String,
+}
+
+#[cfg(unix)]
+enum BoundTerminalResults {
+    Missing,
+    InvalidFile {
+        file: File,
+        identity: ExecutableIdentity,
+    },
+    Directory {
+        directory: File,
+        identity: ExecutableIdentity,
+        manifest: BoundTerminalManifest,
+    },
+}
+
+#[cfg(unix)]
+enum BoundTerminalManifest {
+    Missing,
+    Invalid {
+        file: File,
+        identity: ExecutableIdentity,
+        length: u64,
+    },
+    Ready {
+        file: File,
+        identity: ExecutableIdentity,
+        bytes: Vec<u8>,
+    },
+}
+
+#[cfg(unix)]
+impl BoundTerminalResultOutputs {
+    fn status(&self) -> TerminalResultOutputStatus {
+        match &self.results {
+            BoundTerminalResults::Missing | BoundTerminalResults::InvalidFile { .. } => {
+                TerminalResultOutputStatus::Invalid
+            }
+            BoundTerminalResults::Directory { manifest, .. } => match manifest {
+                BoundTerminalManifest::Missing => TerminalResultOutputStatus::Missing,
+                BoundTerminalManifest::Invalid { .. } => TerminalResultOutputStatus::Invalid,
+                BoundTerminalManifest::Ready { .. } => TerminalResultOutputStatus::Ready,
+            },
+        }
+    }
+
+    fn manifest_bytes(&self) -> Option<&[u8]> {
+        match &self.results {
+            BoundTerminalResults::Directory {
+                manifest: BoundTerminalManifest::Ready { bytes, .. },
+                ..
+            } => Some(bytes),
+            _ => None,
+        }
+    }
+
+    fn reverify(&self, root: &File) -> Result<(), AppError> {
+        let root_metadata = root.metadata().map_err(|_| recovery_required())?;
+        if !secure_owned_directory(&root_metadata)
+            || executable_identity_from_metadata(&root_metadata) != self.root_identity
+        {
+            return Err(recovery_required());
+        }
+        if verify_runtime_directory(&self.service)? != self.service_identity
+            || verify_runtime_directory(&self.artifacts)? != self.artifacts_identity
+            || verify_runtime_directory(&self.artifact_directory)? != self.artifact_identity
+        {
+            return Err(recovery_required());
+        }
+
+        let service = open_runtime_directory_at(root, OsStr::new(RUNTIME_SERVICE_DIRECTORY))
+            .map_err(|_| recovery_required())?;
+        if verify_runtime_directory(&service)? != self.service_identity {
+            return Err(recovery_required());
+        }
+        let (results, _artifacts, artifacts_identity, _artifact_directory, artifact_identity) =
+            bind_terminal_result_service(&service, &self.experiment_id)?;
+        if artifacts_identity != self.artifacts_identity
+            || artifact_identity != self.artifact_identity
+        {
+            return Err(recovery_required());
+        }
+        self.results.reverify(&results)?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl BoundTerminalResults {
+    fn reverify(&self, current: &Self) -> Result<(), AppError> {
+        match (self, current) {
+            (Self::Missing, Self::Missing) => Ok(()),
+            (
+                Self::InvalidFile {
+                    file,
+                    identity,
+                },
+                Self::InvalidFile {
+                    file: current_file,
+                    identity: current_identity,
+                },
+            ) if identity == current_identity => {
+                let retained = verify_runtime_result_file(file)?;
+                let current = verify_runtime_result_file(current_file)?;
+                if retained == *identity && current == *identity {
+                    Ok(())
+                } else {
+                    Err(recovery_required())
+                }
+            }
+            (
+                Self::Directory {
+                    directory,
+                    identity,
+                    manifest,
+                },
+                Self::Directory {
+                    directory: current_directory,
+                    identity: current_identity,
+                    manifest: current_manifest,
+                },
+            ) if identity == current_identity => {
+                if verify_runtime_directory(directory)? != *identity
+                    || verify_runtime_directory(current_directory)? != *identity
+                {
+                    return Err(recovery_required());
+                }
+                manifest.reverify(current_manifest)
+            }
+            _ => Err(recovery_required()),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl BoundTerminalManifest {
+    fn reverify(&self, current: &Self) -> Result<(), AppError> {
+        match (self, current) {
+            (Self::Missing, Self::Missing) => Ok(()),
+            (
+                Self::Invalid {
+                    file,
+                    identity,
+                    length,
+                },
+                Self::Invalid {
+                    file: current_file,
+                    identity: current_identity,
+                    length: current_length,
+                },
+            ) if identity == current_identity && length == current_length => {
+                if verify_runtime_manifest(file)? != *identity
+                    || verify_runtime_manifest(current_file)? != *identity
+                {
+                    return Err(recovery_required());
+                }
+                Ok(())
+            }
+            (
+                Self::Ready {
+                    file,
+                    identity,
+                    bytes,
+                },
+                Self::Ready {
+                    file: current_file,
+                    identity: current_identity,
+                    bytes: current_bytes,
+                },
+            ) if identity == current_identity => {
+                if verify_runtime_manifest(file)? != *identity
+                    || verify_runtime_manifest(current_file)? != *identity
+                {
+                    return Err(recovery_required());
+                }
+                let retained_bytes = read_runtime_manifest_snapshot(file)?;
+                let current_bytes_from_descriptor = read_runtime_manifest_snapshot(current_file)?;
+                if retained_bytes == *bytes
+                    && current_bytes_from_descriptor == *bytes
+                    && current_bytes == bytes
+                {
+                    Ok(())
+                } else {
+                    Err(recovery_required())
+                }
+            }
+            _ => Err(recovery_required()),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PreparedRuntimeOutputs {
+    fn prepare(
+        root: &VerifiedProjectRoot,
+        experiment_id: &str,
+    ) -> Result<Self, AppError> {
+        validate_internal_id("experiment_id", experiment_id)?;
+        let service = open_or_create_runtime_directory_at(
+            &root.directory,
+            OsStr::new(RUNTIME_SERVICE_DIRECTORY),
+        )?;
+        let results = open_or_create_runtime_directory_at(
+            &service.0,
+            OsStr::new(RUNTIME_RESULTS_DIRECTORY),
+        )?;
+        let artifacts = open_or_create_runtime_directory_at(
+            &service.0,
+            OsStr::new(RUNTIME_ARTIFACTS_DIRECTORY),
+        )?;
+        let artifact_directory =
+            open_or_create_runtime_directory_at(&artifacts.0, OsStr::new(experiment_id))?;
+        let runtime = open_or_create_runtime_directory_at(
+            &service.0,
+            OsStr::new(RUNTIME_OUTPUTS_DIRECTORY),
+        )?;
+        let runtime_experiment = create_new_directory_at(&runtime.0, OsStr::new(experiment_id))?;
+        for name in RUNTIME_OUTPUT_DIRECTORY_NAMES {
+            open_or_create_runtime_directory_at(&runtime_experiment, OsStr::new(name))?;
+        }
+        let result_name = OsString::from(format!("{experiment_id}.json"));
+        let result_manifest = open_or_create_runtime_manifest_at(&results.0, &result_name)?;
+        let runtime_path = root
+            .anchor
+            .canonical_path
+            .join(RUNTIME_SERVICE_DIRECTORY)
+            .join(RUNTIME_OUTPUTS_DIRECTORY)
+            .join(experiment_id);
+        let runtime_experiment_identity = directory_identity(&runtime_experiment)?;
+        let prepared = Self {
+            _service: service.0,
+            _results: results.0,
+            _artifacts: artifacts.0,
+            runtime: runtime.0,
+            _runtime_experiment: runtime_experiment,
+            artifact_directory: artifact_directory.0,
+            result_manifest: result_manifest.0,
+            service_identity: service.1,
+            results_identity: results.1,
+            artifacts_identity: artifacts.1,
+            runtime_identity: runtime.1,
+            runtime_experiment_identity,
+            artifact_identity: artifact_directory.1,
+            result_manifest_identity: result_manifest.1,
+            experiment_id: experiment_id.to_owned(),
+            runtime_path,
+        };
+        prepared.reverify(root)?;
+        prepared.require_empty_before_add()?;
+        Ok(prepared)
+    }
+
+    fn require_empty_before_add(&self) -> Result<(), AppError> {
+        let manifest = self
+            .result_manifest
+            .metadata()
+            .map_err(|_| recovery_required())?;
+        if manifest.len() != 0 {
+            return Err(recovery_required());
+        }
+        let mut entries = fs::read_dir(descriptor_path(&self.artifact_directory))
+            .map_err(|_| recovery_required())?;
+        if let Some(entry) = entries.next() {
+            entry.map_err(|_| recovery_required())?;
+            return Err(recovery_required());
+        }
+        verify_runtime_output_scope(
+            &self.runtime,
+            self.runtime_identity,
+            &self.experiment_id,
+            Some(self.runtime_experiment_identity),
+            true,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_runtime_environment(
+        &self,
+        argv: &mut Vec<OsString>,
+    ) -> Result<(), AppError> {
+        if argv.len() < 1 + 4 || argv[0] != OsString::from("/usr/bin/env") {
+            return Err(recovery_required());
+        }
+        let mut assignments = Vec::new();
+        for (name, value) in [
+            ("TMPDIR", check_output_path(&self.runtime_path, "tmp")?),
+            ("TMP", check_output_path(&self.runtime_path, "tmp")?),
+            ("TEMP", check_output_path(&self.runtime_path, "tmp")?),
+            (
+                "CARGO_TARGET_DIR",
+                check_output_path(&self.runtime_path, "cargo-target")?,
+            ),
+            (
+                "UV_PROJECT_ENVIRONMENT",
+                check_output_path(&self.runtime_path, "uv-venv")?,
+            ),
+            (
+                "UV_CACHE_DIR",
+                check_output_path(&self.runtime_path, "uv-cache")?,
+            ),
+            (
+                "UV_PYTHON_INSTALL_DIR",
+                check_output_path(&self.runtime_path, "uv-python")?,
+            ),
+        ] {
+            let mut assignment = OsString::from(name);
+            assignment.push("=");
+            assignment.push(value);
+            assignments.push(assignment);
+        }
+        let cache = check_output_path(&self.runtime_path, "pytest-cache")?;
+        let cache = cache.to_str().ok_or(validation(
+            "code_change.runtime_output",
+            "owned pytest cache path must be UTF-8",
+        ))?;
+        if cache.chars().any(char::is_control) {
+            return Err(validation(
+                "code_change.runtime_output",
+                "owned pytest cache path contains control characters",
+            ));
+        }
+        let escaped = cache.replace('\\', "\\\\").replace('"', "\\\"");
+        let pytest = OsString::from("PYTHONDONTWRITEBYTECODE=1");
+        assignments.push(pytest);
+        let mut pytest = OsString::from("PYTEST_ADDOPTS=-o \"");
+        pytest.push("cache_dir=");
+        pytest.push(escaped);
+        pytest.push("\"");
+        assignments.push(pytest);
+        argv.splice(1 + 4..1 + 4, assignments);
+        Ok(())
+    }
+
+    pub(crate) fn reverify(&self, root: &VerifiedProjectRoot) -> Result<(), AppError> {
+        let root_metadata = root.directory.metadata().map_err(|_| recovery_required())?;
+        if !secure_owned_directory(&root_metadata)
+            || executable_identity_from_metadata(&root_metadata) != root.anchor.identity
+        {
+            return Err(recovery_required());
+        }
+        let service = open_runtime_directory_at(
+            &root.directory,
+            OsStr::new(RUNTIME_SERVICE_DIRECTORY),
+        )
+        .map_err(|_| recovery_required())?;
+        if verify_runtime_directory(&service)? != self.service_identity {
+            return Err(recovery_required());
+        }
+        let service_entries = check_output_directory_entries(&service)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected_service_entries = [
+            RUNTIME_RESULTS_DIRECTORY,
+            RUNTIME_ARTIFACTS_DIRECTORY,
+            RUNTIME_OUTPUTS_DIRECTORY,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<BTreeSet<_>>();
+        if service_entries != expected_service_entries {
+            return Err(recovery_required());
+        }
+        let results = open_runtime_directory_at(&service, OsStr::new(RUNTIME_RESULTS_DIRECTORY))
+            .map_err(|_| recovery_required())?;
+        if verify_runtime_directory(&results)? != self.results_identity {
+            return Err(recovery_required());
+        }
+        let artifacts = open_runtime_directory_at(&service, OsStr::new(RUNTIME_ARTIFACTS_DIRECTORY))
+            .map_err(|_| recovery_required())?;
+        if verify_runtime_directory(&artifacts)? != self.artifacts_identity {
+            return Err(recovery_required());
+        }
+        let runtime = open_runtime_directory_at(&service, OsStr::new(RUNTIME_OUTPUTS_DIRECTORY))
+            .map_err(|_| recovery_required())?;
+        verify_runtime_output_boundary(
+            &runtime,
+            self.runtime_identity,
+            &self._runtime_experiment,
+            self.runtime_experiment_identity,
+            &self.experiment_id,
+        )?;
+        let artifact_directory =
+            open_runtime_directory_at(&artifacts, OsStr::new(&self.experiment_id))
+                .map_err(|_| recovery_required())?;
+        if verify_runtime_directory(&artifact_directory)? != self.artifact_identity {
+            return Err(recovery_required());
+        }
+        let result_name = OsString::from(format!("{}.json", self.experiment_id));
+        let result_manifest = open_runtime_manifest_at(&results, &result_name)?;
+        if result_manifest.1 != self.result_manifest_identity {
+            return Err(recovery_required());
+        }
+        let result_name = OsString::from(format!("{}.json", self.experiment_id));
+        if check_output_directory_entries(&results)? != vec![result_name] {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
 }
 
 /// One editor launch owned by the daemon.  The worktree capability itself is
@@ -234,6 +979,15 @@ pub struct CodeChangeReport {
     pub advanced: usize,
     pub deferred: usize,
     pub rejected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupEditorMarkerEvidence {
+    Absent,
+    ConfirmedPending,
+    ConfirmedReleaseRequested,
+    IndeterminatePending,
+    IndeterminateReleaseRequested,
 }
 
 impl Default for CodeChangeReport {
@@ -262,12 +1016,25 @@ impl std::fmt::Debug for CodeChangeReport {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionRefEvidence {
+    ExpectedOld,
+    Candidate,
+    Unrelated,
+}
+
+#[cfg(unix)]
 pub struct CodeChangeCoordinator<'a> {
     db: &'a Db,
     runner: &'a AgentRunner,
     policy: &'a ResolvedExecutionPolicy,
     limits: CampaignLimits,
     lease_seconds: i64,
+    check_timeout_override: Option<Duration>,
+    #[cfg(debug_assertions)]
+    pre_cas_best_ref_swap_for_test: Arc<Mutex<Option<String>>>,
+    #[cfg(debug_assertions)]
+    pre_cas_update_ref_attempts_for_test: Arc<AtomicU64>,
 }
 
 #[cfg(unix)]
@@ -284,6 +1051,11 @@ impl<'a> CodeChangeCoordinator<'a> {
             policy,
             limits,
             lease_seconds: 600,
+            check_timeout_override: None,
+            #[cfg(debug_assertions)]
+            pre_cas_best_ref_swap_for_test: Arc::new(Mutex::new(None)),
+            #[cfg(debug_assertions)]
+            pre_cas_update_ref_attempts_for_test: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -292,11 +1064,224 @@ impl<'a> CodeChangeCoordinator<'a> {
         self
     }
 
-    /// Advance only the worktree/editor portion of a code-change run.  Check
-    /// execution, candidate submission, evaluation, and cleanup remain owned
-    /// by later lifecycle stages.  Every external operation is preceded by a
-    /// fresh DB/state-root read and every launch is bound to an attempt before
-    /// native gate release.
+    /// Test-only timeout seam for the bounded CheckRunner integration path.
+    /// Production construction always uses the startup-pinned policy timeout.
+    #[doc(hidden)]
+    pub fn with_code_change_check_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.check_timeout_override = Some(timeout);
+        self
+    }
+
+    /// Test-only seam for a competing best-ref update after promotion intent
+    /// is observed and immediately before the coordinator's CAS helper.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn with_pre_cas_best_ref_swap_for_test(self, replacement_sha: String) -> Self {
+        *self
+            .pre_cas_best_ref_swap_for_test
+            .lock()
+            .expect("code-change test hook mutex") = Some(replacement_sha);
+        self
+    }
+
+    /// Return the number of production best-ref CAS commands attempted by the
+    /// test seam on this coordinator.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn pre_cas_update_ref_attempts_for_test(&self) -> u64 {
+        self.pre_cas_update_ref_attempts_for_test
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(debug_assertions)]
+    fn take_pre_cas_best_ref_swap_for_test(&self) -> Option<String> {
+        let mut hook = self
+            .pre_cas_best_ref_swap_for_test
+            .lock()
+            .expect("code-change test hook mutex");
+        hook.take()
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn take_pre_cas_best_ref_swap_for_test(&self) -> Option<String> {
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    fn pre_cas_update_ref_attempt_counter(&self) -> Option<Arc<AtomicU64>> {
+        Some(Arc::clone(&self.pre_cas_update_ref_attempts_for_test))
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn pre_cas_update_ref_attempt_counter(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
+
+    pub async fn recover_startup_editors(
+        &self,
+        now: i64,
+        preserved_agent_run_ids: &[i64],
+        retry_policies: &BTreeMap<String, RetryPolicy>,
+        _confirmed_pending_marker_ids: &BTreeSet<i64>,
+        _confirmed_release_requested_ids: &BTreeSet<i64>,
+        _indeterminate_pending_marker_ids: &BTreeSet<i64>,
+        _indeterminate_release_requested_ids: &BTreeSet<i64>,
+    ) -> Result<CodeChangeReport, AppError> {
+        let code_change_repository = CodeChangeRepository::new(self.db);
+        let agent_run_repository = AgentRunRepository::new(self.db);
+        let mut report = CodeChangeReport::default();
+        const PRE_MARKER_FAILURE_CODE: &str = "editor_launch";
+        const PRE_MARKER_FAILURE_SUMMARY: &str =
+            "editor startup did not reach the execution marker";
+        const UNCERTAIN_FAILURE_CODE: &str = "editor_startup_uncertain";
+        const UNCERTAIN_FAILURE_SUMMARY: &str =
+            "editor startup execution outcome is unknown after restart";
+
+        for agent_run_id in preserved_agent_run_ids {
+            let Some((code_change_run_id, attempt)) = code_change_repository
+                .find_editor_attempt_for_agent_run(*agent_run_id)?
+            else {
+                continue;
+            };
+            let Some(agent_run) = agent_run_repository.find_by_id(*agent_run_id)? else {
+                continue;
+            };
+            if !matches!(
+                agent_run.status,
+                AgentRunStatus::Starting | AgentRunStatus::Running
+            ) {
+                continue;
+            }
+            let retry_policy = retry_policies
+                .get(&agent_run.project_id)
+                .copied()
+                .ok_or(AppError::Validation {
+                    field: "project_id",
+                    message: "startup recovery retry policy is missing for code-change editor project",
+                })?;
+
+            let marker_evidence = match (
+                _confirmed_pending_marker_ids.contains(agent_run_id),
+                _confirmed_release_requested_ids.contains(agent_run_id),
+                _indeterminate_pending_marker_ids.contains(agent_run_id),
+                _indeterminate_release_requested_ids.contains(agent_run_id),
+            ) {
+                (false, false, false, false) => StartupEditorMarkerEvidence::Absent,
+                (true, false, false, false) => {
+                    StartupEditorMarkerEvidence::ConfirmedPending
+                }
+                (false, true, false, false) => {
+                    StartupEditorMarkerEvidence::ConfirmedReleaseRequested
+                }
+                (false, false, true, false) => {
+                    StartupEditorMarkerEvidence::IndeterminatePending
+                }
+                (false, false, false, true) => {
+                    StartupEditorMarkerEvidence::IndeterminateReleaseRequested
+                }
+                _ => {
+                    return Err(AppError::Validation {
+                        field: "launch_gate_state",
+                        message: "startup marker evidence is contradictory",
+                    });
+                }
+            };
+            let startup_uncertain = !matches!(marker_evidence, StartupEditorMarkerEvidence::Absent)
+                || matches!(
+                    agent_run.launch_gate_state.as_str(),
+                    "released" | "release_requested"
+                );
+            if attempt.status == "failed"
+                && attempt.failure_code.as_deref() == Some(UNCERTAIN_FAILURE_CODE)
+            {
+                code_change_repository.require_recovery(
+                    &code_change_run_id,
+                    UNCERTAIN_FAILURE_CODE,
+                    UNCERTAIN_FAILURE_SUMMARY,
+                    now,
+                )?;
+                agent_run_repository.finish_code_change_editor_startup_uncertain(
+                    &agent_run.project_id,
+                    *agent_run_id,
+                    now,
+                    UNCERTAIN_FAILURE_SUMMARY,
+                )?;
+                report.advanced += 1;
+                continue;
+            }
+            if startup_uncertain && matches!(attempt.status.as_str(), "reserved" | "running") {
+                if !code_change_repository.fail_editor_attempt_for_agent_run(
+                    *agent_run_id,
+                    UNCERTAIN_FAILURE_CODE,
+                    UNCERTAIN_FAILURE_SUMMARY,
+                    now,
+                )? {
+                    continue;
+                }
+                code_change_repository.require_recovery(
+                    &code_change_run_id,
+                    UNCERTAIN_FAILURE_CODE,
+                    UNCERTAIN_FAILURE_SUMMARY,
+                    now,
+                )?;
+                agent_run_repository.finish_code_change_editor_startup_uncertain(
+                    &agent_run.project_id,
+                    *agent_run_id,
+                    now,
+                    UNCERTAIN_FAILURE_SUMMARY,
+                )?;
+                report.advanced += 1;
+                continue;
+            }
+
+            let (status, exit_code, last_error) = match attempt.status.as_str() {
+                "ready" => (AgentRunStatus::Completed, Some(0), None),
+                "failed" => (
+                    AgentRunStatus::Failed,
+                    None,
+                    attempt.failure_summary.as_deref(),
+                ),
+                "reserved" | "running"
+                    if agent_run.launch_gate_state == "pending"
+                        && !(_confirmed_pending_marker_ids.contains(agent_run_id)
+                            || _confirmed_release_requested_ids.contains(agent_run_id)
+                            || _indeterminate_pending_marker_ids.contains(agent_run_id)
+                            || _indeterminate_release_requested_ids.contains(agent_run_id)) =>
+                {
+                    if !code_change_repository.fail_editor_attempt_for_agent_run(
+                        *agent_run_id,
+                        PRE_MARKER_FAILURE_CODE,
+                        PRE_MARKER_FAILURE_SUMMARY,
+                        now,
+                    )? {
+                        continue;
+                    }
+                    (AgentRunStatus::Failed, None, Some(PRE_MARKER_FAILURE_SUMMARY))
+                }
+                _ => {
+                    report.deferred += 1;
+                    continue;
+                }
+            };
+
+            agent_run_repository.finish_code_change_editor_startup_terminal(
+                &agent_run.project_id,
+                *agent_run_id,
+                status,
+                now,
+                exit_code,
+                last_error,
+                retry_policy,
+            )?;
+            report.advanced += 1;
+        }
+
+        Ok(report)
+    }
+
+    /// Advance the bounded code-change lifecycle.  Every external operation
+    /// is preceded by a fresh DB/state-root read and every launch is bound to
+    /// an attempt before native gate release.
     pub async fn advance_ready(
         &self,
         now: i64,
@@ -306,6 +1291,28 @@ impl<'a> CodeChangeCoordinator<'a> {
         let runs = repository.list_recoverable(limit)?;
         let mut report = CodeChangeReport::default();
         for run in runs {
+            if run.state == CodeChangeState::ExperimentSubmitted {
+                self.advance_submitted_code_change(&run, now, &mut report)
+                    .await?;
+                continue;
+            }
+            if run.state == CodeChangeState::Evaluated {
+                match repository.transition(
+                    &run.code_change_run_id,
+                    CodeChangeState::Evaluated,
+                    CodeChangeState::CleanupPending,
+                    now,
+                ) {
+                    Ok(_) => report.advanced += 1,
+                    Err(_) => report.deferred += 1,
+                }
+                continue;
+            }
+            if matches!(run.state, CodeChangeState::CleanupPending | CodeChangeState::Rejected) {
+                self.advance_cleanup_code_change(&run, now, &mut report)
+                    .await?;
+                continue;
+            }
             // Rejected runs with a NULL cleanup marker remain recoverable as
             // the durable Task 6 cleanup schedule.  Task 4 ends after
             // terminal editor persistence and must not reopen or clean them.
@@ -314,6 +1321,8 @@ impl<'a> CodeChangeCoordinator<'a> {
                 CodeChangeState::Reserved
                     | CodeChangeState::PreparingWorktree
                     | CodeChangeState::Editing
+                    | CodeChangeState::Checking
+                    | CodeChangeState::Committing
             ) {
                 continue;
             }
@@ -390,7 +1399,7 @@ impl<'a> CodeChangeCoordinator<'a> {
                     message: "code-change proposal is missing from its campaign",
                 })?;
 
-            let candidate = match run.state {
+            let mut candidate = match run.state {
                 CodeChangeState::Reserved | CodeChangeState::PreparingWorktree => {
                     let Some(project_lock) = self
                         .runner
@@ -431,31 +1440,38 @@ impl<'a> CodeChangeCoordinator<'a> {
                         }
                     }
                 }
-                CodeChangeState::Editing => match reopen_code_change_worktree_for_run(
-                    self.policy,
-                    &project,
-                    &original_policy,
-                    self.db,
-                    &run.code_change_run_id,
-                )
-                .await
-                {
-                    Ok(candidate) => candidate,
-                    Err(error) => {
-                        repository.require_recovery(
-                            &run.code_change_run_id,
-                            "worktree_recovery_required",
-                            &bounded_redacted_text(&error.to_string()),
-                            now,
-                        )?;
-                        report.rejected += 1;
-                        continue;
+                CodeChangeState::Editing
+                | CodeChangeState::Checking
+                | CodeChangeState::Committing => {
+                    match reopen_code_change_worktree_for_run(
+                        self.policy,
+                        &project,
+                        &original_policy,
+                        self.db,
+                        &run.code_change_run_id,
+                    )
+                    .await
+                    {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            repository.require_recovery(
+                                &run.code_change_run_id,
+                                "worktree_recovery_required",
+                                &bounded_redacted_text(&error.to_string()),
+                                now,
+                            )?;
+                            report.rejected += 1;
+                            continue;
+                        }
                     }
-                },
+                }
                 _ => continue,
             };
 
-            if run.state != CodeChangeState::Editing {
+            if matches!(
+                run.state,
+                CodeChangeState::Reserved | CodeChangeState::PreparingWorktree
+            ) {
                 repository.transition(
                     &run.code_change_run_id,
                     CodeChangeState::PreparingWorktree,
@@ -480,6 +1496,31 @@ impl<'a> CodeChangeCoordinator<'a> {
                 }
             };
 
+            if run.state == CodeChangeState::Committing {
+                match self
+                    .resume_committing_candidate(
+                        &repository,
+                        &run,
+                        &mut candidate,
+                        now,
+                        &mut report,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        repository.require_recovery(
+                            &run.code_change_run_id,
+                            "worktree_recovery_required",
+                            &bounded_redacted_text(&error.to_string()),
+                            now,
+                        )?;
+                        report.rejected += 1;
+                    }
+                }
+                continue;
+            }
+
             let attempts = repository.list_editor_attempts(&run.code_change_run_id)?;
             if attempts.len() > 2 || run.editor_attempts > 2 {
                 repository.require_recovery(
@@ -490,6 +1531,37 @@ impl<'a> CodeChangeCoordinator<'a> {
                 )?;
                 report.rejected += 1;
                 continue;
+            }
+            if let Some(last) = attempts.last() {
+                if matches!(run.state, CodeChangeState::Editing | CodeChangeState::Checking)
+                    && last.status == "ready"
+                    && last.failure_code.as_deref() != Some("check_failed")
+                {
+                    let rows = repository.list_checks(&run.code_change_run_id, last.attempt)?;
+                    let editor_checks = editor_project_checks(&rows)?;
+                    if let Err(error) = self
+                        .advance_check_round(
+                        &repository,
+                        &run,
+                        last.attempt,
+                        &mut candidate,
+                        &editor_checks,
+                        self.check_timeout_override,
+                        now,
+                        &mut report,
+                    )
+                        .await
+                    {
+                        repository.require_recovery(
+                            &run.code_change_run_id,
+                            "check_round_recovery_required",
+                            &bounded_redacted_text(&error.to_string()),
+                            now,
+                        )?;
+                        report.rejected += 1;
+                    }
+                    continue;
+                }
             }
             let attempt = match attempts.last() {
                 None if run.editor_attempts == 0 => 1,
@@ -509,10 +1581,16 @@ impl<'a> CodeChangeCoordinator<'a> {
                         continue;
                     }
                 Some(attempt) if attempt.status == "ready" => {
-                    // Task 4 ends at terminal editor persistence.  Task 5
-                    // consumes the accepted output and advances to checks.
-                    report.deferred += 1;
-                    continue;
+                    if attempt.attempt == 1
+                        && attempt.failure_code.as_deref() == Some("check_failed")
+                    {
+                        2
+                    } else {
+                        // Task 4 ends at terminal editor persistence.  Task 5
+                        // consumes the accepted output and advances to checks.
+                        report.deferred += 1;
+                        continue;
+                    }
                 }
                 Some(attempt) if attempt.status == "failed" && attempt.attempt == 1 => {
                     if attempt.failure_code.as_deref() == Some("cannot_apply")
@@ -770,6 +1848,772 @@ impl<'a> CodeChangeCoordinator<'a> {
         }
         Ok(report)
     }
+
+    /// Reconcile terminal code-change submissions and cleanup after a restart.
+    /// This entry point is intentionally separate from editor advancement so
+    /// restart recovery can consume a persisted promotion intent without
+    /// launching another agent.
+    pub async fn recover_interrupted(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<CodeChangeReport, AppError> {
+        let repository = CodeChangeRepository::new(self.db);
+        let runs = repository.list_recoverable(limit)?;
+        let mut report = CodeChangeReport::default();
+        for run in runs {
+            if run.state == CodeChangeState::ExperimentSubmitted {
+                self.advance_submitted_code_change(&run, now, &mut report)
+                    .await?;
+                continue;
+            }
+            if run.state == CodeChangeState::Evaluated {
+                match repository.transition(
+                    &run.code_change_run_id,
+                    CodeChangeState::Evaluated,
+                    CodeChangeState::CleanupPending,
+                    now,
+                ) {
+                    Ok(_) => report.advanced += 1,
+                    Err(_) => report.deferred += 1,
+                }
+                continue;
+            }
+            if matches!(run.state, CodeChangeState::CleanupPending | CodeChangeState::Rejected) {
+                self.advance_cleanup_code_change(&run, now, &mut report)
+                    .await?;
+            }
+        }
+        Ok(report)
+    }
+
+    async fn advance_cleanup_code_change(
+        &self,
+        run: &CodeChangeRun,
+        _now: i64,
+        report: &mut CodeChangeReport,
+    ) -> Result<(), AppError> {
+        let authorization = match CodeChangeCleanupAuthorization::load(
+            self.db,
+            &run.code_change_run_id,
+        ) {
+            Ok(authorization) => authorization,
+            Err(_) => {
+                report.deferred += 1;
+                return Ok(());
+            }
+        };
+        let run = match authorization.fresh_run() {
+            Ok(run) => run,
+            Err(_) => {
+                report.deferred += 1;
+                return Ok(());
+            }
+        };
+        if !matches!(run.state, CodeChangeState::CleanupPending | CodeChangeState::Rejected)
+            || run.cleanup_completed_at.is_some()
+        {
+            return Ok(());
+        }
+        let Some(campaign) = CampaignRepository::new(self.db).find_by_id(&run.campaign_id)? else {
+            report.deferred += 1;
+            return Ok(());
+        };
+        let Some(project) = ProjectRepository::new(self.db).find_by_id(&campaign.project_id)? else {
+            report.deferred += 1;
+            return Ok(());
+        };
+        let project_config = match config::load(&project.config_path) {
+            Ok(config) => config,
+            Err(_) => {
+                report.deferred += 1;
+                return Ok(());
+            }
+        };
+        let original_policy = match self.runner.resolve_project_policy(&project, &project_config) {
+            Ok(policy) => policy,
+            Err(_) => {
+                report.deferred += 1;
+                return Ok(());
+            }
+        };
+
+        let cleanup = if run.candidate_sha.is_some() {
+            let candidate = match run.experiment_id.as_deref() {
+                Some(experiment_id) => {
+                    reopen_code_change_result_for_run(
+                        self.policy,
+                        &project,
+                        &original_policy,
+                        self.db,
+                        &run.code_change_run_id,
+                        experiment_id,
+                    )
+                    .await
+                }
+                None => {
+                    reopen_code_change_candidate_for_run(
+                        self.policy,
+                        &project,
+                        &original_policy,
+                        self.db,
+                        &run.code_change_run_id,
+                    )
+                    .await
+                }
+            };
+            match candidate {
+                Ok(candidate) => candidate.cleanup(&authorization).await,
+                Err(error) => Err(error),
+            }
+        } else if run.state == CodeChangeState::Rejected
+            && run.state_root_identity.is_some()
+        {
+            match reopen_code_change_worktree_for_run(
+                self.policy,
+                &project,
+                &original_policy,
+                self.db,
+                &run.code_change_run_id,
+            )
+            .await
+            {
+                Ok(candidate) => candidate.cleanup(&authorization).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            let expected_relative = match owned_worktree_relative_path(
+                &run.campaign_id,
+                &run.proposal_id,
+            ) {
+                Ok(path) => path,
+                Err(_error) => {
+                    report.deferred += 1;
+                    return Ok(());
+                }
+            };
+            let expected_candidate_ref = match candidate_ref(&run.campaign_id, &run.proposal_id) {
+                Ok(reference) => reference,
+                Err(_error) => {
+                    report.deferred += 1;
+                    return Ok(());
+                }
+            };
+            let expected_best_ref = match best_ref(&run.campaign_id) {
+                Ok(reference) => reference,
+                Err(_error) => {
+                    report.deferred += 1;
+                    return Ok(());
+                }
+            };
+            if Path::new(&run.worktree_relative_path) != expected_relative.as_path()
+                || run.worktree_id != run.code_change_run_id
+                || run.candidate_ref != expected_candidate_ref
+                || run.best_ref != expected_best_ref
+            {
+                Err(recovery_required())
+            } else {
+                let original_base_sha = match campaign_start_base_sha(self.db, &run.campaign_id) {
+                    Ok(sha) => sha,
+                    Err(_) => {
+                        report.deferred += 1;
+                        return Ok(());
+                    }
+                };
+                match WorktreeManager::new_for_run(
+                    self.policy,
+                    &project,
+                    &original_policy,
+                    &run.campaign_id,
+                    &run.proposal_id,
+                    &run.base_sha,
+                    &original_base_sha,
+                    &run.worktree_id,
+                    &expected_relative,
+                ) {
+                    Ok(manager) => manager
+                        .cleanup_pre_candidate_authorized(&authorization)
+                        .await,
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match cleanup {
+            Ok(()) => report.advanced += 1,
+            Err(_) => report.deferred += 1,
+        }
+        Ok(())
+    }
+
+    async fn advance_submitted_code_change(
+        &self,
+        run: &CodeChangeRun,
+        now: i64,
+        report: &mut CodeChangeReport,
+    ) -> Result<(), AppError> {
+        let repository = CodeChangeRepository::new(self.db);
+        let Some(campaign) = CampaignRepository::new(self.db).find_by_id(&run.campaign_id)? else {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "campaign_missing",
+                "code-change campaign is missing",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        };
+        let Some(project) = ProjectRepository::new(self.db).find_by_id(&campaign.project_id)? else {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "project_missing",
+                "code-change project is missing",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        };
+        let project_config = match config::load(&project.config_path) {
+            Ok(config) => config,
+            Err(_) => {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "project_config_invalid",
+                    "code-change project configuration could not be loaded",
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        };
+        let original_policy = match self.runner.resolve_project_policy(&project, &project_config) {
+            Ok(policy) => policy,
+            Err(_) => {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "execution_policy_invalid",
+                    "code-change execution policy could not be resolved",
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        };
+        let Some(experiment_id) = run.experiment_id.as_deref() else {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_source_invalid",
+                "code-change promotion has no linked experiment",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        };
+        let Some(experiment) = ExperimentRepository::new(self.db).find_by_id(experiment_id)? else {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_source_invalid",
+                "code-change promotion experiment is missing",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        };
+        let Some(proposal) =
+            ProposalRepository::new(self.db).find_for_campaign(&run.campaign_id, &run.proposal_id)?
+        else {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_source_invalid",
+                "code-change promotion proposal is missing",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        };
+        let source_lineage_valid = proposal.source_experiment_id.is_some()
+            && experiment.campaign_id == run.campaign_id
+            && experiment.proposal_id == run.proposal_id
+            && experiment.code_change_run_id.as_deref() == Some(&run.code_change_run_id)
+            && experiment.code_revision_sha.as_deref() == run.candidate_sha.as_deref()
+            && experiment.parent_experiment_id.as_deref()
+                == proposal.source_experiment_id.as_deref();
+        if !source_lineage_valid {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_source_invalid",
+                "code-change promotion experiment does not match its terminal source",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        }
+        if !is_terminal_experiment_status(experiment.status) {
+            report.deferred += 1;
+            return Ok(());
+        }
+        let mut candidate = match reopen_code_change_result_for_run(
+            self.policy,
+            &project,
+            &original_policy,
+            self.db,
+            &run.code_change_run_id,
+            experiment_id,
+        )
+        .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "promotion_candidate_invalid",
+                    &bounded_redacted_text(&error.to_string()),
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        };
+        if let Err(error) = candidate
+            .verify_promotion_candidate(run, experiment_id)
+            .await
+        {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_candidate_invalid",
+                &bounded_redacted_text(&error.to_string()),
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        }
+        let observed_best = match candidate.best_ref_sha().await {
+            Ok(best) => best,
+            Err(error) => {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "promotion_best_ref_invalid",
+                    &bounded_redacted_text(&error.to_string()),
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        };
+        let first_promotion_pass = run.promotion_outcome.is_none()
+            && run.promotion_expected_best_experiment_id.is_none()
+            && run.promotion_expected_old_sha.is_none()
+            && run.promotion_target_sha.is_none();
+        let expected_old_sha = if first_promotion_pass {
+            observed_best.as_deref()
+        } else {
+            run.promotion_expected_old_sha.as_deref()
+        };
+        let run = match repository.prepare_code_promotion(
+            &run.code_change_run_id,
+            experiment.status,
+            &self.limits,
+            expected_old_sha,
+            now,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "promotion_prepare_failed",
+                    &bounded_redacted_text(&error.to_string()),
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        };
+        let outcome = match run.promotion_outcome.as_deref() {
+            Some(outcome) => match PromotionOutcome::from_str(outcome) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "promotion_intent_invalid",
+                        &bounded_redacted_text(&error.to_string()),
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    return Ok(());
+                }
+            },
+            None => {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "promotion_intent_invalid",
+                    "code-change promotion intent is incomplete",
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        };
+        if outcome == PromotionOutcome::Improved {
+            let candidate_sha = run.candidate_sha.as_deref().ok_or_else(recovery_required)?;
+            let target_sha = run.promotion_target_sha.as_deref();
+            if target_sha != Some(candidate_sha) {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "promotion_target_invalid",
+                    "improved code-change intent does not target its candidate SHA",
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+            let classify = |actual: Option<&str>| {
+                if actual == target_sha {
+                    PromotionRefEvidence::Candidate
+                } else if actual == run.promotion_expected_old_sha.as_deref() {
+                    PromotionRefEvidence::ExpectedOld
+                } else {
+                    PromotionRefEvidence::Unrelated
+                }
+            };
+            match classify(observed_best.as_deref()) {
+                PromotionRefEvidence::Candidate => {}
+                PromotionRefEvidence::ExpectedOld => {
+                    let replacement_sha = self.take_pre_cas_best_ref_swap_for_test();
+                    let attempt_counter = self.pre_cas_update_ref_attempt_counter();
+                    if let Err(error) = candidate
+                        .update_best_ref_cas_for_promotion(
+                            self.db,
+                            &run.code_change_run_id,
+                            run.promotion_expected_old_sha.as_deref(),
+                            replacement_sha.as_deref(),
+                            attempt_counter,
+                        )
+                        .await
+                    {
+                        let after_cas = match candidate.best_ref_sha().await {
+                            Ok(best) => best,
+                            Err(read_error) => {
+                                repository.require_recovery(
+                                    &run.code_change_run_id,
+                                    "promotion_best_ref_invalid",
+                                    &bounded_redacted_text(&read_error.to_string()),
+                                    now,
+                                )?;
+                                report.rejected += 1;
+                                return Ok(());
+                            }
+                        };
+                        match classify(after_cas.as_deref()) {
+                            PromotionRefEvidence::Candidate => {}
+                            PromotionRefEvidence::ExpectedOld => {
+                                report.deferred += 1;
+                                return Ok(());
+                            }
+                            PromotionRefEvidence::Unrelated => {
+                                repository.require_recovery(
+                                    &run.code_change_run_id,
+                                    "promotion_best_ref_conflict",
+                                    &bounded_redacted_text(&error.to_string()),
+                                    now,
+                                )?;
+                                report.rejected += 1;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                PromotionRefEvidence::Unrelated => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "promotion_best_ref_conflict",
+                        "best ref changed since code-change promotion intent",
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    return Ok(());
+                }
+            }
+            let final_best = match candidate.best_ref_sha().await {
+                Ok(best) => best,
+                Err(error) => {
+                    repository.require_recovery(
+                        &run.code_change_run_id,
+                        "promotion_best_ref_invalid",
+                        &bounded_redacted_text(&error.to_string()),
+                        now,
+                    )?;
+                    report.rejected += 1;
+                    return Ok(());
+                }
+            };
+            if final_best.as_deref() != target_sha {
+                repository.require_recovery(
+                    &run.code_change_run_id,
+                    "promotion_best_ref_conflict",
+                    "best ref is not the exact persisted candidate SHA",
+                    now,
+                )?;
+                report.rejected += 1;
+                return Ok(());
+            }
+        }
+        if let Err(error) = candidate
+            .verify_promotion_candidate(&run, experiment_id)
+            .await
+        {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_candidate_invalid",
+                &bounded_redacted_text(&error.to_string()),
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        }
+        if let Err(error) = repository.finalize_code_promotion(
+            &run.code_change_run_id,
+            &self.limits,
+            now,
+        ) {
+            repository.require_recovery(
+                &run.code_change_run_id,
+                "promotion_finalize_failed",
+                &bounded_redacted_text(&error.to_string()),
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        }
+        repository.transition(
+            &run.code_change_run_id,
+            CodeChangeState::Evaluated,
+            CodeChangeState::CleanupPending,
+            now,
+        )?;
+        report.advanced += 1;
+        Ok(())
+    }
+
+    fn finish_failed_check_round(
+        &self,
+        repository: &CodeChangeRepository<'_>,
+        run: &CodeChangeRun,
+        attempt: i64,
+        result: &CheckRoundResult,
+        now: i64,
+        report: &mut CodeChangeReport,
+    ) -> Result<(), AppError> {
+        if result.project_check_count == 0 {
+            repository.reject(
+                &run.code_change_run_id,
+                "project_check_missing",
+                "code-change requires at least one project check",
+                now,
+            )?;
+            report.rejected += 1;
+            return Ok(());
+        }
+        let summary = if !result.git_diff_passed {
+            "Git diff check failed"
+        } else if !result.all_project_checks_passed {
+            "project check failed"
+        } else {
+            "candidate diff changed during checks"
+        };
+        match attempt {
+            1 => {
+                repository.retry_after_failed_checks(
+                    &run.code_change_run_id,
+                    attempt,
+                    summary,
+                    now,
+                )?;
+                report.advanced += 1;
+                Ok(())
+            }
+            2 => {
+                repository.reject(&run.code_change_run_id, "check_failed", summary, now)?;
+                report.rejected += 1;
+                Ok(())
+            }
+            _ => Err(recovery_required()),
+        }
+    }
+
+    async fn commit_checked_candidate(
+        &self,
+        repository: &CodeChangeRepository<'_>,
+        run: &CodeChangeRun,
+        candidate: &mut VerifiedCodeChangeWorktree,
+        now: i64,
+        report: &mut CodeChangeReport,
+    ) -> Result<(), AppError> {
+        let facts = candidate
+            .diff_facts()
+            .cloned()
+            .ok_or_else(recovery_required)?;
+        let changed_file_count = i64::try_from(facts.file_count).map_err(|_| {
+            AppError::Validation {
+                field: "code_change.diff",
+                message: "counts cannot be represented",
+            }
+        })?;
+        let diff_bytes = i64::try_from(facts.diff_bytes).map_err(|_| AppError::Validation {
+            field: "code_change.diff",
+            message: "counts cannot be represented",
+        })?;
+        match run.state {
+            CodeChangeState::Checking => {
+                repository.transition(
+                    &run.code_change_run_id,
+                    CodeChangeState::Checking,
+                    CodeChangeState::Committing,
+                    now,
+                )?;
+            }
+            CodeChangeState::Committing if run.candidate_sha.is_none() => {}
+            _ => return Err(recovery_required()),
+        }
+        let candidate_sha = candidate.commit().await?;
+        let finished = unix_timestamp()?;
+        repository.record_candidate(
+            &run.code_change_run_id,
+            &candidate_sha,
+            facts.persisted_digest(),
+            changed_file_count,
+            diff_bytes,
+            finished,
+        )?;
+        repository.transition(
+            &run.code_change_run_id,
+            CodeChangeState::Committing,
+            CodeChangeState::CandidateReady,
+            finished,
+        )?;
+        report.advanced += 1;
+        Ok(())
+    }
+
+    async fn resume_committing_candidate(
+        &self,
+        repository: &CodeChangeRepository<'_>,
+        run: &CodeChangeRun,
+        candidate: &mut VerifiedCodeChangeWorktree,
+        now: i64,
+        report: &mut CodeChangeReport,
+    ) -> Result<(), AppError> {
+        let existing_ref = candidate.manager.candidate_ref_sha().await?;
+        if let Some(candidate_sha) = existing_ref {
+            if run
+                .candidate_sha
+                .as_deref()
+                .is_some_and(|stored| stored != candidate_sha)
+            {
+                return Err(recovery_required());
+            }
+            let facts = CandidateRepository::new(&candidate.manager, &candidate.candidate)?
+                .committed_diff_facts(&candidate_sha)
+                .await?;
+            let changed_file_count = i64::try_from(facts.file_count).map_err(|_| {
+                AppError::Validation {
+                    field: "code_change.diff",
+                    message: "counts cannot be represented",
+                }
+            })?;
+            let diff_bytes = i64::try_from(facts.diff_bytes).map_err(|_| AppError::Validation {
+                field: "code_change.diff",
+                message: "counts cannot be represented",
+            })?;
+            if run.diff_digest.as_deref() != Some(facts.persisted_digest())
+                || run.changed_file_count != Some(changed_file_count)
+                || run.diff_bytes != Some(diff_bytes)
+            {
+                return Err(recovery_required());
+            }
+            let finished = unix_timestamp()?;
+            repository.record_candidate(
+                &run.code_change_run_id,
+                &candidate_sha,
+                facts.persisted_digest(),
+                changed_file_count,
+                diff_bytes,
+                finished,
+            )?;
+            repository.transition(
+                &run.code_change_run_id,
+                CodeChangeState::Committing,
+                CodeChangeState::CandidateReady,
+                finished,
+            )?;
+            report.advanced += 1;
+            return Ok(());
+        }
+        if run.candidate_sha.is_some() {
+            return Err(recovery_required());
+        }
+        let facts = candidate.verify().await?;
+        let changed_file_count = i64::try_from(facts.file_count).map_err(|_| {
+            AppError::Validation {
+                field: "code_change.diff",
+                message: "counts cannot be represented",
+            }
+        })?;
+        let diff_bytes = i64::try_from(facts.diff_bytes).map_err(|_| AppError::Validation {
+            field: "code_change.diff",
+            message: "counts cannot be represented",
+        })?;
+        if run.diff_digest.as_deref() != Some(facts.persisted_digest())
+            || run.changed_file_count != Some(changed_file_count)
+            || run.diff_bytes != Some(diff_bytes)
+        {
+            return Err(recovery_required());
+        }
+        self.commit_checked_candidate(repository, run, candidate, now, report)
+            .await
+    }
+
+    async fn advance_check_round(
+        &self,
+        repository: &CodeChangeRepository<'_>,
+        run: &CodeChangeRun,
+        attempt: i64,
+        candidate: &mut VerifiedCodeChangeWorktree,
+        editor_checks: &[ProposedCheck],
+        check_timeout_override: Option<Duration>,
+        now: i64,
+        report: &mut CodeChangeReport,
+    ) -> Result<(), AppError> {
+        let run = match run.state {
+            CodeChangeState::Editing => {
+                repository.transition(
+                    &run.code_change_run_id,
+                    CodeChangeState::Editing,
+                    CodeChangeState::Checking,
+                    now,
+                )?
+            }
+            CodeChangeState::Checking => run.clone(),
+            _ => return Err(recovery_required()),
+        };
+        let Some(result) = candidate
+            .run_check_round(
+                self.db,
+                &run.code_change_run_id,
+                attempt,
+                editor_checks,
+                check_timeout_override,
+            )
+            .await?
+        else {
+            report.advanced += 1;
+            return Ok(());
+        };
+        if result.passed() {
+            self.commit_checked_candidate(repository, &run, candidate, now, report)
+                .await
+        } else {
+            self.finish_failed_check_round(repository, &run, attempt, &result, now, report)
+        }
+    }
 }
 
 fn editor_prompt(
@@ -872,9 +2716,8 @@ pub async fn prepare_code_change_worktree_for_run(
         ));
     }
     let expected_relative = owned_worktree_relative_path(&run.campaign_id, &run.proposal_id)?;
-    let expected_candidate_ref =
-        format!("refs/heads/{}", candidate_ref(&run.campaign_id, &run.proposal_id)?);
-    let expected_best_ref = format!("refs/heads/{}", best_ref(&run.campaign_id)?);
+    let expected_candidate_ref = candidate_ref(&run.campaign_id, &run.proposal_id)?;
+    let expected_best_ref = best_ref(&run.campaign_id)?;
     if Path::new(&run.worktree_relative_path) != expected_relative.as_path()
         || run.worktree_id != run.code_change_run_id
         || run.candidate_ref != expected_candidate_ref
@@ -882,6 +2725,7 @@ pub async fn prepare_code_change_worktree_for_run(
     {
         return Err(recovery_required());
     }
+    let original_base_sha = campaign_start_base_sha(db, &run.campaign_id)?;
     let manager = WorktreeManager::new_for_run(
         policy,
         project,
@@ -889,6 +2733,7 @@ pub async fn prepare_code_change_worktree_for_run(
         &run.campaign_id,
         &run.proposal_id,
         &run.base_sha,
+        &original_base_sha,
         &run.worktree_id,
         &expected_relative,
     )?;
@@ -904,6 +2749,8 @@ pub async fn prepare_code_change_worktree_for_run(
         &proof.candidate_common_identity,
         &proof.candidate_admin_path,
         &proof.candidate_common_path,
+        &proof.protected_ref_digest,
+        &proof.remote_config_digest,
         unix_timestamp()?,
     );
     if let Err(error) = ownership_result {
@@ -933,16 +2780,22 @@ pub async fn reopen_code_change_worktree_for_run(
 ) -> Result<VerifiedCodeChangeWorktree, AppError> {
     let run = CodeChangeCleanupAuthorization::load(db, run_id)?.fresh_run()?;
     verify_durable_run_scope(db, &run, project)?;
-    if run.state != CodeChangeState::Editing {
+    if !matches!(
+        run.state,
+        CodeChangeState::Editing
+            | CodeChangeState::Checking
+            | CodeChangeState::Committing
+            | CodeChangeState::Rejected
+    ) || (run.state == CodeChangeState::Rejected && run.candidate_sha.is_some())
+    {
         return Err(validation(
             "code_change.state",
-            "must be editing when reopening an editor worktree",
+            "must be editing, checking, committing, or an uncommitted rejected run when reopening an editor worktree",
         ));
     }
     let expected_relative = owned_worktree_relative_path(&run.campaign_id, &run.proposal_id)?;
-    let expected_candidate_ref =
-        format!("refs/heads/{}", candidate_ref(&run.campaign_id, &run.proposal_id)?);
-    let expected_best_ref = format!("refs/heads/{}", best_ref(&run.campaign_id)?);
+    let expected_candidate_ref = candidate_ref(&run.campaign_id, &run.proposal_id)?;
+    let expected_best_ref = best_ref(&run.campaign_id)?;
     if Path::new(&run.worktree_relative_path) != expected_relative.as_path()
         || run.worktree_id != run.code_change_run_id
         || run.candidate_ref != expected_candidate_ref
@@ -950,6 +2803,7 @@ pub async fn reopen_code_change_worktree_for_run(
     {
         return Err(recovery_required());
     }
+    let original_base_sha = campaign_start_base_sha(db, &run.campaign_id)?;
     let mut manager = WorktreeManager::new_for_run(
         policy,
         project,
@@ -957,11 +2811,189 @@ pub async fn reopen_code_change_worktree_for_run(
         &run.campaign_id,
         &run.proposal_id,
         &run.base_sha,
+        &original_base_sha,
         &run.worktree_id,
         &expected_relative,
     )?;
-    manager.inspect_base().await?;
-    manager.retain_existing_candidate().await
+    let (protected_ref_digest, remote_config_digest) = match (
+        run.protected_ref_digest.as_deref(),
+        run.remote_config_digest.as_deref(),
+    ) {
+        (Some(protected_ref_digest), Some(remote_config_digest)) => {
+            (protected_ref_digest, remote_config_digest)
+        }
+        _ => return Err(recovery_required()),
+    };
+    manager
+        .inspect_base(
+            Some((protected_ref_digest, remote_config_digest)),
+            run.state == CodeChangeState::Committing,
+        )
+        .await?;
+    let candidate = manager.retain_existing_candidate().await?;
+    let proof = candidate.manager.durable_ownership_proof(&candidate.candidate)?;
+    if !durable_ownership_matches_run(&run, &proof) {
+        return Err(recovery_required());
+    }
+    Ok(candidate)
+}
+
+/// Reopen a candidate that has already been committed and published.  This
+/// path is deliberately separate from editor/check recovery: it accepts only
+/// the post-commit states and verifies the persisted commit, candidate ref,
+/// and committed diff facts before exposing the worktree to Pueue.
+#[cfg(unix)]
+pub async fn reopen_code_change_candidate_for_run(
+    policy: &ResolvedExecutionPolicy,
+    project: &Project,
+    original: &ResolvedProjectExecutionPolicy,
+    db: &Db,
+    run_id: &str,
+) -> Result<VerifiedCodeChangeWorktree, AppError> {
+    reopen_code_change_candidate_for_run_with_outputs(policy, project, original, db, run_id, None)
+        .await
+}
+
+/// Reopen a candidate while ingesting the terminal result of its bound
+/// experiment.  The candidate identity and committed diff remain subject to
+/// the same checks as ordinary reopening; only descriptor-bound runtime
+/// output and known verified Python check caches are accepted for ignored
+/// paths.
+#[cfg(unix)]
+pub async fn reopen_code_change_result_for_run(
+    policy: &ResolvedExecutionPolicy,
+    project: &Project,
+    original: &ResolvedProjectExecutionPolicy,
+    db: &Db,
+    run_id: &str,
+    experiment_id: &str,
+) -> Result<VerifiedCodeChangeWorktree, AppError> {
+    validate_internal_id("experiment_id", experiment_id)?;
+    reopen_code_change_candidate_for_run_with_outputs(
+        policy,
+        project,
+        original,
+        db,
+        run_id,
+        Some(experiment_id),
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn reopen_code_change_candidate_for_run_with_outputs(
+    policy: &ResolvedExecutionPolicy,
+    project: &Project,
+    original: &ResolvedProjectExecutionPolicy,
+    db: &Db,
+    run_id: &str,
+    result_experiment_id: Option<&str>,
+) -> Result<VerifiedCodeChangeWorktree, AppError> {
+    let authorization = CodeChangeCleanupAuthorization::load(db, run_id)?;
+    let run = authorization.fresh_run()?;
+    verify_durable_run_scope(db, &run, project)?;
+    let state_allowed = match result_experiment_id {
+        Some(experiment_id) => {
+            matches!(
+                run.state,
+                CodeChangeState::ExperimentSubmitted
+                    | CodeChangeState::CleanupPending
+                    | CodeChangeState::Rejected
+            )
+                && run.experiment_id.as_deref() == Some(experiment_id)
+        }
+        None => matches!(
+            run.state,
+            CodeChangeState::CandidateReady
+                | CodeChangeState::ExperimentSubmitted
+                | CodeChangeState::CleanupPending
+                | CodeChangeState::Rejected
+        ),
+    };
+    if !state_allowed {
+        return Err(validation(
+            "code_change.state",
+            "must be candidate-ready, experiment-submitted, cleanup-pending, or rejected when reopening a candidate",
+        ));
+    }
+    let candidate_sha = run.candidate_sha.as_deref().ok_or_else(recovery_required)?;
+    canonical_full_sha(candidate_sha)?;
+    let expected_relative = owned_worktree_relative_path(&run.campaign_id, &run.proposal_id)?;
+    let expected_candidate_ref = candidate_ref(&run.campaign_id, &run.proposal_id)?;
+    let expected_best_ref = best_ref(&run.campaign_id)?;
+    if Path::new(&run.worktree_relative_path) != expected_relative.as_path()
+        || run.worktree_id != run.code_change_run_id
+        || run.candidate_ref != expected_candidate_ref
+        || run.best_ref != expected_best_ref
+    {
+        return Err(recovery_required());
+    }
+    let original_base_sha = campaign_start_base_sha(db, &run.campaign_id)?;
+    let mut manager = WorktreeManager::new_for_run(
+        policy,
+        project,
+        original,
+        &run.campaign_id,
+        &run.proposal_id,
+        &run.base_sha,
+        &original_base_sha,
+        &run.worktree_id,
+        &expected_relative,
+    )?;
+    let (protected_ref_digest, remote_config_digest) = match (
+        run.protected_ref_digest.as_deref(),
+        run.remote_config_digest.as_deref(),
+    ) {
+        (Some(protected_ref_digest), Some(remote_config_digest)) => {
+            (protected_ref_digest, remote_config_digest)
+        }
+        _ => return Err(recovery_required()),
+    };
+    manager
+        .inspect_base(
+            Some((protected_ref_digest, remote_config_digest)),
+            true,
+        )
+        .await?;
+    let mut candidate = manager.retain_existing_candidate().await?;
+    let proof = candidate.manager.durable_ownership_proof(&candidate.candidate)?;
+    if !durable_ownership_matches_run(&run, &proof) {
+        return Err(recovery_required());
+    }
+    let ref_sha = candidate.manager.candidate_ref_sha().await?;
+    if ref_sha.as_deref() != Some(candidate_sha) {
+        return Err(recovery_required());
+    }
+    let repository = CandidateRepository::new(&candidate.manager, &candidate.candidate)?;
+    let (facts, terminal_result_outputs) = match result_experiment_id {
+        Some(experiment_id) => {
+            let (facts, outputs) = repository
+                .committed_diff_facts_for_result(candidate_sha, experiment_id)
+                .await?;
+            (facts, Some(outputs))
+        }
+        None => (
+            repository.committed_diff_facts(candidate_sha).await?,
+            None,
+        ),
+    };
+    let changed_file_count = i64::try_from(facts.file_count).map_err(|_| AppError::Validation {
+        field: "code_change.diff",
+        message: "counts cannot be represented",
+    })?;
+    let diff_bytes = i64::try_from(facts.diff_bytes).map_err(|_| AppError::Validation {
+        field: "code_change.diff",
+        message: "counts cannot be represented",
+    })?;
+    if run.diff_digest.as_deref() != Some(facts.persisted_digest())
+        || run.changed_file_count != Some(changed_file_count)
+        || run.diff_bytes != Some(diff_bytes)
+    {
+        return Err(recovery_required());
+    }
+    candidate.candidate_sha = Some(candidate_sha.to_owned());
+    candidate.terminal_result_outputs = terminal_result_outputs;
+    Ok(candidate)
 }
 
 #[cfg(unix)]
@@ -971,7 +3003,7 @@ async fn finish_prepared_manager(
     project: &Project,
     original: &ResolvedProjectExecutionPolicy,
 ) -> Result<VerifiedCodeChangeWorktree, AppError> {
-    manager.inspect_base().await?;
+    manager.inspect_base(None, false).await?;
     let candidate = manager.prepare().await?;
     if let Err(error) = policy.for_code_change_worktree(project, original, &candidate) {
         let original = AppError::from(error);
@@ -1000,6 +3032,7 @@ async fn finish_prepared_manager(
         candidate,
         diff_facts: None,
         candidate_sha: None,
+        terminal_result_outputs: None,
     })
 }
 
@@ -1035,6 +3068,15 @@ fn pinned_git_argv(args: &[OsString]) -> Vec<OsString> {
     }
     argv.extend_from_slice(args);
     argv
+}
+
+fn supervisor_diff_check_args(base_sha: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("diff"),
+        OsString::from("--cached"),
+        OsString::from("--check"),
+        OsString::from(base_sha),
+    ]
 }
 
 #[cfg(unix)]
@@ -1107,7 +3149,7 @@ fn verify_cleanup_leaf_identity(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn verify_cleanup_leaf_absent(parent: &File, leaf: &OsStr) -> Result<(), AppError> {
     if directory_entry_exists(parent, leaf)? {
         return Err(recovery_required());
@@ -1120,6 +3162,7 @@ const MAX_EDITOR_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_CHECK_SOURCE_BYTES: usize = 64;
 const MAX_CHECK_ARG_BYTES: usize = 4 * 1024;
 const MAX_CHECK_ARG_COUNT: usize = 32;
+const MAX_PYPROJECT_BYTES: usize = 64 * 1024;
 const MAX_GIT_REF_COMPONENT_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1359,7 +3402,7 @@ pub fn discover_project_checks(
             working_directory: ".".to_owned(),
         });
     }
-    let pytest = root.join("pytest.ini").is_file() || pyproject_has_pytest(root);
+    let pytest = root.join("pytest.ini").is_file() || pyproject_has_pytest(root)?;
     if pytest {
         let (tool, argv) = if root.join("uv.lock").is_file() {
             if available_tools.contains(&CodeChangeTool::Uv) {
@@ -1388,6 +3431,130 @@ pub fn discover_checks(
     available_tools: &BTreeSet<CodeChangeTool>,
 ) -> Result<Vec<ProposedCheck>, AppError> {
     discover_project_checks(root, available_tools)
+}
+
+fn merge_project_checks(
+    discovered: &[ProposedCheck],
+    editor: &[ProposedCheck],
+    max: usize,
+) -> Result<Vec<ProposedCheck>, AppError> {
+    let mut merged = Vec::new();
+    for check in discovered.iter().chain(editor) {
+        if merged.iter().any(|existing| existing == check) {
+            continue;
+        }
+        if merged.len() >= max {
+            return Err(validation(
+                "code_change.proposed_checks",
+                "exceeds the bounded check count",
+            ));
+        }
+        merged.push(check.clone());
+    }
+    Ok(merged)
+}
+
+fn planned_check_rows(
+    attempt: i64,
+    base_sha: &str,
+    discovered: &[ProposedCheck],
+    editor: &[ProposedCheck],
+    max_project_checks: usize,
+) -> Result<Vec<NewCodeChangeCheck>, AppError> {
+    let supervisor_argv = pinned_git_argv(&supervisor_diff_check_args(base_sha))
+        .into_iter()
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| validation("code_change_check.argv", "must be valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = vec![NewCodeChangeCheck::new(
+        attempt,
+        0,
+        "supervisor",
+        supervisor_argv,
+        ".",
+    )];
+    let merged = merge_project_checks(discovered, editor, max_project_checks)?;
+    rows.extend(merged.into_iter().enumerate().map(|(ordinal, check)| {
+        let source = if discovered.iter().any(|candidate| candidate == &check) {
+            "discovered"
+        } else {
+            "editor"
+        };
+        NewCodeChangeCheck::new(
+            attempt,
+            ordinal as i64 + 1,
+            source,
+            check.argv.clone(),
+            check.working_directory.clone(),
+        )
+    }));
+    Ok(rows)
+}
+
+fn validate_persisted_check_plan(
+    existing: &[CodeChangeCheck],
+    planned: &[NewCodeChangeCheck],
+) -> Result<(), AppError> {
+    if existing.len() != planned.len()
+        || existing.iter().zip(planned).any(|(existing, planned)| {
+            existing.attempt != planned.attempt
+                || existing.ordinal != planned.ordinal
+                || existing.source != planned.source
+                || existing.argv != planned.argv
+                || existing.working_directory != planned.working_directory
+        })
+    {
+        return Err(recovery_required());
+    }
+
+    let mut saw_reserved = false;
+    let mut saw_terminal = false;
+    for check in existing {
+        match check.status {
+            CodeChangeCheckStatus::Passed => {
+                if saw_reserved || saw_terminal || check.output_digest.is_none() {
+                    return Err(recovery_required());
+                }
+            }
+            CodeChangeCheckStatus::Reserved => {
+                saw_reserved = true;
+            }
+            CodeChangeCheckStatus::Failed | CodeChangeCheckStatus::TimedOut => {
+                if saw_reserved || saw_terminal {
+                    return Err(recovery_required());
+                }
+                saw_terminal = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn editor_project_checks(
+    rows: &[CodeChangeCheck],
+) -> Result<Vec<ProposedCheck>, AppError> {
+    rows.iter()
+        .filter(|row| row.source == "editor")
+        .map(|row| {
+            if row.argv.is_empty() {
+                return Err(recovery_required());
+            }
+            let source = match tool_for_program(&row.argv[0]) {
+                Some(CodeChangeTool::Cargo) => "cargo",
+                Some(CodeChangeTool::Uv) => "uv",
+                Some(CodeChangeTool::Python) => "python",
+                Some(CodeChangeTool::Git) | None => return Err(recovery_required()),
+            };
+            Ok(ProposedCheck {
+                source: source.to_owned(),
+                argv: row.argv.clone(),
+                working_directory: row.working_directory.clone(),
+            })
+        })
+        .collect()
 }
 
 pub fn is_protected_path(path: &Path) -> bool {
@@ -1616,10 +3783,11 @@ impl GitRepositoryProof {
         root: &VerifiedProjectRoot,
         original: &Self,
     ) -> Result<Self, AppError> {
+        let expected_admin_parent = original.common_path.join("worktrees");
         let candidate = Self::capture(
             root,
             Some(&original.common_path),
-            root.anchor.canonical_path.file_name(),
+            Some(&expected_admin_parent),
         )?;
         if candidate.admin_path == original.admin_path {
             return Err(recovery_required());
@@ -1629,8 +3797,8 @@ impl GitRepositoryProof {
 
     fn capture(
         root: &VerifiedProjectRoot,
-        expected_common: Option<&PathBuf>,
-        expected_admin_name: Option<&OsStr>,
+        expected_common: Option<&Path>,
+        expected_admin_parent: Option<&Path>,
     ) -> Result<Self, AppError> {
         let root_git_path = root.anchor.canonical_path.join(".git");
         if path_has_symlink_component(&root_git_path)? {
@@ -1733,11 +3901,8 @@ impl GitRepositoryProof {
                 return Err(recovery_required());
             }
         }
-        if let Some(expected) = expected_admin_name {
-            let expected_parent = common.path.join("worktrees");
-            if admin_path.parent() != Some(expected_parent.as_path())
-                || admin_path.file_name() != Some(expected)
-            {
+        if let Some(expected_parent) = expected_admin_parent {
+            if admin_path.parent() != Some(expected_parent) {
                 return Err(recovery_required());
             }
             let candidate_git = match &root_git {
@@ -1783,6 +3948,14 @@ impl GitRepositoryProof {
         if let Some(config) = &worktree_config {
             validate_git_config_proof(config, Some(&root.anchor.canonical_path))?;
         }
+        let expected_admin_name = expected_admin_parent
+            .map(|_| {
+                admin_path
+                    .file_name()
+                    .map(OsStr::to_os_string)
+                    .ok_or_else(recovery_required)
+            })
+            .transpose()?;
         Ok(Self {
             root_git,
             admin,
@@ -1795,7 +3968,10 @@ impl GitRepositoryProof {
             admin_config,
             worktree_config,
             expected_root: root.anchor.canonical_path.clone(),
-            expected_admin_name: expected_admin_name.map(OsStr::to_os_string),
+            // Git may sanitize the linked-worktree admin basename (for
+            // example, replacing ':' in a proposal ID), so retain the
+            // canonical name observed from the verified pointer.
+            expected_admin_name,
         })
     }
 
@@ -1926,6 +4102,7 @@ struct WorktreeManager {
     worktree_id: String,
     worktree_relative_path: PathBuf,
     base_sha: String,
+    original_base_sha: String,
     worktree_path: PathBuf,
     candidate_identity: Option<ExecutableIdentity>,
     object_id_len: Option<usize>,
@@ -1947,6 +4124,21 @@ struct DurableOwnershipProof {
     candidate_common_identity: String,
     candidate_admin_path: String,
     candidate_common_path: String,
+    protected_ref_digest: String,
+    remote_config_digest: String,
+}
+
+fn durable_ownership_matches_run(run: &CodeChangeRun, proof: &DurableOwnershipProof) -> bool {
+    run.state_root_identity.as_deref() == Some(proof.state_root_identity.as_str())
+        && run.worktrees_identity.as_deref() == Some(proof.worktrees_identity.as_str())
+        && run.campaign_identity.as_deref() == Some(proof.campaign_identity.as_str())
+        && run.candidate_root_identity.as_deref() == Some(proof.candidate_root_identity.as_str())
+        && run.candidate_admin_identity.as_deref() == Some(proof.candidate_admin_identity.as_str())
+        && run.candidate_common_identity.as_deref() == Some(proof.candidate_common_identity.as_str())
+        && run.candidate_admin_path.as_deref() == Some(proof.candidate_admin_path.as_str())
+        && run.candidate_common_path.as_deref() == Some(proof.candidate_common_path.as_str())
+        && run.protected_ref_digest.as_deref() == Some(proof.protected_ref_digest.as_str())
+        && run.remote_config_digest.as_deref() == Some(proof.remote_config_digest.as_str())
 }
 
 #[cfg(unix)]
@@ -1958,6 +4150,7 @@ impl WorktreeManager {
         campaign_id: &str,
         proposal_id: &str,
         base_sha: &str,
+        original_base_sha: &str,
         worktree_id: &str,
         worktree_relative_path: &Path,
     ) -> Result<Self, AppError> {
@@ -1968,6 +4161,7 @@ impl WorktreeManager {
             campaign_id,
             proposal_id,
             base_sha,
+            original_base_sha,
             worktree_id,
             worktree_relative_path,
         )
@@ -1980,6 +4174,7 @@ impl WorktreeManager {
         campaign_id: &str,
         proposal_id: &str,
         base_sha: &str,
+        original_base_sha: &str,
         worktree_id: &str,
         worktree_relative_path: &Path,
     ) -> Result<Self, AppError> {
@@ -1987,6 +4182,7 @@ impl WorktreeManager {
         validate_internal_id("proposal_id", proposal_id)?;
         validate_internal_id("worktree_id", worktree_id)?;
         canonical_full_sha(base_sha)?;
+        canonical_full_sha(original_base_sha)?;
         if worktree_relative_path != owned_worktree_relative_path(campaign_id, proposal_id)? {
             return Err(validation(
                 "code_change.worktree_relative_path",
@@ -2013,6 +4209,7 @@ impl WorktreeManager {
             worktree_id: worktree_id.to_owned(),
             worktree_relative_path: worktree_relative_path.to_owned(),
             base_sha: base_sha.to_owned(),
+            original_base_sha: original_base_sha.to_owned(),
             worktree_path,
             candidate_identity: None,
             object_id_len: None,
@@ -2036,6 +4233,7 @@ impl WorktreeManager {
             .candidate_repository
             .as_ref()
             .ok_or_else(recovery_required)?;
+        let baseline = self.baseline.as_ref().ok_or_else(recovery_required)?;
         let candidate_metadata = candidate.directory.metadata().map_err(|_| recovery_required())?;
         if !candidate_metadata.is_dir()
             || executable_identity_from_metadata(&candidate_metadata) != candidate.anchor.identity
@@ -2060,10 +4258,16 @@ impl WorktreeManager {
             candidate_common_identity: identity_token(repository.common.identity),
             candidate_admin_path: repository.admin_path.to_string_lossy().into_owned(),
             candidate_common_path: repository.common_path.to_string_lossy().into_owned(),
+            protected_ref_digest: baseline.protected_ref_digest.clone(),
+            remote_config_digest: baseline.remote_config_digest.clone(),
         })
     }
 
-    async fn inspect_base(&mut self) -> Result<(), AppError> {
+    async fn inspect_base(
+        &mut self,
+        expected_baseline: Option<(&str, &str)>,
+        allow_candidate_ref: bool,
+    ) -> Result<(), AppError> {
         self.policy.verify_code_change_state_root()?;
         let original_root = self.original.root_anchor.verify_identity()?;
         if original_root.anchor.canonical_path != self.project.root_path {
@@ -2109,10 +4313,10 @@ impl WorktreeManager {
             .await?;
         require_success(&revision, "inspect Git base revision")?;
         let revision = bounded_utf8_line(&revision.stdout, "Git base revision")?;
-        if revision != self.base_sha {
+        if revision != self.original_base_sha {
             return Err(validation(
-                "code_change.base_sha",
-                "does not match the current project HEAD",
+                "code_change.original_base_sha",
+                "does not match the campaign-start project HEAD",
             ));
         }
         let object_format = self
@@ -2177,19 +4381,33 @@ impl WorktreeManager {
                 MAX_GIT_OUTPUT_BYTES,
             )
             .await?;
-        if existing_candidate_ref.success {
+        if existing_candidate_ref.success && !allow_candidate_ref {
             return Err(validation(
                 "code_change.ref",
                 "candidate ref already exists",
             ));
         }
-        if existing_candidate_ref.exit_code != Some(1) {
+        if !existing_candidate_ref.success && existing_candidate_ref.exit_code != Some(1) {
             return Err(validation(
                 "code_change.ref",
                 "candidate ref could not be inspected",
             ));
         }
         let remote_config_digest = self.remote_config_digest(&original_root, &working_directory).await?;
+        let (protected_ref_digest, remote_config_digest) = match expected_baseline {
+            Some((expected_protected_ref_digest, expected_remote_config_digest)) => {
+                if expected_protected_ref_digest != protected_ref_digest
+                    || expected_remote_config_digest != remote_config_digest
+                {
+                    return Err(recovery_required());
+                }
+                (
+                    expected_protected_ref_digest.to_owned(),
+                    expected_remote_config_digest.to_owned(),
+                )
+            }
+            None => (protected_ref_digest, remote_config_digest),
+        };
         self.baseline = Some(GitBaseline {
             #[cfg(unix)]
             repository: self
@@ -2444,6 +4662,7 @@ impl WorktreeManager {
             candidate,
             diff_facts: None,
             candidate_sha: None,
+            terminal_result_outputs: None,
         })
     }
 
@@ -2513,7 +4732,7 @@ impl WorktreeManager {
         let Some(candidate_parent) = candidate_parent else {
             return Err(recovery_required());
         };
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let candidate_parent_identity = directory_identity(&candidate_parent)?;
         #[cfg(unix)]
         if !directory_entry_exists(&candidate_parent, OsStr::new(&self.proposal_id))? {
@@ -2791,6 +5010,163 @@ impl WorktreeManager {
         Ok(())
     }
 
+    async fn cleanup_pre_candidate_authorized(
+        mut self,
+        authorization: &CodeChangeCleanupAuthorization,
+    ) -> Result<(), AppError> {
+        let run = authorization.fresh_run()?;
+        self.verify_pre_candidate_cleanup_run(&run, authorization)?;
+        self.inspect_base(None, false).await?;
+        self.verify_pre_candidate_cleanup_target_absent()?;
+        let latest = authorization.fresh_run()?;
+        self.verify_pre_candidate_cleanup_run(&latest, authorization)?;
+        CodeChangeRepository::new(&authorization.db)
+            .finish_cleanup(&latest.code_change_run_id, unix_timestamp()?)?;
+        Ok(())
+    }
+
+    fn verify_pre_candidate_cleanup_run(
+        &self,
+        run: &CodeChangeRun,
+        authorization: &CodeChangeCleanupAuthorization,
+    ) -> Result<(), AppError> {
+        let expected_relative = owned_worktree_relative_path(&self.campaign_id, &self.proposal_id)?;
+        let expected_candidate_ref = candidate_ref(&self.campaign_id, &self.proposal_id)?;
+        let expected_best_ref = best_ref(&self.campaign_id)?;
+        if run.code_change_run_id != authorization.run_id
+            || run.campaign_id != self.campaign_id
+            || run.proposal_id != self.proposal_id
+            || run.worktree_id != self.worktree_id
+            || Path::new(&run.worktree_relative_path) != expected_relative.as_path()
+            || run.base_sha != self.base_sha
+            || run.candidate_sha.is_some()
+            || run.experiment_id.is_some()
+            || run.candidate_ref != expected_candidate_ref
+            || run.best_ref != expected_best_ref
+            || run.diff_digest.is_some()
+            || run.changed_file_count.is_some()
+            || run.diff_bytes.is_some()
+            || run.editor_attempts != 0
+            || run.editor_session_id.is_some()
+            || run.promotion_outcome.is_some()
+            || run.promotion_expected_best_experiment_id.is_some()
+            || run.promotion_expected_old_sha.is_some()
+            || run.promotion_target_sha.is_some()
+            || run.cleanup_completed_at.is_some()
+            || run.state_root_identity.is_some()
+            || run.worktrees_identity.is_some()
+            || run.campaign_identity.is_some()
+            || run.candidate_root_identity.is_some()
+            || run.candidate_admin_identity.is_some()
+            || run.candidate_common_identity.is_some()
+            || run.candidate_admin_path.is_some()
+            || run.candidate_common_path.is_some()
+            || run.protected_ref_digest.is_some()
+            || run.remote_config_digest.is_some()
+            || run.candidate_working_directory_identity.is_some()
+            || run.state != CodeChangeState::Rejected
+        {
+            return Err(recovery_required());
+        }
+        verify_durable_run_scope(&authorization.db, run, &self.project)?;
+        validate_cleanup_state_for_mutation(run.state, run.cleanup_completed_at)?;
+        if !CodeChangeRepository::new(&authorization.db)
+            .list_editor_attempts(&run.code_change_run_id)?
+            .is_empty()
+        {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
+    fn verify_pre_candidate_cleanup_target_absent(&self) -> Result<(), AppError> {
+        self.policy.verify_code_change_state_root()?;
+        if path_has_symlink_component(&self.worktree_path)? {
+            return Err(recovery_required());
+        }
+        let state_root = self.policy.code_change_state_root_directory();
+        let candidate_entry_exists = match open_existing_directory_at(
+            &state_root,
+            OsStr::new("worktrees"),
+        ) {
+            Ok(worktrees) => match open_existing_directory_at(&worktrees, OsStr::new(&self.campaign_id))
+            {
+                Ok(campaign) => directory_entry_exists(&campaign, OsStr::new(&self.proposal_id))?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => return Err(recovery_required()),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => return Err(recovery_required()),
+        };
+        if candidate_entry_exists {
+            return Err(recovery_required());
+        }
+        if self.candidate_admin_registered_elsewhere()? {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
+    fn verify_cleanup_task_observations(
+        &self,
+        task_id: i64,
+        task_signature: &str,
+        authorization: &CodeChangeCleanupAuthorization,
+    ) -> Result<(), AppError> {
+        let observations = TaskObservationRepository::new(&authorization.db).find_by_pueue_task(
+            &self.project.project_id,
+            task_id,
+            MAX_CLEANUP_TASK_OBSERVATIONS + 1,
+        )?;
+        if observations.is_empty() || observations.len() > MAX_CLEANUP_TASK_OBSERVATIONS {
+            return Err(recovery_required());
+        }
+
+        for observation in &observations {
+            if observation.project_id != self.project.project_id
+                || observation.pueue_task_id != task_id
+            {
+                return Err(recovery_required());
+            }
+            let managed_identity = cleanup_task_observation_managed_identity(
+                observation,
+                &self.project.pueue_group,
+            )
+            .ok_or_else(recovery_required)?;
+            if managed_identity != task_signature {
+                return Err(recovery_required());
+            }
+        }
+
+        let terminal_count = observations
+            .iter()
+            .filter(|observation| {
+                observation.ended_at.is_some()
+                    && is_terminal_task_observation_state(&observation.state)
+            })
+            .count();
+        if terminal_count != 1 {
+            return Err(recovery_required());
+        }
+
+        let latest_observed_at = observations
+            .iter()
+            .map(|observation| observation.observed_at)
+            .max()
+            .ok_or_else(recovery_required)?;
+        let latest = observations
+            .iter()
+            .filter(|observation| observation.observed_at == latest_observed_at)
+            .collect::<Vec<_>>();
+        if latest.len() != 1
+            || latest[0].ended_at.is_none()
+            || !is_terminal_task_observation_state(&latest[0].state)
+        {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+
     fn verify_cleanup_run(
         &self,
         run: &CodeChangeRun,
@@ -2798,12 +5174,8 @@ impl WorktreeManager {
         candidate: Option<&VerifiedProjectRoot>,
         authorization: &CodeChangeCleanupAuthorization,
     ) -> Result<(), AppError> {
-        let expected_candidate_ref = format!(
-            "refs/heads/{}",
-            candidate_ref(&self.campaign_id, &self.proposal_id)?,
-        );
-        let expected_best_ref =
-            format!("refs/heads/{}", best_ref(&self.campaign_id)?);
+        let expected_candidate_ref = candidate_ref(&self.campaign_id, &self.proposal_id)?;
+        let expected_best_ref = best_ref(&self.campaign_id)?;
         if run.campaign_id != self.campaign_id
             || run.proposal_id != self.proposal_id
             || run.worktree_id != self.worktree_id
@@ -2830,43 +5202,64 @@ impl WorktreeManager {
                     ExperimentStatus::Succeeded
                         | ExperimentStatus::Failed
                         | ExperimentStatus::Cancelled
-                )
+                    )
             {
                 return Err(recovery_required());
             }
+            let submission = SubmissionRepository::new(&authorization.db)
+                .find_by_id(&experiment.submission_id)?
+                .ok_or_else(recovery_required)?;
+            let task_id = experiment.pueue_task_id.ok_or_else(recovery_required)?;
+            let task_signature = experiment
+                .task_signature
+                .as_deref()
+                .ok_or_else(recovery_required)?;
+            if submission.project_id != self.project.project_id
+                || submission.pueue_task_id != Some(task_id)
+                || submission.task_signature.as_deref() != Some(task_signature)
+            {
+                return Err(recovery_required());
+            }
+            self.verify_cleanup_task_observations(task_id, task_signature, authorization)?;
         }
         let connection = authorization.db.connect()?;
         let mut authoritative_rows = 0usize;
         if let Some(experiment_id) = run.experiment_id.as_deref() {
             let mut statement = connection
                 .prepare(
-                    "SELECT ar.status, ar.pid, s.project_id, ar.project_id
+                    "SELECT s.origin_agent_run_id, ar.status, ar.pid, s.project_id, ar.project_id
                      FROM experiments AS e
                      JOIN submissions AS s ON s.submission_id = e.submission_id
-                     JOIN agent_runs AS ar ON ar.run_id = s.origin_agent_run_id
+                     LEFT JOIN agent_runs AS ar ON ar.run_id = s.origin_agent_run_id
                      WHERE e.experiment_id = ?1",
                 )
                 .map_err(crate::db::database_error("inspect code-change experiment liveness"))?;
             let rows = statement
                 .query_map([experiment_id], |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })
                 .map_err(crate::db::database_error("read code-change experiment liveness"))?;
+            let mut experiment_rows = 0;
             let mut lineage_rows = 0;
             for row in rows {
-                lineage_rows += 1;
-                let (status, pid, submission_project, agent_project) = row
+                experiment_rows += 1;
+                let (origin_agent_run_id, status, pid, submission_project, agent_project) = row
                     .map_err(crate::db::database_error("read code-change experiment liveness"))?;
-                if submission_project != self.project.project_id
-                    || agent_project != self.project.project_id
-                {
+                if submission_project != self.project.project_id {
                     return Err(recovery_required());
                 }
+                if let Some(_origin_agent_run_id) = origin_agent_run_id {
+                    lineage_rows += 1;
+                    let status = status.ok_or_else(recovery_required)?;
+                    if agent_project.as_deref() != Some(self.project.project_id.as_str()) {
+                        return Err(recovery_required());
+                    }
                 if !matches!(
                     status.as_str(),
                     "starting"
@@ -2884,13 +5277,18 @@ impl WorktreeManager {
                 if pid.is_some_and(process_is_alive) {
                     return Err(recovery_required());
                 }
+                } else if status.is_some() || pid.is_some() || agent_project.is_some() {
+                    return Err(recovery_required());
             }
-            if lineage_rows != 1 {
-                // A terminal experiment without a resolvable origin run is
-                // not enough durable evidence that no live process remains.
+            }
+            if experiment_rows != 1 || lineage_rows > 1 {
                 return Err(recovery_required());
             }
-            authoritative_rows = authoritative_rows.saturating_add(lineage_rows);
+            // The terminal experiment/task/observation checks above are the
+            // authoritative candidate evidence.  An origin agent run is an
+            // additional liveness proof when one was persisted, but normal
+            // candidate submissions intentionally have no origin run.
+            authoritative_rows = authoritative_rows.saturating_add(experiment_rows);
         }
         let mut statement = connection
             .prepare(
@@ -2916,10 +5314,7 @@ impl WorktreeManager {
             if agent_run_id.is_none() || agent_project.as_deref() != Some(self.project.project_id.as_str()) {
                 return Err(recovery_required());
             }
-            if !matches!(status.as_str(), "reserved" | "running" | "ready" | "failed") {
-                return Err(recovery_required());
-            }
-            if matches!(status.as_str(), "reserved" | "running") && pid.is_none() {
+            if !matches!(status.as_str(), "ready" | "failed") {
                 return Err(recovery_required());
             }
             if pid.is_some_and(process_is_alive) {
@@ -3105,6 +5500,7 @@ impl WorktreeManager {
                 summary,
                 temporary_index.clone(),
                 Some(git_directories),
+                None,
             )
             .await;
         let index_state = match temporary_index.as_ref() {
@@ -3246,7 +5642,7 @@ impl WorktreeManager {
             )
             .await?;
         require_success(&head, "verify original Git HEAD")?;
-        if bounded_utf8_line(&head.stdout, "original HEAD")? != self.base_sha {
+        if bounded_utf8_line(&head.stdout, "original HEAD")? != self.original_base_sha {
             return Err(recovery_required());
         }
         let status = self
@@ -3477,6 +5873,86 @@ impl<'a> CandidateValidator<'a> {
         validate_ignored_tree(&candidate.anchor.canonical_path, &ignored)?;
         validate_no_nested_repositories(&candidate.anchor.canonical_path, &ignored)
     }
+
+    async fn validate_submission_runtime_outputs(
+        &self,
+        candidate: &VerifiedProjectRoot,
+        working_directory: &VerifiedWorkingDirectory,
+    ) -> Result<(), AppError> {
+        let output = self
+            .manager
+            .git(
+                candidate,
+                working_directory,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--ignored=matching",
+                    "--untracked-files=all",
+                ],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&output, "inspect candidate runtime paths")?;
+        let ignored = parse_ignored_status_paths(&output.stdout)?;
+        let (service, caches): (Vec<_>, Vec<_>) = ignored.into_iter().partition(|path| {
+            matches!(
+                path.components().next(),
+                Some(Component::Normal(name)) if name == OsStr::new(RUNTIME_SERVICE_DIRECTORY)
+            )
+        });
+        if service
+            .iter()
+            .any(|path| path != Path::new(RUNTIME_SERVICE_DIRECTORY))
+        {
+            return Err(recovery_required());
+        }
+        if caches.iter().any(|path| !is_python_check_cache_path(path)) {
+            return Err(recovery_required());
+        }
+        validate_ignored_tree(&candidate.anchor.canonical_path, &caches)?;
+        validate_no_nested_repositories(&candidate.anchor.canonical_path, &caches)
+    }
+
+    async fn validate_terminal_result_outputs(
+        &self,
+        experiment_id: &str,
+    ) -> Result<BoundTerminalResultOutputs, AppError> {
+        let working_directory = VerifiedWorkingDirectory::root(self.candidate)?;
+        let output = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--ignored=matching",
+                    "--untracked-files=all",
+                ],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&output, "inspect terminal result paths")?;
+        let ignored = parse_ignored_status_paths(&output.stdout)?;
+        let (_, caches): (Vec<_>, Vec<_>) = ignored.into_iter().partition(|path| {
+            matches!(
+                path.components().next(),
+                Some(Component::Normal(name)) if name == OsStr::new(RUNTIME_SERVICE_DIRECTORY)
+            )
+        });
+        if caches
+            .iter()
+            .any(|path| !is_python_check_cache_path(path))
+        {
+            return Err(recovery_required());
+        }
+        validate_ignored_tree(&self.candidate.anchor.canonical_path, &caches)?;
+        validate_no_nested_repositories(&self.candidate.anchor.canonical_path, &caches)?;
+        bind_terminal_result_outputs(&self.candidate.directory, experiment_id)
+    }
 }
 
 #[cfg(unix)]
@@ -3567,6 +6043,248 @@ impl<'a> CandidateRepository<'a> {
         })
     }
 
+    async fn committed_diff_facts(&self, ref_sha: &str) -> Result<DiffFacts, AppError> {
+        self.committed_diff_facts_with_runtime_outputs(ref_sha, None, false)
+            .await
+            .map(|(facts, _)| facts)
+    }
+
+    async fn committed_diff_facts_for_submission_runtime(
+        &self,
+        ref_sha: &str,
+    ) -> Result<DiffFacts, AppError> {
+        let (facts, _) = self
+            .committed_diff_facts_with_runtime_outputs(ref_sha, None, true)
+            .await?;
+        Ok(facts)
+    }
+
+    async fn committed_diff_facts_for_result(
+        &self,
+        ref_sha: &str,
+        experiment_id: &str,
+    ) -> Result<(DiffFacts, BoundTerminalResultOutputs), AppError> {
+        self.committed_diff_facts_with_runtime_outputs(ref_sha, Some(experiment_id), false)
+            .await
+            .and_then(|(facts, outputs)| {
+                outputs
+                    .ok_or_else(recovery_required)
+                    .map(|outputs| (facts, outputs))
+            })
+    }
+
+    async fn committed_diff_facts_with_runtime_outputs(
+        &self,
+        ref_sha: &str,
+        result_experiment_id: Option<&str>,
+        allow_service_runtime: bool,
+    ) -> Result<(DiffFacts, Option<BoundTerminalResultOutputs>), AppError> {
+        let ref_sha = canonical_full_sha(ref_sha)?;
+        if self.manager.object_id_len != Some(ref_sha.len()) {
+            return Err(recovery_required());
+        }
+        self.manager.validate_original_state().await?;
+        let validator = CandidateValidator::new(self.manager, self.candidate)?;
+        self.manager.validate_git_boundary(self.candidate)?;
+        validate_local_git_metadata(&self.candidate.anchor.canonical_path)?;
+        let working_directory = VerifiedWorkingDirectory::root(self.candidate)?;
+        let status = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&status, "verify committed candidate cleanliness")?;
+        if !status.stdout.is_empty() {
+            return Err(recovery_required());
+        }
+        let head = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&head, "verify committed candidate HEAD")?;
+        if bounded_utf8_line(&head.stdout, "committed candidate HEAD")? != ref_sha {
+            return Err(recovery_required());
+        }
+        let parent_ref = format!("{ref_sha}^");
+        let parent = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &["rev-parse", "--verify", &parent_ref],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&parent, "verify committed candidate parent")?;
+        if bounded_utf8_line(&parent.stdout, "committed candidate parent")?
+            != self.manager.base_sha
+        {
+            return Err(recovery_required());
+        }
+        let tree_ref = format!("{ref_sha}^{{tree}}");
+        let tree = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &["rev-parse", "--verify", &tree_ref],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&tree, "read committed candidate tree")?;
+        let tree_sha = canonical_full_sha(bounded_utf8_line(
+            &tree.stdout,
+            "committed candidate tree",
+        )?)?;
+        if self.manager.object_id_len != Some(tree_sha.len()) {
+            return Err(recovery_required());
+        }
+        let paths_output = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &[
+                    "diff-tree",
+                    "--name-only",
+                    "-z",
+                    "--no-commit-id",
+                    "-r",
+                    "--no-renames",
+                    &self.manager.base_sha,
+                    &tree_sha,
+                ],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&paths_output, "enumerate committed candidate changes")?;
+        let paths = parse_diff_paths(&paths_output.stdout)?;
+        validate_protected_paths(&paths)?;
+        validate_no_nested_repositories(&self.candidate.anchor.canonical_path, &paths)?;
+        validator
+            .validate_no_submodules(self.candidate, &working_directory, &paths)
+            .await?;
+        let terminal_result_outputs = match result_experiment_id {
+            Some(experiment_id) => {
+                Some(
+                    validator
+                        .validate_terminal_result_outputs(experiment_id)
+                        .await?,
+                )
+            }
+            None => {
+                if allow_service_runtime {
+                    validator
+                        .validate_submission_runtime_outputs(
+                            self.candidate,
+                            &working_directory,
+                        )
+                        .await?;
+                } else {
+                    validator
+                        .validate_ignored_protected_paths(self.candidate, &working_directory)
+                        .await?;
+                }
+                None
+            }
+        };
+        let diff = self
+            .manager
+            .git(
+                self.candidate,
+                &working_directory,
+                &["diff-tree", "--binary", &self.manager.base_sha, &tree_sha],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        require_success(&diff, "read committed candidate diff")?;
+        let file_count = paths.len();
+        validate_diff_limits(file_count, diff.stdout.len(), &self.manager.policy.campaign_limits)?;
+        self.manager.validate_original_state().await?;
+        self.manager.validate_git_boundary(self.candidate)?;
+        Ok((
+            DiffFacts {
+                transient_paths: paths,
+                file_count,
+                diff_bytes: diff.stdout.len(),
+                tree_sha,
+                digest: sha256_hex(&diff.stdout),
+            },
+            terminal_result_outputs,
+        ))
+    }
+
+    async fn run_supervisor_diff_check(
+        &self,
+        expected: &DiffFacts,
+    ) -> Result<BoundedToolOutput, AppError> {
+        self.manager.validate_original_state().await?;
+        let index = Arc::new(OwnedTemporaryIndex::create(&self.manager.policy)?);
+        let working_directory = VerifiedWorkingDirectory::root(self.candidate)?;
+        let mut environment = SanitizedEnvironment::for_code_change_tool(&self.manager.policy)?;
+        environment.with_generated("GIT_INDEX_FILE", index.path.clone());
+        let root = self.candidate.try_clone()?;
+        let read_tree = self
+            .run_git_metadata(
+                &root,
+                &working_directory,
+                &environment,
+                &[
+                    OsString::from("read-tree"),
+                    OsString::from(self.manager.base_sha.clone()),
+                ],
+                Some(index.clone()),
+            )
+            .await?;
+        require_success(&read_tree, "construct candidate index")?;
+        let mut add_args = vec![
+            OsString::from("add"),
+            OsString::from("-A"),
+            OsString::from("--"),
+        ];
+        add_args.extend(
+            expected
+                .transient_paths
+                .iter()
+                .map(|path| path.as_os_str().to_os_string()),
+        );
+        let add = self
+            .run_git_metadata(
+                &root,
+                &working_directory,
+                &environment,
+                &add_args,
+                Some(index.clone()),
+            )
+            .await?;
+        require_success(&add, "stage candidate changes")?;
+        let result = self
+            .manager
+            .run_git_owned(
+                &root,
+                &working_directory,
+                supervisor_diff_check_args(&self.manager.base_sha),
+                MAX_CHECK_OUTPUT_BYTES,
+                environment.clone(),
+                Some(index),
+                None,
+                "Git diff check",
+            )
+            .await?;
+        self.manager.validate_original_state().await?;
+        self.manager.validate_git_boundary(&root)?;
+        Ok(result)
+    }
+
     async fn run_git_metadata(
         &self,
         root: &VerifiedProjectRoot,
@@ -3632,6 +6350,7 @@ impl<'a> CandidateRepository<'a> {
                 "Git candidate commit",
                 None,
                 Some(git_directories),
+                None,
             )
             .await?;
         self.manager.validate_git_boundary(&root)?;
@@ -3772,6 +6491,40 @@ impl<'a> CandidateRepository<'a> {
         Ok(())
     }
 
+    #[cfg(debug_assertions)]
+    async fn replace_best_ref_for_test(
+        &self,
+        replacement_sha: &str,
+        expected_old_sha: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.manager.validate_original_state().await?;
+        canonical_full_sha(replacement_sha)?;
+        let zero = self.manager.zero_object_id()?;
+        let expected = match expected_old_sha {
+            Some(value) => {
+                canonical_full_sha(value)?;
+                value.to_owned()
+            }
+            None => zero,
+        };
+        let original_root = self.manager.original.root_anchor.verify_identity()?;
+        let original_cwd = VerifiedWorkingDirectory::root(&original_root)?;
+        let reference = format!("refs/heads/{}", best_ref(&self.manager.campaign_id)?);
+        let output = self
+            .manager
+            .git(
+                &original_root,
+                &original_cwd,
+                &["update-ref", &reference, replacement_sha, &expected],
+                MAX_GIT_OUTPUT_BYTES,
+            )
+            .await?;
+        if !output.success {
+            return Err(recovery_required());
+        }
+        self.manager.validate_original_state().await
+    }
+
     async fn update_best_ref_cas_authorized(
         &self,
         authorization: &CodeChangeCleanupAuthorization,
@@ -3781,6 +6534,33 @@ impl<'a> CandidateRepository<'a> {
         let run = authorization.fresh_run()?;
         self.manager
             .verify_cleanup_run(&run, Some(new_sha), Some(self.candidate), authorization)?;
+        self.update_best_ref_cas_verified(new_sha, expected_old_sha, None, None)
+            .await
+    }
+
+    async fn update_best_ref_cas_for_promotion(
+        &self,
+        new_sha: &str,
+        expected_old_sha: Option<&str>,
+        test_replacement_sha: Option<&str>,
+        test_attempt_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<(), AppError> {
+        self.update_best_ref_cas_verified(
+            new_sha,
+            expected_old_sha,
+            test_replacement_sha,
+            test_attempt_counter,
+        )
+        .await
+    }
+
+    async fn update_best_ref_cas_verified(
+        &self,
+        new_sha: &str,
+        expected_old_sha: Option<&str>,
+        _test_replacement_sha: Option<&str>,
+        _test_attempt_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<(), AppError> {
         self.manager.validate_original_state().await?;
         canonical_full_sha(new_sha)?;
         let zero = self.manager.zero_object_id()?;
@@ -3816,6 +6596,15 @@ impl<'a> CandidateRepository<'a> {
             }
             None if current.is_some() => return Err(recovery_required()),
             _ => {}
+        }
+        #[cfg(debug_assertions)]
+        if let Some(replacement_sha) = _test_replacement_sha {
+            self.replace_best_ref_for_test(replacement_sha, expected_old_sha)
+                .await?;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(counter) = _test_attempt_counter.as_ref() {
+            counter.fetch_add(1, Ordering::SeqCst);
         }
         let output = self
             .manager
@@ -3957,6 +6746,75 @@ struct BoundedToolOutput {
 }
 
 #[cfg(unix)]
+struct CheckCompletion {
+    status: CodeChangeCheckStatus,
+    output_digest: Option<String>,
+    summary: &'static str,
+    passed: bool,
+}
+
+#[cfg(unix)]
+fn classify_check_result(
+    result: Result<BoundedToolOutput, AppError>,
+) -> Result<CheckCompletion, AppError> {
+    match result {
+        Ok(output) if output.success => Ok(CheckCompletion {
+            status: CodeChangeCheckStatus::Passed,
+            output_digest: Some(output.output_digest),
+            summary: "check passed",
+            passed: true,
+        }),
+        Ok(output) => Ok(CheckCompletion {
+            status: CodeChangeCheckStatus::Failed,
+            output_digest: Some(output.output_digest),
+            summary: "check returned non-zero",
+            passed: false,
+        }),
+        Err(AppError::Runtime { operation }) if operation == "code-change tool timeout" => {
+            Ok(CheckCompletion {
+                status: CodeChangeCheckStatus::TimedOut,
+                output_digest: None,
+                summary: "check timed out",
+                passed: false,
+            })
+        }
+        Err(AppError::Validation { field, .. }) if field == "code_change.tool_output" => {
+            Ok(CheckCompletion {
+                status: CodeChangeCheckStatus::Failed,
+                output_digest: None,
+                summary: "check output exceeded limit",
+                passed: false,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn persist_check_completion(
+    repository: &CodeChangeRepository<'_>,
+    run_id: &str,
+    attempt: i64,
+    ordinal: i64,
+    started_at: i64,
+    completion: CheckCompletion,
+) -> Result<bool, AppError> {
+    let finished_at = unix_timestamp()?;
+    repository.finish_check(
+        run_id,
+        attempt,
+        ordinal,
+        completion.status,
+        completion.output_digest.as_deref(),
+        Some(completion.summary),
+        Some(started_at),
+        finished_at,
+        finished_at,
+    )?;
+    Ok(completion.passed)
+}
+
+#[cfg(unix)]
 impl std::fmt::Debug for BoundedToolOutput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -3972,16 +6830,630 @@ impl std::fmt::Debug for BoundedToolOutput {
 }
 
 #[cfg(unix)]
+struct OwnedCheckOutputs {
+    state_root: Arc<File>,
+    state_root_identity: ExecutableIdentity,
+    checks: Arc<File>,
+    checks_identity: ExecutableIdentity,
+    checks_name: OsString,
+    run: Arc<File>,
+    run_identity: ExecutableIdentity,
+    run_name: OsString,
+    attempt: Arc<File>,
+    attempt_identity: ExecutableIdentity,
+    attempt_name: OsString,
+    root: Arc<File>,
+    root_identity: ExecutableIdentity,
+    root_name: OsString,
+    path: PathBuf,
+    unproven: AtomicBool,
+}
+
+#[cfg(unix)]
+impl OwnedCheckOutputs {
+    fn create(
+        policy: &ResolvedExecutionPolicy,
+        run_id: &str,
+        attempt: i64,
+        ordinal: i64,
+        tool: CodeChangeTool,
+    ) -> Result<Self, AppError> {
+        validate_internal_id("code_change_run_id", run_id)?;
+        if !(1..=2).contains(&attempt) || !(1..=8).contains(&ordinal) {
+            return Err(validation(
+                "code_change.check",
+                "attempt and ordinal exceed the bounded check plan",
+            ));
+        }
+        policy.verify_code_change_state_root()?;
+        let state_root = policy.code_change_state_root_directory();
+        let state_root_identity = directory_identity(&state_root)?;
+        let checks_name = OsString::from("code-change-checks");
+        let checks = Arc::new(open_or_create_directory_at(&state_root, &checks_name)?);
+        let checks_identity = directory_identity(&checks)?;
+        let run_name = OsString::from(run_id);
+        let run = Arc::new(open_or_create_directory_at(&checks, &run_name)?);
+        let run_identity = directory_identity(&run)?;
+        let attempt_name = OsString::from(format!("attempt-{attempt}"));
+        let attempt_directory = open_or_create_directory_at(&run, &attempt_name)?;
+        let attempt_identity = directory_identity(&attempt_directory)?;
+        let attempt = Arc::new(attempt_directory);
+        let root_name = OsString::from(format!("check-{ordinal}"));
+        let root_directory = create_new_directory_at(&attempt, &root_name)?;
+        let root_identity = directory_identity(&root_directory)?;
+        let root = Arc::new(root_directory);
+        let path = policy
+            .code_change_state_root_path()
+            .join(&checks_name)
+            .join(run_id)
+            .join(&attempt_name)
+            .join(&root_name);
+        let outputs = Self {
+            state_root,
+            state_root_identity,
+            checks,
+            checks_identity,
+            checks_name,
+            run,
+            run_identity,
+            run_name,
+            attempt,
+            attempt_identity,
+            attempt_name,
+            root,
+            root_identity,
+            root_name,
+            path,
+            unproven: AtomicBool::new(false),
+        };
+        for name in check_output_directory_names(tool) {
+            open_or_create_directory_at(&outputs.root, OsStr::new(name))?;
+        }
+        outputs.verify_before_command()?;
+        Ok(outputs)
+    }
+
+    fn apply_environment(
+        &self,
+        environment: &mut SanitizedEnvironment,
+        tool: CodeChangeTool,
+    ) -> Result<(), AppError> {
+        self.verify_before_command()?;
+        apply_check_output_environment(environment, tool, &self.path)
+    }
+
+    fn verify_before_command(&self) -> Result<(), AppError> {
+        if self.unproven.load(Ordering::Acquire) {
+            return Err(recovery_required());
+        }
+        if let Err(error) = self.verify_location() {
+            self.unproven.store(true, Ordering::Release);
+            return Err(error);
+        }
+        let mut state = CheckOutputAuditState::default();
+        let result = audit_check_output_directory(
+            &self.root,
+            0,
+            self.root_identity.device,
+            &mut state,
+        );
+        if let Err(error) = result {
+            self.unproven.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn verify_location(&self) -> Result<(), AppError> {
+        if directory_identity(&self.state_root)? != self.state_root_identity
+            || directory_identity(&self.checks)? != self.checks_identity
+            || directory_identity(&self.run)? != self.run_identity
+            || directory_identity(&self.attempt)? != self.attempt_identity
+            || directory_identity(&self.root)? != self.root_identity
+        {
+            return Err(recovery_required());
+        }
+        for (parent, name, identity) in [
+            (
+                &self.state_root,
+                &self.checks_name,
+                self.checks_identity,
+            ),
+            (&self.checks, &self.run_name, self.run_identity),
+            (&self.run, &self.attempt_name, self.attempt_identity),
+            (&self.attempt, &self.root_name, self.root_identity),
+        ] {
+            if check_output_entry_identity(parent, name)?.as_ref() != Some(&identity) {
+                return Err(recovery_required());
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup(&self) -> Result<(), AppError> {
+        if self.unproven.load(Ordering::Acquire) {
+            return Err(recovery_required());
+        }
+        let result = self.cleanup_inner();
+        if result.is_err() {
+            self.unproven.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn cleanup_inner(&self) -> Result<(), AppError> {
+        self.verify_location()?;
+        let mut audit = CheckOutputAuditState::default();
+        audit_check_output_directory(
+            &self.root,
+            0,
+            self.root_identity.device,
+            &mut audit,
+        )?;
+        let mut removal = CheckOutputAuditState::default();
+        remove_check_output_directory(
+            &self.root,
+            0,
+            self.root_identity.device,
+            &mut removal,
+        )?;
+        self.verify_location()?;
+        let mut remaining = CheckOutputAuditState::default();
+        audit_check_output_directory(
+            &self.root,
+            0,
+            self.root_identity.device,
+            &mut remaining,
+        )?;
+        if remaining.entries != 0 {
+            return Err(recovery_required());
+        }
+        if check_output_entry_identity(&self.attempt, &self.root_name)?.as_ref()
+            != Some(&self.root_identity)
+        {
+            return Err(recovery_required());
+        }
+        unlink_check_output_entry(&self.attempt, &self.root_name, true)?;
+        if check_output_entry_stat(&self.attempt, &self.root_name)?.is_some() {
+            return Err(recovery_required());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedCheckOutputs {
+    fn drop(&mut self) {
+        if !self.unproven.load(Ordering::Acquire) {
+            let _ = self.cleanup_inner();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn check_output_directory_names(tool: CodeChangeTool) -> &'static [&'static str] {
+    match tool {
+        CodeChangeTool::Cargo => &["tmp", "cargo-target"],
+        CodeChangeTool::Uv => &["tmp", "uv-venv", "uv-cache", "uv-python", "pytest-cache"],
+        CodeChangeTool::Python => &["tmp", "pytest-cache"],
+        CodeChangeTool::Git => &["tmp"],
+    }
+}
+
+#[cfg(unix)]
+fn apply_check_output_environment(
+    environment: &mut SanitizedEnvironment,
+    tool: CodeChangeTool,
+    root: &Path,
+) -> Result<(), AppError> {
+    if !root.is_absolute() {
+        return Err(validation(
+            "code_change.check_output",
+            "owned check output path must be absolute",
+        ));
+    }
+    let tmp = check_output_path(root, "tmp")?;
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        environment.with_generated(name, tmp.clone());
+    }
+    match tool {
+        CodeChangeTool::Cargo => {
+            environment.with_generated("CARGO_TARGET_DIR", check_output_path(root, "cargo-target")?);
+        }
+        CodeChangeTool::Uv => {
+            environment.with_generated(
+                "UV_PROJECT_ENVIRONMENT",
+                check_output_path(root, "uv-venv")?,
+            );
+            environment.with_generated("UV_CACHE_DIR", check_output_path(root, "uv-cache")?);
+            environment.with_generated(
+                "UV_PYTHON_INSTALL_DIR",
+                check_output_path(root, "uv-python")?,
+            );
+            apply_pytest_output_environment(environment, root)?;
+        }
+        CodeChangeTool::Python => {
+            apply_pytest_output_environment(environment, root)?;
+        }
+        CodeChangeTool::Git => {}
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_pytest_output_environment(
+    environment: &mut SanitizedEnvironment,
+    root: &Path,
+) -> Result<(), AppError> {
+    environment.with_generated("PYTHONDONTWRITEBYTECODE", OsStr::new("1"));
+    let cache = check_output_path(root, "pytest-cache")?;
+    let cache = cache.to_str().ok_or(validation(
+        "code_change.check_output",
+        "owned pytest cache path must be UTF-8",
+    ))?;
+    if cache.chars().any(char::is_control) {
+        return Err(validation(
+            "code_change.check_output",
+            "owned pytest cache path contains control characters",
+        ));
+    }
+    let escaped = cache.replace('\\', "\\\\").replace('"', "\\\"");
+    environment.with_generated(
+        "PYTEST_ADDOPTS",
+        OsString::from(format!("-o \"cache_dir={escaped}\"")),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_output_path(root: &Path, name: &str) -> Result<OsString, AppError> {
+    let path = root.join(name);
+    if path.components().any(|component| component == Component::ParentDir) {
+        return Err(recovery_required());
+    }
+    Ok(path.into_os_string())
+}
+
+#[cfg(unix)]
+fn verify_runtime_output_boundary(
+    runtime: &File,
+    runtime_identity: ExecutableIdentity,
+    experiment: &File,
+    experiment_identity: ExecutableIdentity,
+    experiment_id: &str,
+) -> Result<(), AppError> {
+    if verify_runtime_directory(runtime)? != runtime_identity
+        || verify_runtime_directory(experiment)? != experiment_identity
+    {
+        return Err(recovery_required());
+    }
+    let entries = check_output_directory_entries(runtime)?;
+    if entries.len() != 1 || entries[0] != OsStr::new(experiment_id) {
+        return Err(recovery_required());
+    }
+    let current = open_runtime_directory_at(runtime, OsStr::new(experiment_id))
+        .map_err(|_| recovery_required())?;
+    if verify_runtime_directory(&current)? != experiment_identity {
+        return Err(recovery_required());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_runtime_output_scope(
+    runtime: &File,
+    runtime_identity: ExecutableIdentity,
+    experiment_id: &str,
+    expected_experiment_identity: Option<ExecutableIdentity>,
+    require_empty: bool,
+) -> Result<(), AppError> {
+    if verify_runtime_directory(runtime)? != runtime_identity {
+        return Err(recovery_required());
+    }
+    let entries = check_output_directory_entries(runtime)?;
+    if entries.len() != 1 || entries[0] != OsStr::new(experiment_id) {
+        return Err(recovery_required());
+    }
+    let experiment = open_runtime_directory_at(runtime, OsStr::new(experiment_id))
+        .map_err(|_| recovery_required())?;
+    let experiment_identity = verify_runtime_directory(&experiment)?;
+    if expected_experiment_identity.is_some_and(|expected| expected != experiment_identity) {
+        return Err(recovery_required());
+    }
+    let expected = RUNTIME_OUTPUT_DIRECTORY_NAMES
+        .iter()
+        .map(|name| OsString::from(*name))
+        .collect::<BTreeSet<_>>();
+    let actual = check_output_directory_entries(&experiment)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(recovery_required());
+    }
+    let mut audit = CheckOutputAuditState::runtime();
+    for name in RUNTIME_OUTPUT_DIRECTORY_NAMES {
+        let output = open_runtime_directory_at(&experiment, OsStr::new(name))
+            .map_err(|_| recovery_required())?;
+        verify_runtime_directory(&output)?;
+        audit_check_output_directory(&output, 0, experiment_identity.device, &mut audit)?;
+        if require_empty && audit.entries != 0 {
+            return Err(recovery_required());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct CheckOutputAuditState {
+    entries: usize,
+    allocated_bytes: u64,
+    max_entries: usize,
+    max_bytes: u64,
+}
+
+#[cfg(unix)]
+impl Default for CheckOutputAuditState {
+    fn default() -> Self {
+        Self {
+            entries: 0,
+            allocated_bytes: 0,
+            max_entries: MAX_CHECK_OUTPUT_ENTRIES,
+            max_bytes: MAX_CHECK_OUTPUT_ALLOCATED_BYTES,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl CheckOutputAuditState {
+    fn runtime() -> Self {
+        Self {
+            max_entries: MAX_RUNTIME_OUTPUT_ENTRIES,
+            max_bytes: MAX_RUNTIME_OUTPUT_ALLOCATED_BYTES,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(unix)]
+fn audit_check_output_directory(
+    directory: &File,
+    depth: usize,
+    root_device: u64,
+    state: &mut CheckOutputAuditState,
+) -> Result<(), AppError> {
+    if depth > MAX_CHECK_OUTPUT_DEPTH {
+        return Err(recovery_required());
+    }
+    for name in check_output_directory_entries(directory)? {
+        state.entries = state.entries.saturating_add(1);
+        if state.entries > state.max_entries {
+            return Err(recovery_required());
+        }
+        let stat = check_output_entry_stat(directory, &name)?.ok_or_else(recovery_required)?;
+        let file_type = stat.st_mode as u32 & libc::S_IFMT as u32;
+        if stat.st_uid != unsafe { libc::geteuid() as u32 }
+            || stat.st_dev as u64 != root_device
+            || (file_type == libc::S_IFDIR as u32 && stat.st_mode as u32 & 0o022 != 0)
+            || (file_type != libc::S_IFDIR as u32
+                && file_type != libc::S_IFREG as u32
+                && file_type != libc::S_IFLNK as u32)
+        {
+            return Err(recovery_required());
+        }
+        if file_type == libc::S_IFREG as u32 {
+            if stat.st_nlink < 1 || stat.st_size < 0 {
+                return Err(recovery_required());
+            }
+            state.allocated_bytes = state
+                .allocated_bytes
+                .checked_add(stat.st_size as u64)
+                .ok_or_else(recovery_required)?;
+            if state.allocated_bytes > state.max_bytes {
+                return Err(recovery_required());
+            }
+        } else if file_type == libc::S_IFDIR as u32 {
+            let child = open_existing_directory_at(directory, &name)
+                .map_err(|_| recovery_required())?;
+            audit_check_output_directory(&child, depth + 1, root_device, state)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_check_output_directory(
+    directory: &File,
+    depth: usize,
+    root_device: u64,
+    state: &mut CheckOutputAuditState,
+) -> Result<(), AppError> {
+    if depth > MAX_CHECK_OUTPUT_DEPTH {
+        return Err(recovery_required());
+    }
+    for name in check_output_directory_entries(directory)? {
+        state.entries = state.entries.saturating_add(1);
+        if state.entries > state.max_entries {
+            return Err(recovery_required());
+        }
+        let initial = check_output_entry_stat(directory, &name)?.ok_or_else(recovery_required)?;
+        let file_type = initial.st_mode as u32 & libc::S_IFMT as u32;
+        if initial.st_uid != unsafe { libc::geteuid() as u32 }
+            || initial.st_dev as u64 != root_device
+            || (file_type == libc::S_IFDIR as u32 && initial.st_mode as u32 & 0o022 != 0)
+            || (file_type != libc::S_IFDIR as u32
+                && file_type != libc::S_IFREG as u32
+                && file_type != libc::S_IFLNK as u32)
+        {
+            return Err(recovery_required());
+        }
+        if file_type == libc::S_IFREG as u32 {
+            if initial.st_nlink < 1 || initial.st_size < 0 {
+                return Err(recovery_required());
+            }
+            state.allocated_bytes = state
+                .allocated_bytes
+                .checked_add(initial.st_size as u64)
+                .ok_or_else(recovery_required)?;
+            if state.allocated_bytes > state.max_bytes {
+                return Err(recovery_required());
+            }
+            let current = check_output_entry_stat(directory, &name)?.ok_or_else(recovery_required)?;
+            if check_output_identity(&current) != check_output_identity(&initial) {
+                return Err(recovery_required());
+            }
+            unlink_check_output_entry(directory, &name, false)?;
+        } else if file_type == libc::S_IFDIR as u32 {
+            let child = open_existing_directory_at(directory, &name)
+                .map_err(|_| recovery_required())?;
+            remove_check_output_directory(&child, depth + 1, root_device, state)?;
+            let current = check_output_entry_stat(directory, &name)?.ok_or_else(recovery_required)?;
+            if check_output_identity(&current) != check_output_identity(&initial) {
+                return Err(recovery_required());
+            }
+            unlink_check_output_entry(directory, &name, true)?;
+        } else {
+            let current = check_output_entry_stat(directory, &name)?.ok_or_else(recovery_required)?;
+            if check_output_identity(&current) != check_output_identity(&initial) {
+                return Err(recovery_required());
+            }
+            unlink_check_output_entry(directory, &name, false)?;
+        }
+        if check_output_entry_stat(directory, &name)?.is_some() {
+            return Err(recovery_required());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_output_directory_entries(directory: &File) -> Result<Vec<OsString>, AppError> {
+    let dot = std::ffi::CString::new(".").expect("static directory component");
+    let duplicate = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if duplicate < 0 {
+        return Err(recovery_required());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(recovery_required());
+    }
+    let mut names = Vec::new();
+    loop {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { libc::closedir(stream) };
+            if error.raw_os_error().is_some_and(|value| value != 0) {
+                return Err(recovery_required());
+            }
+            return Ok(names);
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if names.len() >= MAX_CHECK_OUTPUT_ENTRIES {
+            unsafe { libc::closedir(stream) };
+            return Err(recovery_required());
+        }
+        names.push(OsString::from_vec(name.to_bytes().to_vec()));
+    }
+}
+
+#[cfg(unix)]
+fn check_output_entry_stat(
+    parent: &File,
+    name: &OsStr,
+) -> Result<Option<libc::stat>, AppError> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| validation("code_change.check_output", "entry name contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(Some(unsafe { stat.assume_init() }));
+    }
+    if io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(recovery_required())
+    }
+}
+
+#[cfg(unix)]
+fn check_output_entry_identity(
+    parent: &File,
+    name: &OsStr,
+) -> Result<Option<ExecutableIdentity>, AppError> {
+    Ok(check_output_entry_stat(parent, name)?.map(|stat| check_output_identity(&stat)))
+}
+
+#[cfg(unix)]
+fn check_output_identity(stat: &libc::stat) -> ExecutableIdentity {
+    ExecutableIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        owner: stat.st_uid as u32,
+        mode: stat.st_mode as u32 & 0o7777,
+    }
+}
+
+#[cfg(unix)]
+fn unlink_check_output_entry(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+) -> Result<(), AppError> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| validation("code_change.check_output", "entry name contains NUL"))?;
+    let result = unsafe {
+        libc::unlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(recovery_required())
+    }
+}
+
+#[cfg(unix)]
 #[derive(Clone)]
 struct BoundedToolRunner {
     policy: ResolvedExecutionPolicy,
     output_limit: usize,
+    timeout: Option<Duration>,
 }
 
 #[cfg(unix)]
 struct ToolProcessLease {
     child: Option<crate::process::VerifiedChild>,
     temporary_index: Option<Arc<OwnedTemporaryIndex>>,
+    check_outputs: Option<OwnedCheckOutputs>,
 }
 
 #[cfg(unix)]
@@ -3989,10 +7461,12 @@ impl ToolProcessLease {
     fn new(
         child: crate::process::VerifiedChild,
         temporary_index: Option<Arc<OwnedTemporaryIndex>>,
+        check_outputs: Option<OwnedCheckOutputs>,
     ) -> Self {
         Self {
             child: Some(child),
             temporary_index,
+            check_outputs,
         }
     }
 
@@ -4003,6 +7477,14 @@ impl ToolProcessLease {
     fn take_child(&mut self) -> crate::process::VerifiedChild {
         self.child.take().expect("tool process lease owns child")
     }
+
+    fn cleanup_check_outputs(&mut self) -> Result<(), AppError> {
+        if let Some(outputs) = self.check_outputs.take() {
+            outputs.cleanup()
+        } else {
+            Ok(())
+}
+    }
 }
 
 #[cfg(unix)]
@@ -4012,6 +7494,7 @@ impl Drop for ToolProcessLease {
             return;
         };
         let temporary_index = self.temporary_index.take();
+        let check_outputs = self.check_outputs.take();
         // Cancellation cannot leave a detached task holding the Git index
         // pathname.  Reap the complete owned group synchronously before the
         // temporary owner is dropped; retain the index for recovery if the
@@ -4021,8 +7504,14 @@ impl Drop for ToolProcessLease {
             if let Some(index) = temporary_index.as_ref() {
                 index.retain_for_recovery();
             }
+            if let Some(outputs) = check_outputs.as_ref() {
+                outputs.unproven.store(true, Ordering::Release);
+        }
+        } else if let Some(outputs) = check_outputs.as_ref() {
+            let _ = outputs.cleanup();
         }
         drop(temporary_index);
+        drop(check_outputs);
     }
 }
 
@@ -4032,6 +7521,19 @@ impl BoundedToolRunner {
         Self {
             policy: policy.clone(),
             output_limit,
+            timeout: None,
+        }
+    }
+
+    fn with_timeout(
+        policy: &ResolvedExecutionPolicy,
+        output_limit: usize,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            policy: policy.clone(),
+            output_limit,
+            timeout: Some(timeout),
         }
     }
 
@@ -4045,6 +7547,7 @@ impl BoundedToolRunner {
         summary: &'static str,
         temporary_index: Option<Arc<OwnedTemporaryIndex>>,
         git_directories: Option<VerifiedGitDirectories>,
+        check_outputs: Option<OwnedCheckOutputs>,
     ) -> Result<BoundedToolOutput, AppError> {
         let root = root.try_clone()?;
         let working_directory = working_directory.try_clone()?;
@@ -4059,6 +7562,7 @@ impl BoundedToolRunner {
                 summary,
                 temporary_index,
                 git_directories,
+                check_outputs,
             )
             .await
     }
@@ -4073,6 +7577,7 @@ impl BoundedToolRunner {
         summary: &'static str,
         _temporary_index: Option<Arc<OwnedTemporaryIndex>>,
         git_directories: Option<VerifiedGitDirectories>,
+        mut check_outputs: Option<OwnedCheckOutputs>,
     ) -> Result<BoundedToolOutput, AppError> {
         if argv.is_empty() || self.output_limit == 0 {
             return Err(validation(
@@ -4097,13 +7602,18 @@ impl BoundedToolRunner {
             return Err(recovery_required());
         }
         let deadline = Instant::now()
-            .checked_add(Duration::from_secs(
-                u64::from(self.policy.campaign_limits.code_change_check_timeout_minutes)
-                    .saturating_mul(60),
-            ))
+            .checked_add(self.timeout.unwrap_or_else(|| {
+                Duration::from_secs(
+                    u64::from(self.policy.campaign_limits.code_change_check_timeout_minutes)
+                        .saturating_mul(60),
+                )
+            }))
             .ok_or(AppError::Runtime {
                 operation: "start bounded code-change tool deadline",
             })?;
+        if let Some(outputs) = check_outputs.as_ref() {
+            outputs.verify_before_command()?;
+        }
         let child = match spawn_verified_command_before_classified(
             VerifiedCommandSpec {
                 launcher: self.policy.launcher_anchor.clone(),
@@ -4124,30 +7634,36 @@ impl BoundedToolRunner {
         {
             Ok(child) => child,
             Err(crate::process::SpawnVerifiedCommandBeforeError::Launch(error)) => {
+                if let Some(outputs) = check_outputs.take() {
+                    let _ = outputs.cleanup();
+                }
                 return Err(error)
             }
             Err(crate::process::SpawnVerifiedCommandBeforeError::Cleanup(error)) => {
+                if let Some(outputs) = check_outputs.take() {
+                    let _ = outputs.cleanup();
+                }
                 return Err(error)
             }
         };
-        let mut lease = ToolProcessLease::new(child, _temporary_index);
+        let mut lease = ToolProcessLease::new(child, _temporary_index, check_outputs);
 
         if let Err(error) = lease.child_mut().release_before(deadline) {
-            return Err(cleanup_tool_failure(lease.child_mut(), error, deadline).await);
+            return Err(cleanup_tool_failure(&mut lease, error, deadline).await);
         }
         if let Err(error) = lease.child_mut().confirm_exec_before(deadline).await {
-            return Err(cleanup_tool_failure(lease.child_mut(), error, deadline).await);
+            return Err(cleanup_tool_failure(&mut lease, error, deadline).await);
         }
         if let Err(error) = lease.child_mut().wait_for_release_ack_before(deadline).await {
-            return Err(cleanup_tool_failure(lease.child_mut(), error, deadline).await);
+            return Err(cleanup_tool_failure(&mut lease, error, deadline).await);
         }
         let stdout = match lease.child_mut().take_stdout() {
             Ok(stream) => stream,
-            Err(error) => return Err(cleanup_tool_failure(lease.child_mut(), error, deadline).await),
+            Err(error) => return Err(cleanup_tool_failure(&mut lease, error, deadline).await),
         };
         let stderr = match lease.child_mut().take_stderr() {
             Ok(stream) => stream,
-            Err(error) => return Err(cleanup_tool_failure(lease.child_mut(), error, deadline).await),
+            Err(error) => return Err(cleanup_tool_failure(&mut lease, error, deadline).await),
         };
 
         let used = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4162,6 +7678,7 @@ impl BoundedToolRunner {
                 if let Err(error) = cleanup {
                     return Err(error);
                 }
+                lease.cleanup_check_outputs()?;
                 return Err(match pending.failure {
                     ToolCollectionFailure::Timeout => AppError::Runtime {
                         operation: "code-change tool timeout",
@@ -4180,6 +7697,7 @@ impl BoundedToolRunner {
             }
         };
         let _child = lease.take_child();
+        lease.cleanup_check_outputs()?;
         let output_digest = digest_tool_output(&stdout, &stderr);
         Ok(BoundedToolOutput {
             success: status.success(),
@@ -4192,6 +7710,22 @@ impl BoundedToolRunner {
     }
 }
 
+struct CheckRoundResult {
+    git_diff_passed: bool,
+    project_check_count: usize,
+    all_project_checks_passed: bool,
+    final_diff_matches: bool,
+}
+
+impl CheckRoundResult {
+    fn passed(&self) -> bool {
+        self.git_diff_passed
+            && self.project_check_count >= 1
+            && self.all_project_checks_passed
+            && self.final_diff_matches
+    }
+}
+
 /// Runs only the fixed, startup-pinned project checks admitted by the editor
 /// protocol.  The result is a bounded digest list; check output is discarded
 /// as soon as the caller has enough information to classify the outcome.
@@ -4200,11 +7734,197 @@ impl BoundedToolRunner {
 struct CheckRunner<'a> {
     manager: &'a WorktreeManager,
     candidate: &'a VerifiedProjectRoot,
+    check_timeout_override: Option<Duration>,
 }
 
 #[allow(dead_code)]
 #[cfg(unix)]
 impl<'a> CheckRunner<'a> {
+    async fn run_supervisor_check(
+        &self,
+        repository: &CodeChangeRepository<'_>,
+        run_id: &str,
+        attempt: i64,
+        expected: &DiffFacts,
+        row: &CodeChangeCheck,
+    ) -> Result<bool, AppError> {
+        if row.ordinal != 0 || row.source != "supervisor" {
+            return Err(recovery_required());
+        }
+        match row.status {
+            CodeChangeCheckStatus::Passed => return Ok(true),
+            CodeChangeCheckStatus::Failed | CodeChangeCheckStatus::TimedOut => return Ok(false),
+            CodeChangeCheckStatus::Reserved => {}
+        }
+        let started = unix_timestamp()?;
+        let result = CandidateRepository::new(self.manager, self.candidate)?
+            .run_supervisor_diff_check(expected)
+            .await;
+        let completion = classify_check_result(result)?;
+        persist_check_completion(repository, run_id, attempt, row.ordinal, started, completion)
+    }
+
+    async fn run_project_checks(
+        &self,
+        repository: &CodeChangeRepository<'_>,
+        run_id: &str,
+        attempt: i64,
+        checks: &[ProposedCheck],
+        rows: &[CodeChangeCheck],
+    ) -> Result<bool, AppError> {
+        if checks.len() != rows.len() {
+            return Err(recovery_required());
+        }
+        let candidate = self.candidate.anchor.verify_identity()?;
+        self.manager.validate_git_boundary(&candidate)?;
+        for (index, (check, row)) in checks.iter().zip(rows).enumerate() {
+            if row.ordinal != index as i64 + 1
+                || !matches!(row.source.as_str(), "discovered" | "editor")
+            {
+                return Err(recovery_required());
+            }
+            match row.status {
+                CodeChangeCheckStatus::Passed => continue,
+                CodeChangeCheckStatus::Failed | CodeChangeCheckStatus::TimedOut => return Ok(false),
+                CodeChangeCheckStatus::Reserved => {
+                    let started = unix_timestamp()?;
+                    let result = self
+                        .run_project_check(
+                            &candidate,
+                            check,
+                            run_id,
+                            attempt,
+                            row.ordinal,
+                        )
+                        .await;
+                    let completion = classify_check_result(result)?;
+                    if !persist_check_completion(
+                        repository,
+                        run_id,
+                        attempt,
+                        row.ordinal,
+                        started,
+                        completion,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn persisted_plan(
+        &self,
+        db: &Db,
+        run_id: &str,
+        attempt: i64,
+        editor_checks: &[ProposedCheck],
+    ) -> Result<(Vec<ProposedCheck>, Vec<CodeChangeCheck>), AppError> {
+        let available = [
+            CodeChangeTool::Cargo,
+            CodeChangeTool::Uv,
+            CodeChangeTool::Python,
+        ]
+        .into_iter()
+        .filter(|tool| self.manager.policy.code_change_tool(*tool).is_some())
+        .collect::<BTreeSet<_>>();
+        let root = self.candidate.anchor.canonical_path.as_path();
+        let limits = &self.manager.policy.campaign_limits;
+        validate_proposed_checks(editor_checks, root, limits, &available)?;
+        let discovered = discover_project_checks(root, &available)?;
+        let merged = merge_project_checks(
+            &discovered,
+            editor_checks,
+            limits.max_code_change_checks as usize,
+        )?;
+        let planned = planned_check_rows(
+            attempt,
+            &self.manager.base_sha,
+            &discovered,
+            editor_checks,
+            limits.max_code_change_checks as usize,
+        )?;
+        let repository = CodeChangeRepository::new(db);
+        let existing = repository.list_checks(run_id, attempt)?;
+        let rows = if existing.is_empty()
+            || existing.iter().all(|row| {
+                row.source == "editor"
+                    && row.status == CodeChangeCheckStatus::Reserved
+                    && row.output_digest.is_none()
+                    && row.summary.is_none()
+                    && row.started_at.is_none()
+                    && row.finished_at.is_none()
+            })
+        {
+            repository.replace_attempt_checks(run_id, attempt, &planned, unix_timestamp()?)?
+        } else {
+            validate_persisted_check_plan(&existing, &planned)?;
+            existing
+        };
+        Ok((merged, rows))
+    }
+
+    async fn run_all(
+        &self,
+        db: &Db,
+        run_id: &str,
+        attempt: i64,
+        expected: &DiffFacts,
+        editor_checks: &[ProposedCheck],
+    ) -> Result<CheckRoundResult, AppError> {
+        let validator = CandidateValidator::new(self.manager, self.candidate)?;
+        let initial = validator.verify().await?;
+        if initial != *expected {
+            return Err(recovery_required());
+        }
+        let (checks, rows) = self.persisted_plan(db, run_id, attempt, editor_checks)?;
+        let (supervisor_row, project_rows) = rows.split_first().ok_or_else(recovery_required)?;
+        let repository = CodeChangeRepository::new(db);
+        let git_diff_passed = self
+            .run_supervisor_check(
+                &repository,
+                run_id,
+                attempt,
+                expected,
+                supervisor_row,
+            )
+            .await?;
+        if !git_diff_passed {
+            return Ok(CheckRoundResult {
+                git_diff_passed: false,
+                project_check_count: checks.len(),
+                all_project_checks_passed: false,
+                final_diff_matches: false,
+            });
+        }
+        let all_project_checks_passed = self
+            .run_project_checks(
+                &repository,
+                run_id,
+                attempt,
+                &checks,
+                project_rows,
+            )
+            .await?;
+        if !all_project_checks_passed {
+            return Ok(CheckRoundResult {
+                git_diff_passed: true,
+                project_check_count: checks.len(),
+                all_project_checks_passed: false,
+                final_diff_matches: false,
+            });
+        }
+        let fresh = validator.verify().await?;
+        let final_diff_matches = fresh == *expected;
+        Ok(CheckRoundResult {
+            git_diff_passed: true,
+            project_check_count: checks.len(),
+            all_project_checks_passed: true,
+            final_diff_matches,
+        })
+    }
+
     async fn run(
         &self,
         candidate: &VerifiedProjectRoot,
@@ -4232,44 +7952,10 @@ impl<'a> CheckRunner<'a> {
         let candidate = self.candidate.anchor.verify_identity()?;
         self.manager.validate_git_boundary(&candidate)?;
         let mut digests = Vec::with_capacity(checks.len());
-        for check in checks {
-            let tool = tool_for_program(&check.argv[0]).ok_or_else(|| {
-                validation(
-                    "code_change_check.argv",
-                    "must start with a pinned code-change tool",
-                )
-            })?;
-            let executable = self.manager.policy.code_change_tool(tool).ok_or_else(|| {
-                validation(
-                    "code_change_check.argv",
-                    "requested tool is not available in the startup policy",
-                )
-            })?;
-            let working_directory = VerifiedWorkingDirectory::open_descendant(
-                &candidate,
-                Path::new(&check.working_directory),
-            )?;
-            self.manager.validate_git_boundary(&candidate)?;
-            let environment = SanitizedEnvironment::for_code_change_tool(&self.manager.policy)?;
-            let output = BoundedToolRunner::new(&self.manager.policy, MAX_CHECK_OUTPUT_BYTES)
-                .run(
-                    executable.clone(),
-                    &candidate,
-                    &working_directory,
-                    check.argv.iter().map(OsString::from).collect(),
-                    environment,
-                    "project check",
-                    None,
-                    None,
-                )
-                .await;
-            let boundary = self.manager.validate_git_boundary(&candidate);
-            let output = match (output, boundary) {
-                (_, Err(error)) => return Err(error),
-                (Err(error), Ok(())) => return Err(error),
-                (Ok(output), Ok(())) => output,
-            };
-            self.manager.validate_original_state().await?;
+        for (index, check) in checks.iter().enumerate() {
+            let output = self
+                .run_project_check(&candidate, check, "adhoc", 1, index as i64 + 1)
+                .await?;
             if !output.success {
                 return Err(AppError::Runtime {
                     operation: "code-change project check failed",
@@ -4280,6 +7966,73 @@ impl<'a> CheckRunner<'a> {
         self.manager.validate_git_boundary(&candidate)?;
         validator.verify().await?;
         Ok(digests)
+    }
+
+    async fn run_project_check(
+        &self,
+        candidate: &VerifiedProjectRoot,
+        check: &ProposedCheck,
+        run_id: &str,
+        attempt: i64,
+        ordinal: i64,
+    ) -> Result<BoundedToolOutput, AppError> {
+        let tool = tool_for_program(&check.argv[0]).ok_or_else(|| {
+            validation(
+                "code_change_check.argv",
+                "must start with a pinned code-change tool",
+            )
+        })?;
+        let executable = self.manager.policy.code_change_tool(tool).ok_or_else(|| {
+            validation(
+                "code_change_check.argv",
+                "requested tool is not available in the startup policy",
+            )
+        })?;
+        let working_directory = VerifiedWorkingDirectory::open_descendant(
+            candidate,
+            Path::new(&check.working_directory),
+        )?;
+        self.manager.validate_git_boundary(candidate)?;
+        let mut environment = SanitizedEnvironment::for_code_change_tool(&self.manager.policy)?;
+        let outputs = OwnedCheckOutputs::create(
+            &self.manager.policy,
+            run_id,
+            attempt,
+            ordinal,
+            tool,
+        )?;
+        outputs.apply_environment(&mut environment, tool)?;
+        let output_runner = self
+            .check_timeout_override
+            .map(|timeout| {
+                BoundedToolRunner::with_timeout(
+                    &self.manager.policy,
+                    MAX_CHECK_OUTPUT_BYTES,
+                    timeout,
+                )
+            })
+            .unwrap_or_else(|| BoundedToolRunner::new(&self.manager.policy, MAX_CHECK_OUTPUT_BYTES));
+        let output = output_runner
+            .run(
+                executable.clone(),
+                candidate,
+                &working_directory,
+                check.argv.iter().map(OsString::from).collect(),
+                environment,
+                "project check",
+                None,
+                None,
+                Some(outputs),
+            )
+            .await;
+        let boundary = self.manager.validate_git_boundary(candidate);
+        let output = match (output, boundary) {
+            (_, Err(error)) => return Err(error),
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(output), Ok(())) => output,
+        };
+        self.manager.validate_original_state().await?;
+        Ok(output)
     }
 }
 
@@ -4421,12 +8174,15 @@ async fn collect_tool_output(
 
 #[cfg(unix)]
 async fn cleanup_tool_failure(
-    child: &mut crate::process::VerifiedChild,
+    lease: &mut ToolProcessLease,
     original: AppError,
     deadline: Instant,
 ) -> AppError {
-    match terminate_process_group_before(child, deadline).await {
+    match terminate_process_group_before(lease.child_mut(), deadline).await {
+        Ok(()) => match lease.cleanup_check_outputs() {
         Ok(()) => original,
+            Err(error) => error,
+        },
         Err(error) => error,
     }
 }
@@ -4505,6 +8261,67 @@ fn recovery_required() -> AppError {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CleanupTaskSignature {
+    group: String,
+    id: i64,
+    enqueued_at: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+    state: String,
+}
+
+fn cleanup_task_timestamp_matches(raw: &Option<String>, stored: Option<i64>) -> bool {
+    match (raw.as_deref(), stored) {
+        (None, None) => true,
+        (Some(raw), Some(stored)) => parse_timestamp(raw) == Some(stored),
+        _ => false,
+    }
+}
+
+fn cleanup_task_observation_managed_identity(
+    observation: &TaskObservation,
+    expected_group: &str,
+) -> Option<String> {
+    if observation.command.len() != 1 || observation.pueue_group != expected_group {
+        return None;
+    }
+    let encoded = observation.task_signature.strip_prefix("pueue-task:v1:")?;
+    let identity = serde_json::from_str::<CleanupTaskSignature>(encoded).ok()?;
+    if identity.group != observation.pueue_group
+        || identity.id != observation.pueue_task_id
+        || !cleanup_task_timestamp_matches(&identity.enqueued_at, observation.enqueued_at)
+        || !cleanup_task_timestamp_matches(&identity.started_at, observation.started_at)
+        || !cleanup_task_timestamp_matches(&identity.ended_at, observation.ended_at)
+        || identity.state != observation.state
+    {
+        return None;
+    }
+    let task = PueueTask {
+        id: identity.id,
+        group: identity.group,
+        command: observation.command[0].clone(),
+        state: identity.state,
+        enqueued_at: identity.enqueued_at,
+        started_at: identity.started_at,
+        ended_at: identity.ended_at,
+        result: None,
+    };
+    if task_signature(&task) != observation.task_signature {
+        return None;
+    }
+    managed_task_run_signature(&task)
+}
+
+fn is_terminal_experiment_status(status: ExperimentStatus) -> bool {
+    matches!(
+        status,
+        ExperimentStatus::Succeeded
+            | ExperimentStatus::Failed
+            | ExperimentStatus::Cancelled
+    )
+}
+
 fn validate_disappeared_cleanup_target(_allow_missing_target: bool) -> Result<(), AppError> {
     Err(recovery_required())
 }
@@ -4581,6 +8398,13 @@ fn process_is_alive(pid: i64) -> bool {
     )
 }
 
+fn is_terminal_task_observation_state(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "done" | "failed" | "killed" | "finished" | "success"
+    )
+}
+
 #[cfg(not(unix))]
 fn process_is_alive(_pid: i64) -> bool {
     true
@@ -4623,6 +8447,14 @@ fn verify_durable_run_scope(
         return Err(recovery_required());
     }
     Ok(())
+}
+
+fn campaign_start_base_sha(db: &Db, campaign_id: &str) -> Result<String, AppError> {
+    let campaign = CampaignRepository::new(db)
+        .find_by_id(campaign_id)?
+        .ok_or_else(recovery_required)?;
+    let base = campaign.base_revision_sha.ok_or_else(recovery_required)?;
+    canonical_full_sha(&base)
 }
 
 #[cfg(unix)]
@@ -5529,7 +9361,41 @@ fn parse_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError> {
     Ok(paths.into_iter().collect())
 }
 
+fn parse_diff_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError> {
+    if bytes.len() > MAX_GIT_OUTPUT_BYTES {
+        return Err(validation(
+            "code_change.diff_paths",
+            "exceeds the bounded Git output size",
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    for path in bytes.split(|byte| *byte == 0) {
+        if path.is_empty() {
+            continue;
+        }
+        insert_status_path(&mut paths, path)?;
+        if paths.len() > MAX_STATUS_PATHS {
+            return Err(validation(
+                "code_change.diff_paths",
+                "exceeds the bounded changed-file count",
+            ));
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
 fn validate_ignored_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError> {
+    let ignored_paths = parse_ignored_status_paths(bytes)?;
+    if ignored_paths.iter().any(|path| is_protected_path(path)) {
+        return Err(validation(
+            "code_change.diff_paths",
+            "contains an ignored protected service path",
+        ));
+    }
+    Ok(ignored_paths)
+}
+
+fn parse_ignored_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError> {
     if bytes.len() > MAX_GIT_OUTPUT_BYTES {
         return Err(validation(
             "code_change.status",
@@ -5546,12 +9412,6 @@ fn validate_ignored_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError>
         }
         let mut record_paths = BTreeSet::new();
         insert_status_path(&mut record_paths, &record[3..])?;
-        if record_paths.iter().any(|path| is_protected_path(path)) {
-            return Err(validation(
-                "code_change.diff_paths",
-                "contains an ignored protected service path",
-            ));
-        }
         ignored_paths.extend(record_paths);
         if ignored_paths.len() > MAX_STATUS_PATHS {
             return Err(validation(
@@ -5561,6 +9421,16 @@ fn validate_ignored_status_paths(bytes: &[u8]) -> Result<Vec<PathBuf>, AppError>
         }
     }
     Ok(ignored_paths)
+}
+
+fn is_python_check_cache_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name)
+                if name == OsStr::new(".pytest_cache") || name == OsStr::new("__pycache__")
+        )
+    })
 }
 
 struct IgnoredScanBudget {
@@ -5643,6 +9513,483 @@ fn validate_ignored_tree(_root: &Path, paths: &[PathBuf]) -> Result<(), AppError
             .collect::<Vec<_>>(),
     )
     .map(|_| ())
+}
+
+#[cfg(unix)]
+fn bind_terminal_result_outputs(
+    root: &File,
+    experiment_id: &str,
+) -> Result<BoundTerminalResultOutputs, AppError> {
+    validate_internal_id("experiment_id", experiment_id)?;
+    let root_metadata = root.metadata().map_err(|_| recovery_required())?;
+    if !secure_owned_directory(&root_metadata) {
+        return Err(recovery_required());
+    }
+    let root_identity = executable_identity_from_metadata(&root_metadata);
+    let service = open_runtime_directory_at(root, OsStr::new(RUNTIME_SERVICE_DIRECTORY))
+        .map_err(|_| recovery_required())?;
+    let service_identity = verify_runtime_directory(&service)?;
+    let (results, artifacts, artifacts_identity, artifact_directory, artifact_identity) =
+        bind_terminal_result_service(&service, experiment_id)?;
+    Ok(BoundTerminalResultOutputs {
+        root_identity,
+        service,
+        service_identity,
+        results,
+        artifacts,
+        artifacts_identity,
+        artifact_directory,
+        artifact_identity,
+        experiment_id: experiment_id.to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn bind_terminal_result_service(
+    service: &File,
+    experiment_id: &str,
+) -> Result<
+    (
+        BoundTerminalResults,
+        File,
+        ExecutableIdentity,
+        File,
+        ExecutableIdentity,
+    ),
+    AppError,
+> {
+    let mut results = BoundTerminalResults::Missing;
+    let mut artifacts = None;
+    for entry in fs::read_dir(descriptor_path(service)).map_err(|_| recovery_required())? {
+        let entry = entry.map_err(|_| recovery_required())?;
+        let name = entry.file_name();
+        if name == OsStr::new(RUNTIME_RESULTS_DIRECTORY) {
+            results = bind_terminal_result_node(service, &name, experiment_id)?;
+        } else if name == OsStr::new(RUNTIME_ARTIFACTS_DIRECTORY) {
+            let directory = open_runtime_directory_at(service, &name)
+                .map_err(|_| recovery_required())?;
+            let identity = verify_runtime_directory(&directory)?;
+            artifacts = Some((directory, identity));
+        } else if name == OsStr::new(RUNTIME_OUTPUTS_DIRECTORY) {
+            let directory = open_runtime_directory_at(service, &name)
+                .map_err(|_| recovery_required())?;
+            let identity = verify_runtime_directory(&directory)?;
+            verify_runtime_output_scope(&directory, identity, experiment_id, None, false)?;
+        } else {
+            return Err(recovery_required());
+        }
+    }
+    let (artifacts, artifacts_identity) = artifacts.ok_or_else(recovery_required)?;
+    let (artifact_directory, artifact_identity) =
+        validate_terminal_result_artifact_directory(&artifacts, experiment_id)?;
+    Ok((
+        results,
+        artifacts,
+        artifacts_identity,
+        artifact_directory,
+        artifact_identity,
+    ))
+}
+
+#[cfg(unix)]
+fn bind_terminal_result_node(
+    service: &File,
+    name: &OsStr,
+    experiment_id: &str,
+) -> Result<BoundTerminalResults, AppError> {
+    match open_ignored_entry_at(service, name)? {
+        None => Ok(BoundTerminalResults::Missing),
+        Some(IgnoredEntry::Symlink) => Err(recovery_required()),
+        Some(IgnoredEntry::File(_)) => {
+            let (file, identity) = open_runtime_result_file_at(service, name)?;
+            Ok(BoundTerminalResults::InvalidFile { file, identity })
+        }
+        Some(IgnoredEntry::Directory(directory)) => {
+            let identity = verify_runtime_directory(&directory)?;
+            let manifest = bind_terminal_result_manifest(&directory, experiment_id)?;
+            Ok(BoundTerminalResults::Directory {
+                directory,
+                identity,
+                manifest,
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn bind_terminal_result_manifest(
+    directory: &File,
+    experiment_id: &str,
+) -> Result<BoundTerminalManifest, AppError> {
+    let expected_name = OsString::from(format!("{experiment_id}.json"));
+    let mut manifest = None;
+    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
+        let entry = entry.map_err(|_| recovery_required())?;
+        let name = entry.file_name();
+        if name != expected_name {
+            return Err(recovery_required());
+        }
+        let (file, identity) = open_runtime_manifest_at(directory, &name)?;
+        let length = file
+            .metadata()
+            .map_err(|_| recovery_required())?
+            .len();
+        if length > MAX_TERMINAL_RESULT_MANIFEST_BYTES {
+            if manifest
+                .replace(BoundTerminalManifest::Invalid {
+                    file,
+                    identity,
+                    length,
+                })
+                .is_some()
+            {
+                return Err(recovery_required());
+            }
+        } else {
+            let bytes = read_runtime_manifest_snapshot(&file)?;
+            if manifest
+                .replace(BoundTerminalManifest::Ready {
+                    file,
+                    identity,
+                    bytes,
+                })
+                .is_some()
+            {
+                return Err(recovery_required());
+            }
+        }
+    }
+    Ok(manifest.unwrap_or(BoundTerminalManifest::Missing))
+}
+
+#[cfg(unix)]
+fn open_runtime_result_file_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<(File, ExecutableIdentity), AppError> {
+    let file = open_runtime_manifest_fd(parent, name, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(|_| recovery_required())?;
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !secure_owned_result_file(&metadata) {
+        return Err(recovery_required());
+    }
+    Ok((file, executable_identity_from_metadata(&metadata)))
+}
+
+#[cfg(unix)]
+fn read_runtime_manifest_snapshot(file: &File) -> Result<Vec<u8>, AppError> {
+    let before = file.metadata().map_err(|_| recovery_required())?;
+    if before.len() > MAX_TERMINAL_RESULT_MANIFEST_BYTES {
+        return Err(recovery_required());
+    }
+    let length = usize::try_from(before.len()).map_err(|_| recovery_required())?;
+    let first = read_runtime_manifest_bytes(file, length)?;
+    let after = file.metadata().map_err(|_| recovery_required())?;
+    if after.len() != before.len() {
+        return Err(recovery_required());
+    }
+    let second = read_runtime_manifest_bytes(file, length)?;
+    if first != second {
+        return Err(recovery_required());
+    }
+    Ok(first)
+}
+
+#[cfg(unix)]
+fn read_runtime_manifest_bytes(file: &File, length: usize) -> Result<Vec<u8>, AppError> {
+    let mut bytes = vec![0; length];
+    let mut offset = 0;
+    while offset < length {
+        let read = file
+            .read_at(&mut bytes[offset..], offset as u64)
+            .map_err(|_| recovery_required())?;
+        if read == 0 {
+            return Err(recovery_required());
+        }
+        offset += read;
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+fn inspect_terminal_result_outputs(
+    root: &File,
+    experiment_id: &str,
+) -> Result<TerminalResultOutputStatus, AppError> {
+    Ok(bind_terminal_result_outputs(root, experiment_id)?.status())
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+fn validate_terminal_result_outputs(root: &File, experiment_id: &str) -> Result<(), AppError> {
+    match inspect_terminal_result_outputs(root, experiment_id)? {
+        TerminalResultOutputStatus::Ready => Ok(()),
+        TerminalResultOutputStatus::Missing | TerminalResultOutputStatus::Invalid => {
+            Err(recovery_required())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_runtime_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL runtime path"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn verify_runtime_directory(directory: &File) -> Result<ExecutableIdentity, AppError> {
+    let metadata = directory.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() as u32 }
+        || metadata.mode() & 0o7777 != RUNTIME_DIRECTORY_MODE
+    {
+        return Err(recovery_required());
+    }
+    Ok(executable_identity_from_metadata(&metadata))
+}
+
+#[cfg(unix)]
+fn mkdirat(parent: &File, name: &OsStr, mode: u32) -> io::Result<()> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL runtime path"))?;
+    let result = unsafe {
+        libc::mkdirat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_or_create_runtime_directory_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<(File, ExecutableIdentity), AppError> {
+    for _ in 0..2 {
+        match open_runtime_directory_at(parent, name) {
+            Ok(directory) => {
+                let identity = verify_runtime_directory(&directory)?;
+                return Ok((directory, identity));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                match mkdirat(parent, name, RUNTIME_DIRECTORY_MODE) {
+                    Ok(()) => continue,
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => continue,
+                    Err(_) => return Err(recovery_required()),
+                }
+            }
+            Err(_) => return Err(recovery_required()),
+        }
+    }
+    Err(recovery_required())
+}
+
+#[cfg(unix)]
+fn open_runtime_manifest_fd(parent: &File, name: &OsStr, flags: i32) -> io::Result<File> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL runtime path"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn verify_runtime_manifest(file: &File) -> Result<ExecutableIdentity, AppError> {
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() as u32 }
+        || metadata.mode() & 0o7777 != RUNTIME_MANIFEST_MODE
+    {
+        return Err(recovery_required());
+    }
+    Ok(executable_identity_from_metadata(&metadata))
+}
+
+#[cfg(unix)]
+fn verify_runtime_result_file(file: &File) -> Result<ExecutableIdentity, AppError> {
+    let metadata = file.metadata().map_err(|_| recovery_required())?;
+    if !secure_owned_result_file(&metadata) {
+        return Err(recovery_required());
+    }
+    Ok(executable_identity_from_metadata(&metadata))
+}
+
+#[cfg(unix)]
+fn open_runtime_manifest_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<(File, ExecutableIdentity), AppError> {
+    let c_name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| recovery_required())?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(recovery_required());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+        return Err(recovery_required());
+    }
+    let file = open_runtime_manifest_fd(parent, name, libc::O_RDONLY | libc::O_NONBLOCK)
+        .map_err(|_| recovery_required())?;
+    let identity = verify_runtime_manifest(&file)?;
+    Ok((file, identity))
+}
+
+#[cfg(unix)]
+fn open_or_create_runtime_manifest_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<(File, ExecutableIdentity), AppError> {
+    for _ in 0..2 {
+        match open_runtime_manifest_at(parent, name) {
+            Ok(file) => return Ok(file),
+            Err(_) => {
+                let result = std::ffi::CString::new(name.as_bytes())
+                    .map_err(|_| validation("code_change.path", "runtime path contains NUL"))?;
+                let fd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        result.as_ptr(),
+                        libc::O_RDWR
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_CLOEXEC
+                            | libc::O_NOFOLLOW,
+                        RUNTIME_MANIFEST_MODE,
+                    )
+                };
+                if fd >= 0 {
+                    let file = unsafe { File::from_raw_fd(fd) };
+                    let identity = verify_runtime_manifest(&file)?;
+                    return Ok((file, identity));
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(recovery_required());
+            }
+        }
+    }
+    Err(recovery_required())
+}
+
+#[cfg(unix)]
+fn validate_terminal_result_artifact_directory(
+    directory: &File,
+    experiment_id: &str,
+) -> Result<(File, ExecutableIdentity), AppError> {
+    let expected_name = OsStr::new(experiment_id);
+    let mut artifact = None;
+    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
+        let entry = entry.map_err(|_| recovery_required())?;
+        let name = entry.file_name();
+        if name != expected_name {
+            return Err(recovery_required());
+        }
+        let current = match open_ignored_entry_at(directory, &name)? {
+            Some(IgnoredEntry::Directory(directory)) => {
+                let identity = verify_runtime_directory(&directory)?;
+                (directory, identity)
+            }
+            Some(IgnoredEntry::Symlink | IgnoredEntry::File(_)) | None => {
+                return Err(recovery_required())
+            }
+        };
+        let mut budget = IgnoredScanBudget { entries: 0, bytes: 0 };
+        scan_terminal_result_artifacts(&current.0, 0, &mut budget)?;
+        artifact = Some(current);
+    }
+    artifact.ok_or_else(recovery_required)
+}
+
+#[cfg(unix)]
+fn scan_terminal_result_artifacts(
+    directory: &File,
+    depth: usize,
+    budget: &mut IgnoredScanBudget,
+) -> Result<(), AppError> {
+    if depth > MAX_IGNORED_SCAN_DEPTH {
+        return Err(validation(
+            "code_change.artifacts",
+            "exceeds the bounded artifact directory depth",
+        ));
+    }
+    let metadata = directory.metadata().map_err(|_| recovery_required())?;
+    if !secure_owned_directory(&metadata) {
+        return Err(recovery_required());
+    }
+    account_ignored_entry(&metadata, budget)?;
+    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
+        let entry = entry.map_err(|_| recovery_required())?;
+        let name = entry.file_name();
+        if is_protected_path(Path::new(&name)) {
+            return Err(recovery_required());
+        }
+        let child = match open_ignored_entry_at(directory, &name)? {
+            Some(child) => child,
+            None => return Err(recovery_required()),
+        };
+        match child {
+            IgnoredEntry::Symlink => return Err(recovery_required()),
+            IgnoredEntry::File(metadata) => {
+                if !secure_owned_result_file(&metadata) {
+                    return Err(recovery_required());
+                }
+                account_ignored_entry(&metadata, budget)?;
+            }
+            IgnoredEntry::Directory(child) => {
+                scan_terminal_result_artifacts(&child, depth + 1, budget)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_owned_result_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && metadata.uid() == unsafe { libc::geteuid() as u32 }
+        && metadata.mode() & 0o022 == 0
 }
 
 fn account_ignored_entry(
@@ -5743,7 +10090,7 @@ fn open_ignored_entry_at(
         libc::openat(
             parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0,
         )
     };
@@ -5976,6 +10323,25 @@ fn open_or_create_directory_at(parent: &File, name: &OsStr) -> Result<File, AppE
         }
     }
     Err(recovery_required())
+}
+
+#[cfg(unix)]
+fn create_new_directory_at(parent: &File, name: &OsStr) -> Result<File, AppError> {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        validation("code_change.path", "directory component contains NUL")
+    })?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if result < 0 {
+        return if io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+            Err(recovery_required())
+        } else {
+            Err(AppError::Runtime {
+                operation: "create code-change output directory",
+            })
+        };
+    }
+    open_existing_directory_at(parent, OsStr::from_bytes(name.as_bytes()))
+        .map_err(|_| recovery_required())
 }
 
 #[cfg(unix)]
@@ -6703,20 +11069,86 @@ fn tool_for_program(program: &str) -> Option<CodeChangeTool> {
     }
 }
 
-fn pyproject_has_pytest(root: &Path) -> bool {
-    let path = root.join("pyproject.toml");
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
+fn read_bounded_pyproject(path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+    #[cfg(unix)]
+    let file = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        );
+        match options.open(path) {
+            Ok(file) => file,
+            Err(source)
+                if source.kind() == io::ErrorKind::NotFound
+                    || source.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(None)
+            }
+            Err(source) => {
+                return Err(AppError::Io {
+                    operation: "read pyproject.toml",
+                    source,
+                })
+            }
+        }
     };
-    toml::from_str::<toml::Value>(&contents)
-        .ok()
-        .is_some_and(|value| {
-            value
-                .get("tool")
-                .and_then(|tool| tool.get("pytest"))
-                .and_then(|pytest| pytest.get("ini_options"))
-                .is_some()
-        })
+    #[cfg(not(unix))]
+    let mut file = {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AppError::Io {
+                    operation: "read pyproject.toml",
+                    source,
+                })
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(None);
+        }
+        fs::File::open(path).map_err(|source| AppError::Io {
+            operation: "read pyproject.toml",
+            source,
+        })?
+    };
+
+    let metadata = file.metadata().map_err(|source| AppError::Io {
+        operation: "read pyproject.toml",
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let mut contents = Vec::with_capacity(MAX_PYPROJECT_BYTES.min(16 * 1024));
+    file.take((MAX_PYPROJECT_BYTES + 1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(|source| AppError::Io {
+            operation: "read pyproject.toml",
+            source,
+        })?;
+    if contents.len() > MAX_PYPROJECT_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(contents))
+}
+
+fn pyproject_has_pytest(root: &Path) -> Result<bool, AppError> {
+    let path = root.join("pyproject.toml");
+    let Some(contents) = read_bounded_pyproject(&path)? else {
+        return Ok(false);
+    };
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return Ok(false);
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(contents) else {
+        return Ok(false);
+    };
+    Ok(value
+        .get("tool")
+        .and_then(|tool| tool.get("pytest"))
+        .and_then(|pytest| pytest.get("ini_options"))
+        .is_some_and(|ini_options| matches!(ini_options, toml::Value::Table(_))))
 }
 
 fn validation(field: &'static str, message: &'static str) -> AppError {
@@ -6864,6 +11296,13 @@ mod tests {
         assert!(
             parse_editor_output(absolute.as_bytes(), root.path(), &limits, &available).is_err()
         );
+        let traversal = valid.replace(
+            "\"working_directory\":\".\"",
+            "\"working_directory\":\"../src\"",
+        );
+        assert!(
+            parse_editor_output(traversal.as_bytes(), root.path(), &limits, &available).is_err()
+        );
         let unknown = valid.replace("\"summary\":\"ok\"", "\"summary\":\"ok\",\"extra\":true");
         assert!(parse_editor_output(unknown.as_bytes(), root.path(), &limits, &available).is_err());
         assert!(
@@ -6890,6 +11329,328 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(validate_proposed_checks(&checks, root.path(), &limits, &available).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_check_environment_relocates_profile_outputs() {
+        let root = Path::new("/private/service state/check");
+        let mut cargo = SanitizedEnvironment::default();
+        apply_check_output_environment(&mut cargo, CodeChangeTool::Cargo, root).unwrap();
+        assert_eq!(cargo.get("CARGO_TARGET_DIR"), Some(root.join("cargo-target").as_os_str()));
+        assert_eq!(cargo.get("TMPDIR"), Some(root.join("tmp").as_os_str()));
+
+        let mut uv = SanitizedEnvironment::default();
+        apply_check_output_environment(&mut uv, CodeChangeTool::Uv, root).unwrap();
+        assert_eq!(uv.get("UV_PROJECT_ENVIRONMENT"), Some(root.join("uv-venv").as_os_str()));
+        assert_eq!(uv.get("UV_CACHE_DIR"), Some(root.join("uv-cache").as_os_str()));
+        assert_eq!(uv.get("PYTHONDONTWRITEBYTECODE"), Some(OsStr::new("1")));
+        assert_eq!(
+            uv.get("PYTEST_ADDOPTS"),
+            Some(OsStr::new("-o \"cache_dir=/private/service state/check/pytest-cache\""))
+        );
+
+        let mut python = SanitizedEnvironment::default();
+        apply_check_output_environment(&mut python, CodeChangeTool::Python, root).unwrap();
+        assert_eq!(python.get("PYTHONDONTWRITEBYTECODE"), Some(OsStr::new("1")));
+        assert_eq!(
+            python.get("PYTEST_ADDOPTS"),
+            Some(OsStr::new("-o \"cache_dir=/private/service state/check/pytest-cache\""))
+        );
+        assert!(python.get("CARGO_TARGET_DIR").is_none());
+        assert!(python.get("UV_PROJECT_ENVIRONMENT").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires real Cargo, uv, and Python installations"]
+    fn real_tool_fixture_writes_only_owned_check_outputs() {
+        use std::process::Command;
+
+        let temp = tempdir().unwrap();
+        secure_test_directory(temp.path());
+        let state_path = temp.path().join("state");
+        let checks_path = state_path.join("code-change-checks");
+        let run_path = checks_path.join("run-1");
+        let attempt_path = run_path.join("attempt-1");
+        let root_path = attempt_path.join("check-1");
+        for path in [&state_path, &checks_path, &run_path, &attempt_path, &root_path] {
+            fs::create_dir(path).unwrap();
+            secure_test_directory(path);
+        }
+        let state_root = Arc::new(File::open(&state_path).unwrap());
+        let checks = Arc::new(File::open(&checks_path).unwrap());
+        let run = Arc::new(File::open(&run_path).unwrap());
+        let attempt = Arc::new(File::open(&attempt_path).unwrap());
+        let root = Arc::new(File::open(&root_path).unwrap());
+        let outputs = OwnedCheckOutputs {
+            state_root_identity: directory_identity(&state_root).unwrap(),
+            checks_identity: directory_identity(&checks).unwrap(),
+            run_identity: directory_identity(&run).unwrap(),
+            attempt_identity: directory_identity(&attempt).unwrap(),
+            root_identity: directory_identity(&root).unwrap(),
+            state_root,
+            checks,
+            checks_name: OsString::from("code-change-checks"),
+            run,
+            run_name: OsString::from("run-1"),
+            attempt,
+            attempt_name: OsString::from("attempt-1"),
+            root,
+            root_name: OsString::from("check-1"),
+            path: root_path.clone(),
+            unproven: AtomicBool::new(false),
+        };
+
+        let cargo_project = temp.path().join("cargo-project");
+        fs::create_dir(&cargo_project).unwrap();
+        secure_test_directory(&cargo_project);
+        fs::create_dir(cargo_project.join("src")).unwrap();
+        secure_test_directory(&cargo_project.join("src"));
+        fs::write(
+            cargo_project.join("Cargo.toml"),
+            "[package]\nname = \"owned-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        secure_test_file(&cargo_project.join("Cargo.toml"));
+        fs::write(cargo_project.join("src/lib.rs"), "pub fn check() {}\n").unwrap();
+        secure_test_file(&cargo_project.join("src/lib.rs"));
+        let cargo_home = temp.path().join("cargo-home");
+        fs::create_dir(&cargo_home).unwrap();
+        secure_test_directory(&cargo_home);
+        let cargo_status = Command::new("cargo")
+            .args(["check", "--offline", "--quiet"])
+            .current_dir(&cargo_project)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_TARGET_DIR", root_path.join("cargo-target"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .status()
+            .unwrap();
+        assert!(cargo_status.success());
+        assert!(root_path.join("cargo-target").is_dir());
+
+        let uv_status = Command::new("uv")
+            .args(["venv"])
+            .arg(root_path.join("uv-venv"))
+            .env("UV_CACHE_DIR", root_path.join("uv-cache"))
+            .env("UV_PYTHON_INSTALL_DIR", root_path.join("uv-python"))
+            .status()
+            .unwrap();
+        assert!(uv_status.success());
+        assert!(root_path.join("uv-venv").is_dir());
+        for path in [root_path.join("uv-cache"), root_path.join("uv-python")] {
+            fs::create_dir_all(&path).unwrap();
+            secure_test_directory(&path);
+        }
+
+        let python_project = temp.path().join("python-project");
+        fs::create_dir(&python_project).unwrap();
+        secure_test_directory(&python_project);
+        fs::write(python_project.join("sample.py"), "value = 1\n").unwrap();
+        secure_test_file(&python_project.join("sample.py"));
+        let python_status = Command::new("python3")
+            .args(["-c", "import sample; assert sample.value == 1"])
+            .current_dir(&python_project)
+            .env("PYTHONPATH", &python_project)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .status()
+            .unwrap();
+        assert!(python_status.success());
+        assert!(!python_project.join("__pycache__").exists());
+
+        fs::create_dir(root_path.join("pytest-cache")).unwrap();
+        secure_test_directory(&root_path.join("pytest-cache"));
+        fs::write(root_path.join("pytest-cache/CACHEDIR.TAG"), b"cache").unwrap();
+        secure_test_file(&root_path.join("pytest-cache/CACHEDIR.TAG"));
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"retained").unwrap();
+        std::os::unix::fs::symlink(&outside, root_path.join("uv-venv/outside-link")).unwrap();
+        fs::hard_link(&outside, root_path.join("uv-cache/shared-entry")).unwrap();
+
+        assert!(outputs.cleanup().is_ok());
+        assert!(!root_path.exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_check_outputs_cleanup_is_descriptor_bound_and_bounded() {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("state");
+        let checks_path = state_path.join("code-change-checks");
+        let run_path = checks_path.join("run-1");
+        let attempt_path = run_path.join("attempt-1");
+        let root_path = attempt_path.join("check-1");
+        for path in [&state_path, &checks_path, &run_path, &attempt_path, &root_path] {
+            fs::create_dir(path).unwrap();
+            secure_test_directory(path);
+        }
+        let state_root = Arc::new(File::open(&state_path).unwrap());
+        let checks = Arc::new(File::open(&checks_path).unwrap());
+        let run = Arc::new(File::open(&run_path).unwrap());
+        let attempt = Arc::new(File::open(&attempt_path).unwrap());
+        let root = Arc::new(File::open(&root_path).unwrap());
+        let outputs = OwnedCheckOutputs {
+            state_root_identity: directory_identity(&state_root).unwrap(),
+            checks_identity: directory_identity(&checks).unwrap(),
+            run_identity: directory_identity(&run).unwrap(),
+            attempt_identity: directory_identity(&attempt).unwrap(),
+            root_identity: directory_identity(&root).unwrap(),
+            state_root,
+            checks,
+            checks_name: OsString::from("code-change-checks"),
+            run,
+            run_name: OsString::from("run-1"),
+            attempt,
+            attempt_name: OsString::from("attempt-1"),
+            root,
+            root_name: OsString::from("check-1"),
+            path: root_path.clone(),
+            unproven: AtomicBool::new(false),
+        };
+        fs::create_dir(root_path.join("nested")).unwrap();
+        secure_test_directory(&root_path.join("nested"));
+        fs::write(root_path.join("nested/output"), b"owned output").unwrap();
+        secure_test_file(&root_path.join("nested/output"));
+        assert!(outputs.cleanup().is_ok());
+        assert!(!root_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_check_outputs_cleanup_unlinks_links_without_following_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("state");
+        let checks_path = state_path.join("code-change-checks");
+        let run_path = checks_path.join("run-1");
+        let attempt_path = run_path.join("attempt-1");
+        let root_path = attempt_path.join("check-1");
+        for path in [&state_path, &checks_path, &run_path, &attempt_path, &root_path] {
+            fs::create_dir(path).unwrap();
+            secure_test_directory(path);
+        }
+        let state_root = Arc::new(File::open(&state_path).unwrap());
+        let checks = Arc::new(File::open(&checks_path).unwrap());
+        let run = Arc::new(File::open(&run_path).unwrap());
+        let attempt = Arc::new(File::open(&attempt_path).unwrap());
+        let root = Arc::new(File::open(&root_path).unwrap());
+        let outputs = OwnedCheckOutputs {
+            state_root_identity: directory_identity(&state_root).unwrap(),
+            checks_identity: directory_identity(&checks).unwrap(),
+            run_identity: directory_identity(&run).unwrap(),
+            attempt_identity: directory_identity(&attempt).unwrap(),
+            root_identity: directory_identity(&root).unwrap(),
+            state_root,
+            checks,
+            checks_name: OsString::from("code-change-checks"),
+            run,
+            run_name: OsString::from("run-1"),
+            attempt,
+            attempt_name: OsString::from("attempt-1"),
+            root,
+            root_name: OsString::from("check-1"),
+            path: root_path.clone(),
+            unproven: AtomicBool::new(false),
+        };
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"must remain").unwrap();
+        symlink(&outside, root_path.join("escape")).unwrap();
+        let hardlink_source = temp.path().join("hardlink-source");
+        fs::write(&hardlink_source, b"must remain too").unwrap();
+        fs::hard_link(&hardlink_source, root_path.join("cache-entry")).unwrap();
+        assert!(outputs.cleanup().is_ok());
+        assert!(!root_path.exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"must remain");
+        assert_eq!(fs::read(&hardlink_source).unwrap(), b"must remain too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_output_scope_creation_rejects_existing_root() {
+        let temp = tempdir().unwrap();
+        let parent_path = temp.path().join("attempt");
+        fs::create_dir(&parent_path).unwrap();
+        secure_test_directory(&parent_path);
+        let root_path = parent_path.join("check-1");
+        fs::create_dir(&root_path).unwrap();
+        secure_test_directory(&root_path);
+        let parent = File::open(&parent_path).unwrap();
+        assert!(create_new_directory_at(&parent, OsStr::new("check-1")).is_err());
+        assert!(root_path.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_output_scope_allows_profile_sized_output_with_explicit_cap() {
+        let temp = tempdir().unwrap();
+        let runtime_path = temp.path().join("runtime");
+        let experiment_path = runtime_path.join("experiment-1");
+        fs::create_dir(&runtime_path).unwrap();
+        fs::create_dir(&experiment_path).unwrap();
+        secure_test_directory(&runtime_path);
+        secure_test_directory(&experiment_path);
+        for name in RUNTIME_OUTPUT_DIRECTORY_NAMES {
+            let output = experiment_path.join(name);
+            fs::create_dir(&output).unwrap();
+            secure_test_directory(&output);
+        }
+        let cargo_target = experiment_path.join("cargo-target").join("profile-marker");
+        let file = fs::File::create(cargo_target).unwrap();
+        file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        let runtime = File::open(&runtime_path).unwrap();
+        let experiment = File::open(&experiment_path).unwrap();
+        let runtime_identity = directory_identity(&runtime).unwrap();
+        let experiment_identity = directory_identity(&experiment).unwrap();
+
+        assert!(verify_runtime_output_scope(
+            &runtime,
+            runtime_identity,
+            "experiment-1",
+            Some(experiment_identity),
+            false,
+        )
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_runtime_boundary_allows_transient_leaf_recreation_but_terminal_audit_does_not() {
+        let temp = tempdir().unwrap();
+        let runtime_path = temp.path().join("runtime");
+        let experiment_path = runtime_path.join("experiment-1");
+        fs::create_dir(&runtime_path).unwrap();
+        fs::create_dir(&experiment_path).unwrap();
+        secure_test_directory(&runtime_path);
+        secure_test_directory(&experiment_path);
+        for name in RUNTIME_OUTPUT_DIRECTORY_NAMES {
+            let output = experiment_path.join(name);
+            fs::create_dir(&output).unwrap();
+            secure_test_directory(&output);
+        }
+        let runtime = File::open(&runtime_path).unwrap();
+        let experiment = File::open(&experiment_path).unwrap();
+        let runtime_identity = directory_identity(&runtime).unwrap();
+        let experiment_identity = directory_identity(&experiment).unwrap();
+        fs::remove_dir(experiment_path.join("uv-venv")).unwrap();
+
+        assert!(verify_runtime_output_boundary(
+            &runtime,
+            runtime_identity,
+            &experiment,
+            experiment_identity,
+            "experiment-1",
+        )
+        .is_ok());
+        assert!(verify_runtime_output_scope(
+            &runtime,
+            runtime_identity,
+            "experiment-1",
+            Some(experiment_identity),
+            false,
+        )
+        .is_err());
     }
 
     #[test]
@@ -6929,6 +11690,331 @@ mod tests {
     }
 
     #[test]
+    fn discovery_with_uv_lock_does_not_fallback_to_python() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts='-q'\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("uv.lock"), "version = 1\n").unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn discovery_python_profile_requires_pytest_configuration() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts='-q'\n",
+        )
+        .unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].argv,
+            PYTHON_PYTEST_CHECK
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discovery_ignores_pyproject_without_pytest_configuration() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("pyproject.toml"), "[tool.black]\nline-length=88\n").unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn discovery_ignores_nonregular_pyproject() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("pyproject.toml")).unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn discovery_ignores_malformed_and_oversized_pyproject() {
+        let cases = [
+            "[tool.pytest.ini_options\naddopts='-q'\n".as_bytes().to_vec(),
+            vec![b'x'; MAX_PYPROJECT_BYTES + 1],
+        ];
+        for contents in cases {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join("pyproject.toml"), contents).unwrap();
+
+            let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+                .unwrap();
+            assert!(checks.is_empty());
+        }
+    }
+
+    #[test]
+    fn discovery_uses_fixed_pytest_argv_without_executing_pyproject_values() {
+        let root = tempdir().unwrap();
+        let marker = root.path().join("not-created");
+        fs::write(
+            root.path().join("pyproject.toml"),
+            format!(
+                "[tool.pytest.ini_options]\naddopts='$(touch {})'\nmarkers=['gpu: use & accelerator; safe']\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].argv,
+            PYTHON_PYTEST_CHECK
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn discovery_accepts_dependency_comparators_and_pytest_markers() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"torch>=2.0; python_version >= '3.10'\"]\n\n[tool.pytest.ini_options]\nmarkers = [\"gpu: accelerator > cpu; requires CUDA\"]\n",
+        )
+        .unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(
+            checks[0].argv,
+            PYTHON_PYTEST_CHECK
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_follow_pyproject_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let target = root.path().join("pytest.toml");
+        fs::write(&target, "[tool.pytest.ini_options]\naddopts='-q'\n").unwrap();
+        symlink(&target, root.path().join("pyproject.toml")).unwrap();
+
+        let checks = discover_project_checks(root.path(), &tools(&[CodeChangeTool::Python]))
+            .unwrap();
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn code_change_project_checks_deduplicate_in_stable_order() {
+        let cargo = ProposedCheck {
+            source: "cargo".to_owned(),
+            argv: RUST_CHECK.iter().map(|arg| (*arg).to_owned()).collect(),
+            working_directory: ".".to_owned(),
+        };
+        let python = ProposedCheck {
+            source: "python".to_owned(),
+            argv: PYTHON_PYTEST_CHECK
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            working_directory: ".".to_owned(),
+        };
+        let discovered = vec![cargo.clone()];
+        let editor = vec![cargo.clone(), python.clone()];
+        let limits = CampaignLimits::default();
+
+        assert_eq!(
+            merge_project_checks(
+                &discovered,
+                &editor,
+                limits.max_code_change_checks as usize,
+            )
+            .unwrap(),
+            vec![cargo.clone(), python.clone()]
+        );
+
+        let limited = CampaignLimits {
+            max_code_change_checks: 1,
+            ..limits
+        };
+        assert!(
+            merge_project_checks(
+                &discovered,
+                &editor,
+                limited.max_code_change_checks as usize,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn code_change_planned_checks_are_durable_and_source_ordered() {
+        let base_sha = "a".repeat(40);
+        let cargo = ProposedCheck {
+            source: "cargo".to_owned(),
+            argv: RUST_CHECK.iter().map(|arg| (*arg).to_owned()).collect(),
+            working_directory: ".".to_owned(),
+        };
+        let python = ProposedCheck {
+            source: "python".to_owned(),
+            argv: PYTHON_PYTEST_CHECK
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            working_directory: "tests".to_owned(),
+        };
+        let uv = ProposedCheck {
+            source: "uv".to_owned(),
+            argv: UV_PYTEST_CHECK.iter().map(|arg| (*arg).to_owned()).collect(),
+            working_directory: ".".to_owned(),
+        };
+        let discovered = vec![cargo.clone()];
+        let editor = vec![cargo.clone(), python.clone()];
+
+        let rows = planned_check_rows(2, &base_sha, &discovered, &editor, 2).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].source, "supervisor");
+        assert_eq!(rows[0].working_directory, ".");
+        assert_eq!(
+            rows[0].argv,
+            pinned_git_argv(&supervisor_diff_check_args(&base_sha))
+                .into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rows[1].source, "discovered");
+        assert_eq!(rows[1].argv, cargo.argv);
+        assert_eq!(rows[1].working_directory, cargo.working_directory);
+        assert_eq!(rows[2].source, "editor");
+        assert_eq!(rows[2].argv, python.argv);
+        assert_eq!(rows[2].working_directory, python.working_directory);
+        assert!(rows.iter().all(|row| {
+            row.status == crate::models::CodeChangeCheckStatus::Reserved
+        }));
+
+        let editor_with_three_projects = vec![cargo, python, uv];
+        assert!(
+            planned_check_rows(2, &base_sha, &discovered, &editor_with_three_projects, 2).is_err()
+        );
+    }
+
+    #[test]
+    fn code_change_persisted_check_plan_requires_exact_ordered_prefix() {
+        let planned = vec![
+            NewCodeChangeCheck::new(
+                1,
+                0,
+                "supervisor",
+                vec!["git".to_owned(), "diff".to_owned()],
+                ".",
+            ),
+            NewCodeChangeCheck::new(
+                1,
+                1,
+                "discovered",
+                vec!["cargo".to_owned(), "test".to_owned()],
+                ".",
+            ),
+            NewCodeChangeCheck::new(
+                1,
+                2,
+                "editor",
+                vec!["cargo".to_owned(), "check".to_owned()],
+                "src",
+            ),
+        ];
+        let row = |planned: &NewCodeChangeCheck, status: CodeChangeCheckStatus| {
+            let finished = !matches!(status, CodeChangeCheckStatus::Reserved);
+            CodeChangeCheck {
+                code_change_run_id: "run-1".to_owned(),
+                attempt: planned.attempt,
+                ordinal: planned.ordinal,
+                source: planned.source.clone(),
+                argv: planned.argv.clone(),
+                working_directory: planned.working_directory.clone(),
+                status,
+                output_digest: finished.then(|| format!("digest-{}", planned.ordinal)),
+                summary: None,
+                started_at: finished.then_some(10),
+                finished_at: finished.then_some(11),
+            }
+        };
+
+        let exact_reserved = vec![
+            row(&planned[0], CodeChangeCheckStatus::Reserved),
+            row(&planned[1], CodeChangeCheckStatus::Reserved),
+        ];
+        assert!(validate_persisted_check_plan(&exact_reserved, &planned[..2]).is_ok());
+
+        let passed = row(&planned[0], CodeChangeCheckStatus::Passed);
+        assert!(validate_persisted_check_plan(
+            &[passed.clone(), row(&planned[1], CodeChangeCheckStatus::Reserved)],
+            &planned[..2],
+        )
+        .is_ok());
+        assert!(validate_persisted_check_plan(
+            &[
+                passed.clone(),
+                row(&planned[1], CodeChangeCheckStatus::Failed),
+                row(&planned[2], CodeChangeCheckStatus::Reserved),
+            ],
+            &planned,
+        )
+        .is_ok());
+
+        let mut wrong_source = exact_reserved.clone();
+        wrong_source[1].source = "editor".to_owned();
+        assert!(validate_persisted_check_plan(&wrong_source, &planned[..2]).is_err());
+        assert!(validate_persisted_check_plan(&exact_reserved, &planned).is_err());
+
+        assert!(validate_persisted_check_plan(
+            &[
+                row(&planned[0], CodeChangeCheckStatus::Reserved),
+                row(&planned[1], CodeChangeCheckStatus::Passed),
+            ],
+            &planned[..2],
+        )
+        .is_err());
+        assert!(validate_persisted_check_plan(
+            &[
+                row(&planned[0], CodeChangeCheckStatus::Failed),
+                row(&planned[1], CodeChangeCheckStatus::Passed),
+            ],
+            &planned[..2],
+        )
+        .is_err());
+        let mut passed_without_digest = passed;
+        passed_without_digest.output_digest = None;
+        assert!(validate_persisted_check_plan(
+            &[
+                passed_without_digest,
+                row(&planned[1], CodeChangeCheckStatus::Reserved),
+            ],
+            &planned[..2],
+        )
+        .is_err());
+    }
+
+    #[test]
     fn protected_paths_and_diff_caps_are_rejected() {
         assert!(is_protected_path(Path::new(".git/index")));
         assert!(is_protected_path(Path::new(".pueue-agent/state")));
@@ -6947,6 +12033,35 @@ mod tests {
             validate_ignored_status_paths(b"!! build/\0M  src/lib.rs\0").unwrap(),
             vec![PathBuf::from("build/")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_result_cache_allowlist_rejects_lookalikes_and_protected_contents() {
+        for path in [
+            ".pytest_cache.bak/results",
+            "nested/__pycache__x/module.pyc",
+            ".mypy_cache/results",
+            "build/test-output",
+        ] {
+            assert!(
+                !is_python_check_cache_path(Path::new(path)),
+                "accepted cache lookalike {path}"
+            );
+        }
+        for path in [".pytest_cache/results", "nested/__pycache__/module.pyc"] {
+            assert!(is_python_check_cache_path(Path::new(path)));
+        }
+
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let cache = root.path().join(".pytest_cache");
+        fs::create_dir(&cache).unwrap();
+        secure_test_directory(&cache);
+        let secret = cache.join(".env");
+        fs::write(&secret, b"secret").unwrap();
+        secure_test_file(&secret);
+        assert!(validate_ignored_tree(root.path(), &[PathBuf::from(".pytest_cache/")]).is_err());
     }
 
     #[cfg(unix)]
@@ -7125,6 +12240,250 @@ mod tests {
         )
         .unwrap();
         assert!(validate_ignored_tree(root.path(), &[PathBuf::from("bytes/")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_result_outputs_allow_only_bound_manifest_and_artifacts() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let service = root.path().join(".pueue-agent");
+        let results = service.join("results");
+        let artifacts = service.join("artifacts");
+        let artifact_run = artifacts.join("experiment:run-1");
+        fs::create_dir_all(&artifact_run).unwrap();
+        fs::create_dir_all(&results).unwrap();
+        secure_test_directory(&service);
+        secure_test_directory(&results);
+        secure_test_directory(&artifacts);
+        secure_test_directory(&artifact_run);
+        fs::write(results.join("experiment:run-1.json"), b"{}\n").unwrap();
+        secure_test_file(&results.join("experiment:run-1.json"));
+        fs::write(artifact_run.join("metrics.txt"), b"ok\n").unwrap();
+        secure_test_file(&artifact_run.join("metrics.txt"));
+        let root_directory = File::open(root.path()).unwrap();
+
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_ok());
+
+        let pytest_cache = root.path().join(".pytest_cache");
+        let pycache = root.path().join("nested/__pycache__");
+        fs::create_dir_all(&pytest_cache).unwrap();
+        fs::create_dir_all(&pycache).unwrap();
+        secure_test_directory(&pytest_cache);
+        secure_test_directory(&pycache);
+        fs::write(pytest_cache.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172\n").unwrap();
+        fs::write(pycache.join("module.cpython-311.pyc"), b"cache\n").unwrap();
+        secure_test_file(&pytest_cache.join("CACHEDIR.TAG"));
+        secure_test_file(&pycache.join("module.cpython-311.pyc"));
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_ok());
+
+        fs::write(results.join("other-experiment.json"), b"{}\n").unwrap();
+        secure_test_file(&results.join("other-experiment.json"));
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+        fs::remove_file(results.join("other-experiment.json")).unwrap();
+
+        std::os::unix::fs::symlink(artifact_run.join("metrics.txt"), artifact_run.join("link"))
+            .unwrap();
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+        fs::remove_file(artifact_run.join("link")).unwrap();
+
+        fs::write(service.join("STATE.md"), b"must be rejected\n").unwrap();
+        secure_test_file(&service.join("STATE.md"));
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_result_outputs_require_bound_nodes_and_exact_modes() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let service = root.path().join(".pueue-agent");
+        let results = service.join("results");
+        let artifacts = service.join("artifacts");
+        let artifact_run = artifacts.join("experiment:run-1");
+        let manifest = results.join("experiment:run-1.json");
+        fs::create_dir_all(&artifact_run).unwrap();
+        fs::create_dir_all(&results).unwrap();
+        secure_test_directory(&service);
+        secure_test_directory(&results);
+        secure_test_directory(&artifacts);
+        secure_test_directory(&artifact_run);
+        fs::write(&manifest, b"{}\n").unwrap();
+        secure_test_file(&manifest);
+        let root_directory = File::open(root.path()).unwrap();
+
+        for directory in [&service, &results, &artifacts, &artifact_run] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o750)).unwrap();
+            assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+            secure_test_directory(directory);
+        }
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+        secure_test_file(&manifest);
+
+        fs::remove_file(&manifest).unwrap();
+        assert!(validate_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+
+        let missing_root = root.path().join("missing-service");
+        fs::create_dir(&missing_root).unwrap();
+        secure_test_directory(&missing_root);
+        let missing_root_directory = File::open(&missing_root).unwrap();
+        assert!(
+            validate_terminal_result_outputs(&missing_root_directory, "experiment:run-1").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_result_output_ingestion_classifies_missing_and_invalid_results() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let service = root.path().join(".pueue-agent");
+        let results = service.join("results");
+        let artifacts = service.join("artifacts");
+        let artifact_run = artifacts.join("experiment:run-1");
+        fs::create_dir_all(&artifact_run).unwrap();
+        fs::create_dir_all(&results).unwrap();
+        secure_test_directory(&service);
+        secure_test_directory(&results);
+        secure_test_directory(&artifacts);
+        secure_test_directory(&artifact_run);
+        let root_directory = File::open(root.path()).unwrap();
+
+        assert_eq!(
+            inspect_terminal_result_outputs(&root_directory, "experiment:run-1").unwrap(),
+            TerminalResultOutputStatus::Missing
+        );
+
+        fs::remove_dir(&results).unwrap();
+        fs::write(&results, b"not-a-directory").unwrap();
+        secure_test_file(&results);
+        assert_eq!(
+            inspect_terminal_result_outputs(&root_directory, "experiment:run-1").unwrap(),
+            TerminalResultOutputStatus::Invalid
+        );
+
+        fs::remove_file(&results).unwrap();
+        assert_eq!(
+            inspect_terminal_result_outputs(&root_directory, "experiment:run-1").unwrap(),
+            TerminalResultOutputStatus::Invalid
+        );
+        let outside = tempdir().unwrap();
+        secure_test_directory(outside.path());
+        std::os::unix::fs::symlink(outside.path(), service.join("results")).unwrap();
+        assert!(inspect_terminal_result_outputs(&root_directory, "experiment:run-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_terminal_result_rejects_same_status_manifest_replacement() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let service = root.path().join(".pueue-agent");
+        let results = service.join("results");
+        let artifacts = service.join("artifacts");
+        let artifact_run = artifacts.join("experiment:run-1");
+        let manifest = results.join("experiment:run-1.json");
+        fs::create_dir_all(&artifact_run).unwrap();
+        fs::create_dir_all(&results).unwrap();
+        secure_test_directory(&service);
+        secure_test_directory(&results);
+        secure_test_directory(&artifacts);
+        secure_test_directory(&artifact_run);
+        fs::write(
+            &manifest,
+            br#"{"schema_version":1,"experiment_id":"experiment:run-1","metrics":{"loss":0.1}}"#,
+        )
+        .unwrap();
+        secure_test_file(&manifest);
+        let root_directory = File::open(root.path()).unwrap();
+
+        let binding = bind_terminal_result_outputs(&root_directory, "experiment:run-1").unwrap();
+        assert_eq!(binding.status(), TerminalResultOutputStatus::Ready);
+        assert!(std::str::from_utf8(binding.manifest_bytes().unwrap())
+            .unwrap()
+            .contains("0.1"));
+
+        let replacement = results.join("replacement.json");
+        fs::write(
+            &replacement,
+            br#"{"schema_version":1,"experiment_id":"experiment:run-1","metrics":{"loss":9.9}}"#,
+        )
+        .unwrap();
+        secure_test_file(&replacement);
+        fs::rename(&replacement, &manifest).unwrap();
+
+        assert!(binding.reverify(&root_directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_terminal_result_rejects_in_place_manifest_mutation() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let service = root.path().join(".pueue-agent");
+        let results = service.join("results");
+        let artifacts = service.join("artifacts");
+        let artifact_run = artifacts.join("experiment:run-1");
+        let manifest = results.join("experiment:run-1.json");
+        fs::create_dir_all(&artifact_run).unwrap();
+        fs::create_dir_all(&results).unwrap();
+        secure_test_directory(&service);
+        secure_test_directory(&results);
+        secure_test_directory(&artifacts);
+        secure_test_directory(&artifact_run);
+        fs::write(
+            &manifest,
+            br#"{"schema_version":1,"experiment_id":"experiment:run-1","metrics":{"loss":0.1}}"#,
+        )
+        .unwrap();
+        secure_test_file(&manifest);
+        let root_directory = File::open(root.path()).unwrap();
+        let binding = bind_terminal_result_outputs(&root_directory, "experiment:run-1").unwrap();
+
+        fs::write(
+            &manifest,
+            br#"{"schema_version":1,"experiment_id":"experiment:run-1","metrics":{"loss":9.9}}"#,
+        )
+        .unwrap();
+        secure_test_file(&manifest);
+
+        assert!(binding.reverify(&root_directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_manifest_reverify_uses_read_only_nonblocking_descriptor() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let manifest = root.path().join("experiment:run-1.json");
+        fs::write(&manifest, b"{}\n").unwrap();
+        secure_test_file(&manifest);
+        let parent = File::open(root.path()).unwrap();
+        let (file, _) = open_runtime_manifest_at(&parent, OsStr::new("experiment:run-1.json"))
+            .unwrap();
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "fcntl(F_GETFL) failed");
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_manifest_fifo_replacement_is_rejected_within_bound() {
+        let root = tempdir().unwrap();
+        secure_test_directory(root.path());
+        let manifest = root.path().join("experiment:run-1.json");
+        fs::write(&manifest, b"{}\n").unwrap();
+        secure_test_file(&manifest);
+        fs::remove_file(&manifest).unwrap();
+        let name = std::ffi::CString::new(manifest.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let parent = File::open(root.path()).unwrap();
+        let started = Instant::now();
+        let result = open_runtime_manifest_at(&parent, OsStr::new("experiment:run-1.json"));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -7328,5 +12687,58 @@ mod tests {
                 "unexpected cleanup authorization for {state:?} with marker {cleanup_completed_at:?}",
             );
         }
+    }
+
+    #[test]
+    fn code_change_check_round_requires_project_check() {
+        let supervisor_only = CheckRoundResult {
+            git_diff_passed: true,
+            project_check_count: 0,
+            all_project_checks_passed: true,
+            final_diff_matches: true,
+        };
+        assert!(!supervisor_only.passed());
+
+        let project_failure = CheckRoundResult {
+            git_diff_passed: true,
+            project_check_count: 1,
+            all_project_checks_passed: false,
+            final_diff_matches: true,
+        };
+        assert!(!project_failure.passed());
+    }
+
+    #[test]
+    fn code_change_check_round_requires_stable_final_diff() {
+        let final_diff_mismatch = CheckRoundResult {
+            git_diff_passed: true,
+            project_check_count: 1,
+            all_project_checks_passed: true,
+            final_diff_matches: false,
+        };
+        assert!(!final_diff_mismatch.passed());
+
+        let accepted = CheckRoundResult {
+            git_diff_passed: true,
+            project_check_count: 1,
+            all_project_checks_passed: true,
+            final_diff_matches: true,
+        };
+        assert!(accepted.passed());
+    }
+
+    #[test]
+    fn code_change_supervisor_diff_check_is_cached_and_base_bound() {
+        let base_sha = "a".repeat(40);
+
+        assert_eq!(
+            supervisor_diff_check_args(&base_sha),
+            vec![
+                OsString::from("diff"),
+                OsString::from("--cached"),
+                OsString::from("--check"),
+                OsString::from(base_sha),
+            ]
+        );
     }
 }

@@ -17,11 +17,11 @@ use crate::{
     },
     environment::ProjectAdmissionLock,
     execution_policy::{
-        preflight_code_change_runtime, CampaignLimits, ProjectRootAnchor,
-        ResolvedExecutionPolicy, VerifiedProjectRoot,
+        preflight_code_change_runtime, CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy,
+        VerifiedProjectRoot, VerifiedWorkingDirectory,
     },
     models::{
-        Campaign, CodeChangeRun, CodeChangeState, Experiment, ExperimentStatus,
+        Campaign, CampaignState, CodeChangeRun, CodeChangeState, Experiment, ExperimentStatus,
         NewCodeChangeRun, ObjectiveMetric, Project, Proposal, ProposalKind, ProposalStatus,
         Submission,
     },
@@ -45,6 +45,9 @@ const BASELINE_HYPOTHESIS: &str = "Establish the initial campaign baseline";
 const ADD_UNKNOWN_REASON: &str = "pueue_add_unknown";
 const ADD_INTERRUPTED_REASON: &str = "pueue_add_interrupted";
 const ADD_IDENTITY_REASON: &str = "pueue_identity_unresolved";
+const RUNTIME_OUTPUT_RECOVERY_REASON: &str = "runtime_output_recovery_required";
+const RUNTIME_OUTPUT_RECOVERY_SUMMARY: &str =
+    "candidate runtime output scope could not be verified";
 const MAX_GIT_OUTPUT_BYTES: usize = 64 * 1024;
 const GIT_RUNTIME: Duration = Duration::from_secs(30);
 const PINNED_GIT_ENVIRONMENT: &[(&str, &str)] = &[
@@ -69,6 +72,23 @@ pub enum CampaignSubmission {
     Deferred,
 }
 
+#[cfg(unix)]
+fn require_code_change_runtime_recovery(
+    db: &Db,
+    experiment: &Experiment,
+    now: i64,
+) -> Result<(), AppError> {
+    if let Some(run_id) = experiment.code_change_run_id.as_deref() {
+        CodeChangeRepository::new(db).require_recovery(
+            run_id,
+            RUNTIME_OUTPUT_RECOVERY_REASON,
+            RUNTIME_OUTPUT_RECOVERY_SUMMARY,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
 enum CodeChangeBaseResolution {
     Available(String),
     InvalidBest,
@@ -87,8 +107,8 @@ pub fn render_status_for_project(
         &campaign.campaign_id,
         crate::status::status_timestamp()?,
     )?
-        .as_ref()
-        .map(DecisionStatusProjection::from);
+    .as_ref()
+    .map(DecisionStatusProjection::from);
     render_campaign_status_with_decision(
         &campaign,
         proposal_count,
@@ -337,7 +357,14 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             base_revision_sha.as_deref(),
         )?;
         match self
-            .submit_accepted_intent_inner(&intent, project, now, Some(admission))
+            .submit_accepted_intent_inner(
+                &intent,
+                project,
+                now,
+                Some(admission),
+                #[cfg(unix)]
+                None,
+            )
             .await?
         {
             CampaignSubmission::Submitted(submission) => Ok(submission),
@@ -353,8 +380,25 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         now: i64,
     ) -> Result<Submission, AppError> {
+        #[cfg(unix)]
+        if let Some(run_id) = intent.experiment.code_change_run_id.as_deref() {
+            return match self.submit_candidate_intent(run_id, project, now).await? {
+                CampaignSubmission::Submitted(submission) => Ok(submission),
+                CampaignSubmission::Deferred => Err(AppError::Validation {
+                    field: "campaign",
+                    message: "campaign and project authority must permit reserved submission",
+                }),
+            };
+        }
         match self
-            .submit_accepted_intent_inner(intent, project, now, None)
+            .submit_accepted_intent_inner(
+                intent,
+                project,
+                now,
+                None,
+                #[cfg(unix)]
+                None,
+            )
             .await?
         {
             CampaignSubmission::Submitted(submission) => Ok(submission),
@@ -371,8 +415,195 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         now: i64,
     ) -> Result<CampaignSubmission, AppError> {
-        self.submit_accepted_intent_inner(intent, project, now, None)
-            .await
+        #[cfg(unix)]
+        if let Some(run_id) = intent.experiment.code_change_run_id.as_deref() {
+            return self.submit_candidate_intent(run_id, project, now).await;
+        }
+        self.submit_accepted_intent_inner(
+            intent,
+            project,
+            now,
+            None,
+            #[cfg(unix)]
+            None,
+        )
+        .await
+    }
+
+    /// Accept and submit the immutable candidate belonging to one durable
+    /// code-change run.  The candidate worktree and proposal cwd are opened
+    /// before the atomic DB acceptance and retained until Pueue identity has
+    /// been verified.
+    #[cfg(unix)]
+    pub async fn submit_candidate_intent(
+        &self,
+        run_id: &str,
+        project: &Project,
+        now: i64,
+    ) -> Result<CampaignSubmission, AppError> {
+        let policy = self.execution_policy.ok_or(AppError::Validation {
+            field: "code_change.policy",
+            message: "startup execution policy is required for candidate submission",
+        })?;
+        let repository = CodeChangeRepository::new(self.db);
+        let run = repository.find_by_id(run_id)?.ok_or(AppError::Validation {
+            field: "code_change_run_id",
+            message: "does not identify a persisted code-change run",
+        })?;
+        let campaign = CampaignRepository::new(self.db)
+            .find_by_id(&run.campaign_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read code-change campaign before candidate submission",
+            })?;
+        let durable_project = ProjectRepository::new(self.db)
+            .find_by_id(&campaign.project_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read code-change project before candidate submission",
+            })?;
+        let proposal = ProposalRepository::new(self.db)
+            .find_by_id(&run.proposal_id)?
+            .ok_or(AppError::Runtime {
+                operation: "read code-change proposal before candidate submission",
+            })?;
+        if proposal.campaign_id != campaign.campaign_id || proposal.kind != ProposalKind::CodeChange
+        {
+            return Err(AppError::Validation {
+                field: "code_change.proposal",
+                message: "must belong to the candidate campaign",
+            });
+        }
+        let project_config = crate::config::load(&durable_project.config_path)?;
+        let original_policy = crate::execution_policy::resolve_project_policy(
+            policy,
+            &durable_project,
+            &project_config,
+        )
+        .map_err(AppError::from)?;
+        let admission = self.acquire_admission(&durable_project)?;
+        let existing_experiment = match run.experiment_id.as_deref() {
+            Some(experiment_id) => Some(
+                ExperimentRepository::new(self.db)
+                    .find_by_id(experiment_id)?
+                    .ok_or(AppError::Runtime {
+                        operation: "read submitted code-change experiment identity",
+                    })?,
+            ),
+            None => None,
+        };
+        if matches!(
+            existing_experiment.as_ref().map(|experiment| experiment.status),
+            None | Some(ExperimentStatus::Reserved)
+        ) {
+            let campaign_active = CampaignRepository::new(self.db)
+                .find_by_id(&campaign.campaign_id)?
+                .is_some_and(|campaign| campaign.state == CampaignState::Active);
+            let project_available = ProjectRepository::new(self.db)
+                .refresh_admission_authority(&durable_project)?
+                .is_some();
+            if !campaign_active || !project_available {
+                return Ok(CampaignSubmission::Deferred);
+            }
+        }
+        let candidate = match existing_experiment.as_ref().map(|experiment| experiment.status) {
+            Some(
+                ExperimentStatus::Submitting
+                | ExperimentStatus::Unreconciled
+                | ExperimentStatus::Accepted
+                | ExperimentStatus::Succeeded
+                | ExperimentStatus::Failed
+                | ExperimentStatus::Cancelled,
+            ) => {
+                match code_change::reopen_code_change_candidate_for_run(
+                    policy,
+                    &durable_project,
+                    &original_policy,
+                    self.db,
+                    run_id,
+                )
+                .await
+                {
+                    Ok(candidate) => candidate,
+                    Err(_) => {
+                        code_change::reopen_code_change_result_for_run(
+                            policy,
+                            &durable_project,
+                            &original_policy,
+                            self.db,
+                            run_id,
+                            &run.experiment_id.as_deref().unwrap_or_default(),
+                        )
+                        .await?
+                    }
+                }
+            }
+            _ => {
+                code_change::reopen_code_change_candidate_for_run(
+                    policy,
+                    &durable_project,
+                    &original_policy,
+                    self.db,
+                    run_id,
+                )
+                .await?
+            }
+        };
+        let working_directory =
+            open_candidate_working_directory(candidate.root(), &proposal.working_directory)?;
+        match existing_experiment.as_ref().map(|experiment| experiment.status) {
+            Some(ExperimentStatus::Reserved) | None => {
+                candidate
+                    .reverify_submission_boundary(&working_directory)
+                    .await?;
+            }
+            Some(_) => {
+                reverify_candidate_submission_or_runtime(
+                    &candidate,
+                    &working_directory,
+                    &run.experiment_id.as_deref().unwrap_or_default(),
+                )
+                .await?;
+            }
+        }
+
+        let (experiment_id, submission_id) = match existing_experiment.as_ref() {
+            Some(experiment) => (experiment.experiment_id.clone(), experiment.submission_id.clone()),
+            None => (
+                candidate_experiment_id(run_id),
+                candidate_submission_id(run_id),
+            ),
+        };
+        let acceptance = CampaignRepository::new(self.db).accept_code_change_candidate(
+            run_id,
+            &experiment_id,
+            &submission_id,
+            now,
+            &self.limits,
+        )?;
+        let intent = match acceptance {
+            ProposalAcceptance::Accepted(intent) => intent,
+            ProposalAcceptance::BudgetWaiting { .. } | ProposalAcceptance::CapacityDeferred => {
+                return Ok(CampaignSubmission::Deferred)
+            }
+            ProposalAcceptance::PendingCodeChange => {
+                return Err(AppError::Runtime {
+                    operation: "accept code-change candidate intent",
+                })
+            }
+        };
+        repository.record_candidate_working_directory_identity(
+            run_id,
+            &intent.experiment.experiment_id,
+            working_directory.identity(),
+            now,
+        )?;
+        self.submit_accepted_intent_inner(
+            &intent,
+            project,
+            now,
+            Some(admission),
+            Some((&candidate, &working_directory)),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -437,6 +668,10 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 ))
             }
             ProposalAcceptance::BudgetWaiting { .. } => Ok(CampaignProposalAdmission::Deferred),
+            ProposalAcceptance::CapacityDeferred => Err(AppError::Validation {
+                field: "proposal.kind",
+                message: "unexpected capacity deferral for an experiment proposal",
+            }),
             ProposalAcceptance::PendingCodeChange => Err(AppError::Validation {
                 field: "proposal.kind",
                 message: "unexpected code-change acceptance for an experiment proposal",
@@ -508,9 +743,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             Ok(()) => match self.code_change_base_sha(&project_root, campaign_id).await {
                 CodeChangeBaseResolution::Available(base_sha) => (Some(base_sha), None),
                 CodeChangeBaseResolution::InvalidBest => (None, Some("best_ref_invalid")),
-                CodeChangeBaseResolution::Unavailable => {
-                    (None, Some("base_revision_unavailable"))
-                }
+                CodeChangeBaseResolution::Unavailable => (None, Some("base_revision_unavailable")),
             },
         };
         let code_change_run = if rejection_reason.is_none() {
@@ -546,7 +779,9 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             rejection_reason,
         )?;
         match accepted {
-            ProposalAcceptance::BudgetWaiting { .. } => Ok(CampaignProposalAdmission::Deferred),
+            ProposalAcceptance::BudgetWaiting { .. } | ProposalAcceptance::CapacityDeferred => {
+                Ok(CampaignProposalAdmission::Deferred)
+            }
             ProposalAcceptance::Accepted(_) => Err(AppError::Validation {
                 field: "proposal.kind",
                 message: "code-change proposal unexpectedly created an experiment",
@@ -649,11 +884,11 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             return CodeChangeBaseResolution::Unavailable;
         };
         let best_reference = format!("refs/heads/{best}");
-        let best_resolution = match resolve_exact_git_ref(anchor, project_root, &best_reference).await
-        {
-            Ok(value) => value,
-            Err(_) => return CodeChangeBaseResolution::Unavailable,
-        };
+        let best_resolution =
+            match resolve_exact_git_ref(anchor, project_root, &best_reference).await {
+                Ok(value) => value,
+                Err(_) => return CodeChangeBaseResolution::Unavailable,
+            };
         match best_resolution {
             GitRefResolution::Invalid => return CodeChangeBaseResolution::InvalidBest,
             GitRefResolution::Present(value) => {
@@ -691,7 +926,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             project_root,
             &["rev-parse", "--verify", &base_revision],
         )
-        .await else {
+        .await
+        else {
             return CodeChangeBaseResolution::Unavailable;
         };
         if !output.status.success() {
@@ -706,8 +942,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         if value != base {
             CodeChangeBaseResolution::Unavailable
         } else {
-            let Ok(reverified) =
-                resolve_exact_git_ref(anchor, project_root, &best_reference).await
+            let Ok(reverified) = resolve_exact_git_ref(anchor, project_root, &best_reference).await
             else {
                 return CodeChangeBaseResolution::InvalidBest;
             };
@@ -730,6 +965,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             project,
             now,
             Some(admitted.admission),
+            #[cfg(unix)]
+            None,
         )
         .await
     }
@@ -740,6 +977,10 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         project: &Project,
         now: i64,
         admission: Option<CampaignAdmission>,
+        #[cfg(unix)] candidate: Option<(
+            &code_change::VerifiedCodeChangeWorktree,
+            &VerifiedWorkingDirectory,
+        )>,
     ) -> Result<CampaignSubmission, AppError> {
         let experiments = ExperimentRepository::new(self.db);
         let current = experiments
@@ -786,36 +1027,111 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 message: "must match the startup-pinned project root",
             });
         }
-        let runtime_argv = crate::environment::campaign_experiment_runtime_argv(
-            &admission.verified_root.anchor.canonical_path,
-            &durable_campaign.campaign_id,
-            &current.experiment_id,
-            &durable_submission.argv,
-        );
-        let expected_command = try_canonical_command_display_os(&runtime_argv)?;
-        let add_args = pueue_add_args(
-            &durable_project.pueue_group,
-            &explicit_working_directory(
+
+        #[cfg(unix)]
+        if candidate.is_some() != current.code_change_run_id.is_some() {
+            return Err(AppError::Validation {
+                field: "campaign.intent",
+                message: "code-change experiments require a verified candidate submission",
+            });
+        }
+        #[cfg(unix)]
+        if candidate.is_some() {
+            match current.status {
+                ExperimentStatus::Submitting => {
+                    experiments.mark_unreconciled(
+                        &current.experiment_id,
+                        ADD_INTERRUPTED_REASON,
+                        now,
+                    )?;
+                    return Err(reconciliation_required());
+                }
+                ExperimentStatus::Unreconciled => return Err(reconciliation_required()),
+                _ => {}
+            }
+        }
+        #[cfg(not(unix))]
+        if current.code_change_run_id.is_some() {
+            return Err(AppError::Validation {
+                field: "campaign.intent",
+                message: "code-change experiments require a supported candidate platform",
+            });
+        }
+
+        #[cfg(unix)]
+        let (command_root, working_directory) = if let Some((candidate, cwd)) = candidate.as_ref() {
+            match current.status {
+                ExperimentStatus::Reserved => {
+                    if let Err(error) = candidate.reverify_submission_boundary(cwd).await {
+                        require_code_change_runtime_recovery(self.db, &current, now)?;
+                        return Err(error);
+                    }
+                }
+                ExperimentStatus::Accepted
+                | ExperimentStatus::Succeeded
+                | ExperimentStatus::Failed
+                | ExperimentStatus::Cancelled => {
+                    reverify_candidate_submission_or_runtime(
+                        candidate,
+                        cwd,
+                        &current.experiment_id,
+                    )
+                    .await?;
+                }
+                ExperimentStatus::Submitting | ExperimentStatus::Unreconciled => {
+                    unreachable!("candidate submission status handled before boundary verification")
+                }
+            }
+            (
+                candidate.root().anchor.canonical_path.clone(),
+                cwd.canonical_path().to_owned(),
+            )
+        } else {
+            (
+                admission.verified_root.anchor.canonical_path.clone(),
+                explicit_working_directory(
+                    &admission.verified_root.anchor.canonical_path,
+                    &durable_proposal.working_directory,
+                ),
+            )
+        };
+        #[cfg(not(unix))]
+        let (command_root, working_directory) = (
+            admission.verified_root.anchor.canonical_path.clone(),
+            explicit_working_directory(
                 &admission.verified_root.anchor.canonical_path,
                 &durable_proposal.working_directory,
             ),
-            &runtime_argv,
         );
-        validate_add_argv(&add_args)?;
+        #[cfg(unix)]
+        let mut prepared_runtime = None;
 
         match current.status {
             ExperimentStatus::Reserved => {
-                if experiments
-                    .begin_submitting_or_defer(&current.experiment_id, now)?
-                    .is_none()
-                {
-                    return Ok(CampaignSubmission::Deferred);
-                }
                 admission
                     .verified_root
                     .anchor
                     .verify_identity()
                     .map_err(AppError::from)?;
+                #[cfg(unix)]
+                if let Some((candidate, cwd)) = candidate.as_ref() {
+                    if let Err(error) = candidate.reverify_submission_boundary(cwd).await {
+                        require_code_change_runtime_recovery(self.db, &current, now)?;
+                        return Err(error);
+                    }
+                    let runtime = match candidate.prepare_runtime_outputs(&current.experiment_id) {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            require_code_change_runtime_recovery(self.db, &current, now)?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = runtime.reverify(candidate.root()) {
+                        require_code_change_runtime_recovery(self.db, &current, now)?;
+                        return Err(error);
+                    }
+                    prepared_runtime = Some(runtime);
+                }
             }
             ExperimentStatus::Submitting => {
                 experiments.mark_unreconciled(
@@ -839,6 +1155,35 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             }
         }
 
+        let mut runtime_argv = crate::environment::campaign_experiment_runtime_argv(
+            &command_root,
+            &durable_campaign.campaign_id,
+            &current.experiment_id,
+            &durable_submission.argv,
+        );
+        #[cfg(unix)]
+        if let Some(runtime) = prepared_runtime.as_ref() {
+            if let Err(error) = runtime.append_runtime_environment(&mut runtime_argv) {
+                require_code_change_runtime_recovery(self.db, &current, now)?;
+                return Err(error);
+            }
+        }
+        let expected_command = try_canonical_command_display_os(&runtime_argv)?;
+        let add_args = pueue_add_args(
+            &durable_project.pueue_group,
+            &working_directory,
+            &runtime_argv,
+        );
+        validate_add_argv(&add_args)?;
+
+        if current.status == ExperimentStatus::Reserved
+            && experiments
+                .begin_submitting_or_defer(&current.experiment_id, now)?
+                .is_none()
+        {
+            return Ok(CampaignSubmission::Deferred);
+        }
+
         let task_id = match self.pueue.add(&add_args).await {
             Ok(task_id) => task_id,
             Err(error) => {
@@ -846,43 +1191,58 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 return Err(error);
             }
         };
+        #[cfg(unix)]
+        if let Some((candidate, cwd)) = candidate.as_ref() {
+            let valid = match prepared_runtime.as_ref() {
+                Some(runtime) => candidate
+                    .reverify_submission_runtime_boundary(cwd, runtime)
+                    .await
+                    .is_ok(),
+                None => candidate.reverify_submission_boundary(cwd).await.is_ok(),
+            };
+            if !valid {
+                experiments.mark_unreconciled(&current.experiment_id, ADD_IDENTITY_REASON, now)?;
+                return Err(reconciliation_required());
+            }
+        }
         let tasks = match self.pueue.status_json().await {
             Ok(tasks) => tasks,
             Err(error) => {
-                experiments.mark_unreconciled(
-                    &current.experiment_id,
-                    ADD_IDENTITY_REASON,
-                    now,
-                )?;
+                experiments.mark_unreconciled(&current.experiment_id, ADD_IDENTITY_REASON, now)?;
                 return Err(error);
             }
         };
         let mut id_matches = tasks.iter().filter(|task| task.id == task_id);
         let task = id_matches.next();
         if task.is_none() || id_matches.next().is_some() {
-            experiments.mark_unreconciled(
-                &current.experiment_id,
-                ADD_IDENTITY_REASON,
-                now,
-            )?;
+            experiments.mark_unreconciled(&current.experiment_id, ADD_IDENTITY_REASON, now)?;
             return Err(reconciliation_required());
         }
         let task = task.expect("checked one Pueue task ID match");
-        let task_signature = if task.group == durable_project.pueue_group
-            && task.command == expected_command
-        {
-            managed_task_run_signature(task)
-        } else {
-            None
-        };
+        let task_signature =
+            if task.group == durable_project.pueue_group && task.command == expected_command {
+                managed_task_run_signature(task)
+            } else {
+                None
+            };
         let Some(task_signature) = task_signature else {
-            experiments.mark_unreconciled(
-                &current.experiment_id,
-                ADD_IDENTITY_REASON,
-                now,
-            )?;
+            experiments.mark_unreconciled(&current.experiment_id, ADD_IDENTITY_REASON, now)?;
             return Err(reconciliation_required());
         };
+        #[cfg(unix)]
+        if let Some((candidate, cwd)) = candidate.as_ref() {
+            let valid = match prepared_runtime.as_ref() {
+                Some(runtime) => candidate
+                    .reverify_submission_runtime_boundary(cwd, runtime)
+                    .await
+                    .is_ok(),
+                None => candidate.reverify_submission_boundary(cwd).await.is_ok(),
+            };
+            if !valid {
+                experiments.mark_unreconciled(&current.experiment_id, ADD_IDENTITY_REASON, now)?;
+                return Err(reconciliation_required());
+            }
+        }
         if let Err(error) =
             experiments.mark_accepted(&current.experiment_id, task_id, &task_signature, now)
         {
@@ -1028,10 +1388,7 @@ fn validate_local_git_config_file(path: &Path) -> Result<(), AppError> {
         field: "git.config",
         message: "local Git configuration must be valid UTF-8",
     })?;
-    if contents
-        .lines()
-        .any(|line| line.trim_end().ends_with('\\'))
-    {
+    if contents.lines().any(|line| line.trim_end().ends_with('\\')) {
         return Err(AppError::Validation {
             field: "git.config",
             message: "local Git configuration contains a line continuation",
@@ -1229,12 +1586,8 @@ async fn resolve_exact_git_ref(
         GitRefPresence::Invalid => Ok(GitRefResolution::Invalid),
         GitRefPresence::Present => {
             let revision = format!("{reference}^{{commit}}");
-            let output = run_pinned_git(
-                anchor,
-                project_root,
-                &["rev-parse", "--verify", &revision],
-            )
-            .await?;
+            let output =
+                run_pinned_git(anchor, project_root, &["rev-parse", "--verify", &revision]).await?;
             if !output.status.success() {
                 return Ok(GitRefResolution::Invalid);
             }
@@ -1474,7 +1827,10 @@ async fn run_pinned_git(
     }
     command.process_group(0);
     #[cfg(target_os = "linux")]
-    inherit_verified_git_fd(&mut command, std::os::fd::AsRawFd::as_raw_fd(&verified.file));
+    inherit_verified_git_fd(
+        &mut command,
+        std::os::fd::AsRawFd::as_raw_fd(&verified.file),
+    );
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
     let mut child = command.spawn().map_err(|_| AppError::Runtime {
@@ -1586,9 +1942,12 @@ where
     let mut bytes = Vec::with_capacity(MAX_GIT_OUTPUT_BYTES.min(8192));
     let mut buffer = [0u8; 8192];
     loop {
-        let count = reader.read(&mut buffer).await.map_err(|_| AppError::Runtime {
-            operation: "read pinned Git output",
-        })?;
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|_| AppError::Runtime {
+                operation: "read pinned Git output",
+            })?;
         if count == 0 {
             return Ok(bytes);
         }
@@ -1644,6 +2003,8 @@ fn validate_intent_identity(
         || intent.experiment.campaign_id != experiment.campaign_id
         || intent.experiment.proposal_id != experiment.proposal_id
         || intent.experiment.submission_id != experiment.submission_id
+        || intent.experiment.code_change_run_id != experiment.code_change_run_id
+        || intent.experiment.code_revision_sha != experiment.code_revision_sha
         || intent.submission.submission_id != submission.submission_id
         || intent.submission.project_id != submission.project_id
     {
@@ -1674,6 +2035,45 @@ fn explicit_working_directory(project_root: &Path, relative: &str) -> std::path:
     }
 }
 
+#[cfg(unix)]
+fn open_candidate_working_directory(
+    candidate: &VerifiedProjectRoot,
+    relative: &str,
+) -> Result<VerifiedWorkingDirectory, AppError> {
+    VerifiedWorkingDirectory::open_descendant(candidate, Path::new(relative))
+        .map_err(AppError::from)
+}
+
+#[cfg(unix)]
+async fn reverify_candidate_submission_or_runtime(
+    candidate: &code_change::VerifiedCodeChangeWorktree,
+    working_directory: &VerifiedWorkingDirectory,
+    experiment_id: &str,
+) -> Result<(), AppError> {
+    match candidate
+        .reverify_submission_boundary(working_directory)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            candidate
+                .reverify_result_ingestion_boundary(working_directory, experiment_id)
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn candidate_experiment_id(run_id: &str) -> String {
+    format!("code-change-experiment:{run_id}")
+}
+
+#[cfg(unix)]
+fn candidate_submission_id(run_id: &str) -> String {
+    format!("code-change-submission:{run_id}")
+}
+
 fn reconciliation_required() -> AppError {
     AppError::Validation {
         field: "experiment",
@@ -1687,25 +2087,44 @@ mod tests {
     use crate::execution_policy::ExecutableAnchor;
 
     #[test]
+    fn candidate_submission_cwd_is_descriptor_bound_to_the_candidate_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate_path = temporary.path().join("candidate");
+        std::fs::create_dir_all(candidate_path.join("nested")).unwrap();
+        let anchor = ProjectRootAnchor::resolve(&candidate_path).unwrap();
+        let candidate = anchor.verify_identity().unwrap();
+
+        let nested = open_candidate_working_directory(&candidate, "nested").unwrap();
+        assert_eq!(nested.canonical_path(), candidate_path.join("nested"));
+        assert!(open_candidate_working_directory(&candidate, "/tmp").is_err());
+        assert!(open_candidate_working_directory(&candidate, "../outside").is_err());
+    }
+
+    #[test]
     fn pinned_git_invocation_disables_config_auth_and_unbounded_output() {
         let argv = pinned_git_argv(&["rev-parse", "HEAD"]);
         let argv = argv
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert!(pinned_git_argv(&[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all"
-        ])
-        .iter()
-        .any(|value| value == "--untracked-files=all"));
-        assert!(argv.windows(2).any(|pair| pair == ["-c", "core.hooksPath=/dev/null"]));
-        assert!(argv.windows(2).any(|pair| pair == ["-c", "core.fsmonitor=false"]));
-        assert!(argv.windows(2).any(|pair| pair == ["-c", "credential.helper="]));
+        assert!(
+            pinned_git_argv(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+                .iter()
+                .any(|value| value == "--untracked-files=all")
+        );
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-c", "core.hooksPath=/dev/null"]));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-c", "core.fsmonitor=false"]));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-c", "credential.helper="]));
         assert!(!argv.windows(2).any(|pair| pair == ["-c", "diff.external="]));
-        assert!(argv.windows(2).any(|pair| pair == ["-c", "commit.gpgSign=false"]));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["-c", "commit.gpgSign=false"]));
         assert!(argv.contains(&"--no-pager".to_owned()));
         let environment = pinned_git_environment();
         assert!(environment.contains(&("GIT_CONFIG_NOSYSTEM", "1")));
@@ -1717,7 +2136,10 @@ mod tests {
         assert!(environment.contains(&("GIT_EDITOR", "/bin/false")));
         assert!(environment.contains(&("GIT_SEQUENCE_EDITOR", "/bin/false")));
         assert!(!environment.iter().any(|(name, _)| {
-            matches!(*name, "HOME" | "PATH" | "AWS_SECRET_ACCESS_KEY" | "GITHUB_TOKEN")
+            matches!(
+                *name,
+                "HOME" | "PATH" | "AWS_SECRET_ACCESS_KEY" | "GITHUB_TOKEN"
+            )
         }));
         assert!(validate_git_output_len(MAX_GIT_OUTPUT_BYTES).is_ok());
         assert!(validate_git_output_len(MAX_GIT_OUTPUT_BYTES + 1).is_err());
@@ -1774,7 +2196,10 @@ mod tests {
         for (name, contents) in [
             ("exact", "[diff]\n\texternal = /tmp/sentinel\n"),
             ("command", "[diff \"driver\"]\n\tcommand = /tmp/sentinel\n"),
-            ("textconv", "[DiFf \"driver\"]\n\ttextConv = /tmp/sentinel\n"),
+            (
+                "textconv",
+                "[DiFf \"driver\"]\n\ttextConv = /tmp/sentinel\n",
+            ),
             (
                 "trust-exit-code",
                 "[diff \"driver\"]\n\ttrustExitCode = true\n",
@@ -1820,7 +2245,10 @@ mod tests {
                 "[ FILTER.foo ]\n\tSmUdGe = /tmp/sentinel\n",
             ),
             ("filter-smudge", "[FILTER.foo]\n\tSMUDGE = /tmp/sentinel\n"),
-            ("filter-process", "[filter.foo]\n\tPROCESS = /tmp/sentinel\n"),
+            (
+                "filter-process",
+                "[filter.foo]\n\tPROCESS = /tmp/sentinel\n",
+            ),
             ("filter-required", "[filter.foo]\n\tREQUIRED = true\n"),
             ("diff-command", "[diff.foo]\n\tcommand = /tmp/sentinel\n"),
             ("diff-textconv", "[DIFF.foo]\n\tTEXTCONV = /tmp/sentinel\n"),
@@ -1901,9 +2329,7 @@ mod tests {
         let branch = "a".repeat(40);
         let tag = "b".repeat(40);
         let peeled = "c".repeat(40);
-        let contents = format!(
-            "{tag} refs/tags/unrelated\n^{peeled}\n{branch} {reference}\n"
-        );
+        let contents = format!("{tag} refs/tags/unrelated\n^{peeled}\n{branch} {reference}\n");
         assert_eq!(
             parse_packed_refs(contents.as_bytes(), reference),
             GitRefPresence::Present
@@ -1935,8 +2361,7 @@ mod tests {
         std::fs::set_permissions(&script, permissions).unwrap();
         let anchor = ExecutableAnchor::from_absolute(&script, &[]).unwrap();
 
-        let result = match run_pinned_git(&anchor, temporary.path(), &["rev-parse", "HEAD"]).await
-        {
+        let result = match run_pinned_git(&anchor, temporary.path(), &["rev-parse", "HEAD"]).await {
             Err(error) => error,
             Ok(_) => panic!("replaced anchor must fail closed"),
         };
@@ -2027,7 +2452,13 @@ mod tests {
             Ok(_) => panic!("the fixture must exceed the bounded stderr limit"),
             Err(error) => error,
         };
-        assert!(matches!(result, AppError::Validation { field: "git.output", .. }));
+        assert!(matches!(
+            result,
+            AppError::Validation {
+                field: "git.output",
+                ..
+            }
+        ));
 
         let descendant = std::fs::read_to_string(temporary.path().join("descendant.pid"))
             .unwrap()
@@ -2062,8 +2493,11 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "git {:?}: {:?}", args, output);
         }
-        std::fs::write(temporary.path().join(".gitattributes"), "tracked filter=clean\n")
-            .unwrap();
+        std::fs::write(
+            temporary.path().join(".gitattributes"),
+            "tracked filter=clean\n",
+        )
+        .unwrap();
         std::fs::write(temporary.path().join("tracked"), "baseline\n").unwrap();
         let output = std::process::Command::new("/usr/bin/git")
             .args(["add", "."])
@@ -2096,7 +2530,10 @@ mod tests {
         std::fs::set_permissions(&filter, permissions).unwrap();
         let config = temporary.path().join(".git/config");
         let mut contents = std::fs::read_to_string(&config).unwrap();
-        contents.push_str(&format!("\n[filter \"clean\"]\n\tclean = {}\n", filter.display()));
+        contents.push_str(&format!(
+            "\n[filter \"clean\"]\n\tclean = {}\n",
+            filter.display()
+        ));
         std::fs::write(config, contents).unwrap();
         std::fs::write(temporary.path().join("tracked"), "changed\n").unwrap();
 
