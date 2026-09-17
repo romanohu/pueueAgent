@@ -34,6 +34,9 @@ source "$REPO_ROOT/tests/support/agent_call_count.sh"
 
 cleanup() {
   cleanup_status=$?
+  if [ "$#" -eq 1 ]; then
+    cleanup_status="$1"
+  fi
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
@@ -68,6 +71,14 @@ cleanup() {
   fi
   return "$cleanup_status"
 }
+handle_signal() {
+  signal_status="$1"
+  trap - EXIT TERM INT
+  cleanup "$signal_status" || true
+  exit "$signal_status"
+}
+trap 'handle_signal 143' TERM
+trap 'handle_signal 130' INT
 trap cleanup EXIT
 
 sql() {

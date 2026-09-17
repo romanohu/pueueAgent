@@ -37,6 +37,68 @@ setup() {
   rm -rf "$retained_work"
 }
 
+@test "signal-terminated real Pueue harness retains diagnostics and status" {
+  fake_bin="$BATS_TEST_TMPDIR/signal-bin"
+  mkdir -p "$fake_bin"
+  work_marker="$BATS_TEST_TMPDIR/signal-work-path"
+  rustc_marker="$BATS_TEST_TMPDIR/signal-rustc-pid"
+  real_mktemp="$(command -v mktemp)"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "work_path=\"\$($real_mktemp \"\$@\")\"" \
+    "printf '%s\\n' \"\$work_path\" > \"$work_marker\"" \
+    'printf "%s\\n" "$work_path"' > "$fake_bin/mktemp"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" Linux' > "$fake_bin/uname"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueue"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueued"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/git"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/python3"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/jq"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/sqlite3"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "printf '%s\\n' \"\$\$\" > \"$rustc_marker\"" \
+    'while :; do sleep 1; done' > "$fake_bin/rustc"
+  chmod +x "$fake_bin"/*
+
+  runner_log="$BATS_TEST_TMPDIR/signal-runner.log"
+  env PATH="$fake_bin:/usr/bin:/bin" \
+    /bin/bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh" \
+    >"$runner_log" 2>&1 &
+  runner_pid=$!
+  work_path=""
+  for _ in $(seq 50); do
+    if [ -s "$work_marker" ]; then
+      work_path="$(<"$work_marker")"
+      break
+    fi
+    sleep 0.1
+  done
+  [ -n "$work_path" ]
+  for _ in $(seq 50); do
+    [ -s "$rustc_marker" ] && break
+    sleep 0.1
+  done
+  [ -s "$rustc_marker" ]
+
+  kill -TERM "$runner_pid" 2>/dev/null || true
+  rustc_pid="$(<"$rustc_marker")"
+  kill -TERM "$rustc_pid" 2>/dev/null || true
+  for _ in $(seq 20); do
+    kill -0 "$rustc_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL "$rustc_pid" 2>/dev/null || true
+  if wait "$runner_pid"; then
+    runner_status=0
+  else
+    runner_status=$?
+  fi
+
+  [ "$runner_status" -eq 143 ]
+  [ -d "$work_path" ]
+  grep -F "Rust E2E retained WORK after failure: $work_path" "$runner_log"
+  rm -rf "$work_path"
+}
+
 @test "real Pueue harness asserts the production-derived Codex network argument" {
   awk '
     index($0, "sandbox_workspace_write.network_access=true") &&
@@ -172,6 +234,41 @@ EOF
   [ "$status" -eq 0 ]
   [ "$(grep -c '^PROJECT_ID=project-a$' "$fake_log")" = "1" ]
   ! grep -Eq 'secret-value|OPENAI_API_KEY' "$fake_log"
+}
+
+@test "learning editor fixture uses the pinned Python check under a narrow PATH" {
+  fixture="$BATS_TEST_TMPDIR/learning-editor"
+  fake_bin="$BATS_TEST_TMPDIR/learning-editor-bin"
+  mkdir -p "$fixture" "$fake_bin"
+  cp "$REPO_ROOT/tests/e2e/learning_experiment/model.py" "$fixture/model.py"
+  printf '%s\n' '#!/bin/sh' "exec \"$(command -v python3)\" \"\$@\"" > "$fake_bin/python"
+  chmod +x "$fake_bin/python"
+  before="$BATS_TEST_TMPDIR/learning-model-before.py"
+  cp "$fixture/model.py" "$before"
+  editor_output="$fixture/editor.json"
+  log="$BATS_TEST_TMPDIR/learning-editor.log"
+  state="$BATS_TEST_TMPDIR/learning-editor.state"
+
+  run env PATH="$fake_bin" \
+    PUEUE_AGENT_TEST_AGENT_LOG="$log" \
+    PUEUE_AGENT_TEST_AGENT_STATE="$state" \
+    PUEUE_AGENT_EDITOR_OUTPUT="$editor_output" \
+    PUEUE_AGENT_EDITOR_MODE=fresh \
+    /bin/bash -c 'cd "$1" && exec /bin/bash "$2" "learning prompt PUEUE_AGENT_E2E_LEARNING"' \
+    bash "$fixture" "$REPO_ROOT/tests/support/fake_agent.sh"
+
+  [ "$status" -eq 0 ]
+  jq -e '.status == "ready" and .proposed_checks[0].source == "python" and .proposed_checks[0].argv == ["python", "-m", "pytest"]' "$editor_output"
+  python3 - "$before" "$fixture/model.py" <<'PY'
+from pathlib import Path
+import sys
+
+before = Path(sys.argv[1]).read_bytes()
+after = Path(sys.argv[2]).read_bytes()
+expected = before.replace(b"LEARNING_RATE = 0.001\n", b"LEARNING_RATE = 0.05\n")
+assert before.count(b"LEARNING_RATE = 0.001\n") == 1
+assert after == expected
+PY
 }
 
 @test "fake Codex records safe argv only and no environment values or prompt" {

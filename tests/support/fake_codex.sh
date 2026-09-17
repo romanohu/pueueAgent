@@ -117,14 +117,10 @@ if [ "$editor_artifact" -eq 1 ] || [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
         *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) editor_scenario="second_check_fail" ;;
         *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) editor_scenario="runtime_oom" ;;
         *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) editor_scenario="runtime_internal" ;;
-        *PUEUE_AGENT_E2E_LEARNING*) editor_scenario="learning" ;;
       esac
       case "$editor_scenario:${PUEUE_AGENT_EDITOR_MODE:-fresh}" in
         success:fresh|second_check_fail:fresh|second_check_fail:resume)
           printf '%s\n' 'def score():' '    return 2' > model.py
-          ;;
-        learning:fresh)
-          sed -i 's/^LEARNING_RATE = 0.001$/LEARNING_RATE = 0.05/' model.py
           ;;
         success:resume|runtime_oom:fresh|runtime_internal:fresh)
           printf '%s\n' 'def score():' '    return 1' > model.py

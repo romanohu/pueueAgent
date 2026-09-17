@@ -55,10 +55,14 @@ if [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
         *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) editor_scenario="second_check_fail" ;;
         *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) editor_scenario="runtime_oom" ;;
         *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) editor_scenario="runtime_internal" ;;
+        *PUEUE_AGENT_E2E_LEARNING*) editor_scenario="learning" ;;
       esac
       case "$editor_scenario:${PUEUE_AGENT_EDITOR_MODE:-fresh}" in
         success:fresh|second_check_fail:fresh|second_check_fail:resume)
           printf '%s\n' 'def score():' '    return 2' > model.py
+          ;;
+        learning:fresh)
+          python -c 'from pathlib import Path; path = Path("model.py"); source = path.read_text(encoding="utf-8"); old = "LEARNING_RATE = 0.001\n"; assert source.count(old) == 1, "expected one learning-rate line"; path.write_text(source.replace(old, "LEARNING_RATE = 0.05\n"), encoding="utf-8")'
           ;;
         success:resume|runtime_oom:fresh|runtime_internal:fresh)
           printf '%s\n' 'def score():' '    return 1' > model.py
