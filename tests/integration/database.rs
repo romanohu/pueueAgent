@@ -14,7 +14,7 @@ use pueue_agent::{
         BatchRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
         EventRepository, ExperimentRepository, IncidentRepository, InterventionRepository,
         NewCodeChangeCheck, ProjectRepository, ProposalAcceptance, ProposalRepository,
-        ResearchRepository,
+        ResearchLaunchBinding, ResearchRepository,
         RunLineageRepository, StartCampaignRequest, SubmissionRepository,
         TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
@@ -925,6 +925,133 @@ fn research_evidence_accepts_a_running_source_and_reports_its_target() {
     assert_eq!(value["facts"]["observed_at"], 1_061);
     assert!(value["facts"]["running"].is_array());
     assert_eq!(evidence.digest.len(), 64);
+}
+
+#[test]
+fn research_bind_agent_run_persists_exact_active_campaign_research_lineage() {
+    let harness = CampaignDbHarness::new();
+    let (review, binding, event_id, reservation_id) = research_binding_fixture(&harness);
+    let run = insert_research_binding_run(
+        &harness,
+        &harness.project_id,
+        event_id,
+        AgentRunStatus::Starting,
+        "campaign_research",
+    );
+
+    ResearchRepository::new(&harness.db)
+        .bind_agent_run(&binding, run.run_id, &harness.project_id, 1_080)
+        .unwrap();
+
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "running");
+    assert_eq!(stored.agent_run_id, Some(run.run_id));
+    assert_eq!(stored.attempt, binding.attempt);
+    assert_eq!(stored.session_generation, binding.session_generation);
+    assert_eq!(stored.context_json.as_deref(), Some(binding.context_json.as_str()));
+    assert_eq!(stored.context_digest.as_deref(), Some(binding.context_digest.as_str()));
+
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert_eq!(state.session_id.as_deref(), Some(binding.session_id.as_str()));
+    assert_eq!(state.session_generation, binding.session_generation);
+
+    let (notes_json, reservation_status): (String, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json,
+                    (SELECT status FROM budget_reservations WHERE reservation_id = ?2)
+             FROM research_reviews WHERE review_id = ?1",
+            params![review.review_id, reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let notes: serde_json::Value = serde_json::from_str(&notes_json).unwrap();
+    assert_eq!(notes["session_binding"], "pending");
+    assert_eq!(notes["planned_session_id"], binding.session_id);
+    assert_eq!(notes["attempt"], binding.attempt);
+    assert_eq!(notes["budget_reservation_id"], binding.budget_reservation_id);
+    assert!(notes["recovery_reason"].is_null());
+    assert_eq!(reservation_status, "consumed");
+}
+
+#[test]
+fn research_bind_agent_run_rejects_an_active_run_from_another_project() {
+    let harness = CampaignDbHarness::new();
+    let (review, binding, _review_event_id, reservation_id) = research_binding_fixture(&harness);
+    let other_root = harness.test.project_root("other-project");
+    register_project(&harness.db, "other-project", &other_root, "pa-other-project");
+    let other_event_id = insert_event(
+        &harness.db,
+        "other-project",
+        "research-binding-foreign-project",
+        1_060,
+    );
+    EventRepository::new(&harness.db)
+        .claim_batch(1_060, 2_060, 1)
+        .unwrap();
+    let run = insert_research_binding_run(
+        &harness,
+        "other-project",
+        other_event_id,
+        AgentRunStatus::Starting,
+        "campaign_research",
+    );
+    assert_research_binding_rejected_without_mutation(
+        &harness,
+        &review,
+        &binding,
+        &reservation_id,
+        run.run_id,
+        "agent_run_id",
+    );
+}
+
+#[test]
+fn research_bind_agent_run_rejects_a_nonresearch_active_run() {
+    let harness = CampaignDbHarness::new();
+    let (review, binding, event_id, reservation_id) = research_binding_fixture(&harness);
+    let run = insert_research_binding_run(
+        &harness,
+        &harness.project_id,
+        event_id,
+        AgentRunStatus::Starting,
+        "codex",
+    );
+    assert_research_binding_rejected_without_mutation(
+        &harness,
+        &review,
+        &binding,
+        &reservation_id,
+        run.run_id,
+        "execution_kind",
+    );
+}
+
+#[test]
+fn research_bind_agent_run_rejects_a_terminal_campaign_research_run() {
+    let harness = CampaignDbHarness::new();
+    let (review, binding, event_id, reservation_id) = research_binding_fixture(&harness);
+    let run = insert_research_binding_run(
+        &harness,
+        &harness.project_id,
+        event_id,
+        AgentRunStatus::Completed,
+        "campaign_research",
+    );
+    assert_research_binding_rejected_without_mutation(
+        &harness,
+        &review,
+        &binding,
+        &reservation_id,
+        run.run_id,
+        "agent_run_id",
+    );
 }
 
 #[test]
@@ -4965,6 +5092,144 @@ fn register_project(db: &Db, project_id: &str, root: &Path, group: &str) {
         100,
     );
     ProjectRepository::new(db).register(&project).unwrap();
+}
+
+fn research_binding_fixture(
+    harness: &CampaignDbHarness,
+) -> (
+    pueue_agent::db::ResearchReview,
+    ResearchLaunchBinding,
+    i64,
+    String,
+) {
+    let review = harness.running_research_review();
+    let evidence = build_research_evidence(&harness.db, &review, 1_061).unwrap();
+    let reservation = match CampaignRepository::new(&harness.db)
+        .reserve_agent_run(
+            &harness.campaign_id,
+            &format!("research:{}:attempt:{}", review.review_id, review.attempt),
+            &CampaignLimits::default(),
+            1_061,
+        )
+        .unwrap()
+    {
+        AgentDecisionReservation::Reserved(reservation) => reservation,
+        AgentDecisionReservation::BudgetWaiting { .. } => {
+            panic!("research fixture budget must admit")
+        }
+        AgentDecisionReservation::Deferred { .. } => {
+            panic!("research fixture campaign must be active")
+        }
+    };
+    let event_id = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT event_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .claim_by_id(&harness.project_id, event_id, 1_061)
+        .unwrap()
+        .expect("research binding event must be claimable");
+    let binding = ResearchLaunchBinding {
+        review_id: review.review_id.clone(),
+        attempt: review.attempt,
+        session_generation: review.session_generation,
+        prior_session_generation: review.session_generation,
+        session_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+        prior_session_id: None,
+        context_json: evidence.json,
+        context_digest: evidence.digest,
+        budget_reservation_id: reservation.reservation_id.clone(),
+        recovery_reason: None,
+    };
+    (review, binding, event_id, reservation.reservation_id)
+}
+
+fn insert_research_binding_run(
+    harness: &CampaignDbHarness,
+    project_id: &str,
+    event_id: i64,
+    status: AgentRunStatus,
+    execution_kind: &str,
+) -> pueue_agent::models::AgentRun {
+    let execution = ExecutionProjection::new(execution_kind, "/usr/bin/codex", "fixture")
+        .unwrap();
+    AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                project_id,
+                event_id,
+                None,
+                status,
+                1_070,
+                harness.test.project_root("research-binding-run").join("agent.log"),
+            )
+            .with_execution(execution),
+            &[event_id],
+        )
+        .unwrap()
+}
+
+fn assert_research_binding_rejected_without_mutation(
+    harness: &CampaignDbHarness,
+    review: &pueue_agent::db::ResearchReview,
+    binding: &ResearchLaunchBinding,
+    reservation_id: &str,
+    run_id: i64,
+    expected_field: &str,
+) {
+    let before_review = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    let before_state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    let before_reservation: (String, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, updated_at FROM budget_reservations WHERE reservation_id = ?1",
+            [reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    let error = ResearchRepository::new(&harness.db)
+        .bind_agent_run(binding, run_id, &harness.project_id, 1_080)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation { field, .. } if field == expected_field
+    ));
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&review.review_id)
+            .unwrap(),
+        before_review
+    );
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap(),
+        before_state
+    );
+    let after_reservation: (String, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, updated_at FROM budget_reservations WHERE reservation_id = ?1",
+            [reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after_reservation, before_reservation);
 }
 
 fn insert_event(db: &Db, project_id: &str, dedup_key: &str, not_before: i64) -> i64 {

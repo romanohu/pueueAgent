@@ -569,6 +569,34 @@ impl<'db> ResearchRepository<'db> {
                 },
             )
             .map_err(database_error("read research run binding"))?;
+        let active_run: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT project_id, execution_kind
+                 FROM agent_runs
+                 WHERE run_id = ?1 AND status IN ('starting','running')",
+                [agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read research agent run"))?;
+        let Some((run_project_id, execution_kind)) = active_run else {
+            return Err(validation_error(
+                "agent_run_id",
+                "must identify an active agent run in the research project",
+            ));
+        };
+        if run_project_id != project_id {
+            return Err(validation_error(
+                "agent_run_id",
+                "must identify an active agent run in the research project",
+            ));
+        }
+        if execution_kind.as_deref() != Some("campaign_research") {
+            return Err(validation_error(
+                "execution_kind",
+                "must identify a campaign_research agent run",
+            ));
+        }
         if current_attempt != binding.attempt
             || current_generation != binding.prior_session_generation
             || current_review_generation != binding.prior_session_generation
