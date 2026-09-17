@@ -42,6 +42,8 @@ struct ResearchHarness {
     experiment_id: String,
     capture_path: PathBuf,
     control_path: PathBuf,
+    codex_home: PathBuf,
+    fixture_session_id: String,
 }
 
 struct ClaimedReview {
@@ -202,20 +204,14 @@ max_agent_runs = 10
         ResearchRepository::new(&db)
             .schedule_running(&campaign_id, NOW + 1, 1, NOW + 60)
             .unwrap();
-        let review = ResearchRepository::new(&db)
+        ResearchRepository::new(&db)
             .claim_due(&campaign_id, &experiment_id, &task_signature, NOW + 61)
             .unwrap()
             .expect("running baseline must produce one research review");
         let capture_path = fixture_root.join("research-capture.txt");
         let control_path = fixture_root.join("research-control.txt");
         let codex = trusted_bin.join("codex");
-        compile_research_codex(
-            &trusted_bin,
-            &codex,
-            &capture_path,
-            &control_path,
-            fixture_session_id,
-        );
+        compile_research_codex(&trusted_bin, &codex, &capture_path, &control_path);
         let pueue = trusted_bin.join("pueue");
         fs::copy(&codex, &pueue).unwrap();
         fs::set_permissions(&pueue, fs::Permissions::from_mode(0o700)).unwrap();
@@ -255,6 +251,7 @@ max_agent_runs = 10
             })
             .unwrap(),
         );
+        let codex_home = policy.codex_home.clone();
         let project_config = config::load(&config_path).unwrap();
         let runner = AgentRunner::new(AgentRunnerConfig::production(), Arc::clone(&policy));
         let project_policy = runner
@@ -272,6 +269,8 @@ max_agent_runs = 10
             experiment_id,
             capture_path,
             control_path,
+            codex_home,
+            fixture_session_id: fixture_session_id.to_owned(),
         }
     }
 
@@ -298,7 +297,7 @@ max_agent_runs = 10
     ) -> pueue_agent::models::BudgetReservation {
         match CampaignRepository::new(&self.db)
             .reserve_agent_run(
-                &self.campaign_id,
+                &review.campaign_id,
                 &format!("research:{}:attempt:{}", review.review_id, review.attempt),
                 &CampaignLimits::default(),
                 now,
@@ -320,12 +319,29 @@ max_agent_runs = 10
         claimed: &ClaimedReview,
         context: AgentContextMode,
     ) -> pueue_agent::agent::AgentHandle {
+        self.try_launch_with_options(claimed, context, &self.fixture_session_id, true, None)
+            .await
+            .unwrap_or_else(|error| panic!("research native launch must bind: {error}"))
+    }
+
+    async fn try_launch_with_options(
+        &self,
+        claimed: &ClaimedReview,
+        context: AgentContextMode,
+        fixture_session_id: &str,
+        write_session: bool,
+        reservation_id: Option<&str>,
+    ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
         let launch_now = claimed.claimed_at + 19;
         fs::write(
             &self.control_path,
             format!(
-                "{}\n{}\n{}\n",
-                claimed.review.review_id, claimed.review.experiment_id, claimed.evidence.digest
+                "{}\n{}\n{}\n{}\n{}\n",
+                claimed.review.review_id,
+                claimed.review.experiment_id,
+                claimed.evidence.digest,
+                fixture_session_id,
+                write_session,
             ),
         )
         .unwrap();
@@ -334,7 +350,10 @@ max_agent_runs = 10
             .claim_by_id(&self.project.project_id, claimed.event_id, launch_now)
             .unwrap()
             .expect("research event must be claimable");
-        let budget = self.reserve_budget(&claimed.review, launch_now);
+        let reservation_id = reservation_id.map(str::to_owned).unwrap_or_else(|| {
+            self.reserve_budget(&claimed.review, launch_now)
+                .reservation_id
+        });
         let run_id_guard = self
             .runner
             .try_acquire_run_id_admission_guard(&self.db)
@@ -358,13 +377,12 @@ max_agent_runs = 10
                 &[claimed.event_id],
                 &claimed.review,
                 &claimed.evidence,
-                budget.reservation_id.as_str(),
+                &reservation_id,
                 launch_now,
                 run_id_guard,
                 project_lock,
             )
             .await
-            .unwrap_or_else(|error| panic!("research native launch must bind: {error}"))
     }
 
     fn execution_kind(&self, run_id: i64) -> String {
@@ -393,12 +411,54 @@ max_agent_runs = 10
     }
 
     fn research_session(&self) -> Option<String> {
+        self.research_session_for(&self.campaign_id)
+    }
+
+    fn research_session_for(&self, campaign_id: &str) -> Option<String> {
         self.db
             .connect()
             .unwrap()
             .query_row(
                 "SELECT session_id FROM campaign_research WHERE campaign_id = ?1",
-                [&self.campaign_id],
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn remove_session_metadata(&self, session_id: &str) {
+        let path = self
+            .codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join(format!("rollout-{session_id}.jsonl"));
+        fs::remove_file(path).unwrap();
+    }
+
+    fn reservation_id_for(&self, review: &pueue_agent::db::ResearchReview) -> String {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT reservation_id FROM budget_reservations
+                 WHERE campaign_id = ?1 AND dimension = 'agent_run' AND subject_key = ?2",
+                rusqlite::params![
+                    &review.campaign_id,
+                    format!("research:{}:attempt:{}", review.review_id, review.attempt),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn reservation_status(&self, reservation_id: &str) -> String {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM budget_reservations WHERE reservation_id = ?1",
+                [reservation_id],
                 |row| row.get(0),
             )
             .unwrap()
@@ -512,7 +572,6 @@ fn compile_research_codex(
     target: &Path,
     capture_path: &Path,
     control_path: &Path,
-    session_id: &str,
 ) {
     let source = trusted_bin.join("research-codex.rs");
     fs::write(
@@ -529,13 +588,15 @@ fn pair(args: &[String], name: &str) -> Option<String> {{
     args.windows(2).find(|pair| pair[0] == name).map(|pair| pair[1].clone())
 }}
 
-fn controls() -> (String, String, String) {{
+fn controls() -> (String, String, String, String, bool) {{
     let contents = fs::read_to_string({control_path:?}).unwrap();
     let mut fields = contents.lines();
     let review_id = fields.next().expect("fixture review control").to_owned();
     let experiment_id = fields.next().expect("fixture experiment control").to_owned();
     let context_digest = fields.next().expect("fixture digest control").to_owned();
-    (review_id, experiment_id, context_digest)
+    let fixture_session_id = fields.next().expect("fixture session control").to_owned();
+    let write_session = fields.next().expect("fixture session mode").parse::<bool>().unwrap();
+    (review_id, experiment_id, context_digest, fixture_session_id, write_session)
 }}
 
 fn write_session(id: &str) {{
@@ -569,8 +630,9 @@ fn main() {{
     let separator = args.iter().position(|arg| arg == "--").unwrap();
     let prompt = args.get(separator + 1).cloned().unwrap_or_default();
     let resume_id = args.windows(2).find(|pair| pair[0] == "resume").map(|pair| pair[1].clone());
-    let session_id = resume_id.clone().unwrap_or_else(|| {session_id:?}.to_owned());
-    write_session(&session_id);
+    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session) = controls();
+    let session_id = resume_id.clone().unwrap_or(fixture_session_id);
+    if should_write_session {{ write_session(&session_id); }}
 
     let write_flags = args.windows(2).any(|pair| pair[0] == "--sandbox")
         || args.windows(2).any(|pair| {{
@@ -611,7 +673,6 @@ fn main() {{
         eprintln!("research output files were not pre-created with the expected schema/output contract");
         std::process::exit(42);
     }}
-    let (review_id, experiment_id, context_digest) = controls();
     let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":"fixture note","next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
     fs::write(output, answer).unwrap();
     println!("fixture-stdout");
@@ -620,7 +681,6 @@ fn main() {{
 "##,
             capture_path = capture_path.display(),
             control_path = control_path.display(),
-            session_id = session_id,
             transcript_sentinel = USER_TRANSCRIPT_SENTINEL,
         ),
     )
@@ -724,4 +784,88 @@ async fn research_new_campaign_starts_a_distinct_fresh_session() {
         .expect("second campaign must persist a session");
     assert_ne!(first_session, second_session);
     assert_eq!(second_session, SECOND_SESSION);
+}
+
+#[tokio::test]
+async fn research_safe_missing_session_reconstructs_lineage_without_resetting_attempt_or_budget() {
+    let harness = ResearchHarness::new("reconstruct", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    let first_session = harness
+        .research_session()
+        .expect("first native run must persist its session");
+    let first_generation = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap()
+        .session_generation;
+    let first_attempt = first.review.attempt;
+    let first_reservation = harness.reservation_id_for(&first.review);
+    assert_eq!(harness.reservation_status(&first_reservation), "consumed");
+
+    harness.remove_session_metadata(&first_session);
+    let changed = harness.prepare_changed_experiment();
+    assert_eq!(changed.review.attempt, first_attempt);
+    let second_result = harness
+        .try_launch_with_options(
+            &changed,
+            AgentContextMode::Fresh,
+            SECOND_SESSION,
+            true,
+            None,
+        )
+        .await;
+    let mut second = second_result
+        .expect("a safely Missing dead session must permit a bounded fresh reconstruction");
+    assert_eq!(
+        second.wait(&harness.db, NOW + 210).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert_eq!(state.session_generation, first_generation + 1);
+    assert_eq!(state.session_id.as_deref(), Some(SECOND_SESSION));
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.attempt, first_attempt);
+    let second_reservation = harness.reservation_id_for(&changed.review);
+    assert_eq!(harness.reservation_status(&first_reservation), "consumed");
+    assert_eq!(harness.reservation_status(&second_reservation), "consumed");
+}
+
+#[tokio::test]
+async fn research_native_launch_rejects_budget_reservation_for_different_review() {
+    let harness = ResearchHarness::new("reservation", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    let first_reservation = harness.reservation_id_for(&first.review);
+    let session = harness
+        .research_session()
+        .expect("first native run must persist its session");
+    let changed = harness.prepare_changed_experiment();
+    let result = harness
+        .try_launch_with_options(
+            &changed,
+            AgentContextMode::Resume {
+                session_id: session,
+            },
+            FIRST_SESSION,
+            true,
+            Some(&first_reservation),
+        )
+        .await;
+    if let Ok(mut handle) = result {
+        let status = handle.wait(&harness.db, NOW + 210).await.unwrap();
+        panic!("native launch accepted a reservation bound to another review (status {status:?})");
+    }
 }
