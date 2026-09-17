@@ -28,8 +28,11 @@ use tempfile::{tempdir, TempDir};
 
 const FIRST_SESSION: &str = "11111111-1111-4111-8111-111111111111";
 const SECOND_SESSION: &str = "22222222-2222-4222-8222-222222222222";
+const STALE_SESSION: &str = "33333333-3333-4333-8333-333333333333";
 const NOW: i64 = 10_000;
 const USER_TRANSCRIPT_SENTINEL: &str = "research-user-note-must-not-reach-public-log";
+const USER_STDOUT_SENTINEL: &str = "fixture-user-output-stdout-7f4a";
+const USER_STDERR_SENTINEL: &str = "fixture-user-output-stderr-8b2c";
 
 struct ResearchHarness {
     _temp: TempDir,
@@ -436,6 +439,26 @@ max_agent_runs = 10
         fs::remove_file(path).unwrap();
     }
 
+    fn seed_preexisting_owned_session(&self, session_id: &str) {
+        let sessions = self.codex_home.join("sessions");
+        let year = sessions.join("2026");
+        let directory = year.join("09");
+        fs::create_dir_all(&directory).unwrap();
+        for path in [&sessions, &year, &directory] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let record = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": self.project.root_path.to_string_lossy(),
+            },
+        });
+        let path = directory.join(format!("rollout-{session_id}.jsonl"));
+        fs::write(&path, format!("{}\n", record)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     fn reservation_id_for(&self, review: &pueue_agent::db::ResearchReview) -> String {
         self.db
             .connect()
@@ -675,13 +698,15 @@ fn main() {{
     }}
     let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":"fixture note","next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
     fs::write(output, answer).unwrap();
-    println!("fixture-stdout");
-    eprintln!("fixture-stderr");
+    println!({stdout_sentinel:?});
+    eprintln!({stderr_sentinel:?});
 }}
 "##,
             capture_path = capture_path.display(),
             control_path = control_path.display(),
             transcript_sentinel = USER_TRANSCRIPT_SENTINEL,
+            stdout_sentinel = USER_STDOUT_SENTINEL,
+            stderr_sentinel = USER_STDERR_SENTINEL,
         ),
     )
     .unwrap();
@@ -727,6 +752,58 @@ async fn research_first_native_launch_is_read_only_schema_bound_and_does_not_log
     assert!(!public_log.contains(USER_TRANSCRIPT_SENTINEL));
     assert!(!public_log.contains("OPENAI_API_KEY"));
     assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
+}
+
+#[tokio::test]
+async fn research_fresh_launch_does_not_adopt_preexisting_same_project_session() {
+    let harness = ResearchHarness::new("stale-session", FIRST_SESSION);
+    harness.seed_preexisting_owned_session(STALE_SESSION);
+    let claimed = harness.initial_review();
+    let result = harness
+        .try_launch_with_options(
+            &claimed,
+            AgentContextMode::Fresh,
+            STALE_SESSION,
+            false,
+            None,
+        )
+        .await;
+    let status = match result {
+        Ok(mut handle) => handle.wait(&harness.db, NOW + 91).await.ok(),
+        Err(_) => None,
+    };
+    assert_ne!(
+        status,
+        Some(pueue_agent::models::AgentRunStatus::Completed),
+        "a valid response must not legitimize a preexisting session the child did not create"
+    );
+    assert_ne!(
+        harness.research_session().as_deref(),
+        Some(STALE_SESSION),
+        "fresh research must not adopt an unrelated same-project session"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_ne!(
+        stored.state, "completed",
+        "a response without child-established session identity must not complete the review"
+    );
+}
+
+#[tokio::test]
+async fn research_public_log_excludes_user_payloads_from_stdout_and_stderr() {
+    let harness = ResearchHarness::new("private-output", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let log_path = handle.log_path.clone();
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    let public_log = fs::read_to_string(log_path).unwrap();
+    assert!(!public_log.contains(USER_STDOUT_SENTINEL));
+    assert!(!public_log.contains(USER_STDERR_SENTINEL));
 }
 
 #[tokio::test]
