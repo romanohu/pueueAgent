@@ -1,5 +1,195 @@
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+  SIGNAL_CHILD_PID=""
+  SIGNAL_CHILD_PID_FILE=""
+  SIGNAL_CLEANED=0
+  SIGNAL_RUSTC_MARKER=""
+  SIGNAL_RUSTC_PID=""
+  SIGNAL_RUNNER_LOG=""
+  SIGNAL_SUPERVISOR_PID=""
+  SIGNAL_WORK_PATH=""
+}
+
+teardown() {
+  signal_fixture_cleanup
+}
+
+signal_pid_valid() {
+  case "${1:-}" in
+    ''|0|1|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+signal_fixture_cleanup() {
+  [ "${SIGNAL_CLEANED:-0}" -eq 0 ] || return 0
+  if ! signal_pid_valid "${SIGNAL_CHILD_PID:-}" &&
+    [ -n "${SIGNAL_CHILD_PID_FILE:-}" ]; then
+    for _ in $(seq 50); do
+      if [ -s "$SIGNAL_CHILD_PID_FILE" ]; then
+        SIGNAL_CHILD_PID="$(<"$SIGNAL_CHILD_PID_FILE")"
+        break
+      fi
+      if signal_pid_valid "${SIGNAL_SUPERVISOR_PID:-}" &&
+        ! kill -0 "$SIGNAL_SUPERVISOR_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+  if ! signal_pid_valid "${SIGNAL_RUSTC_PID:-}" &&
+    [ -n "${SIGNAL_RUSTC_MARKER:-}" ]; then
+    if [ -s "$SIGNAL_RUSTC_MARKER" ]; then
+      SIGNAL_RUSTC_PID="$(<"$SIGNAL_RUSTC_MARKER")"
+    fi
+  fi
+
+  if signal_pid_valid "${SIGNAL_SUPERVISOR_PID:-}"; then
+    kill -TERM "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+  fi
+  if signal_pid_valid "${SIGNAL_CHILD_PID:-}"; then
+    kill -TERM -- "-${SIGNAL_CHILD_PID}" 2>/dev/null || true
+  fi
+  if signal_pid_valid "${SIGNAL_RUSTC_PID:-}"; then
+    kill -TERM "$SIGNAL_RUSTC_PID" 2>/dev/null || true
+  fi
+
+  for _ in $(seq 50); do
+    remaining=0
+    if signal_pid_valid "${SIGNAL_SUPERVISOR_PID:-}" &&
+      kill -0 "$SIGNAL_SUPERVISOR_PID" 2>/dev/null; then
+      remaining=1
+    fi
+    if signal_pid_valid "${SIGNAL_CHILD_PID:-}" &&
+      kill -0 -- "-${SIGNAL_CHILD_PID}" 2>/dev/null; then
+      remaining=1
+    fi
+    if signal_pid_valid "${SIGNAL_RUSTC_PID:-}" &&
+      kill -0 "$SIGNAL_RUSTC_PID" 2>/dev/null; then
+      remaining=1
+    fi
+    [ "$remaining" -eq 0 ] && break
+    sleep 0.1
+  done
+
+  if signal_pid_valid "${SIGNAL_CHILD_PID:-}"; then
+    kill -KILL -- "-${SIGNAL_CHILD_PID}" 2>/dev/null || true
+  fi
+  if signal_pid_valid "${SIGNAL_RUSTC_PID:-}"; then
+    kill -KILL "$SIGNAL_RUSTC_PID" 2>/dev/null || true
+  fi
+  if signal_pid_valid "${SIGNAL_SUPERVISOR_PID:-}"; then
+    kill -KILL "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+    wait "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+  fi
+  if [ -n "${SIGNAL_WORK_PATH:-}" ] && [ -d "$SIGNAL_WORK_PATH" ]; then
+    rm -rf "$SIGNAL_WORK_PATH"
+  fi
+  SIGNAL_CLEANED=1
+}
+
+run_signal_retention_probe() {
+  signal_name="$1"
+  expected_status="$2"
+  readiness_mode="${3:-normal}"
+  case "$signal_name" in
+    TERM|INT) ;;
+    *) return 64 ;;
+  esac
+
+  fake_bin="$BATS_TEST_TMPDIR/signal-bin-$signal_name-$readiness_mode"
+  mkdir -p "$fake_bin"
+  work_marker="$BATS_TEST_TMPDIR/signal-work-path-$signal_name-$readiness_mode"
+  child_pid_file="$BATS_TEST_TMPDIR/signal-child-pid-$signal_name-$readiness_mode"
+  rustc_marker="$BATS_TEST_TMPDIR/signal-rustc-pid-$signal_name-$readiness_mode"
+  real_mktemp="$(command -v mktemp)"
+  real_python3="$(command -v python3)"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "work_path=\"\$($real_mktemp \"\$@\")\"" \
+    "printf '%s\\n' \"\$work_path\" > \"$work_marker\"" \
+    'printf "%s\n" "$work_path"' > "$fake_bin/mktemp"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" Linux' > "$fake_bin/uname"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueue"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueued"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/git"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/python3"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/jq"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/sqlite3"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "printf '%s\\n' \"\$\$\" > \"$rustc_marker\"" \
+    'while :; do sleep 1; done' > "$fake_bin/rustc"
+  chmod +x "$fake_bin"/*
+
+  SIGNAL_CHILD_PID_FILE="$child_pid_file"
+  SIGNAL_RUSTC_MARKER="$rustc_marker"
+  SIGNAL_RUNNER_LOG="$BATS_TEST_TMPDIR/signal-runner-$signal_name-$readiness_mode.log"
+  env PATH="$fake_bin:/usr/bin:/bin" \
+    PUEUE_AGENT_SIGNAL_CHILD_PID_FILE="$child_pid_file" \
+    "$real_python3" "$REPO_ROOT/tests/support/signal_supervisor.py" \
+    /bin/bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh" \
+    >"$SIGNAL_RUNNER_LOG" 2>&1 &
+  SIGNAL_SUPERVISOR_PID=$!
+
+  for _ in $(seq 50); do
+    if [ -s "$child_pid_file" ]; then
+      SIGNAL_CHILD_PID="$(<"$child_pid_file")"
+      break
+    fi
+    sleep 0.1
+  done
+  [ -n "$SIGNAL_CHILD_PID" ]
+  for _ in $(seq 50); do
+    if [ -s "$work_marker" ]; then
+      SIGNAL_WORK_PATH="$(<"$work_marker")"
+      break
+    fi
+    sleep 0.1
+  done
+  [ -n "$SIGNAL_WORK_PATH" ]
+
+  if [ "$readiness_mode" = "fail-before-rustc-pid" ]; then
+    for _ in $(seq 50); do
+      [ -s "$rustc_marker" ] && break
+      sleep 0.1
+    done
+    [ -s "$rustc_marker" ]
+    # Deliberately return before assigning SIGNAL_RUSTC_PID.  Teardown must
+    # discover it from the marker and still terminate the private child group.
+    return 73
+  fi
+
+  for _ in $(seq 50); do
+    if [ -s "$rustc_marker" ]; then
+      SIGNAL_RUSTC_PID="$(<"$rustc_marker")"
+      break
+    fi
+    sleep 0.1
+  done
+  [ -n "$SIGNAL_RUSTC_PID" ]
+
+  kill -"$signal_name" "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+  supervisor_status=125
+  supervisor_exited=0
+  for _ in $(seq 50); do
+    if ! kill -0 "$SIGNAL_SUPERVISOR_PID" 2>/dev/null; then
+      supervisor_exited=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$supervisor_exited" -eq 0 ]; then
+    kill -KILL "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+    wait "$SIGNAL_SUPERVISOR_PID" || supervisor_status=$?
+  elif wait "$SIGNAL_SUPERVISOR_PID"; then
+    supervisor_status=0
+  else
+    supervisor_status=$?
+  fi
+
+  [ "$supervisor_status" -eq "$expected_status" ]
+  [ -d "$SIGNAL_WORK_PATH" ]
+  grep -F "Rust E2E retained WORK after failure: $SIGNAL_WORK_PATH" "$SIGNAL_RUNNER_LOG"
+  signal_fixture_cleanup
 }
 
 @test "real Pueue campaign acceptance is explicitly Linux-only" {
@@ -37,110 +227,31 @@ setup() {
   rm -rf "$retained_work"
 }
 
-@test "signal-terminated real Pueue harness retains diagnostics and status" {
-  fake_bin="$BATS_TEST_TMPDIR/signal-bin"
-  mkdir -p "$fake_bin"
-  work_marker="$BATS_TEST_TMPDIR/signal-work-path"
-  rustc_marker="$BATS_TEST_TMPDIR/signal-rustc-pid"
-  real_mktemp="$(command -v mktemp)"
-  printf '%s\n' '#!/usr/bin/env bash' \
-    "work_path=\"\$($real_mktemp \"\$@\")\"" \
-    "printf '%s\\n' \"\$work_path\" > \"$work_marker\"" \
-    'printf "%s\\n" "$work_path"' > "$fake_bin/mktemp"
-  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" Linux' > "$fake_bin/uname"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueue"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueued"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/git"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/python3"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/jq"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/sqlite3"
-  printf '%s\n' '#!/usr/bin/env bash' \
-    "printf '%s\\n' \"\$\$\" > \"$rustc_marker\"" \
-    'while :; do sleep 1; done' > "$fake_bin/rustc"
-  chmod +x "$fake_bin"/*
+@test "TERM-terminated real Pueue harness retains diagnostics and status" {
+  run_signal_retention_probe TERM 143
+}
 
-  runner_log="$BATS_TEST_TMPDIR/signal-runner.log"
-  runner_pid=""
-  rustc_pid=""
-  work_path=""
-  cleanup_signal_fixture() {
-    for pid in "${runner_pid:-}" "${rustc_pid:-}"; do
-      case "$pid" in
-        ''|*[!0-9]*) continue ;;
-      esac
-      kill -TERM "$pid" 2>/dev/null || true
-    done
-    for _ in $(seq 50); do
-      remaining=0
-      for pid in "${runner_pid:-}" "${rustc_pid:-}"; do
-        case "$pid" in
-          ''|*[!0-9]*) continue ;;
-        esac
-        if kill -0 "$pid" 2>/dev/null; then
-          remaining=1
-        fi
-      done
-      [ "$remaining" -eq 0 ] && break
-      sleep 0.1
-    done
-    for pid in "${runner_pid:-}" "${rustc_pid:-}"; do
-      case "$pid" in
-        ''|*[!0-9]*) continue ;;
-      esac
-      kill -KILL "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    done
-    if [ -n "${work_path:-}" ] && [ -d "$work_path" ]; then
-      rm -rf "$work_path"
-    fi
-  }
-  trap cleanup_signal_fixture EXIT
-  env PATH="$fake_bin:/usr/bin:/bin" \
-    /bin/bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh" \
-    >"$runner_log" 2>&1 &
-  runner_pid=$!
-  for _ in $(seq 50); do
-    if [ -s "$work_marker" ]; then
-      work_path="$(<"$work_marker")"
-      break
-    fi
-    sleep 0.1
-  done
-  [ -n "$work_path" ]
-  for _ in $(seq 50); do
-    [ -s "$rustc_marker" ] && break
-    sleep 0.1
-  done
-  [ -s "$rustc_marker" ]
+@test "INT-terminated real Pueue harness retains diagnostics and status" {
+  run_signal_retention_probe INT 130
+}
 
-  kill -TERM "$runner_pid" 2>/dev/null || true
-  rustc_pid="$(<"$rustc_marker")"
-  kill -TERM "$rustc_pid" 2>/dev/null || true
-  runner_status=125
-  runner_exited=0
-  for _ in $(seq 50); do
-    if ! kill -0 "$runner_pid" 2>/dev/null; then
-      runner_exited=1
-      break
-    fi
-    sleep 0.1
-  done
-  if [ "$runner_exited" -eq 0 ]; then
-    kill -KILL "$runner_pid" 2>/dev/null || true
-    wait "$runner_pid" || runner_status=$?
+@test "signal probe bounds cleanup after readiness failure" {
+  started_at="$(date +%s)"
+  if run_signal_retention_probe TERM 143 fail-before-rustc-pid; then
+    probe_status=0
   else
-    if wait "$runner_pid"; then
-      runner_status=0
-    else
-      runner_status=$?
-    fi
+    probe_status=$?
   fi
+  signal_fixture_cleanup
+  elapsed=$(( $(date +%s) - started_at ))
 
-  [ "$runner_status" -eq 143 ]
-  [ -d "$work_path" ]
-  grep -F "Rust E2E retained WORK after failure: $work_path" "$runner_log"
-  trap - EXIT
-  cleanup_signal_fixture
+  [ "$probe_status" -eq 73 ]
+  [ -s "$SIGNAL_RUSTC_MARKER" ]
+  [ -n "$SIGNAL_RUSTC_PID" ]
+  if kill -0 "$SIGNAL_RUSTC_PID" 2>/dev/null; then
+    false
+  fi
+  [ "$elapsed" -lt 15 ]
 }
 
 @test "real Pueue harness asserts the production-derived Codex network argument" {
