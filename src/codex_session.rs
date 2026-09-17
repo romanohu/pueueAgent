@@ -48,6 +48,12 @@ const MAX_SESSION_STORE_ENTRIES: usize = 4096;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_SESSION_METADATA_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedSessionProbe {
+    Owned(String),
+    Missing,
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionTraversalHookPoint {
@@ -185,10 +191,12 @@ pub fn home_from_environment() -> Result<PathBuf, AppError> {
 mod platform_cfg_contract_tests {
     const SECURE_SESSION_HELPERS: &[&str] = &[
         "verify_project_ownership_unix",
+        "probe_owned_session_unix",
         "resolve_latest_owned_session_unix",
         "walk_session_directory",
         "locate_metadata",
         "locate_metadata_with_limit",
+        "locate_metadata_with_limit_typed",
         "read_metadata_from_file",
         "open_session_home",
         "open_directory_path_nofollow",
@@ -260,6 +268,30 @@ pub fn verify_project_ownership(
     verify_project_ownership_unix(codex_home, project_root, session_id)
 }
 
+pub fn probe_owned_session(
+    codex_home: &Path,
+    project_root: &Path,
+    session_id: &str,
+) -> Result<OwnedSessionProbe, AppError> {
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos"
+    )))]
+    {
+        let _ = (codex_home, project_root, session_id);
+        return Err(AppError::from(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::PreBinding,
+        )));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos"
+    ))]
+    probe_owned_session_unix(codex_home, project_root, session_id)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_project_ownership_unix(
     codex_home: &Path,
@@ -268,24 +300,53 @@ fn verify_project_ownership_unix(
 ) -> Result<String, AppError> {
     let session_id = normalize_session_id(session_id)?;
     let metadata = locate_metadata(codex_home, &session_id)?;
-    let metadata = read_metadata_from_file(metadata.file, &session_id)?;
+    verify_metadata_ownership(project_root, &session_id, metadata.file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn probe_owned_session_unix(
+    codex_home: &Path,
+    project_root: &Path,
+    session_id: &str,
+) -> Result<OwnedSessionProbe, AppError> {
+    let session_id = normalize_session_id(session_id)?;
+    let metadata = match locate_metadata_with_limit_typed(
+        codex_home,
+        &session_id,
+        MAX_SESSION_STORE_ENTRIES,
+    ) {
+        Ok(metadata) => metadata,
+        Err(SessionMetadataLookupError::Missing) => return Ok(OwnedSessionProbe::Missing),
+        Err(SessionMetadataLookupError::Unsafe(error)) => return Err(error),
+    };
+    verify_metadata_ownership(project_root, &session_id, metadata.file)
+        .map(OwnedSessionProbe::Owned)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_metadata_ownership(
+    project_root: &Path,
+    session_id: &str,
+    metadata_file: File,
+) -> Result<String, AppError> {
+    let metadata = read_metadata_from_file(metadata_file, session_id)?;
 
     if metadata.kind != "session_meta" {
         return Err(metadata_error(
-            &session_id,
+            session_id,
             "metadata is malformed (first record is not session_meta)",
         ));
     }
-    let metadata_id = normalize_metadata_id(&metadata.payload.id, &session_id)?;
+    let metadata_id = normalize_metadata_id(&metadata.payload.id, session_id)?;
     if metadata_id != session_id {
         return Err(metadata_error(
-            &session_id,
+            session_id,
             "metadata session ID does not match the requested session",
         ));
     }
     if !metadata.payload.cwd.is_absolute() {
         return Err(metadata_error(
-            &session_id,
+            session_id,
             "metadata is malformed (cwd is not absolute)",
         ));
     }
@@ -297,15 +358,15 @@ fn verify_project_ownership_unix(
         }
     })?;
     let canonical_session_cwd = fs::canonicalize(&metadata.payload.cwd)
-        .map_err(|_| metadata_error(&session_id, "metadata cwd cannot be canonicalized"))?;
+        .map_err(|_| metadata_error(session_id, "metadata cwd cannot be canonicalized"))?;
     if !canonical_session_cwd.starts_with(&canonical_project_root) {
         return Err(metadata_error(
-            &session_id,
+            session_id,
             "metadata cwd is outside project root",
         ));
     }
 
-    Ok(session_id)
+    Ok(session_id.to_owned())
 }
 
 /// Resolve the most recently modified valid session owned by `project_root`.
@@ -527,13 +588,40 @@ fn locate_metadata_with_limit(
     session_id: &str,
     max_entries: usize,
 ) -> Result<OpenedSessionMetadata, AppError> {
+    locate_metadata_with_limit_typed(codex_home, session_id, max_entries)
+        .map_err(|error| match error {
+            SessionMetadataLookupError::Missing => {
+                metadata_error(session_id, "metadata was not found in CODEX_HOME")
+            }
+            SessionMetadataLookupError::Unsafe(error) => error,
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+enum SessionMetadataLookupError {
+    Missing,
+    Unsafe(AppError),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn locate_metadata_with_limit_typed(
+    codex_home: &Path,
+    session_id: &str,
+    max_entries: usize,
+) -> Result<OpenedSessionMetadata, SessionMetadataLookupError> {
     let suffix = format!("-{session_id}.jsonl");
     let mut matched_path = None;
     let mut callback_failure = None;
     let mut remaining_entries = max_entries;
 
     let (codex_home, codex_home_path) = open_session_home(codex_home)
-        .map_err(|_| metadata_error(session_id, "session store is unreadable"))?;
+        .map_err(|_| {
+            SessionMetadataLookupError::Unsafe(metadata_error(
+                session_id,
+                "session store is unreadable",
+            ))
+        })?;
     for store_name in SESSION_STORES {
         let store_path = codex_home_path.join(store_name);
         invoke_session_traversal_hook(SessionTraversalHookPoint::Store, &store_path);
@@ -541,12 +629,17 @@ fn locate_metadata_with_limit(
             Ok(store) => store,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
-                return Err(metadata_error(
+                return Err(SessionMetadataLookupError::Unsafe(metadata_error(
                     session_id,
                     "session store is not a directory",
-                ));
+                )));
             }
-            Err(_) => return Err(metadata_error(session_id, "session store is unreadable")),
+            Err(_) => {
+                return Err(SessionMetadataLookupError::Unsafe(metadata_error(
+                    session_id,
+                    "session store is unreadable",
+                )))
+            }
         };
         let mut visit = |_path: &Path,
                          entry: &std::ffi::OsStr,
@@ -577,23 +670,26 @@ fn locate_metadata_with_limit(
         );
         if let Err(error) = result {
             return match error {
-                SessionWalkError::Limit => Err(metadata_error(
-                    session_id,
-                    "metadata discovery exceeded the traversal limit",
+                SessionWalkError::Limit => Err(SessionMetadataLookupError::Unsafe(
+                    metadata_error(
+                        session_id,
+                        "metadata discovery exceeded the traversal limit",
+                    ),
                 )),
-                SessionWalkError::Callback => Err(metadata_error(
-                    session_id,
-                    callback_failure.unwrap_or("session store is unreadable"),
+                SessionWalkError::Callback => Err(SessionMetadataLookupError::Unsafe(
+                    metadata_error(
+                        session_id,
+                        callback_failure.unwrap_or("session store is unreadable"),
+                    ),
                 )),
-                SessionWalkError::Io => Err(metadata_error(
-                    session_id,
-                    "session store is unreadable",
+                SessionWalkError::Io => Err(SessionMetadataLookupError::Unsafe(
+                    metadata_error(session_id, "session store is unreadable"),
                 )),
             };
         }
     }
 
-    matched_path.ok_or_else(|| metadata_error(session_id, "metadata was not found in CODEX_HOME"))
+    matched_path.ok_or(SessionMetadataLookupError::Missing)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -858,6 +954,123 @@ mod tests {
 
     const SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
     const OTHER_SESSION_ID: &str = "019f9f30-a553-7e21-b108-16a5c341f728";
+
+    #[test]
+    fn safe_empty_store_is_missing_not_owned() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let probe = probe_owned_session(&codex_home, &project_root, SESSION_ID).unwrap();
+
+        assert!(matches!(probe, OwnedSessionProbe::Missing));
+    }
+
+    #[test]
+    fn archived_owned_session_is_owned() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&project_root).unwrap();
+        write_metadata(
+            &codex_home.join("archived_sessions"),
+            SESSION_ID,
+            SESSION_ID,
+            &project_root,
+        );
+
+        let probe = probe_owned_session(&codex_home, &project_root, SESSION_ID).unwrap();
+
+        assert!(matches!(probe, OwnedSessionProbe::Owned(id) if id == SESSION_ID));
+    }
+
+    #[test]
+    fn malformed_metadata_is_not_missing() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let metadata_dir = temp.path().join("codex-home/sessions");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&metadata_dir).unwrap();
+        fs::write(
+            metadata_dir.join(format!("rollout-test-{SESSION_ID}.jsonl")),
+            b"{malformed\n",
+        )
+        .unwrap();
+
+        let error = probe_owned_session(
+            &temp.path().join("codex-home"),
+            &project_root,
+            SESSION_ID,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::CodexSessionMetadata { .. }));
+    }
+
+    #[test]
+    fn foreign_cwd_is_not_missing() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let foreign_root = temp.path().join("foreign");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&foreign_root).unwrap();
+        write_metadata(
+            &codex_home.join("sessions"),
+            SESSION_ID,
+            SESSION_ID,
+            &foreign_root,
+        );
+
+        let error = probe_owned_session(&codex_home, &project_root, SESSION_ID).unwrap_err();
+
+        assert!(matches!(error, AppError::CodexSessionMetadata { .. }));
+    }
+
+    #[test]
+    fn invalid_id_is_not_missing() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let error = probe_owned_session(&codex_home, &project_root, "not-a-uuid").unwrap_err();
+
+        assert!(matches!(error, AppError::Configuration { field: "agent.context.session_id" }));
+    }
+
+    #[test]
+    fn unreadable_home_is_not_missing() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home-file");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::write(&codex_home, b"not a directory").unwrap();
+
+        let error = probe_owned_session(&codex_home, &project_root, SESSION_ID).unwrap_err();
+
+        assert!(matches!(error, AppError::CodexSessionMetadata { .. }));
+    }
+
+    #[test]
+    fn scan_limit_is_not_missing() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&project_root).unwrap();
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for index in 0..=MAX_SESSION_STORE_ENTRIES {
+            fs::write(sessions.join(format!("entry-{index}")), b"not metadata").unwrap();
+        }
+
+        let error = probe_owned_session(&codex_home, &project_root, SESSION_ID).unwrap_err();
+
+        assert!(matches!(error, AppError::CodexSessionMetadata { .. }));
+    }
 
     #[test]
     fn finds_session_metadata_at_the_maximum_discovery_depth() {
