@@ -581,6 +581,105 @@ fn research_claim_is_due_once_and_persists_authoritative_lineage() {
 }
 
 #[test]
+fn research_claim_only_selects_the_oldest_running_candidate() {
+    let h = CampaignDbHarness::new();
+    let mut limits = CampaignLimits::default();
+    limits.max_parallel_experiments = 2;
+    limits.max_proposals_per_cycle = 2;
+    h.start(&limits, 1_000);
+    h.finish_baseline(41, 1_100, ExperimentTerminalOutcome::Succeeded);
+
+    let older_proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Run the older research candidate",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--seed", "older"],
+    );
+    h.accept(
+        "proposal-research-older",
+        "experiment-research-older",
+        "submission-research-older",
+        &older_proposal,
+        &limits,
+        1_200,
+    )
+    .unwrap()
+    .accepted()
+    .unwrap();
+    let newer_proposal = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Run the newer research candidate",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--seed", "newer"],
+    );
+    h.accept(
+        "proposal-research-newer",
+        "experiment-research-newer",
+        "submission-research-newer",
+        &newer_proposal,
+        &limits,
+        1_300,
+    )
+    .unwrap()
+    .accepted()
+    .unwrap();
+
+    let experiments = [
+        ("experiment-research-older", 51, "pueue-task:v1:older", 1_200),
+        ("experiment-research-newer", 52, "pueue-task:v1:newer", 1_300),
+    ];
+    let experiment_repository = ExperimentRepository::new(&h.db);
+    let observation_repository = TaskObservationRepository::new(&h.db);
+    for (experiment_id, task_id, task_signature, started_at) in experiments {
+        experiment_repository
+            .mark_submitting(experiment_id, started_at)
+            .unwrap();
+        experiment_repository
+            .mark_accepted(experiment_id, task_id, task_signature, started_at + 1)
+            .unwrap();
+        observation_repository
+            .upsert(&NewTaskObservation::new(
+                &h.project_id,
+                task_signature,
+                task_id,
+                "pa-campaign-project",
+                vec!["python".to_owned(), "train.py".to_owned()],
+                "Running",
+                Some(started_at - 1),
+                Some(started_at),
+                None,
+                None,
+                started_at + 2,
+            ))
+            .unwrap();
+    }
+
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_400)
+        .unwrap();
+    assert!(repository
+        .claim_due(
+            &h.campaign_id,
+            "experiment-research-newer",
+            "pueue-task:v1:newer",
+            2_800,
+        )
+        .unwrap()
+        .is_none());
+    let review = repository
+        .claim_due(
+            &h.campaign_id,
+            "experiment-research-older",
+            "pueue-task:v1:older",
+            2_800,
+        )
+        .unwrap()
+        .expect("the oldest eligible live experiment should be claimed");
+    assert_eq!(review.experiment_id, "experiment-research-older");
+}
+
+#[test]
 fn research_claim_defers_without_live_task_or_when_campaign_is_paused() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
@@ -887,11 +986,69 @@ fn research_schema_v29_installs_checks_indexes_and_preserves_active_run_ownershi
 
 #[test]
 fn v28_to_v29_research_migration_preserves_events_and_is_idempotent() {
-    let test = TestDatabase::new();
-    let root = test.project_root("v28-research-project");
-    register_project(&test.db, "v28-research-project", &root, "pa-v28-research-project");
-    let event_id = insert_event(&test.db, "v28-research-project", "v28-event", 100);
-    let connection = test.db.connect().unwrap();
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.finish_baseline(41, 1_100, ExperimentTerminalOutcome::Succeeded);
+    let (decision_cycle, decision_reservation) = h.reserved_decision_attempt();
+    let decision_attempt: (String, i64, String, Option<i64>) = h
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT cycle_id, attempt_number, state, agent_run_id
+             FROM decision_attempts WHERE cycle_id = ?1 AND attempt_number = ?2",
+            params![decision_cycle.cycle_id, decision_reservation.attempt_number],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+
+    let code_change_proposal = CampaignDbHarness::proposal(
+        ProposalKind::CodeChange,
+        "Preserve this editor-linked migration row",
+        Some(CampaignDbHarness::BASELINE_EXPERIMENT_ID),
+        &["python", "train.py", "--implementation", "migration"],
+    );
+    assert!(matches!(
+        h.accept_code_change_with_run(
+            "proposal-v28-editor",
+            "experiment-v28-editor",
+            "submission-v28-editor",
+            &code_change_proposal,
+            &CampaignLimits::default(),
+            1_200,
+            "code-change-v28-editor",
+        )
+        .unwrap(),
+        ProposalAcceptance::PendingCodeChange
+    ));
+    code_change_to_editing_for_test(&h, "code-change-v28-editor", 1_220);
+    let editor_agent_run_id = editor_agent_run_for_test(&h, 28, 1_223);
+    let editor_attempt = CodeChangeRepository::new(&h.db)
+        .reserve_editor_attempt(
+            "code-change-v28-editor",
+            1,
+            editor_agent_run_id,
+            "v28-editor-session",
+            1_224,
+        )
+        .unwrap();
+    let code_change_run = CodeChangeRepository::new(&h.db)
+        .find_by_id("code-change-v28-editor")
+        .unwrap()
+        .unwrap();
+    let event_ids_before: Vec<i64> = h
+        .db
+        .connect()
+        .unwrap()
+        .prepare("SELECT event_id FROM events ORDER BY event_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let path = h.test.path.clone();
+
+    let connection = h.db.connect().unwrap();
     connection
         .execute_batch(
             "DROP TABLE campaign_research;
@@ -906,35 +1063,91 @@ fn v28_to_v29_research_migration_preserves_events_and_is_idempotent() {
         .unwrap();
     drop(connection);
 
-    let migrated = Db::open(&test.path).unwrap();
-    assert_eq!(
-        EventRepository::new(&migrated)
-            .find_by_id(event_id)
-            .unwrap()
-            .unwrap()
-            .dedup_key,
-        "v28-event"
-    );
-    let connection = migrated.connect().unwrap();
-    assert_eq!(
-        connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
-        LATEST_SCHEMA_VERSION
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('campaign_research', 'research_reviews')",
-                [],
-                |row| row.get::<_, i64>(0),
+    let assert_preserved = |migrated: &Db| {
+        let cycle = DecisionRepository::new(migrated)
+            .find_cycle_for_source(
+                CampaignDbHarness::CAMPAIGN_ID,
+                CampaignDbHarness::BASELINE_EXPERIMENT_ID,
             )
-            .unwrap(),
-        2
-    );
-    drop(connection);
-    Db::open(&test.path).unwrap();
+            .unwrap()
+            .unwrap();
+        assert_eq!(cycle.cycle_id, decision_cycle.cycle_id);
+        let attempt: (String, i64, String, Option<i64>) = migrated
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT cycle_id, attempt_number, state, agent_run_id
+                 FROM decision_attempts WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![decision_cycle.cycle_id, decision_reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt, decision_attempt);
+
+        let stored_run = CodeChangeRepository::new(migrated)
+            .find_by_id("code-change-v28-editor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_run, code_change_run);
+        assert_eq!(
+            CodeChangeRepository::new(migrated)
+                .find_editor_attempt("code-change-v28-editor", 1)
+                .unwrap(),
+            Some(editor_attempt.clone())
+        );
+        let editor_link: (i64, String, String) = migrated
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT a.run_id, a.project_id, a.execution_kind
+                 FROM agent_runs a
+                 JOIN code_change_editor_attempts e ON e.agent_run_id = a.run_id
+                 WHERE e.code_change_run_id = ?1 AND e.attempt = 1",
+                ["code-change-v28-editor"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            editor_link,
+            (
+                editor_agent_run_id,
+                CampaignDbHarness::PROJECT_ID.to_owned(),
+                "code_change_editor".to_owned()
+            )
+        );
+        let connection = migrated.connect().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name IN ('campaign_research', 'research_reviews')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        let event_ids_after: Vec<i64> = connection
+            .prepare("SELECT event_id FROM events ORDER BY event_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(event_ids_after, event_ids_before);
+    };
+
+    let migrated = Db::open(&path).unwrap();
+    assert_preserved(&migrated);
+    drop(migrated);
+    let reopened = Db::open(&path).unwrap();
+    assert_preserved(&reopened);
 }
 
 #[test]

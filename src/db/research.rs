@@ -7,6 +7,7 @@ use crate::AppError;
 use super::{database_error, Db};
 
 const MAX_RESEARCH_REVIEW_LIST: i64 = 32;
+const MAX_RESEARCH_CANDIDATES: i64 = 32;
 const OPEN_REVIEW_STATES: &str = "('pending','running','ready','retry_wait')";
 const OPEN_OPERATION_STAGES: &str =
     "('intent','stop_requested','stop_confirmed','successor_reserved')";
@@ -207,56 +208,81 @@ impl<'db> ResearchRepository<'db> {
                 .map_err(database_error("commit existing research review claim"))?;
             return Ok(None);
         }
-        if has_open_operation(&transaction, experiment_id)? {
-            transaction
-                .commit()
-                .map_err(database_error("commit existing research operation claim"))?;
-            return Ok(None);
-        }
-
-        // The caller's task signature is only a lookup key. The joins below
-        // prove the campaign, project, submission, experiment, and current
-        // observed task identity before a review is created.
-        let authority: Option<(String, String, i64)> = transaction
-            .query_row(
-                "SELECT c.project_id, e.task_signature, e.pueue_task_id
-                 FROM campaigns c
-                 JOIN projects p ON p.project_id = c.project_id
-                 JOIN experiments e ON e.campaign_id = c.campaign_id
-                 JOIN submissions s
-                   ON s.submission_id = e.submission_id
-                  AND s.project_id = c.project_id
-                 JOIN task_observations observation
-                   ON observation.project_id = c.project_id
-                  AND observation.task_signature = e.task_signature
-                  AND observation.pueue_task_id = e.pueue_task_id
-                  AND observation.pueue_group = p.pueue_group
-                  AND lower(observation.state) = 'running'
-                 WHERE c.campaign_id = ?1
-                   AND c.state = 'active'
-                   AND p.enabled = 1
-                   AND p.paused = 0
-                   AND p.halted_reason IS NULL
-                   AND e.experiment_id = ?2
-                   AND e.status = 'accepted'
-                   AND e.pueue_task_id IS NOT NULL
-                   AND e.task_signature = ?3
-                   AND s.status = 'accepted'
-                   AND s.pueue_task_id = e.pueue_task_id
-                   AND s.task_signature = e.task_signature",
-                params![campaign_id, experiment_id, task_signature],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(database_error("read authoritative research task identity"))?;
-        let Some((project_id, canonical_signature, pueue_task_id)) = authority else {
+        // The caller's task signature is only a lookup key. The bounded query
+        // below first chooses the oldest eligible live candidate, proving the
+        // campaign, project, submission, experiment, and observed task
+        // identity before a review is created.
+        let candidate_query = format!(
+            "SELECT c.project_id, e.experiment_id, e.task_signature, e.pueue_task_id
+             FROM campaigns c
+             JOIN projects p ON p.project_id = c.project_id
+             JOIN experiments e ON e.campaign_id = c.campaign_id
+             JOIN submissions s
+               ON s.submission_id = e.submission_id
+              AND s.project_id = c.project_id
+             JOIN task_observations observation
+               ON observation.project_id = c.project_id
+              AND observation.task_signature = e.task_signature
+              AND observation.pueue_task_id = e.pueue_task_id
+              AND observation.pueue_group = p.pueue_group
+              AND lower(observation.state) = 'running'
+             WHERE c.campaign_id = ?1
+               AND c.state = 'active'
+               AND p.enabled = 1
+               AND p.paused = 0
+               AND p.halted_reason IS NULL
+               AND e.status = 'accepted'
+               AND e.pueue_task_id IS NOT NULL
+               AND s.status = 'accepted'
+               AND s.pueue_task_id = e.pueue_task_id
+               AND s.task_signature = e.task_signature
+               AND NOT EXISTS (
+                   SELECT 1 FROM research_reviews ownership
+                   WHERE ownership.experiment_id = e.experiment_id
+                     AND ownership.operation_stage IN {OPEN_OPERATION_STAGES}
+               )
+             ORDER BY observation.started_at, e.experiment_id
+             LIMIT ?2"
+        );
+        let authority = {
+            let mut statement = transaction
+                .prepare(&candidate_query)
+                .map_err(database_error("prepare authoritative research candidates"))?;
+            let mut candidates = statement
+                .query_map(params![campaign_id, MAX_RESEARCH_CANDIDATES], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(database_error("read authoritative research candidates"))?;
+            candidates.next().transpose().map_err(database_error(
+                "read oldest authoritative research candidate",
+            ))?
+        };
+        let Some((project_id, canonical_experiment_id, canonical_signature, pueue_task_id)) =
+            authority
+        else {
             transaction
                 .commit()
                 .map_err(database_error("commit deferred research review claim"))?;
             return Ok(None);
         };
+        if canonical_experiment_id != experiment_id || canonical_signature != task_signature {
+            transaction
+                .commit()
+                .map_err(database_error("commit non-owner research review claim"))?;
+            return Ok(None);
+        }
 
-        let review_id = research_review_id(campaign_id, experiment_id, &canonical_signature, now);
+        let review_id = research_review_id(
+            campaign_id,
+            &canonical_experiment_id,
+            &canonical_signature,
+            now,
+        );
         let event_dedup_key = format!("campaign-research:v1:{review_id}");
         let payload_json = serde_json::to_string(&json!({
             "source": "campaign_research",
@@ -448,24 +474,6 @@ fn has_open_review(transaction: &Transaction<'_>, campaign_id: &str) -> Result<b
             |row| row.get(0),
         )
         .map_err(database_error("check open campaign research review"))
-}
-
-fn has_open_operation(
-    transaction: &Transaction<'_>,
-    experiment_id: &str,
-) -> Result<bool, AppError> {
-    transaction
-        .query_row(
-            &format!(
-                "SELECT EXISTS(
-                     SELECT 1 FROM research_reviews
-                     WHERE experiment_id = ?1 AND operation_stage IN {OPEN_OPERATION_STAGES}
-                 )"
-            ),
-            [experiment_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error("check open campaign research operation"))
 }
 
 fn next_research_due(start: i64, interval_minutes: u32) -> Result<Option<i64>, AppError> {
