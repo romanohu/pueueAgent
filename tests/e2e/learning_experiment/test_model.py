@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from model import LEARNING_RATE, evaluate, train
+from model import evaluate, train
 
 
 class LearningModelTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class LearningModelTests(unittest.TestCase):
         self.assertEqual(train(learning_rate=0.1, steps=0), 0.0)
 
     def test_candidate_learning_rate_improves_held_out_mse(self):
-        baseline_weight = train(learning_rate=LEARNING_RATE, steps=100)
+        baseline_weight = train(learning_rate=0.001, steps=100)
         candidate_weight = train(learning_rate=0.05, steps=100)
 
         baseline_loss = evaluate(baseline_weight)
@@ -64,8 +64,15 @@ class TrainerContractTests(unittest.TestCase):
             result_path.write_text("old result", encoding="utf-8")
             result_path.chmod(0o600)
             inode_before = result_path.stat().st_ino
+            tracked_sources = (
+                "model.py",
+                "train.py",
+                "test_model.py",
+                "pytest.ini",
+            )
             source_before = {
-                path: path.read_bytes() for path in (self.fixture_root / "model.py",)
+                self.fixture_root / name: (self.fixture_root / name).read_bytes()
+                for name in tracked_sources
             }
 
             completed = self.run_trainer(result_path)

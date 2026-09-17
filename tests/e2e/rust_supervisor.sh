@@ -1461,10 +1461,25 @@ PY
   [ "$learning_promotion_count_before_restart" = "1" ] \
     || fail "learning campaign did not persist exactly one promotion marker"
 
-  # Reconcile only the test daemon; no candidate add or promotion may be
-  # repeated when the post-candidate finite wait is reopened.
+  learning_baseline_observed_at_before_restart="$(sql "SELECT observed_at FROM task_observations WHERE project_id = '$PROJECT_ID_N' AND pueue_task_id = $learning_baseline_task")"
+  learning_candidate_observed_at_before_restart="$(sql "SELECT observed_at FROM task_observations WHERE project_id = '$PROJECT_ID_N' AND pueue_task_id = $learning_candidate_task")"
+  [ -n "$learning_baseline_observed_at_before_restart" ] \
+    && [ -n "$learning_candidate_observed_at_before_restart" ] \
+    || fail "learning restart lacked durable pre-restart task observations"
+  learning_restart_observation_floor="$(sql "SELECT MAX(observed_at) FROM task_observations WHERE project_id = '$PROJECT_ID_N' AND pueue_task_id IN ($learning_baseline_task, $learning_candidate_task)")"
+  restart_observation_barrier_deadline=$(( $(date +%s) + 5 ))
+  while [ "$(date +%s)" -le "$learning_restart_observation_floor" ] \
+    && [ "$(date +%s)" -lt "$restart_observation_barrier_deadline" ]; do
+    sleep 0.1
+  done
+  [ "$(date +%s)" -gt "$learning_restart_observation_floor" ] \
+    || fail "learning restart timestamp barrier did not advance"
+
+  # Reconcile only the test daemon; wait for both durable task observations
+  # to advance before checking that no candidate add or promotion repeats.
   start_daemon
-  sleep 0.3
+  wait_for_sql "SELECT CASE WHEN (SELECT observed_at FROM task_observations WHERE project_id = '$PROJECT_ID_N' AND pueue_task_id = $learning_baseline_task) > $learning_baseline_observed_at_before_restart AND (SELECT observed_at FROM task_observations WHERE project_id = '$PROJECT_ID_N' AND pueue_task_id = $learning_candidate_task) > $learning_candidate_observed_at_before_restart THEN 1 ELSE 0 END" "1" \
+    "learning restart did not complete a fresh reconciliation observation"
   stop_daemon
   [ "$(pueue_group_task_count "$GROUP_N")" = "$learning_task_count_before_restart" ] \
     || fail "learning restart changed the Pueue task count"
