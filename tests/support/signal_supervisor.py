@@ -84,9 +84,12 @@ def main():
     finally:
         stop_child_group(forwarded_signal or signal.SIGTERM)
 
-    if forwarded_signal is not None:
-        return 128 + forwarded_signal
-    return child.returncode
+    child_status = child.returncode
+    if child_status is None:
+        child_status = child.wait()
+    if child_status < 0:
+        return 128 + (-child_status)
+    return child_status
 
 
 if __name__ == "__main__":

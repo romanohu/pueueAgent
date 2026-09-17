@@ -254,6 +254,59 @@ run_signal_retention_probe() {
   [ "$elapsed" -lt 15 ]
 }
 
+@test "signal supervisor preserves a child wrong-exit status after TERM" {
+  child_script="$BATS_TEST_TMPDIR/signal-wrong-exit-child.py"
+  child_pid_file="$BATS_TEST_TMPDIR/signal-wrong-exit-child.pid"
+  supervisor_log="$BATS_TEST_TMPDIR/signal-wrong-exit-supervisor.log"
+  real_python3="$(command -v python3)"
+  printf '%s\n' \
+    'import signal' \
+    '' \
+    'def exit_with_wrong_status(_signum, _frame):' \
+    '    raise SystemExit(42)' \
+    '' \
+    'signal.signal(signal.SIGTERM, exit_with_wrong_status)' \
+    'signal.pause()' > "$child_script"
+
+  SIGNAL_CHILD_PID_FILE="$child_pid_file"
+  SIGNAL_RUNNER_LOG="$supervisor_log"
+  env PUEUE_AGENT_SIGNAL_CHILD_PID_FILE="$child_pid_file" \
+    "$real_python3" "$REPO_ROOT/tests/support/signal_supervisor.py" \
+    "$real_python3" -B "$child_script" \
+    >"$supervisor_log" 2>&1 &
+  SIGNAL_SUPERVISOR_PID=$!
+
+  for _ in $(seq 50); do
+    if [ -s "$child_pid_file" ]; then
+      SIGNAL_CHILD_PID="$(<"$child_pid_file")"
+      break
+    fi
+    sleep 0.1
+  done
+  [ -n "$SIGNAL_CHILD_PID" ]
+
+  kill -TERM "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+  supervisor_exited=0
+  for _ in $(seq 50); do
+    if ! kill -0 "$SIGNAL_SUPERVISOR_PID" 2>/dev/null; then
+      supervisor_exited=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$supervisor_exited" -eq 0 ]; then
+    kill -KILL "$SIGNAL_SUPERVISOR_PID" 2>/dev/null || true
+  fi
+  if wait "$SIGNAL_SUPERVISOR_PID"; then
+    supervisor_status=0
+  else
+    supervisor_status=$?
+  fi
+
+  [ "$supervisor_status" -eq 42 ]
+  signal_fixture_cleanup
+}
+
 @test "real Pueue harness asserts the production-derived Codex network argument" {
   awk '
     index($0, "sandbox_workspace_write.network_access=true") &&
