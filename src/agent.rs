@@ -3042,10 +3042,11 @@ impl AgentHandle {
                     }
                     Ok(session_id)
                 });
-            let persisted = if let Ok(session_id) = session_id {
-                let repository = ResearchRepository::new(db);
-                if repository
-                    .confirm_agent_run_session(
+            let persisted = match session_id {
+                Err(_) => false,
+                Ok(session_id) => {
+                    let repository = ResearchRepository::new(db);
+                    let confirmed = match repository.confirm_agent_run_session(
                         &review_id,
                         self.run_id,
                         attempt,
@@ -3053,34 +3054,36 @@ impl AgentHandle {
                         &planned_session,
                         &session_id,
                         now,
-                    )
-                    .is_err()
-                {
-                    false
-                } else {
-                    bytes
-                        .map_err(AppError::from)
-                        .and_then(|bytes| {
-                            let response_json = String::from_utf8(bytes).map_err(|_| {
-                                AppError::Validation {
-                                    field: "research.response_json",
-                                    message: "must be UTF-8",
+                    ) {
+                        Ok(()) => true,
+                        Err(error @ AppError::Database { .. }) => return Err(error),
+                        Err(_) => false,
+                    };
+                    if !confirmed {
+                        false
+                    } else {
+                        match bytes
+                            .map_err(AppError::from)
+                            .and_then(|bytes| {
+                                let response_json = String::from_utf8(bytes).map_err(|_| {
+                                    AppError::Validation {
+                                        field: "research.response_json",
+                                        message: "must be UTF-8",
+                                    }
+                                })?;
+                                let answer = parse_research_answer(response_json.as_bytes())?;
+                                if answer.review_id != review_id
+                                    || answer.experiment_id != review.experiment_id
+                                    || answer.context_digest != expected_digest
+                                {
+                                    return Err(AppError::Validation {
+                                        field: "research.response_identity",
+                                        message: "research response identity does not match its bound review",
+                                    });
                                 }
-                            })?;
-                            let answer = parse_research_answer(response_json.as_bytes())?;
-                            if answer.review_id != review_id
-                                || answer.experiment_id != review.experiment_id
-                                || answer.context_digest != expected_digest
-                            {
-                                return Err(AppError::Validation {
-                                    field: "research.response_identity",
-                                    message: "research response identity does not match its bound review",
-                                });
-                            }
-                            Ok(response_json)
-                        })
-                        .and_then(|response_json| {
-                            repository.finish_agent_run(
+                                Ok(response_json)
+                            }) {
+                            Ok(response_json) => match repository.finish_agent_run(
                                 &review_id,
                                 self.run_id,
                                 attempt,
@@ -3089,12 +3092,15 @@ impl AgentHandle {
                                 &response_json,
                                 false,
                                 now,
-                            )
-                        })
-                        .is_ok()
+                            ) {
+                                Ok(()) => true,
+                                Err(error @ AppError::Database { .. }) => return Err(error),
+                                Err(_) => false,
+                            },
+                            Err(_) => false,
+                        }
+                    }
                 }
-            } else {
-                false
             };
             persisted
         } else {

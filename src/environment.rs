@@ -1404,13 +1404,11 @@ impl PrivateRunTemp {
                 PolicyViolationStage::RunBoundPreMarker,
             )?;
             let stdout = self.verified_research_stream(
-                "research-stdout.jsonl",
                 &self.research_stdout_anchor,
                 MAX_RESEARCH_STDOUT_BYTES,
                 parent_mount,
             )?;
             let stderr = self.verified_research_stream(
-                "research-stderr.log",
                 &self.research_stderr_anchor,
                 MAX_RESEARCH_STDERR_BYTES,
                 parent_mount,
@@ -1428,7 +1426,6 @@ impl PrivateRunTemp {
     #[cfg(target_os = "linux")]
     fn verified_research_stream(
         &self,
-        name: &str,
         anchor_mutex: &Mutex<Option<DecisionOutputAnchor>>,
         max_size: u64,
         parent_mount: MountIdentity,

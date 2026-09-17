@@ -509,7 +509,37 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn complete_ready_review(&self, review_id: &str) {
+        let review = ResearchRepository::new(&self.db).find(review_id).unwrap();
+        assert_eq!(review.state, "ready");
+        let response_json = review
+            .response_json
+            .as_deref()
+            .expect("ready research review must have a response");
+        pueue_agent::research_protocol::parse_research_answer(response_json.as_bytes())
+            .expect("ready research response must remain schema-valid");
+        let changed = self
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', updated_at = ?1
+                 WHERE review_id = ?2 AND state = 'ready' AND response_json = ?3",
+                rusqlite::params![NOW + 119, review_id, response_json],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the exact ready review must be completed once");
+    }
+
     fn prepare_changed_experiment(&self) -> ClaimedReview {
+        let prior = ResearchRepository::new(&self.db)
+            .recent(&self.campaign_id, 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the prior research review must remain persisted");
+        self.complete_ready_review(&prior.review_id);
         ExperimentRepository::new(&self.db)
             .project_terminal_submission(
                 &self.experiment_id,

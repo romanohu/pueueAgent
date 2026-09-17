@@ -717,7 +717,7 @@ impl<'db> ResearchRepository<'db> {
         let changed = transaction
             .execute(
                 "UPDATE research_reviews
-                 SET state = 'completed', response_json = ?1, finished_at = ?2,
+                 SET state = 'ready', response_json = ?1, finished_at = ?2,
                      updated_at = ?2
                  WHERE review_id = ?3 AND agent_run_id = ?4 AND attempt = ?5
                    AND session_generation = ?6 AND state = 'running'",
@@ -769,37 +769,77 @@ impl<'db> ResearchRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin research session confirmation"))?;
-        let (campaign_id, current_session, current_generation, current_attempt, current_run, state, notes):
-            (String, Option<String>, i64, i64, Option<i64>, String, Option<String>) = transaction
+        let (
+            campaign_id,
+            current_session,
+            current_generation,
+            current_attempt,
+            current_run,
+            review_generation,
+            state,
+            notes_json,
+        ): (
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+        ) = transaction
             .query_row(
                 "SELECT r.campaign_id, c.session_id, c.session_generation,
-                        r.attempt, r.agent_run_id, r.state, r.notes_json
+                        r.attempt, r.agent_run_id, r.session_generation,
+                        r.state, r.notes_json
                  FROM research_reviews AS r
                  JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
                  WHERE r.review_id = ?1",
                 [review_id],
                 |row| Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
                 )),
             )
             .map_err(database_error("read research session confirmation"))?;
         if current_run != Some(agent_run_id)
             || current_attempt != attempt
             || current_generation != session_generation
+            || review_generation != session_generation
             || state != "running"
-            || current_session.as_deref() != Some(planned_session_id)
         {
             return Err(validation_error(
                 "research.binding",
                 "session confirmation does not match the bound native run",
             ));
         }
-        let mut notes = notes
+        let mut notes = notes_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| json!({}));
+        let already_confirmed = current_session.as_deref() == Some(confirmed_session_id)
+            && notes.get("session_binding").and_then(serde_json::Value::as_str)
+                == Some("confirmed")
+            && notes
+                .get("planned_session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(planned_session_id)
+            && notes
+                .get("confirmed_session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(confirmed_session_id);
+        if already_confirmed {
+            return transaction
+                .commit()
+                .map_err(database_error("commit idempotent research session confirmation"));
+        }
+        if current_session.as_deref() != Some(planned_session_id) {
+            return Err(validation_error(
+                "research.binding",
+                "session confirmation does not match the pending session nonce",
+            ));
+        }
         notes["session_binding"] = json!("confirmed");
         notes["planned_session_id"] = json!(planned_session_id);
         notes["confirmed_session_id"] = json!(confirmed_session_id);
@@ -818,7 +858,7 @@ impl<'db> ResearchRepository<'db> {
                 "campaign session changed before confirmation",
             ));
         }
-        transaction
+        let changed = transaction
             .execute(
                 "UPDATE research_reviews
                  SET notes_json = ?1, updated_at = ?2
@@ -827,6 +867,12 @@ impl<'db> ResearchRepository<'db> {
                 params![notes.to_string(), now, review_id, agent_run_id, attempt, session_generation],
             )
             .map_err(database_error("persist research session confirmation"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.binding",
+                "research review changed before session confirmation",
+            ));
+        }
         transaction
             .commit()
             .map_err(database_error("commit research session confirmation"))
