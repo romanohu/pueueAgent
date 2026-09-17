@@ -12,8 +12,9 @@ use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     config,
     db::{
-        AgentDecisionReservation, CampaignRepository, Db, EventRepository, ExperimentRepository,
-        ProjectRepository, ResearchRepository, StartCampaignRequest, TaskObservationRepository,
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
+        ExperimentRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
+        TaskObservationRepository,
     },
     execution_policy::{load_existing_policy, CampaignLimits, PolicyLoadInput, StartupEnvironment},
     models::{
@@ -775,6 +776,194 @@ async fn research_first_native_launch_is_read_only_schema_bound_and_does_not_log
     assert!(!public_log.contains(USER_TRANSCRIPT_SENTINEL));
     assert!(!public_log.contains("OPENAI_API_KEY"));
     assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
+}
+
+#[tokio::test]
+async fn research_successful_answer_leaves_review_ready_and_agent_run_completed() {
+    let harness = ResearchHarness::new("ready-review", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let run_id = handle.run_id;
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+
+    let review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(review.state, "ready");
+    assert!(review.response_json.is_some());
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn research_response_persistence_failure_retains_handle_for_retry() {
+    let harness = ResearchHarness::new("response-failure", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let run_id = handle.run_id;
+    let private_output = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string())
+        .join("research.json");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_research_response_persistence
+             BEFORE UPDATE OF response_json ON research_reviews
+             BEGIN SELECT RAISE(ABORT, 'injected research response persistence failure'); END;",
+        )
+        .unwrap();
+
+    let first = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        first.is_err(),
+        "response persistence failure must retain the handle for retry"
+    );
+    assert!(
+        private_output.exists(),
+        "private research output must remain while finalization is retryable"
+    );
+    assert!(
+        AgentRunRepository::new(&harness.db)
+            .find_active_by_project(&harness.project.project_id)
+            .unwrap()
+            .is_some(),
+        "agent-run ownership must remain active after response persistence failure"
+    );
+    let pending_review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(pending_review.state, "running");
+    assert!(pending_review.response_json.is_none());
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_research_response_persistence")
+        .unwrap();
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 92).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&claimed.review.review_id)
+            .unwrap()
+            .state,
+        "ready"
+    );
+    assert!(
+        !private_output.exists(),
+        "successful retry must release private output"
+    );
+}
+
+#[tokio::test]
+async fn research_terminal_agent_update_failure_does_not_replay_persisted_response() {
+    let harness = ResearchHarness::new("agent-terminal-failure", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let run_id = handle.run_id;
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    let private_output = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string())
+        .join("research.json");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_research_agent_terminal_update
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+             BEGIN SELECT RAISE(ABORT, 'injected research agent terminal update failure'); END;",
+        )
+        .unwrap();
+
+    let first = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        first.is_err(),
+        "generic agent terminal persistence failure must retain the handle"
+    );
+    let persisted = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let persisted_state = persisted.state.clone();
+    let response_json = persisted
+        .response_json
+        .clone()
+        .expect("response was persisted");
+    let notes_json: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(matches!(persisted_state.as_str(), "ready" | "completed"));
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(private_output.exists());
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_research_agent_terminal_update")
+        .unwrap();
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 92).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    let retried = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let retried_notes: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retried.state, persisted_state);
+    assert_eq!(
+        retried.response_json.as_deref(),
+        Some(response_json.as_str())
+    );
+    assert_eq!(retried_notes, notes_json);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert!(
+        !private_output.exists(),
+        "retry must release private output authority"
+    );
 }
 
 #[tokio::test]
