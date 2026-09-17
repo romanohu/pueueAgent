@@ -22,6 +22,7 @@ use pueue_agent::{
         DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
         MAX_DECISION_CONTEXT_BYTES,
     },
+    research_evidence::build_research_evidence,
     diagnostics::{EventFilter, MAX_EVENT_LIST_LIMIT},
     execution_policy::{
         CampaignLimits, ExecutableIdentity, PolicyViolation, PolicyViolationCode,
@@ -330,6 +331,24 @@ impl CampaignDbHarness {
                 started_at + 2,
             ))
             .unwrap();
+    }
+
+    fn running_research_review(&self) -> pueue_agent::db::ResearchReview {
+        self.start(&CampaignLimits::default(), 100);
+        self.make_running_baseline(41, "pueue-task:v1:research", 1_000);
+        let repository = ResearchRepository::new(&self.db);
+        repository
+            .schedule_running(&self.campaign_id, 1_000, 1, 1_060)
+            .unwrap();
+        repository
+            .claim_due(
+                &self.campaign_id,
+                &self.experiment_id,
+                "pueue-task:v1:research",
+                1_060,
+            )
+            .unwrap()
+            .expect("running research review should be claimed")
     }
 
     fn campaign_promotion_state(&self) -> (Option<String>, i64) {
@@ -892,6 +911,259 @@ fn research_recent_is_campaign_scoped_and_clamped_to_thirty_two_rows() {
     assert_eq!(recent.len(), 32);
     assert!(recent.iter().all(|review| review.campaign_id == h.campaign_id));
     assert_eq!(repository.recent("missing-campaign", usize::MAX).unwrap(), Vec::new());
+}
+
+#[test]
+fn research_evidence_accepts_a_running_source_and_reports_its_target() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert_eq!(value["facts"]["review"]["review_id"], review.review_id);
+    assert_eq!(value["facts"]["campaign"]["campaign_id"], h.campaign_id);
+    assert_eq!(value["facts"]["target"]["task_signature"], review.task_signature);
+    assert_eq!(value["facts"]["observed_at"], 1_061);
+    assert!(value["facts"]["running"].is_array());
+    assert_eq!(evidence.digest.len(), 64);
+}
+
+#[test]
+fn research_evidence_rejects_a_foreign_source() {
+    let h = CampaignDbHarness::new();
+    let mut review = h.running_research_review();
+    review.experiment_id = "foreign-experiment".to_owned();
+    assert!(build_research_evidence(&h.db, &review, 1_061).is_err());
+}
+
+#[test]
+fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let connection = h.db.connect().unwrap();
+    let event_id: i64 = connection
+        .query_row(
+            "SELECT event_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for ordinal in 0..33 {
+        let submission_id = format!("research-result-submission-{ordinal}");
+        let proposal_id = format!("research-result-proposal-{ordinal}");
+        let experiment_id = format!("research-result-experiment-{ordinal}");
+        let task_signature = format!("pueue-task:v1:result-{ordinal}");
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at, pueue_task_id,
+                    task_signature, status, kind, metadata_json, origin_agent_run_id
+                 ) VALUES (?1, ?2, '[\"python\"]', ?3, ?4, ?5, 'accepted',
+                           'experiment', '{}', NULL)",
+                params![
+                    &submission_id,
+                    &h.project_id,
+                    3_000 + ordinal,
+                    100 + ordinal,
+                    &task_signature,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, 'experiment', 'accepted', ?3, ?4, '[\"python\"]',
+                           '.', '[]', ?5, NULL, ?6, ?6)",
+                params![
+                    &proposal_id,
+                    &h.campaign_id,
+                    format!("result hypothesis {ordinal}"),
+                    &h.experiment_id,
+                    format!("research-result-digest-{ordinal}"),
+                    3_000 + ordinal,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id,
+                    task_signature, failure_code, failure_fingerprint,
+                    created_at, updated_at, finished_at, code_change_run_id,
+                    code_revision_sha
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'succeeded', ?6, ?7,
+                           NULL, NULL, ?8, ?8, ?8, NULL, NULL)",
+                params![
+                    &experiment_id,
+                    &h.campaign_id,
+                    &proposal_id,
+                    &submission_id,
+                    &h.experiment_id,
+                    100 + ordinal,
+                    &task_signature,
+                    3_000 + ordinal,
+                ],
+            )
+            .unwrap();
+    }
+    for ordinal in 0..33 {
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt, state,
+                    operation_stage, agent_run_id, context_json, context_digest, response_json,
+                    termination_request_id, successor_experiment_id, evidence_schema_version,
+                    session_generation, event_id, not_before, notes_json, failure_code,
+                    decision_cycle_id, checkpoint_json, created_at, started_at, finished_at,
+                    updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 'completed', NULL, NULL, NULL, NULL, NULL,
+                           NULL, NULL, NULL, 0, ?5, ?6, ?7, NULL, NULL, NULL, ?6, NULL, ?6, ?6)",
+                params![
+                    format!("research-note-{ordinal}"),
+                    &h.campaign_id,
+                    &h.experiment_id,
+                    &review.task_signature,
+                    event_id,
+                    2_000 + ordinal,
+                    format!("{{\"note\":\"note-{ordinal}\"}}"),
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert_eq!(value["facts"]["recent_results"].as_array().unwrap().len(), 32);
+    assert_eq!(value["research_notes"].as_array().unwrap().len(), 32);
+    assert!(evidence.json.contains("note-32"));
+    assert!(!evidence.json.contains("note-0"));
+}
+
+#[test]
+fn research_evidence_limits_log_tail_to_four_kibibytes_of_utf8() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let log_dir = h.test.project_root("campaign-project").join(".pueue-agent/logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(log_dir.join("41.log"), "é".repeat(4_000)).unwrap();
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    let tail = value["operations"]["log_tail"]["excerpt"]
+        .as_str()
+        .unwrap();
+    assert!(tail.as_bytes().len() <= 4 * 1024);
+}
+
+#[test]
+fn research_evidence_keeps_serialized_context_within_128_kibibytes() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let log_dir = h.test.project_root("campaign-project").join(".pueue-agent/logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(log_dir.join("41.log"), "large log ".repeat(40_000)).unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET objective_text = ?1 WHERE campaign_id = ?2",
+            params!["large objective ".repeat(40_000), &h.campaign_id],
+        )
+        .unwrap();
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    assert!(evidence.json.as_bytes().len() <= 128 * 1024);
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert!(value["operations"]["omissions"].is_object());
+}
+
+#[test]
+fn research_evidence_bounds_large_objective_notes_and_logs_without_truncating_identity() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let log_dir = h.test.project_root("campaign-project").join(".pueue-agent/logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(log_dir.join("41.log"), "log ".repeat(50_000)).unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET objective_text = ?1 WHERE campaign_id = ?2",
+            params!["objective ".repeat(50_000), &h.campaign_id],
+        )
+        .unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            params![format!("{{\"notes\":\"{}\"}}", "notes ".repeat(50_000)), &review.review_id],
+        )
+        .unwrap();
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert_eq!(value["facts"]["review"]["review_id"], review.review_id);
+    assert_eq!(value["facts"]["campaign"]["campaign_id"], h.campaign_id);
+    assert!(evidence.json.len() <= 128 * 1024);
+}
+
+#[test]
+fn research_evidence_allows_a_missing_metric_as_an_observation() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert!(value["facts"]["target"].get("metric").is_some());
+    assert!(value["facts"]["target"]["metric"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn research_evidence_rejects_an_unsafe_log_path() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let log_dir = h.test.project_root("campaign-project").join(".pueue-agent/logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    let outside = h.test.project_root("outside").join("secret.log");
+    fs::write(&outside, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside, log_dir.join("41.log")).unwrap();
+    assert!(build_research_evidence(&h.db, &review, 1_061).is_err());
+}
+
+#[test]
+fn research_evidence_redacts_planted_credentials_from_notes_and_logs() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let log_dir = h.test.project_root("campaign-project").join(".pueue-agent/logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(
+        log_dir.join("41.log"),
+        "AWS_SECRET_ACCESS_KEY=planted-log-secret token=another-log-secret",
+    )
+    .unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            params![
+                "{\"notes\":\"AWS_SECRET_ACCESS_KEY=planted-note-secret token=another-note-secret\"}",
+                &review.review_id
+            ],
+        )
+        .unwrap();
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    assert!(!evidence.json.contains("planted-log-secret"));
+    assert!(!evidence.json.contains("another-log-secret"));
+    assert!(!evidence.json.contains("planted-note-secret"));
+    assert!(!evidence.json.contains("another-note-secret"));
 }
 
 #[test]

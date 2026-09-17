@@ -42,6 +42,8 @@ pub mod pueue_process;
 pub mod pueue_security;
 pub mod reconcile;
 pub mod result_manifest;
+pub mod research_evidence;
+pub mod research_protocol;
 pub mod retry;
 pub mod runs;
 pub mod scheduler;
