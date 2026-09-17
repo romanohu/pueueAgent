@@ -117,10 +117,14 @@ if [ "$editor_artifact" -eq 1 ] || [ -n "${PUEUE_AGENT_EDITOR_OUTPUT:-}" ]; then
         *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) editor_scenario="second_check_fail" ;;
         *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) editor_scenario="runtime_oom" ;;
         *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) editor_scenario="runtime_internal" ;;
+        *PUEUE_AGENT_E2E_LEARNING*) editor_scenario="learning" ;;
       esac
       case "$editor_scenario:${PUEUE_AGENT_EDITOR_MODE:-fresh}" in
         success:fresh|second_check_fail:fresh|second_check_fail:resume)
           printf '%s\n' 'def score():' '    return 2' > model.py
+          ;;
+        learning:fresh)
+          sed -i 's/^LEARNING_RATE = 0.001$/LEARNING_RATE = 0.05/' model.py
           ;;
         success:resume|runtime_oom:fresh|runtime_internal:fresh)
           printf '%s\n' 'def score():' '    return 1' > model.py
@@ -221,13 +225,30 @@ case "$objective" in
 esac
 
 code_change_argv='["python","train.py"]'
+learning_fixture=0
 case "$objective" in
   *PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS*) ;;
   *PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL*) ;;
   *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM*) code_change_argv='["python","train_oom.py"]' ;;
   *PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL*) code_change_argv='["python","train_internal.py"]' ;;
+  *PUEUE_AGENT_E2E_LEARNING*)
+    learning_fixture=1
+    ;;
   *) code_change_argv="" ;;
 esac
+if [ "$learning_fixture" -eq 1 ]; then
+  if [ -n "$capture" ]; then
+    learning_decision_state="${capture}.learning-proposal-issued"
+    if [ -e "$learning_decision_state" ]; then
+      jq -cn '{schema_version:1,decision:"wait",proposal:null,reason:"await one bounded post-candidate observation window",requested_wait_minutes:1,expected_evidence:["post-candidate promotion remains stable"]}' \
+        > "$output"
+      printf '%s\n' 'LEARNING_FINITE_WAIT' >> "$capture"
+      exit 0
+    fi
+    : > "$learning_decision_state"
+  fi
+  code_change_argv='["python","train.py"]'
+fi
 if [ -n "$code_change_argv" ]; then
   jq -cn \
     --arg source_experiment_id "$source_experiment_id" \

@@ -33,6 +33,7 @@ fail() {
 source "$REPO_ROOT/tests/support/agent_call_count.sh"
 
 cleanup() {
+  cleanup_status=$?
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
@@ -60,7 +61,12 @@ cleanup() {
       fi
       ;;
   esac
-  rm -rf "$WORK"
+  if [ "$cleanup_status" -eq 0 ]; then
+    rm -rf "$WORK"
+  else
+    echo "Rust E2E retained WORK after failure: $WORK" >&2
+  fi
+  return "$cleanup_status"
 }
 trap cleanup EXIT
 
@@ -253,6 +259,23 @@ assert_ml_original_unchanged() {
     || fail "code-change scenario changed remote configuration"
   [ "$(git -C "$PROJECT_M" worktree list --porcelain)" = "$ML_WORKTREES_BEFORE" ] \
     || fail "code-change scenario changed unrelated worktree registrations"
+}
+
+assert_learning_original_unchanged() {
+  [ "$(git -C "$PROJECT_N" rev-parse refs/heads/main)" = "$LEARNING_MAIN_SHA" ] \
+    || fail "learning scenario changed original main SHA"
+  [ "$(git -C "$PROJECT_N" hash-object "$PROJECT_N/model.py")" = "$LEARNING_MODEL_DIGEST" ] \
+    || fail "learning scenario changed original model.py"
+  [ "$(git -C "$PROJECT_N" hash-object "$PROJECT_N/train.py")" = "$LEARNING_TRAIN_DIGEST" ] \
+    || fail "learning scenario changed original train.py"
+  [ "$(git -C "$PROJECT_N" hash-object "$PROJECT_N/test_model.py")" = "$LEARNING_TEST_DIGEST" ] \
+    || fail "learning scenario changed original test_model.py"
+  [ "$(git -C "$PROJECT_N" hash-object "$PROJECT_N/pytest.ini")" = "$LEARNING_PYTEST_DIGEST" ] \
+    || fail "learning scenario changed original pytest.ini"
+  [ "$(git -C "$PROJECT_N" config --local --get-regexp '^remote\.' || true)" = "$LEARNING_REMOTE_CONFIG" ] \
+    || fail "learning scenario changed remote configuration"
+  [ "$(git -C "$PROJECT_N" worktree list --porcelain)" = "$LEARNING_WORKTREES_BEFORE" ] \
+    || fail "learning scenario changed unrelated worktree registrations"
 }
 
 insert_campaign_boundary() {
@@ -550,8 +573,10 @@ PROJECT_J="$WORK/j/restart-diagnosis"
 PROJECT_K="$WORK/k/manifest-promotion"
 PROJECT_L="$WORK/l/goal-review"
 PROJECT_M="$WORK/m/python-ml-code-change"
+PROJECT_N="$WORK/n/python-learning-experiment"
 mkdir -p "$PROJECT_A" "$PROJECT_B" "$PROJECT_C" "$PROJECT_D" \
   "$PROJECT_E" "$PROJECT_F" "$PROJECT_G" "$PROJECT_H" "$PROJECT_I" "$PROJECT_J" "$PROJECT_K" "$PROJECT_L" "$PROJECT_M"
+mkdir -p "$PROJECT_N"
 PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_A"
 "$PA_BIN" init "$PROJECT_B"
@@ -566,6 +591,7 @@ PROJECT_A_CANONICAL="$(cd "$PROJECT_A" && pwd -P)"
 "$PA_BIN" init "$PROJECT_K"
 "$PA_BIN" init "$PROJECT_L"
 "$PA_BIN" init "$PROJECT_M"
+"$PA_BIN" init "$PROJECT_N"
 
 CONFIG_A="$PROJECT_A/.pueue-agent/config.toml"
 CONFIG_B="$PROJECT_B/.pueue-agent/config.toml"
@@ -580,10 +606,11 @@ CONFIG_J="$PROJECT_J/.pueue-agent/config.toml"
 CONFIG_K="$PROJECT_K/.pueue-agent/config.toml"
 CONFIG_L="$PROJECT_L/.pueue-agent/config.toml"
 CONFIG_M="$PROJECT_M/.pueue-agent/config.toml"
+CONFIG_N="$PROJECT_N/.pueue-agent/config.toml"
 [ -f "$CONFIG_A" ] && [ -f "$CONFIG_B" ] && [ -f "$CONFIG_C" ] && [ -f "$CONFIG_D" ] \
   && [ -f "$CONFIG_E" ] && [ -f "$CONFIG_F" ] && [ -f "$CONFIG_G" ] && [ -f "$CONFIG_H" ] \
   && [ -f "$CONFIG_I" ] && [ -f "$CONFIG_J" ] && [ -f "$CONFIG_K" ] && [ -f "$CONFIG_L" ] \
-  && [ -f "$CONFIG_M" ] \
+  && [ -f "$CONFIG_M" ] && [ -f "$CONFIG_N" ] \
   || fail "init did not create TOML configuration"
 PROJECT_ID_A="$(toml_value project_id "$CONFIG_A")"
 PROJECT_ID_B="$(toml_value project_id "$CONFIG_B")"
@@ -598,6 +625,7 @@ PROJECT_ID_J="$(toml_value project_id "$CONFIG_J")"
 PROJECT_ID_K="$(toml_value project_id "$CONFIG_K")"
 PROJECT_ID_L="$(toml_value project_id "$CONFIG_L")"
 PROJECT_ID_M="$(toml_value project_id "$CONFIG_M")"
+PROJECT_ID_N="$(toml_value project_id "$CONFIG_N")"
 GROUP_A="$(toml_value pueue_group "$CONFIG_A")"
 GROUP_B="$(toml_value pueue_group "$CONFIG_B")"
 GROUP_C="$(toml_value pueue_group "$CONFIG_C")"
@@ -611,6 +639,7 @@ GROUP_J="$(toml_value pueue_group "$CONFIG_J")"
 GROUP_K="$(toml_value pueue_group "$CONFIG_K")"
 GROUP_L="$(toml_value pueue_group "$CONFIG_L")"
 GROUP_M="$(toml_value pueue_group "$CONFIG_M")"
+GROUP_N="$(toml_value pueue_group "$CONFIG_N")"
 [ "$PROJECT_ID_A" != "$PROJECT_ID_B" ] || fail "same-basename projects reused project_id"
 [ "$GROUP_A" != "$GROUP_B" ] || fail "same-basename projects reused Pueue group"
 
@@ -627,6 +656,7 @@ write_config "$PROJECT_J" "$PROJECT_ID_J" "$GROUP_J" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_K" "$PROJECT_ID_K" "$GROUP_K" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_L" "$PROJECT_ID_L" "$GROUP_L" "$WORK/bin/fake-agent" 20
 write_config "$PROJECT_M" "$PROJECT_ID_M" "$GROUP_M" "$WORK/bin/fake-agent" 20
+write_config "$PROJECT_N" "$PROJECT_ID_N" "$GROUP_N" "$WORK/bin/fake-agent" 20
 printf '%s\n' 'Keep the supervisor fixture healthy while validating task recovery.' \
   > "$PROJECT_A/.pueue-agent/STATE.md"
 printf '%s\n' 'Keep callback and reconciliation processing idempotent.' \
@@ -649,6 +679,7 @@ printf '%s\n' 'Reach validation loss below 0.20 with promotion' \
   > "$PROJECT_K/.pueue-agent/STATE.md"
 printf '%s\n' 'PUEUE_AGENT_E2E_GOAL' > "$PROJECT_L/.pueue-agent/STATE.md"
 printf '%s\n' 'PUEUE_AGENT_E2E_CODE_CHANGE_SUCCESS' > "$PROJECT_M/.pueue-agent/STATE.md"
+printf '%s\n' 'PUEUE_AGENT_E2E_LEARNING' > "$PROJECT_N/.pueue-agent/STATE.md"
 
 mkdir -p "$XDG_STATE_HOME"
 chmod 700 "$XDG_STATE_HOME"
@@ -728,6 +759,10 @@ agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT
 [projects."$PROJECT_ID_M"]
 custom_agent = "$WORK/bin/fake-agent"
 agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
+
+[projects."$PROJECT_ID_N"]
+custom_agent = "$WORK/bin/fake-agent"
+agent_environment_allow = ["PUEUE_AGENT_TEST_AGENT_LOG", "PUEUE_AGENT_TEST_AGENT_STATE", "PUEUE_AGENT_TEST_AGENT_MODE"]
 EOF
 chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 
@@ -744,8 +779,9 @@ chmod 600 "$PUEUE_AGENT_STATE_DIR/execution-policy.toml"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_K"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_L"
 "$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_M"
+"$PA_BIN" enable --pueue-config "$WORK/pueue.yml" "$PROJECT_N"
 STATE_DB="$XDG_STATE_HOME/pueue-agent/state.sqlite3"
-[ "$(sql 'SELECT COUNT(*) FROM projects')" = "13" ] || fail "projects were not registered"
+[ "$(sql 'SELECT COUNT(*) FROM projects')" = "14" ] || fail "projects were not registered"
 
 # The code-change gate uses one disposable Git/Python repository.  Its local
 # bare remote is only metadata for the protected-remote invariant; no command
@@ -819,6 +855,37 @@ ML_MAIN_SHA="$(git -C "$PROJECT_M" rev-parse refs/heads/main)"
 ML_FILE_DIGEST="$(git -C "$PROJECT_M" hash-object "$PROJECT_M/model.py")"
 ML_REMOTE_CONFIG="$(git -C "$PROJECT_M" config --local --get-regexp '^remote\.' || true)"
 ML_WORKTREES_BEFORE="$(git -C "$PROJECT_M" worktree list --porcelain)"
+
+# The learning campaign is a separate disposable Git project.  Its fixture
+# files are copied from the repository so the real candidate check and
+# Pueue-run trainer exercise the committed snapshot, while the source
+# checkout remains outside the candidate worktree boundary.
+LEARNING_REMOTE="$WORK/n/python-learning-remote.git"
+LEARNING_UNRELATED="$WORK/n/python-learning-unrelated"
+cp "$REPO_ROOT/tests/e2e/learning_experiment/model.py" "$PROJECT_N/model.py"
+cp "$REPO_ROOT/tests/e2e/learning_experiment/train.py" "$PROJECT_N/train.py"
+cp "$REPO_ROOT/tests/e2e/learning_experiment/test_model.py" "$PROJECT_N/test_model.py"
+cp "$REPO_ROOT/tests/e2e/learning_experiment/pytest.ini" "$PROJECT_N/pytest.ini"
+cat > "$PROJECT_N/.gitignore" <<'EOF'
+.pueue-agent/
+__pycache__/
+.pytest_cache/
+EOF
+git init --quiet -b main "$PROJECT_N"
+git -C "$PROJECT_N" config user.name "Pueue Agent E2E"
+git -C "$PROJECT_N" config user.email "pueue-agent-e2e@example.invalid"
+git init --quiet --bare "$LEARNING_REMOTE"
+git -C "$PROJECT_N" remote add origin "$LEARNING_REMOTE"
+git -C "$PROJECT_N" add .gitignore model.py train.py test_model.py pytest.ini
+git -C "$PROJECT_N" commit --quiet -m "baseline learning fixture"
+git -C "$PROJECT_N" worktree add --quiet --detach "$LEARNING_UNRELATED" HEAD
+LEARNING_MAIN_SHA="$(git -C "$PROJECT_N" rev-parse refs/heads/main)"
+LEARNING_MODEL_DIGEST="$(git -C "$PROJECT_N" hash-object "$PROJECT_N/model.py")"
+LEARNING_TRAIN_DIGEST="$(git -C "$PROJECT_N" hash-object "$PROJECT_N/train.py")"
+LEARNING_TEST_DIGEST="$(git -C "$PROJECT_N" hash-object "$PROJECT_N/test_model.py")"
+LEARNING_PYTEST_DIGEST="$(git -C "$PROJECT_N" hash-object "$PROJECT_N/pytest.ini")"
+LEARNING_REMOTE_CONFIG="$(git -C "$PROJECT_N" config --local --get-regexp '^remote\.' || true)"
+LEARNING_WORKTREES_BEFORE="$(git -C "$PROJECT_N" worktree list --porcelain)"
 
 # Healthy monitoring performs reconciliation without spending agent tokens.
 start_daemon
@@ -1262,6 +1329,164 @@ run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_SECOND_CHECK_FAIL" '["python",
 run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_OOM" '["python","train_oom.py"]' "runtime-oom"
 run_code_change_case "PUEUE_AGENT_E2E_CODE_CHANGE_RUNTIME_INTERNAL" '["python","train_internal.py"]' "runtime-internal"
 assert_ml_original_unchanged
+
+# A separate real-Pueue code-change campaign runs the deterministic CPU
+# learning fixture.  The fake decision/editor only selects and applies the
+# learning-rate line; training, manifest ingestion, evaluation, and best-ref
+# promotion all remain supervisor-owned production paths.
+run_learning_case() {
+  printf '%s\n' 'PUEUE_AGENT_E2E_LEARNING' > "$PROJECT_N/.pueue-agent/STATE.md"
+  learning_baseline_summary="$(cd "$PROJECT_N" && "$PA_BIN" submit \
+    --metric-name loss --metric-direction minimize -- python train.py)"
+  learning_baseline_task="$(submission_task_id "$learning_baseline_summary")"
+  record_task_id "learning-source" "$learning_baseline_task"
+  wait_for_task_terminal "$learning_baseline_task"
+  learning_campaign_id="$(sql "SELECT campaign_id FROM experiments WHERE pueue_task_id = $learning_baseline_task")"
+  learning_source_experiment_id="$(sql "SELECT experiment_id FROM experiments WHERE pueue_task_id = $learning_baseline_task")"
+  [ -n "$learning_campaign_id" ] && [ -n "$learning_source_experiment_id" ] \
+    || fail "learning fixture did not create its baseline campaign"
+  learning_candidate_add_before="$(pueue_add_call_count)"
+
+  start_daemon
+  wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$learning_source_experiment_id'" "succeeded" \
+    "learning baseline was not projected succeeded"
+  wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$learning_source_experiment_id' AND primary_metric_name = 'loss' AND artifact_defect IS NULL" "1" \
+    "learning baseline did not persist its measured metric"
+  wait_for_sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$learning_campaign_id'" "$learning_source_experiment_id" \
+    "learning baseline was not established as current best"
+  wait_for_sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$learning_campaign_id' AND kind = 'code_change' AND status = 'pending'" "1" \
+    "learning baseline did not expose one code-change proposal"
+  stop_daemon
+
+  [ "$(sql "SELECT COUNT(*) FROM proposals WHERE campaign_id = '$learning_campaign_id' AND kind = 'code_change'")" = "1" ] \
+    || fail "learning campaign created more than one code-change proposal"
+  learning_run_id="$(sql "SELECT code_change_run_id FROM code_change_runs WHERE campaign_id = '$learning_campaign_id'")"
+  learning_proposal_id="$(sql "SELECT proposal_id FROM code_change_runs WHERE code_change_run_id = '$learning_run_id'")"
+  [ -n "$learning_run_id" ] && [ -n "$learning_proposal_id" ] \
+    || fail "learning proposal did not reserve one code-change run"
+  [ "$(sql "SELECT state FROM code_change_runs WHERE code_change_run_id = '$learning_run_id'")" = "reserved" ] \
+    || fail "learning proposal was not durably reserved"
+  [ "$(sql "SELECT argv_json FROM proposals WHERE proposal_id = '$learning_proposal_id'")" = '["python","train.py"]' ] \
+    || fail "learning proposal argv was not pinned to the trainer"
+  [ "$(decision_call_count "$learning_source_experiment_id")" = "1" ] \
+    || fail "learning baseline did not invoke exactly one decision agent"
+
+  start_daemon
+  wait_for_sql "SELECT COUNT(*) FROM code_change_editor_attempts WHERE code_change_run_id = '$learning_run_id' AND attempt = 1 AND status = 'ready' AND failure_code IS NULL" "1" \
+    "learning editor did not persist one ready first attempt"
+  wait_for_sql "SELECT COUNT(*) FROM code_change_checks WHERE code_change_run_id = '$learning_run_id' AND attempt = 1 AND source = 'discovered' AND status = 'passed' AND output_digest IS NOT NULL" "1" \
+    "learning candidate did not pass its discovered pytest check"
+  wait_for_sql "SELECT COUNT(*) FROM experiments WHERE code_change_run_id = '$learning_run_id' AND pueue_task_id IS NOT NULL" "1" \
+    "learning candidate was not submitted exactly once"
+  learning_candidate_experiment_id="$(sql "SELECT experiment_id FROM experiments WHERE code_change_run_id = '$learning_run_id'")"
+  learning_candidate_task="$(sql "SELECT pueue_task_id FROM experiments WHERE experiment_id = '$learning_candidate_experiment_id'")"
+  record_task_id "learning-candidate" "$learning_candidate_task"
+  stop_daemon
+  [ "$(pueue_add_call_count)" = "$((learning_candidate_add_before + 1))" ] \
+    || fail "learning candidate did not perform exactly one Pueue add"
+  wait_for_task_terminal "$learning_candidate_task"
+
+  start_daemon
+  wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$learning_candidate_experiment_id'" "succeeded" \
+    "learning candidate was not projected succeeded"
+  wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$learning_candidate_experiment_id' AND primary_metric_name = 'loss' AND artifact_defect IS NULL" "1" \
+    "learning candidate did not persist its measured metric"
+  wait_for_sql "SELECT state FROM code_change_runs WHERE code_change_run_id = '$learning_run_id'" "completed" \
+    "learning code-change run did not reach completed state"
+  wait_for_sql "SELECT cleanup_completed_at IS NOT NULL FROM code_change_runs WHERE code_change_run_id = '$learning_run_id'" "1" \
+    "learning candidate did not complete owned-worktree cleanup"
+  wait_for_sql "SELECT promotion_outcome FROM code_change_runs WHERE code_change_run_id = '$learning_run_id'" "improved" \
+    "learning candidate did not record improved promotion"
+  wait_for_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$learning_campaign_id' AND source_experiment_id = '$learning_candidate_experiment_id' AND state = 'waiting'" "1" \
+    "learning post-candidate decision did not return a finite wait"
+  stop_daemon
+
+  learning_baseline_loss="$(sql "SELECT primary_metric_value FROM experiment_metrics WHERE experiment_id = '$learning_source_experiment_id'")"
+  learning_candidate_loss="$(sql "SELECT primary_metric_value FROM experiment_metrics WHERE experiment_id = '$learning_candidate_experiment_id'")"
+  "$REAL_PYTHON" - "$learning_baseline_loss" "$learning_candidate_loss" <<'PY'
+import math
+import sys
+
+baseline, candidate = (float(value) for value in sys.argv[1:])
+expected_baseline = 0.9733487543371924
+expected_candidate = 0.0000030985984047923205
+assert math.isfinite(baseline) and math.isfinite(candidate)
+assert candidate < baseline
+assert math.isclose(baseline, expected_baseline, rel_tol=1e-9, abs_tol=1e-12)
+assert math.isclose(candidate, expected_candidate, rel_tol=1e-9, abs_tol=1e-12)
+PY
+  [ "$(sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$learning_source_experiment_id' AND primary_metric_name = 'loss' AND artifact_defect IS NULL")" = "1" ] \
+    || fail "learning baseline metric row was not bound to its experiment"
+  [ "$(sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$learning_candidate_experiment_id' AND primary_metric_name = 'loss' AND artifact_defect IS NULL")" = "1" ] \
+    || fail "learning candidate metric row was not bound to its experiment"
+  [ "$(sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id IN ('$learning_source_experiment_id', '$learning_candidate_experiment_id')")" = "2" ] \
+    || fail "learning campaign did not retain exactly two metric rows"
+  [ "$(sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$learning_campaign_id' AND pueue_task_id IS NOT NULL")" = "2" ] \
+    || fail "learning campaign did not retain exactly two submitted experiments"
+  [ "$(sql "SELECT COUNT(DISTINCT pueue_task_id) FROM experiments WHERE campaign_id = '$learning_campaign_id'")" = "2" ] \
+    || fail "learning source and candidate tasks were not uniquely linked"
+  [ "$(sql "SELECT COUNT(*) FROM code_change_runs WHERE campaign_id = '$learning_campaign_id'")" = "1" ] \
+    || fail "learning campaign created more than one code-change run"
+  [ "$(sql "SELECT COUNT(*) FROM code_change_runs WHERE campaign_id = '$learning_campaign_id' AND experiment_id = '$learning_candidate_experiment_id'")" = "1" ] \
+    || fail "learning candidate was not uniquely linked to its code-change run"
+  [ "$(sql "SELECT COUNT(*) FROM campaigns WHERE campaign_id = '$learning_campaign_id' AND current_best_experiment_id = '$learning_candidate_experiment_id'")" = "1" ] \
+    || fail "learning candidate did not become the current best experiment"
+
+  learning_candidate_sha="$(sql "SELECT candidate_sha FROM code_change_runs WHERE code_change_run_id = '$learning_run_id'")"
+  learning_best_sha="$(git_ref_sha "$PROJECT_N" "refs/heads/campaign/$learning_campaign_id/best")"
+  [ -n "$learning_candidate_sha" ] && [ "$learning_candidate_sha" = "$learning_best_sha" ] \
+    || fail "learning candidate SHA did not equal promoted best SHA"
+  [ "$(sql "SELECT code_revision_sha = '$learning_candidate_sha' FROM experiments WHERE experiment_id = '$learning_candidate_experiment_id'")" = "1" ] \
+    || fail "learning candidate experiment was not pinned to its candidate SHA"
+  [ "$(git -C "$PROJECT_N" diff --name-only "$LEARNING_MAIN_SHA" "$learning_candidate_sha")" = "model.py" ] \
+    || fail "learning candidate changed files outside model.py"
+  [ "$(git -C "$PROJECT_N" diff --numstat "$LEARNING_MAIN_SHA" "$learning_candidate_sha" -- model.py)" = "$(printf '1\t1\tmodel.py')" ] \
+    || fail "learning candidate changed more than the learning-rate line"
+  if ! git -C "$PROJECT_N" diff --quiet "$LEARNING_MAIN_SHA" "$learning_candidate_sha" -- train.py test_model.py pytest.ini; then
+    fail "learning candidate changed trainer, tests, or pytest policy"
+  fi
+  [ "$(git -C "$PROJECT_N" show "$learning_candidate_sha:model.py" | grep -c '^LEARNING_RATE = 0.05$')" = "1" ] \
+    || fail "learning candidate did not set the requested learning rate"
+  [ "$(git -C "$PROJECT_N" show "$learning_candidate_sha:model.py" | grep -c '^LEARNING_RATE = 0.001$')" = "0" ] \
+    || fail "learning candidate retained the baseline learning rate"
+  [ -z "$(git -C "$PROJECT_N" status --short)" ] \
+    || fail "learning source worktree contains tracked-source writes"
+  assert_learning_original_unchanged
+
+  learning_task_count_before_restart="$(pueue_group_task_count "$GROUP_N")"
+  learning_experiment_ids_before_restart="$(sql "SELECT group_concat(experiment_id, '|') FROM (SELECT experiment_id FROM experiments WHERE campaign_id = '$learning_campaign_id' ORDER BY experiment_id)")"
+  learning_promotion_count_before_restart="$(sql "SELECT COUNT(*) FROM events WHERE kind = 'operator_wake' AND dedup_key LIKE 'promotion:v1:$learning_campaign_id:%'")"
+  learning_best_sha_before_restart="$learning_best_sha"
+  learning_best_experiment_before_restart="$(sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$learning_campaign_id'")"
+  [ "$learning_promotion_count_before_restart" = "1" ] \
+    || fail "learning campaign did not persist exactly one promotion marker"
+
+  # Reconcile only the test daemon; no candidate add or promotion may be
+  # repeated when the post-candidate finite wait is reopened.
+  start_daemon
+  sleep 0.3
+  stop_daemon
+  [ "$(pueue_group_task_count "$GROUP_N")" = "$learning_task_count_before_restart" ] \
+    || fail "learning restart changed the Pueue task count"
+  [ "$(sql "SELECT group_concat(experiment_id, '|') FROM (SELECT experiment_id FROM experiments WHERE campaign_id = '$learning_campaign_id' ORDER BY experiment_id)")" = "$learning_experiment_ids_before_restart" ] \
+    || fail "learning restart changed experiment identities"
+  [ "$(sql "SELECT COUNT(*) FROM events WHERE kind = 'operator_wake' AND dedup_key LIKE 'promotion:v1:$learning_campaign_id:%'")" = "$learning_promotion_count_before_restart" ] \
+    || fail "learning restart duplicated promotion"
+  [ "$(git_ref_sha "$PROJECT_N" "refs/heads/campaign/$learning_campaign_id/best")" = "$learning_best_sha_before_restart" ] \
+    || fail "learning restart changed the promoted best SHA"
+  [ "$(sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$learning_campaign_id'")" = "$learning_best_experiment_before_restart" ] \
+    || fail "learning restart changed current best lineage"
+  [ "$(sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$learning_campaign_id' AND pueue_task_id IS NOT NULL")" = "2" ] \
+    || fail "learning restart duplicated a linked experiment"
+  [ "$(decision_call_count "$learning_candidate_experiment_id")" = "1" ] \
+    || fail "learning restart re-invoked the post-candidate decision"
+  [ "$(grep -Fc 'LEARNING_FINITE_WAIT' "$PUEUE_AGENT_TEST_CODEX_LOG")" = "1" ] \
+    || fail "learning fake decision did not emit exactly one finite wait"
+  assert_learning_original_unchanged
+  "$PA_BIN" campaign retire --pueue-config "$WORK/pueue.yml" "$PROJECT_N" >/dev/null
+}
+
+run_learning_case
 
 # Scenario D: goal_reached decision parks campaign pending review, operator accept retires.
 goal_summary="$(cd "$PROJECT_L" && "$PA_BIN" submit --metric-name loss --metric-direction minimize -- /bin/sh "$REPO_ROOT/tests/e2e/fake_experiments/train_metrics.sh")"

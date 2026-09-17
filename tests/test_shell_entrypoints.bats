@@ -14,6 +14,29 @@ setup() {
   [[ "$output" == *"real-Pueue campaign acceptance requires Linux"* ]]
 }
 
+@test "failed real Pueue harness retains its private diagnostics worktree" {
+  fake_bin="$BATS_TEST_TMPDIR/failure-bin"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" Linux' > "$fake_bin/uname"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueue"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/pueued"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/git"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/python3"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/jq"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/sqlite3"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 73' > "$fake_bin/rustc"
+  chmod +x "$fake_bin"/*
+
+  run env PATH="$fake_bin:/usr/bin:/bin" \
+    bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh"
+
+  [ "$status" -ne 0 ]
+  retained_work="$(printf '%s\n' "$output" | sed -n 's/^Rust E2E retained WORK after failure: //p')"
+  [ -n "$retained_work" ]
+  [ -d "$retained_work" ]
+  rm -rf "$retained_work"
+}
+
 @test "real Pueue harness asserts the production-derived Codex network argument" {
   awk '
     index($0, "sandbox_workspace_write.network_access=true") &&
