@@ -1059,6 +1059,14 @@ impl AgentRunner {
                 message: "must identify a reserved campaign agent run",
             }));
         }
+        ResearchRepository::new(db)
+            .validate_agent_run_reservation(
+                &review.campaign_id,
+                &review.review_id,
+                review.attempt,
+                budget_reservation_id,
+            )
+            .map_err(pre_binding_error)?;
         let persisted = ResearchRepository::new(db)
             .find(&review.review_id)
             .map_err(pre_binding_error)?;
@@ -1081,15 +1089,51 @@ impl AgentRunner {
                 message: "review generation does not match campaign state",
             }));
         }
-        let (session_id, fresh_launch) = match &config.context {
+        let prior_session_id = state.session_id.clone();
+        let prior_session_generation = state.session_generation;
+        let (session_id, fresh_launch, session_generation, recovery_reason) = match &config.context {
             AgentContextMode::Fresh => {
-                if state.session_id.is_some() {
-                    return Err(pre_binding_error(AppError::Validation {
-                        field: "agent.context",
-                        message: "a campaign with an owned research session requires exact resume",
-                    }));
+                if let Some(prior_session_id) = prior_session_id.as_deref() {
+                    match crate::codex_session::probe_owned_session(
+                        &self.policy.codex_home,
+                        &project_policy.root_anchor.canonical_path,
+                        prior_session_id,
+                    )
+                    .map_err(pre_binding_error)?
+                    {
+                        crate::codex_session::OwnedSessionProbe::Owned(_) => {
+                            return Err(pre_binding_error(AppError::Validation {
+                                field: "agent.context",
+                                message:
+                                    "a campaign with an owned research session requires exact resume",
+                            }));
+                        }
+                        crate::codex_session::OwnedSessionProbe::Missing => {
+                            let next_generation = ResearchRepository::new(db)
+                                .prepare_missing_session_reconstruction(
+                                    &review.campaign_id,
+                                    &project.project_id,
+                                    &review.review_id,
+                                    prior_session_id,
+                                    prior_session_generation,
+                                )
+                                .map_err(pre_binding_error)?;
+                            (
+                                Uuid::new_v4().to_string(),
+                                true,
+                                next_generation,
+                                Some("research_session_missing".to_owned()),
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        Uuid::new_v4().to_string(),
+                        true,
+                        prior_session_generation,
+                        None,
+                    )
                 }
-                (Uuid::new_v4().to_string(), true)
             }
             AgentContextMode::Resume { session_id } => {
                 let owned = crate::codex_session::verify_project_ownership(
@@ -1098,13 +1142,13 @@ impl AgentRunner {
                     session_id,
                 )
                 .map_err(pre_binding_error)?;
-                if state.session_id.as_deref() != Some(owned.as_str()) {
+                if prior_session_id.as_deref() != Some(owned.as_str()) {
                     return Err(pre_binding_error(AppError::Validation {
                         field: "agent.context.session_id",
                         message: "research resume must use the campaign-owned session",
                     }));
                 }
-                (owned, false)
+                (owned, false, prior_session_generation, None)
             }
             AgentContextMode::ResumeLatest => {
                 return Err(pre_binding_error(AppError::Validation {
@@ -1137,10 +1181,14 @@ impl AgentRunner {
             binding: ResearchLaunchBinding {
                 review_id: review.review_id.clone(),
                 attempt: review.attempt,
-                session_generation: review.session_generation,
+                session_generation,
+                prior_session_generation,
                 session_id,
+                prior_session_id,
                 context_json: evidence.json.clone(),
                 context_digest: evidence.digest.clone(),
+                budget_reservation_id: budget_reservation_id.to_owned(),
+                recovery_reason,
             },
             fresh_launch,
         };

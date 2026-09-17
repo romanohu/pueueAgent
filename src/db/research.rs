@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -44,9 +44,13 @@ pub struct ResearchLaunchBinding {
     pub review_id: String,
     pub attempt: i64,
     pub session_generation: i64,
+    pub prior_session_generation: i64,
     pub session_id: String,
+    pub prior_session_id: Option<String>,
     pub context_json: String,
     pub context_digest: String,
+    pub budget_reservation_id: String,
+    pub recovery_reason: Option<String>,
 }
 
 pub struct ResearchRepository<'db> {
@@ -425,6 +429,102 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("read recent research reviews"))
     }
 
+    pub fn validate_agent_run_reservation(
+        &self,
+        campaign_id: &str,
+        review_id: &str,
+        attempt: i64,
+        reservation_id: &str,
+    ) -> Result<(), AppError> {
+        validate_budget_reservation_id(reservation_id)?;
+        if attempt < 0 {
+            return Err(validation_error("research.attempt", "must be non-negative"));
+        }
+        let connection = self.db.connect()?;
+        if !budget_reservation_matches(
+            &connection,
+            campaign_id,
+            review_id,
+            attempt,
+            reservation_id,
+        )? {
+            return Err(validation_error(
+                "budget_reservation_id",
+                "must be the consumed campaign reservation for this research review attempt",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn prepare_missing_session_reconstruction(
+        &self,
+        campaign_id: &str,
+        project_id: &str,
+        review_id: &str,
+        prior_session_id: &str,
+        prior_session_generation: i64,
+    ) -> Result<i64, AppError> {
+        validate_session_id(prior_session_id)?;
+        if prior_session_generation < 0 {
+            return Err(validation_error(
+                "research.session_generation",
+                "must be non-negative",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error(
+                "begin research session reconstruction check",
+            ))?;
+        let current: Option<(Option<String>, i64, String, Option<i64>)> = transaction
+            .query_row(
+                "SELECT c.session_id, c.session_generation, r.state, r.agent_run_id
+                 FROM campaign_research AS c
+                 JOIN campaigns AS campaign ON campaign.campaign_id = c.campaign_id
+                 JOIN research_reviews AS r ON r.campaign_id = c.campaign_id
+                 WHERE c.campaign_id = ?1 AND campaign.project_id = ?2
+                   AND r.review_id = ?3",
+                params![campaign_id, project_id, review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(database_error("read research session reconstruction state"))?;
+        let Some((current_session_id, current_generation, review_state, review_run_id)) = current
+        else {
+            return Err(validation_error(
+                "research.review",
+                "does not identify a review in the requested project and campaign",
+            ));
+        };
+        if current_session_id.as_deref() != Some(prior_session_id)
+            || current_generation != prior_session_generation
+            || !matches!(review_state.as_str(), "pending" | "retry_wait")
+            || review_run_id.is_some()
+        {
+            return Err(validation_error(
+                "research.session",
+                "cannot reconstruct a changed or already bound campaign session",
+            ));
+        }
+        if research_has_active_or_unknown_owner(&transaction, campaign_id, review_id)? {
+            return Err(validation_error(
+                "research.session",
+                "cannot reconstruct while a prior research run has active or unknown ownership",
+            ));
+        }
+        let next_generation = current_generation.checked_add(1).ok_or_else(|| {
+            validation_error(
+                "research.session_generation",
+                "cannot advance the session generation",
+            )
+        })?;
+        transaction.commit().map_err(database_error(
+            "commit research session reconstruction check",
+        ))?;
+        Ok(next_generation)
+    }
+
     /// Bind one native research run before its launch gate is released.  The
     /// planned session and exact evidence context are written in the same
     /// transaction as the review's running identity; a successful response
@@ -441,51 +541,89 @@ impl<'db> ResearchRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin research run binding"))?;
-        let (campaign_id, current_session, current_generation, current_attempt, current_run): (
-            String,
-            Option<String>,
-            i64,
-            i64,
-            Option<i64>,
-        ) = transaction
+        let (
+            campaign_id,
+            current_session,
+            current_generation,
+            current_attempt,
+            current_run,
+            current_review_generation,
+        ): (String, Option<String>, i64, i64, Option<i64>, i64) = transaction
             .query_row(
                 "SELECT r.campaign_id, c.session_id, c.session_generation,
-                        r.attempt, r.agent_run_id
+                        r.attempt, r.agent_run_id, r.session_generation
                  FROM research_reviews AS r
                  JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
                  JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
                  WHERE r.review_id = ?1 AND campaign.project_id = ?2",
                 params![binding.review_id, project_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .map_err(database_error("read research run binding"))?;
         if current_attempt != binding.attempt
-            || current_generation != binding.session_generation
+            || current_generation != binding.prior_session_generation
+            || current_review_generation != binding.prior_session_generation
             || current_run.is_some()
-            || current_session
-                .as_deref()
-                .is_some_and(|session| session != binding.session_id)
+            || current_session != binding.prior_session_id
         {
             return Err(validation_error(
                 "research.binding",
                 "review, attempt, or campaign session changed before native binding",
             ));
         }
+        if !budget_reservation_matches(
+            &transaction,
+            &campaign_id,
+            &binding.review_id,
+            binding.attempt,
+            &binding.budget_reservation_id,
+        )? {
+            return Err(validation_error(
+                "budget_reservation_id",
+                "must be the consumed campaign reservation for this research review attempt",
+            ));
+        }
+        if binding.recovery_reason.is_some()
+            && research_has_active_or_unknown_owner(&transaction, &campaign_id, &binding.review_id)?
+        {
+            return Err(validation_error(
+                "research.session",
+                "cannot reconstruct while a prior research run has active or unknown ownership",
+            ));
+        }
+        let recovery_notes = binding
+            .recovery_reason
+            .as_ref()
+            .map(|reason| json!({ "recovery_reason": reason }).to_string());
         let changed = transaction
             .execute(
                 "UPDATE research_reviews
                  SET state = 'running', agent_run_id = ?1, context_json = ?2,
                      context_digest = ?3, started_at = COALESCE(started_at, ?4),
+                     session_generation = ?5, notes_json = COALESCE(?6, notes_json),
                      updated_at = ?4
-                 WHERE review_id = ?5 AND attempt = ?6
+                 WHERE review_id = ?7 AND attempt = ?8
+                   AND session_generation = ?9
                    AND agent_run_id IS NULL AND state IN ('pending','retry_wait')",
                 params![
                     agent_run_id,
                     binding.context_json,
                     binding.context_digest,
                     now,
+                    binding.session_generation,
+                    recovery_notes,
                     binding.review_id,
                     binding.attempt,
+                    binding.prior_session_generation,
                 ],
             )
             .map_err(database_error("bind research review to agent run"))?;
@@ -495,20 +633,28 @@ impl<'db> ResearchRepository<'db> {
                 "review is no longer claimable for this native run",
             ));
         }
-        transaction
+        let changed = transaction
             .execute(
                 "UPDATE campaign_research
-                 SET session_id = COALESCE(session_id, ?1), updated_at = ?2
-                 WHERE campaign_id = ?3 AND session_generation = ?4
-                   AND (session_id IS NULL OR session_id = ?1)",
+                 SET session_id = ?1, session_generation = ?2, updated_at = ?3
+                 WHERE campaign_id = ?4 AND session_generation = ?5
+                   AND ((session_id IS NULL AND ?6 IS NULL) OR session_id = ?6)",
                 params![
                     binding.session_id,
+                    binding.session_generation,
                     now,
                     campaign_id,
-                    binding.session_generation,
+                    binding.prior_session_generation,
+                    binding.prior_session_id,
                 ],
             )
             .map_err(database_error("persist planned research session"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.session",
+                "campaign session changed before native binding",
+            ));
+        }
         transaction
             .commit()
             .map_err(database_error("commit research run binding"))
@@ -743,17 +889,45 @@ fn validation_error(field: &'static str, message: &'static str) -> AppError {
 
 fn validate_research_binding(binding: &ResearchLaunchBinding) -> Result<(), AppError> {
     validate_session_id(&binding.session_id)?;
+    if let Some(prior_session_id) = binding.prior_session_id.as_deref() {
+        validate_session_id(prior_session_id)?;
+    }
     if binding.review_id.is_empty()
         || binding.review_id.len() > 256
         || binding.review_id.chars().any(char::is_control)
         || binding.attempt < 0
         || binding.session_generation < 0
+        || binding.prior_session_generation < 0
     {
         return Err(validation_error(
             "research.binding",
             "contains an invalid review, attempt, or generation",
         ));
     }
+    if binding.recovery_reason.is_some() {
+        let Some(reason) = binding.recovery_reason.as_deref() else {
+            unreachable!();
+        };
+        if binding.prior_session_id.is_none()
+            || binding.session_generation <= binding.prior_session_generation
+            || reason.is_empty()
+            || reason.len() > 128
+            || !reason.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+            })
+        {
+            return Err(validation_error(
+                "research.recovery_reason",
+                "must identify a bounded session reconstruction",
+            ));
+        }
+    } else if binding.session_generation != binding.prior_session_generation {
+        return Err(validation_error(
+            "research.session_generation",
+            "must remain unchanged without a recovery reason",
+        ));
+    }
+    validate_budget_reservation_id(&binding.budget_reservation_id)?;
     if binding.context_json.is_empty()
         || binding.context_json.len() > crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES
     {
@@ -772,6 +946,69 @@ fn validate_research_binding(binding: &ResearchLaunchBinding) -> Result<(), AppE
         ));
     }
     Ok(())
+}
+
+fn validate_budget_reservation_id(reservation_id: &str) -> Result<(), AppError> {
+    if reservation_id.is_empty()
+        || reservation_id.len() > 256
+        || reservation_id.chars().any(char::is_control)
+    {
+        return Err(validation_error(
+            "budget_reservation_id",
+            "must be non-empty, bounded, and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn budget_reservation_matches(
+    connection: &Connection,
+    campaign_id: &str,
+    review_id: &str,
+    attempt: i64,
+    reservation_id: &str,
+) -> Result<bool, AppError> {
+    let subject_key = format!("research:{review_id}:attempt:{attempt}");
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM budget_reservations
+                 WHERE reservation_id = ?1 AND campaign_id = ?2
+                   AND experiment_id IS NULL AND dimension = 'agent_run'
+                   AND subject_key = ?3 AND status = 'consumed'
+             )",
+            params![reservation_id, campaign_id, subject_key],
+            |row| row.get(0),
+        )
+        .map_err(database_error("validate research budget reservation"))
+}
+
+fn research_has_active_or_unknown_owner(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    current_review_id: &str,
+) -> Result<bool, AppError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM research_reviews AS prior
+                 LEFT JOIN agent_runs AS run ON run.run_id = prior.agent_run_id
+                 WHERE prior.campaign_id = ?1 AND prior.review_id <> ?2
+                   AND (
+                       prior.state IN ('running','ready')
+                       OR (
+                           prior.agent_run_id IS NOT NULL
+                           AND (run.run_id IS NULL OR run.status NOT IN (
+                               'completed','failed','timed_out','cancelled'
+                           ))
+                       )
+                   )
+             )",
+            params![campaign_id, current_review_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check research session owner"))
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), AppError> {
