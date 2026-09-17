@@ -47,6 +47,7 @@ struct ClaimedReview {
     review: pueue_agent::db::ResearchReview,
     evidence: ResearchEvidence,
     event_id: i64,
+    claimed_at: i64,
 }
 
 impl ResearchHarness {
@@ -201,10 +202,10 @@ max_agent_runs = 10
             .schedule_running(&campaign_id, NOW + 1, 1, NOW + 60)
             .unwrap();
         let review = ResearchRepository::new(&db)
-            .claim_due(&campaign_id, &experiment_id, &task_signature, NOW + 60)
+            .claim_due(&campaign_id, &experiment_id, &task_signature, NOW + 61)
             .unwrap()
             .expect("running baseline must produce one research review");
-        let evidence = build_research_evidence(&db, &review, NOW + 60).unwrap();
+        let evidence = build_research_evidence(&db, &review, NOW + 61).unwrap();
         let capture_path = fixture_root.join("research-capture.txt");
         let codex = trusted_bin.join("codex");
         compile_research_codex(
@@ -279,24 +280,26 @@ max_agent_runs = 10
             .into_iter()
             .next()
             .expect("initial review remains persisted");
-        let evidence = build_research_evidence(&self.db, &review, NOW + 60).unwrap();
+        let evidence = build_research_evidence(&self.db, &review, NOW + 61).unwrap();
         ClaimedReview {
             event_id: review_event_id(&self.db, &review.review_id),
             review,
             evidence,
+            claimed_at: NOW + 61,
         }
     }
 
     fn reserve_budget(
         &self,
         review: &pueue_agent::db::ResearchReview,
+        now: i64,
     ) -> pueue_agent::models::BudgetReservation {
         match CampaignRepository::new(&self.db)
             .reserve_agent_run(
                 &self.campaign_id,
                 &format!("research:{}:attempt:{}", review.review_id, review.attempt),
                 &CampaignLimits::default(),
-                NOW + 70,
+                now,
             )
             .unwrap()
         {
@@ -315,11 +318,12 @@ max_agent_runs = 10
         claimed: &ClaimedReview,
         context: AgentContextMode,
     ) -> pueue_agent::agent::AgentHandle {
+        let launch_now = claimed.claimed_at + 19;
         EventRepository::new(&self.db)
-            .claim_by_id(&self.project.project_id, claimed.event_id, NOW + 80)
+            .claim_by_id(&self.project.project_id, claimed.event_id, launch_now)
             .unwrap()
             .expect("research event must be claimable");
-        let budget = self.reserve_budget(&claimed.review);
+        let budget = self.reserve_budget(&claimed.review, launch_now);
         let run_id_guard = self
             .runner
             .try_acquire_run_id_admission_guard(&self.db)
@@ -344,7 +348,7 @@ max_agent_runs = 10
                 &claimed.review,
                 &claimed.evidence,
                 budget.reservation_id.as_str(),
-                NOW + 90,
+                launch_now,
                 run_id_guard,
                 project_lock,
             )
@@ -395,7 +399,7 @@ max_agent_runs = 10
                 &self.experiment_id,
                 41,
                 ExperimentTerminalOutcome::Succeeded,
-                NOW + 200,
+                NOW + 120,
             )
             .unwrap();
         let proposal = proposals::validate(
@@ -427,17 +431,17 @@ max_agent_runs = 10
                 &submission_id,
                 &proposal,
                 &CampaignLimits::default(),
-                NOW + 201,
+                NOW + 121,
             )
             .unwrap()
             .accepted()
             .expect("changed experiment must be accepted");
         ExperimentRepository::new(&self.db)
-            .mark_submitting(&experiment_id, NOW + 202)
+            .mark_submitting(&experiment_id, NOW + 122)
             .unwrap();
         let task_signature = format!("pueue-task:v1:{}:two", self.campaign_id);
         ExperimentRepository::new(&self.db)
-            .mark_accepted(&experiment_id, 42, &task_signature, NOW + 203)
+            .mark_accepted(&experiment_id, 42, &task_signature, NOW + 123)
             .unwrap();
         TaskObservationRepository::new(&self.db)
             .upsert(&NewTaskObservation::new(
@@ -447,11 +451,11 @@ max_agent_runs = 10
                 &self.project.pueue_group,
                 vec!["python".to_owned(), "train-changed.py".to_owned()],
                 "Running",
-                Some(NOW + 200),
-                Some(NOW + 201),
+                Some(NOW + 120),
+                Some(NOW + 121),
                 None,
                 None,
-                NOW + 204,
+                NOW + 124,
             ))
             .unwrap();
         self.db
@@ -459,7 +463,7 @@ max_agent_runs = 10
             .unwrap()
             .execute(
                 "UPDATE campaign_research SET next_due_at = ?1 WHERE campaign_id = ?2",
-                rusqlite::params![NOW + 205, self.campaign_id],
+                rusqlite::params![NOW + 125, self.campaign_id],
             )
             .unwrap();
         let review = ResearchRepository::new(&self.db)
@@ -467,15 +471,16 @@ max_agent_runs = 10
                 &self.campaign_id,
                 &experiment_id,
                 &task_signature,
-                NOW + 205,
+                NOW + 125,
             )
             .unwrap()
             .expect("changed running experiment must produce a review");
-        let evidence = build_research_evidence(&self.db, &review, NOW + 205).unwrap();
+        let evidence = build_research_evidence(&self.db, &review, NOW + 125).unwrap();
         ClaimedReview {
             event_id: review_event_id(&self.db, &review.review_id),
             review,
             evidence,
+            claimed_at: NOW + 125,
         }
     }
 }
