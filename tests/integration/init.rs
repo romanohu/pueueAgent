@@ -394,6 +394,47 @@ fn init_instructions_preserve_the_state_md_objective() {
 }
 
 #[test]
+fn init_materializes_the_marked_role_instructions_distribution() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    fs::create_dir(&root).unwrap();
+
+    let output = init(&root);
+
+    assert!(output.status.success());
+    let generated = fs::read(root.join(".pueue-agent/instructions.md")).unwrap();
+    let distribution = fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/instructions.md"),
+    )
+    .unwrap();
+    assert_eq!(generated, distribution);
+    assert!(generated.starts_with(b"<!-- pueue-agent:instructions v1 begin -->\n"));
+    assert!(generated.ends_with(b"<!-- pueue-agent:instructions v1 end -->\n"));
+    let text = String::from_utf8(generated).unwrap();
+    for section in [
+        "## Standard role",
+        "## Decision role",
+        "## Diagnosis role",
+        "## Editor role",
+    ] {
+        assert!(text.contains(section), "missing role section: {section}");
+    }
+}
+
+#[test]
+fn init_preserves_custom_instructions_byte_for_byte() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("experiment");
+    let state = root.join(".pueue-agent");
+    fs::create_dir_all(&state).unwrap();
+    let custom = b"custom project rules\r\nDo not change the dataset.\n";
+    fs::write(state.join("instructions.md"), custom).unwrap();
+
+    assert!(init(&root).status.success());
+    assert_eq!(fs::read(state.join("instructions.md")).unwrap(), custom);
+}
+
+#[test]
 fn init_instructions_keep_phase_one_replacements_advisory_only() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("experiment");

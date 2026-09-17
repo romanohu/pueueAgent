@@ -250,14 +250,21 @@ fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_bo
     let troubleshooting =
         std::fs::read_to_string(root.join("docs/troubleshooting-ja.md")).unwrap();
 
-    let quick_start = concat!(
+    let readme_quick_start = concat!(
+        "pueue-agent init\n",
+        "# edit .pueue-agent/STATE.md\n",
+        "pueue-agent enable\n",
+        "pueue-agent submit --metric-name validation_loss --metric-direction minimize -- python train.py"
+    );
+    assert!(readme.contains(readme_quick_start));
+
+    let getting_started_quick_start = concat!(
         "pueue-agent init\n",
         "# edit .pueue-agent/STATE.md\n",
         "pueue-agent enable\n",
         "pueue-agent submit -- python train.py"
     );
-    assert!(readme.contains(quick_start));
-    assert!(getting_started.contains(quick_start));
+    assert!(getting_started.contains(getting_started_quick_start));
 
     for command in [
         "pueue-agent campaign status",
@@ -298,12 +305,12 @@ fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_bo
 
     for document in [&readme, &getting_started] {
         assert!(document.contains("Phase 2"));
-        assert!(document.contains("terminal completion loop"));
+        assert!(document.contains("structured decision"));
         assert!(document.contains("proposal"));
-        assert!(document.contains("finite wait"));
-        assert!(document.contains("Phase 3"));
-        assert!(document.contains("running OOM/stall observer"));
-        assert!(document.contains("periodic observer"));
+        assert!(document.contains("有限"));
+        assert!(document.contains("実行中"));
+        assert!(document.contains("diagnosis agent"));
+        assert!(document.contains("Periodic DeepCheck"));
         assert!(document.contains("goal review"));
         assert!(document.contains("code worktree"));
         assert!(!document.contains("現時点では自動で次の学習を投入しません"));
@@ -358,18 +365,35 @@ fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_bo
     }
 
     for document in [&readme, &getting_started, &architecture, &workflows] {
-        assert!(document.contains("Phase 3") && document.contains("running OOM/stall observer"));
+        assert!(document.contains("health"));
         assert!(document.contains("後続 phase") && document.contains("goal review"));
         assert!(document.contains("Phase 5") && document.contains("code worktree"));
     }
 
     let instructions = std::fs::read_to_string(root.join("templates/instructions.md")).unwrap();
-    assert!(instructions.contains("Phase 2 decision agent"));
-    assert!(instructions.contains("exactly one structured decision"));
+    assert!(instructions.contains("<!-- pueue-agent:instructions v1 begin -->"));
+    assert!(instructions.contains("<!-- pueue-agent:instructions v1 end -->"));
+    for section in [
+        "## Standard role",
+        "## Decision role",
+        "## Diagnosis role",
+        "## Editor role",
+    ] {
+        assert!(instructions.contains(section), "missing role section: {section}");
+    }
+    assert!(instructions.contains("managed campaign"));
+    assert!(instructions.contains("advisory-only"));
+    assert!(instructions.contains("source"));
+    assert!(instructions.contains("commit"));
+    assert!(instructions.contains("directly"));
     assert!(instructions.contains("proposal"));
-    assert!(instructions.contains("wait"));
-    assert!(instructions.contains("Pueue を直接呼び出さない"));
-    assert!(instructions.contains("source を編集しない"));
+    assert!(instructions.contains("finite wait"));
+    assert!(instructions.contains("goal_reached"));
+    assert!(instructions.contains("evidence_ref"));
+    assert!(instructions.contains("code_change"));
+    assert!(instructions.contains("supervisor-owned editing"));
+    assert!(instructions.contains("kill_and_resume"));
+    assert!(instructions.contains("cannot_apply"));
 }
 
 #[test]

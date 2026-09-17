@@ -1788,14 +1788,14 @@ pub fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {
 
 fn decision_launch_prompt(context: &DecisionContextBundle) -> String {
     format!(
-        "Analyze this supervisor-owned campaign context without modifying the project. Return exactly one JSON decision matching the supplied schema.\n{}",
+        "Analyze this supervisor-owned campaign context without modifying the project. Return exactly one JSON decision matching the supplied schema: proposal, finite wait, or goal_reached with evidence. A code_change proposal requests supervisor-owned editing; it does not authorize you to edit source, commit, modify project state, or submit or terminate a Pueue task yourself. A goal_reached decision requires schema evidence_ref and remains subject to human review.\n{}",
         context.json
     )
 }
 
 fn diagnosis_launch_prompt(evidence_json: &str) -> String {
     format!(
-        "Diagnose this running experiment's health signals without modifying anything. Return exactly one JSON diagnosis matching the supplied schema.\n{}",
+        "Diagnose this running experiment's health signals without modifying anything. Return exactly one JSON diagnosis matching the supplied schema. The recommended_action must be exactly one of continue, kill_and_resume, or kill_and_escalate; you must not kill, resubmit, or edit code yourself.\n{}",
         evidence_json
     )
 }
@@ -3156,6 +3156,38 @@ mod tests {
         assert!(schema.get("oneOf").is_none());
         assert!(schema.get("anyOf").is_none());
         assert_strict_object_schema(&schema);
+    }
+
+    #[test]
+    fn decision_launch_prompt_allows_code_change_and_requires_goal_evidence() {
+        let context = DecisionContextBundle {
+            json: r#"{"bounded":true}"#.to_owned(),
+            digest: "decision-context-digest".to_owned(),
+        };
+
+        let prompt = decision_launch_prompt(&context);
+
+        assert!(prompt.contains(
+            "Return exactly one JSON decision matching the supplied schema: proposal, finite wait, or goal_reached with evidence."
+        ));
+        assert!(prompt.contains("A code_change proposal requests supervisor-owned editing"));
+        assert!(prompt.contains(
+            "it does not authorize you to edit source, commit, modify project state, or submit or terminate a Pueue task yourself"
+        ));
+        assert!(prompt.contains("evidence_ref"));
+        assert!(prompt.contains(r#"{"bounded":true}"#));
+        assert!(!prompt.contains("instructions.md"));
+    }
+
+    #[test]
+    fn diagnosis_launch_prompt_keeps_actions_under_the_supplied_schema() {
+        let prompt = diagnosis_launch_prompt(r#"{"health":"bounded"}"#);
+
+        assert!(prompt.contains("exactly one JSON diagnosis matching the supplied schema"));
+        assert!(prompt.contains("continue, kill_and_resume, or kill_and_escalate"));
+        assert!(prompt.contains("must not kill, resubmit, or edit code yourself"));
+        assert!(prompt.contains(r#"{"health":"bounded"}"#));
+        assert!(!prompt.contains("instructions.md"));
     }
 
     #[test]

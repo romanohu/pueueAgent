@@ -2635,7 +2635,7 @@ fn editor_prompt(
         "base_sha": run.base_sha,
         "candidate_root": candidate_path,
         "working_directory": proposal.working_directory,
-        "instructions": "Modify only the candidate root. Do not mutate the registered project, protected refs, remotes, or credentials. Return only strict editor JSON with status ready or cannot_apply and bounded proposed checks. Do not commit.",
+        "instructions": "Modify only the candidate root. Do not mutate the registered project, protected refs, remotes, or credentials. Return only strict editor JSON with status ready or cannot_apply and bounded proposed checks. Do not commit or update any Git refs. supervisor owns commit, ref updates, check approval, and experiment submission.",
     });
     let json = serde_json::to_string(&payload).map_err(|source| AppError::Serialization {
         operation: "serialize code-change editor prompt",
@@ -11224,6 +11224,86 @@ mod tests {
             "campaign/campaign-1/candidate/proposal-1"
         );
         assert_eq!(best_ref("campaign-1").unwrap(), "campaign/campaign-1/best");
+    }
+
+    #[test]
+    fn editor_prompt_keeps_commit_and_ref_authority_with_the_supervisor() {
+        let campaign = crate::models::Campaign {
+            campaign_id: "campaign-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            objective_text: "lower validation loss".to_owned(),
+            objective_digest: "objective-digest".to_owned(),
+            initial_argv: vec!["python".to_owned(), "train.py".to_owned()],
+            state: crate::models::CampaignState::Active,
+            state_reason: None,
+            baseline_experiment_id: Some("baseline-1".to_owned()),
+            base_revision_sha: Some("a".repeat(40)),
+            next_eligible_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let proposal = crate::models::Proposal {
+            proposal_id: "proposal-1".to_owned(),
+            campaign_id: "campaign-1".to_owned(),
+            kind: crate::models::ProposalKind::CodeChange,
+            status: crate::models::ProposalStatus::Accepted,
+            hypothesis: "reduce validation loss".to_owned(),
+            source_experiment_id: Some("experiment-1".to_owned()),
+            argv: vec!["python".to_owned(), "train.py".to_owned()],
+            working_directory: ".".to_owned(),
+            expected_evidence: vec!["validation loss".to_owned()],
+            canonical_digest: "proposal-digest".to_owned(),
+            reject_reason: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let run = crate::models::CodeChangeRun {
+            code_change_run_id: "code-change-1".to_owned(),
+            proposal_id: "proposal-1".to_owned(),
+            campaign_id: "campaign-1".to_owned(),
+            state: crate::models::CodeChangeState::Editing,
+            base_sha: "a".repeat(40),
+            candidate_sha: None,
+            candidate_ref: "campaign/campaign-1/candidate/proposal-1".to_owned(),
+            best_ref: "campaign/campaign-1/best".to_owned(),
+            worktree_id: "worktree-1".to_owned(),
+            worktree_relative_path: ".pueue-agent/worktrees/campaign-1/proposal-1".to_owned(),
+            editor_session_id: None,
+            editor_attempts: 0,
+            diff_digest: None,
+            changed_file_count: None,
+            diff_bytes: None,
+            experiment_id: None,
+            rejection_code: None,
+            rejection_summary: None,
+            promotion_outcome: None,
+            promotion_expected_best_experiment_id: None,
+            promotion_expected_old_sha: None,
+            promotion_target_sha: None,
+            cleanup_completed_at: None,
+            state_root_identity: None,
+            worktrees_identity: None,
+            campaign_identity: None,
+            candidate_root_identity: None,
+            candidate_admin_identity: None,
+            candidate_common_identity: None,
+            candidate_admin_path: None,
+            candidate_common_path: None,
+            protected_ref_digest: None,
+            remote_config_digest: None,
+            candidate_working_directory_identity: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        let prompt = editor_prompt(&campaign, &proposal, &run, Path::new("/tmp/candidate"))
+            .unwrap();
+
+        assert!(prompt.contains("Do not commit or update any Git refs"));
+        assert!(prompt.contains(
+            "supervisor owns commit, ref updates, check approval, and experiment submission"
+        ));
+        assert!(prompt.contains("candidate_root"));
     }
 
     #[cfg(unix)]

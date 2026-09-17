@@ -1702,6 +1702,31 @@ async fn campaign_prompt_embeds_the_authoritative_persisted_objective_snapshot()
 }
 
 #[tokio::test]
+async fn managed_standard_prompt_is_advisory_and_keeps_submission_authority() {
+    let harness = SchedulerHarness::new();
+    let campaign_id = harness.start_campaign();
+    harness.enqueue_for_campaign(
+        EventKind::TaskFailed,
+        "managed-standard-role-boundary",
+        &campaign_id,
+    );
+
+    let mut report = harness.scheduler().tick().await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    let prompt = &report.started[0].prompt;
+    assert!(prompt.contains("Managed campaign Standard role is advisory-only"));
+    assert!(prompt.contains("do not edit source, commit, or submit jobs directly"));
+    assert!(prompt.contains("supervisor-owned proposal"));
+
+    let mut started = report.started.pop().unwrap();
+    started
+        .handle
+        .wait(&harness.db, harness.now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn campaign_prompt_preserves_the_tail_of_a_maximum_escaped_objective() {
     let harness = SchedulerHarness::new();
     let tail = "OBJECTIVE_TAIL_SENTINEL";

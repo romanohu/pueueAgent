@@ -1447,7 +1447,7 @@ fn build_base_prompt(
     }
     if campaign.is_some() {
         prompt.push_str(
-            "\nInstructions: read .pueue-agent/instructions.md first and use the authoritative SQLite campaign snapshot above as the objective. Treat on-disk STATE.md only as a non-authoritative human reference and state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails.\n",
+            "\nInstructions: read .pueue-agent/instructions.md first and use the authoritative SQLite campaign snapshot above as the objective. Treat on-disk STATE.md only as a non-authoritative human reference and state.json as bounded scratch context. SQLite owns campaign, objective, budget, and lineage authority; preserve configured guardrails. Managed campaign Standard role is advisory-only: do not edit source, commit, or submit jobs directly. Use a supervisor-owned proposal for source edits, commits, or direct submission.\n",
         );
     } else {
         prompt.push_str(
