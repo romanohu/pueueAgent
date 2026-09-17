@@ -970,12 +970,16 @@ fn maybe_fail_io_for_tests(stage: FaultStage) -> io::Result<()> {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-static TEST_SWAP_CANDIDATE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static TEST_SWAP_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_LOCK_BEFORE_FLOCK: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn maybe_swap_candidate_for_tests(state_dir: &File, name: &OsStr) {
-    if !TEST_SWAP_CANDIDATE.swap(false, Ordering::SeqCst) {
+    let armed = TEST_SWAP_CANDIDATE.with(|slot| slot.replace(false));
+    if !armed {
         return;
     }
     unlink_at(state_dir, name).expect("remove owned candidate for deterministic swap");
@@ -996,12 +1000,9 @@ fn maybe_swap_candidate_for_tests(state_dir: &File, name: &OsStr) {
 fn maybe_swap_candidate_for_tests(_state_dir: &File, _name: &OsStr) {}
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-static TEST_LOCK_BEFORE_FLOCK: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn notify_before_flock_for_tests() {
-    if let Some(sender) = TEST_LOCK_BEFORE_FLOCK.lock().unwrap().take() {
+    let sender = TEST_LOCK_BEFORE_FLOCK.with(|slot| slot.borrow_mut().take());
+    if let Some(sender) = sender {
         let _ = sender.send(());
     }
 }
@@ -1137,7 +1138,7 @@ mod tests {
         let (_temporary, root, original) = project();
         let preview = instructions::update(&root, None).unwrap();
         let token = preview.preview_token.as_deref().unwrap();
-        TEST_SWAP_CANDIDATE.store(true, std::sync::atomic::Ordering::SeqCst);
+        TEST_SWAP_CANDIDATE.with(|slot| slot.set(true));
         TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::Rename));
 
         let result = instructions::update(&root, Some(token));
@@ -1162,8 +1163,31 @@ mod tests {
             fs::read(replacements[0].path()).unwrap(),
             b"replacement candidate"
         );
-        TEST_SWAP_CANDIDATE.store(false, std::sync::atomic::Ordering::SeqCst);
+        TEST_SWAP_CANDIDATE.with(|slot| slot.set(false));
         TEST_FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn candidate_swap_hook_is_scoped_to_the_arming_thread() {
+        let (_temporary, root, _original) = project();
+        let preview = instructions::update(&root, None).unwrap();
+        let token = preview.preview_token.as_deref().unwrap().to_owned();
+        TEST_SWAP_CANDIDATE.with(|slot| slot.set(true));
+
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || instructions::update(&worker_root, Some(&token)));
+        let result = worker.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "worker consumed a candidate swap hook armed by another thread: {result:?}"
+        );
+        assert_eq!(
+            fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
+            include_bytes!("../templates/instructions.md")
+        );
+        TEST_SWAP_CANDIDATE.with(|slot| slot.set(false));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1188,9 +1212,11 @@ mod tests {
         assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
 
         let (sender, receiver) = mpsc::channel();
-        *TEST_LOCK_BEFORE_FLOCK.lock().unwrap() = Some(sender);
         let worker_root = root.clone();
-        let worker = std::thread::spawn(move || instructions::update(&worker_root, Some(&token)));
+        let worker = std::thread::spawn(move || {
+            TEST_LOCK_BEFORE_FLOCK.with(|slot| *slot.borrow_mut() = Some(sender));
+            instructions::update(&worker_root, Some(&token))
+        });
         receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("waiting updater did not reach flock");
@@ -1213,7 +1239,33 @@ mod tests {
         );
         let _ = fs::remove_file(old_lock_path);
         let _ = fs::remove_file(lock_path);
-        *TEST_LOCK_BEFORE_FLOCK.lock().unwrap() = None;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lock_notification_hook_is_scoped_to_the_arming_thread() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_temporary, root, _original) = project();
+        let preview = instructions::update(&root, None).unwrap();
+        let token = preview.preview_token.as_deref().unwrap().to_owned();
+        let (sender, receiver) = mpsc::channel();
+        TEST_LOCK_BEFORE_FLOCK.with(|slot| *slot.borrow_mut() = Some(sender));
+
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || instructions::update(&worker_root, Some(&token)));
+        let result = worker.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "worker consumed a lock hook armed by another thread: {result:?}"
+        );
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(1)).is_err(),
+            "worker consumed a lock hook armed by another thread"
+        );
+        TEST_LOCK_BEFORE_FLOCK.with(|slot| *slot.borrow_mut() = None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
