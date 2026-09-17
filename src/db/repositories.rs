@@ -1844,7 +1844,10 @@ impl<'db> EventRepository<'db> {
                 | EventKind::AutoKilled
                 | EventKind::TerminationFailed => count += 1,
                 EventKind::TaskFinished | EventKind::DeepCheck | EventKind::OperatorWake => break,
-                EventKind::CampaignDecision | EventKind::HealthDiagnosis | EventKind::CodeChange => {}
+                EventKind::CampaignDecision
+                | EventKind::HealthDiagnosis
+                | EventKind::CodeChange
+                | EventKind::CampaignResearch => {}
             }
         }
         Ok(count)

@@ -36,6 +36,17 @@ pub struct ResearchReview {
     pub response_json: Option<String>,
     pub termination_request_id: Option<i64>,
     pub successor_experiment_id: Option<String>,
+    pub session_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchLaunchBinding {
+    pub review_id: String,
+    pub attempt: i64,
+    pub session_generation: i64,
+    pub session_id: String,
+    pub context_json: String,
+    pub context_digest: String,
 }
 
 pub struct ResearchRepository<'db> {
@@ -414,6 +425,210 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("read recent research reviews"))
     }
 
+    /// Bind one native research run before its launch gate is released.  The
+    /// planned session and exact evidence context are written in the same
+    /// transaction as the review's running identity; a successful response
+    /// is persisted separately after native completion.
+    pub fn bind_agent_run(
+        &self,
+        binding: &ResearchLaunchBinding,
+        agent_run_id: i64,
+        project_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        validate_research_binding(binding)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research run binding"))?;
+        let (campaign_id, current_session, current_generation, current_attempt, current_run): (
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+        ) = transaction
+            .query_row(
+                "SELECT r.campaign_id, c.session_id, c.session_generation,
+                        r.attempt, r.agent_run_id
+                 FROM research_reviews AS r
+                 JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
+                 JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
+                 WHERE r.review_id = ?1 AND campaign.project_id = ?2",
+                params![binding.review_id, project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(database_error("read research run binding"))?;
+        if current_attempt != binding.attempt
+            || current_generation != binding.session_generation
+            || current_run.is_some()
+            || current_session
+                .as_deref()
+                .is_some_and(|session| session != binding.session_id)
+        {
+            return Err(validation_error(
+                "research.binding",
+                "review, attempt, or campaign session changed before native binding",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'running', agent_run_id = ?1, context_json = ?2,
+                     context_digest = ?3, started_at = COALESCE(started_at, ?4),
+                     updated_at = ?4
+                 WHERE review_id = ?5 AND attempt = ?6
+                   AND agent_run_id IS NULL AND state IN ('pending','retry_wait')",
+                params![
+                    agent_run_id,
+                    binding.context_json,
+                    binding.context_digest,
+                    now,
+                    binding.review_id,
+                    binding.attempt,
+                ],
+            )
+            .map_err(database_error("bind research review to agent run"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.review",
+                "review is no longer claimable for this native run",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = COALESCE(session_id, ?1), updated_at = ?2
+                 WHERE campaign_id = ?3 AND session_generation = ?4
+                   AND (session_id IS NULL OR session_id = ?1)",
+                params![
+                    binding.session_id,
+                    now,
+                    campaign_id,
+                    binding.session_generation,
+                ],
+            )
+            .map_err(database_error("persist planned research session"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research run binding"))
+    }
+
+    /// Persist a schema-validated research response and the owned session
+    /// discovered after a fresh native launch exits.
+    pub fn finish_agent_run(
+        &self,
+        review_id: &str,
+        agent_run_id: i64,
+        attempt: i64,
+        session_generation: i64,
+        session_id: &str,
+        response_json: &str,
+        rebind_session: bool,
+        now: i64,
+    ) -> Result<(), AppError> {
+        validate_session_id(session_id)?;
+        if response_json.is_empty() || response_json.len() > crate::research_protocol::MAX_RESEARCH_ANSWER_BYTES {
+            return Err(validation_error(
+                "research.response_json",
+                "must be non-empty and bounded",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research response persistence"))?;
+        let (campaign_id, current_session, current_generation, current_attempt, current_run): (
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+        ) = transaction
+            .query_row(
+                "SELECT campaign_id, (SELECT session_id FROM campaign_research
+                                      WHERE campaign_id = research_reviews.campaign_id),
+                        session_generation, attempt, agent_run_id
+                 FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(database_error("read research response binding"))?;
+        if current_run != Some(agent_run_id)
+            || current_attempt != attempt
+            || current_generation != session_generation
+            || !rebind_session && current_session.as_deref() != Some(session_id)
+        {
+            return Err(validation_error(
+                "research.binding",
+                "response identity does not match the bound native run",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', response_json = ?1, finished_at = ?2,
+                     updated_at = ?2
+                 WHERE review_id = ?3 AND agent_run_id = ?4 AND attempt = ?5
+                   AND session_generation = ?6 AND state = 'running'",
+                params![
+                    response_json,
+                    now,
+                    review_id,
+                    agent_run_id,
+                    attempt,
+                    session_generation,
+                ],
+            )
+            .map_err(database_error("persist research response"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.review",
+                "running review changed before response persistence",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, updated_at = ?2
+                 WHERE campaign_id = ?3 AND session_generation = ?4",
+                params![session_id, now, campaign_id, session_generation],
+            )
+            .map_err(database_error("persist owned research session"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research response persistence"))
+    }
+
+    pub fn fail_agent_run(
+        &self,
+        review_id: &str,
+        agent_run_id: i64,
+        failure_code: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        if failure_code.is_empty() || failure_code.len() > 128 {
+            return Err(validation_error("research.failure_code", "must be bounded"));
+        }
+        let connection = self.db.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'retry_wait', failure_code = ?1,
+                     finished_at = ?2, updated_at = ?2
+                 WHERE review_id = ?3 AND agent_run_id = ?4 AND state = 'running'",
+                params![failure_code, now, review_id, agent_run_id],
+            )
+            .map_err(database_error("record failed research run"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.review",
+                "failed research run is not the bound running review",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn owns_successor(&self, experiment_id: &str) -> Result<bool, AppError> {
         let connection = self.db.connect()?;
         connection
@@ -518,9 +733,47 @@ fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchReview> {
         response_json: row.get(10)?,
         termination_request_id: row.get(11)?,
         successor_experiment_id: row.get(12)?,
+        session_generation: row.get(14)?,
     })
 }
 
 fn validation_error(field: &'static str, message: &'static str) -> AppError {
     AppError::Validation { field, message }
+}
+
+fn validate_research_binding(binding: &ResearchLaunchBinding) -> Result<(), AppError> {
+    validate_session_id(&binding.session_id)?;
+    if binding.review_id.is_empty()
+        || binding.review_id.len() > 256
+        || binding.review_id.chars().any(char::is_control)
+        || binding.attempt < 0
+        || binding.session_generation < 0
+    {
+        return Err(validation_error(
+            "research.binding",
+            "contains an invalid review, attempt, or generation",
+        ));
+    }
+    if binding.context_json.is_empty()
+        || binding.context_json.len() > crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES
+    {
+        return Err(validation_error(
+            "research.context_json",
+            "must be non-empty and bounded",
+        ));
+    }
+    if binding.context_digest.len() != 64
+        || !binding.context_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || format!("{:x}", Sha256::digest(binding.context_json.as_bytes())) != binding.context_digest
+    {
+        return Err(validation_error(
+            "research.context_digest",
+            "must match the exact context JSON",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), AppError> {
+    crate::codex_session::normalize_session_id(session_id).map(|_| ())
 }

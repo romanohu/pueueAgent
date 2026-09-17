@@ -21,6 +21,10 @@ pub(crate) enum AgentRunRole {
     Diagnosis {
         experiment_id: String,
     },
+    Research {
+        review_id: String,
+        attempt: i64,
+    },
     CodeChangeEditor {
         code_change_run_id: String,
         attempt: i64,
@@ -112,6 +116,7 @@ database_enum!(EventKind {
     CampaignDecision => "campaign_decision",
     HealthDiagnosis => "health_diagnosis",
     CodeChange => "code_change",
+    CampaignResearch => "campaign_research",
 });
 
 database_enum!(EventStatus {
@@ -1008,11 +1013,11 @@ impl ExecutionProjection {
         let execution_kind = execution_kind.as_ref();
         if !matches!(
             execution_kind,
-            "codex" | "custom" | "diagnosis" | "code_change_editor"
+            "codex" | "custom" | "diagnosis" | "code_change_editor" | "campaign_research"
         ) {
             return Err(AppError::Validation {
                 field: "execution_kind",
-                message: "must be codex, custom, diagnosis, or code_change_editor",
+                message: "must be codex, custom, diagnosis, code_change_editor, or campaign_research",
             });
         }
 

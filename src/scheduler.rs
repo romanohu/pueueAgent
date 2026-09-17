@@ -1260,7 +1260,10 @@ fn partition_legacy_events(events: Vec<Event>) -> (Vec<Event>, Vec<i64>) {
     let mut legacy = Vec::with_capacity(events.len());
     let mut campaign_decisions = Vec::new();
     for event in events {
-        if matches!(event.kind, EventKind::CampaignDecision | EventKind::CodeChange) {
+        if matches!(
+            event.kind,
+            EventKind::CampaignDecision | EventKind::CodeChange | EventKind::CampaignResearch
+        ) {
             campaign_decisions.push(event.event_id);
         } else {
             legacy.push(event);
@@ -1280,6 +1283,7 @@ fn event_priority(kind: EventKind) -> u8 {
         EventKind::TaskFinished | EventKind::OperatorWake => 3,
         EventKind::DeepCheck | EventKind::HealthDiagnosis => 4,
         EventKind::CodeChange => 5,
+        EventKind::CampaignResearch => 4,
     }
 }
 
@@ -1290,7 +1294,10 @@ fn legacy_dispatch_mode(kind: EventKind) -> Option<&'static str> {
         EventKind::Stalled => Some("stalled"),
         EventKind::TaskFinished => Some("completion"),
         EventKind::OperatorWake => Some("operator_wake"),
-        EventKind::CampaignDecision | EventKind::HealthDiagnosis | EventKind::CodeChange => None,
+        EventKind::CampaignDecision
+        | EventKind::HealthDiagnosis
+        | EventKind::CodeChange
+        | EventKind::CampaignResearch => None,
         EventKind::DeepCheck => Some("deep_check"),
     }
 }

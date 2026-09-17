@@ -309,6 +309,21 @@ impl CodexArgvBuilder {
         )
     }
 
+    pub(crate) fn build_research_with_private_temp(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+        private_tmp: &VerifiedPrivateTemp,
+    ) -> Result<Vec<OsString>, PolicyViolation> {
+        self.build_named_output_with_private_temp(
+            config,
+            prompt,
+            private_tmp,
+            "research-schema.json",
+            "research.json",
+        )
+    }
+
     pub fn build_editor(
         &self,
         config: &AgentConfig,
@@ -450,6 +465,16 @@ impl CodexArgvBuilder {
                 environment_filters(&BTreeSet::new())?
             ),
         );
+        if let AgentContextMode::Resume { session_id } = &config.context {
+            let owned = codex_session::verify_project_ownership(
+                &self.policy.codex_home,
+                &self.policy.root_anchor.canonical_path,
+                session_id,
+            )
+            .map_err(map_session_error)?;
+            argv.push(OsString::from("resume"));
+            argv.push(OsString::from(owned));
+        }
         argv.push(OsString::from("--"));
         argv.push(OsString::from(prompt));
         Ok(argv)

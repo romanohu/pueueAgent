@@ -1071,6 +1071,13 @@ impl PrivateRunTemp {
         )
     }
 
+    pub(crate) fn prepare_research_schema(
+        &self,
+        schema: &[u8],
+    ) -> Result<(), PolicyViolation> {
+        self.prepare_named_output("research-schema.json", "research.json", schema)
+    }
+
     pub(crate) fn prepare_editor_schema(&self, schema: &[u8]) -> Result<(), PolicyViolation> {
         self.prepare_named_output("editor-schema.json", "editor.json", schema)
     }
@@ -1117,6 +1124,10 @@ impl PrivateRunTemp {
 
     pub(crate) fn read_health_diagnosis_output(&self) -> Result<Vec<u8>, PolicyViolation> {
         self.read_named_output("health-diagnosis.json")
+    }
+
+    pub(crate) fn read_research_output(&self) -> Result<Vec<u8>, PolicyViolation> {
+        self.read_named_output("research.json")
     }
 
     pub(crate) fn read_editor_output(&self) -> Result<Vec<u8>, PolicyViolation> {
