@@ -543,6 +543,8 @@ fn open_or_create_backup_directory(state_dir: &File) -> Result<File, AppError> {
             if identity.mode & 0o777 != DIRECTORY_MODE {
                 return Err(unsafe_path("instruction backup directory permissions"));
             }
+            maybe_sync(state_dir, FaultStage::BackupParentDirectorySync)
+                .map_err(|source| io_error("sync instruction backup directory parent", source))?;
             Ok(directory)
         }
         Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
@@ -559,9 +561,8 @@ fn open_or_create_backup_directory(state_dir: &File) -> Result<File, AppError> {
             set_mode(&directory, DIRECTORY_MODE)
                 .map_err(|source| io_error("secure instruction backup directory", source))?;
             let identity = validate_directory(&directory, "instruction backup directory")?;
-            state_dir
-                .sync_all()
-                .map_err(|source| io_error("sync instruction backup directory", source))?;
+            maybe_sync(state_dir, FaultStage::BackupParentDirectorySync)
+                .map_err(|source| io_error("sync instruction backup directory parent", source))?;
             if identity.mode & 0o777 != DIRECTORY_MODE {
                 return Err(unsafe_path("instruction backup directory permissions"));
             }
@@ -918,6 +919,7 @@ enum FaultStage {
     BackupWrite,
     BackupFileSync,
     BackupDirectorySync,
+    BackupParentDirectorySync,
     CandidateWrite,
     CandidateFileSync,
     Rename,
@@ -1075,22 +1077,28 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn reusable_backup_is_synced_before_retry_after_directory_sync_fault() {
+    fn backup_parent_directory_sync_failures_preserve_original_and_prevent_rename() {
         let (_temporary, root, original) = project();
         let preview = instructions::update(&root, None).unwrap();
         let token = preview.preview_token.as_deref().unwrap().to_owned();
+        let backup_path = root
+            .join(STATE_DIRECTORY)
+            .join(BACKUP_DIRECTORY)
+            .join(format!("{}.md", preview.before_sha256));
 
-        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::BackupDirectorySync));
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::BackupParentDirectorySync));
         assert!(instructions::update(&root, Some(&token)).is_err());
         let backup_dir = root.join(STATE_DIRECTORY).join(BACKUP_DIRECTORY);
         assert!(backup_dir.is_dir());
+        assert!(!backup_path.exists());
         assert_eq!(
             fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
             original
         );
 
-        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::BackupDirectorySync));
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::BackupParentDirectorySync));
         assert!(instructions::update(&root, Some(&token)).is_err());
+        assert!(!backup_path.exists());
         assert_eq!(
             fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
             original
@@ -1212,10 +1220,13 @@ mod tests {
         assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
 
         let (sender, receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
         let worker_root = root.clone();
         let worker = std::thread::spawn(move || {
             TEST_LOCK_BEFORE_FLOCK.with(|slot| *slot.borrow_mut() = Some(sender));
-            instructions::update(&worker_root, Some(&token))
+            let result = instructions::update(&worker_root, Some(&token));
+            completion_sender.send(()).unwrap();
+            result
         });
         receiver
             .recv_timeout(Duration::from_secs(5))
@@ -1227,6 +1238,9 @@ mod tests {
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         drop(holder);
 
+        completion_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiting updater did not complete after lock release");
         let result = worker.join().unwrap();
         assert!(result.is_err());
         assert!(result

@@ -496,7 +496,7 @@ fn unsafe_instruction_links_hardlinks_fifo_and_backup_are_rejected() {
 #[cfg(unix)]
 #[test]
 fn lock_state_and_backup_symlinks_are_rejected_without_publication() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, PermissionsExt};
 
     let (_temporary, instruction_path, original) = initialized_legacy_project();
     let root = instruction_path.parent().unwrap().parent().unwrap();
@@ -530,13 +530,15 @@ fn lock_state_and_backup_symlinks_are_rejected_without_publication() {
 
     let backups = state_dir.join("instructions.backups");
     fs::create_dir(&backups).unwrap();
+    fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
     let outside_backup = root.parent().unwrap().join("outside-backup");
     fs::write(&outside_backup, &original).unwrap();
     let backup_name = format!("{}.md", sha256_hex(&original));
     symlink(&outside_backup, backups.join(backup_name)).unwrap();
     let backup_file_result = update(root, Some(&token));
     assert!(!backup_file_result.status.success());
-    assert!(String::from_utf8_lossy(&backup_file_result.stderr).contains("instructions: unsafe"));
+    assert!(String::from_utf8_lossy(&backup_file_result.stderr)
+        .contains("instructions: unsafe path: open instruction backup"));
     assert_eq!(fs::read(&outside_backup).unwrap(), original);
     assert_eq!(fs::read(&instruction_path).unwrap(), original);
 }
