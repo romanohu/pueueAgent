@@ -60,11 +60,45 @@ setup() {
   chmod +x "$fake_bin"/*
 
   runner_log="$BATS_TEST_TMPDIR/signal-runner.log"
+  runner_pid=""
+  rustc_pid=""
+  work_path=""
+  cleanup_signal_fixture() {
+    for pid in "${runner_pid:-}" "${rustc_pid:-}"; do
+      case "$pid" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    for _ in $(seq 50); do
+      remaining=0
+      for pid in "${runner_pid:-}" "${rustc_pid:-}"; do
+        case "$pid" in
+          ''|*[!0-9]*) continue ;;
+        esac
+        if kill -0 "$pid" 2>/dev/null; then
+          remaining=1
+        fi
+      done
+      [ "$remaining" -eq 0 ] && break
+      sleep 0.1
+    done
+    for pid in "${runner_pid:-}" "${rustc_pid:-}"; do
+      case "$pid" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    done
+    if [ -n "${work_path:-}" ] && [ -d "$work_path" ]; then
+      rm -rf "$work_path"
+    fi
+  }
+  trap cleanup_signal_fixture EXIT
   env PATH="$fake_bin:/usr/bin:/bin" \
     /bin/bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh" \
     >"$runner_log" 2>&1 &
   runner_pid=$!
-  work_path=""
   for _ in $(seq 50); do
     if [ -s "$work_marker" ]; then
       work_path="$(<"$work_marker")"
@@ -82,21 +116,31 @@ setup() {
   kill -TERM "$runner_pid" 2>/dev/null || true
   rustc_pid="$(<"$rustc_marker")"
   kill -TERM "$rustc_pid" 2>/dev/null || true
-  for _ in $(seq 20); do
-    kill -0 "$rustc_pid" 2>/dev/null || break
+  runner_status=125
+  runner_exited=0
+  for _ in $(seq 50); do
+    if ! kill -0 "$runner_pid" 2>/dev/null; then
+      runner_exited=1
+      break
+    fi
     sleep 0.1
   done
-  kill -KILL "$rustc_pid" 2>/dev/null || true
-  if wait "$runner_pid"; then
-    runner_status=0
+  if [ "$runner_exited" -eq 0 ]; then
+    kill -KILL "$runner_pid" 2>/dev/null || true
+    wait "$runner_pid" || runner_status=$?
   else
-    runner_status=$?
+    if wait "$runner_pid"; then
+      runner_status=0
+    else
+      runner_status=$?
+    fi
   fi
 
   [ "$runner_status" -eq 143 ]
   [ -d "$work_path" ]
   grep -F "Rust E2E retained WORK after failure: $work_path" "$runner_log"
-  rm -rf "$work_path"
+  trap - EXIT
+  cleanup_signal_fixture
 }
 
 @test "real Pueue harness asserts the production-derived Codex network argument" {
