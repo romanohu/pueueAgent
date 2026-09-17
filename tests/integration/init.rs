@@ -419,6 +419,20 @@ fn init_materializes_the_marked_role_instructions_distribution() {
     ] {
         assert!(text.contains(section), "missing role section: {section}");
     }
+    assert!(text.contains("非managed の通常 agent run に限り"));
+    assert!(text.contains(
+        "Managed campaign Standard role is advisory-only: do not edit source, commit, or submit jobs directly."
+    ));
+    let dispatch = text
+        .split("## Dispatch mode")
+        .nth(1)
+        .expect("generated instructions must contain dispatch guidance");
+    assert!(dispatch.contains(
+        "非managed の Standard role における `crash`、`failure`、`stalled`"
+    ));
+    assert!(dispatch.contains(
+        "managed campaign の Standard role では修正を行わず、bounded な recommendation/proposal だけを記録する"
+    ));
 }
 
 #[test]

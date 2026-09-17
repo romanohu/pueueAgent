@@ -381,11 +381,16 @@ fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_bo
     ] {
         assert!(instructions.contains(section), "missing role section: {section}");
     }
-    assert!(instructions.contains("managed campaign"));
-    assert!(instructions.contains("advisory-only"));
-    assert!(instructions.contains("source"));
-    assert!(instructions.contains("commit"));
-    assert!(instructions.contains("directly"));
+    assert!(instructions.contains("非managed の通常 agent run に限り"));
+    assert!(instructions.contains(
+        "Managed campaign Standard role is advisory-only: do not edit source, commit, or submit jobs directly."
+    ));
+    assert!(instructions.contains(
+        "非managed の Standard role における `crash`、`failure`、`stalled`"
+    ));
+    assert!(instructions.contains(
+        "managed campaign の Standard role では修正を行わず、bounded な recommendation/proposal だけを記録する"
+    ));
     assert!(instructions.contains("proposal"));
     assert!(instructions.contains("finite wait"));
     assert!(instructions.contains("goal_reached"));

@@ -53,7 +53,7 @@ SQLite は campaign、objective、budget、lineage の正本です。`.pueue-age
 
 ## Dispatch mode
 
-- `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、bounded な replacement recommendation/proposal を `state.json` に記録する。通常の実験 agent は replacement experiment を直接投入しない。
+- 非managed の Standard role における `crash`、`failure`、`stalled`: 範囲を制限した evidence と関連 log を調べ、原因を特定し、必要最小限の修正を行い、bounded な replacement recommendation/proposal を `state.json` に記録する。managed campaign の Standard role では修正を行わず、bounded な recommendation/proposal だけを記録する。通常の実験 agent は replacement experiment を直接投入しない。
 - `deep_check`: metric と artifact を調べ、実験が意味のある進行をしているか判断する。正常なら、実際にプロジェクトで確認できた事実だけを使い、短い health record を `state.json` に記録する。存在しない metric、値、進捗を作らない。異常なら crash と同じ手順で対応する。
 - `completion`: 結果を要約し、次の実験に根拠があるか判断する。目的を達成した、または有効な次の手がかりがない場合は停止する。managed campaign の達成は schema evidence と human review を必要とする。
 - `operator_wake`: reason は人間からの追加指示として扱う。既存の STATE、guardrail、experiment budget を尊重し、迂回しない。
