@@ -215,6 +215,48 @@ fn missing_policy_is_atomic_secure_default() {
 }
 
 #[test]
+fn research_interval_policy_accepts_documented_bounds_and_default() {
+    let cases = [
+        (None, Some(30)),
+        (Some("0"), Some(0)),
+        (Some("30"), Some(30)),
+        (Some("1440"), Some(1_440)),
+        (Some("1441"), None),
+        (Some("-1"), None),
+    ];
+    for (value, expected) in cases {
+        let harness = PolicyHarness::new();
+        load_or_create_policy(&harness.input()).unwrap();
+        let mut policy = fs::read_to_string(harness.policy()).unwrap();
+        if let Some(value) = value {
+            policy = policy.replace(
+                "research_interval_minutes = 30",
+                &format!("research_interval_minutes = {value}"),
+            );
+        } else {
+            policy = policy.replace("research_interval_minutes = 30\n", "");
+        }
+        fs::write(harness.policy(), policy).unwrap();
+        secure_file(&harness.policy());
+
+        let loaded = load_existing_policy(&harness.input());
+        match expected {
+            Some(expected) => assert_eq!(
+                loaded.unwrap().campaign_limits.research_interval_minutes,
+                expected
+            ),
+            None => assert!(matches!(
+                loaded,
+                Err(pueue_agent::execution_policy::PolicyViolation {
+                    code: PolicyViolationCode::PolicyUnknownField,
+                    ..
+                })
+            )),
+        }
+    }
+}
+
+#[test]
 fn decision_campaign_limits_have_safe_service_defaults() {
     let harness = PolicyHarness::new();
     let policy = load_or_create_policy(&harness.input()).unwrap();
@@ -229,6 +271,7 @@ fn decision_campaign_limits_have_safe_service_defaults() {
             max_repairs_per_failure_fingerprint: 2,
             max_proposals_per_cycle: 1,
             observer_interval_minutes: 30,
+            research_interval_minutes: 30,
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
             max_code_change_changed_files: 50,
@@ -333,6 +376,7 @@ fn decision_campaign_limits_reject_values_outside_service_bounds() {
         ("max_proposals_per_cycle", 33),
         ("observer_interval_minutes", 0),
         ("observer_interval_minutes", 1_441),
+        ("research_interval_minutes", 1_441),
         ("max_decision_attempts_per_cycle", 0),
         ("max_decision_attempts_per_cycle", 11),
         ("max_decision_wait_minutes", 0),
@@ -881,6 +925,7 @@ fn campaign_limit_default(field: &str) -> u32 {
         "max_repairs_per_failure_fingerprint" => 2,
         "max_proposals_per_cycle" => 1,
         "observer_interval_minutes" => 30,
+        "research_interval_minutes" => 30,
         "max_decision_attempts_per_cycle" => 3,
         "max_decision_wait_minutes" => 1_440,
         "max_code_change_changed_files" => 50,

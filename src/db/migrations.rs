@@ -4,11 +4,15 @@ use crate::{environment::MAX_PRIVATE_TEMP_RUN_ID, AppError};
 
 use super::database_error;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 28;
+pub const LATEST_SCHEMA_VERSION: i64 = 29;
 const EVENTS_V23_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis'";
 const EVENTS_V26_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis', 'code_change'";
+const EVENTS_V29_KIND_LIST: &str =
+    "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis', 'code_change', 'campaign_research'";
+const EVENTS_V29_WITHOUT_CODE_CHANGE_KIND_LIST: &str =
+    "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision', 'health_diagnosis', 'campaign_research'";
 const EVENTS_V18_KIND_LIST: &str =
     "'task_finished', 'task_failed', 'crash', 'stalled', 'deep_check', 'auto_killed', 'termination_failed', 'operator_wake', 'campaign_decision'";
 const EVENTS_V17_KIND_LIST: &str =
@@ -427,6 +431,58 @@ const CODE_CHANGE_V28_BASELINE_COLUMNS: &[&str] = &[
     "protected_ref_digest",
     "remote_config_digest",
 ];
+const CAMPAIGN_RESEARCH_V29_TABLE_SQL: &str = r#"
+    CREATE TABLE campaign_research (
+        campaign_id TEXT PRIMARY KEY REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+        session_id TEXT,
+        session_generation INTEGER NOT NULL DEFAULT 0 CHECK (session_generation >= 0),
+        next_due_at INTEGER,
+        blocked_reason TEXT,
+        last_review_id TEXT REFERENCES research_reviews(review_id) ON DELETE SET NULL,
+        updated_at INTEGER NOT NULL
+    );
+"#;
+const RESEARCH_REVIEWS_V29_TABLE_SQL: &str = r#"
+    CREATE TABLE research_reviews (
+        review_id TEXT PRIMARY KEY,
+        campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+        experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+        task_signature TEXT NOT NULL,
+        attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+        state TEXT NOT NULL CHECK (state IN (
+            'pending', 'running', 'ready', 'completed', 'retry_wait', 'discarded', 'blocked'
+        )),
+        operation_stage TEXT CHECK (operation_stage IS NULL OR operation_stage IN (
+            'intent', 'stop_requested', 'stop_confirmed', 'successor_reserved'
+        )),
+        agent_run_id INTEGER REFERENCES agent_runs(run_id) ON DELETE RESTRICT,
+        context_json TEXT,
+        context_digest TEXT,
+        response_json TEXT,
+        termination_request_id INTEGER REFERENCES termination_requests(request_id) ON DELETE RESTRICT,
+        successor_experiment_id TEXT REFERENCES experiments(experiment_id) ON DELETE RESTRICT,
+        evidence_schema_version INTEGER CHECK (
+            evidence_schema_version IS NULL OR evidence_schema_version >= 0
+        ),
+        session_generation INTEGER NOT NULL CHECK (session_generation >= 0),
+        event_id INTEGER NOT NULL REFERENCES events(event_id) ON DELETE RESTRICT,
+        not_before INTEGER NOT NULL,
+        notes_json TEXT,
+        failure_code TEXT,
+        decision_cycle_id TEXT REFERENCES decision_cycles(cycle_id) ON DELETE RESTRICT,
+        checkpoint_json TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER,
+        updated_at INTEGER NOT NULL
+    );
+"#;
+const RESEARCH_ONE_OPEN_REVIEW_INDEX_SQL: &str = "CREATE UNIQUE INDEX research_one_open_review_per_campaign
+    ON research_reviews(campaign_id)
+    WHERE state IN ('pending','running','ready','retry_wait');";
+const RESEARCH_ONE_OPEN_OPERATION_INDEX_SQL: &str = "CREATE UNIQUE INDEX research_one_open_operation_per_experiment
+    ON research_reviews(experiment_id)
+    WHERE operation_stage IN ('intent','stop_requested','stop_confirmed','successor_reserved');";
 
 pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     let version: i64 = connection
@@ -447,10 +503,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         verify_running_health_schema_v22(connection)?;
         verify_evaluation_schema_v24(connection)?;
         verify_evaluation_schema_v25(connection)?;
-        verify_event_kinds_v26(connection)?;
+        verify_event_kinds_v29(connection)?;
         verify_code_change_schema_v26(connection)?;
         verify_code_change_schema_v27(connection)?;
         verify_code_change_schema_v28(connection)?;
+        verify_research_schema_v29(connection)?;
         validate_agent_run_id_sequence(connection)?;
         // Current-schema databases used to bypass all validation. Keep the
         // no-write fast path only after checking the canonical status CHECK,
@@ -920,6 +977,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<(), AppError> {
     } else {
         verify_code_change_schema_v28(&transaction)?;
     }
+    if version <= 28 {
+        migrate_research_schema_to_v29(&transaction)?;
+    } else {
+        verify_research_schema_v29(&transaction)?;
+    }
     transaction
         .commit()
         .map_err(database_error("commit SQLite migration"))?;
@@ -1015,6 +1077,274 @@ fn verify_code_change_schema_v28(connection: &Connection) -> Result<(), AppError
     Ok(())
 }
 
+fn migrate_research_schema_to_v29(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), AppError> {
+    migrate_event_kinds_to_v29(transaction)?;
+
+    let has_research_reviews: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'research_reviews'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check SQLite v29 research reviews table"))?;
+    let has_campaign_research: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'campaign_research'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check SQLite v29 campaign research table"))?;
+    if has_research_reviews || has_campaign_research {
+        if !(has_research_reviews
+            && has_campaign_research
+            && research_schema_v29_is_canonical(transaction).unwrap_or(false))
+        {
+            return Err(AppError::Runtime {
+                operation: "verify partial SQLite v29 research schema",
+            });
+        }
+    } else {
+        transaction
+            .execute_batch(RESEARCH_REVIEWS_V29_TABLE_SQL)
+            .map_err(database_error("create SQLite v29 research reviews"))?;
+        transaction
+            .execute_batch(CAMPAIGN_RESEARCH_V29_TABLE_SQL)
+            .map_err(database_error("create SQLite v29 campaign research"))?;
+    }
+    for (name, sql) in [
+        (
+            "research_one_open_review_per_campaign",
+            RESEARCH_ONE_OPEN_REVIEW_INDEX_SQL,
+        ),
+        (
+            "research_one_open_operation_per_experiment",
+            RESEARCH_ONE_OPEN_OPERATION_INDEX_SQL,
+        ),
+    ] {
+        ensure_index_definition(transaction, name, sql)?;
+    }
+    verify_research_schema_v29(transaction)?;
+    transaction
+        .execute_batch("PRAGMA user_version = 29;")
+        .map_err(database_error("set SQLite v29 schema version"))
+}
+
+fn verify_research_schema_v29(connection: &Connection) -> Result<(), AppError> {
+    if research_schema_v29_is_canonical(connection).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v29 research schema",
+        })
+    }
+}
+
+fn research_schema_v29_is_canonical(connection: &Connection) -> rusqlite::Result<bool> {
+    for (table, expected_sql) in [
+        ("research_reviews", RESEARCH_REVIEWS_V29_TABLE_SQL),
+        ("campaign_research", CAMPAIGN_RESEARCH_V29_TABLE_SQL),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+
+    if !campaign_table_info_matches(
+        connection,
+        "campaign_research",
+        &[
+            ("campaign_id", "TEXT", 0, 1),
+            ("session_id", "TEXT", 0, 0),
+            ("session_generation", "INTEGER", 1, 0),
+            ("next_due_at", "INTEGER", 0, 0),
+            ("blocked_reason", "TEXT", 0, 0),
+            ("last_review_id", "TEXT", 0, 0),
+            ("updated_at", "INTEGER", 1, 0),
+        ])?
+        || !campaign_table_info_matches(
+            connection,
+            "research_reviews",
+            &[
+                ("review_id", "TEXT", 0, 1),
+                ("campaign_id", "TEXT", 1, 0),
+                ("experiment_id", "TEXT", 1, 0),
+                ("task_signature", "TEXT", 1, 0),
+                ("attempt", "INTEGER", 1, 0),
+                ("state", "TEXT", 1, 0),
+                ("operation_stage", "TEXT", 0, 0),
+                ("agent_run_id", "INTEGER", 0, 0),
+                ("context_json", "TEXT", 0, 0),
+                ("context_digest", "TEXT", 0, 0),
+                ("response_json", "TEXT", 0, 0),
+                ("termination_request_id", "INTEGER", 0, 0),
+                ("successor_experiment_id", "TEXT", 0, 0),
+                ("evidence_schema_version", "INTEGER", 0, 0),
+                ("session_generation", "INTEGER", 1, 0),
+                ("event_id", "INTEGER", 1, 0),
+                ("not_before", "INTEGER", 1, 0),
+                ("notes_json", "TEXT", 0, 0),
+                ("failure_code", "TEXT", 0, 0),
+                ("decision_cycle_id", "TEXT", 0, 0),
+                ("checkpoint_json", "TEXT", 0, 0),
+                ("created_at", "INTEGER", 1, 0),
+                ("started_at", "INTEGER", 0, 0),
+                ("finished_at", "INTEGER", 0, 0),
+                ("updated_at", "INTEGER", 1, 0),
+            ],
+        )?
+    {
+        return Ok(false);
+    }
+
+    if !campaign_foreign_keys_match(
+        connection,
+        "campaign_research",
+        &[("campaigns", "campaign_id", "campaign_id", "CASCADE"), (
+            "research_reviews",
+            "last_review_id",
+            "review_id",
+            "SET NULL",
+        )],
+    )? || !campaign_foreign_keys_match(
+        connection,
+        "research_reviews",
+        &[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("experiments", "experiment_id", "experiment_id", "RESTRICT"),
+            ("agent_runs", "agent_run_id", "run_id", "RESTRICT"),
+            (
+                "termination_requests",
+                "termination_request_id",
+                "request_id",
+                "RESTRICT",
+            ),
+            (
+                "experiments",
+                "successor_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+            ("events", "event_id", "event_id", "RESTRICT"),
+            (
+                "decision_cycles",
+                "decision_cycle_id",
+                "cycle_id",
+                "RESTRICT",
+            ),
+        ],
+    )? {
+        return Ok(false);
+    }
+
+    for (name, expected_sql) in [
+        (
+            "research_one_open_review_per_campaign",
+            RESEARCH_ONE_OPEN_REVIEW_INDEX_SQL,
+        ),
+        (
+            "research_one_open_operation_per_experiment",
+            RESEARCH_ONE_OPEN_OPERATION_INDEX_SQL,
+        ),
+    ] {
+        let actual_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !actual_sql
+            .as_deref()
+            .is_some_and(|sql| compact_sql_exact(sql) == compact_sql_exact(expected_sql))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn migrate_event_kinds_to_v29(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
+    let event_sql: String = transaction
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read SQLite events schema for v29 migration"))?;
+    if !event_kind_list_matches(&event_sql, EVENTS_V29_KIND_LIST) {
+        if !event_kind_list_matches(&event_sql, EVENTS_V26_KIND_LIST) {
+            return Err(AppError::Runtime {
+                operation: "verify SQLite event kinds before v29 migration",
+            });
+        }
+        let old_kind_list = event_kind_list(&event_sql).ok_or(AppError::Runtime {
+            operation: "read SQLite event kind list for v29 migration",
+        })?;
+        transaction
+            .execute_batch("PRAGMA writable_schema = ON;")
+            .map_err(database_error("enable SQLite writable schema for v29 event migration"))?;
+        let replaced = transaction.execute(
+            "UPDATE sqlite_master
+                SET sql = replace(sql, ?1, ?2)
+              WHERE type = 'table' AND name = 'events'
+                AND sql LIKE '%' || ?1 || '%'",
+            params![old_kind_list, EVENTS_V29_KIND_LIST],
+        );
+        let writable_schema_disabled = transaction
+            .execute_batch("PRAGMA writable_schema = OFF;")
+            .map_err(database_error(
+                "disable SQLite writable schema after v29 event migration",
+            ));
+        let replaced = replaced.map_err(database_error("add campaign research event kind"))?;
+        writable_schema_disabled?;
+        if replaced != 1 {
+            return Err(AppError::Runtime {
+                operation: "migrate exactly one SQLite events kind list to v29",
+            });
+        }
+    }
+    verify_event_kinds_v29(transaction)
+}
+
+fn verify_event_kinds_v29(connection: &Connection) -> Result<(), AppError> {
+    let event_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read SQLite events schema for v29 verification"))?;
+    if event_sql
+        .as_deref()
+        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V29_KIND_LIST))
+    {
+        Ok(())
+    } else {
+        Err(AppError::Runtime {
+            operation: "verify SQLite v29 event kinds",
+        })
+    }
+}
+
 fn migrate_event_kinds_to_v23(transaction: &rusqlite::Transaction<'_>) -> Result<(), AppError> {
     let event_sql: String = transaction
         .query_row(
@@ -1026,6 +1356,7 @@ fn migrate_event_kinds_to_v23(transaction: &rusqlite::Transaction<'_>) -> Result
     if !event_kind_list_matches(&event_sql, EVENTS_V23_KIND_LIST) {
         if !event_kind_list_matches(&event_sql, EVENTS_V18_KIND_LIST)
             && !event_kind_list_matches(&event_sql, EVENTS_V26_KIND_LIST)
+            && !event_kind_list_matches(&event_sql, EVENTS_V29_KIND_LIST)
         {
             return Err(AppError::Runtime {
                 operation: "verify SQLite event kinds before v23 migration",
@@ -1080,6 +1411,8 @@ fn verify_event_kinds_v23(connection: &Connection) -> Result<(), AppError> {
         .is_some_and(|sql| {
             event_kind_list_matches(sql, EVENTS_V23_KIND_LIST)
                 || event_kind_list_matches(sql, EVENTS_V26_KIND_LIST)
+                || event_kind_list_matches(sql, EVENTS_V29_WITHOUT_CODE_CHANGE_KIND_LIST)
+                || event_kind_list_matches(sql, EVENTS_V29_KIND_LIST)
         })
     {
         Ok(())
@@ -1099,7 +1432,10 @@ fn migrate_event_kinds_to_v26(transaction: &rusqlite::Transaction<'_>) -> Result
         )
         .map_err(database_error("read SQLite events schema for v26 migration"))?;
     if !event_kind_list_matches(&event_sql, EVENTS_V26_KIND_LIST) {
-        if !event_kind_list_matches(&event_sql, EVENTS_V23_KIND_LIST) {
+        if !event_kind_list_matches(&event_sql, EVENTS_V23_KIND_LIST)
+            && !event_kind_list_matches(&event_sql, EVENTS_V29_KIND_LIST)
+            && !event_kind_list_matches(&event_sql, EVENTS_V29_WITHOUT_CODE_CHANGE_KIND_LIST)
+        {
             return Err(AppError::Runtime {
                 operation: "verify SQLite event kinds before v26 migration",
             });
@@ -1144,7 +1480,10 @@ fn verify_event_kinds_v26(connection: &Connection) -> Result<(), AppError> {
         .map_err(database_error("read SQLite events schema for v26 verification"))?;
     if event_sql
         .as_deref()
-        .is_some_and(|sql| event_kind_list_matches(sql, EVENTS_V26_KIND_LIST))
+        .is_some_and(|sql| {
+            event_kind_list_matches(sql, EVENTS_V26_KIND_LIST)
+                || event_kind_list_matches(sql, EVENTS_V29_KIND_LIST)
+        })
     {
         Ok(())
     } else {
@@ -3320,6 +3659,8 @@ fn events_kind_list_is_current(event_sql: &str) -> bool {
     event_kind_list_matches(event_sql, EVENTS_V26_KIND_LIST)
         || event_kind_list_matches(event_sql, EVENTS_V23_KIND_LIST)
         || event_kind_list_matches(event_sql, EVENTS_V18_KIND_LIST)
+        || event_kind_list_matches(event_sql, EVENTS_V29_WITHOUT_CODE_CHANGE_KIND_LIST)
+        || event_kind_list_matches(event_sql, EVENTS_V29_KIND_LIST)
 }
 
 fn event_kind_list(event_sql: &str) -> Option<&str> {

@@ -1,0 +1,518 @@
+use rusqlite::{params, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use crate::AppError;
+
+use super::{database_error, Db};
+
+const MAX_RESEARCH_REVIEW_LIST: i64 = 32;
+const OPEN_REVIEW_STATES: &str = "('pending','running','ready','retry_wait')";
+const OPEN_OPERATION_STAGES: &str =
+    "('intent','stop_requested','stop_confirmed','successor_reserved')";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchState {
+    pub campaign_id: String,
+    pub session_id: Option<String>,
+    pub session_generation: i64,
+    pub next_due_at: Option<i64>,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchReview {
+    pub review_id: String,
+    pub campaign_id: String,
+    pub experiment_id: String,
+    pub task_signature: String,
+    pub attempt: i64,
+    pub state: String,
+    pub operation_stage: Option<String>,
+    pub agent_run_id: Option<i64>,
+    pub context_json: Option<String>,
+    pub context_digest: Option<String>,
+    pub response_json: Option<String>,
+    pub termination_request_id: Option<i64>,
+    pub successor_experiment_id: Option<String>,
+}
+
+pub struct ResearchRepository<'db> {
+    db: &'db Db,
+}
+
+const REVIEW_SELECT: &str = "SELECT review_id, campaign_id, experiment_id,
+        task_signature, attempt, state, operation_stage, agent_run_id,
+        context_json, context_digest, response_json, termination_request_id,
+        successor_experiment_id, evidence_schema_version, session_generation,
+        event_id, not_before, notes_json, failure_code, decision_cycle_id,
+        checkpoint_json, created_at, started_at, finished_at, updated_at
+    FROM research_reviews";
+
+impl<'db> ResearchRepository<'db> {
+    pub fn new(db: &'db Db) -> Self {
+        Self { db }
+    }
+
+    pub fn ensure_campaign(&self, campaign_id: &str) -> Result<(), AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research state creation"))?;
+        ensure_campaign_in_transaction(&transaction, campaign_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research state creation"))
+    }
+
+    pub fn state(&self, campaign_id: &str) -> Result<ResearchState, AppError> {
+        let connection = self.db.connect()?;
+        let campaign_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM campaigns WHERE campaign_id = ?1
+                 )",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check research campaign"))?;
+        if !campaign_exists {
+            return Err(validation_error(
+                "campaign_id",
+                "does not identify a persisted campaign",
+            ));
+        }
+        connection
+            .query_row(
+                "SELECT campaign_id, session_id, session_generation,
+                        next_due_at, blocked_reason
+                 FROM campaign_research
+                 WHERE campaign_id = ?1",
+                [campaign_id],
+                |row| {
+                    Ok(ResearchState {
+                        campaign_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        session_generation: row.get(2)?,
+                        next_due_at: row.get(3)?,
+                        blocked_reason: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error("read research state"))
+            .map(|state| {
+                state.unwrap_or_else(|| ResearchState {
+                    campaign_id: campaign_id.to_owned(),
+                    session_id: None,
+                    session_generation: 0,
+                    next_due_at: None,
+                    blocked_reason: None,
+                })
+            })
+    }
+
+    pub fn schedule_running(
+        &self,
+        campaign_id: &str,
+        started_at: i64,
+        interval_minutes: u32,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let candidate_due = next_research_due(started_at, interval_minutes)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research scheduling"))?;
+        ensure_campaign_in_transaction(&transaction, campaign_id)?;
+
+        let (current_due, blocked_reason): (Option<i64>, Option<String>) = transaction
+            .query_row(
+                "SELECT next_due_at, blocked_reason
+                 FROM campaign_research WHERE campaign_id = ?1",
+                [campaign_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(database_error("read research scheduling state"))?;
+        let has_open_review = has_open_review(&transaction, campaign_id)?;
+        let next_due = if interval_minutes == 0 {
+            None
+        } else if blocked_reason.is_some() || has_open_review {
+            current_due
+        } else if current_due.is_some() {
+            current_due
+        } else {
+            let completed_anchor: Option<i64> = transaction
+                .query_row(
+                    "SELECT COALESCE(finished_at, updated_at)
+                     FROM research_reviews
+                     WHERE campaign_id = ?1 AND state = 'completed'
+                     ORDER BY COALESCE(finished_at, updated_at) DESC, review_id DESC
+                     LIMIT 1",
+                    [campaign_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error("read latest completed research review"))?;
+            completed_anchor
+                .map(|anchor| next_research_due(anchor, interval_minutes))
+                .unwrap_or(Ok(candidate_due))?
+        };
+        if next_due != current_due {
+            transaction
+                .execute(
+                    "UPDATE campaign_research
+                     SET next_due_at = ?1, updated_at = ?2
+                     WHERE campaign_id = ?3",
+                    params![next_due, now, campaign_id],
+                )
+                .map_err(database_error("schedule research state"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit research scheduling"))
+    }
+
+    pub fn claim_due(
+        &self,
+        campaign_id: &str,
+        experiment_id: &str,
+        task_signature: &str,
+        now: i64,
+    ) -> Result<Option<ResearchReview>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research review claim"))?;
+        ensure_campaign_in_transaction(&transaction, campaign_id)?;
+
+        let (next_due_at, blocked_reason, session_generation): (Option<i64>, Option<String>, i64) =
+            transaction
+                .query_row(
+                    "SELECT next_due_at, blocked_reason, session_generation
+                 FROM campaign_research WHERE campaign_id = ?1",
+                    [campaign_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(database_error("read research claim state"))?;
+        if blocked_reason.is_some() || next_due_at.is_none_or(|due| due > now) {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped research review claim"))?;
+            return Ok(None);
+        }
+        if has_open_review(&transaction, campaign_id)? {
+            transaction
+                .commit()
+                .map_err(database_error("commit existing research review claim"))?;
+            return Ok(None);
+        }
+        if has_open_operation(&transaction, experiment_id)? {
+            transaction
+                .commit()
+                .map_err(database_error("commit existing research operation claim"))?;
+            return Ok(None);
+        }
+
+        // The caller's task signature is only a lookup key. The joins below
+        // prove the campaign, project, submission, experiment, and current
+        // observed task identity before a review is created.
+        let authority: Option<(String, String, i64)> = transaction
+            .query_row(
+                "SELECT c.project_id, e.task_signature, e.pueue_task_id
+                 FROM campaigns c
+                 JOIN projects p ON p.project_id = c.project_id
+                 JOIN experiments e ON e.campaign_id = c.campaign_id
+                 JOIN submissions s
+                   ON s.submission_id = e.submission_id
+                  AND s.project_id = c.project_id
+                 JOIN task_observations observation
+                   ON observation.project_id = c.project_id
+                  AND observation.task_signature = e.task_signature
+                  AND observation.pueue_task_id = e.pueue_task_id
+                  AND observation.pueue_group = p.pueue_group
+                  AND lower(observation.state) = 'running'
+                 WHERE c.campaign_id = ?1
+                   AND c.state = 'active'
+                   AND p.enabled = 1
+                   AND p.paused = 0
+                   AND p.halted_reason IS NULL
+                   AND e.experiment_id = ?2
+                   AND e.status = 'accepted'
+                   AND e.pueue_task_id IS NOT NULL
+                   AND e.task_signature = ?3
+                   AND s.status = 'accepted'
+                   AND s.pueue_task_id = e.pueue_task_id
+                   AND s.task_signature = e.task_signature",
+                params![campaign_id, experiment_id, task_signature],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(database_error("read authoritative research task identity"))?;
+        let Some((project_id, canonical_signature, pueue_task_id)) = authority else {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred research review claim"))?;
+            return Ok(None);
+        };
+
+        let review_id = research_review_id(campaign_id, experiment_id, &canonical_signature, now);
+        let event_dedup_key = format!("campaign-research:v1:{review_id}");
+        let payload_json = serde_json::to_string(&json!({
+            "source": "campaign_research",
+            "campaign_id": campaign_id,
+            "experiment_id": experiment_id,
+            "task_id": pueue_task_id,
+            "task_signature": canonical_signature,
+            "review_id": review_id,
+        }))
+        .map_err(|source| AppError::Serialization {
+            operation: "serialize campaign research event",
+            source,
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO events (
+                    project_id, campaign_id, experiment_id, kind, dedup_key,
+                    payload_json, status, attempts, not_before, lease_until,
+                    created_at, completed_at, last_error
+                 ) VALUES (?1, ?2, ?3, 'campaign_research', ?4, ?5,
+                           'pending', 0, ?6, NULL, ?6, NULL, NULL)
+                 ON CONFLICT(project_id, dedup_key) DO NOTHING",
+                params![
+                    project_id,
+                    campaign_id,
+                    experiment_id,
+                    event_dedup_key,
+                    payload_json,
+                    now,
+                ],
+            )
+            .map_err(database_error("insert campaign research event"))?;
+        let event_id: i64 = transaction
+            .query_row(
+                "SELECT event_id FROM events
+                 WHERE project_id = ?1 AND dedup_key = ?2
+                   AND kind = 'campaign_research'
+                   AND campaign_id = ?3 AND experiment_id = ?4
+                   AND payload_json = ?5 AND status = 'pending'",
+                params![
+                    project_id,
+                    event_dedup_key,
+                    campaign_id,
+                    experiment_id,
+                    payload_json,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read campaign research event"))?;
+        transaction
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 'pending', NULL, NULL, NULL, NULL,
+                           NULL, NULL, NULL, NULL, ?5, ?6, ?7, NULL, NULL, NULL,
+                           NULL, ?7, NULL, NULL, ?7)",
+                params![
+                    review_id,
+                    campaign_id,
+                    experiment_id,
+                    canonical_signature,
+                    session_generation,
+                    event_id,
+                    now,
+                ],
+            )
+            .map_err(database_error("insert campaign research review"))?;
+        transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET next_due_at = NULL, last_review_id = ?1, updated_at = ?2
+                 WHERE campaign_id = ?3",
+                params![review_id, now, campaign_id],
+            )
+            .map_err(database_error("advance campaign research state"))?;
+        let review = transaction
+            .query_row(
+                &format!("{REVIEW_SELECT} WHERE review_id = ?1"),
+                [review_id.as_str()],
+                review_from_row,
+            )
+            .map_err(database_error("read claimed campaign research review"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research review claim"))?;
+        Ok(Some(review))
+    }
+
+    pub fn find(&self, review_id: &str) -> Result<ResearchReview, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                &format!("{REVIEW_SELECT} WHERE review_id = ?1"),
+                [review_id],
+                review_from_row,
+            )
+            .optional()
+            .map_err(database_error("find research review"))?
+            .ok_or_else(|| {
+                validation_error("review_id", "does not identify a persisted research review")
+            })
+    }
+
+    pub fn recent(&self, campaign_id: &str, limit: usize) -> Result<Vec<ResearchReview>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{REVIEW_SELECT}
+                 WHERE campaign_id = ?1
+                 ORDER BY created_at DESC, review_id DESC
+                 LIMIT ?2"
+            ))
+            .map_err(database_error("prepare recent research review query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    campaign_id,
+                    limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64
+                ],
+                review_from_row,
+            )
+            .map_err(database_error("query recent research reviews"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read recent research reviews"))
+    }
+
+    pub fn owns_successor(&self, experiment_id: &str) -> Result<bool, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM research_reviews
+                     WHERE experiment_id = ?1
+                       AND successor_experiment_id IS NOT NULL
+                 )",
+                [experiment_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check research successor ownership"))
+    }
+}
+
+fn ensure_campaign_in_transaction(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+) -> Result<(), AppError> {
+    let updated_at: Option<i64> = transaction
+        .query_row(
+            "SELECT updated_at FROM campaigns WHERE campaign_id = ?1",
+            [campaign_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("check research campaign before creation"))?;
+    let Some(updated_at) = updated_at else {
+        return Err(validation_error(
+            "campaign_id",
+            "does not identify a persisted campaign",
+        ));
+    };
+    transaction
+        .execute(
+            "INSERT INTO campaign_research (
+                campaign_id, session_id, session_generation, next_due_at,
+                blocked_reason, last_review_id, updated_at
+             ) VALUES (?1, NULL, 0, NULL, NULL, NULL, ?2)
+             ON CONFLICT(campaign_id) DO NOTHING",
+            params![campaign_id, updated_at],
+        )
+        .map_err(database_error("ensure campaign research state"))?;
+    Ok(())
+}
+
+fn has_open_review(transaction: &Transaction<'_>, campaign_id: &str) -> Result<bool, AppError> {
+    transaction
+        .query_row(
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1 FROM research_reviews
+                     WHERE campaign_id = ?1 AND state IN {OPEN_REVIEW_STATES}
+                 )"
+            ),
+            [campaign_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check open campaign research review"))
+}
+
+fn has_open_operation(
+    transaction: &Transaction<'_>,
+    experiment_id: &str,
+) -> Result<bool, AppError> {
+    transaction
+        .query_row(
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1 FROM research_reviews
+                     WHERE experiment_id = ?1 AND operation_stage IN {OPEN_OPERATION_STAGES}
+                 )"
+            ),
+            [experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check open campaign research operation"))
+}
+
+fn next_research_due(start: i64, interval_minutes: u32) -> Result<Option<i64>, AppError> {
+    if interval_minutes == 0 {
+        return Ok(None);
+    }
+    start
+        .checked_add(i64::from(interval_minutes) * 60)
+        .map(Some)
+        .ok_or_else(|| validation_error("research.next_due_at", "timestamp overflow"))
+}
+
+fn research_review_id(
+    campaign_id: &str,
+    experiment_id: &str,
+    task_signature: &str,
+    now: i64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(campaign_id.as_bytes());
+    digest.update([0]);
+    digest.update(experiment_id.as_bytes());
+    digest.update([0]);
+    digest.update(task_signature.as_bytes());
+    digest.update([0]);
+    digest.update(now.to_le_bytes());
+    format!("research-review:v1:{:x}", digest.finalize())
+}
+
+fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchReview> {
+    Ok(ResearchReview {
+        review_id: row.get(0)?,
+        campaign_id: row.get(1)?,
+        experiment_id: row.get(2)?,
+        task_signature: row.get(3)?,
+        attempt: row.get(4)?,
+        state: row.get(5)?,
+        operation_stage: row.get(6)?,
+        agent_run_id: row.get(7)?,
+        context_json: row.get(8)?,
+        context_digest: row.get(9)?,
+        response_json: row.get(10)?,
+        termination_request_id: row.get(11)?,
+        successor_experiment_id: row.get(12)?,
+    })
+}
+
+fn validation_error(field: &'static str, message: &'static str) -> AppError {
+    AppError::Validation { field, message }
+}

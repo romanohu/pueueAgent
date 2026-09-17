@@ -39,6 +39,7 @@ max_same_spec_retries = 2
 max_repairs_per_failure_fingerprint = 2
 max_proposals_per_cycle = 1
 observer_interval_minutes = 30
+research_interval_minutes = 30
 max_decision_attempts_per_cycle = 3
 max_decision_wait_minutes = 1440
 max_code_change_changed_files = 50
@@ -467,6 +468,7 @@ pub struct CampaignLimits {
     pub max_repairs_per_failure_fingerprint: u32,
     pub max_proposals_per_cycle: u32,
     pub observer_interval_minutes: u32,
+    pub research_interval_minutes: u32,
     pub max_decision_attempts_per_cycle: u32,
     pub max_decision_wait_minutes: u32,
     pub max_code_change_changed_files: u32,
@@ -488,6 +490,7 @@ impl Default for CampaignLimits {
             max_repairs_per_failure_fingerprint: 2,
             max_proposals_per_cycle: 1,
             observer_interval_minutes: 30,
+            research_interval_minutes: 30,
             max_decision_attempts_per_cycle: 3,
             max_decision_wait_minutes: 1_440,
             max_code_change_changed_files: 50,
@@ -2158,6 +2161,9 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         observer_interval_minutes: raw
             .observer_interval_minutes
             .unwrap_or(defaults.observer_interval_minutes),
+        research_interval_minutes: raw
+            .research_interval_minutes
+            .unwrap_or(defaults.research_interval_minutes),
         max_decision_attempts_per_cycle: raw
             .max_decision_attempts_per_cycle
             .unwrap_or(defaults.max_decision_attempts_per_cycle),
@@ -2191,6 +2197,7 @@ fn parse_campaign_limits(raw: RawCampaignLimits) -> Result<CampaignLimits, Polic
         || limits.max_repairs_per_failure_fingerprint > 100
         || !(1..=32).contains(&limits.max_proposals_per_cycle)
         || !(1..=1_440).contains(&limits.observer_interval_minutes)
+        || limits.research_interval_minutes > 1_440
         || !(1..=10).contains(&limits.max_decision_attempts_per_cycle)
         || !(1..=10_080).contains(&limits.max_decision_wait_minutes)
         || !(1..=50).contains(&limits.max_code_change_changed_files)
@@ -2774,6 +2781,7 @@ struct RawCampaignLimits {
     max_repairs_per_failure_fingerprint: Option<u32>,
     max_proposals_per_cycle: Option<u32>,
     observer_interval_minutes: Option<u32>,
+    research_interval_minutes: Option<u32>,
     max_decision_attempts_per_cycle: Option<u32>,
     max_decision_wait_minutes: Option<u32>,
     max_code_change_changed_files: Option<u32>,

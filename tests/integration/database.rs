@@ -14,6 +14,7 @@ use pueue_agent::{
         BatchRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
         EventRepository, ExperimentRepository, IncidentRepository, InterventionRepository,
         NewCodeChangeCheck, ProjectRepository, ProposalAcceptance, ProposalRepository,
+        ResearchRepository,
         RunLineageRepository, StartCampaignRequest, SubmissionRepository,
         TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
@@ -301,6 +302,36 @@ impl CampaignDbHarness {
             .unwrap();
     }
 
+    fn make_running_baseline(&self, task_id: i64, task_signature: &str, started_at: i64) {
+        let repository = ExperimentRepository::new(&self.db);
+        repository
+            .mark_submitting(&self.experiment_id, started_at)
+            .unwrap();
+        repository
+            .mark_accepted(
+                &self.experiment_id,
+                task_id,
+                task_signature,
+                started_at + 1,
+            )
+            .unwrap();
+        TaskObservationRepository::new(&self.db)
+            .upsert(&NewTaskObservation::new(
+                &self.project_id,
+                task_signature,
+                task_id,
+                "pa-campaign-project",
+                vec!["python".to_owned(), "train.py".to_owned()],
+                "Running",
+                Some(started_at - 1),
+                Some(started_at),
+                None,
+                None,
+                started_at + 2,
+            ))
+            .unwrap();
+    }
+
     fn campaign_promotion_state(&self) -> (Option<String>, i64) {
         self.db
             .connect()
@@ -461,6 +492,637 @@ impl CampaignDbHarness {
             .map(|handle| handle.join().unwrap())
             .collect()
     }
+}
+
+#[test]
+fn research_state_creation_is_idempotent() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    let repo = ResearchRepository::new(&h.db);
+    repo.ensure_campaign(&h.campaign_id).unwrap();
+    repo.ensure_campaign(&h.campaign_id).unwrap();
+    let state = repo.state(&h.campaign_id).unwrap();
+    assert_eq!(state.session_generation, 0);
+    assert_eq!(state.session_id, None);
+    assert_eq!(state.next_due_at, None);
+    assert_eq!(CampaignLimits::default().research_interval_minutes, 30);
+}
+
+#[test]
+fn research_state_rejects_an_unknown_campaign_foreign_key() {
+    let h = CampaignDbHarness::new();
+    let error = ResearchRepository::new(&h.db)
+        .ensure_campaign("missing-campaign")
+        .unwrap_err();
+    assert!(matches!(error, AppError::Validation { field: "campaign_id", .. }));
+}
+
+#[test]
+fn research_claim_is_due_once_and_persists_authoritative_lineage() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:research", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_010)
+        .unwrap();
+    assert_eq!(repository.state(&h.campaign_id).unwrap().next_due_at, Some(2_800));
+    assert!(repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "forged-caller-signature",
+            2_799,
+        )
+        .unwrap()
+        .is_none());
+
+    let review = repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:research",
+            2_800,
+        )
+        .unwrap()
+        .expect("due running experiment should be claimed");
+    assert_eq!(review.campaign_id, h.campaign_id);
+    assert_eq!(review.experiment_id, h.experiment_id);
+    assert_eq!(review.task_signature, "pueue-task:v1:research");
+    assert_eq!(review.state, "pending");
+    assert_eq!(review.attempt, 0);
+    assert_eq!(repository.find(&review.review_id).unwrap(), review);
+    assert!(repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:research",
+            2_801,
+        )
+        .unwrap()
+        .is_none());
+
+    let connection = h.db.connect().unwrap();
+    let event: (String, String, String, String) = connection
+        .query_row(
+            "SELECT kind, campaign_id, experiment_id, payload_json
+             FROM events WHERE event_id = (SELECT event_id FROM research_reviews WHERE review_id = ?1)",
+            [&review.review_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(event.0, "campaign_research");
+    assert_eq!(event.1, h.campaign_id);
+    assert_eq!(event.2, h.experiment_id);
+    let payload: serde_json::Value = serde_json::from_str(&event.3).unwrap();
+    assert_eq!(payload["task_signature"], "pueue-task:v1:research");
+    assert_eq!(payload["task_id"], 41);
+}
+
+#[test]
+fn research_claim_defers_without_live_task_or_when_campaign_is_paused() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+    assert!(repository
+        .claim_due(&h.campaign_id, &h.experiment_id, "missing", 2_800)
+        .unwrap()
+        .is_none());
+
+    h.make_running_baseline(41, "pueue-task:v1:paused", 1_000);
+    CampaignRepository::new(&h.db)
+        .pause(&h.project_id, 1_002)
+        .unwrap();
+    assert!(repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:paused",
+            2_800,
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn research_claim_due_is_exclusive_across_two_database_connections() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:race", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let db = h.db.clone();
+            let campaign_id = h.campaign_id.clone();
+            let experiment_id = h.experiment_id.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                ResearchRepository::new(&db).claim_due(
+                    &campaign_id,
+                    &experiment_id,
+                    "pueue-task:v1:race",
+                    2_800,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|review| review.is_some()).count(), 1);
+    assert_eq!(
+        h.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = ?1",
+                [&h.campaign_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn research_claim_rolls_back_event_and_state_when_event_insert_fails() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:rollback", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_campaign_research_event
+             BEFORE INSERT ON events
+             WHEN NEW.kind = 'campaign_research'
+             BEGIN
+                 SELECT RAISE(ABORT, 'research event rejected');
+             END;",
+        )
+        .unwrap();
+
+    assert!(repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:rollback",
+            2_800,
+        )
+        .is_err());
+    assert_eq!(repository.state(&h.campaign_id).unwrap().next_due_at, Some(2_800));
+    let connection = h.db.connect().unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = ?1",
+                [&h.campaign_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'campaign_research'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn research_schedule_anchors_later_due_at_completion_and_disables_zero_interval() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:completion", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+    let review = repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:completion",
+            2_800,
+        )
+        .unwrap()
+        .unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'completed', finished_at = 4_000, updated_at = 4_000
+             WHERE review_id = ?1",
+            [&review.review_id],
+        )
+        .unwrap();
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 4_001)
+        .unwrap();
+    assert_eq!(repository.state(&h.campaign_id).unwrap().next_due_at, Some(5_800));
+
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 0, 4_002)
+        .unwrap();
+    assert_eq!(repository.state(&h.campaign_id).unwrap().next_due_at, None);
+}
+
+#[test]
+fn research_recent_is_campaign_scoped_and_clamped_to_thirty_two_rows() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:recent", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+    for ordinal in 0..33 {
+        let due = repository
+            .state(&h.campaign_id)
+            .unwrap()
+            .next_due_at
+            .expect("research review should be scheduled");
+        let review = repository
+            .claim_due(
+                &h.campaign_id,
+                &h.experiment_id,
+                "pueue-task:v1:recent",
+                due,
+            )
+            .unwrap()
+            .expect("scheduled running experiment should be claimed");
+        if ordinal < 32 {
+            let completed_at = due + 1;
+            h.db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'completed', finished_at = ?1, updated_at = ?1
+                     WHERE review_id = ?2",
+                    params![completed_at, review.review_id],
+                )
+                .unwrap();
+            repository
+                .schedule_running(&h.campaign_id, 1_000, 30, completed_at)
+                .unwrap();
+        }
+    }
+    let recent = repository.recent(&h.campaign_id, usize::MAX).unwrap();
+    assert_eq!(recent.len(), 32);
+    assert!(recent.iter().all(|review| review.campaign_id == h.campaign_id));
+    assert_eq!(repository.recent("missing-campaign", usize::MAX).unwrap(), Vec::new());
+}
+
+#[test]
+fn research_schema_v29_installs_checks_indexes_and_preserves_active_run_ownership() {
+    let test = TestDatabase::new();
+    let connection = test.db.connect().unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        LATEST_SCHEMA_VERSION
+    );
+    let event_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(event_sql.contains("'campaign_research'"));
+    assert_eq!(
+        table_columns(&connection, "campaign_research"),
+        vec![
+            ("campaign_id".to_owned(), "TEXT".to_owned(), 0, 1),
+            ("session_id".to_owned(), "TEXT".to_owned(), 0, 0),
+            ("session_generation".to_owned(), "INTEGER".to_owned(), 1, 0),
+            ("next_due_at".to_owned(), "INTEGER".to_owned(), 0, 0),
+            ("blocked_reason".to_owned(), "TEXT".to_owned(), 0, 0),
+            ("last_review_id".to_owned(), "TEXT".to_owned(), 0, 0),
+            ("updated_at".to_owned(), "INTEGER".to_owned(), 1, 0),
+        ]
+    );
+    assert_eq!(
+        table_columns(&connection, "research_reviews").len(),
+        25
+    );
+    assert_eq!(
+        table_foreign_keys(&connection, "campaign_research"),
+        expected_foreign_keys(&[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("research_reviews", "last_review_id", "review_id", "SET NULL"),
+        ])
+    );
+    assert_eq!(
+        table_foreign_keys(&connection, "research_reviews"),
+        expected_foreign_keys(&[
+            ("campaigns", "campaign_id", "campaign_id", "CASCADE"),
+            ("experiments", "experiment_id", "experiment_id", "RESTRICT"),
+            ("agent_runs", "agent_run_id", "run_id", "RESTRICT"),
+            (
+                "termination_requests",
+                "termination_request_id",
+                "request_id",
+                "RESTRICT",
+            ),
+            (
+                "experiments",
+                "successor_experiment_id",
+                "experiment_id",
+                "RESTRICT",
+            ),
+            ("events", "event_id", "event_id", "RESTRICT"),
+            ("decision_cycles", "decision_cycle_id", "cycle_id", "RESTRICT"),
+        ])
+    );
+    for (name, sql) in [
+        (
+            "research_one_open_review_per_campaign",
+            "CREATE UNIQUE INDEX research_one_open_review_per_campaign ON research_reviews(campaign_id) WHERE state IN ('pending','running','ready','retry_wait')",
+        ),
+        (
+            "research_one_open_operation_per_experiment",
+            "CREATE UNIQUE INDEX research_one_open_operation_per_experiment ON research_reviews(experiment_id) WHERE operation_stage IN ('intent','stop_requested','stop_confirmed','successor_reserved')",
+        ),
+        (
+            "agent_runs_one_active_per_project_idx",
+            "CREATE UNIQUE INDEX agent_runs_one_active_per_project_idx ON agent_runs(project_id) WHERE status IN ('starting', 'running')",
+        ),
+    ] {
+        let actual_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compact_schema_sql(&actual_sql), compact_schema_sql(sql));
+    }
+    drop(connection);
+    Db::open(&test.path).unwrap();
+}
+
+#[test]
+fn v28_to_v29_research_migration_preserves_events_and_is_idempotent() {
+    let test = TestDatabase::new();
+    let root = test.project_root("v28-research-project");
+    register_project(&test.db, "v28-research-project", &root, "pa-v28-research-project");
+    let event_id = insert_event(&test.db, "v28-research-project", "v28-event", 100);
+    let connection = test.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE campaign_research;
+             DROP TABLE research_reviews;
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_master
+                SET sql = replace(sql, ', ' || '''campaign_research''', '')
+              WHERE type = 'table' AND name = 'events';
+             PRAGMA writable_schema = OFF;
+             PRAGMA user_version = 28;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = Db::open(&test.path).unwrap();
+    assert_eq!(
+        EventRepository::new(&migrated)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap()
+            .dedup_key,
+        "v28-event"
+    );
+    let connection = migrated.connect().unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        LATEST_SCHEMA_VERSION
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('campaign_research', 'research_reviews')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    drop(connection);
+    Db::open(&test.path).unwrap();
+}
+
+#[test]
+fn research_schema_rejects_unknown_states_and_same_target_open_operations() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:index", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+    let review = repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:index",
+            2_800,
+        )
+        .unwrap()
+        .unwrap();
+    let connection = h.db.connect().unwrap();
+    assert!(connection
+        .execute(
+            "UPDATE research_reviews SET state = 'unknown' WHERE review_id = ?1",
+            [&review.review_id],
+        )
+        .is_err());
+    connection
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'completed', operation_stage = 'intent'
+             WHERE review_id = ?1",
+            [&review.review_id],
+        )
+        .unwrap();
+    assert!(connection
+        .execute(
+            "INSERT INTO research_reviews
+             SELECT 'duplicate-review', campaign_id, experiment_id, task_signature,
+                    attempt, state, operation_stage, agent_run_id, context_json,
+                    context_digest, response_json, termination_request_id,
+                    successor_experiment_id, evidence_schema_version,
+                    session_generation, event_id, not_before, notes_json, failure_code,
+                    decision_cycle_id, checkpoint_json, created_at, started_at,
+                    finished_at, updated_at
+             FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+        )
+        .is_err());
+}
+
+#[test]
+fn research_claim_defers_when_a_completed_review_still_owns_an_operation() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:owned", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
+        .unwrap();
+    let review = repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:owned",
+            2_800,
+        )
+        .unwrap()
+        .unwrap();
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'completed', operation_stage = 'intent',
+                 finished_at = 3_000, updated_at = 3_000
+             WHERE review_id = ?1",
+            [&review.review_id],
+        )
+        .unwrap();
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 3_001)
+        .unwrap();
+    assert!(repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:owned",
+            4_800,
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn research_claims_are_isolated_between_campaigns() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    h.make_running_baseline(41, "pueue-task:v1:campaign-a", 1_000);
+    let other_root = h.test.project_root("campaign-project-b");
+    register_project(
+        &h.db,
+        "campaign-project-b",
+        &other_root,
+        "pa-campaign-project-b",
+    );
+    let objective = CampaignDbHarness::objective();
+    let baseline = CampaignDbHarness::proposal(
+        ProposalKind::Experiment,
+        "Measure the other command",
+        None,
+        &["python", "other.py"],
+    );
+    let initial_argv = baseline.argv().to_vec();
+    let other = CampaignRepository::new(&h.db)
+        .start_with_baseline(
+            StartCampaignRequest {
+                campaign_id: "campaign-2",
+                project_id: "campaign-project-b",
+                objective: &objective,
+                initial_argv: &initial_argv,
+                baseline: &baseline,
+                submission_id: "submission-campaign-b",
+                experiment_id: "experiment-campaign-b",
+                proposal_id: "proposal-campaign-b",
+                metadata: &json!({}),
+                origin_agent_run_id: None,
+                objective_metric: None,
+                now: 1_000,
+            },
+            &CampaignLimits::default(),
+        )
+        .unwrap();
+    ExperimentRepository::new(&h.db)
+        .mark_submitting(&other.experiment.experiment_id, 1_000)
+        .unwrap();
+    ExperimentRepository::new(&h.db)
+        .mark_accepted(
+            &other.experiment.experiment_id,
+            42,
+            "pueue-task:v1:campaign-b",
+            1_001,
+        )
+        .unwrap();
+    TaskObservationRepository::new(&h.db)
+        .upsert(&NewTaskObservation::new(
+            "campaign-project-b",
+            "pueue-task:v1:campaign-b",
+            42,
+            "pa-campaign-project-b",
+            vec!["python".to_owned(), "other.py".to_owned()],
+            "Running",
+            Some(999),
+            Some(1_000),
+            None,
+            None,
+            1_002,
+        ))
+        .unwrap();
+
+    let repository = ResearchRepository::new(&h.db);
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 30, 1_003)
+        .unwrap();
+    repository
+        .schedule_running("campaign-2", 1_000, 30, 1_003)
+        .unwrap();
+    let campaign_a = repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            "pueue-task:v1:campaign-a",
+            2_800,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(repository
+        .claim_due(
+            "campaign-2",
+            &other.experiment.experiment_id,
+            "pueue-task:v1:campaign-b",
+            2_800,
+        )
+        .unwrap()
+        .is_some());
+    assert_eq!(repository.recent(&h.campaign_id, 32).unwrap().len(), 1);
+    assert_eq!(repository.recent("campaign-2", 32).unwrap().len(), 1);
+    assert_eq!(campaign_a.campaign_id, h.campaign_id);
 }
 
 fn canonical_v17_campaign_fixture() -> (TempDir, PathBuf) {

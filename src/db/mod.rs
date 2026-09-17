@@ -4,6 +4,7 @@ mod decisions;
 pub mod experiment_metrics;
 pub mod migrations;
 mod repositories;
+mod research;
 pub mod running_health;
 
 pub use campaigns::{
@@ -20,6 +21,7 @@ pub use decisions::{
 pub(crate) use decisions::ReadyDecision;
 pub use experiment_metrics::MetricsRepository;
 pub use migrations::LATEST_SCHEMA_VERSION;
+pub use research::{ResearchRepository, ResearchReview, ResearchState};
 pub use running_health::HealthRepository;
 
 use std::{fs, path::Path, path::PathBuf, sync::{Arc, Mutex}, time::Duration};
