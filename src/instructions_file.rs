@@ -101,7 +101,8 @@ pub(crate) fn publish(
         return Err(conflict("instruction file changed during backup"));
     }
 
-    let temporary = create_candidate(&project.state_dir, candidate)?;
+    let state_path = project.canonical_root.join(STATE_DIRECTORY);
+    let temporary = create_candidate(&project.state_dir, &state_path, candidate)?;
     let temporary_name = temporary.name.clone();
     let temporary_identity = temporary.identity;
     let mut published = false;
@@ -122,6 +123,7 @@ pub(crate) fn publish(
             temporary_identity,
             candidate,
         )?;
+        maybe_swap_candidate_for_tests(&project.state_dir, &temporary_name);
         maybe_fail(FaultStage::Rename)?;
         rename_at(
             &project.state_dir,
@@ -153,7 +155,12 @@ pub(crate) fn publish(
     })();
     drop(temporary.file);
     if !published {
-        let _ = unlink_at(&project.state_dir, &temporary_name);
+        cleanup_owned_entry(
+            &project.state_dir,
+            &state_path.join(&temporary_name),
+            &temporary_name,
+            temporary_identity,
+        );
     }
     drop(lock);
     publish_result.map(|()| PublishResult::Updated(backup_path))
@@ -392,6 +399,7 @@ fn acquire_lock(state_dir: &File, lock_path: &Path) -> Result<File, AppError> {
         return Err(unsafe_path("instruction update lock permissions"));
     }
     maybe_fail(FaultStage::LockAcquire)?;
+    notify_before_flock_for_tests();
     let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     if result != 0 {
         return Err(io_error(
@@ -399,6 +407,7 @@ fn acquire_lock(state_dir: &File, lock_path: &Path) -> Result<File, AppError> {
             io::Error::last_os_error(),
         ));
     }
+    verify_named_identity(lock_path, identity)?;
     Ok(lock)
 }
 
@@ -439,6 +448,10 @@ fn backup_original(
                     "existing instruction backup does not match original",
                 ));
             }
+            maybe_sync(&existing, FaultStage::BackupFileSync)
+                .map_err(|source| io_error("sync existing instruction backup", source))?;
+            maybe_sync(&backup_directory, FaultStage::BackupDirectorySync)
+                .map_err(|source| io_error("sync existing instruction backup directory", source))?;
             Ok(backup_path)
         }
         Err(source) if source.raw_os_error() == Some(libc::ENOENT) => {
@@ -450,30 +463,60 @@ fn backup_original(
             )
             .map_err(|source| map_component_error("create instruction backup", source))?;
             if let Err(error) = validate_regular(&backup, "instruction backup", false) {
-                let _ = unlink_at(&backup_directory, OsStr::new(&backup_name));
+                cleanup_created_entry(
+                    &backup_directory,
+                    &backup_path,
+                    OsStr::new(&backup_name),
+                    &backup,
+                );
                 return Err(error);
             }
             if let Err(source) = set_mode(&backup, FILE_MODE) {
-                let _ = unlink_at(&backup_directory, OsStr::new(&backup_name));
+                cleanup_created_entry(
+                    &backup_directory,
+                    &backup_path,
+                    OsStr::new(&backup_name),
+                    &backup,
+                );
                 return Err(io_error("secure instruction backup", source));
             }
             let identity = match validate_regular(&backup, "instruction backup", false) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    let _ = unlink_at(&backup_directory, OsStr::new(&backup_name));
+                    cleanup_created_entry(
+                        &backup_directory,
+                        &backup_path,
+                        OsStr::new(&backup_name),
+                        &backup,
+                    );
                     return Err(error);
                 }
             };
             if identity.nlink != 1 {
-                let _ = unlink_at(&backup_directory, OsStr::new(&backup_name));
+                cleanup_created_entry(
+                    &backup_directory,
+                    &backup_path,
+                    OsStr::new(&backup_name),
+                    &backup,
+                );
                 return Err(unsafe_path("instruction backup link count"));
             }
             if let Err(error) = verify_named_identity(&backup_path, identity) {
-                let _ = unlink_at(&backup_directory, OsStr::new(&backup_name));
+                cleanup_created_entry(
+                    &backup_directory,
+                    &backup_path,
+                    OsStr::new(&backup_name),
+                    &backup,
+                );
                 return Err(error);
             }
             if let Err(error) = write_and_sync_backup(&backup, original) {
-                let _ = unlink_at(&backup_directory, OsStr::new(&backup_name));
+                cleanup_created_entry(
+                    &backup_directory,
+                    &backup_path,
+                    OsStr::new(&backup_name),
+                    &backup,
+                );
                 return Err(error);
             }
             if let Err(source) = maybe_sync(&backup_directory, FaultStage::BackupDirectorySync) {
@@ -544,7 +587,11 @@ fn write_and_sync_backup(file: &File, original: &[u8]) -> Result<(), AppError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn create_candidate(state_dir: &File, candidate: &[u8]) -> Result<TemporaryFile, AppError> {
+fn create_candidate(
+    state_dir: &File,
+    state_path: &Path,
+    candidate: &[u8],
+) -> Result<TemporaryFile, AppError> {
     let pid = std::process::id();
     for _ in 0..16 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -560,18 +607,18 @@ fn create_candidate(state_dir: &File, candidate: &[u8]) -> Result<TemporaryFile,
             Err(source) => return Err(map_component_error("create instruction candidate", source)),
         };
         if let Err(source) = set_mode(&file, FILE_MODE) {
-            let _ = unlink_at(state_dir, &name);
+            cleanup_created_entry(state_dir, &state_path.join(&name), &name, &file);
             return Err(io_error("secure instruction candidate", source));
         }
         let identity = match validate_regular(&file, "instruction candidate", false) {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = unlink_at(state_dir, &name);
+                cleanup_created_entry(state_dir, &state_path.join(&name), &name, &file);
                 return Err(error);
             }
         };
         if let Err(error) = write_and_sync_candidate(&file, candidate) {
-            let _ = unlink_at(state_dir, &name);
+            cleanup_created_entry(state_dir, &state_path.join(&name), &name, &file);
             return Err(error);
         }
         return Ok(TemporaryFile {
@@ -629,6 +676,20 @@ fn verify_named_identity(path: &Path, expected: Identity) -> Result<(), AppError
         return Err(unsafe_path("instruction path identity changed"));
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cleanup_created_entry(parent: &File, path: &Path, name: &OsStr, file: &File) {
+    if let Ok(identity) = identity_from_file(file) {
+        cleanup_owned_entry(parent, path, name, identity);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cleanup_owned_entry(parent: &File, path: &Path, name: &OsStr, expected: Identity) {
+    if verify_named_identity(path, expected).is_ok() {
+        let _ = unlink_at(parent, name);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -909,6 +970,46 @@ fn maybe_fail_io_for_tests(stage: FaultStage) -> io::Result<()> {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static TEST_SWAP_CANDIDATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn maybe_swap_candidate_for_tests(state_dir: &File, name: &OsStr) {
+    if !TEST_SWAP_CANDIDATE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    unlink_at(state_dir, name).expect("remove owned candidate for deterministic swap");
+    let mut replacement = open_at(
+        state_dir,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
+        FILE_MODE,
+    )
+    .expect("create replacement candidate for deterministic swap");
+    replacement
+        .write_all(b"replacement candidate")
+        .expect("write replacement candidate");
+    replacement.sync_all().expect("sync replacement candidate");
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn maybe_swap_candidate_for_tests(_state_dir: &File, _name: &OsStr) {}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static TEST_LOCK_BEFORE_FLOCK: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn notify_before_flock_for_tests() {
+    if let Some(sender) = TEST_LOCK_BEFORE_FLOCK.lock().unwrap().take() {
+        let _ = sender.send(());
+    }
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn notify_before_flock_for_tests() {}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 thread_local! {
     static TEST_FAULT: std::cell::RefCell<Option<FaultStage>> = const { std::cell::RefCell::new(None) };
 }
@@ -973,6 +1074,37 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn reusable_backup_is_synced_before_retry_after_directory_sync_fault() {
+        let (_temporary, root, original) = project();
+        let preview = instructions::update(&root, None).unwrap();
+        let token = preview.preview_token.as_deref().unwrap().to_owned();
+
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::BackupDirectorySync));
+        assert!(instructions::update(&root, Some(&token)).is_err());
+        let backup_dir = root.join(STATE_DIRECTORY).join(BACKUP_DIRECTORY);
+        assert!(backup_dir.is_dir());
+        assert_eq!(
+            fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
+            original
+        );
+
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::BackupDirectorySync));
+        assert!(instructions::update(&root, Some(&token)).is_err());
+        assert_eq!(
+            fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
+            original
+        );
+
+        assert!(instructions::update(&root, Some(&token)).is_ok());
+        assert_eq!(
+            fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
+            include_bytes!("../templates/instructions.md")
+        );
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn rename_fault_cleans_only_the_owned_candidate() {
         let (_temporary, root, original) = project();
         let preview = instructions::update(&root, None).unwrap();
@@ -997,6 +1129,91 @@ mod tests {
             .count();
         assert_eq!(temporary_count, 0);
         TEST_FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn candidate_cleanup_retains_a_replacement_at_the_named_path() {
+        let (_temporary, root, original) = project();
+        let preview = instructions::update(&root, None).unwrap();
+        let token = preview.preview_token.as_deref().unwrap();
+        TEST_SWAP_CANDIDATE.store(true, std::sync::atomic::Ordering::SeqCst);
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = Some(FaultStage::Rename));
+
+        let result = instructions::update(&root, Some(token));
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(root.join(STATE_DIRECTORY).join(INSTRUCTIONS_FILE)).unwrap(),
+            original
+        );
+        let replacements = fs::read_dir(root.join(STATE_DIRECTORY))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".instructions.")
+                    && entry.file_name().to_string_lossy().ends_with(".tmp")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(
+            fs::read(replacements[0].path()).unwrap(),
+            b"replacement candidate"
+        );
+        TEST_SWAP_CANDIDATE.store(false, std::sync::atomic::Ordering::SeqCst);
+        TEST_FAULT.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn waiting_lock_replacement_is_rejected_after_flock() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_temporary, root, original) = project();
+        let preview = instructions::update(&root, None).unwrap();
+        let token = preview.preview_token.as_deref().unwrap().to_owned();
+        let state_path = root.join(STATE_DIRECTORY);
+        let lock_path = state_path.join(LOCK_FILE);
+        fs::write(&lock_path, b"").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        *TEST_LOCK_BEFORE_FLOCK.lock().unwrap() = Some(sender);
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || instructions::update(&worker_root, Some(&token)));
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiting updater did not reach flock");
+
+        let old_lock_path = state_path.join(".instructions.lock.old");
+        fs::rename(&lock_path, &old_lock_path).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        drop(holder);
+
+        let result = worker.join().unwrap();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("instructions: unsafe"));
+        assert_eq!(
+            fs::read(state_path.join(INSTRUCTIONS_FILE)).unwrap(),
+            original
+        );
+        let _ = fs::remove_file(old_lock_path);
+        let _ = fs::remove_file(lock_path);
+        *TEST_LOCK_BEFORE_FLOCK.lock().unwrap() = None;
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

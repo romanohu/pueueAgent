@@ -87,6 +87,23 @@ fn update_preview_reports_a_legacy_distribution_without_writing() {
     assert!(!root.join(".pueue-agent.sqlite3").exists());
 }
 
+#[test]
+fn preview_prints_substantive_managed_instruction_diff() {
+    let (_temporary, instruction_path, _original) = initialized_legacy_project();
+    let root = instruction_path.parent().unwrap().parent().unwrap();
+
+    let preview = update(root, None);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let output = String::from_utf8(preview.stdout).unwrap();
+    assert!(output.contains("+## Standard role"));
+    assert!(output.contains("+## Diagnosis role"));
+    assert!(output.contains("-## Phase 2 decision agent"));
+}
+
 #[cfg(unix)]
 #[test]
 fn preview_then_apply_preserves_custom_bytes_and_all_unrelated_state() {
@@ -316,6 +333,30 @@ fn unknown_custom_or_malformed_distributions_fail_closed_without_writes() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("instructions: conflict"));
         assert_eq!(fs::read(&instruction_path).unwrap(), before);
         assert!(!root.join(".pueue-agent/instructions.backups").exists());
+    }
+}
+
+#[test]
+fn reserved_marker_variants_fail_closed_through_the_cli() {
+    for extra_marker in [
+        b"<!-- pueue-agent:instructions v2 begin -->\n".as_slice(),
+        b"<!-- pueue-agent:instructions v1 begin\n".as_slice(),
+    ] {
+        for distribution in [
+            include_bytes!("../../templates/instructions.md").as_slice(),
+            include_bytes!("../../templates/legacy/instructions-v0.md").as_slice(),
+        ] {
+            let (_temporary, instruction_path, _original) = initialized_legacy_project();
+            let contents = [distribution, extra_marker].concat();
+            fs::write(&instruction_path, &contents).unwrap();
+
+            let root = instruction_path.parent().unwrap().parent().unwrap();
+            let result = update(root, None);
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("instructions: conflict"));
+            assert_eq!(fs::read(&instruction_path).unwrap(), contents);
+            assert!(!root.join(".pueue-agent/instructions.backups").exists());
+        }
     }
 }
 
