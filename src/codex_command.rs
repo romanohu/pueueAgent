@@ -45,6 +45,7 @@ pub struct CodexCapabilities {
     pub project_config_isolation: bool,
     pub json_output_schema: bool,
     pub output_last_message: bool,
+    pub json_events: bool,
     pub permission_profiles: bool,
 }
 
@@ -58,6 +59,7 @@ impl CodexCapabilities {
             project_config_isolation: true,
             json_output_schema: false,
             output_last_message: false,
+            json_events: false,
             permission_profiles: false,
         }
     }
@@ -71,6 +73,7 @@ impl CodexCapabilities {
             project_config_isolation: true,
             json_output_schema: true,
             output_last_message: true,
+            json_events: true,
             permission_profiles: true,
         }
     }
@@ -84,6 +87,7 @@ impl CodexCapabilities {
             project_config_isolation: false,
             json_output_schema: false,
             output_last_message: false,
+            json_events: false,
             permission_profiles: false,
         }
     }
@@ -103,6 +107,10 @@ impl CodexCapabilities {
             && self.json_output_schema
             && self.output_last_message
             && self.permission_profiles
+    }
+
+    pub const fn supports_research_policy(self) -> bool {
+        self.supports_decision_policy() && self.json_events
     }
 }
 
@@ -124,12 +132,22 @@ pub(crate) fn detect_codex_capabilities(
             && exec_help.contains("--ignore-rules"),
         json_output_schema: exec_help.contains("--output-schema"),
         output_last_message: exec_help.contains("--output-last-message"),
+        json_events: help_has_flag(exec_help, "--json"),
         permission_profiles,
     };
     capabilities
         .supports_decision_policy()
         .then_some(capabilities)
         .ok_or_else(unsafe_argument)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn help_has_flag(help: &str, flag: &str) -> bool {
+    help.split_ascii_whitespace().any(|token| {
+        token.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+        }) == flag
+    })
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -291,6 +309,7 @@ impl CodexArgvBuilder {
             private_tmp,
             "decision-schema.json",
             "decision.json",
+            false,
         )
     }
 
@@ -306,6 +325,7 @@ impl CodexArgvBuilder {
             private_tmp,
             "health-diagnosis-schema.json",
             "health-diagnosis.json",
+            false,
         )
     }
 
@@ -321,6 +341,7 @@ impl CodexArgvBuilder {
             private_tmp,
             "research-schema.json",
             "research.json",
+            true,
         )
     }
 
@@ -427,8 +448,13 @@ impl CodexArgvBuilder {
         private_tmp: &VerifiedPrivateTemp,
         schema_name: &str,
         output_name: &str,
+        research_json: bool,
     ) -> Result<Vec<OsString>, PolicyViolation> {
-        self.preflight_decision(config, prompt)?;
+        if research_json {
+            self.preflight_research(config, prompt)?;
+        } else {
+            self.preflight_decision(config, prompt)?;
+        }
 
         let root = path_text(&self.policy.root_anchor.canonical_path)?;
         let schema = path_text(&private_tmp.target_path().join(schema_name))?;
@@ -447,6 +473,9 @@ impl CodexArgvBuilder {
             OsString::from("--output-last-message"),
             OsString::from(output),
         ];
+        if research_json {
+            argv.push(OsString::from("--json"));
+        }
 
         push_codex_overrides(&mut argv, config)?;
         push_decision_permission_profile(&mut argv, self.policy.network);
@@ -617,6 +646,20 @@ impl CodexArgvBuilder {
                 .model
                 .as_deref()
                 .is_some_and(|model| model.is_empty() || model.contains('\0'))
+        {
+            return Err(unsafe_argument());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_research(
+        &self,
+        config: &AgentConfig,
+        prompt: &str,
+    ) -> Result<(), PolicyViolation> {
+        self.preflight_decision(config, prompt)?;
+        if !self.capabilities.supports_research_policy()
+            || matches!(config.context, AgentContextMode::ResumeLatest)
         {
             return Err(unsafe_argument());
         }
@@ -838,10 +881,11 @@ mod tests {
     #[test]
     fn installed_codex_capabilities_require_supported_version_and_exact_help_surface() {
         let root_help = "--strict-config --sandbox read-only workspace-write --ask-for-approval never";
-        let exec_help = "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message";
+        let exec_help = "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json";
         let capabilities = detect_codex_capabilities("codex-cli 0.148.0", root_help, exec_help)
             .unwrap();
         assert!(capabilities.supports_decision_policy());
+        assert!(capabilities.supports_research_policy());
         assert!(detect_codex_capabilities("codex-cli 0.137.9", root_help, exec_help).is_err());
         assert!(detect_codex_capabilities(
             "codex-cli 0.148.0",
@@ -849,5 +893,25 @@ mod tests {
             "--ignore-user-config --ignore-rules --strict-config --output-schema",
         )
         .is_err());
+        assert!(detect_codex_capabilities(
+            "codex-cli 0.148.0",
+            root_help,
+            "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message",
+        )
+        .is_ok());
+        assert!(!detect_codex_capabilities(
+            "codex-cli 0.148.0",
+            root_help,
+            "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message",
+        )
+        .unwrap()
+        .supports_research_policy());
+        assert!(!detect_codex_capabilities(
+            "codex-cli 0.148.0",
+            root_help,
+            "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json-schema",
+        )
+        .unwrap()
+        .supports_research_policy());
     }
 }

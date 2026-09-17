@@ -28,6 +28,8 @@ use crate::execution_policy::{
 use std::{io::Write, sync::Mutex};
 #[cfg(target_os = "linux")]
 use crate::decision_protocol::MAX_DECISION_BYTES;
+#[cfg(unix)]
+use crate::project_logs::LogFileIdentity;
 
 pub use crate::execution_policy::StartupEnvironment;
 
@@ -109,6 +111,10 @@ pub const MAX_PRIVATE_TEMP_ALLOCATED_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_PRIVATE_TEMP_GENERATIONS: usize = 4096;
 pub const MAX_PRIVATE_TEMP_RUN_ID: i64 = i64::MAX - 1;
 const MAX_DECISION_ARTIFACT_SCAN_ENTRIES: usize = 4096;
+#[cfg(target_os = "linux")]
+const MAX_RESEARCH_STDOUT_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_RESEARCH_STDERR_BYTES: u64 = 256 * 1024;
 
 /// Metadata-only evidence discovered relative to a retained project-root
 /// descriptor. File contents are deliberately outside this projection.
@@ -814,6 +820,10 @@ pub struct PrivateRunTemp {
     identity: (u64, u64),
     #[cfg(target_os = "linux")]
     decision_output_anchor: Mutex<Option<DecisionOutputAnchor>>,
+    #[cfg(target_os = "linux")]
+    research_stdout_anchor: Mutex<Option<DecisionOutputAnchor>>,
+    #[cfg(target_os = "linux")]
+    research_stderr_anchor: Mutex<Option<DecisionOutputAnchor>>,
 }
 
 /// An opaque, verified directory capability for the native target's private
@@ -824,6 +834,16 @@ pub(crate) struct VerifiedPrivateTemp {
     pub(crate) directory: File,
     pub(crate) identity: ExecutableIdentity,
     run_id: i64,
+    #[cfg(unix)]
+    pub(crate) research_streams: Option<VerifiedResearchStreams>,
+}
+
+#[cfg(unix)]
+pub(crate) struct VerifiedResearchStreams {
+    pub(crate) stdout: File,
+    pub(crate) stdout_identity: LogFileIdentity,
+    pub(crate) stderr: File,
+    pub(crate) stderr_identity: LogFileIdentity,
 }
 
 impl VerifiedPrivateTemp {
@@ -1045,6 +1065,10 @@ impl PrivateRunTemp {
                 identity,
                 #[cfg(target_os = "linux")]
                 decision_output_anchor: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                research_stdout_anchor: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                research_stderr_anchor: Mutex::new(None),
             })
         }
     }
@@ -1075,7 +1099,38 @@ impl PrivateRunTemp {
         &self,
         schema: &[u8],
     ) -> Result<(), PolicyViolation> {
-        self.prepare_named_output("research-schema.json", "research.json", schema)
+        self.prepare_named_output("research-schema.json", "research.json", schema)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate_current()?;
+            let stdout = create_private_decision_file(
+                &self.directory,
+                OsStr::new("research-stdout.jsonl"),
+                &[],
+            )?;
+            let stderr = create_private_decision_file(
+                &self.directory,
+                OsStr::new("research-stderr.log"),
+                &[],
+            )?;
+            *self
+                .research_stdout_anchor
+                .lock()
+                .map_err(|_| temp_error())? = Some(stdout);
+            *self
+                .research_stderr_anchor
+                .lock()
+                .map_err(|_| temp_error())? = Some(stderr);
+            self.directory.sync_all().map_err(|_| temp_error())?;
+            self.revalidate_current()
+        }
     }
 
     pub(crate) fn prepare_editor_schema(&self, schema: &[u8]) -> Result<(), PolicyViolation> {
@@ -1130,6 +1185,43 @@ impl PrivateRunTemp {
         self.read_named_output("research.json")
     }
 
+    pub(crate) fn read_research_stdout(&self) -> Result<Vec<u8>, PolicyViolation> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.read_anchored_output(
+                "research-stdout.jsonl",
+                &self.research_stdout_anchor,
+                MAX_RESEARCH_STDOUT_BYTES,
+            )
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_research_stderr(&self) -> Result<Vec<u8>, PolicyViolation> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.read_anchored_output(
+                "research-stderr.log",
+                &self.research_stderr_anchor,
+                MAX_RESEARCH_STDERR_BYTES,
+            )
+        }
+    }
+
     pub(crate) fn read_editor_output(&self) -> Result<Vec<u8>, PolicyViolation> {
         self.read_named_output("editor.json")
     }
@@ -1167,12 +1259,22 @@ impl PrivateRunTemp {
                     PolicyViolationStage::Finalized,
                 ));
             }
-            let before = validate_decision_output_file(&anchor.file, expected, parent_mount)?;
+            let before = validate_decision_output_file(
+                &anchor.file,
+                expected,
+                parent_mount,
+                MAX_DECISION_BYTES as u64,
+            )?;
             let size = usize::try_from(before.size).map_err(|_| {
                 temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
             })?;
             let bytes = read_decision_output_file(&anchor.file, size)?;
-            let after = validate_decision_output_file(&anchor.file, expected, parent_mount)?;
+            let after = validate_decision_output_file(
+                &anchor.file,
+                expected,
+                parent_mount,
+                MAX_DECISION_BYTES as u64,
+            )?;
             if before != after {
                 return Err(temp_violation_at(
                     TempUnsafeReason::IdentityChanged,
@@ -1195,6 +1297,60 @@ impl PrivateRunTemp {
             self.revalidate_current()?;
             Ok(bytes)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_anchored_output(
+        &self,
+        output_name: &str,
+        anchor_mutex: &Mutex<Option<DecisionOutputAnchor>>,
+        max_size: u64,
+    ) -> Result<Vec<u8>, PolicyViolation> {
+        self.revalidate_current()?;
+        let anchor = anchor_mutex.lock().map_err(|_| temp_error())?;
+        let anchor = anchor.as_ref().ok_or_else(temp_error)?;
+        let expected = anchor.identity;
+        let parent_mount = directory_mount_identity_at(
+            &self.directory,
+            PolicyViolationStage::Finalized,
+        )?;
+        if entry_mount_identity_at(
+            &self.directory,
+            OsStr::new(output_name),
+            PolicyViolationStage::Finalized,
+        )? != parent_mount
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::MountBoundary,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        let before = validate_decision_output_file(&anchor.file, expected, parent_mount, max_size)?;
+        let size = usize::try_from(before.size).map_err(|_| {
+            temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
+        })?;
+        let bytes = read_decision_output_file(&anchor.file, size)?;
+        let after = validate_decision_output_file(&anchor.file, expected, parent_mount, max_size)?;
+        if before != after {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        let visible = artifact_entry_metadata_at(&self.directory, OsStr::new(output_name))?;
+        if visible.identity != expected
+            || visible.mount_identity != parent_mount
+            || visible.owner != unsafe { libc::geteuid() as u32 }
+            || visible.mode & 0o7777 != 0o600
+            || visible.size != before.size
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        self.revalidate_current()?;
+        Ok(bytes)
     }
 
     /// Clone and revalidate the retained directory capability for target use.
@@ -1220,8 +1376,69 @@ impl PrivateRunTemp {
                 directory,
                 identity,
                 run_id,
+                #[cfg(target_os = "linux")]
+                research_streams: None,
+                #[cfg(all(unix, not(target_os = "linux")))]
+                research_streams: None,
             })
         }
+    }
+
+    pub(crate) fn verified_target_for_research(
+        &self,
+    ) -> Result<VerifiedPrivateTemp, PolicyViolation> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut target = self.verified_target()?;
+            self.revalidate_current()?;
+            let parent_mount = directory_mount_identity_at(
+                &self.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let stdout = self.verified_research_stream(
+                "research-stdout.jsonl",
+                &self.research_stdout_anchor,
+                MAX_RESEARCH_STDOUT_BYTES,
+                parent_mount,
+            )?;
+            let stderr = self.verified_research_stream(
+                "research-stderr.log",
+                &self.research_stderr_anchor,
+                MAX_RESEARCH_STDERR_BYTES,
+                parent_mount,
+            )?;
+            target.research_streams = Some(VerifiedResearchStreams {
+                stdout: stdout.0,
+                stdout_identity: stdout.1,
+                stderr: stderr.0,
+                stderr_identity: stderr.1,
+            });
+            Ok(target)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verified_research_stream(
+        &self,
+        name: &str,
+        anchor_mutex: &Mutex<Option<DecisionOutputAnchor>>,
+        max_size: u64,
+        parent_mount: MountIdentity,
+    ) -> Result<(File, LogFileIdentity), PolicyViolation> {
+        let anchor = anchor_mutex.lock().map_err(|_| temp_error())?;
+        let anchor = anchor.as_ref().ok_or_else(temp_error)?;
+        validate_decision_output_file(&anchor.file, anchor.identity, parent_mount, max_size)?;
+        let file = anchor.file.try_clone().map_err(|_| temp_error())?;
+        let identity = LogFileIdentity::from_open_descriptor(&file).map_err(|_| temp_error())?;
+        Ok((file, identity))
     }
 
     pub fn cleanup_contents_before(
@@ -1726,6 +1943,7 @@ fn validate_decision_output_file(
     file: &File,
     expected: (u64, u64),
     expected_mount: MountIdentity,
+    max_size: u64,
 ) -> Result<DecisionFileSnapshot, PolicyViolation> {
     use std::os::unix::fs::MetadataExt;
 
@@ -1744,7 +1962,7 @@ fn validate_decision_output_file(
         || snapshot.owner != unsafe { libc::geteuid() as u32 }
         || snapshot.mode != 0o600
         || snapshot.links != 1
-        || snapshot.size > MAX_DECISION_BYTES as u64
+        || snapshot.size > max_size
         || directory_mount_identity_at(file, PolicyViolationStage::Finalized)? != expected_mount
     {
         return Err(temp_violation_at(

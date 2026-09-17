@@ -69,6 +69,9 @@ pub const GIT_COMMON_DIR_FD: RawFd = 14;
 /// Descriptor carrying the verified worktree-parent capability for Git
 /// worktree add/remove operations.
 pub const GIT_WORKTREE_PARENT_FD: RawFd = 15;
+/// Optional descriptor carrying the verified private stderr capability for
+/// research agent launches.
+pub const AGENT_LOG_STDERR_FD: RawFd = 16;
 /// Compatibility alias for the final acknowledgement descriptor.
 pub const ACK_FD: RawFd = RELEASE_ACK_FD;
 
@@ -115,6 +118,7 @@ const FIELD_TARGET_IDENTITY: u8 = 3;
 const FIELD_CWD: u8 = 4;
 const FIELD_PROJECT_ROOT_IDENTITY: u8 = 5;
 const FIELD_AGENT_LOG_IDENTITY: u8 = 6;
+const FIELD_AGENT_LOG_STDERR_IDENTITY: u8 = 14;
 const FIELD_PUEUE_CONFIG_IDENTITY: u8 = 7;
 const FIELD_TARGET_PATH: u8 = 8;
 const FIELD_PRIVATE_TEMP_IDENTITY: u8 = 9;
@@ -132,6 +136,7 @@ pub struct FixedFdContract {
     pub target: RawFd,
     pub project_root: RawFd,
     pub agent_log: RawFd,
+    pub agent_log_stderr: RawFd,
     pub pueue_config: RawFd,
     pub release_ack: RawFd,
     pub private_temp: RawFd,
@@ -150,6 +155,7 @@ impl Default for FixedFdContract {
             target: TARGET_FD,
             project_root: PROJECT_ROOT_FD,
             agent_log: AGENT_LOG_FD,
+            agent_log_stderr: AGENT_LOG_STDERR_FD,
             pueue_config: PUEUE_CONFIG_FD,
             release_ack: RELEASE_ACK_FD,
             private_temp: PRIVATE_TEMP_TARGET_FD,
@@ -170,6 +176,7 @@ impl FixedFdContract {
             target: TARGET_FD,
             project_root: PROJECT_ROOT_FD,
             agent_log: AGENT_LOG_FD,
+            agent_log_stderr: AGENT_LOG_STDERR_FD,
             pueue_config: PUEUE_CONFIG_FD,
             release_ack: RELEASE_ACK_FD,
             private_temp: PRIVATE_TEMP_TARGET_FD,
@@ -187,6 +194,7 @@ impl FixedFdContract {
             && self.target == TARGET_FD
             && self.project_root == PROJECT_ROOT_FD
             && self.agent_log == AGENT_LOG_FD
+            && self.agent_log_stderr == AGENT_LOG_STDERR_FD
             && self.pueue_config == PUEUE_CONFIG_FD
             && self.release_ack == RELEASE_ACK_FD
             && self.private_temp == PRIVATE_TEMP_TARGET_FD
@@ -259,6 +267,7 @@ pub struct ControlFrame {
     pub target_identity: ExecutableIdentity,
     pub project_root_identity: Option<ExecutableIdentity>,
     pub agent_log_identity: Option<ExecutableIdentity>,
+    pub agent_log_stderr_identity: Option<ExecutableIdentity>,
     pub pueue_config_identity: Option<ExecutableIdentity>,
     pub target_path: Option<OsString>,
     pub private_temp_identity: Option<ExecutableIdentity>,
@@ -280,6 +289,10 @@ impl fmt::Debug for ControlFrame {
             .field("target_identity_present", &true)
             .field("project_root_identity_present", &self.project_root_identity.is_some())
             .field("agent_log_identity_present", &self.agent_log_identity.is_some())
+            .field(
+                "agent_log_stderr_identity_present",
+                &self.agent_log_stderr_identity.is_some(),
+            )
             .field("pueue_config_identity_present", &self.pueue_config_identity.is_some())
             .field("target_path_present", &self.target_path.is_some())
             .field("private_temp_identity_present", &self.private_temp_identity.is_some())
@@ -512,6 +525,7 @@ pub enum VerifiedChildIo {
         stdout: std::fs::File,
         stderr: std::fs::File,
         identity: LogFileIdentity,
+        stderr_identity: Option<LogFileIdentity>,
     },
 }
 
@@ -1184,7 +1198,7 @@ pub fn run_internal_launch() -> Result<(), BootstrapError> {
     // Keep a duplicate of stdin solely for the bounded failure record. The
     // fixed-map installer owns and may close fd 0 on an error path.
     let failure_channel = unsafe {
-        libc::fcntl(0, libc::F_DUPFD_CLOEXEC, GIT_WORKTREE_PARENT_FD + 1)
+        libc::fcntl(0, libc::F_DUPFD_CLOEXEC, AGENT_LOG_STDERR_FD + 1)
     };
     let result = receive_and_install_bootstrap(libc::STDIN_FILENO);
     let outcome = match result {
@@ -1515,7 +1529,7 @@ impl PlatformTarget {
                         libc::fcntl(
                             source,
                             libc::F_DUPFD_CLOEXEC,
-                            GIT_WORKTREE_PARENT_FD + 1,
+                            AGENT_LOG_STDERR_FD + 1,
                         )
                     };
                     if duplicate < 0 {
@@ -2456,15 +2470,27 @@ fn spawn_verified_command_with_deadlines(
         };
 
     let mut agent_log_identity = None;
+    let mut agent_log_stderr_identity = None;
+    let requested_stderr_identity = match &spec.child_io {
+        VerifiedChildIo::AgentLog { stderr_identity, .. } => *stderr_identity,
+        VerifiedChildIo::Capture => None,
+    };
     let capture = matches!(&spec.child_io, VerifiedChildIo::Capture);
     let (stdout, stderr) = match spec.child_io {
         VerifiedChildIo::Capture => (Stdio::piped(), Stdio::piped()),
-        VerifiedChildIo::AgentLog { stdout, stderr, identity } => {
+        VerifiedChildIo::AgentLog { stdout, stderr, identity, stderr_identity } => {
             validate_agent_log_descriptor(&stdout, identity)?;
-            validate_agent_log_descriptor(&stderr, identity)?;
+            let stderr_identity = stderr_identity.unwrap_or(identity);
+            validate_agent_log_descriptor(&stderr, stderr_identity)?;
             flags = flags.union(LaunchFlags::AGENT_LOG);
             agent_log_identity = Some(log_identity(identity));
+            if let Some(identity) = requested_stderr_identity {
+                agent_log_stderr_identity = Some(log_identity(identity));
+            }
             rights.push(duplicate_owned(&stdout)?);
+            if requested_stderr_identity.is_some() {
+                rights.push(duplicate_owned(&stderr)?);
+            }
             (Stdio::from(stdout), Stdio::from(stderr))
         }
     };
@@ -2498,6 +2524,7 @@ fn spawn_verified_command_with_deadlines(
         target_identity,
         project_root_identity,
         agent_log_identity,
+        agent_log_stderr_identity,
         pueue_config_identity,
         target_path: Some(spec.executable.canonical_path.as_os_str().to_os_string()),
         private_temp_identity,
@@ -3004,7 +3031,12 @@ pub(crate) fn bootstrap_slots(frame: &ControlFrame) -> Result<Vec<RawFd>, CodecE
     if frame.flags.contains(LaunchFlags::GIT_WORKTREE_PARENT) {
         slots.push(GIT_WORKTREE_PARENT_FD);
     }
-    if frame.flags.contains(LaunchFlags::AGENT_LOG) { slots.push(AGENT_LOG_FD); }
+    if frame.flags.contains(LaunchFlags::AGENT_LOG) {
+        slots.push(AGENT_LOG_FD);
+        if frame.agent_log_stderr_identity.is_some() {
+            slots.push(AGENT_LOG_STDERR_FD);
+        }
+    }
     if frame.flags.contains(LaunchFlags::PUEUE_CONFIG) { slots.push(PUEUE_CONFIG_FD); }
     slots.push(RELEASE_ACK_FD);
     if frame.flags.contains(LaunchFlags::PRIVATE_TEMP) { slots.push(PRIVATE_TEMP_TARGET_FD); }
@@ -3133,7 +3165,7 @@ fn receive_bootstrap_packet_with_timeout(
     // admin/common/parent, log/config, lifecycle and private-temp rights.
     // Keep one spare slot so an over-cardinality message is observed rather
     // than silently accepted at the protocol maximum.
-    let max_rights = 13usize;
+    let max_rights = 14usize;
     let ancillary_bytes = max_rights * mem::size_of::<RawFd>();
     let control_len = unsafe { libc::CMSG_SPACE(ancillary_bytes as _) } as usize;
     let mut control = vec![0u8; control_len];
@@ -3201,7 +3233,7 @@ fn receive_bootstrap_packet_with_timeout(
         return Err(BootstrapError::UnexpectedAncillary);
     }
     if rights.is_empty() { return Err(BootstrapError::MissingRights); }
-    if rights.len() > 12 { return Err(BootstrapError::WrongRightCount); }
+    if rights.len() > 13 { return Err(BootstrapError::WrongRightCount); }
     for right in &rights {
         let flags = unsafe { libc::fcntl(right.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 { return Err(BootstrapError::Io(io::Error::last_os_error())); }
@@ -3381,7 +3413,7 @@ struct FixedSlotTracker {
 #[cfg(unix)]
 impl FixedSlotTracker {
     fn new(expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
-        Self::with_range(CONTROL_FD, GIT_WORKTREE_PARENT_FD, expected, owned)
+        Self::with_range(CONTROL_FD, AGENT_LOG_STDERR_FD, expected, owned)
     }
     fn with_range(base: RawFd, end: RawFd, expected: Vec<RawFd>, owned: Vec<RawFd>) -> Self {
         let states = (base..=end).map(|fd| {
@@ -3455,7 +3487,7 @@ struct TrackedSource {
 fn original_fixed_slots(control: Option<&OwnedFd>, rights: &[OwnedFd]) -> Vec<RawFd> {
     control.into_iter().chain(rights.iter())
         .map(AsRawFd::as_raw_fd)
-        .filter(|fd| (CONTROL_FD..=GIT_WORKTREE_PARENT_FD).contains(fd))
+        .filter(|fd| (CONTROL_FD..=AGENT_LOG_STDERR_FD).contains(fd))
         .collect()
 }
 
@@ -3476,7 +3508,7 @@ fn release_original_at(sources: &mut [TrackedSource], destination: RawFd) {
 #[cfg(unix)]
 impl TrackedSource {
     fn move_above_fixed(descriptor: OwnedFd) -> Result<Self, BootstrapError> {
-        Self::move_above_ceiling(descriptor, GIT_WORKTREE_PARENT_FD)
+        Self::move_above_ceiling(descriptor, AGENT_LOG_STDERR_FD)
     }
 
     fn move_above_ceiling(
@@ -3626,6 +3658,12 @@ fn validate_role(
         {
             frame.agent_log_identity
         }
+        AGENT_LOG_STDERR_FD
+            if file_type == libc::S_IFREG
+                && (access == libc::O_WRONLY || access == libc::O_RDWR) =>
+        {
+            frame.agent_log_stderr_identity
+        }
         PUEUE_CONFIG_FD if file_type == libc::S_IFREG && access == libc::O_RDONLY => {
             frame.pueue_config_identity
         }
@@ -3644,6 +3682,7 @@ fn validate_role(
                 | GIT_COMMON_DIR_FD
                 | GIT_WORKTREE_PARENT_FD
                 | AGENT_LOG_FD
+                | AGENT_LOG_STDERR_FD
                 | PUEUE_CONFIG_FD
                 | PRIVATE_TEMP_TARGET_FD
         )
@@ -3683,6 +3722,7 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
         + usize::from(frame.project_root_identity.is_some())
         + usize::from(frame.working_directory_identity.is_some())
         + usize::from(frame.agent_log_identity.is_some())
+        + usize::from(frame.agent_log_stderr_identity.is_some())
         + usize::from(frame.pueue_config_identity.is_some())
         + usize::from(frame.target_path.is_some())
         + usize::from(frame.private_temp_identity.is_some())
@@ -3699,6 +3739,7 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
         frame.project_root_identity.is_some(),
         frame.working_directory_identity.is_some(),
         frame.agent_log_identity.is_some(),
+        frame.agent_log_stderr_identity.is_some(),
         frame.pueue_config_identity.is_some(),
     ] {
         if present { payload_len = payload_len.checked_add(encoded_field_size(IDENTITY_SIZE)).ok_or(CodecError::LengthOverflow)?; }
@@ -3762,6 +3803,13 @@ pub fn encode_control_frame(frame: &ControlFrame) -> Result<Vec<u8>, CodecError>
             &identity,
         );
     }
+    if let Some(identity) = frame.agent_log_stderr_identity {
+        append_identity_field(
+            &mut output,
+            FIELD_AGENT_LOG_STDERR_IDENTITY,
+            &identity,
+        );
+    }
     Ok(output)
 }
 
@@ -3778,13 +3826,14 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
     if bytes.len() > total { return Err(CodecError::TrailingBytes); }
     let mut cursor = Cursor::new(&bytes[HEADER_SIZE..total]);
     let field_count = cursor.u32()? as usize;
-    if field_count > 13 { return Err(CodecError::TooManyFields); }
+    if field_count > 14 { return Err(CodecError::TooManyFields); }
     let mut argv = None;
     let mut environment = None;
     let mut target_identity = None;
     let mut cwd = None;
     let mut project_root_identity = None;
     let mut agent_log_identity = None;
+    let mut agent_log_stderr_identity = None;
     let mut pueue_config_identity = None;
     let mut target_path = None;
     let mut private_temp_identity = None;
@@ -3807,6 +3856,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
             FIELD_CWD => set_once(&mut cwd, decode_os_field(body), kind)?,
             FIELD_PROJECT_ROOT_IDENTITY => set_once(&mut project_root_identity, decode_identity(body), kind)?,
             FIELD_AGENT_LOG_IDENTITY => set_once(&mut agent_log_identity, decode_identity(body), kind)?,
+            FIELD_AGENT_LOG_STDERR_IDENTITY => set_once(&mut agent_log_stderr_identity, decode_identity(body), kind)?,
             FIELD_PUEUE_CONFIG_IDENTITY => set_once(&mut pueue_config_identity, decode_identity(body), kind)?,
             FIELD_TARGET_PATH => set_once(&mut target_path, decode_os_field(body), kind)?,
             FIELD_PRIVATE_TEMP_IDENTITY => set_once(&mut private_temp_identity, decode_identity(body), kind)?,
@@ -3827,6 +3877,7 @@ pub fn decode_control_frame(bytes: &[u8]) -> Result<ControlFrame, CodecError> {
         cwd: cwd.transpose()?,
         project_root_identity: project_root_identity.transpose()?,
         agent_log_identity: agent_log_identity.transpose()?,
+        agent_log_stderr_identity: agent_log_stderr_identity.transpose()?,
         pueue_config_identity: pueue_config_identity.transpose()?,
         target_path: target_path.transpose()?,
         private_temp_identity: private_temp_identity.transpose()?,
@@ -3854,6 +3905,9 @@ fn validate_frame_shape(frame: &ControlFrame) -> Result<(), CodecError> {
     if !frame.flags.contains(LaunchFlags::PROCESS_GROUP) { return Err(CodecError::MissingProcessGroup); }
     if !private_temp && frame.private_temp_identity.is_some() {
         return Err(CodecError::UnexpectedField(FIELD_PRIVATE_TEMP_IDENTITY));
+    }
+    if !log && frame.agent_log_stderr_identity.is_some() {
+        return Err(CodecError::UnexpectedField(FIELD_AGENT_LOG_STDERR_IDENTITY));
     }
     if !working_directory && frame.working_directory_identity.is_some() {
         return Err(CodecError::UnexpectedField(FIELD_WORKING_DIRECTORY_IDENTITY));
@@ -4173,6 +4227,7 @@ mod tests {
             project_root_identity: Some(identity()),
             working_directory_identity: Some(identity()),
             agent_log_identity: Some(identity()),
+            agent_log_stderr_identity: None,
             pueue_config_identity: None,
             target_path: None,
             private_temp_identity: Some(identity()),
@@ -4187,6 +4242,23 @@ mod tests {
         let original = frame();
         let encoded = original.encode().unwrap();
         assert_eq!(ControlFrame::decode(&encoded).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_frame_round_trips_optional_private_stderr_identity() {
+        let mut original = frame();
+        original.agent_log_stderr_identity = Some(ExecutableIdentity {
+            device: 4,
+            inode: 5,
+            owner: 6,
+            mode: 0o600,
+        });
+        assert_eq!(ControlFrame::decode(&original.encode().unwrap()).unwrap(), original);
+        assert_eq!(
+            bootstrap_slots(&original).unwrap(),
+            vec![3, 4, 5, 6, 7, 12, 8, 16, 10, 11]
+        );
     }
 
     #[test]
@@ -4872,6 +4944,7 @@ mod tests {
             project_root_identity: Some(identity()),
             working_directory_identity: Some(identity()),
             agent_log_identity: None,
+            agent_log_stderr_identity: None,
             pueue_config_identity: None,
             target_path: Some(executable.into_os_string()),
             private_temp_identity: None,

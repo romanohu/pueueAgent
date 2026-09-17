@@ -600,16 +600,20 @@ impl<'db> ResearchRepository<'db> {
                 "cannot reconstruct while a prior research run has active or unknown ownership",
             ));
         }
-        let recovery_notes = binding
-            .recovery_reason
-            .as_ref()
-            .map(|reason| json!({ "recovery_reason": reason }).to_string());
+        let recovery_notes = json!({
+            "session_binding": "pending",
+            "planned_session_id": binding.session_id,
+            "attempt": binding.attempt,
+            "budget_reservation_id": binding.budget_reservation_id,
+            "recovery_reason": binding.recovery_reason,
+        })
+        .to_string();
         let changed = transaction
             .execute(
                 "UPDATE research_reviews
                  SET state = 'running', agent_run_id = ?1, context_json = ?2,
                      context_digest = ?3, started_at = COALESCE(started_at, ?4),
-                     session_generation = ?5, notes_json = COALESCE(?6, notes_json),
+                     session_generation = ?5, notes_json = ?6,
                      updated_at = ?4
                  WHERE review_id = ?7 AND attempt = ?8
                    AND session_generation = ?9
@@ -670,7 +674,7 @@ impl<'db> ResearchRepository<'db> {
         session_generation: i64,
         session_id: &str,
         response_json: &str,
-        rebind_session: bool,
+        _rebind_session: bool,
         now: i64,
     ) -> Result<(), AppError> {
         validate_session_id(session_id)?;
@@ -703,7 +707,7 @@ impl<'db> ResearchRepository<'db> {
         if current_run != Some(agent_run_id)
             || current_attempt != attempt
             || current_generation != session_generation
-            || !rebind_session && current_session.as_deref() != Some(session_id)
+            || current_session.as_deref() != Some(session_id)
         {
             return Err(validation_error(
                 "research.binding",
@@ -746,6 +750,88 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("commit research response persistence"))
     }
 
+    /// Replace the supervisor's fresh-launch nonce with the exact session ID
+    /// emitted by that bound child. The immutable review/run/generation
+    /// linkage and the pending nonce are the CAS predicate.
+    pub fn confirm_agent_run_session(
+        &self,
+        review_id: &str,
+        agent_run_id: i64,
+        attempt: i64,
+        session_generation: i64,
+        planned_session_id: &str,
+        confirmed_session_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        validate_session_id(planned_session_id)?;
+        validate_session_id(confirmed_session_id)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research session confirmation"))?;
+        let (campaign_id, current_session, current_generation, current_attempt, current_run, state, notes):
+            (String, Option<String>, i64, i64, Option<i64>, String, Option<String>) = transaction
+            .query_row(
+                "SELECT r.campaign_id, c.session_id, c.session_generation,
+                        r.attempt, r.agent_run_id, r.state, r.notes_json
+                 FROM research_reviews AS r
+                 JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
+                 WHERE r.review_id = ?1",
+                [review_id],
+                |row| Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?,
+                )),
+            )
+            .map_err(database_error("read research session confirmation"))?;
+        if current_run != Some(agent_run_id)
+            || current_attempt != attempt
+            || current_generation != session_generation
+            || state != "running"
+            || current_session.as_deref() != Some(planned_session_id)
+        {
+            return Err(validation_error(
+                "research.binding",
+                "session confirmation does not match the bound native run",
+            ));
+        }
+        let mut notes = notes
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        notes["session_binding"] = json!("confirmed");
+        notes["planned_session_id"] = json!(planned_session_id);
+        notes["confirmed_session_id"] = json!(confirmed_session_id);
+        let changed = transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, updated_at = ?2
+                 WHERE campaign_id = ?3 AND session_generation = ?4
+                   AND session_id = ?5",
+                params![confirmed_session_id, now, campaign_id, session_generation, planned_session_id],
+            )
+            .map_err(database_error("confirm owned research session"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.session",
+                "campaign session changed before confirmation",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1, updated_at = ?2
+                 WHERE review_id = ?3 AND agent_run_id = ?4 AND attempt = ?5
+                   AND session_generation = ?6 AND state = 'running'",
+                params![notes.to_string(), now, review_id, agent_run_id, attempt, session_generation],
+            )
+            .map_err(database_error("persist research session confirmation"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research session confirmation"))
+    }
+
     pub fn fail_agent_run(
         &self,
         review_id: &str,
@@ -773,6 +859,68 @@ impl<'db> ResearchRepository<'db> {
             ));
         }
         Ok(())
+    }
+
+    /// Set a failed run to retry and retire only its still-pending nonce.
+    /// A previously confirmed session is intentionally retained for exact
+    /// recovery after a schema or response failure.
+    pub fn fail_agent_run_and_clear_session(
+        &self,
+        review_id: &str,
+        agent_run_id: i64,
+        attempt: i64,
+        session_generation: i64,
+        planned_session_id: &str,
+        failure_code: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        validate_session_id(planned_session_id)?;
+        if failure_code.is_empty() || failure_code.len() > 128 {
+            return Err(validation_error("research.failure_code", "must be bounded"));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin failed research session retirement"))?;
+        let (campaign_id, current_generation): (String, i64) = transaction
+            .query_row(
+                "SELECT r.campaign_id, c.session_generation
+                 FROM research_reviews AS r
+                 JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
+                 WHERE r.review_id = ?1 AND r.agent_run_id = ?2
+                   AND r.attempt = ?3 AND r.session_generation = ?4
+                   AND r.state = 'running'",
+                params![review_id, agent_run_id, attempt, session_generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(database_error("read failed research session retirement"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'retry_wait', failure_code = ?1,
+                     finished_at = ?2, updated_at = ?2
+                 WHERE review_id = ?3 AND agent_run_id = ?4 AND state = 'running'",
+                params![failure_code, now, review_id, agent_run_id],
+            )
+            .map_err(database_error("record failed research run"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.review",
+                "failed research run is not the bound running review",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = NULL, updated_at = ?1
+                 WHERE campaign_id = ?2 AND session_generation = ?3
+                   AND session_id = ?4",
+                params![now, campaign_id, current_generation, planned_session_id],
+            )
+            .map_err(database_error("retire pending research session"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit failed research session retirement"))
     }
 
     pub fn owns_successor(&self, experiment_id: &str) -> Result<bool, AppError> {

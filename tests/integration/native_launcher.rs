@@ -286,6 +286,7 @@ fn main() {
             target_identity: identity(&target.metadata().unwrap()),
             project_root_identity: Some(identity(&root.metadata().unwrap())),
             agent_log_identity: Some(identity(&log.metadata().unwrap())),
+            agent_log_stderr_identity: None,
             pueue_config_identity: None,
             target_path: None,
             private_temp_identity: Some(identity(&private_temp.metadata().unwrap())),
@@ -352,6 +353,7 @@ fn main() {
             stdout,
             stderr,
             identity,
+            stderr_identity: None,
         }
     }
 
@@ -584,6 +586,7 @@ fn main() {
                 target_identity: ExecutableIdentity { device: 0, inode: 0, owner: 0, mode: 0 },
                 project_root_identity: None,
                 agent_log_identity: None,
+                agent_log_stderr_identity: None,
                 pueue_config_identity: Some(ExecutableIdentity { device: 0, inode: 0, owner: 0, mode: 0 }),
                 target_path: None,
                 private_temp_identity: None,

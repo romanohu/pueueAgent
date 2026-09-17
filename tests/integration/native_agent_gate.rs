@@ -168,6 +168,7 @@ fn main() {
             log_root: self.root.try_clone().expect("clone verified log root"),
             relative_log_path: PathBuf::from(LOG),
             relative_marker_path: PathBuf::from(MARKER),
+            private_research_streams: false,
         }
     }
 

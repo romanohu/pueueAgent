@@ -33,7 +33,7 @@ use crate::{
     },
     interventions::InterventionReservation,
     health_diagnosis::{parse_and_validate_diagnosis, HEALTH_DIAGNOSIS_SCHEMA},
-    research_protocol::{parse_research_answer, RESEARCH_OUTPUT_SCHEMA},
+    research_protocol::{parse_research_answer, parse_research_thread_id, RESEARCH_OUTPUT_SCHEMA},
     models::{
         launch_gate_marker_path, AgentContextMode, AgentRunRole, AgentRunStatus,
         ExecutionProjection, HealthState, NewAgentRun, Project,
@@ -1343,15 +1343,18 @@ impl AgentRunner {
         let agent_start_guard = AgentStartUpgradeGuard::acquire(db).map_err(pre_binding_error)?;
         match &role {
             AgentRunRole::Standard => self.preflight_project_launch(project_policy, config, prompt),
-            AgentRunRole::Decision { .. }
-            | AgentRunRole::Diagnosis { .. }
-            | AgentRunRole::Research { .. } => {
+            AgentRunRole::Decision { .. } | AgentRunRole::Diagnosis { .. } => {
                 CodexArgvBuilder::new(
                     project_policy.clone(),
                     decision_capabilities.expect("decision launch capabilities were resolved"),
                 )
                     .preflight_decision(config, prompt)
             }
+            AgentRunRole::Research { .. } => CodexArgvBuilder::new(
+                project_policy.clone(),
+                decision_capabilities.expect("research launch capabilities were resolved"),
+            )
+            .preflight_research(config, prompt),
             AgentRunRole::CodeChangeEditor { .. } => match project_policy.agent_kind {
                 AgentKind::BuiltInCodex => CodexArgvBuilder::new(
                     project_policy.clone(),
@@ -1678,7 +1681,11 @@ impl AgentRunner {
                 ));
             }
         }
-        let private_temp_target = match temp.verified_target() {
+        let private_temp_target = match if matches!(&role, AgentRunRole::Research { .. }) {
+            temp.verified_target_for_research()
+        } else {
+            temp.verified_target()
+        } {
             Ok(target) => target,
             Err(error) => {
                 let error = AppError::from(error);
@@ -1883,6 +1890,7 @@ impl AgentRunner {
                 log_root: service_root,
                 relative_log_path,
                 relative_marker_path,
+                private_research_streams: matches!(&role, AgentRunRole::Research { .. }),
             },
             private_temp_target,
         ) {
@@ -3009,60 +3017,109 @@ impl AgentHandle {
                 message: "research context was not durably bound before native launch",
             })?;
             let bytes = temp.read_research_output();
-            match bytes
+            let events = temp.read_research_stdout();
+            let session_id = events
                 .map_err(AppError::from)
-                .and_then(|bytes| {
-                    let answer = parse_research_answer(&bytes)?;
-                    if answer.review_id != review_id
-                        || answer.experiment_id != review.experiment_id
-                        || answer.context_digest != expected_digest
-                    {
+                .and_then(|event_bytes| {
+                    let session_id = parse_research_thread_id(&event_bytes)?;
+                    if !fresh_launch && session_id != planned_session {
                         return Err(AppError::Validation {
-                            field: "research.response_identity",
-                            message: "research response identity does not match its bound review",
+                            field: "research.thread_id",
+                            message: "resume research run returned a different session",
                         });
                     }
-                    let session_id = if fresh_launch {
-                        crate::codex_session::resolve_latest_owned_session(
-                            &global_policy.codex_home,
-                            &project_policy.root_anchor.canonical_path,
-                        )
-                        .map_err(AppError::from)?
-                    } else {
-                        planned_session.clone()
-                    };
-                    let response_json = String::from_utf8(bytes).map_err(|_| AppError::Validation {
-                        field: "research.response_json",
-                        message: "must be UTF-8",
-                    })?;
-                    Ok((session_id, response_json))
-                }) {
-                Ok((session_id, response_json)) => {
-                    ResearchRepository::new(db).finish_agent_run(
+                    let owned = crate::codex_session::probe_owned_session(
+                        &global_policy.codex_home,
+                        &project_policy.root_anchor.canonical_path,
+                        &session_id,
+                    )
+                    .map_err(AppError::from)?;
+                    if !matches!(owned, crate::codex_session::OwnedSessionProbe::Owned(ref id) if id == &session_id) {
+                        return Err(AppError::Validation {
+                            field: "research.thread_id",
+                            message: "research thread is not an owned project session",
+                        });
+                    }
+                    Ok(session_id)
+                });
+            let persisted = if let Ok(session_id) = session_id {
+                let repository = ResearchRepository::new(db);
+                if repository
+                    .confirm_agent_run_session(
                         &review_id,
                         self.run_id,
                         attempt,
                         session_generation,
+                        &planned_session,
                         &session_id,
-                        &response_json,
-                        fresh_launch,
                         now,
-                    )?;
-                    true
+                    )
+                    .is_err()
+                {
+                    false
+                } else {
+                    bytes
+                        .map_err(AppError::from)
+                        .and_then(|bytes| {
+                            let response_json = String::from_utf8(bytes).map_err(|_| {
+                                AppError::Validation {
+                                    field: "research.response_json",
+                                    message: "must be UTF-8",
+                                }
+                            })?;
+                            let answer = parse_research_answer(response_json.as_bytes())?;
+                            if answer.review_id != review_id
+                                || answer.experiment_id != review.experiment_id
+                                || answer.context_digest != expected_digest
+                            {
+                                return Err(AppError::Validation {
+                                    field: "research.response_identity",
+                                    message: "research response identity does not match its bound review",
+                                });
+                            }
+                            Ok(response_json)
+                        })
+                        .and_then(|response_json| {
+                            repository.finish_agent_run(
+                                &review_id,
+                                self.run_id,
+                                attempt,
+                                session_generation,
+                                &session_id,
+                                &response_json,
+                                false,
+                                now,
+                            )
+                        })
+                        .is_ok()
                 }
-                Err(_) => false,
-            }
+            } else {
+                false
+            };
+            persisted
         } else {
             false
         };
         if !persisted {
             let failure_code = failure.unwrap_or("research_output_invalid");
-            ResearchRepository::new(db).fail_agent_run(
-                &review_id,
-                self.run_id,
-                failure_code,
-                now,
-            )?;
+            if fresh_launch {
+                ResearchRepository::new(db).fail_agent_run_and_clear_session(
+                    &review_id,
+                    self.run_id,
+                    attempt,
+                    session_generation,
+                    &planned_session,
+                    failure_code,
+                    now,
+                )?;
+            } else {
+                ResearchRepository::new(db).fail_agent_run(
+                    &review_id,
+                    self.run_id,
+                    failure_code,
+                    now,
+                )?;
+            }
             if let Some(outcome) = &mut self.terminal_outcome {
                 outcome.status = AgentRunStatus::Failed;
                 outcome.last_error = Some(failure_code.to_owned());

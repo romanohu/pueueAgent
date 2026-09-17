@@ -335,16 +335,37 @@ max_agent_runs = 10
         write_session: bool,
         reservation_id: Option<&str>,
     ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
+        self.try_launch_with_thread_id(
+            claimed,
+            context,
+            fixture_session_id,
+            fixture_session_id,
+            write_session,
+            reservation_id,
+        )
+        .await
+    }
+
+    async fn try_launch_with_thread_id(
+        &self,
+        claimed: &ClaimedReview,
+        context: AgentContextMode,
+        fixture_session_id: &str,
+        thread_id: &str,
+        write_session: bool,
+        reservation_id: Option<&str>,
+    ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
         let launch_now = claimed.claimed_at + 19;
         fs::write(
             &self.control_path,
             format!(
-                "{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n",
                 claimed.review.review_id,
                 claimed.review.experiment_id,
                 claimed.evidence.digest,
                 fixture_session_id,
                 write_session,
+                thread_id,
             ),
         )
         .unwrap();
@@ -611,7 +632,7 @@ fn pair(args: &[String], name: &str) -> Option<String> {{
     args.windows(2).find(|pair| pair[0] == name).map(|pair| pair[1].clone())
 }}
 
-fn controls() -> (String, String, String, String, bool) {{
+fn controls() -> (String, String, String, String, bool, String) {{
     let contents = fs::read_to_string({control_path:?}).unwrap();
     let mut fields = contents.lines();
     let review_id = fields.next().expect("fixture review control").to_owned();
@@ -619,7 +640,8 @@ fn controls() -> (String, String, String, String, bool) {{
     let context_digest = fields.next().expect("fixture digest control").to_owned();
     let fixture_session_id = fields.next().expect("fixture session control").to_owned();
     let write_session = fields.next().expect("fixture session mode").parse::<bool>().unwrap();
-    (review_id, experiment_id, context_digest, fixture_session_id, write_session)
+    let thread_id = fields.next().expect("fixture thread identity").to_owned();
+    (review_id, experiment_id, context_digest, fixture_session_id, write_session, thread_id)
 }}
 
 fn write_session(id: &str) {{
@@ -646,14 +668,14 @@ fn main() {{
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args == ["--version"] {{ println!("codex-cli 0.148.0"); return; }}
     if args == ["--help"] {{ println!("--strict-config --sandbox read-only workspace-write --ask-for-approval never"); return; }}
-    if args == ["exec", "--help"] {{ println!("--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message"); return; }}
+    if args == ["exec", "--help"] {{ println!("--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json"); return; }}
 
     let Some(output) = pair(&args, "--output-last-message") else {{ return; }};
     let Some(schema) = pair(&args, "--output-schema") else {{ return; }};
     let separator = args.iter().position(|arg| arg == "--").unwrap();
     let prompt = args.get(separator + 1).cloned().unwrap_or_default();
     let resume_id = args.windows(2).find(|pair| pair[0] == "resume").map(|pair| pair[1].clone());
-    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session) = controls();
+    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session, thread_id) = controls();
     let session_id = resume_id.clone().unwrap_or(fixture_session_id);
     if should_write_session {{ write_session(&session_id); }}
 
@@ -698,7 +720,8 @@ fn main() {{
     }}
     let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":"fixture note","next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
     fs::write(output, answer).unwrap();
-    println!({stdout_sentinel:?});
+    println!(r#"{{{{"type":"message","payload":{{{{"text":{stdout_sentinel:?}}}}}}}}}"#);
+    println!(r#"{{{{"type":"thread.started","thread_id":"{{}}"}}}}"#, thread_id);
     eprintln!({stderr_sentinel:?});
 }}
 "##,
@@ -763,7 +786,7 @@ async fn research_fresh_launch_does_not_adopt_preexisting_same_project_session()
         .try_launch_with_options(
             &claimed,
             AgentContextMode::Fresh,
-            STALE_SESSION,
+            FIRST_SESSION,
             false,
             None,
         )
@@ -788,6 +811,48 @@ async fn research_fresh_launch_does_not_adopt_preexisting_same_project_session()
     assert_ne!(
         stored.state, "completed",
         "a response without child-established session identity must not complete the review"
+    );
+}
+
+#[tokio::test]
+async fn research_resume_rejects_a_different_run_emitted_thread() {
+    let harness = ResearchHarness::new("resume-mismatch", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+
+    let changed = harness.prepare_changed_experiment();
+    let result = harness
+        .try_launch_with_thread_id(
+            &changed,
+            AgentContextMode::Resume {
+                session_id: FIRST_SESSION.to_owned(),
+            },
+            FIRST_SESSION,
+            SECOND_SESSION,
+            true,
+            None,
+        )
+        .await;
+    let status = match result {
+        Ok(mut handle) => handle.wait(&harness.db, NOW + 210).await.ok(),
+        Err(_) => None,
+    };
+    assert_ne!(
+        status,
+        Some(pueue_agent::models::AgentRunStatus::Completed),
+        "resume must not accept a child that reports another thread"
+    );
+    assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
+    assert_ne!(
+        ResearchRepository::new(&harness.db)
+            .find(&changed.review.review_id)
+            .unwrap()
+            .state,
+        "completed"
     );
 }
 

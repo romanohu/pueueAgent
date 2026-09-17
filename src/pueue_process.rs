@@ -83,6 +83,7 @@ fn validate_pueue_frame(
         target_identity: identity,
         project_root_identity: None,
         agent_log_identity: None,
+        agent_log_stderr_identity: None,
         pueue_config_identity: Some(identity),
         target_path: Some(target_path),
         private_temp_identity: None,

@@ -13,6 +13,7 @@ pub const MAX_RESEARCH_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_RESEARCH_EVIDENCE_REFS: usize = 16;
 pub const MAX_RESEARCH_EVIDENCE_REF_BYTES: usize = 512;
 pub const MAX_RESEARCH_ARGV: usize = 256;
+pub const MAX_RESEARCH_EVENT_BYTES: usize = 1024 * 1024;
 
 pub const RESEARCH_OUTPUT_SCHEMA: &[u8] = br#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -93,6 +94,57 @@ pub fn parse_research_answer(bytes: &[u8]) -> Result<ResearchAnswer, AppError> {
         source,
     })?;
     validate_research_answer(answer)
+}
+
+/// Parse the bounded JSONL event stream produced by a research Codex run.
+///
+/// Only a top-level `thread.started` event is authoritative.  Text nested in
+/// another event is never interpreted as session identity, and exactly one
+/// started event is required.
+pub fn parse_research_thread_id(bytes: &[u8]) -> Result<String, AppError> {
+    if bytes.is_empty() || bytes.len() > MAX_RESEARCH_EVENT_BYTES {
+        return Err(validation_error(
+            "research.thread_events",
+            "must be 1 to 1048576 bytes",
+        ));
+    }
+    let mut thread_id = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(line).map_err(|source| AppError::Serialization {
+            operation: "parse research event stream",
+            source,
+        })?;
+        let object = value.as_object().ok_or_else(|| validation_error(
+            "research.thread_events",
+            "each event must be a JSON object",
+        ))?;
+        if object.get("type").and_then(Value::as_str) != Some("thread.started") {
+            continue;
+        }
+        let value = object
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| validation_error("research.thread_id", "thread.started must include thread_id"))?;
+        let value = crate::codex_session::normalize_session_id(value).map_err(|_| {
+            validation_error("research.thread_id", "must be a normalized UUID")
+        })?;
+        if thread_id.replace(value).is_some() {
+            return Err(validation_error(
+                "research.thread_id",
+                "must contain exactly one thread.started event",
+            ));
+        }
+    }
+    thread_id.ok_or_else(|| {
+        validation_error(
+            "research.thread_id",
+            "must contain exactly one thread.started event",
+        )
+    })
 }
 
 fn validate_research_answer(answer: ResearchAnswer) -> Result<ResearchAnswer, AppError> {
@@ -360,7 +412,7 @@ fn validation_error(field: &'static str, message: &'static str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_research_answer;
+    use super::{parse_research_answer, parse_research_thread_id};
     use serde_json::json;
 
     fn valid_answer() -> serde_json::Value {
@@ -513,5 +565,29 @@ mod tests {
             "support_evidence_refs": ["artifact:checkpoint"]
         });
         assert!(parse_research_answer(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn thread_parser_accepts_one_top_level_started_event() {
+        let bytes = br#"{"type":"message","payload":{"text":"{\"type\":\"thread.started\"}"}}
+{"type":"thread.started","thread_id":"11111111-1111-4111-8111-111111111111"}
+{"type":"turn.completed"}
+"#;
+        assert_eq!(
+            parse_research_thread_id(bytes).unwrap(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+
+    #[test]
+    fn thread_parser_rejects_malformed_or_duplicate_identity() {
+        let malformed = br#"{"type":"thread.started","thread_id":"11111111-1111-4111-8111-111111111111"
+"#;
+        assert!(parse_research_thread_id(malformed).is_err());
+
+        let duplicate = br#"{"type":"thread.started","thread_id":"11111111-1111-4111-8111-111111111111"}
+{"type":"thread.started","thread_id":"22222222-2222-4222-8222-222222222222"}
+"#;
+        assert!(parse_research_thread_id(duplicate).is_err());
     }
 }

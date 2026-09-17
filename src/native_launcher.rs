@@ -38,6 +38,7 @@ pub struct NativeLaunchSpec {
     pub log_root: VerifiedProjectRoot,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
+    pub private_research_streams: bool,
 }
 
 /// Non-Unix builds retain the public shape so callers can compile uniformly,
@@ -53,6 +54,7 @@ pub struct NativeLaunchSpec {
     pub log_root: VerifiedProjectRoot,
     pub relative_log_path: PathBuf,
     pub relative_marker_path: PathBuf,
+    pub private_research_streams: bool,
 }
 
 /// Marker/release adapter for an agent process.
@@ -73,13 +75,18 @@ impl NativeLauncher {
         spec: NativeLaunchSpec,
         private_temp: &PrivateRunTemp,
     ) -> Result<NativeAgentChild, AppError> {
-        Self::spawn_verified(spec, private_temp.verified_target()?)
+        let private_temp = if spec.private_research_streams {
+            private_temp.verified_target_for_research()?
+        } else {
+            private_temp.verified_target()?
+        };
+        Self::spawn_verified(spec, private_temp)
     }
 
     #[cfg(unix)]
     pub(crate) fn spawn_verified(
         spec: NativeLaunchSpec,
-        private_temp: VerifiedPrivateTemp,
+        mut private_temp: VerifiedPrivateTemp,
     ) -> Result<NativeAgentChild, AppError> {
         let working_directory = verified_working_directory(&spec.project_root, spec.cwd.as_deref())?;
         let command_root = spec.project_root.try_clone()?;
@@ -101,8 +108,23 @@ impl NativeLauncher {
             return Err(native_gate_error(PolicyViolationStage::PostMarker));
         }
         let identity = *agent_log.identity();
-        let stdout = agent_log.try_clone()?;
-        let stderr = agent_log.into_file();
+        let (stdout, stderr, stdout_identity, stderr_identity) =
+            if spec.private_research_streams {
+                let streams = private_temp
+                    .research_streams
+                    .take()
+                    .ok_or_else(|| native_gate_error(PolicyViolationStage::NativeGate))?;
+                (
+                    streams.stdout,
+                    streams.stderr,
+                    streams.stdout_identity,
+                    Some(streams.stderr_identity),
+                )
+            } else {
+                let stdout = agent_log.try_clone()?;
+                let stderr = agent_log.into_file();
+                (stdout, stderr, identity, None)
+            };
 
         let executable_anchor = spec.executable.clone();
         let verified = crate::process::spawn_verified_agent_command(
@@ -120,7 +142,8 @@ impl NativeLauncher {
                 child_io: crate::process::VerifiedChildIo::AgentLog {
                     stdout,
                     stderr,
-                    identity,
+                    identity: stdout_identity,
+                    stderr_identity,
                 },
             },
             private_temp,
