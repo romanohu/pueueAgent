@@ -96,6 +96,10 @@ name = "health_diagnosis"
 path = "tests/integration/health_diagnosis.rs"
 
 [[test]]
+name = "research_agent"
+path = "tests/integration/research_agent.rs"
+
+[[test]]
 name = "health_actions"
 path = "tests/integration/health_actions.rs"
 
