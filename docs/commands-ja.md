@@ -21,6 +21,18 @@
 - **例:** `pueue-agent init .`
 - **失敗時の確認:** 書込み権限と、指定ディレクトリが意図したプロジェクトかを確認します。
 
+### `pueue-agent instructions`
+
+- **構文:** `pueue-agent instructions update [PROJECT_ROOT]` または `pueue-agent instructions update --apply PREVIEW_TOKEN [PROJECT_ROOT]`
+- **目的:** 既存プロジェクトの、既知の旧版配布部分だけを差分確認後に更新します。`init`、`upgrade`、daemon 起動から自動適用されることはありません。
+- **状態変更:** `update` は引数なしなら読み取り専用の preview です。`--apply` を指定した場合だけ、承認済み token に一致する配布部分をバックアップ付きで置き換えます。config、`STATE.md`、`state.json`、SQLite、campaign、budget、service、既存 agent run は変更しません。
+- **使い方:** まず `pueue-agent instructions update .` を実行し、`status: update_available`、差分、`preview_token` を確認します。内容を承認した同じプロジェクトで、表示された token を `--apply` に渡します。token はプロジェクトの canonical path と更新前後の全 bytes に結び付くため、手動編集後は再 preview が必要です。
+- **既知版の判定:** 更新対象は基準 commit `5d1a8e0` の旧版全体と完全一致する配布部分がちょうど1回ある場合だけです。前後の独自 bytes は保持されます。新版 marker の本文が完全一致する場合は `current`、本文編集、未知版、重複・混在・壊れた marker、欠落ファイルは `conflict` です。CLI は推測 merge や独自文章の破棄をしません。
+- **バックアップ:** apply 前に原本を `.pueue-agent/instructions.backups/<OLD_SHA256>.md` へ保存します。新規 backup directory は mode `0700`、backup と更新後 instructions は `0600` です。同名の既存 backup は安全性と bytes が一致する場合だけ再利用され、上書きされません。
+- **復旧:** conflict の場合は更新を適用せず、marker の外側に独自文章を残す形で人が `.pueue-agent/instructions.md` を整理してから再 preview します。backup から戻す場合は、同時に editor や update を走らせないことを確認し、backup bytes を人が確認してから手動で復元します。自動 rollback や backup の自動削除は行いません。
+- **適用タイミング:** 実行中の agent prompt は遡及変更されません。apply 後、次に instructions を読む新しい run から反映されます。必要なら先に `pause` で新規 automation を止め、別の editor が同時にファイルを編集していないことを確認してください。
+- **終了コード:** `current`、`update_available`、`updated` は `0`、conflict・unsafe path・I/O 失敗は `1`、`--apply` の値欠落など clap の構文不正は `2` です。
+
 ### `pueue-agent enable`
 
 - **構文:** `pueue-agent enable [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`

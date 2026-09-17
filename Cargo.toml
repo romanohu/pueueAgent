@@ -8,6 +8,10 @@ name = "cli_help"
 path = "tests/integration/cli_help.rs"
 
 [[test]]
+name = "instructions"
+path = "tests/integration/instructions.rs"
+
+[[test]]
 name = "config"
 path = "tests/integration/config.rs"
 

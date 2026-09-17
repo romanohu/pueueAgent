@@ -77,6 +77,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Wake(args) => commands::wake(args),
         Command::Version(args) => commands::version(args),
         Command::Upgrade(args) => commands::upgrade(args).await,
+        Command::Instructions(args) => commands::instructions(args),
         Command::Start(args) => commands::start(args),
         Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
@@ -95,7 +96,8 @@ mod commands {
         cli::{
             CampaignAction, CampaignArgs, CancelArgs, DaemonArgs, DisableArgs, DoctorArgs,
             EventArgs, EventsArgs, ExperimentAction, ExperimentArgs, ExplainArgs, InitArgs,
-            InspectArgs, ProjectArgs, ProposalAction, ProposalArgs, RunsArgs,
+            InspectArgs, InstructionsAction, InstructionsArgs, ProjectArgs, ProposalAction,
+            ProposalArgs, RunsArgs,
             ServiceLifecycleArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs,
             UpgradeArgs, VersionArgs, WakeArgs,
         },
@@ -796,6 +798,25 @@ mod commands {
                 Err(upgrade_diagnostic_error(failure))
             }
         }
+    }
+
+    pub fn instructions(args: InstructionsArgs) -> Result<(), AppError> {
+        match args.action {
+            InstructionsAction::Update(args) => {
+                let current_dir = env::current_dir().map_err(|source| AppError::Io {
+                    operation: "read current directory",
+                    source,
+                })?;
+                let project_root = match args.project_root {
+                    Some(path) => project::find_root(&path)?,
+                    None => project::find_root(&current_dir)?,
+                };
+                let result =
+                    pueue_agent::instructions::update(&project_root, args.apply.as_deref())?;
+                println!("{}", pueue_agent::instructions::render_update(&result));
+            }
+        }
+        Ok(())
     }
 
     fn upgrade_diagnostic_error(error: impl std::fmt::Display) -> AppError {

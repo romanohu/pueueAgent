@@ -13,6 +13,18 @@ pueue-agent runs --limit 100
 
 個別の task は `pueue-agent inspect <TASK_ID>`、incident は `pueue-agent explain <INCIDENT_ID>` で絞り込みます。機械処理には各コマンドの `--json` を使えます。コマンドの上限と状態変更の有無は[コマンドリファレンス](commands-ja.md)を参照してください。
 
+## Instructions update が conflict または unsafe で停止する
+
+| 症状 | 想定原因 | 安全な対応 |
+| --- | --- | --- |
+| `status: update_available` だが apply が `instructions: conflict` | preview 後に独自文章、旧版 bytes、project root、または対象ファイルが変わり、token が失効した | 原本を保存したまま同じ project で再 preview し、表示された差分を人が確認して新しい token を使う。古い token を繰り返さない |
+| marker の編集、重複、旧版と新版の混在、未知の文章として conflict | 配布本文が既知の完全一致ではない。CLI は自動 merge や独自文章の破棄をしない | `.pueue-agent/instructions.md` を人が確認し、管理対象は新版 marker の外に独自文章を置く。整理後に再 preview する |
+| instructions が missing、invalid UTF-8、または 64 KiB 超 | 対象ファイルの欠落・破損・上限超過 | 新規ファイルを自動作成せず、信頼できる配布物または backup を人が確認して復旧し、その後に preview する |
+| `instructions: unsafe path`、symlink/hardlink、権限エラー | root、`.pueue-agent`、instructions、backup、lock の identity/type/owner/mode が安全条件に一致しない | symlink 経由や permission の緩和で迂回しない。別の editor/update を止め、管理者が対象 path と所有者を確認してから再実行する |
+| apply 後に `publication durability uncertain` | rename 後の検証または親 directory の同期結果が確認できない | 成功や未変更と断定せず、表示された backup を保全する。active agent と別の update/editor を止め、原本と実ファイルを人が確認して復旧する |
+
+preview は SQLite、Pueue、service、lock、backup を作成しません。apply の前後に別の editor と同じ file を競合させないでください。既存 agent run の prompt は更新されず、次に instructions を読む run から反映されます。
+
 ## Service が起動していない
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |

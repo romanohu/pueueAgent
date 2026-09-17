@@ -37,6 +37,7 @@ pub enum Command {
     Wake(WakeArgs),
     Version(VersionArgs),
     Upgrade(UpgradeArgs),
+    Instructions(InstructionsArgs),
     Start(ServiceLifecycleArgs),
     Stop(ServiceLifecycleArgs),
     Daemon(DaemonArgs),
@@ -171,6 +172,25 @@ pub struct ExperimentInspectArgs {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    #[arg(value_name = "PROJECT_ROOT")]
+    pub project_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct InstructionsArgs {
+    #[command(subcommand)]
+    pub action: InstructionsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InstructionsAction {
+    Update(InstructionsUpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InstructionsUpdateArgs {
+    #[arg(long, value_name = "PREVIEW_TOKEN")]
+    pub apply: Option<String>,
     #[arg(value_name = "PROJECT_ROOT")]
     pub project_root: Option<PathBuf>,
 }

@@ -59,6 +59,22 @@ pueue-agent enable
 pueue-agent submit -- python train.py
 ```
 
+## 配布指示を更新する
+
+既に初期化済みのプロジェクトへ新しい agent 指示を反映する場合は、まず差分だけを preview します。preview はファイル、SQLite、Pueue、service、lock、backup を変更しません。
+
+```bash
+pueue-agent instructions update .
+# 出力された preview_token と差分を確認する
+pueue-agent instructions update --apply <PREVIEW_TOKEN> .
+```
+
+更新対象は基準 commit `5d1a8e0` の既知の旧版配布 bytes 全体がちょうど1回ある場合だけです。前後にある独自の prefix/suffix bytes は保存され、新版の配布部分は `<!-- pueue-agent:instructions v1 begin -->` と `<!-- pueue-agent:instructions v1 end -->` で囲まれます。本文を編集した指示、未知版、重複・混在・壊れた marker、欠落した instructions は conflict として停止し、推測 merge や暗黙の新規作成を行いません。
+
+apply では原本が `.pueue-agent/instructions.backups/<OLD_SHA256>.md` に保存されます。新規 backup directory は `0700`、backup と更新後 instructions は `0600` です。同名 backup は bytes と安全な identity が一致する場合だけ再利用されます。復元が必要な場合は、active agent と別の update/editor がないことを確認し、backup の内容を人が確認してから手動で戻してください。自動 rollback や backup の自動削除はありません。
+
+実行中の agent の prompt は遡及変更されず、更新後に instructions を読む次の run から反映されます。更新中は別の editor で同じファイルを編集しないでください。競合が出たら manual に独自文章を marker の外へ整理し、再度 preview して新しい token を使います。
+
 ## 生成ファイルを確認する
 
 `init` はプロジェクト直下に `.pueue-agent/` を作成し、次のファイルとディレクトリを生成します。

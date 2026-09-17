@@ -23,6 +23,8 @@ pub mod health;
 pub mod health_diagnosis;
 pub mod incidents;
 pub mod init;
+pub mod instructions;
+mod instructions_file;
 pub mod interventions;
 pub mod logs;
 pub mod models;
