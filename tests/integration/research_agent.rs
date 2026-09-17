@@ -205,8 +205,6 @@ max_agent_runs = 10
             .unwrap()
             .expect("running baseline must produce one research review");
         let evidence = build_research_evidence(&db, &review, NOW + 60).unwrap();
-        let event_id = review_event_id(&db, &review.review_id);
-
         let capture_path = fixture_root.join("research-capture.txt");
         let codex = trusted_bin.join("codex");
         compile_research_codex(
@@ -544,7 +542,7 @@ fn write_session(id: &str) {{
     record.push_str(id);
     record.push_str("\",\"cwd\":\"");
     record.push_str(&cwd);
-    record.push_str("\"}}}\n");
+    record.push_str("\"}}}}\n");
     fs::write(directory.join(format!("rollout-{{}}.jsonl", id)), record).unwrap();
 }}
 
@@ -613,7 +611,7 @@ fn main() {{
 async fn research_first_native_launch_is_read_only_schema_bound_and_does_not_log_transcript() {
     let harness = ResearchHarness::new("first", FIRST_SESSION);
     let claimed = harness.initial_review();
-    let handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
     assert_eq!(harness.execution_kind(handle.run_id), "campaign_research");
     let block = harness.capture_block(1);
     assert!(block.contains("SCHEMA=/dev/fd/11/research-schema.json"));
@@ -640,7 +638,7 @@ async fn research_first_native_launch_is_read_only_schema_bound_and_does_not_log
 async fn research_changed_experiment_in_same_campaign_exactly_resumes_owned_session() {
     let harness = ResearchHarness::new("same", FIRST_SESSION);
     let first = harness.initial_review();
-    let first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
     first_handle.wait(&harness.db, NOW + 91).await.unwrap();
     assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
 
@@ -648,7 +646,7 @@ async fn research_changed_experiment_in_same_campaign_exactly_resumes_owned_sess
     let session = harness
         .research_session()
         .expect("same campaign must retain its owned session");
-    let second_handle = harness
+    let mut second_handle = harness
         .launch(
             &changed,
             AgentContextMode::Resume {
@@ -671,7 +669,7 @@ async fn research_changed_experiment_in_same_campaign_exactly_resumes_owned_sess
 async fn research_new_campaign_starts_a_distinct_fresh_session() {
     let first = ResearchHarness::new("campaign-a", FIRST_SESSION);
     let first_review = first.initial_review();
-    let first_handle = first.launch(&first_review, AgentContextMode::Fresh).await;
+    let mut first_handle = first.launch(&first_review, AgentContextMode::Fresh).await;
     first_handle.wait(&first.db, NOW + 91).await.unwrap();
     let first_session = first
         .research_session()
@@ -679,7 +677,7 @@ async fn research_new_campaign_starts_a_distinct_fresh_session() {
 
     let second = ResearchHarness::new("campaign-b", SECOND_SESSION);
     let second_review = second.initial_review();
-    let second_handle = second.launch(&second_review, AgentContextMode::Fresh).await;
+    let mut second_handle = second.launch(&second_review, AgentContextMode::Fresh).await;
     let block = second.capture_block(1);
     assert!(block.contains("RESUME_ID=<none>"));
     assert!(!block.contains(&format!("RESUME_ID={first_session}")));
