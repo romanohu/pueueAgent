@@ -947,7 +947,7 @@ fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
             |row| row.get(0),
         )
         .unwrap();
-    for ordinal in 0..33 {
+    for ordinal in 0..100 {
         let submission_id = format!("research-result-submission-{ordinal}");
         let proposal_id = format!("research-result-proposal-{ordinal}");
         let experiment_id = format!("research-result-experiment-{ordinal}");
@@ -1010,7 +1010,7 @@ fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
             )
             .unwrap();
     }
-    for ordinal in 0..33 {
+    for ordinal in 0..100 {
         connection
             .execute(
                 "INSERT INTO research_reviews (
@@ -1040,8 +1040,78 @@ fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
     let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
     assert_eq!(value["facts"]["recent_results"].as_array().unwrap().len(), 32);
     assert_eq!(value["research_notes"].as_array().unwrap().len(), 32);
-    assert!(evidence.json.contains("note-32"));
-    assert!(!evidence.json.contains("note-0"));
+    assert_eq!(value["operations"]["omissions"]["recent_results"], 68);
+    assert_eq!(value["operations"]["omissions"]["research_notes"], 68);
+    assert!(evidence.json.contains("note-99"));
+    assert!(!evidence.json.contains("note-67"));
+}
+
+#[test]
+fn research_evidence_reports_exact_running_observation_omissions() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let repository = TaskObservationRepository::new(&h.db);
+    let large_command = (0..64).map(|_| "x".repeat(240)).collect::<Vec<_>>();
+    for ordinal in 0..99 {
+        repository
+            .upsert(&NewTaskObservation::new(
+                &h.project_id,
+                format!("pueue-task:v1:running-{ordinal}"),
+                100 + ordinal,
+                "pa-campaign-project",
+                large_command.clone(),
+                "Running",
+                Some(2_000 + ordinal),
+                Some(2_001 + ordinal),
+                None,
+                None,
+                2_002 + ordinal,
+            ))
+            .unwrap();
+    }
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    let included = value["facts"]["running"].as_array().unwrap().len();
+    let omitted = value["operations"]["omissions"]["running"]
+        .as_u64()
+        .unwrap() as usize;
+    assert!(
+        included < 32,
+        "byte pruning should remove running observations"
+    );
+    assert!(
+        omitted > 68,
+        "byte pruning should increment exact omissions"
+    );
+    assert_eq!(included + omitted, 100);
+}
+
+#[test]
+fn research_evidence_labels_capped_artifact_hints_as_an_incomplete_lower_bound() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let root = h.test.project_root("campaign-project");
+    for ordinal in 0..40 {
+        fs::write(root.join(format!("artifact-{ordinal}")), "metadata").unwrap();
+    }
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert_eq!(
+        value["operations"]["artifact_hints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        32
+    );
+    assert_eq!(value["operations"]["artifact_hints_complete"], false);
+    assert!(
+        value["operations"]["artifact_hints_omitted_at_least"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 }
 
 #[test]

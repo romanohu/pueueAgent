@@ -123,22 +123,24 @@ pub fn build_research_evidence(
         MAX_ARTIFACT_HINT_DEPTH,
         MAX_ARTIFACT_HINT_FIELD_BYTES,
     )?;
-    let (mut running, running_omitted) = running_observations(db, &project.project_id)?;
-    running.truncate(MAX_RESEARCH_RUNNING);
+    let mut artifact_hints_omitted_at_least = artifact_hints
+        .len()
+        .saturating_sub(MAX_RESEARCH_ARTIFACT_HINTS);
+    let artifact_hints_complete = artifact_hints_omitted_at_least == 0;
+    let (running, running_omitted) = running_observations(db, &project.project_id)?;
     let target_proposal = ProposalRepository::new(db)
         .find_for_campaign(&campaign.campaign_id, &target.proposal_id)?
         .ok_or_else(|| validation_error("proposal_id", "does not identify the target proposal"))?;
     let target_metric = MetricsRepository::get(db, &target.experiment_id)?;
-    let mut recent_results = ExperimentRepository::new(db)
-        .list_terminal_for_campaign(&campaign.campaign_id, MAX_RESEARCH_RESULTS + 1)?
+    let (recent_experiments, result_total) = ExperimentRepository::new(db)
+        .list_terminal_for_campaign_with_total(&campaign.campaign_id, MAX_RESEARCH_RESULTS)?;
+    let recent_results = recent_experiments
         .into_iter()
         .map(|experiment| result_value(db, &experiment))
         .collect::<Result<Vec<_>, _>>()?;
-    let results_omitted = recent_results.len().saturating_sub(MAX_RESEARCH_RESULTS);
-    recent_results.truncate(MAX_RESEARCH_RESULTS);
+    let results_omitted = result_total.saturating_sub(recent_results.len());
 
-    let mut research_notes = research_notes(db, &campaign.campaign_id)?;
-    research_notes.truncate(MAX_RESEARCH_NOTES);
+    let (research_notes, notes_omitted) = research_notes(db, &campaign.campaign_id)?;
 
     let log_tail = read_research_log_tail(&root_anchor, &project.root_path, task_id)?;
     let status = CampaignRepository::new(db)
@@ -209,15 +211,9 @@ pub fn build_research_evidence(
         })
         .collect::<Vec<_>>();
     let mut omissions = BTreeMap::from([
-        (
-            "artifact_hints".to_owned(),
-            artifact_hints
-                .len()
-                .saturating_sub(MAX_RESEARCH_ARTIFACT_HINTS),
-        ),
         ("log_tail".to_owned(), 0),
         ("recent_results".to_owned(), results_omitted),
-        ("research_notes".to_owned(), 0),
+        ("research_notes".to_owned(), notes_omitted),
         ("running".to_owned(), running_omitted),
     ]);
 
@@ -238,6 +234,13 @@ pub fn build_research_evidence(
             "budgets": budgets,
             "log_tail": log_tail,
             "artifact_hints": artifact_values,
+            "artifact_hints_complete": artifact_hints_complete,
+            "artifact_hints_omitted_at_least": artifact_hints_omitted_at_least,
+            "artifact_hints_scope": {
+                "max_hints": MAX_RESEARCH_ARTIFACT_HINTS,
+                "max_depth": MAX_ARTIFACT_HINT_DEPTH,
+                "max_field_bytes": MAX_ARTIFACT_HINT_FIELD_BYTES,
+            },
             "omissions": omissions,
         }
     });
@@ -258,7 +261,10 @@ pub fn build_research_evidence(
         } else if pop_oldest_array(&mut context, &["facts", "running"]) {
             increment_omission(&mut omissions, "running");
         } else if pop_oldest_array(&mut context, &["operations", "artifact_hints"]) {
-            increment_omission(&mut omissions, "artifact_hints");
+            artifact_hints_omitted_at_least += 1;
+            context["operations"]["artifact_hints_complete"] = Value::Bool(false);
+            context["operations"]["artifact_hints_omitted_at_least"] =
+                json!(artifact_hints_omitted_at_least);
         } else if !context["operations"]["log_tail"].is_null() {
             context["operations"]["log_tail"] = Value::Null;
             increment_omission(&mut omissions, "log_tail");
@@ -275,29 +281,48 @@ pub fn build_research_evidence(
     Ok(ResearchEvidence { json, digest })
 }
 
-fn research_notes(db: &Db, campaign_id: &str) -> Result<Vec<Value>, AppError> {
-    let connection = db.connect()?;
-    let mut statement = connection
-        .prepare(
-            "SELECT review_id, attempt, state, notes_json
-             FROM research_reviews
-             WHERE campaign_id = ?1 AND notes_json IS NOT NULL
-             ORDER BY created_at DESC, review_id DESC
-             LIMIT ?2",
+fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), AppError> {
+    let mut connection = db.connect()?;
+    let transaction = connection
+        .transaction()
+        .map_err(database_error("begin research notes snapshot"))?;
+    let count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM research_reviews
+             WHERE campaign_id = ?1 AND notes_json IS NOT NULL",
+            [campaign_id],
+            |row| row.get(0),
         )
-        .map_err(database_error("prepare research notes query"))?;
-    let rows = statement
-        .query_map(params![campaign_id, MAX_RESEARCH_NOTES as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(database_error("query research notes"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error("read research notes"))?;
+        .map_err(database_error("count research notes"))?;
+    let count = bounded_count("research_notes", count)?;
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT review_id, attempt, state, notes_json
+                 FROM research_reviews
+                 WHERE campaign_id = ?1 AND notes_json IS NOT NULL
+                 ORDER BY created_at DESC, review_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(database_error("prepare research notes query"))?;
+        let rows = statement
+            .query_map(params![campaign_id, MAX_RESEARCH_NOTES as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(database_error("query research notes"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read research notes"))?;
+        rows
+    };
+    transaction
+        .commit()
+        .map_err(database_error("commit research notes snapshot"))?;
+    let omitted = count.saturating_sub(rows.len());
     rows.into_iter()
         .map(|(review_id, attempt, state, notes)| {
             Ok(json!({
@@ -309,25 +334,37 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<Vec<Value>, AppError> {
             }))
         })
         .collect::<Result<Vec<_>, AppError>>()
+        .map(|values| (values, omitted))
 }
 
 fn running_observations(db: &Db, project_id: &str) -> Result<(Vec<Value>, usize), AppError> {
-    let connection = db.connect()?;
-    let mut statement = connection
-        .prepare(
-            "SELECT task_signature, pueue_task_id, pueue_group, command_json, state,
-                    enqueued_at, started_at, ended_at, result, observed_at
-             FROM task_observations
-             WHERE project_id = ?1 AND lower(state) = 'running'
-             ORDER BY COALESCE(started_at, enqueued_at, observed_at) DESC,
-                      task_signature DESC
-             LIMIT ?2",
+    let mut connection = db.connect()?;
+    let transaction = connection.transaction().map_err(database_error(
+        "begin research running observations snapshot",
+    ))?;
+    let count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM task_observations
+             WHERE project_id = ?1 AND lower(state) = 'running'",
+            [project_id],
+            |row| row.get(0),
         )
-        .map_err(database_error("prepare research running observations"))?;
-    let rows = statement
-        .query_map(
-            params![project_id, (MAX_RESEARCH_RUNNING + 1) as i64],
-            |row| {
+        .map_err(database_error("count research running observations"))?;
+    let count = bounded_count("running", count)?;
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT task_signature, pueue_task_id, pueue_group, command_json, state,
+                        enqueued_at, started_at, ended_at, result, observed_at
+                 FROM task_observations
+                 WHERE project_id = ?1 AND lower(state) = 'running'
+                 ORDER BY COALESCE(started_at, enqueued_at, observed_at) DESC,
+                          task_signature DESC
+                 LIMIT ?2",
+            )
+            .map_err(database_error("prepare research running observations"))?;
+        let rows = statement
+            .query_map(params![project_id, MAX_RESEARCH_RUNNING as i64], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -340,15 +377,18 @@ fn running_observations(db: &Db, project_id: &str) -> Result<(Vec<Value>, usize)
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, i64>(9)?,
                 ))
-            },
-        )
-        .map_err(database_error("query research running observations"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error("read research running observations"))?;
-    let omitted = rows.len().saturating_sub(MAX_RESEARCH_RUNNING);
+            })
+            .map_err(database_error("query research running observations"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read research running observations"))?;
+        rows
+    };
+    transaction.commit().map_err(database_error(
+        "commit research running observations snapshot",
+    ))?;
+    let omitted = count.saturating_sub(rows.len());
     let values = rows
         .into_iter()
-        .take(MAX_RESEARCH_RUNNING)
         .map(
             |(
                 task_signature,
@@ -526,4 +566,9 @@ fn bounded_research_text(value: &str, maximum_bytes: usize) -> String {
 
 fn validation_error(field: &'static str, message: &'static str) -> AppError {
     AppError::Validation { field, message }
+}
+
+fn bounded_count(field: &'static str, count: i64) -> Result<usize, AppError> {
+    usize::try_from(count)
+        .map_err(|_| validation_error(field, "scoped count does not fit the platform size"))
 }

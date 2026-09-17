@@ -2484,6 +2484,52 @@ impl<'db> ExperimentRepository<'db> {
         Ok(experiments)
     }
 
+    pub fn list_terminal_for_campaign_with_total(
+        &self,
+        campaign_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<Experiment>, usize), AppError> {
+        validate_inspection_limit(limit)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection.transaction().map_err(database_error(
+            "begin terminal campaign experiment snapshot",
+        ))?;
+        let total: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM experiments
+                 WHERE campaign_id = ?1
+                   AND status IN ('succeeded','failed','cancelled')",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("count terminal campaign experiments"))?;
+        let mut statement = transaction
+            .prepare(&format!(
+                "{EXPERIMENT_SELECT} WHERE campaign_id = ?1
+                   AND status IN ('succeeded','failed','cancelled')
+                 ORDER BY finished_at DESC, experiment_id DESC LIMIT ?2"
+            ))
+            .map_err(database_error(
+                "prepare terminal campaign experiment snapshot",
+            ))?;
+        let experiments = statement
+            .query_map(params![campaign_id, limit as i64], experiment_from_row)
+            .map_err(database_error(
+                "query terminal campaign experiment snapshot",
+            ))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read terminal campaign experiment snapshot"))?;
+        drop(statement);
+        transaction.commit().map_err(database_error(
+            "commit terminal campaign experiment snapshot",
+        ))?;
+        let total = usize::try_from(total).map_err(|_| AppError::Validation {
+            field: "recent_results",
+            message: "scoped count does not fit the platform size",
+        })?;
+        Ok((experiments, total))
+    }
+
     pub fn inspect_for_campaign(
         &self,
         campaign_id: &str,
