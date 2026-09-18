@@ -16,7 +16,9 @@ use pueue_agent::{
         ExperimentRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
         TaskObservationRepository,
     },
-    execution_policy::{load_existing_policy, CampaignLimits, PolicyLoadInput, StartupEnvironment},
+    execution_policy::{
+        load_existing_policy, AgentKind, CampaignLimits, PolicyLoadInput, StartupEnvironment,
+    },
     models::{
         AgentContextMode, ExperimentTerminalOutcome, NewProject, NewTaskObservation, ProposalKind,
     },
@@ -34,6 +36,7 @@ const NOW: i64 = 10_000;
 const USER_TRANSCRIPT_SENTINEL: &str = "research-user-note-must-not-reach-public-log";
 const USER_STDOUT_SENTINEL: &str = "fixture-user-output-stdout-7f4a";
 const USER_STDERR_SENTINEL: &str = "fixture-user-output-stderr-8b2c";
+const SAVED_ADVICE_SENTINEL: &str = "saved-research-advice-4d9e";
 
 struct ResearchHarness {
     _temp: TempDir,
@@ -48,6 +51,9 @@ struct ResearchHarness {
     control_path: PathBuf,
     codex_home: PathBuf,
     fixture_session_id: String,
+    codex_path: PathBuf,
+    custom_agent_path: Option<PathBuf>,
+    custom_agent_sentinel: Option<PathBuf>,
 }
 
 struct ClaimedReview {
@@ -59,6 +65,18 @@ struct ClaimedReview {
 
 impl ResearchHarness {
     fn new(label: &str, fixture_session_id: &str) -> Self {
+        Self::new_with_options(label, fixture_session_id, false)
+    }
+
+    fn new_with_custom_agent(label: &str, fixture_session_id: &str) -> Self {
+        Self::new_with_options(label, fixture_session_id, true)
+    }
+
+    fn new_with_options(
+        label: &str,
+        fixture_session_id: &str,
+        ordinary_custom_agent: bool,
+    ) -> Self {
         let temp = tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let fixture_root = fs::canonicalize(temp.path()).unwrap();
@@ -68,6 +86,10 @@ impl ResearchHarness {
         let trusted_bin = fixture_root.join("trusted-bin");
         let policy_state = fixture_root.join("policy-state");
         let codex_home = fixture_root.join("codex-home");
+        let codex = trusted_bin.join("codex");
+        let custom_agent_path = ordinary_custom_agent.then(|| trusted_bin.join("custom-agent"));
+        let custom_agent_sentinel =
+            ordinary_custom_agent.then(|| fixture_root.join("custom-agent-ran"));
         for directory in [
             &project_root,
             &service_dir,
@@ -78,6 +100,11 @@ impl ResearchHarness {
         ] {
             fs::create_dir_all(directory).unwrap();
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if let (Some(custom_agent_path), Some(custom_agent_sentinel)) =
+            (&custom_agent_path, &custom_agent_sentinel)
+        {
+            compile_custom_agent(custom_agent_path, custom_agent_sentinel);
         }
         fs::write(
             service_dir.join("STATE.md"),
@@ -99,6 +126,10 @@ impl ResearchHarness {
         let task_signature = format!("pueue-task:v1:{label}:one");
         let objective_digest = format!("research-objective-digest-{label}");
         let config_path = service_dir.join("config.toml");
+        let ordinary_program = custom_agent_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "codex".to_owned());
         fs::write(
             &config_path,
             format!(
@@ -106,7 +137,7 @@ impl ResearchHarness {
 pueue_group = "{project_id}"
 
 [agent]
-program = "codex"
+program = {ordinary_program:?}
 args = ["{{prompt}}"]
 timeout_minutes = 1
 max_retries = 0
@@ -214,7 +245,6 @@ max_agent_runs = 10
             .expect("running baseline must produce one research review");
         let capture_path = fixture_root.join("research-capture.txt");
         let control_path = fixture_root.join("research-control.txt");
-        let codex = trusted_bin.join("codex");
         compile_research_codex(&trusted_bin, &codex, &capture_path, &control_path);
         let pueue = trusted_bin.join("pueue");
         fs::copy(&codex, &pueue).unwrap();
@@ -225,10 +255,20 @@ max_agent_runs = 10
         let pueue_config = fixture_root.join("pueue.yml");
         fs::write(&pueue_config, "fixture: true\n").unwrap();
         fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        let custom_policy = custom_agent_path
+            .as_ref()
+            .map(|path| {
+                format!(
+                    "\n[projects.{:?}]\ncustom_agent = {:?}\n",
+                    project_id,
+                    path.display().to_string(),
+                )
+            })
+            .unwrap_or_default();
         fs::write(
             policy_state.join("execution-policy.toml"),
             format!(
-                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n{custom_policy}",
                 trusted_bin.display().to_string(),
                 codex.display().to_string(),
                 pueue.display().to_string(),
@@ -275,6 +315,9 @@ max_agent_runs = 10
             control_path,
             codex_home,
             fixture_session_id: fixture_session_id.to_owned(),
+            codex_path: codex,
+            custom_agent_path,
+            custom_agent_sentinel,
         }
     }
 
@@ -509,6 +552,22 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn review_notes(&self, review_id: &str) -> serde_json::Value {
+        let notes_json: String = self
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&notes_json).unwrap()
+    }
+
+    // Fixture-only simulation of the future Task 5 action consumer. Production
+    // does not complete a ready review or save advice through this test helper.
     fn complete_ready_review(&self, review_id: &str) {
         let review = ResearchRepository::new(&self.db).find(review_id).unwrap();
         assert_eq!(review.state, "ready");
@@ -516,17 +575,52 @@ max_agent_runs = 10
             .response_json
             .as_deref()
             .expect("ready research review must have a response");
-        pueue_agent::research_protocol::parse_research_answer(response_json.as_bytes())
-            .expect("ready research response must remain schema-valid");
+        let answer =
+            pueue_agent::research_protocol::parse_research_answer(response_json.as_bytes())
+                .expect("ready research response must remain schema-valid");
+        assert_eq!(answer.review_id, review.review_id);
+        assert_eq!(answer.experiment_id, review.experiment_id);
+        assert_eq!(
+            answer.context_digest,
+            review
+                .context_digest
+                .as_deref()
+                .expect("ready research review must retain its context digest")
+        );
+        assert_eq!(answer.notes, SAVED_ADVICE_SENTINEL);
+        let existing_notes_json: String = self
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut notes: serde_json::Value =
+            serde_json::from_str(&existing_notes_json).expect("binding notes must be an object");
+        notes
+            .as_object_mut()
+            .expect("binding notes must remain an object")
+            .insert("saved_advice".to_owned(), serde_json::json!(answer.notes));
+        let saved_notes_json = notes.to_string();
         let changed = self
             .db
             .connect()
             .unwrap()
             .execute(
                 "UPDATE research_reviews
-                 SET state = 'completed', updated_at = ?1
-                 WHERE review_id = ?2 AND state = 'ready' AND response_json = ?3",
-                rusqlite::params![NOW + 119, review_id, response_json],
+                 SET state = 'completed', notes_json = ?1, updated_at = ?2
+                 WHERE review_id = ?3 AND state = 'ready'
+                   AND response_json = ?4 AND notes_json = ?5",
+                rusqlite::params![
+                    saved_notes_json,
+                    NOW + 119,
+                    review_id,
+                    response_json,
+                    existing_notes_json,
+                ],
             )
             .unwrap();
         assert_eq!(changed, 1, "the exact ready review must be completed once");
@@ -629,6 +723,100 @@ max_agent_runs = 10
             claimed_at: NOW + 125,
         }
     }
+
+    fn prepare_new_campaign(&self) -> ClaimedReview {
+        ExperimentRepository::new(&self.db)
+            .project_terminal_submission(
+                &self.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                NOW + 120,
+            )
+            .unwrap();
+        CampaignRepository::new(&self.db)
+            .retire(&self.project.project_id, NOW + 121)
+            .unwrap();
+
+        let campaign_id = format!("{}-second-campaign", self.campaign_id);
+        let experiment_id = format!("{}-experiment", campaign_id);
+        let submission_id = format!("{}-submission", campaign_id);
+        let proposal_id = format!("{}-proposal", campaign_id);
+        let task_signature = format!("pueue-task:v1:{}:second", self.campaign_id);
+        let objective = ObjectiveSnapshot {
+            text: "Start a distinct campaign in the same project safely.".to_owned(),
+            digest: format!("{}-second-objective", self.campaign_id),
+        };
+        let initial_argv = vec!["python".to_owned(), "train-second.py".to_owned()];
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the second campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: initial_argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["second validation loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: &campaign_id,
+                    project_id: &self.project.project_id,
+                    objective: &objective,
+                    initial_argv: &initial_argv,
+                    baseline: &baseline,
+                    submission_id: &submission_id,
+                    experiment_id: &experiment_id,
+                    proposal_id: &proposal_id,
+                    metadata: &serde_json::json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: NOW + 200,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        ExperimentRepository::new(&self.db)
+            .mark_submitting(&experiment_id, NOW + 201)
+            .unwrap();
+        ExperimentRepository::new(&self.db)
+            .mark_accepted(&experiment_id, 42, &task_signature, NOW + 202)
+            .unwrap();
+        TaskObservationRepository::new(&self.db)
+            .upsert(&NewTaskObservation::new(
+                &self.project.project_id,
+                &task_signature,
+                42,
+                &self.project.pueue_group,
+                initial_argv,
+                "Running",
+                Some(NOW + 200),
+                Some(NOW + 201),
+                None,
+                None,
+                NOW + 203,
+            ))
+            .unwrap();
+        ResearchRepository::new(&self.db)
+            .ensure_campaign(&campaign_id)
+            .unwrap();
+        ResearchRepository::new(&self.db)
+            .schedule_running(&campaign_id, NOW + 201, 1, NOW + 260)
+            .unwrap();
+        let review = ResearchRepository::new(&self.db)
+            .claim_due(&campaign_id, &experiment_id, &task_signature, NOW + 261)
+            .unwrap()
+            .expect("second campaign baseline must produce a research review");
+        let evidence = build_research_evidence(&self.db, &review, NOW + 261).unwrap();
+        ClaimedReview {
+            event_id: review_event_id(&self.db, &review.review_id),
+            review,
+            evidence,
+            claimed_at: NOW + 261,
+        }
+    }
 }
 
 fn review_event_id(db: &Db, review_id: &str) -> i64 {
@@ -640,6 +828,36 @@ fn review_event_id(db: &Db, review_id: &str) -> i64 {
             |row| row.get(0),
         )
         .unwrap()
+}
+
+fn compile_custom_agent(target: &Path, sentinel: &Path) {
+    let source = target.with_extension("rs");
+    fs::write(
+        &source,
+        format!(
+            r#"use std::fs;
+
+fn main() {{
+    fs::write({sentinel:?}, "ordinary custom agent executed").unwrap();
+    std::process::exit(97);
+}}
+"#,
+            sentinel = sentinel.display().to_string(),
+        ),
+    )
+    .unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(target)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated custom agent failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn compile_research_codex(
@@ -749,7 +967,7 @@ fn main() {{
         eprintln!("research output files were not pre-created with the expected schema/output contract");
         std::process::exit(42);
     }}
-    let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":"fixture note","next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
+    let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":{saved_advice:?},"next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
     fs::write(output, answer).unwrap();
     println!(r#"{{{{"type":"message","payload":{{{{"text":{stdout_sentinel:?}}}}}}}}}"#);
     println!(r#"{{{{"type":"thread.started","thread_id":"{{}}"}}}}"#, thread_id);
@@ -761,6 +979,7 @@ fn main() {{
             transcript_sentinel = USER_TRANSCRIPT_SENTINEL,
             stdout_sentinel = USER_STDOUT_SENTINEL,
             stderr_sentinel = USER_STDERR_SENTINEL,
+            saved_advice = SAVED_ADVICE_SENTINEL,
         ),
     )
     .unwrap();
@@ -831,6 +1050,45 @@ async fn research_successful_answer_leaves_review_ready_and_agent_run_completed(
             .unwrap()
             .status,
         pueue_agent::models::AgentRunStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn research_uses_builtin_codex_when_ordinary_agent_is_enrolled_custom() {
+    let harness = ResearchHarness::new_with_custom_agent("custom-ordinary", FIRST_SESSION);
+    assert!(matches!(
+        harness.project_policy.agent_kind,
+        AgentKind::Custom
+    ));
+    let custom_agent_path = harness
+        .custom_agent_path
+        .as_ref()
+        .expect("custom ordinary executable must be configured");
+    let custom_agent_sentinel = harness
+        .custom_agent_sentinel
+        .as_ref()
+        .expect("custom ordinary executable must have a sentinel");
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    let block = harness.capture_block(1);
+    assert!(block.contains("PROMPT_HAS_ROLE=true"));
+    assert!(!custom_agent_sentinel.exists());
+    let run = AgentRunRepository::new(&harness.db)
+        .find_by_id(handle.run_id)
+        .unwrap()
+        .expect("research agent run must persist");
+    assert_eq!(run.execution_kind.as_deref(), Some("campaign_research"));
+    assert_eq!(
+        run.executable_path.as_deref(),
+        Some(harness.codex_path.to_str().unwrap())
+    );
+    assert_ne!(
+        run.executable_path.as_deref(),
+        Some(custom_agent_path.to_str().unwrap())
     );
 }
 
@@ -1124,27 +1382,53 @@ async fn research_changed_experiment_in_same_campaign_exactly_resumes_owned_sess
 
 #[tokio::test]
 async fn research_new_campaign_starts_a_distinct_fresh_session() {
-    let first = ResearchHarness::new("campaign-a", FIRST_SESSION);
-    let first_review = first.initial_review();
-    let mut first_handle = first.launch(&first_review, AgentContextMode::Fresh).await;
-    first_handle.wait(&first.db, NOW + 91).await.unwrap();
-    let first_session = first
+    let harness = ResearchHarness::new("campaign-shared", FIRST_SESSION);
+    let first_review = harness.initial_review();
+    let mut first_handle = harness.launch(&first_review, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        pueue_agent::models::AgentRunStatus::Completed
+    );
+    harness.complete_ready_review(&first_review.review.review_id);
+    let first_session = harness
         .research_session()
         .expect("first campaign must persist a session");
 
-    let second = ResearchHarness::new("campaign-b", SECOND_SESSION);
-    let second_review = second.initial_review();
-    let mut second_handle = second.launch(&second_review, AgentContextMode::Fresh).await;
-    let status = second_handle.wait(&second.db, NOW + 91).await.unwrap();
+    let second_review = harness.prepare_new_campaign();
+    let mut second_handle = harness
+        .try_launch_with_options(
+            &second_review,
+            AgentContextMode::Fresh,
+            SECOND_SESSION,
+            true,
+            None,
+        )
+        .await
+        .expect("second campaign must launch fresh in the same project");
+    let status = second_handle.wait(&harness.db, NOW + 291).await.unwrap();
     assert_eq!(status, pueue_agent::models::AgentRunStatus::Completed);
-    let block = second.capture_block(1);
+    let block = harness.capture_block(2);
     assert!(block.contains("RESUME_ID=<none>"));
+    assert!(!block.contains("resume_latest"));
     assert!(!block.contains(&format!("RESUME_ID={first_session}")));
-    let second_session = second
-        .research_session()
+    let second_session = harness
+        .research_session_for(&second_review.review.campaign_id)
         .expect("second campaign must persist a session");
     assert_ne!(first_session, second_session);
     assert_eq!(second_session, SECOND_SESSION);
+    assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
+    for session_id in [FIRST_SESSION, SECOND_SESSION] {
+        let metadata = harness
+            .codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join(format!("rollout-{session_id}.jsonl"));
+        assert!(
+            metadata.is_file(),
+            "shared CODEX_HOME must retain {session_id}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1166,10 +1450,40 @@ async fn research_safe_missing_session_reconstructs_lineage_without_resetting_at
     let first_attempt = first.review.attempt;
     let first_reservation = harness.reservation_id_for(&first.review);
     assert_eq!(harness.reservation_status(&first_reservation), "consumed");
+    let first_notes = harness.review_notes(&first.review.review_id);
+    assert_eq!(first_notes["session_binding"], "confirmed");
 
     harness.remove_session_metadata(&first_session);
     let changed = harness.prepare_changed_experiment();
+    let first_notes = harness.review_notes(&first.review.review_id);
+    assert_eq!(first_notes["saved_advice"], SAVED_ADVICE_SENTINEL);
     assert_eq!(changed.review.attempt, first_attempt);
+    let evidence: serde_json::Value = serde_json::from_str(&changed.evidence.json).unwrap();
+    let research_notes = evidence["research_notes"]
+        .as_array()
+        .expect("research evidence must expose bounded notes");
+    let prior_note = research_notes
+        .iter()
+        .find(|note| note["review_id"] == first.review.review_id)
+        .expect("research evidence must retain the prior review advice");
+    assert_eq!(prior_note["notes"], SAVED_ADVICE_SENTINEL);
+    for forbidden in [
+        "session_binding",
+        "planned_session_id",
+        "confirmed_session_id",
+        "budget_reservation_id",
+        FIRST_SESSION,
+        first_reservation.as_str(),
+    ] {
+        assert!(
+            research_notes.iter().all(|note| {
+                note["notes"]
+                    .as_str()
+                    .is_some_and(|notes| !notes.contains(forbidden))
+            }),
+            "public research advice must not expose {forbidden}"
+        );
+    }
     let second_result = harness
         .try_launch_with_options(
             &changed,
@@ -1195,6 +1509,8 @@ async fn research_safe_missing_session_reconstructs_lineage_without_resetting_at
         .find(&changed.review.review_id)
         .unwrap();
     assert_eq!(stored.attempt, first_attempt);
+    let changed_notes = harness.review_notes(&changed.review.review_id);
+    assert_eq!(changed_notes["recovery_reason"], "research_session_missing");
     let second_reservation = harness.reservation_id_for(&changed.review);
     assert_eq!(harness.reservation_status(&first_reservation), "consumed");
     assert_eq!(harness.reservation_status(&second_reservation), "consumed");
