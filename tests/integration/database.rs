@@ -14,7 +14,7 @@ use pueue_agent::{
         BatchRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
         EventRepository, ExperimentRepository, IncidentRepository, InterventionRepository,
         NewCodeChangeCheck, ProjectRepository, ProposalAcceptance, ProposalRepository,
-        ResearchLaunchBinding, ResearchRepository,
+        ResearchLaunchBinding, ResearchRepository, ResearchReview, ResearchState,
         RunLineageRepository, StartCampaignRequest, SubmissionRepository,
         TaskObservationRepository, TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
@@ -1181,6 +1181,119 @@ fn research_bind_agent_run_rejects_a_terminal_campaign_research_run() {
 }
 
 #[test]
+fn research_missing_session_reconstruction_rejects_unknown_prior_owners() {
+    for (label, status, expected_status, needs_interrupted_status) in [
+        ("starting", AgentRunStatus::Starting, "starting", false),
+        ("running", AgentRunStatus::Running, "running", false),
+        ("interrupted", AgentRunStatus::Starting, "interrupted", true),
+    ] {
+        let harness = CampaignDbHarness::new();
+        let (review, _binding, _event_id, reservation_id) = research_binding_fixture(&harness);
+        let (prior_review_id, prior_run_id) = insert_prior_research_owner(
+            &harness,
+            label,
+            status,
+            needs_interrupted_status,
+        );
+        set_research_reconstruction_context(&harness, &review.review_id);
+
+        let before = research_reconstruction_snapshot(&harness, &review.review_id, &reservation_id);
+
+        let error = ResearchRepository::new(&harness.db)
+            .prepare_missing_session_reconstruction(
+                &harness.campaign_id,
+                &harness.project_id,
+                &review.review_id,
+                PRIOR_RESEARCH_SESSION_ID,
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation { field, .. } if field == "research.session"
+        ));
+        assert_research_reconstruction_unchanged(
+            &harness,
+            &review.review_id,
+            &reservation_id,
+            before,
+        );
+        let prior_owner: (String, Option<i64>, String) = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT r.state, r.agent_run_id, run.status
+                 FROM research_reviews AS r
+                 JOIN agent_runs AS run ON run.run_id = r.agent_run_id
+                 WHERE r.review_id = ?1",
+                [&prior_review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            prior_owner,
+            (
+                "completed".to_owned(),
+                Some(prior_run_id),
+                expected_status.to_owned()
+            )
+        );
+    }
+}
+
+#[test]
+fn research_missing_session_reconstruction_allows_a_terminal_prior_owner() {
+    let harness = CampaignDbHarness::new();
+    let (review, _binding, _event_id, reservation_id) = research_binding_fixture(&harness);
+    let (prior_review_id, prior_run_id) = insert_prior_research_owner(
+        &harness,
+        "completed",
+        AgentRunStatus::Completed,
+        false,
+    );
+    set_research_reconstruction_context(&harness, &review.review_id);
+
+    let before = research_reconstruction_snapshot(&harness, &review.review_id, &reservation_id);
+
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .prepare_missing_session_reconstruction(
+                &harness.campaign_id,
+                &harness.project_id,
+                &review.review_id,
+                PRIOR_RESEARCH_SESSION_ID,
+                1,
+            )
+            .unwrap(),
+        2
+    );
+    assert_research_reconstruction_unchanged(
+        &harness,
+        &review.review_id,
+        &reservation_id,
+        before,
+    );
+    let prior_owner: (String, Option<i64>, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT r.state, r.agent_run_id, run.status
+             FROM research_reviews AS r
+             JOIN agent_runs AS run ON run.run_id = r.agent_run_id
+             WHERE r.review_id = ?1",
+            [&prior_review_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        prior_owner,
+        ("completed".to_owned(), Some(prior_run_id), "completed".to_owned())
+    );
+}
+
+#[test]
 fn research_evidence_rejects_a_foreign_source() {
     let h = CampaignDbHarness::new();
     let mut review = h.running_research_review();
@@ -1220,6 +1333,163 @@ fn insert_research_note(
             ],
         )
         .unwrap();
+}
+
+const PRIOR_RESEARCH_SESSION_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+fn insert_prior_research_owner(
+    harness: &CampaignDbHarness,
+    label: &str,
+    status: AgentRunStatus,
+    needs_interrupted_status: bool,
+) -> (String, i64) {
+    let event_id = insert_event(
+        &harness.db,
+        &harness.project_id,
+        &format!("prior-research-owner-{label}"),
+        1_070,
+    );
+    EventRepository::new(&harness.db)
+        .claim_by_id(&harness.project_id, event_id, 1_070)
+        .unwrap()
+        .expect("prior research owner event must be claimable");
+    let review_id = format!("prior-research-owner-{label}");
+    let task_signature = format!("pueue-task:v1:prior-research-owner-{label}");
+    insert_research_note(
+        &harness.db.connect().unwrap(),
+        &review_id,
+        &harness.campaign_id,
+        &harness.experiment_id,
+        &task_signature,
+        event_id,
+        1_070,
+        "{}",
+    );
+    let run = insert_research_binding_run(
+        harness,
+        &harness.project_id,
+        event_id,
+        status,
+        "campaign_research",
+    );
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE research_reviews SET agent_run_id = ?1 WHERE review_id = ?2",
+            params![run.run_id, review_id],
+        )
+        .unwrap();
+    if needs_interrupted_status {
+        connection
+            .execute(
+                "UPDATE agent_runs SET status = 'interrupted' WHERE run_id = ?1",
+                [run.run_id],
+            )
+            .unwrap();
+    }
+    (review_id, run.run_id)
+}
+
+fn set_research_reconstruction_context(harness: &CampaignDbHarness, review_id: &str) {
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE campaign_research
+             SET session_id = ?1, session_generation = 1
+             WHERE campaign_id = ?2",
+            params![PRIOR_RESEARCH_SESSION_ID, harness.campaign_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE research_reviews SET session_generation = 1 WHERE review_id = ?1",
+            [review_id],
+        )
+        .unwrap();
+}
+
+fn count_rows(db: &Db, sql: &str, value: &str) -> i64 {
+    db.connect()
+        .unwrap()
+        .query_row(sql, [value], |row| row.get(0))
+        .unwrap()
+}
+
+fn research_reconstruction_snapshot(
+    harness: &CampaignDbHarness,
+    review_id: &str,
+    reservation_id: &str,
+) -> (ResearchReview, ResearchState, i64, i64, (String, i64)) {
+    let repository = ResearchRepository::new(&harness.db);
+    let review = repository.find(review_id).unwrap();
+    let state = repository.state(&harness.campaign_id).unwrap();
+    let run_count = count_rows(
+        &harness.db,
+        "SELECT COUNT(*) FROM agent_runs WHERE project_id = ?1",
+        &harness.project_id,
+    );
+    let reservation_count = count_rows(
+        &harness.db,
+        "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+        &harness.campaign_id,
+    );
+    let reservation = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, updated_at FROM budget_reservations WHERE reservation_id = ?1",
+            [reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (review, state, run_count, reservation_count, reservation)
+}
+
+fn assert_research_reconstruction_unchanged(
+    harness: &CampaignDbHarness,
+    review_id: &str,
+    reservation_id: &str,
+    before: (ResearchReview, ResearchState, i64, i64, (String, i64)),
+) {
+    let (before_review, before_state, before_runs, before_reservations, before_reservation) = before;
+    assert_eq!(
+        ResearchRepository::new(&harness.db).find(review_id).unwrap(),
+        before_review
+    );
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap(),
+        before_state
+    );
+    assert_eq!(
+        count_rows(
+            &harness.db,
+            "SELECT COUNT(*) FROM agent_runs WHERE project_id = ?1",
+            &harness.project_id,
+        ),
+        before_runs
+    );
+    assert_eq!(
+        count_rows(
+            &harness.db,
+            "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+            &harness.campaign_id,
+        ),
+        before_reservations
+    );
+    let after_reservation = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, updated_at FROM budget_reservations WHERE reservation_id = ?1",
+            [reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after_reservation, before_reservation);
 }
 
 #[test]
