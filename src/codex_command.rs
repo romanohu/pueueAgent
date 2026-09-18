@@ -857,7 +857,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::{
         ffi::OsStr,
-        fs::{self, File},
+        fs,
         os::unix::fs::MetadataExt,
         path::PathBuf,
     };
@@ -992,10 +992,9 @@ mod tests {
         let fixture = tempdir().unwrap();
         let project_root = fixture.path().join("project");
         let codex_home = fixture.path().join("codex-home");
-        let private_root = fixture.path().join("private-temp");
         fs::create_dir_all(&project_root).unwrap();
         fs::create_dir_all(codex_home.join("sessions")).unwrap();
-        fs::create_dir_all(&private_root).unwrap();
+        fs::create_dir_all(project_root.join(".pueue-agent")).unwrap();
         fs::write(
             codex_home
                 .join("sessions")
@@ -1038,13 +1037,9 @@ mod tests {
             trusted_path: Vec::new(),
             private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
         };
-        let private_directory = File::open(&private_root).unwrap();
-        let private_tmp = VerifiedPrivateTemp {
-            directory: private_directory,
-            identity,
-            run_id: 1,
-            research_streams: None,
-        };
+        let verified_root = root_anchor.verify_identity().unwrap();
+        let private_temp = crate::environment::PrivateRunTemp::create(&verified_root, 1).unwrap();
+        let private_tmp = private_temp.verified_target().unwrap();
         (CodexArgvBuilder::new(policy, CodexCapabilities::all()), private_tmp, fixture)
     }
 }
