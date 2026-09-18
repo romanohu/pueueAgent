@@ -854,6 +854,17 @@ fn map_session_error(error: AppError) -> PolicyViolation {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::{
+        ffi::OsStr,
+        fs::{self, File},
+        os::unix::fs::MetadataExt,
+        path::PathBuf,
+    };
+
+    #[cfg(target_os = "linux")]
+    use tempfile::{tempdir, TempDir};
+
     use super::*;
 
     #[test]
@@ -913,5 +924,127 @@ mod tests {
         )
         .unwrap()
         .supports_research_policy());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn decision_and_diagnosis_do_not_resume_an_owned_context() {
+        let (builder, private_tmp, _fixture) = command_fixture();
+        let config = agent_config(AgentContextMode::Resume {
+            session_id: SESSION_ID.to_owned(),
+        });
+
+        let decision = builder
+            .build_decision_with_private_temp(&config, "decision fixture", &private_tmp)
+            .unwrap();
+        let diagnosis = builder
+            .build_health_diagnosis_with_private_temp(&config, "diagnosis fixture", &private_tmp)
+            .unwrap();
+
+        for (role, argv) in [("decision", decision), ("diagnosis", diagnosis)] {
+            assert!(
+                !argv
+                    .iter()
+                    .any(|argument| argument.as_os_str() == OsStr::new("resume")),
+                "{role} argv must remain fresh: {argv:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn research_prompt_rejects_a_native_argument_field_overflow() {
+        let (builder, private_tmp, _fixture) = command_fixture();
+        let config = agent_config(AgentContextMode::Fresh);
+        let oversized_prompt = "e".repeat(crate::process::MAX_FIELD_SIZE + 1);
+
+        let error = builder
+            .build_research_with_private_temp(&config, &oversized_prompt, &private_tmp)
+            .unwrap_err();
+
+        assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
+        assert_eq!(error.stage, PolicyViolationStage::PreBinding);
+    }
+
+    #[cfg(target_os = "linux")]
+    const SESSION_ID: &str = "019f9f30-5f31-7a40-8e28-bd95e1f6c537";
+
+    #[cfg(target_os = "linux")]
+    fn agent_config(context: AgentContextMode) -> crate::config::AgentConfig {
+        crate::config::AgentConfig {
+            program: "codex".to_owned(),
+            args: vec!["{prompt}".to_owned()],
+            timeout_minutes: 1,
+            max_retries: 0,
+            context,
+            execution: crate::config::AgentExecutionConfig {
+                network: NetworkMode::Enabled,
+            },
+            codex: crate::config::AgentCodexConfig {
+                model: None,
+                reasoning_effort: None,
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn command_fixture() -> (CodexArgvBuilder, VerifiedPrivateTemp, TempDir) {
+        let fixture = tempdir().unwrap();
+        let project_root = fixture.path().join("project");
+        let codex_home = fixture.path().join("codex-home");
+        let private_root = fixture.path().join("private-temp");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(&private_root).unwrap();
+        fs::write(
+            codex_home
+                .join("sessions")
+                .join(format!("rollout-test-{SESSION_ID}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": SESSION_ID, "cwd": project_root},
+                })
+            ),
+        )
+        .unwrap();
+
+        let metadata = fs::metadata(&project_root).unwrap();
+        let identity = ExecutableIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode: metadata.mode(),
+        };
+        let root_anchor = ProjectRootAnchor {
+            canonical_path: project_root,
+            identity,
+            resolution_fingerprint: "fixture-root".to_owned(),
+        };
+        let policy = ResolvedProjectExecutionPolicy {
+            project_id: "codex-command-fixture".to_owned(),
+            root_anchor: root_anchor.clone(),
+            agent_anchor: ExecutableAnchor {
+                canonical_path: PathBuf::from("/usr/bin/codex"),
+                identity,
+                resolution_fingerprint: "fixture-codex".to_owned(),
+            },
+            agent_kind: AgentKind::BuiltInCodex,
+            network: NetworkMode::Enabled,
+            agent_environment_allow: Default::default(),
+            task_environment_allow: Default::default(),
+            codex_home,
+            trusted_path: Vec::new(),
+            private_temp_relative_root: PathBuf::from(".pueue-agent/tmp"),
+        };
+        let private_directory = File::open(&private_root).unwrap();
+        let private_tmp = VerifiedPrivateTemp {
+            directory: private_directory,
+            identity,
+            run_id: 1,
+            research_streams: None,
+        };
+        (CodexArgvBuilder::new(policy, CodexCapabilities::all()), private_tmp, fixture)
     }
 }

@@ -969,6 +969,49 @@ mod tests {
     }
 
     #[test]
+    fn nested_nonmatching_symlink_is_not_missing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        symlink(&outside, sessions.join("unrelated")).unwrap();
+
+        let result = probe_owned_session(&codex_home, &project_root, SESSION_ID);
+
+        assert!(matches!(
+            result,
+            Err(AppError::CodexSessionMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn unreadable_nested_directory_is_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        let unreadable = codex_home.join("sessions/unreadable");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = probe_owned_session(&codex_home, &project_root, SESSION_ID);
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            result,
+            Err(AppError::CodexSessionMetadata { .. })
+        ));
+    }
+
+    #[test]
     fn archived_owned_session_is_owned() {
         let temp = TempDir::new().unwrap();
         let project_root = temp.path().join("project");

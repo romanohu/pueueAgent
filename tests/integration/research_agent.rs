@@ -25,6 +25,7 @@ use pueue_agent::{
         AgentContextMode, AgentRunStatus, EventStatus, ExperimentStatus, ExperimentTerminalOutcome,
         NewProject, NewTaskObservation, ProposalKind,
     },
+    process::MAX_FIELD_SIZE,
     proposals::{self, ProposalInput},
     research_evidence::{build_research_evidence, ResearchEvidence},
     retry::RetryPolicy,
@@ -2185,6 +2186,44 @@ async fn research_public_log_excludes_user_payloads_from_stdout_and_stderr() {
     let public_log = fs::read_to_string(log_path).unwrap();
     assert!(!public_log.contains(USER_STDOUT_SENTINEL));
     assert!(!public_log.contains(USER_STDERR_SENTINEL));
+}
+
+#[tokio::test]
+async fn research_oversized_context_is_rejected_before_binding() {
+    let harness = ResearchHarness::new("oversized-context", FIRST_SESSION);
+    let mut claimed = harness.initial_review();
+    let oversized_context = serde_json::json!({
+        "schema_version": 1,
+        "facts": {"padding": "x".repeat(MAX_FIELD_SIZE)},
+    });
+    claimed.evidence.json = serde_json::to_string(&oversized_context).unwrap();
+    claimed.evidence.digest = format!("{:x}", Sha256::digest(claimed.evidence.json.as_bytes()));
+    assert!(claimed.evidence.json.len() > MAX_FIELD_SIZE);
+    assert!(claimed.evidence.json.len() < pueue_agent::research_evidence::MAX_RESEARCH_CONTEXT_BYTES);
+
+    let error = match harness
+        .try_launch_with_options(&claimed, AgentContextMode::Fresh, FIRST_SESSION, true, None)
+        .await
+    {
+        Ok(_) => panic!("oversized research context must be rejected before binding"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.stage,
+        pueue_agent::agent::AgentSpawnStage::PreBinding
+    ));
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "pending");
+    assert!(stored.agent_run_id.is_none());
+    assert!(stored.context_json.is_none());
+    assert!(stored.context_digest.is_none());
+    assert!(stored.response_json.is_none());
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
