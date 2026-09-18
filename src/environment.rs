@@ -1237,65 +1237,11 @@ impl PrivateRunTemp {
         }
         #[cfg(target_os = "linux")]
         {
-            self.revalidate_current()?;
-            let anchor = self
-                .decision_output_anchor
-                .lock()
-                .map_err(|_| temp_error())?;
-            let anchor = anchor
-                .as_ref()
-                .ok_or_else(temp_error)?;
-            let expected = anchor.identity;
-            let name = OsStr::new(output_name);
-            let parent_mount = directory_mount_identity_at(
-                &self.directory,
-                PolicyViolationStage::Finalized,
-            )?;
-            if entry_mount_identity_at(&self.directory, name, PolicyViolationStage::Finalized)?
-                != parent_mount
-            {
-                return Err(temp_violation_at(
-                    TempUnsafeReason::MountBoundary,
-                    PolicyViolationStage::Finalized,
-                ));
-            }
-            let before = validate_decision_output_file(
-                &anchor.file,
-                expected,
-                parent_mount,
+            self.read_anchored_output(
+                output_name,
+                &self.decision_output_anchor,
                 MAX_DECISION_BYTES as u64,
-            )?;
-            let size = usize::try_from(before.size).map_err(|_| {
-                temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
-            })?;
-            let bytes = read_decision_output_file(&anchor.file, size)?;
-            let after = validate_decision_output_file(
-                &anchor.file,
-                expected,
-                parent_mount,
-                MAX_DECISION_BYTES as u64,
-            )?;
-            if before != after {
-                return Err(temp_violation_at(
-                    TempUnsafeReason::IdentityChanged,
-                    PolicyViolationStage::Finalized,
-                ));
-            }
-            let visible =
-                artifact_entry_metadata_at(&self.directory, OsStr::new(output_name))?;
-            if visible.identity != expected
-                || visible.mount_identity != parent_mount
-                || visible.owner != unsafe { libc::geteuid() as u32 }
-                || visible.mode & 0o7777 != 0o600
-                || visible.size != before.size
-            {
-                return Err(temp_violation_at(
-                    TempUnsafeReason::IdentityChanged,
-                    PolicyViolationStage::Finalized,
-                ));
-            }
-            self.revalidate_current()?;
-            Ok(bytes)
+            )
         }
     }
 

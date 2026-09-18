@@ -494,15 +494,17 @@ impl CodexArgvBuilder {
                 environment_filters(&BTreeSet::new())?
             ),
         );
-        if let AgentContextMode::Resume { session_id } = &config.context {
-            let owned = codex_session::verify_project_ownership(
-                &self.policy.codex_home,
-                &self.policy.root_anchor.canonical_path,
-                session_id,
-            )
-            .map_err(map_session_error)?;
-            argv.push(OsString::from("resume"));
-            argv.push(OsString::from(owned));
+        if research_json {
+            if let AgentContextMode::Resume { session_id } = &config.context {
+                let owned = codex_session::verify_project_ownership(
+                    &self.policy.codex_home,
+                    &self.policy.root_anchor.canonical_path,
+                    session_id,
+                )
+                .map_err(map_session_error)?;
+                argv.push(OsString::from("resume"));
+                argv.push(OsString::from(owned));
+            }
         }
         argv.push(OsString::from("--"));
         argv.push(OsString::from(prompt));
@@ -658,7 +660,8 @@ impl CodexArgvBuilder {
         prompt: &str,
     ) -> Result<(), PolicyViolation> {
         self.preflight_decision(config, prompt)?;
-        if !self.capabilities.supports_research_policy()
+        if prompt.len() > crate::process::MAX_FIELD_SIZE
+            || !self.capabilities.supports_research_policy()
             || matches!(config.context, AgentContextMode::ResumeLatest)
         {
             return Err(unsafe_argument());

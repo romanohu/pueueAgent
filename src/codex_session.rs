@@ -314,6 +314,7 @@ fn probe_owned_session_unix(
         codex_home,
         &session_id,
         MAX_SESSION_STORE_ENTRIES,
+        true,
     ) {
         Ok(metadata) => metadata,
         Err(SessionMetadataLookupError::Missing) => return Ok(OwnedSessionProbe::Missing),
@@ -477,6 +478,7 @@ fn resolve_latest_owned_session_unix(
             &store_path,
             0,
             &mut remaining_entries,
+            false,
             &mut visit,
         )
         .map_err(|_| session_not_owned())?;
@@ -508,6 +510,7 @@ fn walk_session_directory<F>(
     display_directory: &Path,
     depth: usize,
     remaining_entries: &mut usize,
+    strict_open_errors: bool,
     callback: &mut F,
 ) -> Result<(), SessionWalkError>
 where
@@ -529,6 +532,7 @@ where
                 let metadata = file.metadata().map_err(|_| SessionWalkError::Io)?;
                 Some((file, metadata))
             }
+            Err(_) if strict_open_errors => return Err(SessionWalkError::Io),
             Err(_) => None,
         };
         if opened
@@ -540,7 +544,14 @@ where
             }
             invoke_session_traversal_hook(SessionTraversalHookPoint::NestedDirectory, &path);
             let (file, _) = opened.expect("directory entry was just checked");
-            walk_session_directory(&file, &path, depth + 1, remaining_entries, callback)?;
+            walk_session_directory(
+                &file,
+                &path,
+                depth + 1,
+                remaining_entries,
+                strict_open_errors,
+                callback,
+            )?;
         } else {
             callback(&path, &entry, opened).map_err(|_| SessionWalkError::Callback)?;
         }
@@ -588,7 +599,7 @@ fn locate_metadata_with_limit(
     session_id: &str,
     max_entries: usize,
 ) -> Result<OpenedSessionMetadata, AppError> {
-    locate_metadata_with_limit_typed(codex_home, session_id, max_entries)
+    locate_metadata_with_limit_typed(codex_home, session_id, max_entries, false)
         .map_err(|error| match error {
             SessionMetadataLookupError::Missing => {
                 metadata_error(session_id, "metadata was not found in CODEX_HOME")
@@ -609,6 +620,7 @@ fn locate_metadata_with_limit_typed(
     codex_home: &Path,
     session_id: &str,
     max_entries: usize,
+    strict_open_errors: bool,
 ) -> Result<OpenedSessionMetadata, SessionMetadataLookupError> {
     let suffix = format!("-{session_id}.jsonl");
     let mut matched_path = None;
@@ -666,6 +678,7 @@ fn locate_metadata_with_limit_typed(
             &store_path,
             0,
             &mut remaining_entries,
+            strict_open_errors,
             &mut visit,
         );
         if let Err(error) = result {
