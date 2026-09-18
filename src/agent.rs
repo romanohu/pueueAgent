@@ -306,6 +306,7 @@ pub struct BoundCleanupHandle {
     intent: BoundFinalizationIntent,
     kind: BoundCleanupKind,
     decision_failure: Option<DecisionFailureContext>,
+    research_failure: Option<ResearchFailurePersistence>,
     editor_failure: Option<EditorLaunchFailure>,
 }
 
@@ -437,6 +438,9 @@ impl BoundCleanupHandle {
         if needs_finalization {
             let scoped_db = deadline_scoped_db(db, deadline)?;
             let db = scoped_db.as_ref().unwrap_or(db);
+            if let Some(research_failure) = self.research_failure.as_mut() {
+                research_failure.persist(db, self.run_id, finished_at)?;
+            }
             if let Some(decision_failure) = &self.decision_failure {
                 decision_failure.persist(db, self.run_id, finished_at)?;
             }
@@ -522,10 +526,53 @@ enum ResearchPersistence {
     Persisted,
 }
 
+struct ResearchFailurePersistence {
+    binding: ResearchLaunchBinding,
+    fresh_launch: bool,
+    persisted: bool,
+}
+
 #[derive(Clone)]
 struct ResearchLaunchContext {
     binding: ResearchLaunchBinding,
     fresh_launch: bool,
+}
+
+impl ResearchFailurePersistence {
+    fn from_context(context: &ResearchLaunchContext) -> Self {
+        Self {
+            binding: context.binding.clone(),
+            fresh_launch: context.fresh_launch,
+            persisted: false,
+        }
+    }
+
+    fn persist(&mut self, db: &crate::db::Db, run_id: i64, now: i64) -> Result<(), AppError> {
+        if self.persisted {
+            return Ok(());
+        }
+        let repository = ResearchRepository::new(db);
+        if self.fresh_launch {
+            repository.fail_agent_run_and_clear_session(
+                &self.binding.review_id,
+                run_id,
+                self.binding.attempt,
+                self.binding.session_generation,
+                &self.binding.session_id,
+                "research_launch",
+                now,
+            )?;
+        } else {
+            repository.fail_agent_run(
+                &self.binding.review_id,
+                run_id,
+                "research_launch",
+                now,
+            )?;
+        }
+        self.persisted = true;
+        Ok(())
+    }
 }
 
 enum PreparedDecision {
@@ -1495,6 +1542,7 @@ impl AgentRunner {
                 return Err(resolve_bound_role_failure(
                     db,
                     None,
+                    None,
                     &repository,
                     project,
                     run.run_id,
@@ -1517,6 +1565,7 @@ impl AgentRunner {
             ) {
                 return Err(resolve_bound_role_failure(
                     db,
+                    None,
                     None,
                     &repository,
                     project,
@@ -1556,6 +1605,7 @@ impl AgentRunner {
                 resolve_bound_role_failure(
                     db,
                     decision_failure.as_ref(),
+                    research_context.as_ref(),
                     &repository,
                     project,
                     run.run_id,
@@ -1573,6 +1623,7 @@ impl AgentRunner {
                 resolve_bound_role_failure(
                     db,
                     decision_failure.as_ref(),
+                    research_context.as_ref(),
                     &repository,
                     project,
                     run.run_id,
@@ -1588,6 +1639,7 @@ impl AgentRunner {
                 resolve_bound_role_failure(
                     db,
                     decision_failure.as_ref(),
+                    research_context.as_ref(),
                     &repository,
                     project,
                     run.run_id,
@@ -1612,6 +1664,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1633,6 +1686,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1654,6 +1708,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1675,6 +1730,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1701,6 +1757,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1796,6 +1853,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1840,6 +1898,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1861,6 +1920,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     BoundFinalizationIntent::from_failure(&error, retry_policy),
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1909,6 +1969,7 @@ impl AgentRunner {
                         execution,
                     },
                     decision_failure,
+                    research_context.as_ref(),
                     intent,
                     editor_launch_failure_for_role(&role, run.run_id, &error),
                     error,
@@ -1935,6 +1996,7 @@ impl AgentRunner {
                     execution,
                 },
                 decision_failure.clone(),
+                research_context.as_ref(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
@@ -1957,6 +2019,7 @@ impl AgentRunner {
                     execution,
                 },
                 decision_failure.clone(),
+                research_context.as_ref(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
@@ -1978,6 +2041,7 @@ impl AgentRunner {
                     execution,
                 },
                 decision_failure.clone(),
+                research_context.as_ref(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
@@ -1999,6 +2063,7 @@ impl AgentRunner {
                 child,
                 retained_authority,
                 decision_failure.clone(),
+                research_context.as_ref(),
                 BoundFinalizationIntent::from_failure(&error, retry_policy),
                 editor_launch_failure_for_role(&role, run.run_id, &error),
                 error,
@@ -2014,6 +2079,7 @@ impl AgentRunner {
                 child,
                 retained_authority,
                 decision_failure.clone(),
+                research_context.as_ref(),
                 BoundFinalizationIntent::PostMarkerExecutionUnknown {
                     reason: "post_marker_dispatch_ack".to_owned(),
                 },
@@ -2311,6 +2377,7 @@ fn resolve_unowned_decision_bind_failure(
             intent,
             kind: BoundCleanupKind::PendingFinalization,
             decision_failure: None,
+            research_failure: None,
             editor_failure: None,
         });
     }
@@ -2345,6 +2412,7 @@ fn pending_decision_finalization_error(
             intent,
             decision_failure: Some(decision_failure),
             kind: BoundCleanupKind::PendingMarker,
+            research_failure: None,
             editor_failure: None,
         }),
     }
@@ -2358,6 +2426,7 @@ fn resolve_retained_temp_failure(
     finished_at: i64,
     retained_authority: RetainedLaunchAuthority,
     decision_failure: Option<DecisionFailureContext>,
+    research_context: Option<&ResearchLaunchContext>,
     intent: BoundFinalizationIntent,
     editor_failure: Option<EditorLaunchFailure>,
     source: AppError,
@@ -2374,6 +2443,7 @@ fn resolve_retained_temp_failure(
             finalized: false,
         },
         editor_failure,
+        research_failure: research_context.map(ResearchFailurePersistence::from_context),
     };
     match cleanup.retry_finalization_and_cleanup(db, finished_at, None) {
         Ok(()) => AgentSpawnError {
@@ -2415,6 +2485,7 @@ fn resolve_retained_temp_failure(
 fn resolve_bound_role_failure(
     db: &crate::db::Db,
     decision_failure: Option<&DecisionFailureContext>,
+    research_context: Option<&ResearchLaunchContext>,
     repository: &AgentRunRepository<'_>,
     project: &Project,
     run_id: i64,
@@ -2424,6 +2495,7 @@ fn resolve_bound_role_failure(
     source: AppError,
 ) -> AgentSpawnError {
     let editor_bound = editor_failure.is_some();
+    let mut research_failure = research_context.map(ResearchFailurePersistence::from_context);
     let intent = BoundFinalizationIntent::from_failure(&source, policy);
     if let Some(decision_failure) = decision_failure {
         if let Err(error) = decision_failure.persist(db, run_id, finished_at) {
@@ -2435,6 +2507,36 @@ fn resolve_bound_role_failure(
                 error,
             );
         }
+    }
+    if let Err(error) = research_failure
+        .as_mut()
+        .map(|research_failure| research_failure.persist(db, run_id, finished_at))
+        .transpose()
+    {
+        return AgentSpawnError {
+            stage: if intent.is_post_marker() {
+                AgentSpawnStage::PostMarker {
+                    run_id,
+                    resolved: false,
+                }
+            } else {
+                AgentSpawnStage::RunBoundPreMarker {
+                    run_id,
+                    resolved: false,
+                }
+            },
+            policy: policy_from_error(&source),
+            source: error,
+            cleanup: Some(BoundCleanupHandle {
+                project_id: project.project_id.clone(),
+                run_id,
+                intent,
+                decision_failure: None,
+                research_failure: research_failure.take(),
+                kind: BoundCleanupKind::PendingFinalization,
+                editor_failure: None,
+            }),
+        };
     }
     if let Some(editor_failure) = editor_failure {
         if let Err(error) = CodeChangeRepository::new(db).fail_editor_attempt_for_agent_run(
@@ -2465,6 +2567,7 @@ fn resolve_bound_role_failure(
                     intent,
                     kind: BoundCleanupKind::PendingFinalization,
                     decision_failure: None,
+                    research_failure: None,
                     editor_failure: Some(editor_failure),
                 }),
             };
@@ -2478,7 +2581,7 @@ fn resolve_bound_role_failure(
         policy,
         source,
     );
-    if editor_bound
+    if (editor_bound || research_failure.is_some())
         && matches!(
             error.stage,
             AgentSpawnStage::RunBoundPreMarker {
@@ -2497,6 +2600,7 @@ fn resolve_bound_role_failure(
             intent,
             kind: BoundCleanupKind::PendingFinalization,
             decision_failure: None,
+            research_failure: research_failure.take(),
             editor_failure: None,
         });
     }
@@ -2531,6 +2635,7 @@ async fn resolve_live_child_failure(
     child: NativeAgentChild,
     retained_authority: RetainedLaunchAuthority,
     decision_failure: Option<DecisionFailureContext>,
+    research_context: Option<&ResearchLaunchContext>,
     intent: BoundFinalizationIntent,
     editor_failure: Option<EditorLaunchFailure>,
     source: AppError,
@@ -2560,6 +2665,7 @@ async fn resolve_live_child_failure(
             finalized: false,
         },
         editor_failure,
+        research_failure: research_context.map(ResearchFailurePersistence::from_context),
     };
 
     let termination_uncertain = match &cleanup.kind {
@@ -4502,6 +4608,7 @@ mod tests {
                 reason: "original_post_marker_failure".to_owned(),
             },
             decision_failure: None,
+            research_failure: None,
             editor_failure: None,
             kind: BoundCleanupKind::LiveChild {
                 child,
