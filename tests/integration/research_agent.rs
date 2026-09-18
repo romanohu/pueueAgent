@@ -16,11 +16,13 @@ use pueue_agent::{
         ExperimentRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
         TaskObservationRepository,
     },
+    environment::MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
     execution_policy::{
         load_existing_policy, AgentKind, CampaignLimits, PolicyLoadInput, StartupEnvironment,
     },
     models::{
-        AgentContextMode, ExperimentTerminalOutcome, NewProject, NewTaskObservation, ProposalKind,
+        AgentContextMode, AgentRunStatus, EventStatus, ExperimentTerminalOutcome, NewProject,
+        NewTaskObservation, ProposalKind,
     },
     proposals::{self, ProposalInput},
     research_evidence::{build_research_evidence, ResearchEvidence},
@@ -1054,6 +1056,260 @@ async fn research_successful_answer_leaves_review_ready_and_agent_run_completed(
 }
 
 #[tokio::test]
+async fn research_bind_failure_rolls_back_review_without_invoking_native_child() {
+    let harness = ResearchHarness::new("bind-rollback", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_research_bind
+             BEFORE UPDATE OF agent_run_id ON research_reviews
+             WHEN NEW.agent_run_id IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'injected research bind failure'); END;",
+        )
+        .unwrap();
+
+    let error = match harness
+        .try_launch_with_options(&claimed, AgentContextMode::Fresh, FIRST_SESSION, true, None)
+        .await
+    {
+        Ok(_) => panic!("research bind trigger must reject launch"),
+        Err(error) => error,
+    };
+    let run_id = match &error.stage {
+        pueue_agent::agent::AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: true,
+        } => *run_id,
+        stage => panic!("bind rollback must resolve generic run, got {stage:?}"),
+    };
+    assert!(error.cleanup.is_none());
+    assert!(
+        !harness.capture_path.exists(),
+        "bind rollback must not invoke the native child"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "pending");
+    assert!(stored.agent_run_id.is_none());
+    assert!(stored.context_json.is_none());
+    assert!(stored.context_digest.is_none());
+    assert!(stored.response_json.is_none());
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert!(state.session_id.is_none());
+    assert_eq!(state.session_generation, claimed.review.session_generation);
+    assert_eq!(stored.attempt, claimed.review.attempt);
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Failed
+    );
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn research_post_binding_temp_setup_failure_records_retry_without_invoking_native_child() {
+    let harness = ResearchHarness::new("setup-failure", FIRST_SESSION);
+    let blocked_tmp = harness.project.root_path.join(".pueue-agent").join("tmp");
+    fs::write(&blocked_tmp, b"not a directory").unwrap();
+    let claimed = harness.initial_review();
+    let error = match harness
+        .try_launch_with_options(&claimed, AgentContextMode::Fresh, FIRST_SESSION, true, None)
+        .await
+    {
+        Ok(_) => panic!("private temp setup failure must reject launch"),
+        Err(error) => error,
+    };
+    let run_id = match &error.stage {
+        pueue_agent::agent::AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: true,
+        } => *run_id,
+        stage => panic!("direct setup failure must resolve generic run, got {stage:?}"),
+    };
+    assert!(error.cleanup.is_none());
+    assert!(
+        !harness.capture_path.exists(),
+        "private temp setup failure must not invoke the native child"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "retry_wait");
+    assert_eq!(stored.agent_run_id, Some(run_id));
+    assert!(stored.context_json.is_some());
+    assert!(stored.context_digest.is_some());
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.attempt, claimed.review.attempt);
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert!(
+        state.session_id.is_none(),
+        "the fresh nonce must be retired"
+    );
+    assert_eq!(state.session_generation, claimed.review.session_generation);
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Failed
+    );
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn research_post_binding_finalization_failure_retains_same_cleanup_authority() {
+    let harness = ResearchHarness::new("setup-finalization-failure", FIRST_SESSION);
+    let blocked_tmp = harness.project.root_path.join(".pueue-agent").join("tmp");
+    fs::write(&blocked_tmp, b"not a directory").unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_research_launch_finalization
+             BEFORE UPDATE OF state ON research_reviews
+             WHEN OLD.state = 'running' AND NEW.state = 'retry_wait'
+             BEGIN SELECT RAISE(ABORT, 'injected research launch finalizer failure'); END;",
+        )
+        .unwrap();
+    let claimed = harness.initial_review();
+    let error = match harness
+        .try_launch_with_options(&claimed, AgentContextMode::Fresh, FIRST_SESSION, true, None)
+        .await
+    {
+        Ok(_) => panic!("research finalization failure must retain cleanup authority"),
+        Err(error) => error,
+    };
+    let run_id = match &error.stage {
+        pueue_agent::agent::AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: false,
+        } => *run_id,
+        stage => panic!("research finalization must remain unresolved, got {stage:?}"),
+    };
+    let mut cleanup = error
+        .cleanup
+        .expect("research finalization failure must return cleanup authority");
+    assert_eq!(cleanup.run_id(), run_id);
+    assert!(
+        !harness.capture_path.exists(),
+        "private temp setup failure must not invoke the native child"
+    );
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(bound.state, "running");
+    assert_eq!(bound.agent_run_id, Some(run_id));
+    assert!(bound.response_json.is_none());
+    assert_eq!(bound.attempt, claimed.review.attempt);
+    let pending_notes = harness.review_notes(&claimed.review.review_id);
+    assert_eq!(pending_notes["session_binding"], "pending");
+    let planned_session = pending_notes["planned_session_id"]
+        .as_str()
+        .expect("bound fresh launch must retain its pending nonce")
+        .to_owned();
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap()
+            .session_id
+            .as_deref(),
+        Some(planned_session.as_str())
+    );
+    assert!(
+        AgentRunRepository::new(&harness.db)
+            .find_active_by_project(&harness.project.project_id)
+            .unwrap()
+            .is_some(),
+        "generic run ownership must remain active with unresolved research cleanup"
+    );
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_research_launch_finalization")
+        .unwrap();
+    cleanup.retry(&harness.db, NOW + 92).await.unwrap();
+
+    let retried = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(retried.state, "retry_wait");
+    assert_eq!(retried.agent_run_id, Some(run_id));
+    assert_eq!(retried.attempt, claimed.review.attempt);
+    assert!(retried.response_json.is_none());
+    assert!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap()
+            .session_id
+            .is_none(),
+        "retry must retire the exact pending nonce"
+    );
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Failed
+    );
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn research_uses_builtin_codex_when_ordinary_agent_is_enrolled_custom() {
     let harness = ResearchHarness::new_with_custom_agent("custom-ordinary", FIRST_SESSION);
     assert!(matches!(
@@ -1252,6 +1508,114 @@ async fn research_terminal_agent_update_failure_does_not_replay_persisted_respon
         !private_output.exists(),
         "retry must release private output authority"
     );
+}
+
+#[tokio::test]
+async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
+    let harness = ResearchHarness::new("cleanup-entry-cap", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let run_id = handle.run_id;
+    let private_dir = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string());
+    for ordinal in 0..=MAX_PRIVATE_TEMP_CLEANUP_ENTRIES {
+        fs::write(
+            private_dir.join(format!("overflow-{ordinal}")),
+            b"fixture overflow",
+        )
+        .unwrap();
+    }
+    let first = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        first.is_err(),
+        "cleanup entry cap must retain the successful handle for retry"
+    );
+    let persisted = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(persisted.state, "ready");
+    let response_json = persisted
+        .response_json
+        .clone()
+        .expect("successful response must persist before cleanup");
+    let notes_json: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    let session_id = harness
+        .research_session()
+        .expect("successful response must confirm the native session");
+    let run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("terminal agent run must persist before cleanup");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(
+        fs::read_dir(&private_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("overflow-")),
+        "cleanup failure must preserve the private directory contents"
+    );
+
+    for entry in fs::read_dir(&private_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("overflow-") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 92).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let retried = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(retried.state, persisted.state);
+    assert_eq!(
+        retried.response_json.as_deref(),
+        Some(response_json.as_str())
+    );
+    let retried_notes: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retried_notes, notes_json);
+    assert_eq!(
+        harness.research_session().as_deref(),
+        Some(session_id.as_str())
+    );
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Completed
+    );
+    assert!(fs::read_dir(&private_dir).unwrap().next().is_none());
+    let capture = fs::read_to_string(&harness.capture_path).unwrap();
+    assert_eq!(capture.matches("CALL_START\n").count(), 1);
 }
 
 #[tokio::test]
