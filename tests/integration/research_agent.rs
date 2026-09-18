@@ -2313,7 +2313,10 @@ async fn research_fresh_reconstruction_rejects_foreign_session_metadata() {
             "success",
         )
         .await;
-    let error = result.expect_err("foreign metadata must reject fresh reconstruction");
+    let error = match result {
+        Ok(_) => panic!("foreign metadata must reject fresh reconstruction"),
+        Err(error) => error,
+    };
     assert!(matches!(
         error.stage,
         pueue_agent::agent::AgentSpawnStage::PreBinding
@@ -2381,7 +2384,10 @@ async fn research_fresh_reconstruction_rejects_unsafe_session_store() {
             "success",
         )
         .await;
-    let error = result.expect_err("unsafe store must reject fresh reconstruction");
+    let error = match result {
+        Ok(_) => panic!("unsafe store must reject fresh reconstruction"),
+        Err(error) => error,
+    };
     assert!(matches!(
         error.source,
         pueue_agent::AppError::CodexSessionMetadata { .. }
