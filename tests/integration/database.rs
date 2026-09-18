@@ -52,6 +52,7 @@ use pueue_agent::{
 };
 use rusqlite::{params, Connection};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 struct TestDatabase {
@@ -978,6 +979,131 @@ fn research_bind_agent_run_persists_exact_active_campaign_research_lineage() {
     assert_eq!(notes["budget_reservation_id"], binding.budget_reservation_id);
     assert!(notes["recovery_reason"].is_null());
     assert_eq!(reservation_status, "consumed");
+}
+
+#[test]
+fn research_finish_agent_run_rejects_context_replacement_after_confirmation() {
+    let harness = CampaignDbHarness::new();
+    let (review, binding, event_id, _reservation_id) = research_binding_fixture(&harness);
+    let run = insert_research_binding_run(
+        &harness,
+        &harness.project_id,
+        event_id,
+        AgentRunStatus::Starting,
+        "campaign_research",
+    );
+    let repository = ResearchRepository::new(&harness.db);
+    repository
+        .bind_agent_run(&binding, run.run_id, &harness.project_id, 1_080)
+        .unwrap();
+    repository
+        .confirm_agent_run_session(&binding, run.run_id, &binding.session_id, 1_081)
+        .unwrap();
+
+    let mut alternate_context: serde_json::Value =
+        serde_json::from_str(&binding.context_json).unwrap();
+    alternate_context["facts"]["observed_at"] = json!(1_062);
+    let alternate_context = alternate_context.to_string();
+    let alternate_digest = format!("{:x}", Sha256::digest(alternate_context.as_bytes()));
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET context_json = ?1, context_digest = ?2
+             WHERE review_id = ?3",
+            params![alternate_context, alternate_digest, review.review_id],
+        )
+        .unwrap();
+    let response_json = json!({
+        "schema_version": 1,
+        "review_id": binding.review_id,
+        "experiment_id": binding.experiment_id,
+        "context_digest": binding.context_digest,
+        "action": "continue",
+        "reason": "fixture",
+        "evidence_refs": [],
+        "notes": "fixture",
+        "next_direction": null,
+        "checkpoint": null,
+    })
+    .to_string();
+    let error = repository
+        .finish_agent_run(
+            &binding,
+            run.run_id,
+            &binding.session_id,
+            &response_json,
+            false,
+            1_082,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation { field, .. } if field == "research.binding"
+    ));
+    let stored = repository.find(&review.review_id).unwrap();
+    assert_eq!(stored.state, "running");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run.run_id));
+    assert_eq!(
+        repository.state(&harness.campaign_id).unwrap().session_id.as_deref(),
+        Some(binding.session_id.as_str())
+    );
+}
+
+#[test]
+fn research_failure_guard_rejects_campaign_generation_replacement() {
+    let harness = CampaignDbHarness::new();
+    let (review, binding, event_id, _reservation_id) = research_binding_fixture(&harness);
+    let run = insert_research_binding_run(
+        &harness,
+        &harness.project_id,
+        event_id,
+        AgentRunStatus::Starting,
+        "campaign_research",
+    );
+    let repository = ResearchRepository::new(&harness.db);
+    repository
+        .bind_agent_run(&binding, run.run_id, &harness.project_id, 1_080)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET session_generation = session_generation + 1
+             WHERE campaign_id = ?1",
+            [&harness.campaign_id],
+        )
+        .unwrap();
+
+    let error = repository
+        .fail_agent_run_and_clear_session(
+            &binding,
+            run.run_id,
+            None,
+            "research_output_invalid",
+            1_081,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Validation { field, .. } if field == "research.binding"
+    ));
+    let stored = repository.find(&review.review_id).unwrap();
+    assert_eq!(stored.state, "running");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run.run_id));
+    assert_eq!(
+        repository.state(&harness.campaign_id).unwrap().session_generation,
+        binding.session_generation + 1
+    );
+    assert_eq!(
+        repository.state(&harness.campaign_id).unwrap().session_id.as_deref(),
+        Some(binding.session_id.as_str())
+    );
 }
 
 #[test]
@@ -5239,6 +5365,8 @@ fn research_binding_fixture(
         .expect("research binding event must be claimable");
     let binding = ResearchLaunchBinding {
         review_id: review.review_id.clone(),
+        campaign_id: review.campaign_id.clone(),
+        experiment_id: review.experiment_id.clone(),
         attempt: review.attempt,
         session_generation: review.session_generation,
         prior_session_generation: review.session_generation,

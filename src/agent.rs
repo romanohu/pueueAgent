@@ -517,10 +517,7 @@ enum EditorPersistence {
 
 enum ResearchPersistence {
     Pending {
-        review_id: String,
-        attempt: i64,
-        session_generation: i64,
-        session_id: String,
+        binding: ResearchLaunchBinding,
         fresh_launch: bool,
     },
     Persisted,
@@ -554,21 +551,14 @@ impl ResearchFailurePersistence {
         let repository = ResearchRepository::new(db);
         if self.fresh_launch {
             repository.fail_agent_run_and_clear_session(
-                &self.binding.review_id,
+                &self.binding,
                 run_id,
-                self.binding.attempt,
-                self.binding.session_generation,
-                &self.binding.session_id,
+                None,
                 "research_launch",
                 now,
             )?;
         } else {
-            repository.fail_agent_run(
-                &self.binding.review_id,
-                run_id,
-                "research_launch",
-                now,
-            )?;
+            repository.fail_agent_run(&self.binding, run_id, "research_launch", now)?;
         }
         self.persisted = true;
         Ok(())
@@ -1227,6 +1217,8 @@ impl AgentRunner {
         let context = ResearchLaunchContext {
             binding: ResearchLaunchBinding {
                 review_id: review.review_id.clone(),
+                campaign_id: review.campaign_id.clone(),
+                experiment_id: review.experiment_id.clone(),
                 attempt: review.attempt,
                 session_generation,
                 prior_session_generation,
@@ -2125,10 +2117,7 @@ impl AgentRunner {
             },
             research_persistence: research_context.map(|context| {
                 ResearchPersistence::Pending {
-                    review_id: context.binding.review_id,
-                    attempt: context.binding.attempt,
-                    session_generation: context.binding.session_generation,
-                    session_id: context.binding.session_id,
+                    binding: context.binding,
                     fresh_launch: context.fresh_launch,
                 }
             }),
@@ -3071,23 +3060,13 @@ impl AgentHandle {
         db: &crate::db::Db,
         now: i64,
     ) -> Result<(), AppError> {
-        let (review_id, attempt, session_generation, planned_session, fresh_launch) =
-            match self.research_persistence.as_ref() {
-                Some(ResearchPersistence::Pending {
-                    review_id,
-                    attempt,
-                    session_generation,
-                    session_id,
-                    fresh_launch,
-                }) => (
-                    review_id.clone(),
-                    *attempt,
-                    *session_generation,
-                    session_id.clone(),
-                    *fresh_launch,
-                ),
-                Some(ResearchPersistence::Persisted) | None => return Ok(()),
-            };
+        let (binding, fresh_launch) = match self.research_persistence.as_ref() {
+            Some(ResearchPersistence::Pending {
+                binding,
+                fresh_launch,
+            }) => (binding.clone(), *fresh_launch),
+            Some(ResearchPersistence::Persisted) | None => return Ok(()),
+        };
         let process_completed = self
             .terminal_outcome
             .as_ref()
@@ -3097,6 +3076,7 @@ impl AgentHandle {
         } else {
             None
         };
+        let mut confirmed_session_id = None;
         let persisted = if failure.is_none() {
             let (temp, global_policy, project_policy) = match &self.retained_authority {
                 RetainedLaunchAuthority::Retained {
@@ -3117,18 +3097,13 @@ impl AgentHandle {
                     })
                 }
             };
-            let review = ResearchRepository::new(db).find(&review_id)?;
-            let expected_digest = review.context_digest.clone().ok_or(AppError::Validation {
-                field: "research.context_digest",
-                message: "research context was not durably bound before native launch",
-            })?;
             let bytes = temp.read_research_output();
             let events = temp.read_research_stdout();
             let session_id = events
                 .map_err(AppError::from)
                 .and_then(|event_bytes| {
                     let session_id = parse_research_thread_id(&event_bytes)?;
-                    if !fresh_launch && session_id != planned_session {
+                    if !fresh_launch && session_id != binding.session_id {
                         return Err(AppError::Validation {
                             field: "research.thread_id",
                             message: "resume research run returned a different session",
@@ -3153,11 +3128,8 @@ impl AgentHandle {
                 Ok(session_id) => {
                     let repository = ResearchRepository::new(db);
                     let confirmed = match repository.confirm_agent_run_session(
-                        &review_id,
+                        &binding,
                         self.run_id,
-                        attempt,
-                        session_generation,
-                        &planned_session,
                         &session_id,
                         now,
                     ) {
@@ -3168,6 +3140,7 @@ impl AgentHandle {
                     if !confirmed {
                         false
                     } else {
+                        confirmed_session_id = Some(session_id.clone());
                         match bytes
                             .map_err(AppError::from)
                             .and_then(|bytes| {
@@ -3178,9 +3151,9 @@ impl AgentHandle {
                                     }
                                 })?;
                                 let answer = parse_research_answer(response_json.as_bytes())?;
-                                if answer.review_id != review_id
-                                    || answer.experiment_id != review.experiment_id
-                                    || answer.context_digest != expected_digest
+                                if answer.review_id != binding.review_id
+                                    || answer.experiment_id != binding.experiment_id
+                                    || answer.context_digest != binding.context_digest
                                 {
                                     return Err(AppError::Validation {
                                         field: "research.response_identity",
@@ -3190,10 +3163,8 @@ impl AgentHandle {
                                 Ok(response_json)
                             }) {
                             Ok(response_json) => match repository.finish_agent_run(
-                                &review_id,
+                                &binding,
                                 self.run_id,
-                                attempt,
-                                session_generation,
                                 &session_id,
                                 &response_json,
                                 false,
@@ -3216,21 +3187,14 @@ impl AgentHandle {
             let failure_code = failure.unwrap_or("research_output_invalid");
             if fresh_launch {
                 ResearchRepository::new(db).fail_agent_run_and_clear_session(
-                    &review_id,
+                    &binding,
                     self.run_id,
-                    attempt,
-                    session_generation,
-                    &planned_session,
+                    confirmed_session_id.as_deref(),
                     failure_code,
                     now,
                 )?;
             } else {
-                ResearchRepository::new(db).fail_agent_run(
-                    &review_id,
-                    self.run_id,
-                    failure_code,
-                    now,
-                )?;
+                ResearchRepository::new(db).fail_agent_run(&binding, self.run_id, failure_code, now)?;
             }
             if let Some(outcome) = &mut self.terminal_outcome {
                 outcome.status = AgentRunStatus::Failed;
