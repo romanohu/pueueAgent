@@ -22,8 +22,8 @@ use pueue_agent::{
         load_existing_policy, AgentKind, CampaignLimits, PolicyLoadInput, StartupEnvironment,
     },
     models::{
-        AgentContextMode, AgentRunStatus, EventStatus, ExperimentTerminalOutcome, NewProject,
-        NewTaskObservation, ProposalKind,
+        AgentContextMode, AgentRunStatus, EventStatus, ExperimentStatus, ExperimentTerminalOutcome,
+        NewProject, NewTaskObservation, ProposalKind,
     },
     proposals::{self, ProposalInput},
     research_evidence::{build_research_evidence, ResearchEvidence},
@@ -425,8 +425,32 @@ max_agent_runs = 10
         reservation_id: Option<&str>,
         barrier: bool,
     ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
+        self.try_launch_with_fixture_mode(
+            claimed,
+            context,
+            fixture_session_id,
+            thread_id,
+            write_session,
+            reservation_id,
+            barrier,
+            "success",
+        )
+        .await
+    }
+
+    async fn try_launch_with_fixture_mode(
+        &self,
+        claimed: &ClaimedReview,
+        context: AgentContextMode,
+        fixture_session_id: &str,
+        thread_id: &str,
+        write_session: bool,
+        reservation_id: Option<&str>,
+        barrier: bool,
+        mode: &str,
+    ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
         let launch_now = claimed.claimed_at + 19;
-        self.write_fixture_controls(
+        self.write_fixture_controls_with_mode(
             &claimed.review.review_id,
             &claimed.review.experiment_id,
             &claimed.evidence.digest,
@@ -434,6 +458,7 @@ max_agent_runs = 10
             write_session,
             thread_id,
             barrier,
+            mode,
         );
         EventRepository::new(&self.db)
             .claim_by_id(&self.project.project_id, claimed.event_id, launch_now)
@@ -484,10 +509,33 @@ max_agent_runs = 10
         thread_id: &str,
         barrier: bool,
     ) {
+        self.write_fixture_controls_with_mode(
+            review_id,
+            experiment_id,
+            context_digest,
+            fixture_session_id,
+            write_session,
+            thread_id,
+            barrier,
+            "success",
+        );
+    }
+
+    fn write_fixture_controls_with_mode(
+        &self,
+        review_id: &str,
+        experiment_id: &str,
+        context_digest: &str,
+        fixture_session_id: &str,
+        write_session: bool,
+        thread_id: &str,
+        barrier: bool,
+        mode: &str,
+    ) {
         fs::write(
             &self.control_path,
             format!(
-                "{review_id}\n{experiment_id}\n{context_digest}\n{fixture_session_id}\n{write_session}\n{thread_id}\n{barrier}\n"
+                "{review_id}\n{experiment_id}\n{context_digest}\n{fixture_session_id}\n{write_session}\n{thread_id}\n{barrier}\n{mode}\n"
             ),
         )
         .unwrap();
@@ -509,8 +557,23 @@ max_agent_runs = 10
         panic!("research fixture did not reach the post-gate barrier");
     }
 
+    async fn wait_for_child_session_ready(&self) {
+        let ready = self.barrier_path("session-ready");
+        for _ in 0..200 {
+            if ready.is_file() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("research fixture did not reach the post-session barrier");
+    }
+
     fn release_child(&self) {
         fs::write(self.barrier_path("release"), b"release").unwrap();
+    }
+
+    fn release_child_after_session(&self) {
+        fs::write(self.barrier_path("session-release"), b"release").unwrap();
     }
 
     fn assert_active_run_and_private_output(&self, run_id: i64) {
@@ -572,13 +635,89 @@ max_agent_runs = 10
     }
 
     fn remove_session_metadata(&self, session_id: &str) {
-        let path = self
-            .codex_home
+        let path = self.session_metadata_path(session_id);
+        fs::remove_file(path).unwrap();
+    }
+
+    fn session_metadata_path(&self, session_id: &str) -> PathBuf {
+        self.codex_home
             .join("sessions")
             .join("2026")
             .join("09")
-            .join(format!("rollout-{session_id}.jsonl"));
-        fs::remove_file(path).unwrap();
+            .join(format!("rollout-{session_id}.jsonl"))
+    }
+
+    fn replace_session_metadata_with_foreign_cwd(&self, session_id: &str) {
+        let foreign_root = self._temp.path().join("foreign-session-root");
+        fs::create_dir_all(&foreign_root).unwrap();
+        fs::set_permissions(&foreign_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let record = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": foreign_root,
+            },
+        });
+        let path = self.session_metadata_path(session_id);
+        fs::write(&path, format!("{}\n", record)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn replace_session_store_with_symlink(&self) {
+        let sessions = self.codex_home.join("sessions");
+        let preserved = self.codex_home.join("sessions-preserved");
+        let foreign_store = self._temp.path().join("foreign-session-store");
+        fs::create_dir_all(&foreign_store).unwrap();
+        fs::set_permissions(&foreign_store, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&sessions, &preserved).unwrap();
+        std::os::unix::fs::symlink(&foreign_store, &sessions).unwrap();
+    }
+
+    fn assert_failure_preserves_learning(
+        &self,
+        claimed: &ClaimedReview,
+        run_id: i64,
+        expected_failure_code: &str,
+    ) {
+        let stored = ResearchRepository::new(&self.db)
+            .find(&claimed.review.review_id)
+            .unwrap();
+        assert_eq!(stored.state, "retry_wait");
+        assert!(stored.response_json.is_none());
+        assert_eq!(stored.agent_run_id, Some(run_id));
+        assert_eq!(stored.attempt, claimed.review.attempt);
+        assert!(stored.termination_request_id.is_none());
+        let failure_code: Option<String> = self
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+                [&claimed.review.review_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failure_code.as_deref(), Some(expected_failure_code));
+        let experiment = ExperimentRepository::new(&self.db)
+            .find_by_id(&self.experiment_id)
+            .unwrap()
+            .expect("fixture experiment must remain persisted");
+        assert_eq!(experiment.status, ExperimentStatus::Accepted);
+        let observation_state: String = self
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM task_observations WHERE task_signature = ?1",
+                [&claimed.review.task_signature],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observation_state, "Running");
+        assert_eq!(
+            self.reservation_status(&self.reservation_id_for(&claimed.review)),
+            "consumed"
+        );
     }
 
     fn seed_preexisting_owned_session(&self, session_id: &str) {
@@ -1024,7 +1163,7 @@ fn pair(args: &[String], name: &str) -> Option<String> {{
     args.windows(2).find(|pair| pair[0] == name).map(|pair| pair[1].clone())
 }}
 
-fn controls() -> (String, String, String, String, bool, String, bool) {{
+fn controls() -> (String, String, String, String, bool, String, bool, String) {{
     let contents = fs::read_to_string({control_path:?}).unwrap();
     let mut fields = contents.lines();
     let review_id = fields.next().expect("fixture review control").to_owned();
@@ -1034,7 +1173,8 @@ fn controls() -> (String, String, String, String, bool, String, bool) {{
     let write_session = fields.next().expect("fixture session mode").parse::<bool>().unwrap();
     let thread_id = fields.next().expect("fixture thread identity").to_owned();
     let barrier = fields.next().unwrap_or("false").parse::<bool>().unwrap();
-    (review_id, experiment_id, context_digest, fixture_session_id, write_session, thread_id, barrier)
+    let mode = fields.next().unwrap_or("success").to_owned();
+    (review_id, experiment_id, context_digest, fixture_session_id, write_session, thread_id, barrier, mode)
 }}
 
 fn write_session(id: &str) {{
@@ -1109,6 +1249,8 @@ fn main() {{
     }}
     let barrier_path = PathBuf::from({control_path:?}).with_file_name("child-ready");
     let release_path = PathBuf::from({control_path:?}).with_file_name("release");
+    let session_ready_path = PathBuf::from({control_path:?}).with_file_name("session-ready");
+    let session_release_path = PathBuf::from({control_path:?}).with_file_name("session-release");
     let contents = fs::read_to_string({control_path:?}).unwrap();
     let barrier = contents.lines().nth(6).unwrap_or("false").parse::<bool>().unwrap();
     if barrier {{
@@ -1126,14 +1268,38 @@ fn main() {{
             std::process::exit(43);
         }}
     }}
-    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session, thread_id, _) = controls();
+    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session, thread_id, _, mode) = controls();
     let session_id = resume_id.clone().unwrap_or(fixture_session_id);
     if should_write_session {{ write_session(&session_id); }}
-    let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":{saved_advice:?},"next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
-    fs::write(output, answer).unwrap();
+    if mode == "post-session-barrier" {{
+        fs::write(&session_ready_path, "ready").unwrap();
+        let mut released = false;
+        for _ in 0..5000 {{
+            if session_release_path.is_file() {{
+                released = true;
+                break;
+            }}
+            thread::sleep(Duration::from_millis(1));
+        }}
+        if !released {{
+            eprintln!("research fixture post-session barrier timed out");
+            std::process::exit(44);
+        }}
+    }}
+    let answer_review_id = if mode == "wrong-review" {{ "wrong-review-id".to_owned() }} else {{ review_id.clone() }};
+    let answer_experiment_id = if mode == "wrong-experiment" {{ "wrong-experiment-id".to_owned() }} else {{ experiment_id.clone() }};
+    let answer_digest = if mode == "wrong-digest" {{ "0".repeat(64) }} else {{ context_digest.clone() }};
+    let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":{saved_advice:?},"next_direction":null,"checkpoint":null}}}}"#, answer_review_id, answer_experiment_id, answer_digest, review_id);
+    match mode.as_str() {{
+        "malformed" => fs::write(output, b"{{malformed").unwrap(),
+        "partial" => fs::write(output, vec![b'{{']).unwrap(),
+        "oversized" => fs::write(output, vec![b'x'; 131073]).unwrap(),
+        _ => fs::write(output, answer).unwrap(),
+    }}
     println!(r#"{{{{"type":"message","payload":{{{{"text":{stdout_sentinel:?}}}}}}}}}"#);
     println!(r#"{{{{"type":"thread.started","thread_id":"{{}}"}}}}"#, thread_id);
     eprintln!({stderr_sentinel:?});
+    if mode == "nonzero" {{ std::process::exit(17); }}
 }}
 "##,
             capture_path = capture_path.display(),
@@ -2019,6 +2185,269 @@ async fn research_public_log_excludes_user_payloads_from_stdout_and_stderr() {
     let public_log = fs::read_to_string(log_path).unwrap();
     assert!(!public_log.contains(USER_STDOUT_SENTINEL));
     assert!(!public_log.contains(USER_STDERR_SENTINEL));
+}
+
+#[tokio::test]
+async fn research_invalid_outputs_preserve_lineage_and_learning() {
+    for mode in [
+        "malformed",
+        "partial",
+        "oversized",
+        "wrong-review",
+        "wrong-experiment",
+        "wrong-digest",
+    ] {
+        let harness = ResearchHarness::new(&format!("invalid-{mode}"), FIRST_SESSION);
+        let claimed = harness.initial_review();
+        let mut handle = harness
+            .try_launch_with_fixture_mode(
+                &claimed,
+                AgentContextMode::Fresh,
+                FIRST_SESSION,
+                FIRST_SESSION,
+                true,
+                None,
+                false,
+                mode,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{mode} fixture must bind: {error}"));
+        let run_id = handle.run_id;
+        assert_eq!(
+            handle.wait(&harness.db, NOW + 91).await.unwrap(),
+            AgentRunStatus::Failed,
+            "{mode} output must be a failed research attempt"
+        );
+        harness.assert_failure_preserves_learning(&claimed, run_id, "research_output_invalid");
+    }
+}
+
+#[tokio::test]
+async fn research_nonzero_child_exit_preserves_lineage_and_learning() {
+    let harness = ResearchHarness::new("nonzero", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            false,
+            "nonzero",
+        )
+        .await
+        .expect("nonzero fixture must bind");
+    let run_id = handle.run_id;
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Failed
+    );
+    harness.assert_failure_preserves_learning(&claimed, run_id, "research_exit");
+}
+
+#[tokio::test]
+async fn research_timeout_now_preserves_timeout_classification_and_lineage() {
+    let harness = ResearchHarness::new("timeout-now", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+            "timeout",
+        )
+        .await
+        .expect("blocked timeout fixture must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    assert_eq!(
+        handle.timeout_now(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::TimedOut
+    );
+    harness.assert_failure_preserves_learning(&claimed, run_id, "research_timeout");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::TimedOut
+    );
+}
+
+#[tokio::test]
+async fn research_fresh_reconstruction_rejects_foreign_session_metadata() {
+    let harness = ResearchHarness::new("unsafe-foreign-cwd", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let first_generation = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap()
+        .session_generation;
+    let first_reservation = harness.reservation_id_for(&first.review);
+    let changed = harness.prepare_changed_experiment();
+    harness.replace_session_metadata_with_foreign_cwd(FIRST_SESSION);
+    let invocations = fs::read_to_string(&harness.capture_path)
+        .unwrap()
+        .matches("CALL_START\n")
+        .count();
+    let result = harness
+        .try_launch_with_fixture_mode(
+            &changed,
+            AgentContextMode::Fresh,
+            SECOND_SESSION,
+            SECOND_SESSION,
+            true,
+            None,
+            false,
+            "success",
+        )
+        .await;
+    let error = result.expect_err("foreign metadata must reject fresh reconstruction");
+    assert!(matches!(
+        error.stage,
+        pueue_agent::agent::AgentSpawnStage::PreBinding
+    ));
+    assert!(matches!(
+        error.source,
+        pueue_agent::AppError::CodexSessionMetadata { .. }
+    ));
+    assert!(error.cleanup.is_none());
+    assert_eq!(
+        fs::read_to_string(&harness.capture_path)
+            .unwrap()
+            .matches("CALL_START\n")
+            .count(),
+        invocations,
+        "unsafe reconstruction must not invoke a second child"
+    );
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert_eq!(state.session_generation, first_generation);
+    assert_eq!(state.session_id.as_deref(), Some(FIRST_SESSION));
+    assert_eq!(harness.reservation_status(&first_reservation), "consumed");
+    assert_eq!(
+        harness.reservation_status(&harness.reservation_id_for(&changed.review)),
+        "consumed"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "pending");
+    assert!(stored.agent_run_id.is_none());
+    assert!(stored.response_json.is_none());
+}
+
+#[tokio::test]
+async fn research_fresh_reconstruction_rejects_unsafe_session_store() {
+    let harness = ResearchHarness::new("unsafe-session-store", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let first_generation = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap()
+        .session_generation;
+    let first_reservation = harness.reservation_id_for(&first.review);
+    let changed = harness.prepare_changed_experiment();
+    harness.replace_session_store_with_symlink();
+    let invocations = fs::read_to_string(&harness.capture_path)
+        .unwrap()
+        .matches("CALL_START\n")
+        .count();
+    let result = harness
+        .try_launch_with_fixture_mode(
+            &changed,
+            AgentContextMode::Fresh,
+            SECOND_SESSION,
+            SECOND_SESSION,
+            true,
+            None,
+            false,
+            "success",
+        )
+        .await;
+    let error = result.expect_err("unsafe store must reject fresh reconstruction");
+    assert!(matches!(
+        error.source,
+        pueue_agent::AppError::CodexSessionMetadata { .. }
+    ));
+    assert!(error.cleanup.is_none());
+    assert_eq!(
+        fs::read_to_string(&harness.capture_path)
+            .unwrap()
+            .matches("CALL_START\n")
+            .count(),
+        invocations
+    );
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert_eq!(state.session_generation, first_generation);
+    assert_eq!(state.session_id.as_deref(), Some(FIRST_SESSION));
+    assert_eq!(harness.reservation_status(&first_reservation), "consumed");
+    assert_eq!(
+        harness.reservation_status(&harness.reservation_id_for(&changed.review)),
+        "consumed"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "pending");
+    assert!(stored.agent_run_id.is_none());
+    assert!(stored.response_json.is_none());
+}
+
+#[tokio::test]
+async fn research_postlaunch_unsafe_session_is_durably_classified() {
+    let harness = ResearchHarness::new("unsafe-postlaunch", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+            "post-session-barrier",
+        )
+        .await
+        .expect("postlaunch unsafe fixture must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    harness.release_child();
+    harness.wait_for_child_session_ready().await;
+    harness.replace_session_metadata_with_foreign_cwd(FIRST_SESSION);
+    harness.release_child_after_session();
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Failed
+    );
+    harness.assert_failure_preserves_learning(&claimed, run_id, "research_session_unsafe");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Failed
+    );
 }
 
 #[tokio::test]
