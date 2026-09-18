@@ -523,6 +523,11 @@ enum ResearchPersistence {
     Persisted,
 }
 
+enum ResearchSessionError {
+    Output,
+    UnsafeProbe,
+}
+
 struct ResearchFailurePersistence {
     binding: ResearchLaunchBinding,
     fresh_launch: bool,
@@ -3067,17 +3072,13 @@ impl AgentHandle {
             }) => (binding.clone(), *fresh_launch),
             Some(ResearchPersistence::Persisted) | None => return Ok(()),
         };
-        let process_completed = self
-            .terminal_outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.status == AgentRunStatus::Completed);
-        let failure = if !process_completed {
-            Some("research_exit")
-        } else {
-            None
+        let mut failure_code = match self.terminal_outcome.as_ref().map(|outcome| outcome.status) {
+            Some(AgentRunStatus::Completed) => None,
+            Some(AgentRunStatus::TimedOut) => Some("research_timeout"),
+            _ => Some("research_exit"),
         };
         let mut confirmed_session_id = None;
-        let persisted = if failure.is_none() {
+        let persisted = if failure_code.is_none() {
             let (temp, global_policy, project_policy) = match &self.retained_authority {
                 RetainedLaunchAuthority::Retained {
                     global_policy,
@@ -3100,31 +3101,30 @@ impl AgentHandle {
             let bytes = temp.read_research_output();
             let events = temp.read_research_stdout();
             let session_id = events
-                .map_err(AppError::from)
+                .map_err(|_| ResearchSessionError::Output)
                 .and_then(|event_bytes| {
-                    let session_id = parse_research_thread_id(&event_bytes)?;
+                    let session_id = parse_research_thread_id(&event_bytes)
+                        .map_err(|_| ResearchSessionError::Output)?;
                     if !fresh_launch && session_id != binding.session_id {
-                        return Err(AppError::Validation {
-                            field: "research.thread_id",
-                            message: "resume research run returned a different session",
-                        });
+                        return Err(ResearchSessionError::Output);
                     }
                     let owned = crate::codex_session::probe_owned_session(
                         &global_policy.codex_home,
                         &project_policy.root_anchor.canonical_path,
                         &session_id,
                     )
-                    .map_err(AppError::from)?;
+                    .map_err(|_| ResearchSessionError::UnsafeProbe)?;
                     if !matches!(owned, crate::codex_session::OwnedSessionProbe::Owned(ref id) if id == &session_id) {
-                        return Err(AppError::Validation {
-                            field: "research.thread_id",
-                            message: "research thread is not an owned project session",
-                        });
+                        return Err(ResearchSessionError::Output);
                     }
                     Ok(session_id)
                 });
             let persisted = match session_id {
-                Err(_) => false,
+                Err(ResearchSessionError::UnsafeProbe) => {
+                    failure_code = Some("research_session_unsafe");
+                    false
+                }
+                Err(ResearchSessionError::Output) => false,
                 Ok(session_id) => {
                     let repository = ResearchRepository::new(db);
                     let confirmed = match repository.confirm_agent_run_session(
@@ -3184,7 +3184,7 @@ impl AgentHandle {
             false
         };
         if !persisted {
-            let failure_code = failure.unwrap_or("research_output_invalid");
+            let failure_code = failure_code.unwrap_or("research_output_invalid");
             if fresh_launch {
                 ResearchRepository::new(db).fail_agent_run_and_clear_session(
                     &binding,
@@ -3197,7 +3197,9 @@ impl AgentHandle {
                 ResearchRepository::new(db).fail_agent_run(&binding, self.run_id, failure_code, now)?;
             }
             if let Some(outcome) = &mut self.terminal_outcome {
-                outcome.status = AgentRunStatus::Failed;
+                if outcome.status == AgentRunStatus::Completed {
+                    outcome.status = AgentRunStatus::Failed;
+                }
                 outcome.last_error = Some(failure_code.to_owned());
             }
         }
