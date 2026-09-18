@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -11,6 +13,8 @@ const MAX_RESEARCH_CANDIDATES: i64 = 32;
 const OPEN_REVIEW_STATES: &str = "('pending','running','ready','retry_wait')";
 const OPEN_OPERATION_STAGES: &str =
     "('intent','stop_requested','stop_confirmed','successor_reserved')";
+const RESEARCH_RETRY_FAILURE_UNSAFE: &str = "research_session_unsafe";
+const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResearchState {
@@ -191,6 +195,700 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("commit research scheduling"))
     }
 
+    /// Schedule each active campaign that still has an authoritative running
+    /// task.  The durable observation is the clock source: a missing native
+    /// `started_at` falls back to the first confirmed running observation, not
+    /// the submission timestamp.
+    pub fn schedule_running_campaigns(
+        &self,
+        interval_minutes: u32,
+        now: i64,
+        limit: usize,
+    ) -> Result<usize, AppError> {
+        if limit == 0 || interval_minutes == 0 {
+            return Ok(0);
+        }
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT c.campaign_id,
+                        MIN(COALESCE(observation.started_at,
+                                     observation.first_observed_at))
+                 FROM campaigns AS c
+                 JOIN projects AS p ON p.project_id = c.project_id
+                 JOIN experiments AS e ON e.campaign_id = c.campaign_id
+                 JOIN submissions AS s
+                   ON s.submission_id = e.submission_id
+                  AND s.project_id = c.project_id
+                 JOIN task_observations AS observation
+                   ON observation.project_id = c.project_id
+                  AND observation.task_signature = e.task_signature
+                  AND observation.pueue_task_id = e.pueue_task_id
+                  AND observation.pueue_group = p.pueue_group
+                  AND lower(observation.state) = 'running'
+                 WHERE c.state = 'active'
+                   AND p.enabled = 1 AND p.paused = 0
+                   AND p.halted_reason IS NULL
+                   AND e.status = 'accepted'
+                   AND e.pueue_task_id IS NOT NULL
+                   AND s.status = 'accepted'
+                   AND s.pueue_task_id = e.pueue_task_id
+                   AND s.task_signature = e.task_signature
+                 GROUP BY c.campaign_id
+                 ORDER BY MIN(COALESCE(observation.started_at,
+                                        observation.first_observed_at)),
+                          c.campaign_id
+                 LIMIT ?1",
+            )
+            .map_err(database_error("prepare running research campaign query"))?;
+        let campaigns = statement
+            .query_map([limit.min(MAX_RESEARCH_CANDIDATES as usize) as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(database_error("query running research campaigns"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read running research campaigns"))?;
+        drop(statement);
+        let mut scheduled = 0;
+        for (campaign_id, started_at) in campaigns {
+            self.schedule_running(&campaign_id, started_at, interval_minutes, now)?;
+            scheduled += 1;
+        }
+        Ok(scheduled)
+    }
+
+    /// Return pending or retry-wait reviews whose durable wake time has
+    /// arrived.  CampaignResearch events are intentionally not exposed to the
+    /// generic scheduler; this is the dedicated coordinator's queue.
+    pub fn due_reviews(&self, now: i64, limit: usize) -> Result<Vec<ResearchReview>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{REVIEW_SELECT}
+                 WHERE state IN ('pending','retry_wait') AND not_before <= ?1
+                 ORDER BY not_before, created_at, review_id
+                 LIMIT ?2"
+            ))
+            .map_err(database_error("prepare due research review query"))?;
+        let rows = statement
+            .query_map(params![now, limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64], review_from_row)
+            .map_err(database_error("query due research reviews"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read due research reviews"))
+    }
+
+    /// Claim the oldest authoritative running experiment for each campaign
+    /// whose durable interval has elapsed.  The claim itself remains the
+    /// transactional source of truth; this method only supplies the bounded
+    /// candidates to the dedicated coordinator.
+    pub fn claim_due_campaigns(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<ResearchReview>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT c.campaign_id, e.experiment_id, e.task_signature
+                 FROM campaign_research AS state
+                 JOIN campaigns AS c ON c.campaign_id = state.campaign_id
+                 JOIN projects AS p ON p.project_id = c.project_id
+                 JOIN experiments AS e ON e.campaign_id = c.campaign_id
+                 JOIN submissions AS s
+                   ON s.submission_id = e.submission_id
+                  AND s.project_id = c.project_id
+                 JOIN task_observations AS observation
+                   ON observation.project_id = c.project_id
+                  AND observation.task_signature = e.task_signature
+                  AND observation.pueue_task_id = e.pueue_task_id
+                  AND observation.pueue_group = p.pueue_group
+                  AND lower(observation.state) = 'running'
+                 WHERE state.next_due_at <= ?1
+                   AND state.blocked_reason IS NULL
+                   AND c.state = 'active'
+                   AND p.enabled = 1 AND p.paused = 0
+                   AND p.halted_reason IS NULL
+                   AND e.status = 'accepted' AND e.pueue_task_id IS NOT NULL
+                   AND s.status = 'accepted'
+                   AND s.pueue_task_id = e.pueue_task_id
+                   AND s.task_signature = e.task_signature
+                   AND NOT EXISTS (
+                       SELECT 1 FROM research_reviews AS open_review
+                       WHERE open_review.campaign_id = c.campaign_id
+                         AND open_review.state IN ('pending','running','ready','retry_wait')
+                   )
+                 ORDER BY state.next_due_at,
+                          COALESCE(observation.started_at, observation.first_observed_at),
+                          e.experiment_id
+                 LIMIT ?2",
+            )
+            .map_err(database_error("prepare due research campaign claims"))?;
+        let rows = statement
+            .query_map(
+                params![now, limit.min(MAX_RESEARCH_CANDIDATES as usize) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(database_error("query due research campaign claims"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read due research campaign claims"))?;
+        drop(statement);
+        let mut seen_campaigns = BTreeSet::new();
+        let mut reviews = Vec::new();
+        for (campaign_id, experiment_id, task_signature) in rows {
+            if !seen_campaigns.insert(campaign_id.clone()) {
+                continue;
+            }
+            if let Some(review) = self.claim_due(
+                &campaign_id,
+                &experiment_id,
+                &task_signature,
+                now,
+            )? {
+                reviews.push(review);
+            }
+        }
+        Ok(reviews)
+    }
+
+    pub fn event_id(&self, review_id: &str) -> Result<i64, AppError> {
+        let connection = self.db.connect()?;
+        connection
+            .query_row(
+                "SELECT event_id FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read research review event"))?
+            .ok_or_else(|| validation_error("review_id", "does not identify a persisted research review"))
+    }
+
+    pub fn reservation_id_for_attempt(
+        &self,
+        campaign_id: &str,
+        review_id: &str,
+        attempt: i64,
+    ) -> Result<Option<String>, AppError> {
+        if attempt < 0 {
+            return Err(validation_error("research.attempt", "must be non-negative"));
+        }
+        let connection = self.db.connect()?;
+        let subject_key = format!("research:{review_id}:attempt:{attempt}");
+        connection
+            .query_row(
+                "SELECT reservation_id FROM budget_reservations
+                 WHERE campaign_id = ?1 AND experiment_id IS NULL
+                   AND dimension = 'agent_run' AND subject_key = ?2
+                   AND status = 'consumed'",
+                params![campaign_id, subject_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read research budget reservation"))
+    }
+
+    pub fn retry_is_blocked(&self, review_id: &str) -> Result<bool, AppError> {
+        Ok(self.retry_failure_code(review_id)?.is_some())
+    }
+
+    pub fn retry_failure_code(&self, review_id: &str) -> Result<Option<String>, AppError> {
+        let connection = self.db.connect()?;
+        let failure_code: Option<String> = connection
+            .query_row(
+                "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read research retry policy"))?
+            .flatten();
+        Ok(failure_code.filter(|code| {
+            code == RESEARCH_RETRY_FAILURE_UNSAFE || code == RESEARCH_RETRY_FAILURE_POLICY
+        }))
+    }
+
+    pub fn next_attempt_for_launch(&self, review_id: &str) -> Result<i64, AppError> {
+        let connection = self.db.connect()?;
+        let row: Option<(i64, Option<i64>, Option<String>)> = connection
+            .query_row(
+                "SELECT attempt, agent_run_id, failure_code
+                 FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(database_error("read next research attempt"))?;
+        let Some((attempt, agent_run_id, failure_code)) = row else {
+            return Err(validation_error(
+                "review_id",
+                "does not identify a persisted research review",
+            ));
+        };
+        if attempt > 0 && agent_run_id.is_none() && failure_code.is_none() {
+            Ok(attempt)
+        } else {
+            attempt
+                .checked_add(1)
+                .ok_or_else(|| validation_error("research.attempt", "cannot advance review attempt"))
+        }
+    }
+
+    pub fn claimed_unbound_event_ids(&self) -> Result<Vec<i64>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT r.event_id
+                 FROM research_reviews AS r
+                 JOIN events AS event ON event.event_id = r.event_id
+                 WHERE r.state IN ('pending','retry_wait')
+                   AND r.agent_run_id IS NULL
+                   AND event.kind = 'campaign_research'
+                   AND event.status = 'claimed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_run_events link
+                       WHERE link.project_id = event.project_id
+                         AND link.event_id = event.event_id
+                   )
+                 ORDER BY r.event_id",
+            )
+            .map_err(database_error("prepare unbound research event recovery"))?;
+        let event_ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(database_error("query unbound research events"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read unbound research events"))?;
+        Ok(event_ids)
+    }
+
+    /// Admit exactly one bounded review attempt.  A reservation-without-run
+    /// recovery reuses its already-consumed attempt; all ordinary retries
+    /// increment the attempt once and never refund the prior reservation.
+    pub fn prepare_attempt(
+        &self,
+        review_id: &str,
+        reservation_id: &str,
+        max_attempts: u32,
+        now: i64,
+    ) -> Result<Option<ResearchReview>, AppError> {
+        validate_budget_reservation_id(reservation_id)?;
+        if max_attempts == 0 {
+            return Err(validation_error(
+                "max_decision_attempts_per_cycle",
+                "must be positive",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research attempt admission"))?;
+        let current: (String, String, i64, Option<i64>, i64, String, Option<String>) = transaction
+            .query_row(
+                "SELECT campaign_id, state, attempt, agent_run_id,
+                        session_generation, experiment_id, failure_code
+                 FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?,
+                )),
+            )
+            .optional()
+            .map_err(database_error("read research attempt admission"))?
+            .ok_or_else(|| validation_error("review_id", "does not identify a persisted research review"))?;
+        let (
+            campaign_id,
+            state,
+            current_attempt,
+            current_run,
+            _generation,
+            _experiment_id,
+            failure_code,
+        ) = current;
+        if !matches!(state.as_str(), "pending" | "retry_wait") || current_run.is_some() {
+            transaction
+                .commit()
+                .map_err(database_error("commit skipped research attempt admission"))?;
+            return Ok(None);
+        }
+        let reservation_matches = budget_reservation_matches(
+            &transaction,
+            &campaign_id,
+            review_id,
+            current_attempt,
+            reservation_id,
+        )?;
+        let target_attempt = if current_attempt > 0
+            && current_run.is_none()
+            && failure_code.is_none()
+            && reservation_matches
+        {
+            current_attempt
+        } else {
+            current_attempt.checked_add(1).ok_or_else(|| {
+                validation_error("research.attempt", "cannot advance review attempt")
+            })?
+        };
+        if target_attempt > i64::from(max_attempts) {
+            block_review_in_transaction(
+                &transaction,
+                review_id,
+                "research_attempt_limit",
+                now,
+            )?;
+            transaction
+                .commit()
+                .map_err(database_error("commit research attempt limit"))?;
+            return Ok(None);
+        }
+        if !budget_reservation_matches(
+            &transaction,
+            &campaign_id,
+            review_id,
+            target_attempt,
+            reservation_id,
+        )? {
+            return Err(validation_error(
+                "budget_reservation_id",
+                "must be the consumed campaign reservation for this research review attempt",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET attempt = ?1, state = 'pending', operation_stage = NULL,
+                     agent_run_id = NULL, context_json = NULL, context_digest = NULL,
+                     response_json = NULL, failure_code = NULL, started_at = NULL,
+                     finished_at = NULL, not_before = ?2, updated_at = ?2
+                 WHERE review_id = ?3 AND state IN ('pending','retry_wait')
+                   AND agent_run_id IS NULL AND attempt = ?4",
+                params![target_attempt, now, review_id, current_attempt],
+            )
+            .map_err(database_error("admit research review attempt"))?;
+        if changed != 1 {
+            transaction
+                .commit()
+                .map_err(database_error("commit changed research attempt"))?;
+            return Ok(None);
+        }
+        let review = transaction
+            .query_row(
+                &format!("{REVIEW_SELECT} WHERE review_id = ?1"),
+                [review_id],
+                review_from_row,
+            )
+            .map_err(database_error("read admitted research review"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research attempt admission"))?;
+        Ok(Some(review))
+    }
+
+    /// Put a native failure behind a finite, redacted retry wake.  Unsafe and
+    /// policy failures bypass retry immediately; the campaign is marked
+    /// blocked so another daemon cannot launch around the decision.
+    pub fn schedule_retry(
+        &self,
+        review_id: &str,
+        max_attempts: u32,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research retry scheduling"))?;
+        let row: Option<(i64, String, Option<String>)> = transaction
+            .query_row(
+                "SELECT attempt, state, failure_code FROM research_reviews
+                 WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(database_error("read research retry state"))?;
+        let Some((attempt, state, failure_code)) = row else {
+            return Err(validation_error("review_id", "does not identify a persisted research review"));
+        };
+        if state != "retry_wait" {
+            transaction
+                .commit()
+                .map_err(database_error("commit unchanged research retry state"))?;
+            return Ok(false);
+        }
+        let blocked = failure_code.as_deref().is_some_and(|code| {
+            code == RESEARCH_RETRY_FAILURE_UNSAFE || code == RESEARCH_RETRY_FAILURE_POLICY
+        }) || attempt >= i64::from(max_attempts);
+        if blocked {
+            block_review_in_transaction(
+                &transaction,
+                review_id,
+                failure_code.as_deref().unwrap_or("research_attempt_limit"),
+                now,
+            )?;
+        } else {
+            let not_before = now.saturating_add(crate::retry::retry_backoff_seconds(attempt.max(1)));
+            transaction
+                .execute(
+                    "UPDATE research_reviews
+                     SET not_before = CASE WHEN not_before > ?1 THEN not_before ELSE ?1 END,
+                         updated_at = ?2
+                     WHERE review_id = ?3 AND state = 'retry_wait'",
+                    params![not_before, now, review_id],
+                )
+                .map_err(database_error("schedule bounded research retry"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit research retry scheduling"))?;
+        Ok(blocked)
+    }
+
+    pub fn fail_unbound_attempt(
+        &self,
+        review_id: &str,
+        failure_code: &str,
+        now: i64,
+        max_attempts: u32,
+        block_immediately: bool,
+    ) -> Result<bool, AppError> {
+        if failure_code.is_empty() || failure_code.len() > 128 {
+            return Err(validation_error("research.failure_code", "must be bounded"));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin unbound research failure"))?;
+        let attempt: i64 = transaction
+            .query_row(
+                "SELECT attempt FROM research_reviews
+                 WHERE review_id = ?1 AND agent_run_id IS NULL
+                   AND state IN ('pending','retry_wait')",
+                [review_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read unbound research failure"))?
+            .ok_or_else(|| validation_error("research.review", "is no longer an unbound retry"))?;
+        let blocked = block_immediately || attempt >= i64::from(max_attempts);
+        if blocked {
+            block_review_in_transaction(&transaction, review_id, failure_code, now)?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'retry_wait', failure_code = ?1,
+                         finished_at = ?2, not_before = ?4, updated_at = ?2
+                     WHERE review_id = ?3 AND agent_run_id IS NULL
+                       AND state IN ('pending','retry_wait')",
+                    params![
+                        failure_code,
+                        now,
+                        review_id,
+                        now.saturating_add(crate::retry::retry_backoff_seconds(attempt.max(1))),
+                    ],
+                )
+                .map_err(database_error("record unbound research failure"))?;
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit unbound research failure"))?;
+        Ok(blocked)
+    }
+
+    /// Reconcile a review whose bound process is terminal but whose native
+    /// response never reached the durable `ready` state.  Missing lineage is
+    /// treated as corruption and blocks rather than allowing a second owner.
+    pub fn block_invalid_lineage(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research lineage validation"))?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT r.review_id, r.state, r.agent_run_id,
+                        r.context_json, r.context_digest,
+                        campaign.project_id, run.project_id
+                 FROM research_reviews AS r
+                 JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
+                 LEFT JOIN agent_runs AS run ON run.run_id = r.agent_run_id
+                 WHERE r.state NOT IN ('ready','completed','discarded','blocked')",
+            )
+            .map_err(database_error("prepare research lineage validation"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(database_error("query research lineage validation"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read research lineage validation"))?;
+        drop(statement);
+        let mut blocked = 0;
+        for (
+            review_id,
+            state,
+            agent_run_id,
+            context_json,
+            context_digest,
+            campaign_project_id,
+            run_project_id,
+        ) in rows
+        {
+            let context_valid = match (context_json.as_deref(), context_digest.as_deref()) {
+                (None, None) if agent_run_id.is_none() => true,
+                (Some(context), Some(digest)) => {
+                    digest.len() == 64
+                        && digest
+                            .chars()
+                            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+                        && format!("{:x}", Sha256::digest(context.as_bytes())) == digest
+                }
+                _ => false,
+            };
+            let run_project_matches = run_project_id
+                .as_deref()
+                .is_some_and(|run_project| run_project == campaign_project_id);
+            let valid = match state.as_str() {
+                "pending" => agent_run_id.is_none() && context_json.is_none() && context_digest.is_none(),
+                "retry_wait" => agent_run_id.is_none() && context_json.is_none() && context_digest.is_none()
+                    || agent_run_id.is_some() && context_valid && run_project_matches,
+                "running" => agent_run_id.is_some() && context_valid && run_project_matches,
+                _ => true,
+            };
+            if !valid || (agent_run_id.is_some() && !run_project_matches) {
+                block_review_in_transaction(
+                    &transaction,
+                    &review_id,
+                    "research_lineage_corrupt",
+                    now,
+                )?;
+                blocked += 1;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit research lineage validation"))?;
+        Ok(blocked)
+    }
+
+    pub fn recover_terminal_runs(&self, now: i64) -> Result<usize, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin persisted research response recovery"))?;
+        transaction
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', lease_until = NULL,
+                     completed_at = ?1, last_error = NULL
+                 WHERE event_id IN (
+                     SELECT event_id FROM research_reviews WHERE state = 'ready'
+                 ) AND status IN ('in_flight','dispatched')",
+                [now],
+            )
+            .map_err(database_error("complete persisted research response event"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit persisted research response recovery"))?;
+
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT r.review_id, r.agent_run_id, run.status
+                 FROM research_reviews AS r
+                 LEFT JOIN agent_runs AS run ON run.run_id = r.agent_run_id
+                 WHERE r.state = 'running'",
+            )
+            .map_err(database_error("prepare research terminal recovery"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(database_error("query research terminal recovery"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read research terminal recovery"))?;
+        drop(statement);
+        let mut recovered = 0;
+        for (review_id, run_id, status) in rows {
+            let Some(run_id) = run_id else {
+                self.block_review(&review_id, "research_lineage_corrupt", now)?;
+                recovered += 1;
+                continue;
+            };
+            if status.is_none() {
+                self.block_review(&review_id, "research_lineage_corrupt", now)?;
+                recovered += 1;
+            } else if !matches!(status.as_deref(), Some("starting" | "running")) {
+                let mut connection = self.db.connect()?;
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(database_error("begin terminal research retry"))?;
+                let retry_at = now.saturating_add(crate::retry::retry_backoff_seconds(1));
+                let changed = transaction
+                    .execute(
+                        "UPDATE research_reviews
+                         SET state = 'retry_wait', failure_code = 'research_interrupted',
+                             finished_at = ?1, not_before = ?1, updated_at = ?1
+                         WHERE review_id = ?2 AND state = 'running'
+                           AND agent_run_id = ?3",
+                        params![now, review_id, run_id],
+                    )
+                    .map_err(database_error("record terminal research retry"))?;
+                transaction
+                    .execute(
+                        "UPDATE events
+                         SET status = 'retry_wait', lease_until = NULL,
+                             not_before = ?1, last_error = 'research_interrupted'
+                         WHERE event_id = (
+                             SELECT event_id FROM research_reviews WHERE review_id = ?2
+                         ) AND status IN ('in_flight','dispatched')",
+                        params![retry_at, review_id],
+                    )
+                    .map_err(database_error("requeue terminal research event"))?;
+                transaction
+                    .commit()
+                    .map_err(database_error("commit terminal research retry"))?;
+                recovered += changed;
+            }
+        }
+        Ok(recovered)
+    }
+
+    pub fn block_review(
+        &self,
+        review_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research block"))?;
+        block_review_in_transaction(&transaction, review_id, reason, now)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research block"))
+    }
+
     pub fn claim_due(
         &self,
         campaign_id: &str,
@@ -258,7 +956,8 @@ impl<'db> ResearchRepository<'db> {
                    WHERE ownership.experiment_id = e.experiment_id
                      AND ownership.operation_stage IN {OPEN_OPERATION_STAGES}
                )
-             ORDER BY observation.started_at, e.experiment_id
+             ORDER BY COALESCE(observation.started_at, observation.first_observed_at),
+                      e.experiment_id
              LIMIT ?2"
         );
         let authority = {
@@ -1105,6 +1804,14 @@ impl<'db> ResearchRepository<'db> {
                 "failed research run is not the bound running review",
             ));
         }
+        let retry_at = now.saturating_add(crate::retry::retry_backoff_seconds(binding.attempt));
+        transaction
+            .execute(
+                "UPDATE research_reviews SET not_before = ?1
+                 WHERE review_id = ?2 AND agent_run_id = ?3 AND state = 'retry_wait'",
+                params![retry_at, binding.review_id, agent_run_id],
+            )
+            .map_err(database_error("schedule failed research retry"))?;
         transaction
             .commit()
             .map_err(database_error("commit failed research run"))
@@ -1249,6 +1956,14 @@ impl<'db> ResearchRepository<'db> {
                 "failed research run is not the bound running review",
             ));
         }
+        let retry_at = now.saturating_add(crate::retry::retry_backoff_seconds(binding.attempt));
+        transaction
+            .execute(
+                "UPDATE research_reviews SET not_before = ?1
+                 WHERE review_id = ?2 AND agent_run_id = ?3 AND state = 'retry_wait'",
+                params![retry_at, binding.review_id, agent_run_id],
+            )
+            .map_err(database_error("schedule failed research session retry"))?;
         transaction
             .execute(
                 "UPDATE campaign_research
@@ -1335,7 +2050,44 @@ fn has_open_review(transaction: &Transaction<'_>, campaign_id: &str) -> Result<b
         .map_err(database_error("check open campaign research review"))
 }
 
-fn next_research_due(start: i64, interval_minutes: u32) -> Result<Option<i64>, AppError> {
+fn block_review_in_transaction(
+    transaction: &Transaction<'_>,
+    review_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    if reason.is_empty() || reason.len() > 128 || reason.chars().any(char::is_control) {
+        return Err(validation_error("research.blocked_reason", "must be bounded"));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'blocked', failure_code = ?1, finished_at = ?2,
+                 not_before = ?2, updated_at = ?2
+             WHERE review_id = ?3 AND state <> 'ready'",
+            params![reason, now, review_id],
+        )
+        .map_err(database_error("block research review"))?;
+    if changed != 1 {
+        return Err(validation_error(
+            "research.review",
+            "cannot block a missing or already terminal review",
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE campaign_research
+             SET blocked_reason = ?1, next_due_at = NULL, updated_at = ?2
+             WHERE campaign_id = (
+                 SELECT campaign_id FROM research_reviews WHERE review_id = ?3
+             )",
+            params![reason, now, review_id],
+        )
+        .map_err(database_error("block research campaign"))?;
+    Ok(())
+}
+
+pub fn next_research_due(start: i64, interval_minutes: u32) -> Result<Option<i64>, AppError> {
     if interval_minutes == 0 {
         return Ok(None);
     }

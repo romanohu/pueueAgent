@@ -11,6 +11,7 @@ use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -3530,6 +3531,11 @@ pub struct AgentRunRecovery {
     /// code-change coordinator consumes this bounded identity list before
     /// ordinary dispatch resumes.
     pub preserved_code_change_editor_run_ids: Vec<i64>,
+    /// Campaign-research native owners remain durable across the generic
+    /// recovery pass.  The dedicated research coordinator reconciles these
+    /// rows only after startup marker ownership has been inspected.
+    pub preserved_research_runs: usize,
+    pub preserved_research_run_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3662,6 +3668,108 @@ fn editor_recovery_binding(
             && run_session_id.as_deref() == Some(session_id.as_str())
             && !session_id.is_empty();
     Ok((true, valid))
+}
+
+/// Validate the immutable durable identity of a campaign-research owner.  An
+/// active native row is preserved only when exactly one review points to it,
+/// the campaign still belongs to this project, and the review/session/context
+/// lineage is complete.  Unknown or contradictory ownership fails closed.
+fn research_recovery_binding(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    agent_run_id: i64,
+) -> Result<(bool, bool), AppError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT r.review_id, r.campaign_id, r.experiment_id, r.attempt,
+                    r.state, r.agent_run_id, r.context_json, r.context_digest,
+                    r.session_generation, c.session_id, c.session_generation,
+                    r.event_id, campaign.project_id
+             FROM research_reviews AS r
+             JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
+             JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
+             WHERE r.agent_run_id = ?1",
+        )
+        .map_err(database_error("prepare campaign research recovery binding"))?;
+    let rows = statement
+        .query_map([agent_run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, String>(12)?,
+            ))
+        })
+        .map_err(database_error("query campaign research recovery binding"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read campaign research recovery binding"))?;
+    if rows.len() != 1 {
+        return Ok((!rows.is_empty(), false));
+    }
+    let (
+        review_id,
+        campaign_id,
+        experiment_id,
+        attempt,
+        state,
+        bound_run_id,
+        context_json,
+        context_digest,
+        review_generation,
+        session_id,
+        campaign_generation,
+        event_id,
+        bound_project_id,
+    ) = &rows[0];
+    let valid = !review_id.is_empty()
+        && !campaign_id.is_empty()
+        && !experiment_id.is_empty()
+        && transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM experiments
+                     WHERE experiment_id = ?1 AND campaign_id = ?2
+                 )",
+                params![experiment_id, campaign_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error("validate campaign research experiment lineage"))?
+        && *attempt > 0
+        && state == "running"
+        && *bound_run_id == Some(agent_run_id)
+        && bound_project_id == project_id
+        && context_json.as_deref().is_some_and(|value| !value.is_empty())
+        && context_digest
+            .as_deref()
+            .is_some_and(|value| {
+                value.len() == 64
+                    && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                    && context_json.as_deref().is_some_and(|context| {
+                        format!("{:x}", Sha256::digest(context.as_bytes())) == value
+                    })
+            })
+        && *review_generation == *campaign_generation
+        && session_id.as_deref().is_some_and(|value| !value.is_empty());
+    let event_link_valid = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_run_events
+                 WHERE project_id = ?1 AND run_id = ?2 AND event_id = ?3
+             )",
+            params![project_id, agent_run_id, event_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error("validate campaign research event lineage"))?;
+    Ok((true, valid && event_link_valid))
 }
 
 impl From<RetryPolicy> for GateFailurePolicy {
@@ -4207,6 +4315,43 @@ impl<'db> AgentRunRepository<'db> {
                         message: "durable code-change editor binding requires code_change_editor execution kind",
                     });
                 }
+                let (has_research_binding, valid_research_binding) =
+                    research_recovery_binding(&transaction, &project.project_id, *run_id)?;
+                if execution_kind.as_deref() == Some("campaign_research")
+                    && !valid_research_binding
+                {
+                    // Do not hand an uncertain research owner to generic
+                    // recovery.  If a review row is still discoverable,
+                    // block it durably; the active run remains untouched so
+                    // an unknown PID/gate cannot be resumed elsewhere.
+                    transaction
+                        .execute(
+                            "UPDATE research_reviews
+                             SET state = 'blocked', failure_code = 'research_lineage_corrupt',
+                                 finished_at = ?1, updated_at = ?1
+                             WHERE agent_run_id = ?2 AND state <> 'ready'",
+                            params![finished_at, *run_id],
+                        )
+                        .map_err(database_error("block corrupt campaign research binding"))?;
+                    transaction
+                        .execute(
+                            "UPDATE campaign_research
+                             SET blocked_reason = 'research_lineage_corrupt',
+                                 next_due_at = NULL, updated_at = ?1
+                             WHERE campaign_id IN (
+                                 SELECT campaign_id FROM research_reviews
+                                 WHERE agent_run_id = ?2
+                             )",
+                            params![finished_at, *run_id],
+                        )
+                        .map_err(database_error("block corrupt campaign research campaign"))?;
+                }
+                if execution_kind.as_deref() != Some("campaign_research") && has_research_binding {
+                    return Err(AppError::Validation {
+                        field: "execution_kind",
+                        message: "durable campaign-research binding requires campaign_research execution kind",
+                    });
+                }
             }
 
             for (run_id, run_status, gate_state, policy_code, failure_stage, execution_kind) in active_runs {
@@ -4216,6 +4361,11 @@ impl<'db> AgentRunRepository<'db> {
                     // generic interrupted work.
                     recovery.preserved_code_change_editors += 1;
                     recovery.preserved_code_change_editor_run_ids.push(run_id);
+                    continue;
+                }
+                if execution_kind.as_deref() == Some("campaign_research") {
+                    recovery.preserved_research_runs += 1;
+                    recovery.preserved_research_run_ids.push(run_id);
                     continue;
                 }
                 if confirmed_pending_marker_ids.contains(&run_id)

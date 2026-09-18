@@ -639,6 +639,26 @@ impl AgentRunner {
         resolve_project_policy(&self.policy, project, config)
     }
 
+    /// Select the only safe research context for an already recorded session.
+    /// A genuinely missing session remains eligible for the native role's
+    /// bounded fresh reconstruction; an owned session must resume exactly.
+    pub fn research_context_for(
+        &self,
+        project_policy: &ResolvedProjectExecutionPolicy,
+        session_id: &str,
+    ) -> Result<AgentContextMode, AppError> {
+        match crate::codex_session::probe_owned_session(
+            &self.policy.codex_home,
+            &project_policy.root_anchor.canonical_path,
+            session_id,
+        )? {
+            crate::codex_session::OwnedSessionProbe::Owned(owned) => {
+                Ok(AgentContextMode::Resume { session_id: owned })
+            }
+            crate::codex_session::OwnedSessionProbe::Missing => Ok(AgentContextMode::Fresh),
+        }
+    }
+
     pub fn preflight_private_temp_capacity(
         &self,
         policy: &ResolvedProjectExecutionPolicy,

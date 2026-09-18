@@ -27,6 +27,7 @@ use crate::{
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
     reconcile::{ReconcileReport, Reconciler},
+    research::{recover_research, run_due_research},
     retry::RetryPolicy,
     scheduler::{Scheduler, SchedulerConfig, SchedulerReport},
     termination::{TerminationManager, TerminationOutcome},
@@ -75,6 +76,10 @@ pub struct DaemonReport {
     pub requeued_agent_events: usize,
     pub dead_lettered_agent_events: usize,
     pub preserved_code_change_editors: usize,
+    pub preserved_research_runs: usize,
+    pub research_started: usize,
+    pub research_deferred: usize,
+    pub research_blocked: usize,
     pub decision_recovery: DecisionRecoveryReport,
     pub decisions: DecisionLoopReport,
     pub code_changes: CodeChangeLoopReport,
@@ -170,6 +175,7 @@ where
                     &indeterminate_pending_marker_ids,
                     &indeterminate_release_requested_ids,
                 )?;
+            recover_research(&self.db, now, self.policy.campaign_limits).await?;
 
             #[cfg(unix)]
             {
@@ -243,6 +249,7 @@ where
             report.requeued_agent_events = recovery.requeued_events;
             report.dead_lettered_agent_events = recovery.dead_lettered_events;
             report.preserved_code_change_editors = recovery.preserved_code_change_editors;
+            report.preserved_research_runs = recovery.preserved_research_runs;
         }
 
         self.dispatch_reserved_campaign_submissions(now).await?;
@@ -270,6 +277,10 @@ where
             .schedule(&reconciliation.observed_tasks)?;
 
         report.finished_agents += self.poll_retained_ownership_at(now).await?;
+        let research = self.run_due_research(now).await?;
+        report.research_started += research.0;
+        report.research_deferred += research.1;
+        report.research_blocked += research.2;
         #[cfg(unix)]
         {
             let runner = self.runner.as_ref().ok_or(AppError::Runtime {
@@ -643,6 +654,28 @@ where
         self.active_agents
             .extend(report.started.into_iter().map(|started| started.handle));
         Ok(spawned)
+    }
+
+    async fn run_due_research(&mut self, now: i64) -> Result<(usize, usize, usize), AppError> {
+        let runner = self.runner.take().ok_or(AppError::Runtime {
+            operation: "take daemon research runner",
+        })?;
+        let outcome = run_due_research(
+            &self.db,
+            &runner,
+            self.policy.campaign_limits,
+            now,
+            self.config.claim_limit,
+        )
+        .await;
+        self.runner = Some(runner);
+        let report = outcome?;
+        let started = report.started.len();
+        let deferred = report.deferred;
+        let blocked = report.blocked;
+        self.active_cleanups.extend(report.cleanups);
+        self.active_agents.extend(report.started);
+        Ok((started, deferred, blocked))
     }
 
     async fn run_termination(&self) -> Result<Vec<TerminationOutcome>, AppError> {

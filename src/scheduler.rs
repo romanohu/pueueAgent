@@ -1579,6 +1579,17 @@ mod tests {
     }
 
     #[test]
+    fn campaign_research_is_not_a_legacy_agent_dispatch_mode() {
+        let (legacy, deferred) = partition_legacy_events(vec![
+            event(1, EventKind::TaskFinished),
+            event(2, EventKind::CampaignResearch),
+        ]);
+        assert_eq!(legacy.iter().map(|event| event.event_id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(deferred, vec![2]);
+        assert_eq!(legacy_dispatch_mode(EventKind::CampaignResearch), None);
+    }
+
+    #[test]
     fn unresolved_error_signal_wraps_only_unresolved_stages() {
         let resolved = unresolved_spawn_error(
             AgentSpawnStage::PostMarker {
