@@ -1124,7 +1124,7 @@ async fn research_bind_failure_rolls_back_review_without_invoking_native_child()
             .unwrap()
             .unwrap()
             .status,
-        EventStatus::Completed
+        EventStatus::DeadLetter
     );
 }
 
@@ -1190,7 +1190,7 @@ async fn research_post_binding_temp_setup_failure_records_retry_without_invoking
             .unwrap()
             .unwrap()
             .status,
-        EventStatus::Completed
+        EventStatus::DeadLetter
     );
 }
 
@@ -1305,7 +1305,7 @@ async fn research_post_binding_finalization_failure_retains_same_cleanup_authori
             .unwrap()
             .unwrap()
             .status,
-        EventStatus::Completed
+        EventStatus::DeadLetter
     );
 }
 
@@ -1537,6 +1537,7 @@ async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
     let persisted = ResearchRepository::new(&harness.db)
         .find(&claimed.review.review_id)
         .unwrap();
+    let persisted_review = persisted.clone();
     assert_eq!(persisted.state, "ready");
     let response_json = persisted
         .response_json
@@ -1560,6 +1561,17 @@ async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
         .find_by_id(run_id)
         .unwrap()
         .expect("terminal agent run must persist before cleanup");
+    let persisted_run = run.clone();
+    let persisted_review_timestamps: (Option<i64>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT finished_at, updated_at FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert_eq!(harness.reservation_status(&reservation_id), "consumed");
     assert!(
@@ -1584,7 +1596,7 @@ async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
     let retried = ResearchRepository::new(&harness.db)
         .find(&claimed.review.review_id)
         .unwrap();
-    assert_eq!(retried.state, persisted.state);
+    assert_eq!(retried, persisted_review);
     assert_eq!(
         retried.response_json.as_deref(),
         Some(response_json.as_str())
@@ -1609,10 +1621,20 @@ async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
         AgentRunRepository::new(&harness.db)
             .find_by_id(run_id)
             .unwrap()
-            .unwrap()
-            .status,
-        AgentRunStatus::Completed
+            .unwrap(),
+        persisted_run
     );
+    let retried_review_timestamps: (Option<i64>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT finished_at, updated_at FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retried_review_timestamps, persisted_review_timestamps);
     assert!(fs::read_dir(&private_dir).unwrap().next().is_none());
     let capture = fs::read_to_string(&harness.capture_path).unwrap();
     assert_eq!(capture.matches("CALL_START\n").count(), 1);
