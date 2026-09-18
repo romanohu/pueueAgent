@@ -289,7 +289,11 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), App
     let count: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM research_reviews
-             WHERE campaign_id = ?1 AND notes_json IS NOT NULL",
+             WHERE campaign_id = ?1
+               AND json_type(
+                     CASE WHEN json_valid(notes_json) THEN notes_json ELSE '{}' END,
+                     '$.saved_advice'
+                   ) = 'text'",
             [campaign_id],
             |row| row.get(0),
         )
@@ -298,9 +302,17 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), App
     let rows = {
         let mut statement = transaction
             .prepare(
-                "SELECT review_id, attempt, state, notes_json
+                "SELECT review_id, attempt, state,
+                        json_extract(
+                            CASE WHEN json_valid(notes_json) THEN notes_json ELSE '{}' END,
+                            '$.saved_advice'
+                        )
                  FROM research_reviews
-                 WHERE campaign_id = ?1 AND notes_json IS NOT NULL
+                 WHERE campaign_id = ?1
+                   AND json_type(
+                         CASE WHEN json_valid(notes_json) THEN notes_json ELSE '{}' END,
+                         '$.saved_advice'
+                       ) = 'text'
                  ORDER BY created_at DESC, review_id DESC
                  LIMIT ?2",
             )

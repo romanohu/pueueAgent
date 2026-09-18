@@ -1062,6 +1062,105 @@ fn research_evidence_rejects_a_foreign_source() {
     assert!(build_research_evidence(&h.db, &review, 1_061).is_err());
 }
 
+fn insert_research_note(
+    connection: &Connection,
+    review_id: &str,
+    campaign_id: &str,
+    experiment_id: &str,
+    task_signature: &str,
+    event_id: i64,
+    created_at: i64,
+    notes_json: &str,
+) {
+    connection
+        .execute(
+            "INSERT INTO research_reviews (
+                review_id, campaign_id, experiment_id, task_signature, attempt, state,
+                operation_stage, agent_run_id, context_json, context_digest, response_json,
+                termination_request_id, successor_experiment_id, evidence_schema_version,
+                session_generation, event_id, not_before, notes_json, failure_code,
+                decision_cycle_id, checkpoint_json, created_at, started_at, finished_at,
+                updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 0, 'completed', NULL, NULL, NULL, NULL, NULL,
+                       NULL, NULL, NULL, 0, ?5, ?6, ?7, NULL, NULL, NULL, ?6, NULL, ?6, ?6)",
+            params![
+                review_id,
+                campaign_id,
+                experiment_id,
+                task_signature,
+                event_id,
+                created_at,
+                notes_json,
+            ],
+        )
+        .unwrap();
+}
+
+#[test]
+fn research_evidence_counts_only_saved_advice_and_excludes_binding_history() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let connection = h.db.connect().unwrap();
+    let event_id: i64 = connection
+        .query_row(
+            "SELECT event_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for ordinal in 0..33 {
+        let review_id = format!("research-advice-{ordinal}");
+        let advice = format!(r#"{{"saved_advice":"advice-{ordinal}"}}"#);
+        insert_research_note(
+            &connection,
+            &review_id,
+            &h.campaign_id,
+            &h.experiment_id,
+            &review.task_signature,
+            event_id,
+            3_000 + ordinal,
+            &advice,
+        );
+    }
+    for (ordinal, notes_json) in [
+        (
+            0,
+            r#"{"session_binding":"confirmed","planned_session_id":"nonce-a"}"#,
+        ),
+        (
+            1,
+            r#"{"budget_reservation_id":"reservation-a","attempt":4}"#,
+        ),
+        (2, "{not-json"),
+    ] {
+        let review_id = format!("research-binding-only-{ordinal}");
+        insert_research_note(
+            &connection,
+            &review_id,
+            &h.campaign_id,
+            &h.experiment_id,
+            &review.task_signature,
+            event_id,
+            4_000 + ordinal,
+            notes_json,
+        );
+    }
+    drop(connection);
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    let notes = value["research_notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 32);
+    assert_eq!(value["operations"]["omissions"]["research_notes"], 1);
+    assert_eq!(notes[0]["notes"], "advice-32");
+    assert!(evidence.json.contains("advice-1"));
+    assert!(!evidence.json.contains("session_binding"));
+    assert!(!evidence.json.contains("planned_session_id"));
+    assert!(!evidence.json.contains("budget_reservation_id"));
+    assert!(!evidence.json.contains("not-json"));
+    assert!(!evidence.json.contains("advice-0"));
+}
+
 #[test]
 fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
     let h = CampaignDbHarness::new();
@@ -1138,28 +1237,18 @@ fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
             .unwrap();
     }
     for ordinal in 0..100 {
-        connection
-            .execute(
-                "INSERT INTO research_reviews (
-                    review_id, campaign_id, experiment_id, task_signature, attempt, state,
-                    operation_stage, agent_run_id, context_json, context_digest, response_json,
-                    termination_request_id, successor_experiment_id, evidence_schema_version,
-                    session_generation, event_id, not_before, notes_json, failure_code,
-                    decision_cycle_id, checkpoint_json, created_at, started_at, finished_at,
-                    updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, 0, 'completed', NULL, NULL, NULL, NULL, NULL,
-                           NULL, NULL, NULL, 0, ?5, ?6, ?7, NULL, NULL, NULL, ?6, NULL, ?6, ?6)",
-                params![
-                    format!("research-note-{ordinal}"),
-                    &h.campaign_id,
-                    &h.experiment_id,
-                    &review.task_signature,
-                    event_id,
-                    2_000 + ordinal,
-                    format!("{{\"note\":\"note-{ordinal}\"}}"),
-                ],
-            )
-            .unwrap();
+        let review_id = format!("research-note-{ordinal}");
+        let advice = format!(r#"{{"saved_advice":"note-{ordinal}"}}"#);
+        insert_research_note(
+            &connection,
+            &review_id,
+            &h.campaign_id,
+            &h.experiment_id,
+            &review.task_signature,
+            event_id,
+            2_000 + ordinal,
+            &advice,
+        );
     }
     drop(connection);
 
@@ -1299,7 +1388,10 @@ fn research_evidence_bounds_large_objective_notes_and_logs_without_truncating_id
         .unwrap()
         .execute(
             "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
-            params![format!("{{\"notes\":\"{}\"}}", "notes ".repeat(50_000)), &review.review_id],
+            params![
+                json!({"saved_advice": "notes ".repeat(50_000)}).to_string(),
+                &review.review_id
+            ],
         )
         .unwrap();
 
@@ -1307,6 +1399,10 @@ fn research_evidence_bounds_large_objective_notes_and_logs_without_truncating_id
     let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
     assert_eq!(value["facts"]["review"]["review_id"], review.review_id);
     assert_eq!(value["facts"]["campaign"]["campaign_id"], h.campaign_id);
+    let notes = value["research_notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0]["notes"].as_str().unwrap().starts_with("notes "));
+    assert!(notes[0]["notes"].as_str().unwrap().len() <= 240);
     assert!(evidence.json.len() <= 128 * 1024);
 }
 
@@ -1350,13 +1446,19 @@ fn research_evidence_redacts_planted_credentials_from_notes_and_logs() {
         .execute(
             "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
             params![
-                "{\"notes\":\"AWS_SECRET_ACCESS_KEY=planted-note-secret token=another-note-secret\"}",
+                json!({
+                    "saved_advice":
+                        "AWS_SECRET_ACCESS_KEY=planted-note-secret token=another-note-secret"
+                })
+                .to_string(),
                 &review.review_id
             ],
         )
         .unwrap();
 
     let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    assert_eq!(value["research_notes"].as_array().unwrap().len(), 1);
     assert!(!evidence.json.contains("planted-log-secret"));
     assert!(!evidence.json.contains("another-log-secret"));
     assert!(!evidence.json.contains("planted-note-secret"));
