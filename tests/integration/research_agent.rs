@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::Duration,
 };
 
 use pueue_agent::{
@@ -29,6 +30,7 @@ use pueue_agent::{
     retry::RetryPolicy,
     state::ObjectiveSnapshot,
 };
+use sha2::{Digest, Sha256};
 use tempfile::{tempdir, TempDir};
 
 const FIRST_SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -401,21 +403,38 @@ max_agent_runs = 10
         write_session: bool,
         reservation_id: Option<&str>,
     ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
-        let launch_now = claimed.claimed_at + 19;
-        fs::write(
-            &self.control_path,
-            format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n",
-                claimed.review.review_id,
-                claimed.review.experiment_id,
-                claimed.evidence.digest,
-                fixture_session_id,
-                write_session,
-                thread_id,
-            ),
+        self.try_launch_with_thread_id_barrier(
+            claimed,
+            context,
+            fixture_session_id,
+            thread_id,
+            write_session,
+            reservation_id,
+            false,
         )
-        .unwrap();
-        fs::set_permissions(&self.control_path, fs::Permissions::from_mode(0o600)).unwrap();
+        .await
+    }
+
+    async fn try_launch_with_thread_id_barrier(
+        &self,
+        claimed: &ClaimedReview,
+        context: AgentContextMode,
+        fixture_session_id: &str,
+        thread_id: &str,
+        write_session: bool,
+        reservation_id: Option<&str>,
+        barrier: bool,
+    ) -> Result<pueue_agent::agent::AgentHandle, pueue_agent::agent::AgentSpawnError> {
+        let launch_now = claimed.claimed_at + 19;
+        self.write_fixture_controls(
+            &claimed.review.review_id,
+            &claimed.review.experiment_id,
+            &claimed.evidence.digest,
+            fixture_session_id,
+            write_session,
+            thread_id,
+            barrier,
+        );
         EventRepository::new(&self.db)
             .claim_by_id(&self.project.project_id, claimed.event_id, launch_now)
             .unwrap()
@@ -453,6 +472,62 @@ max_agent_runs = 10
                 project_lock,
             )
             .await
+    }
+
+    fn write_fixture_controls(
+        &self,
+        review_id: &str,
+        experiment_id: &str,
+        context_digest: &str,
+        fixture_session_id: &str,
+        write_session: bool,
+        thread_id: &str,
+        barrier: bool,
+    ) {
+        fs::write(
+            &self.control_path,
+            format!(
+                "{review_id}\n{experiment_id}\n{context_digest}\n{fixture_session_id}\n{write_session}\n{thread_id}\n{barrier}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&self.control_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn barrier_path(&self, name: &str) -> PathBuf {
+        self.control_path.with_file_name(name)
+    }
+
+    async fn wait_for_child_ready(&self) {
+        let ready = self.barrier_path("child-ready");
+        for _ in 0..200 {
+            if ready.is_file() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("research fixture did not reach the post-gate barrier");
+    }
+
+    fn release_child(&self) {
+        fs::write(self.barrier_path("release"), b"release").unwrap();
+    }
+
+    fn assert_active_run_and_private_output(&self, run_id: i64) {
+        let active_run = AgentRunRepository::new(&self.db)
+            .find_active_by_project(&self.project.project_id)
+            .unwrap();
+        assert_eq!(active_run.map(|run| run.run_id), Some(run_id));
+        assert!(
+            self.project
+                .root_path
+                .join(".pueue-agent")
+                .join("tmp")
+                .join(run_id.to_string())
+                .join("research.json")
+                .is_file(),
+            "research output must remain under the retained private authority"
+        );
     }
 
     fn execution_kind(&self, run_id: i64) -> String {
@@ -726,6 +801,72 @@ max_agent_runs = 10
         }
     }
 
+    fn admit_sibling_experiment(&self) -> String {
+        let objective_digest = format!(
+            "research-objective-digest-{}",
+            self.campaign_id
+                .strip_prefix("research-")
+                .and_then(|value| value.strip_suffix("-campaign"))
+                .expect("fixture campaign ID shape")
+        );
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Try a sibling candidate for immutable binding checks".to_owned(),
+                source_experiment_id: Some(self.experiment_id.clone()),
+                argv: vec!["python".to_owned(), "train-sibling.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["sibling validation loss".to_owned()],
+            },
+            &objective_digest,
+        )
+        .unwrap();
+        let experiment_id = format!("{}-experiment-3", self.campaign_id);
+        let proposal_id = format!("{}-proposal-3", self.campaign_id);
+        let submission_id = format!("{}-submission-3", self.campaign_id);
+        let limits = CampaignLimits {
+            max_parallel_experiments: 2,
+            max_proposals_per_cycle: 2,
+            ..CampaignLimits::default()
+        };
+        CampaignRepository::new(&self.db)
+            .accept_proposal(
+                &self.campaign_id,
+                &proposal_id,
+                &experiment_id,
+                &submission_id,
+                &proposal,
+                &limits,
+                NOW + 126,
+            )
+            .unwrap()
+            .accepted()
+            .expect("sibling experiment must be accepted from the terminal baseline");
+        ExperimentRepository::new(&self.db)
+            .mark_submitting(&experiment_id, NOW + 127)
+            .unwrap();
+        let task_signature = format!("pueue-task:v1:{}:three", self.campaign_id);
+        ExperimentRepository::new(&self.db)
+            .mark_accepted(&experiment_id, 43, &task_signature, NOW + 128)
+            .unwrap();
+        TaskObservationRepository::new(&self.db)
+            .upsert(&NewTaskObservation::new(
+                &self.project.project_id,
+                &task_signature,
+                43,
+                &self.project.pueue_group,
+                vec!["python".to_owned(), "train-sibling.py".to_owned()],
+                "Running",
+                Some(NOW + 126),
+                Some(NOW + 127),
+                None,
+                None,
+                NOW + 129,
+            ))
+            .unwrap();
+        experiment_id
+    }
+
     fn prepare_new_campaign(&self) -> ClaimedReview {
         ExperimentRepository::new(&self.db)
             .project_terminal_submission(
@@ -872,7 +1013,7 @@ fn compile_research_codex(
     fs::write(
         &source,
         format!(
-            r##"use std::{{env, fs, io::Write, os::unix::fs::PermissionsExt, path::PathBuf}};
+            r##"use std::{{env, fs, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, thread, time::Duration}};
 
 fn append(path: &str, line: &str) {{
     let mut file = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
@@ -883,7 +1024,7 @@ fn pair(args: &[String], name: &str) -> Option<String> {{
     args.windows(2).find(|pair| pair[0] == name).map(|pair| pair[1].clone())
 }}
 
-fn controls() -> (String, String, String, String, bool, String) {{
+fn controls() -> (String, String, String, String, bool, String, bool) {{
     let contents = fs::read_to_string({control_path:?}).unwrap();
     let mut fields = contents.lines();
     let review_id = fields.next().expect("fixture review control").to_owned();
@@ -892,7 +1033,8 @@ fn controls() -> (String, String, String, String, bool, String) {{
     let fixture_session_id = fields.next().expect("fixture session control").to_owned();
     let write_session = fields.next().expect("fixture session mode").parse::<bool>().unwrap();
     let thread_id = fields.next().expect("fixture thread identity").to_owned();
-    (review_id, experiment_id, context_digest, fixture_session_id, write_session, thread_id)
+    let barrier = fields.next().unwrap_or("false").parse::<bool>().unwrap();
+    (review_id, experiment_id, context_digest, fixture_session_id, write_session, thread_id, barrier)
 }}
 
 fn write_session(id: &str) {{
@@ -926,10 +1068,6 @@ fn main() {{
     let separator = args.iter().position(|arg| arg == "--").unwrap();
     let prompt = args.get(separator + 1).cloned().unwrap_or_default();
     let resume_id = args.windows(2).find(|pair| pair[0] == "resume").map(|pair| pair[1].clone());
-    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session, thread_id) = controls();
-    let session_id = resume_id.clone().unwrap_or(fixture_session_id);
-    if should_write_session {{ write_session(&session_id); }}
-
     let write_flags = args.windows(2).any(|pair| pair[0] == "--sandbox")
         || args.windows(2).any(|pair| {{
             pair[0] == "-c" && pair[1].starts_with("sandbox_workspace_write.")
@@ -969,6 +1107,28 @@ fn main() {{
         eprintln!("research output files were not pre-created with the expected schema/output contract");
         std::process::exit(42);
     }}
+    let barrier_path = PathBuf::from({control_path:?}).with_file_name("child-ready");
+    let release_path = PathBuf::from({control_path:?}).with_file_name("release");
+    let contents = fs::read_to_string({control_path:?}).unwrap();
+    let barrier = contents.lines().nth(6).unwrap_or("false").parse::<bool>().unwrap();
+    if barrier {{
+        fs::write(&barrier_path, "ready").unwrap();
+        let mut released = false;
+        for _ in 0..5000 {{
+            if release_path.is_file() {{
+                released = true;
+                break;
+            }}
+            thread::sleep(Duration::from_millis(1));
+        }}
+        if !released {{
+            eprintln!("research fixture release barrier timed out");
+            std::process::exit(43);
+        }}
+    }}
+    let (review_id, experiment_id, context_digest, fixture_session_id, should_write_session, thread_id, _) = controls();
+    let session_id = resume_id.clone().unwrap_or(fixture_session_id);
+    if should_write_session {{ write_session(&session_id); }}
     let answer = format!(r#"{{{{"schema_version":1,"review_id":"{{}}","experiment_id":"{{}}","context_digest":"{{}}","action":"continue","reason":"fixture observed bounded evidence","evidence_refs":["research:{{}}"],"notes":{saved_advice:?},"next_direction":null,"checkpoint":null}}}}"#, review_id, experiment_id, context_digest, review_id);
     fs::write(output, answer).unwrap();
     println!(r#"{{{{"type":"message","payload":{{{{"text":{stdout_sentinel:?}}}}}}}}}"#);
@@ -2058,4 +2218,413 @@ async fn research_native_launch_rejects_budget_reservation_for_different_review(
         let status = handle.wait(&harness.db, NOW + 210).await.unwrap();
         panic!("native launch accepted a reservation bound to another review (status {status:?})");
     }
+}
+
+#[tokio::test]
+async fn research_finalization_rejects_mutated_experiment_identity() {
+    let harness = ResearchHarness::new("immutable-experiment", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let changed = harness.prepare_changed_experiment();
+    let alternate_experiment = harness.admit_sibling_experiment();
+    let mut handle = harness
+        .try_launch_with_thread_id_barrier(
+            &changed,
+            AgentContextMode::Resume {
+                session_id: FIRST_SESSION.to_owned(),
+            },
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("held resumed research review must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    assert_eq!(bound.state, "running");
+    assert_eq!(bound.agent_run_id, Some(run_id));
+    assert_eq!(bound.experiment_id, changed.review.experiment_id);
+    assert_eq!(
+        bound.context_json.as_deref(),
+        Some(changed.evidence.json.as_str())
+    );
+    assert_eq!(
+        bound.context_digest.as_deref(),
+        Some(changed.evidence.digest.as_str())
+    );
+    let reservation_id = harness.reservation_id_for(&changed.review);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+
+    let changed_rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET experiment_id = ?1 WHERE review_id = ?2",
+            rusqlite::params![&alternate_experiment, &changed.review.review_id],
+        )
+        .unwrap();
+    assert_eq!(changed_rows, 1);
+    harness.write_fixture_controls(
+        &changed.review.review_id,
+        &alternate_experiment,
+        bound.context_digest.as_deref().unwrap(),
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+    harness.release_child();
+    let result = handle.wait(&harness.db, NOW + 210).await;
+    assert!(
+        !matches!(result, Ok(AgentRunStatus::Completed)),
+        "a response for a replacement experiment must not complete the bound review: {result:?}"
+    );
+
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    assert_ne!(stored.state, "ready");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run_id));
+    assert_eq!(stored.attempt, bound.attempt);
+    assert_eq!(stored.session_generation, bound.session_generation);
+    let alternate_reviews: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM research_reviews
+             WHERE experiment_id = ?1 AND review_id <> ?2",
+            rusqlite::params![&alternate_experiment, &changed.review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(alternate_reviews, 0, "the sibling must not gain a review");
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+}
+
+#[tokio::test]
+async fn research_finalization_rejects_mutated_context_pair() {
+    let harness = ResearchHarness::new("immutable-context-pair", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("fresh research review must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(bound.state, "running");
+    assert_eq!(bound.agent_run_id, Some(run_id));
+    assert_eq!(
+        bound.context_json.as_deref(),
+        Some(claimed.evidence.json.as_str())
+    );
+    assert_eq!(
+        bound.context_digest.as_deref(),
+        Some(claimed.evidence.digest.as_str())
+    );
+    let mut alternate_context: serde_json::Value =
+        serde_json::from_str(bound.context_json.as_deref().unwrap()).unwrap();
+    alternate_context["facts"]["observed_at"] = serde_json::json!(NOW + 62);
+    let alternate_context = alternate_context.to_string();
+    let alternate_digest = format!("{:x}", Sha256::digest(alternate_context.as_bytes()));
+    let changed_rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET context_json = ?1, context_digest = ?2
+             WHERE review_id = ?3",
+            rusqlite::params![
+                &alternate_context,
+                &alternate_digest,
+                &claimed.review.review_id
+            ],
+        )
+        .unwrap();
+    assert_eq!(changed_rows, 1);
+    harness.write_fixture_controls(
+        &claimed.review.review_id,
+        &claimed.review.experiment_id,
+        &alternate_digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+    harness.release_child();
+    let result = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        !matches!(result, Ok(AgentRunStatus::Completed)),
+        "a response for replacement evidence must not complete the bound review: {result:?}"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_ne!(stored.state, "ready");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run_id));
+}
+
+#[tokio::test]
+async fn research_finalization_rejects_context_bytes_replaced_under_same_digest() {
+    let harness = ResearchHarness::new("immutable-context-bytes", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("fresh research review must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(
+        bound.context_json.as_deref(),
+        Some(claimed.evidence.json.as_str())
+    );
+    assert_eq!(
+        bound.context_digest.as_deref(),
+        Some(claimed.evidence.digest.as_str())
+    );
+    let original_digest = bound.context_digest.clone().expect("bound digest");
+    let mut alternate_context: serde_json::Value =
+        serde_json::from_str(bound.context_json.as_deref().unwrap()).unwrap();
+    alternate_context["facts"]["observed_at"] = serde_json::json!(NOW + 63);
+    let alternate_context = alternate_context.to_string();
+    assert_ne!(
+        alternate_context,
+        bound.context_json.clone().expect("bound context")
+    );
+    let changed_rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET context_json = ?1 WHERE review_id = ?2",
+            rusqlite::params![&alternate_context, &claimed.review.review_id],
+        )
+        .unwrap();
+    assert_eq!(changed_rows, 1);
+    harness.write_fixture_controls(
+        &claimed.review.review_id,
+        &claimed.review.experiment_id,
+        &original_digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+    harness.release_child();
+    let result = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        !matches!(result, Ok(AgentRunStatus::Completed)),
+        "unchanged digest must not legitimize replacement context bytes: {result:?}"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_ne!(stored.state, "ready");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run_id));
+}
+
+#[tokio::test]
+async fn research_finalization_retains_authority_when_attempt_changes() {
+    let harness = ResearchHarness::new("immutable-attempt", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("fresh research review must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let changed_rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET attempt = attempt + 1 WHERE review_id = ?1",
+            [&claimed.review.review_id],
+        )
+        .unwrap();
+    assert_eq!(changed_rows, 1);
+    harness.release_child();
+    let result = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        result.is_err(),
+        "attempt CAS mismatch must retain the handle for reconciliation: {result:?}"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "running");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run_id));
+    assert_eq!(stored.attempt, bound.attempt + 1);
+    harness.assert_active_run_and_private_output(run_id);
+}
+
+#[tokio::test]
+async fn research_resume_finalization_retains_authority_when_review_generation_changes() {
+    let harness = ResearchHarness::new("immutable-review-generation", FIRST_SESSION);
+    let first = harness.initial_review();
+    let mut first_handle = harness.launch(&first, AgentContextMode::Fresh).await;
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let changed = harness.prepare_changed_experiment();
+    let session = harness
+        .research_session()
+        .expect("changed review must retain the campaign session");
+    let mut handle = harness
+        .try_launch_with_thread_id_barrier(
+            &changed,
+            AgentContextMode::Resume {
+                session_id: session.clone(),
+            },
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("resumed research review must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    let changed_rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET session_generation = session_generation + 1
+             WHERE review_id = ?1",
+            [&changed.review.review_id],
+        )
+        .unwrap();
+    assert_eq!(changed_rows, 1);
+    harness.release_child();
+    let result = handle.wait(&harness.db, NOW + 210).await;
+    assert!(
+        result.is_err(),
+        "resume generation CAS mismatch must retain the same handle: {result:?}"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&changed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "running");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run_id));
+    assert_eq!(stored.session_generation, bound.session_generation + 1);
+    harness.assert_active_run_and_private_output(run_id);
+    assert_eq!(
+        harness.research_session().as_deref(),
+        Some(session.as_str())
+    );
+}
+
+#[tokio::test]
+async fn research_finalization_retains_authority_when_campaign_generation_changes() {
+    let harness = ResearchHarness::new("immutable-campaign-generation", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("fresh research review must bind");
+    let run_id = handle.run_id;
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let changed_rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET session_generation = session_generation + 1
+             WHERE campaign_id = ?1",
+            [&claimed.review.campaign_id],
+        )
+        .unwrap();
+    assert_eq!(changed_rows, 1);
+    harness.release_child();
+    let result = handle.wait(&harness.db, NOW + 91).await;
+    assert!(
+        result.is_err(),
+        "campaign generation CAS mismatch must retain the same handle: {result:?}"
+    );
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "running");
+    assert!(stored.response_json.is_none());
+    assert_eq!(stored.agent_run_id, Some(run_id));
+    assert_eq!(stored.session_generation, bound.session_generation);
+    harness.assert_active_run_and_private_output(run_id);
+    let campaign_generation: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT session_generation FROM campaign_research WHERE campaign_id = ?1",
+            [&claimed.review.campaign_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(campaign_generation, bound.session_generation + 1);
 }
