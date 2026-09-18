@@ -858,7 +858,7 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
-        os::unix::fs::MetadataExt,
+        os::unix::fs::PermissionsExt,
         path::PathBuf,
     };
 
@@ -866,7 +866,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     #[cfg(target_os = "linux")]
-    use crate::execution_policy::{ExecutableAnchor, ExecutableIdentity, ProjectRootAnchor};
+    use crate::execution_policy::{ExecutableAnchor, ProjectRootAnchor};
 
     use super::*;
 
@@ -998,7 +998,9 @@ mod tests {
         let fixture = tempdir().unwrap();
         let project_root = fixture.path().join("project");
         let codex_home = fixture.path().join("codex-home");
-        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir(&project_root).unwrap();
+        fs::set_permissions(&project_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
         fs::create_dir_all(codex_home.join("sessions")).unwrap();
         fs::create_dir_all(project_root.join(".pueue-agent")).unwrap();
         fs::write(
@@ -1015,24 +1017,13 @@ mod tests {
         )
         .unwrap();
 
-        let metadata = fs::metadata(&project_root).unwrap();
-        let identity = ExecutableIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            owner: metadata.uid(),
-            mode: metadata.mode(),
-        };
-        let root_anchor = ProjectRootAnchor {
-            canonical_path: project_root,
-            identity,
-            resolution_fingerprint: "fixture-root".to_owned(),
-        };
+        let root_anchor = ProjectRootAnchor::resolve(&project_root).unwrap();
         let policy = ResolvedProjectExecutionPolicy {
             project_id: "codex-command-fixture".to_owned(),
             root_anchor: root_anchor.clone(),
             agent_anchor: ExecutableAnchor {
                 canonical_path: PathBuf::from("/usr/bin/codex"),
-                identity,
+                identity: root_anchor.identity,
                 resolution_fingerprint: "fixture-codex".to_owned(),
             },
             agent_kind: AgentKind::BuiltInCodex,
