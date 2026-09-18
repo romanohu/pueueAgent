@@ -865,6 +865,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use tempfile::{tempdir, TempDir};
 
+    #[cfg(target_os = "linux")]
+    use crate::execution_policy::{ExecutableAnchor, ExecutableIdentity, ProjectRootAnchor};
+
     use super::*;
 
     #[test]
@@ -958,9 +961,12 @@ mod tests {
         let config = agent_config(AgentContextMode::Fresh);
         let oversized_prompt = "e".repeat(crate::process::MAX_FIELD_SIZE + 1);
 
-        let error = builder
+        let error = match builder
             .build_research_with_private_temp(&config, &oversized_prompt, &private_tmp)
-            .unwrap_err();
+        {
+            Ok(_) => panic!("oversized research prompt must be rejected"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
         assert_eq!(error.stage, PolicyViolationStage::PreBinding);
