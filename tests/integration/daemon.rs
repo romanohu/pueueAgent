@@ -7427,26 +7427,30 @@ async fn code_change_candidate_commit_uses_fixed_identity_and_message() {
         run_git(&[
             "show",
             "-s",
-            "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%B",
+            "--format=%an%x00%ae%x00%at%x00%aI%x00%cn%x00%ce%x00%ct%x00%cI%x00%s%x00%B",
             &candidate_sha,
         ])
         .stdout,
     )
     .unwrap();
     let fields = metadata.trim_end().split('\0').collect::<Vec<_>>();
-    assert_eq!(
-        fields,
-        [
-            "pueue-agent",
-            "pueue-agent@localhost",
-            "2000-01-01T00:00:00+00:00",
-            "pueue-agent",
-            "pueue-agent@localhost",
-            "2000-01-01T00:00:00+00:00",
-            "pueue-agent code-change candidate",
-            "pueue-agent code-change candidate",
-        ]
-    );
+    assert_eq!(fields.len(), 10);
+    assert_eq!(fields[0], "pueue-agent");
+    assert_eq!(fields[1], "pueue-agent@localhost");
+    assert_eq!(fields[2], "946684800");
+    assert!(matches!(
+        fields[3],
+        "2000-01-01T00:00:00Z" | "2000-01-01T00:00:00+00:00"
+    ));
+    assert_eq!(fields[4], "pueue-agent");
+    assert_eq!(fields[5], "pueue-agent@localhost");
+    assert_eq!(fields[6], "946684800");
+    assert!(matches!(
+        fields[7],
+        "2000-01-01T00:00:00Z" | "2000-01-01T00:00:00+00:00"
+    ));
+    assert_eq!(fields[8], "pueue-agent code-change candidate");
+    assert_eq!(fields[9], "pueue-agent code-change candidate");
 
     let parent = String::from_utf8(
         run_git(&["rev-parse", &format!("{candidate_sha}^")]).stdout,
