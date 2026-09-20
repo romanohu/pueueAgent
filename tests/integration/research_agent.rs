@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    ffi::OsString,
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -9,9 +10,11 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     config,
+    daemon::{Daemon, DaemonConfig},
     db::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
         ExperimentRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
@@ -28,6 +31,7 @@ use pueue_agent::{
         AgentContextMode, AgentRunStatus, EventKind, EventStatus, ExperimentStatus,
         ExperimentTerminalOutcome, NewEvent, NewProject, NewTaskObservation, ProposalKind,
     },
+    pueue::{PueueApi, PueueTask},
     process::MAX_FIELD_SIZE,
     proposals::{self, ProposalInput},
     research::run_due_research,
@@ -47,9 +51,90 @@ const USER_STDOUT_SENTINEL: &str = "fixture-user-output-stdout-7f4a";
 const USER_STDERR_SENTINEL: &str = "fixture-user-output-stderr-8b2c";
 const SAVED_ADVICE_SENTINEL: &str = "saved-research-advice-4d9e";
 
+#[derive(Clone)]
+struct ResearchDaemonPueue {
+    tasks: Arc<Vec<PueueTask>>,
+}
+
+impl ResearchDaemonPueue {
+    fn from_running_observation(db: &Db, project_id: &str) -> Self {
+        let (id, group, command_json, state, enqueued_at, started_at, ended_at, result): (
+            i64,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT pueue_task_id, pueue_group, command_json, state,
+                        enqueued_at, started_at, ended_at, result
+                 FROM task_observations
+                 WHERE project_id = ?1 AND lower(state) = 'running'
+                 ORDER BY observed_at DESC
+                 LIMIT 1",
+                [project_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let command: Vec<String> = serde_json::from_str(&command_json).unwrap();
+        Self {
+            tasks: Arc::new(vec![PueueTask {
+                id,
+                group,
+                command: command.join(" "),
+                state,
+                enqueued_at: enqueued_at.map(|value| value.to_string()),
+                started_at: started_at.map(|value| value.to_string()),
+                ended_at: ended_at.map(|value| value.to_string()),
+                result: result.map(|value| serde_json::from_str(&value).unwrap()),
+            }]),
+        }
+    }
+}
+
+#[async_trait]
+impl PueueApi for ResearchDaemonPueue {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, pueue_agent::AppError> {
+        Ok(self.tasks.as_ref().clone())
+    }
+
+    async fn add(&self, _args: &[OsString]) -> Result<i64, pueue_agent::AppError> {
+        panic!("replacement-daemon research fixture must not submit a new Pueue task")
+    }
+
+    async fn kill(&self, _task_id: i64) -> Result<(), pueue_agent::AppError> {
+        panic!("replacement-daemon research fixture must not kill a Pueue task")
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), pueue_agent::AppError> {
+        panic!("replacement-daemon research fixture must not remove a Pueue task")
+    }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), pueue_agent::AppError> {
+        panic!("replacement-daemon research fixture must not create a Pueue group")
+    }
+}
+
 struct ResearchHarness {
     _temp: TempDir,
     db: Db,
+    policy: Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
     project: pueue_agent::models::Project,
     project_policy: pueue_agent::execution_policy::ResolvedProjectExecutionPolicy,
     project_config: pueue_agent::config::ProjectConfig,
@@ -77,17 +162,22 @@ struct ClaimedReview {
 
 impl ResearchHarness {
     fn new(label: &str, fixture_session_id: &str) -> Self {
-        Self::new_with_options(label, fixture_session_id, false)
+        Self::new_with_options_and_task_signature(label, fixture_session_id, false, false)
     }
 
     fn new_with_custom_agent(label: &str, fixture_session_id: &str) -> Self {
-        Self::new_with_options(label, fixture_session_id, true)
+        Self::new_with_options_and_task_signature(label, fixture_session_id, true, false)
     }
 
-    fn new_with_options(
+    fn new_for_replacement_daemon(label: &str, fixture_session_id: &str) -> Self {
+        Self::new_with_options_and_task_signature(label, fixture_session_id, false, true)
+    }
+
+    fn new_with_options_and_task_signature(
         label: &str,
         fixture_session_id: &str,
         ordinary_custom_agent: bool,
+        daemon_compatible_task_signature: bool,
     ) -> Self {
         let temp = tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -142,7 +232,20 @@ impl ResearchHarness {
         let experiment_id = format!("research-{label}-experiment-1");
         let submission_id = format!("research-{label}-submission-1");
         let proposal_id = format!("research-{label}-proposal-1");
-        let task_signature = format!("pueue-task:v1:{label}:one");
+        let task_signature = if daemon_compatible_task_signature {
+            pueue_agent::reconcile::task_signature(&PueueTask {
+                id: 41,
+                group: project_id.clone(),
+                command: "python train.py".to_owned(),
+                state: "Running".to_owned(),
+                enqueued_at: Some(NOW.to_string()),
+                started_at: Some((NOW + 1).to_string()),
+                ended_at: None,
+                result: None,
+            })
+        } else {
+            format!("pueue-task:v1:{label}:one")
+        };
         let objective_digest = format!("research-objective-digest-{label}");
         let config_path = service_dir.join("config.toml");
         let secondary_config_path = secondary_service_dir.join("config.toml");
@@ -363,6 +466,7 @@ max_agent_runs = 10
         Self {
             _temp: temp,
             db,
+            policy,
             project,
             project_policy,
             project_config,
@@ -403,10 +507,19 @@ max_agent_runs = 10
         review: &pueue_agent::db::ResearchReview,
         now: i64,
     ) -> pueue_agent::models::BudgetReservation {
+        self.reserve_budget_for_attempt(review, review.attempt, now)
+    }
+
+    fn reserve_budget_for_attempt(
+        &self,
+        review: &pueue_agent::db::ResearchReview,
+        attempt: i64,
+        now: i64,
+    ) -> pueue_agent::models::BudgetReservation {
         match CampaignRepository::new(&self.db)
             .reserve_agent_run(
                 &review.campaign_id,
-                &format!("research:{}:attempt:{}", review.review_id, review.attempt),
+                &format!("research:{}:attempt:{attempt}", review.review_id),
                 &CampaignLimits::default(),
                 now,
             )
@@ -554,6 +667,53 @@ max_agent_runs = 10
                 project_lock,
             )
             .await
+    }
+
+    fn replacement_daemon_at(&self, now: i64) -> Daemon<ResearchDaemonPueue> {
+        let policy = Arc::clone(&self.policy);
+        Daemon::new(
+            self.db.clone(),
+            ResearchDaemonPueue::from_running_observation(&self.db, &self.project.project_id),
+            Arc::clone(&policy),
+            AgentRunner::new(
+                AgentRunnerConfig::production().with_codex_capabilities(
+                    pueue_agent::codex_command::CodexCapabilities::all(),
+                ),
+                policy,
+            ),
+            DaemonConfig {
+                interval: Duration::from_millis(10),
+                lease_seconds: 60,
+                claim_limit: 1,
+                now_override: Some(now),
+                shutdown_grace_period: Duration::from_secs(30),
+            },
+        )
+    }
+
+    async fn run_replacement_until_ready(
+        &self,
+        daemon: &mut Daemon<ResearchDaemonPueue>,
+        review_id: &str,
+    ) -> usize {
+        let mut started = 0;
+        for _ in 0..200 {
+            let report = match Box::pin(daemon.run_once()).await {
+                Ok(report) => report,
+                Err(error) => panic!("replacement daemon must settle research: {error}"),
+            };
+            started += report.research_started;
+            if ResearchRepository::new(&self.db)
+                .find(review_id)
+                .unwrap()
+                .state
+                == "ready"
+            {
+                return started;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("replacement daemon did not settle research review {review_id}");
     }
 
     fn write_fixture_controls(
@@ -849,6 +1009,19 @@ max_agent_runs = 10
             )
             .unwrap();
         serde_json::from_str(&notes_json).unwrap()
+    }
+
+    fn review_retry_metadata(&self, review_id: &str) -> (Option<i64>, Option<String>) {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT not_before, failure_code
+                 FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
     }
 
     fn assert_recovery_identity(
@@ -2845,6 +3018,699 @@ async fn research_terminal_agent_update_failure_does_not_replay_persisted_respon
     assert!(
         !private_output.exists(),
         "retry must release private output authority"
+    );
+}
+
+#[tokio::test]
+async fn research_replacement_daemon_retires_ready_response_after_terminal_failure() {
+    let harness = ResearchHarness::new_for_replacement_daemon("restart-ready", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let run_id = handle.run_id;
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    let private_output = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string())
+        .join("research.json");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_restart_ready_terminal_update
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+             BEGIN SELECT RAISE(ABORT, 'injected restart ready terminal update failure'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        handle.wait(&harness.db, NOW + 91).await.is_err(),
+        "the generic terminal write must fail after the ready response is persisted"
+    );
+    let before = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let before_response = before
+        .response_json
+        .clone()
+        .expect("the response must be durable before generic finalization");
+    let before_notes = harness.review_notes(&claimed.review.review_id);
+    let before_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("the generic run must remain durable");
+    let before_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the research event must remain durable");
+    assert_eq!(before.state, "ready");
+    assert_eq!(before_run.status, AgentRunStatus::Running);
+    assert_eq!(before_run.launch_gate_state, "released");
+    assert_eq!(before_event.status, EventStatus::Dispatched);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(private_output.is_file());
+
+    drop(handle);
+    assert!(
+        private_output.is_file(),
+        "dropping the quiescent original handle must not release its durable generation"
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_restart_ready_terminal_update")
+        .unwrap();
+
+    let run_count_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservation_count_before = harness.campaign_reservation_count(&claimed.review.campaign_id);
+    let mut replacement = harness.replacement_daemon_at(NOW + 92);
+    let report = match Box::pin(replacement.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("replacement daemon must retire the ready owner: {error}"),
+    };
+    assert_eq!(report.research_started, 0);
+
+    let after = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let after_notes = harness.review_notes(&claimed.review.review_id);
+    let after_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("the retired generic run must remain durable");
+    let after_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the retired research event must remain durable");
+    assert_eq!(after.state, "ready");
+    assert_eq!(after.response_json.as_deref(), Some(before_response.as_str()));
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after_run.status, AgentRunStatus::Completed);
+    assert!(after_run.finished_at.is_some());
+    assert_eq!(after_event.status, EventStatus::Completed);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        ResearchHarness::notes_without_cleanup(&after_notes),
+        ResearchHarness::notes_without_cleanup(&before_notes)
+    );
+    assert_eq!(
+        after_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("complete")
+    );
+    assert!(!private_output.exists());
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count_before
+    );
+    let run_count_after: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(run_count_after, run_count_before);
+
+    let mut idempotent = harness.replacement_daemon_at(NOW + 93);
+    let idempotent_report = match Box::pin(idempotent.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("retired ready owner must be idempotent: {error}"),
+    };
+    assert_eq!(idempotent_report.research_started, 0);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&claimed.review.review_id)
+            .unwrap()
+            .response_json
+            .as_deref(),
+        Some(before_response.as_str())
+    );
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count_before
+    );
+}
+
+#[tokio::test]
+async fn research_replacement_daemon_retires_classified_retry_after_terminal_failure() {
+    let harness = ResearchHarness::new_for_replacement_daemon("restart-retry", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            false,
+            "malformed",
+        )
+        .await
+        .expect("malformed native launch must bind");
+    let run_id = handle.run_id;
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    let private_output = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string())
+        .join("research.json");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_restart_retry_terminal_update
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+             BEGIN SELECT RAISE(ABORT, 'injected restart retry terminal update failure'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        handle.wait(&harness.db, NOW + 91).await.is_err(),
+        "the generic terminal write must fail after the classified retry is persisted"
+    );
+    let before = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let before_notes = harness.review_notes(&claimed.review.review_id);
+    let before_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("the generic run must remain durable");
+    let before_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the research event must remain durable");
+    let (retry_wake, before_failure_code) = harness.review_retry_metadata(&claimed.review.review_id);
+    let retry_wake = retry_wake
+        .expect("classified research failure must persist a retry wake");
+    assert_eq!(before.state, "retry_wait");
+    assert_eq!(before_failure_code.as_deref(), Some("research_output_invalid"));
+    assert!(before.response_json.is_none());
+    assert_eq!(harness.research_session(), None);
+    assert_eq!(before_run.status, AgentRunStatus::Running);
+    assert_eq!(before_run.launch_gate_state, "released");
+    assert_eq!(before_event.status, EventStatus::Dispatched);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(private_output.is_file());
+
+    drop(handle);
+    assert!(
+        private_output.is_file(),
+        "dropping the quiescent original handle must not release its durable generation"
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_restart_retry_terminal_update")
+        .unwrap();
+
+    let run_count_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservation_count_before = harness.campaign_reservation_count(&claimed.review.campaign_id);
+    let mut replacement = harness.replacement_daemon_at(retry_wake.saturating_sub(1));
+    let report = match Box::pin(replacement.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("replacement daemon must retire the classified owner: {error}"),
+    };
+    assert_eq!(report.research_started, 0);
+
+    let after = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let (after_retry_wake, after_failure_code) =
+        harness.review_retry_metadata(&claimed.review.review_id);
+    let after_notes = harness.review_notes(&claimed.review.review_id);
+    let after_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("the retired generic run must remain durable");
+    let after_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the retired research event must remain durable");
+    assert_eq!(after.state, "retry_wait");
+    assert_eq!(after_failure_code.as_deref(), Some("research_output_invalid"));
+    assert!(after.response_json.is_none());
+    assert_eq!(after_retry_wake, Some(retry_wake));
+    assert_eq!(harness.research_session(), None);
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after_run.status, AgentRunStatus::Failed);
+    assert!(after_run.finished_at.is_some());
+    assert_eq!(after_event.status, EventStatus::RetryWait);
+    assert_eq!(after_event.not_before, retry_wake);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        ResearchHarness::notes_without_cleanup(&after_notes),
+        ResearchHarness::notes_without_cleanup(&before_notes)
+    );
+    assert_eq!(
+        after_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("complete")
+    );
+    assert!(!private_output.exists());
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count_before
+    );
+    let run_count_after: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(run_count_after, run_count_before);
+}
+
+#[tokio::test]
+async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_terminal_failure() {
+    let harness = ResearchHarness::new_for_replacement_daemon("restart-unsafe", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut handle = harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+            "post-session-barrier",
+        )
+        .await
+        .expect("postlaunch unsafe fixture must bind");
+    let run_id = handle.run_id;
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    let private_output = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string())
+        .join("research.json");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_restart_unsafe_terminal_update
+             BEFORE UPDATE OF status ON agent_runs
+             WHEN NEW.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+             BEGIN SELECT RAISE(ABORT, 'injected restart unsafe terminal update failure'); END;",
+        )
+        .unwrap();
+    harness.wait_for_child_ready().await;
+    harness.release_child();
+    harness.wait_for_child_session_ready().await;
+    harness.replace_session_metadata_with_foreign_cwd(FIRST_SESSION);
+    harness.release_child_after_session();
+
+    assert!(
+        handle.wait(&harness.db, NOW + 91).await.is_err(),
+        "the generic terminal write must fail after unsafe classification is persisted"
+    );
+    let before = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let before_notes = harness.review_notes(&claimed.review.review_id);
+    let before_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("the generic run must remain durable");
+    let before_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the research event must remain durable");
+    let (retry_wake, before_failure_code) = harness.review_retry_metadata(&claimed.review.review_id);
+    let retry_wake = retry_wake
+        .expect("unsafe research failure must persist a retry wake");
+    assert_eq!(before.state, "retry_wait");
+    assert_eq!(before_failure_code.as_deref(), Some("research_session_unsafe"));
+    assert!(before.response_json.is_none());
+    assert_eq!(harness.research_session(), None);
+    assert_eq!(before_run.status, AgentRunStatus::Running);
+    assert_eq!(before_run.launch_gate_state, "released");
+    assert_eq!(before_event.status, EventStatus::Dispatched);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(private_output.is_file());
+
+    drop(handle);
+    assert!(private_output.is_file());
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_restart_unsafe_terminal_update")
+        .unwrap();
+
+    let run_count_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservation_count_before = harness.campaign_reservation_count(&claimed.review.campaign_id);
+    let mut replacement = harness.replacement_daemon_at(retry_wake.saturating_sub(1));
+    let report = match Box::pin(replacement.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("replacement daemon must retire unsafe ownership: {error}"),
+    };
+    assert_eq!(report.research_started, 0);
+
+    let retired_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the retired research event must remain durable");
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&claimed.review.review_id)
+            .unwrap()
+            .state,
+        "retry_wait"
+    );
+    assert_eq!(retired_event.status, EventStatus::RetryWait);
+    assert!(!private_output.exists());
+
+    drop(replacement);
+    let mut blocker = harness.replacement_daemon_at(retry_wake);
+    let report = match Box::pin(blocker.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("replacement daemon must classify unsafe ownership: {error}"),
+    };
+    assert_eq!(report.research_started, 0);
+
+    let after = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let (after_retry_wake, after_failure_code) =
+        harness.review_retry_metadata(&claimed.review.review_id);
+    let after_notes = harness.review_notes(&claimed.review.review_id);
+    let after_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("the retired generic run must remain durable");
+    let after_event = EventRepository::new(&harness.db)
+        .find_by_id(claimed.event_id)
+        .unwrap()
+        .expect("the retired research event must remain durable");
+    assert_eq!(after.state, "blocked");
+    assert_eq!(after_failure_code.as_deref(), Some("research_session_unsafe"));
+    assert!(after.response_json.is_none());
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(harness.research_session(), None);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap()
+            .blocked_reason
+            .as_deref(),
+        Some("research_session_unsafe")
+    );
+    assert_eq!(after_run.status, AgentRunStatus::Failed);
+    assert!(after_run.finished_at.is_some());
+    assert_eq!(after_event.status, EventStatus::Failed);
+    assert_eq!(after_retry_wake, Some(retry_wake));
+    assert_eq!(after_event.not_before, retired_event.not_before);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        ResearchHarness::notes_without_cleanup(&after_notes),
+        ResearchHarness::notes_without_cleanup(&before_notes)
+    );
+    assert_eq!(
+        after_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("complete")
+    );
+    assert!(!private_output.exists());
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count_before
+    );
+    let run_count_after: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(run_count_after, run_count_before);
+}
+
+#[tokio::test]
+async fn research_replacement_daemon_launches_pending_claim_once() {
+    let harness = ResearchHarness::new_for_replacement_daemon("restart-pending", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    assert_eq!(claimed.review.attempt, 0);
+    assert!(claimed.review.agent_run_id.is_none());
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Pending
+    );
+    assert_eq!(harness.campaign_reservation_count(&claimed.review.campaign_id), 0);
+    harness.write_fixture_controls(
+        &claimed.review.review_id,
+        &claimed.review.experiment_id,
+        &claimed.evidence.digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+
+    let mut daemon = harness.replacement_daemon_at(NOW + 80);
+    let first_report = match Box::pin(daemon.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("replacement daemon must launch the pending claim: {error}"),
+    };
+    assert_eq!(first_report.research_started, 1);
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let bound_digest = bound
+        .context_digest
+        .as_deref()
+        .expect("the launched pending claim must persist its evidence digest");
+    harness.write_fixture_controls(
+        &bound.review_id,
+        &bound.experiment_id,
+        bound_digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+    harness.release_child();
+    assert_eq!(
+        first_report.research_started
+            + harness
+                .run_replacement_until_ready(&mut daemon, &claimed.review.review_id)
+                .await,
+        1
+    );
+    let second_report = match Box::pin(daemon.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("pending claim settlement must remain bounded: {error}"),
+    };
+    assert_eq!(second_report.research_started, 0);
+    assert_eq!(
+        fs::read_to_string(&harness.capture_path)
+            .unwrap()
+            .matches("CALL_START\n")
+            .count(),
+        1,
+        "the replacement daemon must launch the claimed review exactly once"
+    );
+
+    let review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(review.state, "ready");
+    assert_eq!(review.attempt, 1);
+    let run_id = review.agent_run_id.expect("pending claim must bind one run");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Completed
+    );
+    let reservation_id = harness.reservation_id_for(&review);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(harness.campaign_reservation_count(&review.campaign_id), 1);
+    assert!(AgentRunRepository::new(&harness.db)
+        .find_active_by_project(&harness.project.project_id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn research_replacement_daemon_reuses_reservation_without_binding() {
+    let harness = ResearchHarness::new_for_replacement_daemon("restart-reservation", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let admitted = harness.reserve_budget_for_attempt(&claimed.review, 1, NOW + 80);
+    let prepared = ResearchRepository::new(&harness.db)
+        .prepare_attempt(
+            &claimed.review.review_id,
+            &admitted.reservation_id,
+            CampaignLimits::default().max_decision_attempts_per_cycle,
+            NOW + 80,
+        )
+        .unwrap()
+        .expect("the consumed reservation must admit an unbound attempt");
+    harness.write_fixture_controls(
+        &prepared.review_id,
+        &prepared.experiment_id,
+        &claimed.evidence.digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+    assert_eq!(harness.reservation_status(&admitted.reservation_id), "consumed");
+    assert_eq!(harness.campaign_reservation_count(&claimed.review.campaign_id), 1);
+    assert!(claimed.review.agent_run_id.is_none());
+    assert_eq!(prepared.attempt, 1);
+    assert_eq!(prepared.state, "pending");
+
+    let mut daemon = harness.replacement_daemon_at(NOW + 80);
+    let first_report = match Box::pin(daemon.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("replacement daemon must bind the existing reservation: {error}"),
+    };
+    assert_eq!(first_report.research_started, 1);
+    harness.wait_for_child_ready().await;
+    let bound = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    let bound_digest = bound
+        .context_digest
+        .as_deref()
+        .expect("the launched reservation must persist its evidence digest");
+    harness.write_fixture_controls(
+        &bound.review_id,
+        &bound.experiment_id,
+        bound_digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        true,
+    );
+    harness.release_child();
+    assert_eq!(
+        first_report.research_started
+            + harness
+                .run_replacement_until_ready(&mut daemon, &claimed.review.review_id)
+                .await,
+        1
+    );
+    let second_report = match Box::pin(daemon.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("reserved research settlement must remain bounded: {error}"),
+    };
+    assert_eq!(second_report.research_started, 0);
+    assert_eq!(
+        fs::read_to_string(&harness.capture_path)
+            .unwrap()
+            .matches("CALL_START\n")
+            .count(),
+        1,
+        "the existing reservation must not manufacture a duplicate launch"
+    );
+
+    let review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(review.state, "ready");
+    assert_eq!(review.attempt, 1);
+    let run_id = review.agent_run_id.expect("reserved review must bind one run");
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(
+        harness.reservation_id_for(&review),
+        admitted.reservation_id,
+        "the replacement daemon must reuse the admitted reservation"
+    );
+    assert_eq!(harness.reservation_status(&admitted.reservation_id), "consumed");
+    assert_eq!(harness.campaign_reservation_count(&review.campaign_id), 1);
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Completed
     );
 }
 
