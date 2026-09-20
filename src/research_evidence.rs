@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rusqlite::{params, types::Type, Row};
+use rusqlite::{params, types::Type, Row, Transaction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -291,6 +291,19 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), App
     let transaction = connection
         .transaction()
         .map_err(database_error("begin research notes snapshot"))?;
+    let notes = research_notes_in_transaction(&transaction, campaign_id, MAX_RESEARCH_NOTES)?;
+    transaction
+        .commit()
+        .map_err(database_error("commit research notes snapshot"))?;
+    Ok(notes)
+}
+
+pub(crate) fn research_notes_in_transaction(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    limit: usize,
+) -> Result<(Vec<Value>, usize), AppError> {
+    let limit = limit.min(MAX_RESEARCH_NOTES) as i64;
     let count: i64 = transaction
         .query_row(
             "SELECT COUNT(*) FROM research_reviews
@@ -323,7 +336,7 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), App
             )
             .map_err(database_error("prepare research notes query"))?;
         let rows = statement
-            .query_map(params![campaign_id, MAX_RESEARCH_NOTES as i64], |row| {
+            .query_map(params![campaign_id, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -336,9 +349,6 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), App
             .map_err(database_error("read research notes"))?;
         rows
     };
-    transaction
-        .commit()
-        .map_err(database_error("commit research notes snapshot"))?;
     let omitted = count.saturating_sub(rows.len());
     rows.into_iter()
         .map(|(review_id, attempt, state, notes)| {

@@ -1916,6 +1916,17 @@ impl<'db> IncidentRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin active incident upsert"))?;
+        let update = Self::upsert_active_in_transaction(&transaction, incident)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit active incident upsert"))?;
+        Ok(update)
+    }
+
+    pub(crate) fn upsert_active_in_transaction(
+        transaction: &Transaction<'_>,
+        incident: &NewIncident,
+    ) -> Result<IncidentUpdate, AppError> {
         let latest_resolved = transaction
             .query_row(
                 &format!(
@@ -1999,9 +2010,6 @@ impl<'db> IncidentRepository<'db> {
             }
         };
 
-        transaction
-            .commit()
-            .map_err(database_error("commit active incident upsert"))?;
         Ok(update)
     }
 
@@ -6174,6 +6182,17 @@ impl<'db> TerminationRequestRepository<'db> {
             .map_err(database_error(
                 "begin idempotent termination request insert",
             ))?;
+        let stored = Self::insert_idempotent_in_transaction(&transaction, request)?;
+        transaction.commit().map_err(database_error(
+            "commit idempotent termination request insert",
+        ))?;
+        Ok(stored)
+    }
+
+    pub(crate) fn insert_idempotent_in_transaction(
+        transaction: &Transaction<'_>,
+        request: &NewTerminationRequest,
+    ) -> Result<TerminationRequest, AppError> {
         transaction
             .execute(
                 "INSERT INTO termination_requests (
@@ -6206,9 +6225,6 @@ impl<'db> TerminationRequestRepository<'db> {
                 termination_request_from_row,
             )
             .map_err(database_error("read idempotent termination request"))?;
-        transaction.commit().map_err(database_error(
-            "commit idempotent termination request insert",
-        ))?;
         Ok(stored)
     }
 
