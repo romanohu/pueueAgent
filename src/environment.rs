@@ -17,7 +17,7 @@ use std::{
     time::Instant,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::execution_policy::{
     ExecutableIdentity, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
@@ -818,12 +818,74 @@ pub struct PrivateRunTemp {
     parent: File,
     directory: File,
     identity: (u64, u64),
+    recovery_identity: PrivateRunTempRecoveryIdentityV1,
     #[cfg(target_os = "linux")]
     decision_output_anchor: Mutex<Option<DecisionOutputAnchor>>,
     #[cfg(target_os = "linux")]
     research_stdout_anchor: Mutex<Option<DecisionOutputAnchor>>,
     #[cfg(target_os = "linux")]
     research_stderr_anchor: Mutex<Option<DecisionOutputAnchor>>,
+}
+
+/// The immutable filesystem identity needed to reopen one native research
+/// generation after a supervisor restart.  The V1 type is intentionally
+/// path-free: the startup root anchor supplies the trusted pathname and the
+/// identities prove that every reopened descriptor is the original object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateRunTempRecoveryIdentityV1 {
+    pub service_root_identity: PrivateRunTempRecoveryRootIdentity,
+    pub temp_identity: PrivateRunTempRecoveryTempIdentity,
+}
+
+impl PrivateRunTempRecoveryIdentityV1 {
+    pub const VERSION: u8 = 1;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateRunTempRecoveryRootIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub owner: u32,
+    pub mode: u32,
+    #[serde(rename = "resolution")]
+    pub resolution_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateRunTempRecoveryTempIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub owner: u32,
+    pub mode: u32,
+    #[serde(rename = "mount")]
+    pub mount_identity: [u64; 2],
+    pub service_identity: PrivateRunTempRecoveryDirectoryIdentity,
+    pub parent_identity: PrivateRunTempRecoveryDirectoryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateRunTempRecoveryDirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub owner: u32,
+    pub mode: u32,
+}
+
+/// A cleanup-only capability for a previously recorded native research
+/// generation.  It deliberately has no output anchors and cannot create or
+/// adopt a new generation.
+#[derive(Debug)]
+pub struct RecoveredPrivateRunTempCleanup {
+    anchor: crate::execution_policy::ProjectRootAnchor,
+    expected: PrivateRunTempRecoveryIdentityV1,
+    name: OsString,
+    service: File,
+    parent: File,
+    directory: File,
 }
 
 /// An opaque, verified directory capability for the native target's private
@@ -1040,7 +1102,12 @@ impl PrivateRunTemp {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             validate_run_id(run_id)?;
-            let owner = root.directory.try_clone().map_err(|_| temp_error())?;
+            let verified_root = root.anchor.verify_identity()?;
+            let owner = verified_root.directory.try_clone().map_err(|_| temp_error())?;
+            let root_mount = directory_mount_identity_at(
+                &owner,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
             let service =
                 open_or_create_private_temp_container(&owner, OsStr::new(PRIVATE_TEMP_ROOT))?;
             let tmp = open_or_create_directory(&service, OsStr::new(PRIVATE_TEMP_DIR))?;
@@ -1051,25 +1118,170 @@ impl PrivateRunTemp {
             directory.sync_all().map_err(|_| temp_error())?;
             tmp.sync_all().map_err(|_| temp_error())?;
             let identity = directory_identity(&directory)?;
-            let path = root
+            let service_identity = recovery_directory_identity_at(
+                &service,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let parent_identity = recovery_directory_identity_at(
+                &tmp,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let temp_identity = recovery_temp_identity_at(
+                &directory,
+                root_mount,
+                service_identity,
+                parent_identity,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let service_root_identity = recovery_root_identity(&verified_root.anchor);
+            let path = verified_root
                 .anchor
                 .canonical_path
                 .join(PRIVATE_TEMP_ROOT)
                 .join(PRIVATE_TEMP_DIR)
                 .join(&name);
-            Ok(Self {
+            let temp = Self {
                 name,
                 path,
                 parent: tmp,
                 directory,
                 identity,
+                recovery_identity: PrivateRunTempRecoveryIdentityV1 {
+                    service_root_identity,
+                    temp_identity,
+                },
                 #[cfg(target_os = "linux")]
                 decision_output_anchor: Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 research_stdout_anchor: Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 research_stderr_anchor: Mutex::new(None),
-            })
+            };
+            temp.recovery_identity(&verified_root)?;
+            Ok(temp)
+        }
+    }
+
+    /// Capture the immutable identities needed to reopen this exact
+    /// generation after a native supervisor restart.  The current startup
+    /// root anchor is verified before any descendant identity is recorded.
+    pub fn recovery_identity(
+        &self,
+        root: &VerifiedProjectRoot,
+    ) -> Result<PrivateRunTempRecoveryIdentityV1, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (self, root);
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let verified_root = root.anchor.verify_identity()?;
+            if recovery_root_identity(&verified_root.anchor)
+                != self.recovery_identity.service_root_identity
+            {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let expected_path = verified_root
+                .anchor
+                .canonical_path
+                .join(PRIVATE_TEMP_ROOT)
+                .join(PRIVATE_TEMP_DIR)
+                .join(&self.name);
+            if self.path != expected_path {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+
+            let root_mount = directory_mount_identity_at(
+                &verified_root.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let service = open_directory_on_mount(
+                &verified_root.directory,
+                OsStr::new(PRIVATE_TEMP_ROOT),
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            validate_private_temp_container_at(
+                &service,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let service_identity = recovery_directory_identity_at(
+                &service,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if service_identity != self.recovery_identity.temp_identity.service_identity {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let parent = open_directory_on_mount(
+                &service,
+                OsStr::new(PRIVATE_TEMP_DIR),
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            validate_private_directory_at(&parent, PolicyViolationStage::RunBoundPreMarker)?;
+            let parent_identity = recovery_directory_identity_at(
+                &parent,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if parent_identity != self.recovery_identity.temp_identity.parent_identity {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            if directory_identity_at(&parent, PolicyViolationStage::RunBoundPreMarker)?
+                != directory_identity(&self.parent)?
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let directory = open_directory_on_mount(
+                &parent,
+                &self.name,
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            validate_private_directory_at(
+                &directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if directory_identity_at(&directory, PolicyViolationStage::RunBoundPreMarker)?
+                != self.identity
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let temp_identity = recovery_temp_identity_at(
+                &directory,
+                root_mount,
+                service_identity,
+                parent_identity,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if temp_identity != self.recovery_identity.temp_identity {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            Ok(self.recovery_identity.clone())
         }
     }
 
@@ -1794,6 +2006,251 @@ impl PrivateRunTemp {
 
 impl Drop for PrivateRunTemp {
     fn drop(&mut self) {}
+}
+
+impl RecoveredPrivateRunTempCleanup {
+    /// Reopen only the generation described by the startup-pinned identity.
+    /// This constructor never creates a missing directory and never learns
+    /// expected identities from the descriptors it opens.
+    pub fn open(
+        startup_verified_service_root: &VerifiedProjectRoot,
+        run_id: i64,
+        expected: &PrivateRunTempRecoveryIdentityV1,
+    ) -> Result<Self, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (startup_verified_service_root, run_id, expected);
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            validate_run_id(run_id)?;
+            if expected.service_root_identity
+                != recovery_root_identity(&startup_verified_service_root.anchor)
+            {
+                return Err(PolicyViolation::new(
+                    PolicyViolationCode::RootChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let verified_root = startup_verified_service_root.anchor.verify_identity()?;
+            let root_mount = directory_mount_identity_at(
+                &verified_root.directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let service = open_directory_on_mount(
+                &verified_root.directory,
+                OsStr::new(PRIVATE_TEMP_ROOT),
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            validate_private_temp_container_at(
+                &service,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let service_identity = recovery_directory_identity_at(
+                &service,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if service_identity != expected.temp_identity.service_identity {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let parent = open_directory_on_mount(
+                &service,
+                OsStr::new(PRIVATE_TEMP_DIR),
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            validate_private_directory_at(&parent, PolicyViolationStage::RunBoundPreMarker)?;
+            let parent_identity = recovery_directory_identity_at(
+                &parent,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if parent_identity != expected.temp_identity.parent_identity {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let name = OsString::from(run_id.to_string());
+            let directory = open_directory_on_mount(
+                &parent,
+                &name,
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            validate_private_directory_at(
+                &directory,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let actual = recovery_temp_identity_at(
+                &directory,
+                root_mount,
+                service_identity.clone(),
+                parent_identity.clone(),
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if actual != expected.temp_identity {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            Ok(Self {
+                anchor: verified_root.anchor,
+                expected: expected.clone(),
+                name,
+                service,
+                parent,
+                directory,
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn revalidate_current(&self) -> Result<MountIdentity, PolicyViolation> {
+        let verified_root = self.anchor.verify_identity()?;
+        let root_mount = directory_mount_identity_at(
+            &verified_root.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let service = open_directory_on_mount(
+            &verified_root.directory,
+            OsStr::new(PRIVATE_TEMP_ROOT),
+            root_mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        validate_private_temp_container_at(
+            &service,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let service_identity = recovery_directory_identity_at(
+            &service,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        if service_identity != self.expected.temp_identity.service_identity
+            || service_identity != recovery_directory_identity_at(
+                &self.service,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        let parent = open_directory_on_mount(
+            &service,
+            OsStr::new(PRIVATE_TEMP_DIR),
+            root_mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        validate_private_directory_at(&parent, PolicyViolationStage::RunBoundPreMarker)?;
+        let parent_identity = recovery_directory_identity_at(
+            &parent,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        if parent_identity != self.expected.temp_identity.parent_identity
+            || parent_identity != recovery_directory_identity_at(
+                &self.parent,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        let directory = open_directory_on_mount(
+            &parent,
+            &self.name,
+            root_mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        validate_private_directory_at(
+            &directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let actual = recovery_temp_identity_at(
+            &directory,
+            root_mount,
+            service_identity,
+            parent_identity,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        if actual != self.expected.temp_identity
+            || actual != recovery_temp_identity_at(
+                &self.directory,
+                MountIdentity(self.expected.temp_identity.mount_identity),
+                self.expected.temp_identity.service_identity.clone(),
+                self.expected.temp_identity.parent_identity.clone(),
+                PolicyViolationStage::RunBoundPreMarker,
+            )?
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        Ok(root_mount)
+    }
+
+    /// Run the existing bounded audit/removal protocol against the retained
+    /// original descriptor, with identity checks bracketing the operation.
+    pub fn cleanup_contents_before(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = deadline;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let root_mount = self.revalidate_current()?;
+            check_cleanup_deadline(deadline)?;
+            let mut state = AuditState::default();
+            let entries = audit_directory(
+                &self.directory,
+                0,
+                &mut state,
+                deadline,
+                PolicyViolationStage::RunBoundPreMarker,
+                root_mount,
+                #[cfg(all(test, unix))]
+                None,
+            )?;
+            let mut report = TempCleanupReport {
+                entries_removed: 0,
+                allocated_bytes_reclaimed: 0,
+            };
+            remove_audited_entries(
+                &self.directory,
+                &entries,
+                &mut report,
+                deadline,
+                root_mount,
+            )?;
+            finish_cleanup_before_success(
+                &self.directory,
+                deadline,
+                #[cfg(all(test, unix))]
+                None,
+            )?;
+            self.revalidate_current()?;
+            Ok(report)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3255,6 +3712,67 @@ fn verified_private_temp_identity(
 }
 
 #[cfg(unix)]
+fn recovery_root_identity(
+    anchor: &crate::execution_policy::ProjectRootAnchor,
+) -> PrivateRunTempRecoveryRootIdentity {
+    PrivateRunTempRecoveryRootIdentity {
+        device: anchor.identity.device,
+        inode: anchor.identity.inode,
+        owner: anchor.identity.owner,
+        mode: anchor.identity.mode,
+        resolution_fingerprint: anchor.resolution_fingerprint.clone(),
+    }
+}
+
+#[cfg(unix)]
+fn recovery_directory_identity_at(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<PrivateRunTempRecoveryDirectoryIdentity, PolicyViolation> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    let identity = PrivateRunTempRecoveryDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+    };
+    if !metadata.is_dir() || identity.owner != unsafe { libc::geteuid() as u32 } {
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn recovery_temp_identity_at(
+    directory: &File,
+    mount_identity: MountIdentity,
+    service_identity: PrivateRunTempRecoveryDirectoryIdentity,
+    parent_identity: PrivateRunTempRecoveryDirectoryIdentity,
+    stage: PolicyViolationStage,
+) -> Result<PrivateRunTempRecoveryTempIdentity, PolicyViolation> {
+    let identity = recovery_directory_identity_at(directory, stage)?;
+    if identity.mode != 0o700 {
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
+    }
+    if directory_mount_identity_at(directory, stage)? != mount_identity {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(PrivateRunTempRecoveryTempIdentity {
+        device: identity.device,
+        inode: identity.inode,
+        owner: identity.owner,
+        mode: identity.mode,
+        mount_identity: mount_identity.0,
+        service_identity,
+        parent_identity,
+    })
+}
+
+#[cfg(unix)]
 fn directory_identity(directory: &File) -> Result<(u64, u64), PolicyViolation> {
     directory_identity_at(directory, PolicyViolationStage::RunBoundPreMarker)
 }
@@ -3559,7 +4077,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{symlink, PermissionsExt},
         time::Duration,
     };
 
@@ -3573,6 +4091,247 @@ mod tests {
         let root = anchor.verify_identity().unwrap();
         let temp = PrivateRunTemp::create(&root, run_id).unwrap();
         (holder, temp)
+    }
+
+    fn recovery_temp(
+        run_id: i64,
+    ) -> (
+        tempfile::TempDir,
+        VerifiedProjectRoot,
+        PrivateRunTemp,
+        PrivateRunTempRecoveryIdentityV1,
+    ) {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let temp = PrivateRunTemp::create(&root, run_id).unwrap();
+        let expected = temp.recovery_identity(&root).unwrap();
+        (holder, root, temp, expected)
+    }
+
+    #[test]
+    fn recovery_cleanup_reopens_exact_original_generation() {
+        let (_holder, root, temp, expected) = recovery_temp(740);
+        let payload = temp.path().join("payload");
+        fs::write(&payload, b"original").unwrap();
+
+        let mut recovered =
+            RecoveredPrivateRunTempCleanup::open(&root, 740, &expected).unwrap();
+        drop(temp);
+        let report = recovered.cleanup_contents_before(None).unwrap();
+
+        assert_eq!(report.entries_removed, 1);
+        assert!(!payload.exists());
+    }
+
+    #[test]
+    fn recovery_open_rejects_root_and_generation_replacements_without_touching_sentinels() {
+        {
+            let (holder, root, temp, expected) = recovery_temp(741);
+            let root_path = root.anchor.canonical_path.clone();
+            let retired = holder.path().join("retired-root");
+            fs::rename(&root_path, &retired).unwrap();
+            fs::create_dir(&root_path).unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let replacement = root_path
+                .join(PRIVATE_TEMP_ROOT)
+                .join(PRIVATE_TEMP_DIR)
+                .join("741");
+            fs::create_dir_all(&replacement).unwrap();
+            fs::set_permissions(
+                root_path.join(PRIVATE_TEMP_ROOT),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(
+                root_path.join(PRIVATE_TEMP_ROOT).join(PRIVATE_TEMP_DIR),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = replacement.join("sentinel");
+            fs::write(&sentinel, b"replacement-root").unwrap();
+
+            let error =
+                RecoveredPrivateRunTempCleanup::open(&root, 741, &expected).unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::RootChanged);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"replacement-root");
+            drop(temp);
+        }
+
+        {
+            let (_holder, root, temp, expected) = recovery_temp(742);
+            let original = temp.path().to_path_buf();
+            let retired = original.with_extension("retired");
+            fs::rename(&original, &retired).unwrap();
+            fs::create_dir(&original).unwrap();
+            fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = original.join("sentinel");
+            fs::write(&sentinel, b"replacement-generation").unwrap();
+
+            let error =
+                RecoveredPrivateRunTempCleanup::open(&root, 742, &expected).unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"replacement-generation");
+            drop(temp);
+        }
+    }
+
+    #[test]
+    fn recovery_open_rejects_symlink_mode_and_mount_mismatch_without_cleanup() {
+        {
+            let (_holder, root, temp, expected) = recovery_temp(743);
+            let original = temp.path().to_path_buf();
+            let retired = original.with_extension("retired");
+            fs::rename(&original, &retired).unwrap();
+            let target = retired.with_extension("target");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = target.join("sentinel");
+            fs::write(&sentinel, b"symlink-target").unwrap();
+            symlink(&target, &original).unwrap();
+
+            let error =
+                RecoveredPrivateRunTempCleanup::open(&root, 743, &expected).unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"symlink-target");
+            drop(temp);
+        }
+
+        {
+            let (_holder, root, temp, expected) = recovery_temp(744);
+            let sentinel = temp.path().join("sentinel");
+            fs::write(&sentinel, b"mode-mismatch").unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o1700)).unwrap();
+
+            let error =
+                RecoveredPrivateRunTempCleanup::open(&root, 744, &expected).unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"mode-mismatch");
+            drop(temp);
+        }
+
+        {
+            let (_holder, root, temp, mut expected) = recovery_temp(745);
+            let sentinel = temp.path().join("sentinel");
+            fs::write(&sentinel, b"mount-mismatch").unwrap();
+            expected.temp_identity.mount_identity[0] =
+                expected.temp_identity.mount_identity[0].wrapping_add(1);
+
+            let error =
+                RecoveredPrivateRunTempCleanup::open(&root, 745, &expected).unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"mount-mismatch");
+            drop(temp);
+        }
+    }
+
+    #[test]
+    fn recovery_open_rejects_changed_private_temp_parent_without_touching_sentinel() {
+        {
+            let (holder, root, temp, expected) = recovery_temp(746);
+            let service = root.anchor.canonical_path.join(PRIVATE_TEMP_ROOT);
+            let retired = holder.path().join("retired-service");
+            fs::rename(&service, &retired).unwrap();
+            fs::create_dir(&service).unwrap();
+            fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+            let replacement = service.join(PRIVATE_TEMP_DIR).join("746");
+            fs::create_dir_all(&replacement).unwrap();
+            fs::set_permissions(
+                service.join(PRIVATE_TEMP_DIR),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = replacement.join("sentinel");
+            fs::write(&sentinel, b"replacement-parent").unwrap();
+
+            let error = RecoveredPrivateRunTempCleanup::open(&root, 746, &expected)
+                .unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"replacement-parent");
+            drop(temp);
+        }
+
+        {
+            let (holder, root, temp, expected) = recovery_temp(747);
+            let parent = root
+                .anchor
+                .canonical_path
+                .join(PRIVATE_TEMP_ROOT)
+                .join(PRIVATE_TEMP_DIR);
+            let retired = holder.path().join("retired-temp-parent");
+            fs::rename(&parent, &retired).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let moved = parent.join("747");
+            fs::rename(retired.join("747"), &moved).unwrap();
+            let sentinel = moved.join("sentinel");
+            fs::write(&sentinel, b"replacement-temp-parent").unwrap();
+
+            let error = RecoveredPrivateRunTempCleanup::open(&root, 747, &expected)
+                .unwrap_err();
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"replacement-temp-parent");
+            drop(temp);
+        }
+    }
+
+    #[test]
+    fn recovery_identity_rejects_service_substitution_before_publishing() {
+        let (holder, root, temp, _expected) = recovery_temp(748);
+        let service = root.anchor.canonical_path.join(PRIVATE_TEMP_ROOT);
+        let retired = holder.path().join("retired-service");
+        fs::rename(&service, &retired).unwrap();
+        fs::create_dir(&service).unwrap();
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(
+            retired.join(PRIVATE_TEMP_DIR),
+            service.join(PRIVATE_TEMP_DIR),
+        )
+        .unwrap();
+        let sentinel = service
+            .join(PRIVATE_TEMP_DIR)
+            .join("748")
+            .join("sentinel");
+        fs::write(&sentinel, b"substituted-service").unwrap();
+
+        let error = temp.recovery_identity(&root).unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"substituted-service");
+        drop(temp);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn recovery_identity_is_path_free_and_strictly_serialized() {
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStringExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let root_path = holder.path().join(OsString::from_vec(vec![b'p', 0xff]));
+        #[cfg(target_os = "macos")]
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let temp = PrivateRunTemp::create(&root, 749).unwrap();
+        let expected = temp.recovery_identity(&root).unwrap();
+        let encoded = serde_json::to_value(&expected).unwrap();
+        let decoded: PrivateRunTempRecoveryIdentityV1 =
+            serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, expected);
+
+        let mut extra = encoded;
+        extra["temp_identity"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PrivateRunTempRecoveryIdentityV1>(extra).is_err());
     }
 
     #[test]
