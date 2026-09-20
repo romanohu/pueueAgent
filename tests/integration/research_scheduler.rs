@@ -2328,7 +2328,7 @@ async fn startup_recovery_preserves_unsafe_research_failure_as_typed_outcome() {
 async fn startup_recovery_preserves_research_owner_for_missing_malformed_or_foreign_authority() {
     for mutation in ["missing", "malformed", "foreign"] {
         let fixture = fixture();
-        let (review_id, run_id, event_id, _reservation_id, binding) =
+        let (review_id, run_id, event_id, reservation_id, binding) =
             i4_seed_bound_research(&fixture, false);
         i4_set_ready_result(&fixture, &review_id, &binding);
         i4_update_notes(&fixture, &review_id, |notes| {
@@ -2373,6 +2373,11 @@ async fn startup_recovery_preserves_research_owner_for_missing_malformed_or_fore
         assert_eq!(recovery.failed_runs, 0, "{mutation}");
         assert_eq!(recovery.requeued_events, 0, "{mutation}");
         assert_eq!(recovery.dead_lettered_events, 0, "{mutation}");
+        assert_eq!(
+            i4_reservation_status(&fixture, &reservation_id),
+            "consumed",
+            "{mutation} reservation"
+        );
         let after = ResearchRepository::new(&fixture.db)
             .find(&review_id)
             .expect("research review after fail-closed recovery");

@@ -1965,6 +1965,7 @@ async fn bound_cleanup_pending_project_defers_without_attempt_while_other_projec
 async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases() {
     let harness = DaemonHarness::new();
     prepare_healthy_research_fixture(&harness);
+    harness.register_project("project-b", "pb-project", "codex");
     let experiment_id = harness.campaign_experiment();
     let task = running_task();
     let task_signature = pueue_agent::reconcile::task_signature(&task);
@@ -2040,7 +2041,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
             DaemonConfig {
                 interval: Duration::from_millis(10),
                 lease_seconds: 60,
-                claim_limit: 100,
+                claim_limit: 1,
                 now_override: Some(harness.now),
                 shutdown_grace_period: Duration::from_secs(30),
             },
@@ -2050,6 +2051,10 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     let mut first_daemon = make_daemon();
     let first_report = first_daemon.run_once().await.unwrap();
     assert_eq!(first_report.research_started, 1);
+    let mut second_daemon = make_daemon();
+    let early_report = second_daemon.run_once().await.unwrap();
+    assert_eq!(early_report.research_started, 0);
+    assert_eq!(early_report.diagnoses, 0);
     let run_id: i64 = harness
         .db
         .connect()
@@ -2113,10 +2118,8 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     HealthRepository::set_state(&harness.db, &experiment_id, HealthState::Suspicious, harness.now)
         .unwrap();
 
-    // Complete startup recovery before making the retry due. This keeps the
-    // second daemon's wake at the explicit boundary below instead of having
-    // startup retry scheduling move it forward during this test.
-    let mut second_daemon = make_daemon();
+    // The second daemon was already started while the first owner was live.
+    // Its later pass must still observe the durable cleanup boundary.
     let warmup = second_daemon.run_once().await.unwrap();
     assert_eq!(warmup.research_started, 0);
     assert_eq!(warmup.diagnoses, 0);
@@ -2127,6 +2130,54 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
             .state,
         HealthState::Suspicious
     );
+
+    let later_experiment_id = harness.campaign_experiment_for(
+        "project-b",
+        "later-health-campaign",
+        "later-health-experiment",
+    );
+    let mut later_task = running_task();
+    later_task.id = 142;
+    later_task.group = "pb-project".to_owned();
+    let later_task_signature = pueue_agent::reconcile::task_signature(&later_task);
+    harness
+        .fake_pueue
+        .set_tasks(vec![running_task(), later_task.clone()]);
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&later_experiment_id, 202)
+        .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .mark_accepted(&later_experiment_id, later_task.id, &later_task_signature, 203)
+        .unwrap();
+    HealthRepository::ensure_running(
+        &harness.db,
+        "project-b",
+        "later-health-campaign",
+        &later_experiment_id,
+        later_task.id,
+        harness.now + 1,
+    )
+    .unwrap();
+    HealthRepository::record_observation(
+        &harness.db,
+        &later_experiment_id,
+        harness.now,
+        SignalSummaryEntry {
+            class: "oom".to_owned(),
+            source: "fixture".to_owned(),
+            evidence_digest: "later-health-fixture".to_owned(),
+            observed_at: harness.now,
+        },
+    )
+    .unwrap();
+    HealthRepository::set_state(
+        &harness.db,
+        &later_experiment_id,
+        HealthState::Suspicious,
+        harness.now + 1,
+    )
+    .unwrap();
+    let health_later_before = health_admission_snapshot(&harness.db, "project-b");
     let health_pending_before = health_admission_snapshot(&harness.db, "project-a");
 
     let research_run_count = || {
@@ -2185,13 +2236,17 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
 
     let blocked_report = second_daemon.run_once().await.unwrap();
     assert_eq!(blocked_report.research_started, 0);
-    assert_eq!(blocked_report.diagnoses, 0);
+    assert_eq!(blocked_report.diagnoses, 1);
     assert_eq!(research_run_count(), research_run_count_before);
     assert_eq!(reservation_count(), reservation_count_before);
     assert_eq!(
         health_admission_snapshot(&harness.db, "project-a"),
         health_pending_before
     );
+    let health_later_after = health_admission_snapshot(&harness.db, "project-b");
+    assert_eq!(health_later_after.0, health_later_before.0 + 1);
+    assert_eq!(health_later_after.1, health_later_before.1 + 1);
+    assert_eq!(health_later_after.2, health_later_before.2 + 1);
     assert_eq!(
         ResearchRepository::new(&harness.db)
             .find(&review.review_id)
