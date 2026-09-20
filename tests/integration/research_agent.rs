@@ -501,6 +501,31 @@ max_agent_runs = 10
         }
     }
 
+    fn admit_initial_review_attempt(&self, claimed: &ClaimedReview) -> (ClaimedReview, String) {
+        let now = claimed.claimed_at + 19;
+        let reservation = self.reserve_budget_for_attempt(&claimed.review, 1, now);
+        let review = ResearchRepository::new(&self.db)
+            .prepare_attempt(
+                &claimed.review.review_id,
+                &reservation.reservation_id,
+                CampaignLimits::default().max_decision_attempts_per_cycle,
+                now,
+            )
+            .unwrap()
+            .expect("the initial research review must admit attempt one");
+        assert_eq!(review.attempt, 1);
+        let evidence = build_research_evidence(&self.db, &review, now).unwrap();
+        (
+            ClaimedReview {
+                event_id: claimed.event_id,
+                review,
+                evidence,
+                claimed_at: claimed.claimed_at,
+            },
+            reservation.reservation_id,
+        )
+    }
+
     fn reserve_budget(
         &self,
         review: &pueue_agent::db::ResearchReview,
@@ -3097,10 +3122,19 @@ async fn research_terminal_agent_update_failure_does_not_replay_persisted_respon
 #[tokio::test]
 async fn research_replacement_daemon_retires_ready_response_after_terminal_failure() {
     let harness = ResearchHarness::new_for_replacement_daemon("restart-ready", FIRST_SESSION);
-    let claimed = harness.initial_review();
-    let mut handle = harness.launch(&claimed, AgentContextMode::Fresh).await;
+    let initial = harness.initial_review();
+    let (claimed, reservation_id) = harness.admit_initial_review_attempt(&initial);
+    let mut handle = harness
+        .try_launch_with_options(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            true,
+            Some(&reservation_id),
+        )
+        .await
+        .expect("admitted ready native launch must bind");
     let run_id = handle.run_id;
-    let reservation_id = harness.reservation_id_for(&claimed.review);
     let private_output = harness
         .project
         .root_path
@@ -3141,6 +3175,7 @@ async fn research_replacement_daemon_retires_ready_response_after_terminal_failu
         .unwrap()
         .expect("the research event must remain durable");
     assert_eq!(before.state, "ready");
+    assert_eq!(before.attempt, 1);
     assert_eq!(before_run.status, AgentRunStatus::Running);
     assert_eq!(before_run.launch_gate_state, "released");
     assert_eq!(before_event.status, EventStatus::Dispatched);
@@ -3192,6 +3227,14 @@ async fn research_replacement_daemon_retires_ready_response_after_terminal_failu
     assert_eq!(after.state, "ready");
     assert_eq!(after.response_json.as_deref(), Some(before_response.as_str()));
     assert_eq!(after.attempt, before.attempt);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap()
+            .blocked_reason
+            .as_deref(),
+        None
+    );
     assert_eq!(after_run.status, AgentRunStatus::Completed);
     assert!(after_run.finished_at.is_some());
     assert_eq!(after_event.status, EventStatus::Completed);
@@ -3248,7 +3291,8 @@ async fn research_replacement_daemon_retires_ready_response_after_terminal_failu
 #[tokio::test]
 async fn research_replacement_daemon_retires_classified_retry_after_terminal_failure() {
     let harness = ResearchHarness::new_for_replacement_daemon("restart-retry", FIRST_SESSION);
-    let claimed = harness.initial_review();
+    let initial = harness.initial_review();
+    let (claimed, reservation_id) = harness.admit_initial_review_attempt(&initial);
     let mut handle = harness
         .try_launch_with_fixture_mode(
             &claimed,
@@ -3256,14 +3300,13 @@ async fn research_replacement_daemon_retires_classified_retry_after_terminal_fai
             FIRST_SESSION,
             FIRST_SESSION,
             true,
-            None,
+            Some(&reservation_id),
             false,
             "malformed",
         )
         .await
         .expect("malformed native launch must bind");
     let run_id = handle.run_id;
-    let reservation_id = harness.reservation_id_for(&claimed.review);
     let private_output = harness
         .project
         .root_path
@@ -3303,6 +3346,7 @@ async fn research_replacement_daemon_retires_classified_retry_after_terminal_fai
     let retry_wake = retry_wake
         .expect("classified research failure must persist a retry wake");
     assert_eq!(before.state, "retry_wait");
+    assert_eq!(before.attempt, 1);
     assert_eq!(before_failure_code.as_deref(), Some("research_output_invalid"));
     assert!(before.response_json.is_none());
     let confirmed_session = harness.research_session();
@@ -3396,12 +3440,14 @@ async fn research_replacement_daemon_retires_classified_retry_after_terminal_fai
         )
         .unwrap();
     assert_eq!(run_count_after, run_count_before);
+
 }
 
 #[tokio::test]
 async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_terminal_failure() {
     let harness = ResearchHarness::new_for_replacement_daemon("restart-unsafe", FIRST_SESSION);
-    let claimed = harness.initial_review();
+    let initial = harness.initial_review();
+    let (claimed, reservation_id) = harness.admit_initial_review_attempt(&initial);
     let mut handle = harness
         .try_launch_with_fixture_mode(
             &claimed,
@@ -3409,14 +3455,13 @@ async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_termin
             FIRST_SESSION,
             FIRST_SESSION,
             true,
-            None,
+            Some(&reservation_id),
             true,
             "post-session-barrier",
         )
         .await
         .expect("postlaunch unsafe fixture must bind");
     let run_id = handle.run_id;
-    let reservation_id = harness.reservation_id_for(&claimed.review);
     let private_output = harness
         .project
         .root_path
@@ -3461,6 +3506,7 @@ async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_termin
     let retry_wake = retry_wake
         .expect("unsafe research failure must persist a retry wake");
     assert_eq!(before.state, "retry_wait");
+    assert_eq!(before.attempt, 1);
     assert_eq!(before_failure_code.as_deref(), Some("research_session_unsafe"));
     assert!(before.response_json.is_none());
     assert_eq!(harness.research_session(), None);
@@ -3497,27 +3543,26 @@ async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_termin
     };
     assert_eq!(report.research_started, 0);
 
+    let retired_review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(retired_review.state, "retry_wait");
+    assert_eq!(retired_review.attempt, before.attempt);
     let retired_event = EventRepository::new(&harness.db)
         .find_by_id(claimed.event_id)
         .unwrap()
         .expect("the retired research event must remain durable");
-    assert_eq!(
-        ResearchRepository::new(&harness.db)
-            .find(&claimed.review.review_id)
-            .unwrap()
-            .state,
-        "blocked"
-    );
     let (_, first_failure_code) = harness.review_retry_metadata(&claimed.review.review_id);
     assert_eq!(first_failure_code.as_deref(), Some("research_session_unsafe"));
-    assert_eq!(retired_event.status, EventStatus::Failed);
+    assert_eq!(retired_event.status, EventStatus::RetryWait);
+    assert_eq!(retired_event.not_before, retry_wake);
     assert_eq!(
         ResearchRepository::new(&harness.db)
             .state(&harness.campaign_id)
             .unwrap()
             .blocked_reason
             .as_deref(),
-        Some("research_session_unsafe")
+        None
     );
     assert!(!private_output.exists());
 
@@ -3590,6 +3635,70 @@ async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_termin
         )
         .unwrap();
     assert_eq!(run_count_after, run_count_before);
+
+    let settled_review = after.clone();
+    let settled_event = after_event.clone();
+    let settled_run = after_run.clone();
+    let settled_state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    let settled_notes = after_notes.clone();
+    let settled_retry_wake = after_retry_wake;
+    let settled_failure_code = after_failure_code.clone();
+    drop(blocker);
+    let mut idempotent = harness.replacement_daemon_at(retry_wake.saturating_add(1));
+    let idempotent_report = match Box::pin(idempotent.run_once()).await {
+        Ok(report) => report,
+        Err(error) => panic!("settled unsafe research owner must be idempotent: {error}"),
+    };
+    assert_eq!(idempotent_report.research_started, 0);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&claimed.review.review_id)
+            .unwrap(),
+        settled_review
+    );
+    let (idempotent_retry_wake, idempotent_failure_code) =
+        harness.review_retry_metadata(&claimed.review.review_id);
+    assert_eq!(idempotent_retry_wake, settled_retry_wake);
+    assert_eq!(idempotent_failure_code, settled_failure_code);
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .expect("the settled research event must remain durable"),
+        settled_event
+    );
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .find_by_id(run_id)
+            .unwrap()
+            .expect("the settled generic run must remain durable"),
+        settled_run
+    );
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap(),
+        settled_state
+    );
+    assert_eq!(harness.review_notes(&claimed.review.review_id), settled_notes);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count_before
+    );
+    let idempotent_run_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(idempotent_run_count, run_count_before);
 }
 
 #[tokio::test]
