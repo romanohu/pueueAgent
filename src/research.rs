@@ -72,9 +72,9 @@ pub(crate) async fn run_due_research_with_cleanup_blocked_projects(
 
     let repository = ResearchRepository::new(db);
     repository.schedule_running_campaigns(limits.research_interval_minutes, now, limit)?;
-    let mut due_reviews = repository.claim_due_campaigns(now, limit)?;
+    let mut due_reviews = repository.due_reviews(now, limit)?;
     let remaining = limit.saturating_sub(due_reviews.len());
-    for review in repository.due_reviews(now, remaining)? {
+    for review in repository.claim_due_campaigns(now, remaining)? {
         if due_reviews.len() >= limit {
             break;
         }
@@ -162,6 +162,23 @@ async fn launch_review(
         return Ok(());
     }
     let event_id = repository.event_id(review_id)?;
+    if review.state == "retry_wait" && !repository.retry_owner_ready(review_id)? {
+        report.deferred += 1;
+        return Ok(());
+    }
+    let cap_attempt = repository.next_attempt_for_launch(review_id)?;
+    if cap_attempt > i64::from(limits.max_decision_attempts_per_cycle) {
+        repository.block_review(review_id, "research_attempt_limit", now)?;
+        let _ = EventRepository::new(db).transition_many(
+            &[event_id],
+            EventStatus::Failed,
+            now,
+            None,
+            Some("research_attempt_limit"),
+        )?;
+        report.blocked += 1;
+        return Ok(());
+    }
     let Some(_event) = EventRepository::new(db).claim_by_id(
         &project_id_for_review(db, &review.campaign_id)?,
         event_id,
@@ -192,11 +209,6 @@ async fn launch_review(
         return Ok(());
     }
     if cleanup_blocked_projects.contains(&project.project_id) {
-        EventRepository::new(db).defer_claimed(&[event_id])?;
-        report.deferred += 1;
-        return Ok(());
-    }
-    if review.state == "retry_wait" && !repository.retry_owner_ready(review_id)? {
         EventRepository::new(db).defer_claimed(&[event_id])?;
         report.deferred += 1;
         return Ok(());

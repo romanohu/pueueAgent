@@ -1168,10 +1168,10 @@ impl AgentRunner {
                         &project_policy.root_anchor.canonical_path,
                         prior_session_id,
                     )
-                    .map_err(pre_binding_error)?
+                    .map_err(research_session_probe_error)?
                     {
                         crate::codex_session::OwnedSessionProbe::Owned(_) => {
-                            return Err(pre_binding_error(AppError::Validation {
+                            return Err(research_session_probe_error(AppError::Validation {
                                 field: "agent.context",
                                 message:
                                     "a campaign with an owned research session requires exact resume",
@@ -1210,9 +1210,9 @@ impl AgentRunner {
                     &project_policy.root_anchor.canonical_path,
                     session_id,
                 )
-                .map_err(pre_binding_error)?;
+                .map_err(research_session_probe_error)?;
                 if prior_session_id.as_deref() != Some(owned.as_str()) {
-                    return Err(pre_binding_error(AppError::Validation {
+                    return Err(research_session_probe_error(AppError::Validation {
                         field: "agent.context.session_id",
                         message: "research resume must use the campaign-owned session",
                     }));
@@ -2282,6 +2282,13 @@ fn pre_binding_error(source: AppError) -> AgentSpawnError {
         policy,
         cleanup: None,
     }
+}
+
+fn research_session_probe_error(_source: AppError) -> AgentSpawnError {
+    pre_binding_error(AppError::from(PolicyViolation::new(
+        PolicyViolationCode::SessionNotOwned,
+        PolicyViolationStage::PreBinding,
+    )))
 }
 
 /// Campaign-experiment lineage of the triggering event, when the run manages
