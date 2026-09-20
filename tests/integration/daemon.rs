@@ -40,9 +40,16 @@ use pueue_agent::{
     agent::AgentHandle,
     db::{
         CodeChangeRepository, HealthRepository, ResearchRepository, TaskObservationRepository,
+        ResearchLaunchBinding,
     },
-    models::{CodeChangeCheckStatus, HealthState, NewTaskObservation, SignalSummaryEntry},
+    environment::PrivateRunTemp,
+    models::{
+        CodeChangeCheckStatus, ExecutionProjection, HealthState, NewAgentRun,
+        NewTaskObservation, SignalSummaryEntry,
+    },
 };
+#[cfg(target_os = "linux")]
+use pueue_agent::research_evidence::build_research_evidence;
 
 #[cfg(target_os = "linux")]
 use pueue_agent::{
@@ -2461,6 +2468,384 @@ fn health_admission_snapshot(db: &Db, project_id: &str) -> (i64, i64, i64) {
         diagnosis_events,
         private_temp_generations,
     )
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct StartupRecoveryDbSnapshot {
+    review: Vec<String>,
+    event: Vec<String>,
+    run: Vec<String>,
+    campaign_research: Vec<String>,
+    reservations: Vec<Vec<String>>,
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_row_values(row: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<String>> {
+    (0..row.as_ref().column_count())
+        .map(|index| Ok(format!("{:?}", row.get_ref(index)?.to_owned())))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn startup_recovery_db_snapshot(
+    db: &Db,
+    campaign_id: &str,
+    review_id: &str,
+    event_id: i64,
+    run_id: i64,
+) -> StartupRecoveryDbSnapshot {
+    let connection = db.connect().unwrap();
+    let review = connection
+        .query_row(
+            "SELECT * FROM research_reviews WHERE review_id = ?1",
+            [review_id],
+            snapshot_row_values,
+        )
+        .unwrap();
+    let event = connection
+        .query_row(
+            "SELECT * FROM events WHERE event_id = ?1",
+            [event_id],
+            snapshot_row_values,
+        )
+        .unwrap();
+    let run = connection
+        .query_row(
+            "SELECT * FROM agent_runs WHERE run_id = ?1",
+            [run_id],
+            snapshot_row_values,
+        )
+        .unwrap();
+    let campaign_research = connection
+        .query_row(
+            "SELECT * FROM campaign_research WHERE campaign_id = ?1",
+            [campaign_id],
+            snapshot_row_values,
+        )
+        .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT * FROM budget_reservations
+             WHERE campaign_id = ?1 ORDER BY reservation_id",
+        )
+        .unwrap();
+    let reservations = statement
+        .query_map([campaign_id], snapshot_row_values)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    StartupRecoveryDbSnapshot {
+        review,
+        event,
+        run,
+        campaign_research,
+        reservations,
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SeededPidlessResearchOwner {
+    campaign_id: String,
+    review_id: String,
+    event_id: i64,
+    run_id: i64,
+    run_temp: PathBuf,
+    marker_path: PathBuf,
+    snapshot: StartupRecoveryDbSnapshot,
+}
+
+#[cfg(target_os = "linux")]
+fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearchOwner {
+    let experiment_id = harness.campaign_experiment();
+    let task = running_task();
+    let task_signature = pueue_agent::reconcile::task_signature(&task);
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&experiment_id, 190)
+        .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .mark_accepted(&experiment_id, task.id, &task_signature, 191)
+        .unwrap();
+    TaskObservationRepository::new(&harness.db)
+        .upsert(&NewTaskObservation::new(
+            "project-a",
+            &task_signature,
+            task.id,
+            &task.group,
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "Running",
+            Some(100),
+            Some(101),
+            None,
+            None,
+            harness.now,
+        ))
+        .unwrap();
+    let campaign_id = "daemon-campaign".to_owned();
+    ResearchRepository::new(&harness.db)
+        .ensure_campaign(&campaign_id)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET next_due_at = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![harness.now, campaign_id],
+        )
+        .unwrap();
+    let review = ResearchRepository::new(&harness.db)
+        .claim_due(
+            &campaign_id,
+            &experiment_id,
+            &task_signature,
+            harness.now,
+        )
+        .unwrap()
+        .expect("seeded running campaign must claim a research review");
+    let event_id: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT event_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .claim_by_id("project-a", event_id, harness.now + 60)
+        .unwrap()
+        .expect("seeded research event must be claimable");
+    let reservation = match CampaignRepository::new(&harness.db)
+        .reserve_agent_run(
+            &campaign_id,
+            &format!("research:{}:attempt:1", review.review_id),
+            &CampaignLimits::default(),
+            harness.now,
+        )
+        .unwrap()
+    {
+        pueue_agent::db::AgentDecisionReservation::Reserved(reservation) => reservation,
+        pueue_agent::db::AgentDecisionReservation::BudgetWaiting { .. }
+        | pueue_agent::db::AgentDecisionReservation::Deferred { .. } => {
+            panic!("seeded campaign reservation must be admitted")
+        }
+    };
+    let admitted = ResearchRepository::new(&harness.db)
+        .prepare_attempt(
+            &review.review_id,
+            &reservation.reservation_id,
+            CampaignLimits::default().max_decision_attempts_per_cycle,
+            harness.now,
+        )
+        .unwrap()
+        .expect("seeded research attempt must be admitted");
+    let evidence = build_research_evidence(&harness.db, &admitted, harness.now).unwrap();
+    let binding = ResearchLaunchBinding {
+        review_id: admitted.review_id.clone(),
+        campaign_id: admitted.campaign_id.clone(),
+        experiment_id: admitted.experiment_id.clone(),
+        attempt: admitted.attempt,
+        session_generation: admitted.session_generation,
+        prior_session_generation: admitted.session_generation,
+        session_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+        prior_session_id: None,
+        context_json: evidence.json,
+        context_digest: evidence.digest,
+        budget_reservation_id: reservation.reservation_id.clone(),
+        recovery_reason: None,
+    };
+    let policy = harness.policy();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production()
+            .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+        Arc::clone(&policy),
+    );
+    let project = ProjectRepository::new(&harness.db)
+        .find_by_id("project-a")
+        .unwrap()
+        .unwrap();
+    let project_config = config::load(&project.config_path).unwrap();
+    let project_policy = runner
+        .resolve_project_policy(&project, &project_config)
+        .unwrap();
+    let log_path = project
+        .root_path
+        .join(pueue_agent::agent::relative_log_path(event_id, harness.now));
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::with_context(
+                &project.project_id,
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                harness.now,
+                &log_path,
+                AgentContextMode::Fresh,
+                None,
+                vec![event_id.to_string()],
+            )
+            .with_execution(
+                ExecutionProjection::new("campaign_research", "/bin/echo", "fixture")
+                    .unwrap(),
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    ResearchRepository::new(&harness.db)
+        .bind_agent_run(&binding, run.run_id, &project.project_id, harness.now)
+        .unwrap();
+    let verified_root = project_policy.root_anchor.verify_identity().unwrap();
+    let temp = PrivateRunTemp::create(&verified_root, run.run_id).unwrap();
+    let recovery_identity = temp.recovery_identity(&verified_root).unwrap();
+    ResearchRepository::new(&harness.db)
+        .record_native_recovery_authority(
+            &binding,
+            run.run_id,
+            &recovery_identity,
+            true,
+            harness.now,
+        )
+        .unwrap();
+    let run_temp = temp.path().to_path_buf();
+    let marker_path = PathBuf::from(format!("{}.gate-started", log_path.display()));
+    assert!(!marker_path.exists());
+    let snapshot = startup_recovery_db_snapshot(
+        &harness.db,
+        &campaign_id,
+        &admitted.review_id,
+        event_id,
+        run.run_id,
+    );
+    SeededPidlessResearchOwner {
+        campaign_id,
+        review_id: admitted.review_id,
+        event_id,
+        run_id: run.run_id,
+        run_temp,
+        marker_path,
+        snapshot,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn startup_pidless_absent_recovery_rolls_back_cleanup_and_cas_failures() {
+    let harness = DaemonHarness::new();
+    prepare_healthy_research_fixture(&harness);
+    let seeded = seed_pidless_research_owner(&harness);
+    let baseline = research_crash_snapshot(&harness.db, &seeded.review_id);
+    let overflow_subtree = create_cleanup_depth_overflow(&seeded.run_temp);
+    let mut daemon = harness.daemon();
+
+    assert!(
+        daemon.run_once().await.is_err(),
+        "cleanup overflow must fail before startup-owner retirement"
+    );
+    assert_eq!(
+        startup_recovery_db_snapshot(
+            &harness.db,
+            &seeded.campaign_id,
+            &seeded.review_id,
+            seeded.event_id,
+            seeded.run_id,
+        ),
+        seeded.snapshot
+    );
+    assert!(overflow_subtree.is_dir());
+
+    fs::remove_dir_all(&overflow_subtree).unwrap();
+    assert!(
+        fs::read_dir(&seeded.run_temp)
+            .unwrap()
+            .next()
+            .is_none(),
+        "successful cleanup must remove the overflow subtree before its CAS"
+    );
+    let cleanup_sentinel = seeded.run_temp.join("late-cas-sentinel");
+    fs::write(&cleanup_sentinel, b"cleanup-before-cas").unwrap();
+    let escaped_review_id = seeded.review_id.replace('\'', "''");
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_pidless_recovery_review_cas
+             BEFORE UPDATE OF failure_code ON research_reviews
+             WHEN OLD.review_id = '{escaped_review_id}'
+                  AND NEW.failure_code = 'research_interrupted'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected startup recovery review CAS failure');
+             END;"
+        ))
+        .unwrap();
+    assert!(
+        daemon.run_once().await.is_err(),
+        "late startup-owner CAS failure must be returned after cleanup"
+    );
+    assert_eq!(
+        startup_recovery_db_snapshot(
+            &harness.db,
+            &seeded.campaign_id,
+            &seeded.review_id,
+            seeded.event_id,
+            seeded.run_id,
+        ),
+        seeded.snapshot
+    );
+    assert!(!cleanup_sentinel.exists());
+    assert!(
+        fs::read_dir(&seeded.run_temp)
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_eq!(
+        research_crash_snapshot(&harness.db, &seeded.review_id)
+            .cleanup_phase
+            .as_deref(),
+        Some("pending")
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_pidless_recovery_review_cas;")
+        .unwrap();
+
+    let retired = daemon
+        .run_once()
+        .await
+        .expect("startup owner should retire after both faults are removed");
+    assert_eq!(retired.research_started, 0);
+    let retired_snapshot = research_crash_snapshot(&harness.db, &seeded.review_id);
+    assert_eq!(retired_snapshot.review_state, "retry_wait");
+    assert_eq!(retired_snapshot.event_status, "retry_wait");
+    assert_eq!(retired_snapshot.run_status.as_deref(), Some("failed"));
+    assert_eq!(retired_snapshot.run_pid, None);
+    assert_eq!(retired_snapshot.gate_state.as_deref(), Some("failed"));
+    assert_eq!(retired_snapshot.cleanup_phase.as_deref(), Some("complete"));
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&seeded.campaign_id)
+            .unwrap()
+            .session_id,
+        None
+    );
+    assert_eq!(retired_snapshot.run_count, baseline.run_count);
+    assert_eq!(retired_snapshot.reservation_count, baseline.reservation_count);
+    assert!(!seeded.marker_path.exists());
+
+    let after_idempotent = daemon
+        .run_once()
+        .await
+        .expect("retired startup owner should be absent on the next pass");
+    assert_eq!(after_idempotent.research_started, 0);
+    let after_snapshot = research_crash_snapshot(&harness.db, &seeded.review_id);
+    assert_eq!(after_snapshot.run_count, retired_snapshot.run_count);
+    assert_eq!(after_snapshot.reservation_count, retired_snapshot.reservation_count);
+    assert_eq!(after_snapshot.cleanup_phase, retired_snapshot.cleanup_phase);
 }
 
 #[cfg(target_os = "linux")]
