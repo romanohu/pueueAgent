@@ -351,7 +351,7 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
     }
 }
 
-fn decision_resource_id(kind: &str, reservation: &DecisionReservation) -> String {
+pub(crate) fn decision_resource_id(kind: &str, reservation: &DecisionReservation) -> String {
     let digest = Sha256::digest(
         format!(
             "campaign-decision-intent:v1\0{}\0{}\0{kind}",

@@ -2,16 +2,17 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use sha2::{Digest, Sha256};
 
 use crate::{
-    decision_evidence::{
-        decision_context_schema_version, validate_stored_decision_context,
-    },
+    decision::decision_resource_id,
+    decision_evidence::{decision_context_schema_version, validate_stored_decision_context},
+    decision_protocol::{parse_and_validate_decision, ValidatedDecision},
     diagnostics::MAX_EVENT_LIST_LIMIT,
     execution_policy::CampaignLimits,
     models::{
         AgentRunStatus, CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle,
-        DecisionCycleState, Event, EventKind, EventStatus, ExperimentStatus, NewEvent,
+        DecisionCycleState, Event, EventKind, EventStatus, ExperimentStatus, NewEvent, ProposalKind,
     },
     output::bounded_redacted_text,
+    proposals::ValidatedProposal,
     research_protocol::parse_research_answer,
     AppError,
 };
@@ -98,6 +99,387 @@ pub struct DecisionReservation {
     pub source_experiment_id: String,
     pub attempt_number: i64,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecisionSuccessorAuthority {
+    pub reservation: DecisionReservation,
+    pub proposal_id: String,
+    pub experiment_id: String,
+    pub submission_id: String,
+}
+
+pub(crate) fn validate_decision_successor_in_transaction(
+    transaction: &Transaction<'_>,
+    reservation: &DecisionReservation,
+    proposal: &ValidatedProposal,
+    proposal_id: &str,
+    experiment_id: &str,
+    submission_id: &str,
+    limits: CampaignLimits,
+) -> Result<DecisionSuccessorAuthority, AppError> {
+    let authority = read_authority(transaction, &reservation.cycle_id)?;
+    validate_reservation_lineage(&authority, reservation)?;
+    validate_authority_lineage(&authority)?;
+
+    let expected_cycle_id = DecisionRepository::terminal_cycle_id(
+        &authority.cycle.campaign_id,
+        &authority.cycle.source_experiment_id,
+    );
+    if authority.cycle.cycle_id != expected_cycle_id {
+        return Err(validation_error(
+            "decision_cycle",
+            "does not identify the deterministic terminal cycle",
+        ));
+    }
+
+    let latest_attempt_number: i64 = transaction
+        .query_row(
+            "SELECT MAX(attempt_number) FROM decision_attempts WHERE cycle_id = ?1",
+            [&reservation.cycle_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read latest decision successor attempt"))?;
+    if latest_attempt_number != reservation.attempt_number {
+        return Err(validation_error(
+            "decision_reservation",
+            "must identify the latest persisted decision attempt",
+        ));
+    }
+    let attempt = read_attempt(
+        transaction,
+        &reservation.cycle_id,
+        reservation.attempt_number,
+    )?;
+    if attempt.state != DecisionAttemptState::Decided
+        || attempt.decision_kind.as_deref() != Some("proposal")
+    {
+        return Err(validation_error(
+            "decision_attempt",
+            "must be the latest decided proposal attempt",
+        ));
+    }
+    if !matches!(
+        authority.cycle.state,
+        DecisionCycleState::Analyzing | DecisionCycleState::Completed
+    ) {
+        return Err(validation_error(
+            "decision_cycle",
+            "must be analyzing or completed for successor admission",
+        ));
+    }
+
+    let context_json = attempt.context_json.as_deref().ok_or_else(|| {
+        validation_error(
+            "decision_context",
+            "must remain persisted on the decided attempt",
+        )
+    })?;
+    validate_payload("context_json", context_json)?;
+    let context_schema_version = decision_context_schema_version(context_json)?;
+    if attempt.context_schema_version != Some(i64::from(context_schema_version)) {
+        return Err(validation_error(
+            "decision_context.schema_version",
+            "does not match the persisted decision context",
+        ));
+    }
+    let context_digest = attempt.context_digest.as_deref().ok_or_else(|| {
+        validation_error(
+            "context_digest",
+            "must remain persisted on the decided attempt",
+        )
+    })?;
+    validate_token("context_digest", context_digest, MAX_DECISION_DIGEST_BYTES)?;
+    if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+        return Err(validation_error(
+            "context_digest",
+            "does not match the exact persisted decision context",
+        ));
+    }
+    validate_stored_decision_context(
+        context_json,
+        &authority.objective_digest,
+        &authority.cycle.source_experiment_id,
+    )?;
+
+    let decision_json = attempt.decision_json.as_deref().ok_or_else(|| {
+        validation_error(
+            "decision_json",
+            "must remain persisted on the decided attempt",
+        )
+    })?;
+    validate_payload("decision_json", decision_json)?;
+    let decision_digest = attempt.decision_digest.as_deref().ok_or_else(|| {
+        validation_error(
+            "decision_digest",
+            "must remain persisted on the decided attempt",
+        )
+    })?;
+    validate_token("decision_digest", decision_digest, MAX_DECISION_DIGEST_BYTES)?;
+    let persisted_decision = parse_and_validate_decision(
+        decision_json.as_bytes(),
+        &authority.objective_digest,
+        limits,
+    )?;
+    let persisted_proposal = match persisted_decision {
+        ValidatedDecision::Proposal(proposal) => proposal,
+        _ => {
+            return Err(validation_error(
+                "decision_kind",
+                "must remain a proposal decision",
+            ));
+        }
+    };
+    if decision_digest != persisted_proposal.canonical_digest() {
+        return Err(validation_error(
+            "decision_digest",
+            "does not match the reparsed persisted decision",
+        ));
+    }
+    if persisted_proposal.canonical_digest() != proposal.canonical_digest()
+        || persisted_proposal.source_experiment_id()
+            != Some(authority.cycle.source_experiment_id.as_str())
+        || proposal.source_experiment_id()
+            != Some(authority.cycle.source_experiment_id.as_str())
+    {
+        return Err(validation_error(
+            "proposal",
+            "does not match the persisted terminal decision proposal",
+        ));
+    }
+
+    let persisted_reservation = DecisionReservation {
+        cycle_id: authority.cycle.cycle_id.clone(),
+        campaign_id: authority.cycle.campaign_id.clone(),
+        source_experiment_id: authority.cycle.source_experiment_id.clone(),
+        attempt_number: attempt.attempt_number,
+        created_at: attempt.created_at,
+    };
+    let expected_proposal_id = decision_resource_id("proposal", &persisted_reservation);
+    let expected_experiment_id = decision_resource_id("experiment", &persisted_reservation);
+    let expected_submission_id = decision_resource_id("submission", &persisted_reservation);
+    if proposal_id != expected_proposal_id
+        || experiment_id != expected_experiment_id
+        || submission_id != expected_submission_id
+    {
+        return Err(validation_error(
+            "decision_resources",
+            "must use deterministic IDs derived from the persisted cycle and attempt",
+        ));
+    }
+
+    let ownership = research_ownership_in_transaction(
+        transaction,
+        &authority.project_id,
+        &authority.cycle.campaign_id,
+        &authority.cycle.source_experiment_id,
+    )?;
+    let linked_successor = match ownership {
+        ResearchOwnership::None => false,
+        ResearchOwnership::Open(_) => {
+            return Err(validation_error(
+                "research_ownership",
+                "must not be open during successor admission",
+            ));
+        }
+        ResearchOwnership::Attached(owner) => {
+            if owner.project_id != authority.project_id
+                || owner.campaign_id != authority.cycle.campaign_id
+                || owner.source_experiment_id != authority.cycle.source_experiment_id
+                || owner.decision_cycle_id.as_deref() != Some(expected_cycle_id.as_str())
+            {
+                return Err(validation_error(
+                    "research_ownership",
+                    "must identify the exact attached cycle",
+                ));
+            }
+            match owner.successor_experiment_id.as_deref() {
+                None => false,
+                Some(successor) if successor == expected_experiment_id => true,
+                Some(_) => {
+                    return Err(validation_error(
+                        "research_ownership",
+                        "attached successor does not match the deterministic experiment ID",
+                    ));
+                }
+            }
+        }
+    };
+
+    if linked_successor || authority.cycle.state == DecisionCycleState::Completed {
+        validate_successor_proof(
+            transaction,
+            &authority,
+            &persisted_proposal,
+            &expected_proposal_id,
+            &expected_experiment_id,
+            &expected_submission_id,
+            linked_successor,
+        )?;
+    }
+
+    Ok(DecisionSuccessorAuthority {
+        reservation: persisted_reservation,
+        proposal_id: expected_proposal_id,
+        experiment_id: expected_experiment_id,
+        submission_id: expected_submission_id,
+    })
+}
+
+fn validate_successor_proof(
+    transaction: &Transaction<'_>,
+    authority: &DecisionAuthority,
+    persisted_proposal: &ValidatedProposal,
+    expected_proposal_id: &str,
+    expected_experiment_id: &str,
+    expected_submission_id: &str,
+    linked_successor: bool,
+) -> Result<(), AppError> {
+    if authority.cycle.state == DecisionCycleState::Completed
+        && (authority.cycle.last_decision_kind.as_deref() != Some("proposal")
+            || authority.cycle.next_wake_at.is_some())
+    {
+        return Err(validation_error(
+            "decision_cycle",
+            "completed successor admission lacks proposal completion proof",
+        ));
+    }
+
+    let durable_proposal: Option<(ProposalKind, crate::models::ProposalStatus)> = transaction
+        .query_row(
+            "SELECT kind, status FROM proposals
+             WHERE proposal_id = ?1 AND campaign_id = ?2
+               AND source_experiment_id = ?3
+               AND canonical_digest = ?4",
+            params![
+                expected_proposal_id,
+                authority.cycle.campaign_id,
+                authority.cycle.source_experiment_id,
+                persisted_proposal.canonical_digest(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(database_error("validate successor proposal proof"))?;
+    let Some((durable_kind, durable_status)) = durable_proposal else {
+        return Err(validation_error(
+            "proposal_id",
+            "successor admission lacks its durable proposal",
+        ));
+    };
+    if durable_kind != persisted_proposal.kind() {
+        return Err(validation_error(
+            "proposal.kind",
+            "successor admission proposal kind changed",
+        ));
+    }
+
+    if persisted_proposal.kind() == ProposalKind::CodeChange
+        && !linked_successor
+        && durable_status == crate::models::ProposalStatus::Pending
+    {
+        let editor_admission_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM code_change_runs
+                     WHERE campaign_id = ?1 AND proposal_id = ?2
+                       AND state = 'candidate_ready' AND experiment_id IS NULL
+                 )",
+                params![authority.cycle.campaign_id, expected_proposal_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("validate pending code-change proof"))?;
+        if !editor_admission_exists {
+            return Err(validation_error(
+                "code_change.run",
+                "pending code-change admission lacks its exact candidate-ready editor run",
+            ));
+        }
+        return Ok(());
+    }
+
+    if durable_status != crate::models::ProposalStatus::Accepted {
+        return Err(validation_error(
+            "proposal.status",
+            "successor admission requires an accepted durable proposal",
+        ));
+    }
+
+    let intent_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM experiments AS experiment
+                 JOIN submissions AS submission
+                   ON submission.submission_id = experiment.submission_id
+                 JOIN budget_reservations AS budget
+                   ON budget.experiment_id = experiment.experiment_id
+                  AND budget.campaign_id = experiment.campaign_id
+                  AND budget.dimension = 'experiment'
+                  AND budget.status IN ('reserved','consumed')
+                 WHERE experiment.experiment_id = ?1
+                   AND experiment.campaign_id = ?2
+                   AND experiment.proposal_id = ?3
+                   AND experiment.submission_id = ?4
+                   AND submission.submission_id = ?4
+                   AND submission.project_id = ?5
+             )",
+            params![
+                expected_experiment_id,
+                authority.cycle.campaign_id,
+                expected_proposal_id,
+                expected_submission_id,
+                authority.project_id,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(database_error("validate successor experiment proof"))?;
+    if !intent_exists {
+        return Err(validation_error(
+            "experiment_id",
+            "successor admission lacks its durable experiment intent",
+        ));
+    }
+
+    if persisted_proposal.kind() == ProposalKind::CodeChange {
+        let candidate_binding_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM code_change_runs AS run
+                     JOIN experiments AS experiment
+                       ON experiment.experiment_id = run.experiment_id
+                      AND experiment.code_change_run_id = run.code_change_run_id
+                     WHERE run.campaign_id = ?1 AND run.proposal_id = ?2
+                       AND run.state = 'experiment_submitted'
+                       AND run.experiment_id = ?3
+                       AND experiment.campaign_id = ?1
+                       AND experiment.proposal_id = ?2
+                       AND experiment.submission_id = ?4
+                 )",
+                params![
+                    authority.cycle.campaign_id,
+                    expected_proposal_id,
+                    expected_experiment_id,
+                    expected_submission_id,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error("validate submitted code-change proof"))?;
+        if !candidate_binding_exists {
+            return Err(validation_error(
+                "code_change.run",
+                "accepted code-change admission lacks its exact submitted editor binding",
+            ));
+        }
+    } else if !linked_successor && authority.cycle.state != DecisionCycleState::Completed {
+        return Err(validation_error(
+            "research_ownership",
+            "experiment intent is not linked to the attached research owner",
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +868,21 @@ impl<'db> DecisionRepository<'db> {
             }
             event
         } else {
+            let decision_attempt_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM decision_attempts WHERE cycle_id = ?1
+                     )",
+                    [cycle_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(database_error("check decision attempts before research event insert"))?;
+            if decision_attempt_exists {
+                return Err(validation_error(
+                    "research.handoff",
+                    "cannot create an unclaimed terminal event after decision work exists",
+                ));
+            }
             if already_attached {
                 return Err(validation_error(
                     "research.handoff",
@@ -3130,6 +3527,2052 @@ mod research_attachment_tests {
                 },
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_successor_tests {
+    use super::*;
+    use crate::{
+        db::{
+            AgentRunRepository, CampaignRepository, EventRepository, ExperimentRepository,
+            IncidentRepository, ProjectRepository, ProposalAcceptance, ResearchRepository,
+            StartCampaignRequest, TaskObservationRepository, TerminationRequestRepository,
+        },
+        decision_evidence::{
+            DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
+        },
+        decision_protocol::{parse_and_validate_decision, ValidatedDecision},
+        execution_policy::{CampaignLimits, ProjectRootAnchor},
+        models::{
+            AgentContextMode, AgentRunStatus, CodeChangeState, ExecutionProjection,
+            NewAgentRun, NewCodeChangeRun, NewEvent, NewIncident, NewProject,
+            NewTaskObservation, NewTerminationRequest, ProposalKind, TerminationRequestStatus,
+        },
+        pueue::PueueTask,
+        proposals::{self, ProposalInput, ValidatedProposal},
+        reconcile::{managed_task_run_signature, task_signature},
+        state::ObjectiveSnapshot,
+    };
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _temp: TempDir,
+        db: Db,
+        reservation: DecisionReservation,
+        proposal: ValidatedProposal,
+    }
+
+    struct BaseFixture {
+        _temp: TempDir,
+        db: Db,
+        cycle: DecisionCycle,
+    }
+
+    fn base_fixture() -> BaseFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                "project-1",
+                &root,
+                "group-1",
+                root.join("config.toml"),
+                1,
+            ))
+            .unwrap();
+        let objective = ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "objective-digest".to_owned(),
+        };
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Measure the initial command".to_owned(),
+                source_experiment_id: None,
+                argv: vec!["python".to_owned(), "train.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            "objective-digest",
+        )
+        .unwrap();
+        CampaignRepository::new(&db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "campaign-1",
+                    project_id: "project-1",
+                    objective: &objective,
+                    initial_argv: baseline.argv(),
+                    baseline: &baseline,
+                    submission_id: "submission-baseline",
+                    experiment_id: "experiment-1",
+                    proposal_id: "proposal-baseline",
+                    metadata: &serde_json::json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: 100,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        ExperimentRepository::new(&db)
+            .mark_submitting("experiment-1", 101)
+            .unwrap();
+        ExperimentRepository::new(&db)
+            .mark_accepted("experiment-1", 41, "pueue-task:v1:decision-fixture", 102)
+            .unwrap();
+        ExperimentRepository::new(&db)
+            .project_terminal_submission(
+                "experiment-1",
+                41,
+                crate::models::ExperimentTerminalOutcome::Succeeded,
+                103,
+            )
+            .unwrap();
+
+        let decisions = DecisionRepository::new(&db);
+        let cycle = decisions
+            .ensure_cycle_for_terminal("campaign-1", "experiment-1", 104)
+            .unwrap();
+        BaseFixture {
+            _temp: temp,
+            db,
+            cycle,
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let BaseFixture {
+            _temp: temp,
+            db,
+            cycle,
+        } = base_fixture();
+        let decisions = DecisionRepository::new(&db);
+        let reservation = decisions
+            .reserve_next_attempt("project-1", &cycle.cycle_id, 105)
+            .unwrap()
+            .unwrap();
+        let project = ProjectRepository::new(&db)
+            .find_by_id("project-1")
+            .unwrap()
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let context = DecisionEvidenceBuilder::new(&db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &[DecisionPueueTaskProjection {
+                    task_id: 41,
+                    task_signature: "pueue-task:v1:decision-fixture".to_owned(),
+                    group: "group-1".to_owned(),
+                    state: "done".to_owned(),
+                    enqueued_at: Some(100),
+                    started_at: Some(101),
+                    ended_at: Some(103),
+                    exit_code: Some(0),
+                }],
+                observed_at: 106,
+            })
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, &context.json, &context.digest, 107)
+            .unwrap();
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Try the next command".to_owned(),
+                source_experiment_id: Some("experiment-1".to_owned()),
+                argv: vec!["python".to_owned(), "next.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            "objective-digest",
+        )
+        .unwrap();
+        let decision_json = serde_json::json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "experiment",
+                "hypothesis": proposal.hypothesis(),
+                "source_experiment_id": proposal.source_experiment_id(),
+                "argv": proposal.argv(),
+                "working_directory": proposal.working_directory(),
+                "expected_evidence": proposal.expected_evidence(),
+            },
+            "reason": null,
+            "requested_wait_minutes": null,
+            "expected_evidence": null,
+            "evidence_ref": null,
+        })
+        .to_string();
+        let decision_digest = match parse_and_validate_decision(
+            decision_json.as_bytes(),
+            "objective-digest",
+            CampaignLimits::default(),
+        )
+        .unwrap()
+        {
+            ValidatedDecision::Proposal(proposal) => proposal.canonical_digest().to_owned(),
+            _ => unreachable!(),
+        };
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET state = 'decided', decision_json = ?1, decision_digest = ?2,
+                     decision_kind = 'proposal', finished_at = 108
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![
+                    decision_json,
+                    decision_digest,
+                    reservation.cycle_id,
+                    reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        Fixture {
+            _temp: temp,
+            db,
+            reservation,
+            proposal,
+        }
+    }
+
+    fn ids(reservation: &DecisionReservation) -> (String, String, String) {
+        (
+            decision_resource_id("proposal", reservation),
+            decision_resource_id("experiment", reservation),
+            decision_resource_id("submission", reservation),
+        )
+    }
+
+    fn assert_initial_attached_authority(fixture: &Fixture) {
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let successor: Option<String> = transaction
+            .query_row(
+                "SELECT successor_experiment_id FROM research_reviews
+                 WHERE review_id = 'review-attached'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(successor.is_none());
+        let deterministic_proposal_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM proposals WHERE proposal_id = ?1",
+                [proposal_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let deterministic_editor_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM code_change_runs WHERE proposal_id = ?1",
+                [proposal_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let deterministic_budget_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE dimension = 'code_change' AND subject_key = ?1",
+                [proposal_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deterministic_proposal_count, 0);
+        assert_eq!(deterministic_editor_count, 0);
+        assert_eq!(deterministic_budget_count, 0);
+        let authority = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(authority.reservation, fixture.reservation);
+        assert_eq!(authority.proposal_id, proposal_id);
+        assert_eq!(authority.experiment_id, experiment_id);
+        assert_eq!(authority.submission_id, submission_id);
+        transaction.commit().unwrap();
+    }
+
+    fn persist_ordinary_successor_fixture(fixture: &Fixture) {
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let argv_json = serde_json::to_string(fixture.proposal.argv()).unwrap();
+        let evidence_json = serde_json::to_string(fixture.proposal.expected_evidence()).unwrap();
+        let metadata_json = serde_json::json!({
+            "campaign_id": fixture.reservation.campaign_id,
+            "proposal_id": proposal_id,
+            "experiment_id": experiment_id,
+        })
+        .to_string();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'accepted', ?4, ?5, ?6, ?7, ?8, ?9,
+                           NULL, ?10, ?10)",
+                params![
+                    proposal_id,
+                    fixture.reservation.campaign_id,
+                    fixture.proposal.kind(),
+                    fixture.proposal.hypothesis(),
+                    fixture.proposal.source_experiment_id(),
+                    argv_json,
+                    fixture.proposal.working_directory(),
+                    evidence_json,
+                    fixture.proposal.canonical_digest(),
+                    119_i64,
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at,
+                    pueue_task_id, task_signature, status, kind, metadata_json,
+                    origin_agent_run_id
+                 ) VALUES (?1, 'project-1', ?2, ?3, NULL, NULL, 'pending',
+                           'experiment', ?4, NULL)",
+                params![submission_id, argv_json, 119_i64, metadata_json],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id,
+                    task_signature, failure_code, failure_fingerprint,
+                    created_at, updated_at, finished_at, resume_of_experiment_id,
+                    checkpoint_note, code_change_run_id, code_revision_sha
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'reserved', NULL, NULL,
+                           NULL, NULL, ?6, ?6, NULL, NULL, NULL, NULL, NULL)",
+                params![
+                    experiment_id,
+                    fixture.reservation.campaign_id,
+                    proposal_id,
+                    submission_id,
+                    fixture.reservation.source_experiment_id,
+                    119_i64,
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO budget_reservations (
+                    reservation_id, campaign_id, experiment_id, dimension,
+                    subject_key, status, window_started_at, window_ends_at,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'experiment', ?3, 'reserved',
+                           ?4, ?5, ?4, ?4)",
+                params![
+                    format!("experiment:{experiment_id}"),
+                    fixture.reservation.campaign_id,
+                    experiment_id,
+                    119_i64,
+                    120_i64,
+                ],
+            )
+            .unwrap();
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET successor_experiment_id = ?1
+                 WHERE review_id = 'review-attached'
+                   AND decision_cycle_id = ?2
+                   AND state = 'completed' AND operation_stage IS NULL
+                   AND successor_experiment_id IS NULL",
+                params![experiment_id, fixture.reservation.cycle_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        transaction.commit().unwrap();
+    }
+
+    fn persist_code_change_editor_fixture(fixture: &Fixture) {
+        let (proposal_id, _, _) = ids(&fixture.reservation);
+        let candidate_ref = crate::code_change::candidate_ref(
+            &fixture.reservation.campaign_id,
+            &proposal_id,
+        )
+        .unwrap();
+        let best_ref = crate::code_change::best_ref(&fixture.reservation.campaign_id).unwrap();
+        let argv_json = serde_json::to_string(fixture.proposal.argv()).unwrap();
+        let evidence_json = serde_json::to_string(fixture.proposal.expected_evidence()).unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, 'code_change', 'pending', ?3, ?4, ?5, ?6,
+                           ?7, ?8, NULL, ?9, ?9)",
+                params![
+                    proposal_id,
+                    fixture.reservation.campaign_id,
+                    fixture.proposal.hypothesis(),
+                    fixture.proposal.source_experiment_id(),
+                    argv_json,
+                    fixture.proposal.working_directory(),
+                    evidence_json,
+                    fixture.proposal.canonical_digest(),
+                    119_i64,
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO code_change_runs (
+                    code_change_run_id, proposal_id, campaign_id, state, base_sha,
+                    candidate_sha, candidate_ref, best_ref, worktree_id,
+                    worktree_relative_path, editor_session_id, editor_attempts,
+                    diff_digest, changed_file_count, diff_bytes, experiment_id,
+                    rejection_code, rejection_summary, promotion_outcome,
+                    promotion_expected_best_experiment_id, promotion_expected_old_sha,
+                    promotion_target_sha, cleanup_completed_at, created_at, updated_at
+                 ) VALUES ('code-change-attached-authority-run', ?1, ?2,
+                           'reserved',
+                           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', NULL, ?3,
+                           ?4, 'worktree-code-change-attached-authority', ?5,
+                           NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                           NULL, NULL, NULL, NULL, ?6, ?6)",
+                params![
+                    proposal_id,
+                    fixture.reservation.campaign_id,
+                    candidate_ref,
+                    best_ref,
+                    format!(".pueue-agent/worktrees/campaign-1/{proposal_id}"),
+                    119_i64,
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO budget_reservations (
+                    reservation_id, campaign_id, experiment_id, dimension,
+                    subject_key, status, window_started_at, window_ends_at,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, NULL, 'code_change', ?3, 'consumed',
+                           ?4, ?5, ?4, ?4)",
+                params![
+                    format!("code-change:{proposal_id}"),
+                    fixture.reservation.campaign_id,
+                    proposal_id,
+                    119_i64,
+                    120_i64,
+                ],
+            )
+            .unwrap();
+        let changed = transaction
+            .execute(
+                "UPDATE code_change_runs
+                 SET state = 'candidate_ready', candidate_sha = ?1,
+                     diff_digest = 'authority-diff', changed_file_count = 1,
+                     diff_bytes = 1, updated_at = ?2
+                 WHERE code_change_run_id = 'code-change-attached-authority-run'",
+                params![
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    119_i64,
+                ],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        transaction.commit().unwrap();
+    }
+
+    fn persist_code_change_successor_fixture(fixture: &Fixture) {
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let argv_json = serde_json::to_string(fixture.proposal.argv()).unwrap();
+        let metadata_json = serde_json::json!({
+            "campaign_id": fixture.reservation.campaign_id,
+            "proposal_id": proposal_id,
+            "experiment_id": experiment_id,
+        })
+        .to_string();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let proposal_changed = transaction
+            .execute(
+                "UPDATE proposals
+                 SET status = 'accepted', reject_reason = NULL, updated_at = ?1
+                 WHERE proposal_id = ?2 AND campaign_id = ?3 AND status = 'pending'",
+                params![119_i64, proposal_id, fixture.reservation.campaign_id],
+            )
+            .unwrap();
+        assert_eq!(proposal_changed, 1);
+        transaction
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at,
+                    pueue_task_id, task_signature, status, kind, metadata_json,
+                    origin_agent_run_id
+                 ) VALUES (?1, 'project-1', ?2, ?3, NULL, NULL, 'pending',
+                           'experiment', ?4, NULL)",
+                params![submission_id, argv_json, 119_i64, metadata_json],
+            )
+            .unwrap();
+        let candidate_sha: String = transaction
+            .query_row(
+                "SELECT candidate_sha FROM code_change_runs
+                 WHERE code_change_run_id = 'code-change-attached-authority-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id,
+                    task_signature, failure_code, failure_fingerprint,
+                    created_at, updated_at, finished_at, resume_of_experiment_id,
+                    checkpoint_note, code_change_run_id, code_revision_sha
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'reserved', NULL, NULL,
+                           NULL, NULL, ?6, ?6, NULL, NULL, NULL,
+                           'code-change-attached-authority-run', ?7)",
+                params![
+                    experiment_id,
+                    fixture.reservation.campaign_id,
+                    proposal_id,
+                    submission_id,
+                    fixture.reservation.source_experiment_id,
+                    119_i64,
+                    candidate_sha,
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO budget_reservations (
+                    reservation_id, campaign_id, experiment_id, dimension,
+                    subject_key, status, window_started_at, window_ends_at,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'experiment', ?3, 'reserved',
+                           ?4, ?5, ?4, ?4)",
+                params![
+                    format!("experiment:{experiment_id}"),
+                    fixture.reservation.campaign_id,
+                    experiment_id,
+                    119_i64,
+                    120_i64,
+                ],
+            )
+            .unwrap();
+        let run_changed = transaction
+            .execute(
+                "UPDATE code_change_runs
+                 SET experiment_id = ?1, state = 'experiment_submitted', updated_at = ?2
+                 WHERE code_change_run_id = 'code-change-attached-authority-run'
+                   AND state = 'candidate_ready' AND experiment_id IS NULL",
+                params![experiment_id, 119_i64],
+            )
+            .unwrap();
+        assert_eq!(run_changed, 1);
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET successor_experiment_id = ?1
+                 WHERE review_id = 'review-attached'
+                   AND decision_cycle_id = ?2
+                   AND state = 'completed' AND operation_stage IS NULL
+                   AND successor_experiment_id IS NULL",
+                params![experiment_id, fixture.reservation.cycle_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        transaction.commit().unwrap();
+    }
+
+    fn code_change_fixture() -> Fixture {
+        let mut fixture = fixture();
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::CodeChange,
+                hypothesis: "Apply the reviewed training fix".to_owned(),
+                source_experiment_id: Some("experiment-1".to_owned()),
+                argv: vec!["python".to_owned(), "train.py".to_owned(), "--fix".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            "objective-digest",
+        )
+        .unwrap();
+        let decision_json = serde_json::json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "code_change",
+                "hypothesis": proposal.hypothesis(),
+                "source_experiment_id": proposal.source_experiment_id(),
+                "argv": proposal.argv(),
+                "working_directory": proposal.working_directory(),
+                "expected_evidence": proposal.expected_evidence(),
+            },
+            "reason": null,
+            "requested_wait_minutes": null,
+            "expected_evidence": null,
+            "evidence_ref": null,
+        })
+        .to_string();
+        let decision_digest = match parse_and_validate_decision(
+            decision_json.as_bytes(),
+            "objective-digest",
+            CampaignLimits::default(),
+        )
+        .unwrap()
+        {
+            ValidatedDecision::Proposal(proposal) => proposal.canonical_digest().to_owned(),
+            _ => unreachable!(),
+        };
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET decision_json = ?1, decision_digest = ?2, decision_kind = 'proposal'
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![
+                    decision_json,
+                    decision_digest,
+                    fixture.reservation.cycle_id,
+                    fixture.reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        fixture.proposal = proposal;
+        fixture
+    }
+
+    fn make_code_change_candidate_ready(fixture: &Fixture) -> String {
+        let (proposal_id, _, _) = ids(&fixture.reservation);
+        let run_id = "code-change-authority-run";
+        let run = NewCodeChangeRun::new(
+            run_id,
+            &proposal_id,
+            "campaign-1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            crate::code_change::candidate_ref("campaign-1", &proposal_id).unwrap(),
+            "campaign/campaign-1/best",
+            "worktree-code-change-authority",
+            format!(".pueue-agent/worktrees/campaign-1/{proposal_id}"),
+            109,
+        );
+        let acceptance = CampaignRepository::new(&fixture.db)
+            .accept_code_change_proposal(
+                "campaign-1",
+                &proposal_id,
+                &decision_resource_id("experiment", &fixture.reservation),
+                &decision_resource_id("submission", &fixture.reservation),
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                109,
+                Some(&run),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(acceptance, ProposalAcceptance::PendingCodeChange));
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE code_change_runs
+                 SET state = ?1, candidate_sha = ?2, diff_digest = ?3,
+                     changed_file_count = 1, diff_bytes = 1
+                 WHERE code_change_run_id = ?4",
+                params![
+                    CodeChangeState::CandidateReady,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "authority-diff",
+                    run_id,
+                ],
+            )
+            .unwrap();
+        run_id.to_owned()
+    }
+
+    fn attach_real_research_owner(
+        fixture: &Fixture,
+        successor_experiment_id: Option<&str>,
+        seed_terminal_event: bool,
+    ) -> Result<(), AppError> {
+        let task = PueueTask {
+            id: 41,
+            group: "group-1".to_owned(),
+            command: "python train.py".to_owned(),
+            state: "Done".to_owned(),
+            enqueued_at: Some("100".to_owned()),
+            started_at: Some("101".to_owned()),
+            ended_at: Some("103".to_owned()),
+            result: Some(serde_json::json!({"Success": 0})),
+        };
+        let raw_task_signature = task_signature(&task);
+        let managed_task_signature = managed_task_run_signature(&task).unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET task_signature = ?1
+                 WHERE experiment_id = 'experiment-1'",
+                [&managed_task_signature],
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE submissions SET task_signature = ?1
+                 WHERE submission_id = 'submission-baseline'",
+                [&managed_task_signature],
+            )
+            .unwrap();
+        TaskObservationRepository::new(&fixture.db)
+            .upsert(&NewTaskObservation::new(
+                "project-1",
+                raw_task_signature.clone(),
+                task.id,
+                task.group.clone(),
+                vec![task.command.clone()],
+                task.state.clone(),
+                Some(100),
+                Some(101),
+                Some(103),
+                task.result.as_ref().map(serde_json::Value::to_string),
+                110,
+            ))
+            .unwrap();
+        ResearchRepository::new(&fixture.db)
+            .ensure_campaign("campaign-1")
+            .unwrap();
+
+        let research_event = EventRepository::new(&fixture.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    "project-1",
+                    EventKind::CampaignResearch,
+                    "research-attached",
+                    serde_json::json!({
+                        "source": "campaign_research",
+                        "campaign_id": "campaign-1",
+                        "experiment_id": "experiment-1",
+                    }),
+                    111,
+                    111,
+                )
+                .with_campaign_lineage("campaign-1", Some("experiment-1")),
+            )
+            .unwrap();
+        EventRepository::new(&fixture.db)
+            .claim_by_id("project-1", research_event.event_id, 112)
+            .unwrap()
+            .unwrap();
+        let run = AgentRunRepository::new(&fixture.db)
+            .insert_with_events(
+                &NewAgentRun::with_context(
+                    "project-1",
+                    research_event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    112,
+                    fixture._temp.path().join("research.log"),
+                    AgentContextMode::Fresh,
+                    None,
+                    Vec::new(),
+                )
+                .with_execution(
+                    ExecutionProjection::new("campaign_research", "/bin/sh", "fixture")
+                        .unwrap(),
+                ),
+                &[research_event.event_id],
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE agent_runs SET status = 'completed', finished_at = 113,
+                        exit_code = 0, launch_gate_state = 'released'
+                 WHERE run_id = ?1",
+                [run.run_id],
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events SET status = 'completed', lease_until = NULL,
+                        completed_at = 113
+                 WHERE event_id = ?1",
+                [research_event.event_id],
+            )
+            .unwrap();
+
+        let incident = IncidentRepository::new(&fixture.db)
+            .upsert_active(&NewIncident::new(
+                "project-1",
+                "task_finished",
+                Some(raw_task_signature.clone()),
+                "research-attached",
+                111,
+            ))
+            .unwrap()
+            .incident;
+        let request = TerminationRequestRepository::new(&fixture.db)
+            .insert_idempotent(&NewTerminationRequest::new(
+                incident.incident_id,
+                "project-1",
+                raw_task_signature,
+                "research-attached",
+                111,
+                None,
+            ))
+            .unwrap();
+        TerminationRequestRepository::new(&fixture.db)
+            .transition_status(request.request_id, TerminationRequestStatus::Confirmed)
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE termination_requests SET confirmed_at = 113 WHERE request_id = ?1",
+                [request.request_id],
+            )
+            .unwrap();
+
+        let review_id = "review-attached";
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaign_research SET session_id = ?1, session_generation = 0
+                 WHERE campaign_id = 'campaign-1'",
+                [session_id],
+            )
+            .unwrap();
+        let context_json = serde_json::json!({
+            "schema_version": 1,
+            "facts": {
+                "review": {
+                    "review_id": review_id,
+                    "experiment_id": "experiment-1",
+                    "task_signature": managed_task_signature,
+                },
+                "campaign": {"campaign_id": "campaign-1"},
+                "project": {"project_id": "project-1"},
+                "objective": {"digest": "objective-digest"},
+                "target": {
+                    "experiment_id": "experiment-1",
+                    "pueue_task_id": 41,
+                    "task_signature": managed_task_signature,
+                },
+                "evidence": [{"evidence_ref": format!("research:{review_id}")}],
+            },
+        })
+        .to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let response_json = serde_json::json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": "experiment-1",
+            "context_digest": context_digest,
+            "action": "stop_and_next",
+            "reason": "the baseline should be pruned",
+            "evidence_refs": [format!("research:{review_id}")],
+            "notes": "save this bounded advice",
+            "next_direction": "try a smaller learning rate",
+            "checkpoint": null,
+        })
+        .to_string();
+        let native_notes = serde_json::json!({
+            "native_recovery": {
+                "version": 1,
+                "run_id": run.run_id,
+                "review_id": review_id,
+                "campaign_id": "campaign-1",
+                "experiment_id": "experiment-1",
+                "attempt": 1,
+                "session_generation": 0,
+                "fresh_launch": true,
+                "session_id": session_id,
+                "service_root_identity": {
+                    "device": 1, "inode": 2, "owner": 3, "mode": 448,
+                    "resolution": "fixture-root"
+                },
+                "temp_identity": {
+                    "device": 1, "inode": 4, "owner": 3, "mode": 448,
+                    "mount": [1, 2],
+                    "service_identity": {"device": 1, "inode": 5, "owner": 3, "mode": 448},
+                    "parent_identity": {"device": 1, "inode": 6, "owner": 3, "mode": 448}
+                },
+                "cleanup": {"phase": "complete", "completed_at": 113}
+            },
+            "planned_session_id": session_id,
+            "confirmed_session_id": session_id,
+            "session_binding": "confirmed",
+        })
+        .to_string();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 ) VALUES (?1, 'campaign-1', 'experiment-1', ?2, 1, 'ready',
+                           'stop_confirmed', ?3, ?4, ?5, ?6, ?7, NULL, 1, 0, ?8,
+                           111, ?9, NULL, NULL, NULL, 111, 112, NULL, 112)",
+                params![
+                    review_id,
+                    managed_task_signature,
+                    run.run_id,
+                    context_json,
+                    context_digest,
+                    response_json,
+                    request.request_id,
+                    research_event.event_id,
+                    native_notes,
+                ],
+            )
+            .unwrap();
+
+        let cycle_id = DecisionRepository::terminal_cycle_id("campaign-1", "experiment-1");
+        let terminal_event = DecisionRepository::terminal_decision_event(
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+            TerminalDecisionEventProjection {
+                task_id: task.id,
+                managed_task_signature: &managed_task_signature,
+                group: &task.group,
+                state: &task.state,
+                enqueued_at: Some(100),
+                started_at: Some(101),
+                ended_at: Some(103),
+                exit_code: Some(0),
+            },
+            114,
+        );
+        if seed_terminal_event {
+            EventRepository::new(&fixture.db)
+                .insert_idempotent(&terminal_event)
+                .unwrap();
+        }
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let owner = match research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap()
+        {
+            ResearchOwnership::Open(Some(owner)) => owner,
+            ownership => panic!("expected open confirmed owner, got {ownership:?}"),
+        };
+        DecisionRepository::attach_research_terminal_cycle_in_transaction(
+            &transaction,
+            &owner,
+            &terminal_event,
+            114,
+        )?;
+        if let Some(successor_experiment_id) = successor_experiment_id {
+            transaction
+                .execute(
+                    "UPDATE research_reviews
+                     SET successor_experiment_id = ?1
+                     WHERE review_id = ?2 AND decision_cycle_id = ?3
+                       AND state = 'completed' AND operation_stage IS NULL",
+                    params![successor_experiment_id, review_id, cycle_id],
+                )
+                .unwrap();
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit research owner fixture"))?;
+        Ok(())
+    }
+
+    fn attached_fixture() -> Fixture {
+        let BaseFixture {
+            _temp: temp,
+            db,
+            cycle,
+        } = base_fixture();
+        let reservation_seed = DecisionReservation {
+            cycle_id: cycle.cycle_id.clone(),
+            campaign_id: "campaign-1".to_owned(),
+            source_experiment_id: "experiment-1".to_owned(),
+            attempt_number: 1,
+            created_at: 115,
+        };
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Try the next command".to_owned(),
+                source_experiment_id: Some("experiment-1".to_owned()),
+                argv: vec!["python".to_owned(), "next.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            "objective-digest",
+        )
+        .unwrap();
+        let fixture = Fixture {
+            _temp: temp,
+            db,
+            reservation: reservation_seed,
+            proposal,
+        };
+        attach_real_research_owner(&fixture, None, true).unwrap();
+        let Fixture {
+            _temp: temp,
+            db,
+            reservation: reservation_seed,
+            proposal,
+        } = fixture;
+        let decisions = DecisionRepository::new(&db);
+        let reservation = decisions
+            .reserve_next_attempt("project-1", &cycle.cycle_id, 115)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation, reservation_seed);
+        let project = ProjectRepository::new(&db)
+            .find_by_id("project-1")
+            .unwrap()
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let task = PueueTask {
+            id: 41,
+            group: "group-1".to_owned(),
+            command: "python train.py".to_owned(),
+            state: "Done".to_owned(),
+            enqueued_at: Some("100".to_owned()),
+            started_at: Some("101".to_owned()),
+            ended_at: Some("103".to_owned()),
+            result: Some(serde_json::json!({"Success": 0})),
+        };
+        let managed_task_signature = managed_task_run_signature(&task).unwrap();
+        let context = DecisionEvidenceBuilder::new(&db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &[DecisionPueueTaskProjection {
+                    task_id: task.id,
+                    task_signature: managed_task_signature,
+                    group: task.group.clone(),
+                    state: task.state.clone(),
+                    enqueued_at: Some(100),
+                    started_at: Some(101),
+                    ended_at: Some(103),
+                    exit_code: Some(0),
+                }],
+                observed_at: 116,
+            })
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, &context.json, &context.digest, 117)
+            .unwrap();
+        let decision_json = serde_json::json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "experiment",
+                "hypothesis": proposal.hypothesis(),
+                "source_experiment_id": proposal.source_experiment_id(),
+                "argv": proposal.argv(),
+                "working_directory": proposal.working_directory(),
+                "expected_evidence": proposal.expected_evidence(),
+            },
+            "reason": null,
+            "requested_wait_minutes": null,
+            "expected_evidence": null,
+            "evidence_ref": null,
+        })
+        .to_string();
+        let decision_digest = match parse_and_validate_decision(
+            decision_json.as_bytes(),
+            "objective-digest",
+            CampaignLimits::default(),
+        )
+        .unwrap()
+        {
+            ValidatedDecision::Proposal(proposal) => proposal.canonical_digest().to_owned(),
+            _ => unreachable!(),
+        };
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET state = 'decided', decision_json = ?1, decision_digest = ?2,
+                     decision_kind = 'proposal', finished_at = 118
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![
+                    decision_json,
+                    decision_digest,
+                    reservation.cycle_id,
+                    reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        let fixture = Fixture {
+            _temp: temp,
+            db,
+            reservation,
+            proposal,
+        };
+        assert_initial_attached_authority(&fixture);
+        persist_ordinary_successor_fixture(&fixture);
+        fixture
+    }
+
+    fn attached_code_change_fixture() -> Fixture {
+        let BaseFixture {
+            _temp: temp,
+            db,
+            cycle,
+        } = base_fixture();
+        let reservation_seed = DecisionReservation {
+            cycle_id: cycle.cycle_id.clone(),
+            campaign_id: "campaign-1".to_owned(),
+            source_experiment_id: "experiment-1".to_owned(),
+            attempt_number: 1,
+            created_at: 115,
+        };
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::CodeChange,
+                hypothesis: "Apply the reviewed training fix".to_owned(),
+                source_experiment_id: Some("experiment-1".to_owned()),
+                argv: vec!["python".to_owned(), "train.py".to_owned(), "--fix".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            "objective-digest",
+        )
+        .unwrap();
+        let fixture = Fixture {
+            _temp: temp,
+            db,
+            reservation: reservation_seed,
+            proposal,
+        };
+        attach_real_research_owner(&fixture, None, true).unwrap();
+        let Fixture {
+            _temp: temp,
+            db,
+            reservation: reservation_seed,
+            proposal,
+        } = fixture;
+        let decisions = DecisionRepository::new(&db);
+        let reservation = decisions
+            .reserve_next_attempt("project-1", &cycle.cycle_id, 115)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation, reservation_seed);
+        let project = ProjectRepository::new(&db)
+            .find_by_id("project-1")
+            .unwrap()
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let task = PueueTask {
+            id: 41,
+            group: "group-1".to_owned(),
+            command: "python train.py".to_owned(),
+            state: "Done".to_owned(),
+            enqueued_at: Some("100".to_owned()),
+            started_at: Some("101".to_owned()),
+            ended_at: Some("103".to_owned()),
+            result: Some(serde_json::json!({"Success": 0})),
+        };
+        let managed_task_signature = managed_task_run_signature(&task).unwrap();
+        let context = DecisionEvidenceBuilder::new(&db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &[DecisionPueueTaskProjection {
+                    task_id: task.id,
+                    task_signature: managed_task_signature,
+                    group: task.group.clone(),
+                    state: task.state.clone(),
+                    enqueued_at: Some(100),
+                    started_at: Some(101),
+                    ended_at: Some(103),
+                    exit_code: Some(0),
+                }],
+                observed_at: 116,
+            })
+            .unwrap();
+        decisions
+            .store_evidence(&reservation, &context.json, &context.digest, 117)
+            .unwrap();
+        let decision_json = serde_json::json!({
+            "schema_version": 1,
+            "decision": "proposal",
+            "proposal": {
+                "kind": "code_change",
+                "hypothesis": proposal.hypothesis(),
+                "source_experiment_id": proposal.source_experiment_id(),
+                "argv": proposal.argv(),
+                "working_directory": proposal.working_directory(),
+                "expected_evidence": proposal.expected_evidence(),
+            },
+            "reason": null,
+            "requested_wait_minutes": null,
+            "expected_evidence": null,
+            "evidence_ref": null,
+        })
+        .to_string();
+        let decision_digest = match parse_and_validate_decision(
+            decision_json.as_bytes(),
+            "objective-digest",
+            CampaignLimits::default(),
+        )
+        .unwrap()
+        {
+            ValidatedDecision::Proposal(proposal) => proposal.canonical_digest().to_owned(),
+            _ => unreachable!(),
+        };
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET state = 'decided', decision_json = ?1, decision_digest = ?2,
+                     decision_kind = 'proposal', finished_at = 118
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![
+                    decision_json,
+                    decision_digest,
+                    reservation.cycle_id,
+                    reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        let fixture = Fixture {
+            _temp: temp,
+            db,
+            reservation,
+            proposal,
+        };
+        assert_initial_attached_authority(&fixture);
+        persist_code_change_editor_fixture(&fixture);
+        persist_code_change_successor_fixture(&fixture);
+        fixture
+    }
+
+    #[test]
+    fn attachment_rejects_an_absent_terminal_event_when_the_cycle_already_has_an_attempt() {
+        let fixture = fixture();
+        assert!(attach_real_research_owner(&fixture, None, false).is_err());
+    }
+
+    #[test]
+    fn attached_ordinary_parent_only_successor_remains_attached() {
+        let fixture = attached_fixture();
+        let (proposal_id, experiment_id, _) = ids(&fixture.reservation);
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments
+                 SET resume_of_experiment_id = NULL, parent_experiment_id = 'experiment-1'
+                 WHERE experiment_id = ?1",
+                [&experiment_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap();
+        assert!(matches!(ownership, ResearchOwnership::Attached(_)));
+        transaction.commit().unwrap();
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET parent_experiment_id = NULL
+                 WHERE experiment_id = ?1",
+                [&experiment_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap();
+        assert!(matches!(ownership, ResearchOwnership::Open(Some(_))));
+        transaction.commit().unwrap();
+
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE proposals SET campaign_id = 'campaign-foreign'
+                 WHERE proposal_id = ?1",
+                [&proposal_id],
+            )
+            .unwrap();
+        drop(connection);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap();
+        assert!(matches!(ownership, ResearchOwnership::Open(Some(_))));
+        transaction.commit().unwrap();
+
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE proposals SET campaign_id = 'campaign-1'
+                 WHERE proposal_id = ?1",
+                [&proposal_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET parent_experiment_id = 'experiment-1'
+                 WHERE experiment_id = ?1",
+                [&experiment_id],
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE proposals SET source_experiment_id = NULL
+                 WHERE proposal_id = ?1",
+                [&proposal_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap();
+        assert!(matches!(ownership, ResearchOwnership::Open(Some(_))));
+        transaction.commit().unwrap();
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE proposals SET source_experiment_id = 'experiment-1'
+                 WHERE proposal_id = ?1",
+                [&proposal_id],
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments
+                 SET resume_of_experiment_id = 'experiment-1'
+                 WHERE experiment_id = ?1",
+                [&experiment_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap();
+        assert!(matches!(ownership, ResearchOwnership::Open(Some(_))));
+    }
+
+    #[test]
+    fn checkpoint_successor_requires_the_persisted_parent_lineage() {
+        let fixture = attached_fixture();
+        let (_, experiment_id, _) = ids(&fixture.reservation);
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'successor_reserved', decision_cycle_id = NULL
+                 WHERE review_id = 'review-attached'",
+                [],
+            )
+            .unwrap();
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET resume_of_experiment_id = 'experiment-1', parent_experiment_id = NULL
+                 WHERE experiment_id = ?1",
+                [&experiment_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+        )
+        .unwrap();
+        let ResearchOwnership::Open(Some(snapshot)) = ownership else {
+            panic!("expected checkpoint lineage corruption to remain open");
+        };
+        assert!(snapshot.recovery_required);
+    }
+
+    #[test]
+    fn successor_authority_replays_an_attached_accepted_code_change_candidate() {
+        let fixture = attached_code_change_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let authority = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(authority.experiment_id, experiment_id);
+        transaction.commit().unwrap();
+
+        DecisionRepository::new(&fixture.db)
+            .mark_completed(
+                &fixture.reservation.cycle_id,
+                fixture.reservation.attempt_number,
+                119,
+            )
+            .unwrap();
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let replay = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(replay, authority);
+    }
+
+    #[test]
+    fn successor_authority_accepts_exact_decided_attempt_and_replay() {
+        let fixture = fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let authority = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(authority.reservation, fixture.reservation);
+        assert_eq!(authority.proposal_id, proposal_id);
+        transaction.commit().unwrap();
+
+        DecisionRepository::new(&fixture.db)
+            .mark_completed(
+                &fixture.reservation.cycle_id,
+                fixture.reservation.attempt_number,
+                110,
+            )
+            .unwrap();
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let missing_proof = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        );
+        assert!(missing_proof.is_err());
+        transaction.commit().unwrap();
+
+        CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                &fixture.reservation.campaign_id,
+                &authority.proposal_id,
+                &authority.experiment_id,
+                &authority.submission_id,
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                109,
+            )
+            .unwrap();
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let replay = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(replay, authority);
+    }
+
+    #[test]
+    fn successor_authority_replays_an_exact_attached_successor_before_and_after_completion() {
+        let fixture = attached_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let authority = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(authority.experiment_id, experiment_id);
+        transaction.commit().unwrap();
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET successor_experiment_id = 'experiment-1'
+                 WHERE review_id = 'review-attached'",
+                [],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        transaction.commit().unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews SET successor_experiment_id = ?1
+                 WHERE review_id = 'review-attached'",
+                [&experiment_id],
+            )
+            .unwrap();
+
+        DecisionRepository::new(&fixture.db)
+            .mark_completed(
+                &fixture.reservation.cycle_id,
+                fixture.reservation.attempt_number,
+                115,
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let replay = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(replay, authority);
+    }
+
+    #[test]
+    fn successor_authority_accepts_only_an_exact_pending_code_change_candidate() {
+        let fixture = code_change_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let run_id = make_code_change_candidate_ready(&fixture);
+        DecisionRepository::new(&fixture.db)
+            .mark_completed(
+                &fixture.reservation.cycle_id,
+                fixture.reservation.attempt_number,
+                110,
+            )
+            .unwrap();
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let authority = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(authority.experiment_id, experiment_id);
+        transaction.commit().unwrap();
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE code_change_runs SET state = 'committing' WHERE code_change_run_id = ?1",
+                [&run_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn successor_authority_replays_an_accepted_code_change_candidate_only_with_exact_binding() {
+        let fixture = code_change_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let run_id = make_code_change_candidate_ready(&fixture);
+        let acceptance = CampaignRepository::new(&fixture.db)
+            .accept_code_change_candidate(
+                &run_id,
+                &experiment_id,
+                &submission_id,
+                110,
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        assert!(matches!(acceptance, ProposalAcceptance::Accepted(_)));
+        DecisionRepository::new(&fixture.db)
+            .mark_completed(
+                &fixture.reservation.cycle_id,
+                fixture.reservation.attempt_number,
+                111,
+            )
+            .unwrap();
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let authority = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(authority.experiment_id, experiment_id);
+        transaction.commit().unwrap();
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE code_change_runs SET experiment_id = 'experiment-1'
+                 WHERE code_change_run_id = ?1",
+                [&run_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn successor_authority_rejects_wrong_selector_digest_and_resource_ids() {
+        let fixture = fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let mut wrong_attempt = fixture.reservation.clone();
+        wrong_attempt.attempt_number += 1;
+        let mut wrong_cycle = fixture.reservation.clone();
+        wrong_cycle.cycle_id = "wrong-cycle".to_owned();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &wrong_cycle,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &wrong_attempt,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            "wrong-proposal",
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        transaction.commit().unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts SET decision_digest = 'changed'
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        transaction.commit().unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts SET decision_digest = ?1
+                 WHERE cycle_id = ?2 AND attempt_number = ?3",
+                params![
+                    fixture.proposal.canonical_digest(),
+                    fixture.reservation.cycle_id,
+                    fixture.reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        let original_decision_json: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT decision_json FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_decision_digest: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT decision_digest FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let malformed_decision_json =
+            r#"{"schema_version":1,"decision":"proposal","unexpected":true}"#;
+        let malformed_decision_digest =
+            format!("{:x}", Sha256::digest(malformed_decision_json.as_bytes()));
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET decision_json = ?1, decision_digest = ?2
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![
+                    malformed_decision_json,
+                    malformed_decision_digest,
+                    fixture.reservation.cycle_id,
+                    fixture.reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        transaction.commit().unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts
+                 SET decision_json = ?1, decision_digest = ?2
+                 WHERE cycle_id = ?3 AND attempt_number = ?4",
+                params![
+                    original_decision_json,
+                    original_decision_digest,
+                    fixture.reservation.cycle_id,
+                    fixture.reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        let original_context_digest: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT context_digest FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts SET context_digest = 'changed-context'
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        transaction.commit().unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts SET context_digest = ?1
+                 WHERE cycle_id = ?2 AND attempt_number = ?3",
+                params![
+                    original_context_digest,
+                    fixture.reservation.cycle_id,
+                    fixture.reservation.attempt_number,
+                ],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            "wrong-experiment",
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_err());
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            "wrong-submission",
+            CampaignLimits::default(),
+        )
+        .is_err());
+        assert!(validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn successor_authority_rejects_open_research_owner() {
+        let fixture = fixture();
+        let event = EventRepository::new(&fixture.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    "project-1",
+                    EventKind::CampaignResearch,
+                    "research-open",
+                    serde_json::json!({}),
+                    111,
+                    111,
+                )
+                .with_campaign_lineage("campaign-1", Some("experiment-1")),
+            )
+            .unwrap();
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO research_reviews (
+                     review_id, campaign_id, experiment_id, task_signature, attempt,
+                     state, operation_stage, agent_run_id, context_json, context_digest,
+                     response_json, termination_request_id, successor_experiment_id,
+                     evidence_schema_version, session_generation, event_id, not_before,
+                     notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                     created_at, started_at, finished_at, updated_at
+                 ) VALUES (
+                     'review-open', 'campaign-1', 'experiment-1',
+                     'pueue-task:v1:decision-fixture', 1, 'ready', 'intent', NULL,
+                     NULL, NULL, NULL, NULL, NULL, NULL, 0, ?1, 111, NULL, NULL,
+                     NULL, NULL, 111, NULL, NULL, 111
+                 )",
+                [event.event_id],
+            )
+            .unwrap();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let error = validate_decision_successor_in_transaction(
+            &transaction,
+            &fixture.reservation,
+            &fixture.proposal,
+            &proposal_id,
+            &experiment_id,
+            &submission_id,
+            CampaignLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Validation { field: "research_ownership", .. }));
     }
 }
 

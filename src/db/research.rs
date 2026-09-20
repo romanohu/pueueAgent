@@ -4042,6 +4042,9 @@ struct ResearchOwnershipCandidate {
     successor_experiment_id: Option<String>,
     successor_campaign_id: Option<String>,
     successor_source_experiment_id: Option<String>,
+    successor_parent_experiment_id: Option<String>,
+    successor_proposal_campaign_id: Option<String>,
+    successor_proposal_source_experiment_id: Option<String>,
     notes_json: Option<String>,
     failure_code: Option<String>,
     campaign_session: Option<String>,
@@ -4084,11 +4087,14 @@ fn research_ownership_candidate_from_row(
         successor_experiment_id: row.get(28)?,
         successor_campaign_id: row.get(29)?,
         successor_source_experiment_id: row.get(30)?,
-        notes_json: row.get(31)?,
-        failure_code: row.get(32)?,
-        campaign_session: row.get(33)?,
-        campaign_generation: row.get(34)?,
-        state: row.get(35)?,
+        successor_parent_experiment_id: row.get(31)?,
+        successor_proposal_campaign_id: row.get(32)?,
+        successor_proposal_source_experiment_id: row.get(33)?,
+        notes_json: row.get(34)?,
+        failure_code: row.get(35)?,
+        campaign_session: row.get(36)?,
+        campaign_generation: row.get(37)?,
+        state: row.get(38)?,
     })
 }
 
@@ -4116,7 +4122,9 @@ pub(crate) fn research_ownership_in_transaction(
                     termination.status, review.decision_cycle_id,
                     cycle.campaign_id, cycle.source_experiment_id,
                     review.successor_experiment_id, successor.campaign_id,
-                    successor.resume_of_experiment_id, review.notes_json,
+                    successor.resume_of_experiment_id, successor.parent_experiment_id,
+                    successor_proposal.campaign_id, successor_proposal.source_experiment_id,
+                    review.notes_json,
                     review.failure_code, campaign_research.session_id,
                     campaign_research.session_generation, review.state
              FROM research_reviews AS review
@@ -4136,6 +4144,8 @@ pub(crate) fn research_ownership_in_transaction(
                ON cycle.cycle_id = review.decision_cycle_id
              LEFT JOIN experiments AS successor
                ON successor.experiment_id = review.successor_experiment_id
+             LEFT JOIN proposals AS successor_proposal
+               ON successor_proposal.proposal_id = successor.proposal_id
              WHERE review.experiment_id = ?1
                AND (
                    review.operation_stage IN ('intent','stop_requested',
@@ -4318,9 +4328,24 @@ pub(crate) fn research_ownership_in_transaction(
             || candidate.cycle_source_experiment_id.as_deref() != Some(source_experiment_id);
     }
     if let Some(successor_id) = candidate.successor_experiment_id.as_deref() {
-        recovery_required |= candidate.successor_campaign_id.as_deref() != Some(campaign_id)
-            || candidate.successor_source_experiment_id.as_deref() != Some(source_experiment_id)
-            || successor_id.is_empty();
+        let successor_identity_matches = candidate.successor_campaign_id.as_deref()
+            == Some(campaign_id)
+            && candidate.successor_proposal_campaign_id.as_deref() == Some(campaign_id)
+            && candidate.successor_proposal_source_experiment_id.as_deref()
+                == Some(source_experiment_id);
+        let ordinary_successor = successor_identity_matches
+            && candidate.state == "completed"
+            && candidate.operation_stage.is_none()
+            && candidate.decision_cycle_id.as_deref() == Some(expected_cycle.as_str())
+            && candidate.successor_parent_experiment_id.as_deref() == Some(source_experiment_id)
+            && candidate.successor_source_experiment_id.is_none();
+        let checkpoint_successor = successor_identity_matches
+            && candidate.operation_stage.as_deref() == Some("successor_reserved")
+            && candidate.decision_cycle_id.is_none()
+            && candidate.successor_parent_experiment_id.as_deref() == Some(source_experiment_id)
+            && candidate.successor_source_experiment_id.as_deref() == Some(source_experiment_id);
+        let successor_lineage_matches = ordinary_successor || checkpoint_successor;
+        recovery_required |= successor_id.is_empty() || !successor_lineage_matches;
     }
 
     let attached = candidate.state == "completed"
