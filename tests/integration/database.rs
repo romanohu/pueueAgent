@@ -44,7 +44,9 @@ use pueue_agent::{
         MAX_EXECUTABLE_PATH_BYTES,
     },
     proposals::{self, ProposalInput, ValidatedProposal},
+    pueue::PueueTask,
     promotion::PromotionOutcome,
+    reconcile::{managed_task_run_signature, task_signature},
     retry::{EventResolution, RetryPolicy},
     runs::{collect_fresh, FollowCursor},
     state::ObjectiveSnapshot,
@@ -96,6 +98,42 @@ struct CampaignDbHarness {
     project_id: String,
     campaign_id: String,
     experiment_id: String,
+}
+
+fn canonical_research_task(
+    task_id: i64,
+    label: &str,
+    group: &str,
+    started_at: i64,
+) -> (PueueTask, String, String) {
+    canonical_research_task_with_command(
+        task_id,
+        group,
+        started_at,
+        format!("python {label}.py"),
+    )
+}
+
+fn canonical_research_task_with_command(
+    task_id: i64,
+    group: &str,
+    started_at: i64,
+    command: String,
+) -> (PueueTask, String, String) {
+    let task = PueueTask {
+        id: task_id,
+        group: group.to_owned(),
+        command,
+        state: "Running".to_owned(),
+        enqueued_at: Some((started_at - 1).to_string()),
+        started_at: Some(started_at.to_string()),
+        ended_at: None,
+        result: None,
+    };
+    let raw_signature = task_signature(&task);
+    let managed_signature =
+        managed_task_run_signature(&task).expect("canonical research task has managed identity");
+    (task, raw_signature, managed_signature)
 }
 
 impl CampaignDbHarness {
@@ -227,6 +265,35 @@ impl CampaignDbHarness {
         .unwrap()
     }
 
+    fn start_with_baseline(
+        &self,
+        baseline: &ValidatedProposal,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> pueue_agent::db::ManagedSubmissionIntent {
+        let objective = Self::objective();
+        let initial_argv = baseline.argv().to_vec();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: Self::CAMPAIGN_ID,
+                    project_id: Self::PROJECT_ID,
+                    objective: &objective,
+                    initial_argv: &initial_argv,
+                    baseline,
+                    submission_id: "submission-baseline",
+                    experiment_id: Self::BASELINE_EXPERIMENT_ID,
+                    proposal_id: "proposal-baseline",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now,
+                },
+                limits,
+            )
+            .unwrap()
+    }
+
     fn accept(
         &self,
         proposal_id: &str,
@@ -304,7 +371,32 @@ impl CampaignDbHarness {
             .unwrap();
     }
 
-    fn make_running_baseline(&self, task_id: i64, task_signature: &str, started_at: i64) {
+    fn make_running_research_baseline(
+        &self,
+        task_id: i64,
+        label: &str,
+        started_at: i64,
+    ) -> String {
+        self.make_running_research_baseline_with_command(
+            task_id,
+            format!("python {label}.py"),
+            started_at,
+        )
+    }
+
+    fn make_running_research_baseline_with_command(
+        &self,
+        task_id: i64,
+        command: String,
+        started_at: i64,
+    ) -> String {
+        let group = "pa-campaign-project";
+        let (task, raw_signature, managed_signature) = canonical_research_task_with_command(
+            task_id,
+            group,
+            started_at,
+            command,
+        );
         let repository = ExperimentRepository::new(&self.db);
         repository
             .mark_submitting(&self.experiment_id, started_at)
@@ -313,18 +405,18 @@ impl CampaignDbHarness {
             .mark_accepted(
                 &self.experiment_id,
                 task_id,
-                task_signature,
+                &managed_signature,
                 started_at + 1,
             )
             .unwrap();
         TaskObservationRepository::new(&self.db)
             .upsert(&NewTaskObservation::new(
                 &self.project_id,
-                task_signature,
+                raw_signature,
                 task_id,
-                "pa-campaign-project",
-                vec!["python".to_owned(), "train.py".to_owned()],
-                "Running",
+                group,
+                vec![task.command],
+                task.state,
                 Some(started_at - 1),
                 Some(started_at),
                 None,
@@ -332,11 +424,12 @@ impl CampaignDbHarness {
                 started_at + 2,
             ))
             .unwrap();
+        managed_signature
     }
 
     fn running_research_review(&self) -> pueue_agent::db::ResearchReview {
         self.start(&CampaignLimits::default(), 100);
-        self.make_running_baseline(41, "pueue-task:v1:research", 1_000);
+        let managed_signature = self.make_running_research_baseline(41, "research", 1_000);
         let repository = ResearchRepository::new(&self.db);
         repository
             .schedule_running(&self.campaign_id, 1_000, 1, 1_060)
@@ -345,7 +438,7 @@ impl CampaignDbHarness {
             .claim_due(
                 &self.campaign_id,
                 &self.experiment_id,
-                "pueue-task:v1:research",
+                &managed_signature,
                 1_060,
             )
             .unwrap()
@@ -541,7 +634,7 @@ fn research_state_rejects_an_unknown_campaign_foreign_key() {
 fn research_claim_is_due_once_and_persists_authoritative_lineage() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:research", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "research", 1_000);
     let repository = ResearchRepository::new(&h.db);
 
     repository
@@ -562,14 +655,14 @@ fn research_claim_is_due_once_and_persists_authoritative_lineage() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:research",
+            &task_signature,
             2_800,
         )
         .unwrap()
         .expect("due running experiment should be claimed");
     assert_eq!(review.campaign_id, h.campaign_id);
     assert_eq!(review.experiment_id, h.experiment_id);
-    assert_eq!(review.task_signature, "pueue-task:v1:research");
+    assert_eq!(review.task_signature, task_signature);
     assert_eq!(review.state, "pending");
     assert_eq!(review.attempt, 0);
     assert_eq!(repository.find(&review.review_id).unwrap(), review);
@@ -577,7 +670,7 @@ fn research_claim_is_due_once_and_persists_authoritative_lineage() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:research",
+            &task_signature,
             2_801,
         )
         .unwrap()
@@ -596,7 +689,7 @@ fn research_claim_is_due_once_and_persists_authoritative_lineage() {
     assert_eq!(event.1, h.campaign_id);
     assert_eq!(event.2, h.experiment_id);
     let payload: serde_json::Value = serde_json::from_str(&event.3).unwrap();
-    assert_eq!(payload["task_signature"], "pueue-task:v1:research");
+    assert_eq!(payload["task_signature"], task_signature);
     assert_eq!(payload["task_id"], 41);
 }
 
@@ -645,26 +738,28 @@ fn research_claim_only_selects_the_oldest_running_candidate() {
     .unwrap();
 
     let experiments = [
-        ("experiment-research-older", 51, "pueue-task:v1:older", 1_200),
-        ("experiment-research-newer", 52, "pueue-task:v1:newer", 1_300),
+        ("experiment-research-older", 51, "older", 1_200),
+        ("experiment-research-newer", 52, "newer", 1_300),
     ];
     let experiment_repository = ExperimentRepository::new(&h.db);
     let observation_repository = TaskObservationRepository::new(&h.db);
-    for (experiment_id, task_id, task_signature, started_at) in experiments {
+    for (experiment_id, task_id, label, started_at) in experiments {
+        let (task, raw_signature, managed_signature) =
+            canonical_research_task(task_id, label, "pa-campaign-project", started_at);
         experiment_repository
             .mark_submitting(experiment_id, started_at)
             .unwrap();
         experiment_repository
-            .mark_accepted(experiment_id, task_id, task_signature, started_at + 1)
+            .mark_accepted(experiment_id, task_id, &managed_signature, started_at + 1)
             .unwrap();
         observation_repository
             .upsert(&NewTaskObservation::new(
                 &h.project_id,
-                task_signature,
+                raw_signature,
                 task_id,
                 "pa-campaign-project",
-                vec!["python".to_owned(), "train.py".to_owned()],
-                "Running",
+                vec![task.command],
+                task.state,
                 Some(started_at - 1),
                 Some(started_at),
                 None,
@@ -682,7 +777,7 @@ fn research_claim_only_selects_the_oldest_running_candidate() {
         .claim_due(
             &h.campaign_id,
             "experiment-research-newer",
-            "pueue-task:v1:newer",
+            &canonical_research_task(52, "newer", "pa-campaign-project", 1_300).2,
             2_800,
         )
         .unwrap()
@@ -691,7 +786,7 @@ fn research_claim_only_selects_the_oldest_running_candidate() {
         .claim_due(
             &h.campaign_id,
             "experiment-research-older",
-            "pueue-task:v1:older",
+            &canonical_research_task(51, "older", "pa-campaign-project", 1_200).2,
             2_800,
         )
         .unwrap()
@@ -712,7 +807,7 @@ fn research_claim_defers_without_live_task_or_when_campaign_is_paused() {
         .unwrap()
         .is_none());
 
-    h.make_running_baseline(41, "pueue-task:v1:paused", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "paused", 1_000);
     CampaignRepository::new(&h.db)
         .pause(&h.project_id, 1_002)
         .unwrap();
@@ -720,7 +815,7 @@ fn research_claim_defers_without_live_task_or_when_campaign_is_paused() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:paused",
+            &task_signature,
             2_800,
         )
         .unwrap()
@@ -731,7 +826,7 @@ fn research_claim_defers_without_live_task_or_when_campaign_is_paused() {
 fn research_claim_due_is_exclusive_across_two_database_connections() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:race", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "race", 1_000);
     let repository = ResearchRepository::new(&h.db);
     repository
         .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
@@ -744,12 +839,13 @@ fn research_claim_due_is_exclusive_across_two_database_connections() {
             let db = h.db.clone();
             let campaign_id = h.campaign_id.clone();
             let experiment_id = h.experiment_id.clone();
+            let task_signature = task_signature.clone();
             thread::spawn(move || {
                 barrier.wait();
                 ResearchRepository::new(&db).claim_due(
                     &campaign_id,
                     &experiment_id,
-                    "pueue-task:v1:race",
+                    &task_signature,
                     2_800,
                 )
             })
@@ -778,7 +874,7 @@ fn research_claim_due_is_exclusive_across_two_database_connections() {
 fn research_claim_rolls_back_event_and_state_when_event_insert_fails() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:rollback", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "rollback", 1_000);
     let repository = ResearchRepository::new(&h.db);
     repository
         .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
@@ -800,7 +896,7 @@ fn research_claim_rolls_back_event_and_state_when_event_insert_fails() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:rollback",
+            &task_signature,
             2_800,
         )
         .is_err());
@@ -832,7 +928,7 @@ fn research_claim_rolls_back_event_and_state_when_event_insert_fails() {
 fn research_schedule_anchors_later_due_at_completion_and_disables_zero_interval() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:completion", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "completion", 1_000);
     let repository = ResearchRepository::new(&h.db);
     repository
         .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
@@ -841,7 +937,7 @@ fn research_schedule_anchors_later_due_at_completion_and_disables_zero_interval(
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:completion",
+            &task_signature,
             2_800,
         )
         .unwrap()
@@ -871,7 +967,7 @@ fn research_schedule_anchors_later_due_at_completion_and_disables_zero_interval(
 fn research_recent_is_campaign_scoped_and_clamped_to_thirty_two_rows() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:recent", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "recent", 1_000);
     let repository = ResearchRepository::new(&h.db);
     repository
         .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
@@ -886,7 +982,7 @@ fn research_recent_is_campaign_scoped_and_clamped_to_thirty_two_rows() {
             .claim_due(
                 &h.campaign_id,
                 &h.experiment_id,
-                "pueue-task:v1:recent",
+                &task_signature,
                 due,
             )
             .unwrap()
@@ -1661,23 +1757,57 @@ fn research_evidence_bounds_recent_results_and_notes_to_thirty_two() {
 #[test]
 fn research_evidence_reports_exact_running_observation_omissions() {
     let h = CampaignDbHarness::new();
-    let review = h.running_research_review();
+    let mut large_argv = Vec::with_capacity(245);
+    large_argv.push("python".to_owned());
+    large_argv.extend((0..244).map(|_| "x".repeat(240)));
+    let baseline = proposals::validate_initial_baseline(
+        ProposalInput {
+            kind: ProposalKind::Experiment,
+            hypothesis: "Measure the initial command".to_owned(),
+            source_experiment_id: None,
+            argv: large_argv.clone(),
+            working_directory: ".".to_owned(),
+            expected_evidence: vec!["validation loss".to_owned()],
+        },
+        "objective-digest",
+    )
+    .unwrap();
+    h.start_with_baseline(&baseline, &CampaignLimits::default(), 100);
+    let managed_signature = h.make_running_research_baseline_with_command(
+        41,
+        large_argv.join(" "),
+        1_000,
+    );
+    let research_repository = ResearchRepository::new(&h.db);
+    research_repository
+        .schedule_running(&h.campaign_id, 1_000, 1, 1_060)
+        .unwrap();
+    let review = research_repository
+        .claim_due(
+            &h.campaign_id,
+            &h.experiment_id,
+            &managed_signature,
+            1_060,
+        )
+        .unwrap()
+        .expect("running research review should be claimed");
     let repository = TaskObservationRepository::new(&h.db);
-    let large_command = (0..64).map(|_| "x".repeat(240)).collect::<Vec<_>>();
     for ordinal in 0..99 {
+        let (task, raw_signature, _managed_signature) =
+            canonical_research_task(100 + ordinal, "running", "pa-campaign-project", 2_001 + ordinal);
         repository
             .upsert(&NewTaskObservation::new(
                 &h.project_id,
-                format!("pueue-task:v1:running-{ordinal}"),
-                100 + ordinal,
+                raw_signature,
+                task.id,
                 "pa-campaign-project",
-                large_command.clone(),
-                "Running",
-                Some(2_000 + ordinal),
-                Some(2_001 + ordinal),
+                vec![task.command],
+                task.state,
+                task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+                task.started_at.as_deref().and_then(|value| value.parse().ok()),
+                task.ended_at.as_deref().and_then(|value| value.parse().ok()),
                 None,
-                None,
-                2_002 + ordinal,
+                2_003 + ordinal,
             ))
             .unwrap();
     }
@@ -1697,6 +1827,45 @@ fn research_evidence_reports_exact_running_observation_omissions() {
         "byte pruning should increment exact omissions"
     );
     assert_eq!(included + omitted, 100);
+}
+
+#[test]
+fn research_evidence_emits_bounded_managed_running_signatures() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let repository = TaskObservationRepository::new(&h.db);
+    for ordinal in 0..39 {
+        let (task, raw_signature, _managed_signature) = canonical_research_task(
+            100 + ordinal,
+            &format!("bounded-{ordinal}"),
+            "pa-campaign-project",
+            2_001 + ordinal,
+        );
+        repository
+            .upsert(&NewTaskObservation::new(
+                &h.project_id,
+                raw_signature,
+                task.id,
+                "pa-campaign-project",
+                vec![task.command],
+                task.state,
+                task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+                task.started_at.as_deref().and_then(|value| value.parse().ok()),
+                None,
+                None,
+                2_003 + ordinal,
+            ))
+            .unwrap();
+    }
+
+    let evidence = build_research_evidence(&h.db, &review, 1_061).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&evidence.json).unwrap();
+    let running = value["facts"]["running"].as_array().unwrap();
+    assert_eq!(running.len(), 32);
+    assert_eq!(value["operations"]["omissions"]["running"], 8);
+    assert!(running.iter().all(|entry| entry["task_signature"]
+        .as_str()
+        .is_some_and(|signature| signature.starts_with("pueue-managed-run:v1:"))));
 }
 
 #[test]
@@ -2121,7 +2290,7 @@ fn v28_to_v29_research_migration_preserves_events_and_is_idempotent() {
 fn research_schema_rejects_unknown_states_and_same_target_open_operations() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:index", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "index", 1_000);
     let repository = ResearchRepository::new(&h.db);
     repository
         .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
@@ -2130,7 +2299,7 @@ fn research_schema_rejects_unknown_states_and_same_target_open_operations() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:index",
+            &task_signature,
             2_800,
         )
         .unwrap()
@@ -2170,7 +2339,7 @@ fn research_schema_rejects_unknown_states_and_same_target_open_operations() {
 fn research_claim_defers_when_a_completed_review_still_owns_an_operation() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:owned", 1_000);
+    let task_signature = h.make_running_research_baseline(41, "owned", 1_000);
     let repository = ResearchRepository::new(&h.db);
     repository
         .schedule_running(&h.campaign_id, 1_000, 30, 1_001)
@@ -2179,7 +2348,7 @@ fn research_claim_defers_when_a_completed_review_still_owns_an_operation() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:owned",
+            &task_signature,
             2_800,
         )
         .unwrap()
@@ -2202,7 +2371,7 @@ fn research_claim_defers_when_a_completed_review_still_owns_an_operation() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:owned",
+            &task_signature,
             4_800,
         )
         .unwrap()
@@ -2213,7 +2382,7 @@ fn research_claim_defers_when_a_completed_review_still_owns_an_operation() {
 fn research_claims_are_isolated_between_campaigns() {
     let h = CampaignDbHarness::new();
     h.start(&CampaignLimits::default(), 1_000);
-    h.make_running_baseline(41, "pueue-task:v1:campaign-a", 1_000);
+    let campaign_a_signature = h.make_running_research_baseline(41, "campaign-a", 1_000);
     let other_root = h.test.project_root("campaign-project-b");
     register_project(
         &h.db,
@@ -2248,6 +2417,8 @@ fn research_claims_are_isolated_between_campaigns() {
             &CampaignLimits::default(),
         )
         .unwrap();
+    let (other_task, other_raw_signature, other_managed_signature) =
+        canonical_research_task(42, "campaign-b", "pa-campaign-project-b", 1_000);
     ExperimentRepository::new(&h.db)
         .mark_submitting(&other.experiment.experiment_id, 1_000)
         .unwrap();
@@ -2255,18 +2426,18 @@ fn research_claims_are_isolated_between_campaigns() {
         .mark_accepted(
             &other.experiment.experiment_id,
             42,
-            "pueue-task:v1:campaign-b",
+            &other_managed_signature,
             1_001,
         )
         .unwrap();
     TaskObservationRepository::new(&h.db)
         .upsert(&NewTaskObservation::new(
             "campaign-project-b",
-            "pueue-task:v1:campaign-b",
+            other_raw_signature,
             42,
             "pa-campaign-project-b",
-            vec!["python".to_owned(), "other.py".to_owned()],
-            "Running",
+            vec![other_task.command],
+            other_task.state,
             Some(999),
             Some(1_000),
             None,
@@ -2286,7 +2457,7 @@ fn research_claims_are_isolated_between_campaigns() {
         .claim_due(
             &h.campaign_id,
             &h.experiment_id,
-            "pueue-task:v1:campaign-a",
+            &campaign_a_signature,
             2_800,
         )
         .unwrap()
@@ -2295,7 +2466,7 @@ fn research_claims_are_isolated_between_campaigns() {
         .claim_due(
             "campaign-2",
             &other.experiment.experiment_id,
-            "pueue-task:v1:campaign-b",
+            &other_managed_signature,
             2_800,
         )
         .unwrap()

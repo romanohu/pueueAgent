@@ -177,7 +177,7 @@ impl ResearchHarness {
         label: &str,
         fixture_session_id: &str,
         ordinary_custom_agent: bool,
-        daemon_compatible_task_signature: bool,
+        _daemon_compatible_task_signature: bool,
     ) -> Self {
         let temp = tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -232,20 +232,19 @@ impl ResearchHarness {
         let experiment_id = format!("research-{label}-experiment-1");
         let submission_id = format!("research-{label}-submission-1");
         let proposal_id = format!("research-{label}-proposal-1");
-        let task_signature = if daemon_compatible_task_signature {
-            pueue_agent::reconcile::task_signature(&PueueTask {
-                id: 41,
-                group: project_id.clone(),
-                command: "python train.py".to_owned(),
-                state: "Running".to_owned(),
-                enqueued_at: Some(NOW.to_string()),
-                started_at: Some((NOW + 1).to_string()),
-                ended_at: None,
-                result: None,
-            })
-        } else {
-            format!("pueue-task:v1:{label}:one")
+        let daemon_task = PueueTask {
+            id: 41,
+            group: project_id.clone(),
+            command: "python train.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some(NOW.to_string()),
+            started_at: Some((NOW + 1).to_string()),
+            ended_at: None,
+            result: None,
         };
+        let task_signature = pueue_agent::reconcile::managed_task_run_signature(&daemon_task)
+            .unwrap();
+        let observation_signature = pueue_agent::reconcile::task_signature(&daemon_task);
         let objective_digest = format!("research-objective-digest-{label}");
         let config_path = service_dir.join("config.toml");
         let secondary_config_path = secondary_service_dir.join("config.toml");
@@ -379,10 +378,10 @@ max_agent_runs = 10
         TaskObservationRepository::new(&db)
             .upsert(&NewTaskObservation::new(
                 &project_id,
-                &task_signature,
+                &observation_signature,
                 41,
                 &project_id,
-                initial_argv,
+                vec![daemon_task.command.clone()],
                 "Running",
                 Some(NOW),
                 Some(NOW + 1),
@@ -925,8 +924,10 @@ max_agent_runs = 10
             .connect()
             .unwrap()
             .query_row(
-                "SELECT state FROM task_observations WHERE task_signature = ?1",
-                [&claimed.review.task_signature],
+                "SELECT state FROM task_observations
+                 WHERE project_id = ?1 AND pueue_task_id = 41
+                 ORDER BY observed_at DESC LIMIT 1",
+                [&self.project.project_id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1228,20 +1229,38 @@ max_agent_runs = 10
         ExperimentRepository::new(&self.db)
             .mark_submitting(&experiment_id, NOW + 122)
             .unwrap();
-        let task_signature = format!("pueue-task:v1:{}:two", self.campaign_id);
+        let changed_task = PueueTask {
+            id: 42,
+            group: self.project.pueue_group.clone(),
+            command: "python train-changed.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some((NOW + 120).to_string()),
+            started_at: Some((NOW + 121).to_string()),
+            ended_at: None,
+            result: None,
+        };
+        let task_signature =
+            pueue_agent::reconcile::managed_task_run_signature(&changed_task).unwrap();
+        let observation_signature = pueue_agent::reconcile::task_signature(&changed_task);
         ExperimentRepository::new(&self.db)
             .mark_accepted(&experiment_id, 42, &task_signature, NOW + 123)
             .unwrap();
         TaskObservationRepository::new(&self.db)
             .upsert(&NewTaskObservation::new(
                 &self.project.project_id,
-                &task_signature,
-                42,
-                &self.project.pueue_group,
-                vec!["python".to_owned(), "train-changed.py".to_owned()],
-                "Running",
-                Some(NOW + 120),
-                Some(NOW + 121),
+                &observation_signature,
+                changed_task.id,
+                &changed_task.group,
+                vec![changed_task.command.clone()],
+                &changed_task.state,
+                changed_task
+                    .enqueued_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                changed_task
+                    .started_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
                 None,
                 None,
                 NOW + 124,
@@ -1317,20 +1336,38 @@ max_agent_runs = 10
         ExperimentRepository::new(&self.db)
             .mark_submitting(&experiment_id, NOW + 127)
             .unwrap();
-        let task_signature = format!("pueue-task:v1:{}:three", self.campaign_id);
+        let sibling_task = PueueTask {
+            id: 43,
+            group: self.project.pueue_group.clone(),
+            command: "python train-sibling.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some((NOW + 126).to_string()),
+            started_at: Some((NOW + 127).to_string()),
+            ended_at: None,
+            result: None,
+        };
+        let task_signature =
+            pueue_agent::reconcile::managed_task_run_signature(&sibling_task).unwrap();
+        let observation_signature = pueue_agent::reconcile::task_signature(&sibling_task);
         ExperimentRepository::new(&self.db)
-            .mark_accepted(&experiment_id, 43, &task_signature, NOW + 128)
+            .mark_accepted(&experiment_id, sibling_task.id, &task_signature, NOW + 128)
             .unwrap();
         TaskObservationRepository::new(&self.db)
             .upsert(&NewTaskObservation::new(
                 &self.project.project_id,
-                &task_signature,
-                43,
-                &self.project.pueue_group,
-                vec!["python".to_owned(), "train-sibling.py".to_owned()],
-                "Running",
-                Some(NOW + 126),
-                Some(NOW + 127),
+                &observation_signature,
+                sibling_task.id,
+                &sibling_task.group,
+                vec![sibling_task.command.clone()],
+                &sibling_task.state,
+                sibling_task
+                    .enqueued_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                sibling_task
+                    .started_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
                 None,
                 None,
                 NOW + 129,
@@ -1356,7 +1393,19 @@ max_agent_runs = 10
         let experiment_id = format!("{}-experiment", campaign_id);
         let submission_id = format!("{}-submission", campaign_id);
         let proposal_id = format!("{}-proposal", campaign_id);
-        let task_signature = format!("pueue-task:v1:{}:second", self.campaign_id);
+        let second_task = PueueTask {
+            id: 42,
+            group: self.project.pueue_group.clone(),
+            command: "python train-second.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some((NOW + 200).to_string()),
+            started_at: Some((NOW + 201).to_string()),
+            ended_at: None,
+            result: None,
+        };
+        let task_signature =
+            pueue_agent::reconcile::managed_task_run_signature(&second_task).unwrap();
+        let observation_signature = pueue_agent::reconcile::task_signature(&second_task);
         let objective = ObjectiveSnapshot {
             text: "Start a distinct campaign in the same project safely.".to_owned(),
             digest: format!("{}-second-objective", self.campaign_id),
@@ -1397,18 +1446,24 @@ max_agent_runs = 10
             .mark_submitting(&experiment_id, NOW + 201)
             .unwrap();
         ExperimentRepository::new(&self.db)
-            .mark_accepted(&experiment_id, 42, &task_signature, NOW + 202)
+            .mark_accepted(&experiment_id, second_task.id, &task_signature, NOW + 202)
             .unwrap();
         TaskObservationRepository::new(&self.db)
             .upsert(&NewTaskObservation::new(
                 &self.project.project_id,
-                &task_signature,
-                42,
-                &self.project.pueue_group,
-                initial_argv,
-                "Running",
-                Some(NOW + 200),
-                Some(NOW + 201),
+                &observation_signature,
+                second_task.id,
+                &second_task.group,
+                vec![second_task.command.clone()],
+                &second_task.state,
+                second_task
+                    .enqueued_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                second_task
+                    .started_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
                 None,
                 None,
                 NOW + 203,
@@ -1447,7 +1502,19 @@ max_agent_runs = 10
         let experiment_id = format!("{}-experiment", campaign_id);
         let submission_id = format!("{}-submission", campaign_id);
         let proposal_id = format!("{}-proposal", campaign_id);
-        let task_signature = format!("pueue-task:v1:{}", campaign_id);
+        let secondary_task = PueueTask {
+            id: 142,
+            group: project.pueue_group.clone(),
+            command: "python train-secondary.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some((NOW + 21).to_string()),
+            started_at: Some((NOW + 22).to_string()),
+            ended_at: None,
+            result: None,
+        };
+        let task_signature =
+            pueue_agent::reconcile::managed_task_run_signature(&secondary_task).unwrap();
+        let observation_signature = pueue_agent::reconcile::task_signature(&secondary_task);
         let objective = ObjectiveSnapshot {
             text: "Start a secondary campaign for queue fairness checks.".to_owned(),
             digest: format!("{}-objective", campaign_id),
@@ -1493,13 +1560,19 @@ max_agent_runs = 10
         TaskObservationRepository::new(&self.db)
             .upsert(&NewTaskObservation::new(
                 &project.project_id,
-                &task_signature,
-                142,
-                &project.pueue_group,
-                initial_argv,
-                "Running",
-                Some(NOW + 21),
-                Some(NOW + 22),
+                &observation_signature,
+                secondary_task.id,
+                &secondary_task.group,
+                vec![secondary_task.command.clone()],
+                &secondary_task.state,
+                secondary_task
+                    .enqueued_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                secondary_task
+                    .started_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
                 None,
                 None,
                 NOW + 24,

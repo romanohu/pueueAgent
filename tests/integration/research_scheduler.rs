@@ -17,14 +17,53 @@ use pueue_agent::{
         NewProject, NewTaskObservation, ProposalKind,
     },
     proposals::{self, ProposalInput},
+    pueue::{PueueApi, PueueTask},
+    reconcile::{managed_task_run_signature, task_signature, Reconciler},
     research::recover_research,
+    research_evidence::build_research_evidence,
     retry::RetryPolicy,
     state::ObjectiveSnapshot,
+    AppError,
 };
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use pueue_agent::db::next_research_due;
+
+#[derive(Clone)]
+struct ResearchSchedulerPueue {
+    tasks: Vec<PueueTask>,
+}
+
+impl ResearchSchedulerPueue {
+    fn with_tasks(tasks: Vec<PueueTask>) -> Self {
+        Self { tasks }
+    }
+}
+
+#[async_trait]
+impl PueueApi for ResearchSchedulerPueue {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        Ok(self.tasks.clone())
+    }
+
+    async fn add(&self, _args: &[std::ffi::OsString]) -> Result<i64, AppError> {
+        panic!("research identity fixture must not submit a Pueue task")
+    }
+
+    async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("research identity fixture must not kill a Pueue task")
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        panic!("research identity fixture must not remove a Pueue task")
+    }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        panic!("research identity fixture must not create a Pueue group")
+    }
+}
 
 #[test]
 fn zero_interval_disables_research() {
@@ -42,21 +81,359 @@ fn due_time_reports_timestamp_overflow() {
     assert!(error.to_string().contains("research.next_due_at"));
 }
 
+#[tokio::test]
+async fn reconciler_live_identity_feeds_research_schedule_and_evidence() {
+    let (fixture, task, managed_signature) = reconciled_identity_fixture();
+    let live_signature = task_signature(&task);
+    assert_ne!(managed_signature, live_signature);
+    assert_eq!(
+        TaskObservationRepository::new(&fixture.db)
+            .find("research-scheduler-project", &managed_signature)
+            .expect("read pre-reconcile managed observation"),
+        None,
+        "the fixture must not install a synthetic managed observation alias"
+    );
+
+    let report = Reconciler::new(
+        &fixture.db,
+        ResearchSchedulerPueue::with_tasks(vec![task.clone()]),
+    )
+    .run_once_at(1_001)
+    .await
+    .expect("reconcile live task");
+    assert_eq!(report.observed_task_count, 1);
+    let live_observation = TaskObservationRepository::new(&fixture.db)
+        .find("research-scheduler-project", &live_signature)
+        .expect("read reconciled live observation")
+        .expect("reconciler must persist the live observation");
+    assert_eq!(live_observation.pueue_task_id, task.id);
+    assert_eq!(live_observation.started_at, Some(1_000));
+    assert!(
+        TaskObservationRepository::new(&fixture.db)
+            .find("research-scheduler-project", &managed_signature)
+            .expect("read managed observation after reconcile")
+            .is_none(),
+        "only the reconciler-produced live identity may be present"
+    );
+
+    let repository = ResearchRepository::new(&fixture.db);
+    assert_eq!(
+        repository
+            .schedule_running_campaigns(30, 1_001, 1)
+            .expect("schedule reconciled running campaign"),
+        1
+    );
+    let review = repository
+        .claim_due_campaigns(2_800, 1)
+        .expect("claim reconciled campaign")
+        .into_iter()
+        .next()
+        .expect("reconciled campaign must produce a due review");
+    let evidence = build_research_evidence(&fixture.db, &review, 2_800)
+        .expect("research evidence must use the reconciled live identity");
+    assert!(!evidence.json.is_empty());
+    assert_eq!(
+        format!("{:x}", Sha256::digest(evidence.json.as_bytes())),
+        evidence.digest
+    );
+}
+
+#[tokio::test]
+async fn reconciler_does_not_reuse_numeric_identity_after_live_task_changes() {
+    let (fixture, original_task, managed_signature) = reconciled_identity_fixture();
+    let original_live_signature = task_signature(&original_task);
+    Reconciler::new(
+        &fixture.db,
+        ResearchSchedulerPueue::with_tasks(vec![original_task.clone()]),
+    )
+    .run_once_at(1_001)
+    .await
+    .expect("reconcile original live task");
+    ResearchRepository::new(&fixture.db)
+        .schedule_running(&fixture.campaign_id, 1_000, 30, 2_799)
+        .expect("establish a due research schedule from the valid snapshot");
+
+    let mut changed_task = original_task.clone();
+    changed_task.command = "python changed.py".to_owned();
+    changed_task.enqueued_at = Some("901".to_owned());
+    changed_task.started_at = Some("1001".to_owned());
+    let changed_live_signature = task_signature(&changed_task);
+    assert_ne!(original_live_signature, changed_live_signature);
+    assert_ne!(
+        managed_signature,
+        managed_task_run_signature(&changed_task).expect("changed managed task identity")
+    );
+    Reconciler::new(
+        &fixture.db,
+        ResearchSchedulerPueue::with_tasks(vec![changed_task]),
+    )
+    .run_once_at(1_002)
+    .await
+    .expect("reconcile changed live task");
+
+    let observations = TaskObservationRepository::new(&fixture.db);
+    assert!(
+        observations
+            .find("research-scheduler-project", &original_live_signature)
+            .expect("read original live observation")
+            .is_some(),
+        "the original observation remains historical evidence"
+    );
+    assert!(
+        observations
+            .find("research-scheduler-project", &changed_live_signature)
+            .expect("read changed live observation")
+            .is_some(),
+        "the changed live identity must be observed separately"
+    );
+
+    let repository = ResearchRepository::new(&fixture.db);
+    assert!(
+        repository
+            .claim_due(
+                &fixture.campaign_id,
+                &fixture.experiment_id,
+                &managed_signature,
+                2_800,
+            )
+            .expect("claim after live identity change")
+            .is_none(),
+        "the due claim must revalidate the changed live identity"
+    );
+    assert_eq!(
+        repository
+            .schedule_running_campaigns(30, 1_002, 1)
+            .expect("schedule after live identity change"),
+        0,
+        "a changed task with the same numeric id/group must not revive the old campaign"
+    );
+    assert!(
+        repository
+            .claim_due_campaigns(2_800, 1)
+            .expect("claim due campaign after live identity change")
+            .is_empty(),
+        "the stale campaign must not consume a research claim"
+    );
+}
+
+#[tokio::test]
+async fn reconciler_skips_changed_prefix_for_later_live_campaign() {
+    let (fixture, original_task, original_managed_signature) = reconciled_identity_fixture();
+    let original_live_signature = task_signature(&original_task);
+    Reconciler::new(
+        &fixture.db,
+        ResearchSchedulerPueue::with_tasks(vec![original_task.clone()]),
+    )
+    .run_once_at(1_001)
+    .await
+    .expect("reconcile original live task");
+
+    let later_label = "later-reconciled";
+    let later_task = PueueTask {
+        id: 42,
+        group: format!("research-scheduler-{later_label}-group"),
+        command: "python later.py".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("901".to_owned()),
+        started_at: Some("1001".to_owned()),
+        ended_at: None,
+        result: None,
+    };
+    let (later_campaign_id, later_experiment_id, later_managed_signature) =
+        add_reconciled_campaign(&fixture, &later_task, later_label, 900);
+    let mut changed_task = original_task;
+    changed_task.command = "python changed.py".to_owned();
+    changed_task.enqueued_at = Some("902".to_owned());
+    changed_task.started_at = Some("1001".to_owned());
+    let changed_live_signature = task_signature(&changed_task);
+    assert_ne!(original_live_signature, changed_live_signature);
+    assert_ne!(
+        original_managed_signature,
+        managed_task_run_signature(&changed_task).expect("changed managed task identity")
+    );
+
+    Reconciler::new(
+        &fixture.db,
+        ResearchSchedulerPueue::with_tasks(vec![changed_task, later_task.clone()]),
+    )
+    .run_once_at(1_002)
+    .await
+    .expect("reconcile changed prefix and later live task");
+
+    let repository = ResearchRepository::new(&fixture.db);
+    assert_eq!(
+        repository
+            .schedule_running_campaigns(30, 1_002, 1)
+            .expect("schedule later valid campaign behind changed prefix"),
+        1,
+        "an invalid oldest identity must not consume the bounded scheduler prefix"
+    );
+    assert_eq!(
+        repository
+            .state(&later_campaign_id)
+            .expect("read later research state")
+            .next_due_at,
+        Some(2_801)
+    );
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("read changed-prefix research state")
+            .next_due_at,
+        None,
+        "the changed prefix must not be scheduled by the live scheduler"
+    );
+    repository
+        .schedule_running(&fixture.campaign_id, 1_000, 30, 2_801)
+        .expect("establish a due state for the changed prefix claim check");
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("read due changed-prefix research state")
+            .next_due_at,
+        Some(2_800)
+    );
+    assert_eq!(
+        repository
+            .claim_due_campaigns(2_801, 1)
+            .expect("claim later valid campaign behind changed prefix")
+            .into_iter()
+            .next()
+            .map(|review| review.experiment_id),
+        Some(later_experiment_id)
+    );
+    assert!(
+        TaskObservationRepository::new(&fixture.db)
+            .find("research-scheduler-project", &later_managed_signature)
+            .expect("read later managed observation alias")
+            .is_none(),
+        "the Reconciler must continue to publish only its raw live identity"
+    );
+}
+
+#[tokio::test]
+async fn equal_latest_lifecycle_snapshots_fail_closed_for_claim_and_evidence() {
+    let (fixture, running_task, managed_signature) = reconciled_identity_fixture();
+    let mut terminal_task = running_task.clone();
+    terminal_task.state = "Done".to_owned();
+    terminal_task.ended_at = Some("1100".to_owned());
+    let observations = TaskObservationRepository::new(&fixture.db);
+    for task in [&running_task, &terminal_task] {
+        observations
+            .upsert(&NewTaskObservation::new(
+                "research-scheduler-project",
+                &task_signature(task),
+                task.id,
+                &task.group,
+                vec![task.command.clone()],
+                &task.state,
+                task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+                task.started_at.as_deref().and_then(|value| value.parse().ok()),
+                task.ended_at.as_deref().and_then(|value| value.parse().ok()),
+                None,
+                1_001,
+            ))
+            .expect("tied lifecycle observation");
+    }
+    let repository = ResearchRepository::new(&fixture.db);
+    repository
+        .schedule_running(&fixture.campaign_id, 1_000, 30, 2_799)
+        .expect("establish due state for tied observations");
+    assert_eq!(
+        repository
+            .schedule_running_campaigns(30, 1_001, 1)
+            .expect("schedule tied lifecycle observations"),
+        0,
+        "a running/terminal tie must not enter the bounded schedule"
+    );
+    assert!(
+        repository
+            .claim_due(
+                &fixture.campaign_id,
+                &fixture.experiment_id,
+                &managed_signature,
+                2_800,
+            )
+            .expect("claim tied lifecycle observations")
+            .is_none(),
+        "a tied lifecycle snapshot must not be claimable"
+    );
+
+    let (evidence_fixture, running_task, managed_signature) = reconciled_identity_fixture();
+    let evidence_observations = TaskObservationRepository::new(&evidence_fixture.db);
+    evidence_observations
+        .upsert(&NewTaskObservation::new(
+            "research-scheduler-project",
+            &task_signature(&running_task),
+            running_task.id,
+            &running_task.group,
+            vec![running_task.command.clone()],
+            &running_task.state,
+            Some(900),
+            Some(1_000),
+            None,
+            None,
+            1_001,
+        ))
+        .expect("running evidence observation");
+    let evidence_repository = ResearchRepository::new(&evidence_fixture.db);
+    evidence_repository
+        .schedule_running(&evidence_fixture.campaign_id, 1_000, 30, 2_799)
+        .expect("schedule earlier evidence review");
+    let review = evidence_repository
+        .claim_due(
+            &evidence_fixture.campaign_id,
+            &evidence_fixture.experiment_id,
+            &managed_signature,
+            2_800,
+        )
+        .expect("claim earlier evidence review")
+        .expect("earlier evidence review must be claimable");
+    let mut terminal_task = running_task;
+    terminal_task.state = "Done".to_owned();
+    terminal_task.ended_at = Some("1100".to_owned());
+    evidence_observations
+        .upsert(&NewTaskObservation::new(
+            "research-scheduler-project",
+            &task_signature(&terminal_task),
+            terminal_task.id,
+            &terminal_task.group,
+            vec![terminal_task.command.clone()],
+            &terminal_task.state,
+            Some(900),
+            Some(1_000),
+            Some(1_100),
+            None,
+            1_001,
+        ))
+        .expect("terminal tie for earlier evidence review");
+    let error = build_research_evidence(&evidence_fixture.db, &review, 2_800)
+        .expect_err("evidence must reject tied current lifecycle observations");
+    assert!(error.to_string().contains("ambiguous current task observations"));
+}
+
 struct SchedulerFixture {
     _temp: TempDir,
     db: Db,
     campaign_id: String,
     experiment_id: String,
     task_signature: String,
+    observation_signature: String,
 }
 
 fn fixture() -> SchedulerFixture {
+    fixture_with_task(&scheduler_task(), true)
+}
+
+fn fixture_with_task(task: &PueueTask, seed_observation: bool) -> SchedulerFixture {
     let temp = tempfile::tempdir().expect("fixture directory");
     let root = temp.path().join("project");
     fs::create_dir_all(&root).expect("project root");
     let config_path = root.join("config.toml");
     fs::write(&config_path, "fixture").expect("project config");
     let db = Db::open(&temp.path().join("state.sqlite3")).expect("database");
+    let managed_signature = managed_task_run_signature(task).expect("managed task identity");
+    let observation_signature = task_signature(task);
     let project_id = "research-scheduler-project";
     let campaign_id = "research-scheduler-campaign";
     let experiment_id = "research-scheduler-experiment";
@@ -110,25 +487,30 @@ fn fixture() -> SchedulerFixture {
     ExperimentRepository::new(&db)
         .mark_submitting(experiment_id, 901)
         .expect("submission intent");
-    let task_signature = "research-scheduler-task:v1";
     ExperimentRepository::new(&db)
-        .mark_accepted(experiment_id, 41, task_signature, 902)
+        .mark_accepted(experiment_id, task.id, &managed_signature, 902)
         .expect("accepted experiment");
-    TaskObservationRepository::new(&db)
-        .upsert(&NewTaskObservation::new(
-            project_id,
-            task_signature,
-            41,
-            "research-scheduler-group",
-            argv,
-            "Running",
-            Some(900),
-            Some(1_000),
-            None,
-            None,
-            1_001,
-        ))
-        .expect("running observation");
+    if seed_observation {
+        TaskObservationRepository::new(&db)
+            .upsert(&NewTaskObservation::new(
+                project_id,
+                &observation_signature,
+                task.id,
+                &task.group,
+                vec![task.command.clone()],
+                &task.state,
+                task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+                task.started_at.as_deref().and_then(|value| value.parse().ok()),
+                task.ended_at.as_deref().and_then(|value| value.parse().ok()),
+                task.result
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .expect("serialize fixture task result"),
+                1_001,
+            ))
+            .expect("running observation");
+    }
     ResearchRepository::new(&db)
         .ensure_campaign(campaign_id)
         .expect("research state");
@@ -137,8 +519,123 @@ fn fixture() -> SchedulerFixture {
         db,
         campaign_id: campaign_id.to_owned(),
         experiment_id: experiment_id.to_owned(),
-        task_signature: task_signature.to_owned(),
+        task_signature: managed_signature,
+        observation_signature,
     }
+}
+
+fn scheduler_task() -> PueueTask {
+    PueueTask {
+        id: 41,
+        group: "research-scheduler-group".to_owned(),
+        command: "python train.py".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("900".to_owned()),
+        started_at: Some("1000".to_owned()),
+        ended_at: None,
+        result: None,
+    }
+}
+
+fn reconciled_identity_fixture() -> (SchedulerFixture, PueueTask, String) {
+    let task = scheduler_task();
+    let managed_signature = managed_task_run_signature(&task).expect("managed task identity");
+    let fixture = fixture_with_task(&task, false);
+    (fixture, task, managed_signature)
+}
+
+fn add_reconciled_campaign(
+    fixture: &SchedulerFixture,
+    task: &PueueTask,
+    label: &str,
+    now: i64,
+) -> (String, String, String) {
+    let root = fixture._temp.path().join(label).join("project");
+    fs::create_dir_all(&root).expect("later project root");
+    let config_path = root.join("config.toml");
+    fs::write(&config_path, "fixture").expect("later project config");
+    let project_id = format!("research-scheduler-{label}-project");
+    let pueue_group = format!("research-scheduler-{label}-group");
+    ProjectRepository::new(&fixture.db)
+        .register(&NewProject::new(
+            &project_id,
+            root,
+            &pueue_group,
+            config_path,
+            now,
+        ))
+        .expect("later project registration");
+    let campaign_id = format!("research-scheduler-{label}-campaign");
+    let experiment_id = format!("research-scheduler-{label}-experiment");
+    let submission_id = format!("research-scheduler-{label}-submission");
+    let proposal_id = format!("research-scheduler-{label}-proposal");
+    let objective = ObjectiveSnapshot {
+        text: format!("Improve the bounded {label} objective"),
+        digest: format!("research-scheduler-{label}-objective"),
+    };
+    let argv = task
+        .command
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let proposal = proposals::validate_initial_baseline(
+        ProposalInput {
+            kind: ProposalKind::Experiment,
+            hypothesis: format!("measure the {label} baseline"),
+            source_experiment_id: None,
+            argv: argv.clone(),
+            working_directory: ".".to_owned(),
+            expected_evidence: vec!["loss".to_owned()],
+        },
+        &objective.digest,
+    )
+    .expect("baseline proposal");
+    CampaignRepository::new(&fixture.db)
+        .start_with_baseline(
+            StartCampaignRequest {
+                campaign_id: &campaign_id,
+                project_id: &project_id,
+                objective: &objective,
+                initial_argv: &argv,
+                baseline: &proposal,
+                submission_id: &submission_id,
+                experiment_id: &experiment_id,
+                proposal_id: &proposal_id,
+                metadata: &serde_json::json!({}),
+                origin_agent_run_id: None,
+                objective_metric: None,
+                now,
+            },
+            &CampaignLimits::default(),
+        )
+        .expect("later campaign creation");
+    ExperimentRepository::new(&fixture.db)
+        .mark_submitting(&experiment_id, now + 1)
+        .expect("later submission intent");
+    let managed_signature = managed_task_run_signature(task).expect("later managed identity");
+    ExperimentRepository::new(&fixture.db)
+        .mark_accepted(&experiment_id, task.id, &managed_signature, now + 2)
+        .expect("later accepted experiment");
+    let observation_signature = task_signature(task);
+    TaskObservationRepository::new(&fixture.db)
+        .upsert(&NewTaskObservation::new(
+            &project_id,
+            &observation_signature,
+            task.id,
+            &pueue_group,
+            vec![task.command.clone()],
+            &task.state,
+            task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+            task.started_at.as_deref().and_then(|value| value.parse().ok()),
+            task.ended_at.as_deref().and_then(|value| value.parse().ok()),
+            None,
+            now + 3,
+        ))
+        .expect("later running observation");
+    ResearchRepository::new(&fixture.db)
+        .ensure_campaign(&campaign_id)
+        .expect("later research state");
+    (campaign_id, experiment_id, managed_signature)
 }
 
 fn seed_active_research_outcome(
@@ -384,11 +881,22 @@ fn add_running_campaign(
     let experiment_id = format!("research-scheduler-{label}-experiment");
     let submission_id = format!("research-scheduler-{label}-submission");
     let proposal_id = format!("research-scheduler-{label}-proposal");
+    let pueue_group = format!("research-scheduler-{label}-group");
+    let task = PueueTask {
+        id: started_at + 41,
+        group: pueue_group.clone(),
+        command: format!("python train-{label}.py"),
+        state: "Running".to_owned(),
+        enqueued_at: Some(started_at.to_string()),
+        started_at: Some(started_at.to_string()),
+        ended_at: None,
+        result: None,
+    };
     ProjectRepository::new(db)
         .register(&NewProject::new(
             &project_id,
             root,
-            format!("research-scheduler-{label}-group"),
+            &pueue_group,
             config_path,
             started_at,
         ))
@@ -432,26 +940,27 @@ fn add_running_campaign(
     ExperimentRepository::new(db)
         .mark_submitting(&experiment_id, started_at + 1)
         .expect("submission intent");
-    let task_signature = format!("research-scheduler-task:v1:{label}");
+    let managed_signature = managed_task_run_signature(&task).expect("managed task identity");
     ExperimentRepository::new(db)
-        .mark_accepted(&experiment_id, started_at + 41, &task_signature, started_at + 2)
+        .mark_accepted(&experiment_id, task.id, &managed_signature, started_at + 2)
         .expect("accepted experiment");
+    let observation_signature = task_signature(&task);
     TaskObservationRepository::new(db)
         .upsert(&NewTaskObservation::new(
             &project_id,
-            &task_signature,
-            started_at + 41,
-            format!("research-scheduler-{label}-group"),
-            argv,
-            "Running",
+            &observation_signature,
+            task.id,
+            &pueue_group,
+            vec![task.command.clone()],
+            &task.state,
             Some(started_at),
-            Some(started_at),
+            task.started_at.as_deref().and_then(|value| value.parse().ok()),
             None,
             None,
             started_at + 3,
         ))
         .expect("running observation");
-    (campaign_id, experiment_id, task_signature)
+    (campaign_id, experiment_id, managed_signature)
 }
 
 #[test]
@@ -491,26 +1000,41 @@ fn bounded_running_campaign_scheduling_advances_past_already_scheduled_campaigns
 #[test]
 fn missing_started_at_uses_first_confirmed_running_observation() {
     let fixture = fixture();
+    let mut queued_task = scheduler_task();
+    queued_task.state = "Queued".to_owned();
+    queued_task.started_at = None;
+    let mut running_task = queued_task.clone();
+    running_task.state = "Running".to_owned();
+    running_task.started_at = None;
+    let mut authoritative_task = running_task.clone();
+    authoritative_task.started_at = Some("3900".to_owned());
+    let mut terminal_task = running_task.clone();
+    terminal_task.state = "Done".to_owned();
+    terminal_task.started_at = Some("3800".to_owned());
+    let queued_signature = task_signature(&queued_task);
+    let running_signature = task_signature(&running_task);
+    let authoritative_signature = task_signature(&authoritative_task);
+    let terminal_signature = task_signature(&terminal_task);
     fixture
         .db
         .connect()
         .unwrap()
         .execute(
             "DELETE FROM task_observations WHERE project_id = ?1 AND task_signature = ?2",
-            rusqlite::params!["research-scheduler-project", &fixture.task_signature],
+            rusqlite::params!["research-scheduler-project", &fixture.observation_signature],
         )
         .expect("remove the fixture's initial running observation");
     let observations = TaskObservationRepository::new(&fixture.db);
     observations
         .upsert(&NewTaskObservation::new(
             "research-scheduler-project",
-            &fixture.task_signature,
-            41,
-            "research-scheduler-group",
-            vec!["python".to_owned(), "train.py".to_owned()],
-            "Queued",
-            None,
-            None,
+            &queued_signature,
+            queued_task.id,
+            &queued_task.group,
+            vec![queued_task.command.clone()],
+            &queued_task.state,
+            Some(900),
+            queued_task.started_at.as_deref().and_then(|value| value.parse().ok()),
             None,
             None,
             1_000,
@@ -519,12 +1043,12 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
     observations
         .upsert(&NewTaskObservation::new(
             "research-scheduler-project",
-            &fixture.task_signature,
-            41,
-            "research-scheduler-group",
-            vec!["python".to_owned(), "train.py".to_owned()],
-            "Running",
-            None,
+            &running_signature,
+            running_task.id,
+            &running_task.group,
+            vec![running_task.command.clone()],
+            &running_task.state,
+            Some(900),
             None,
             None,
             None,
@@ -549,12 +1073,12 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
     observations
         .upsert(&NewTaskObservation::new(
             "research-scheduler-project",
-            &fixture.task_signature,
-            41,
-            "research-scheduler-group",
-            vec!["python".to_owned(), "train.py".to_owned()],
-            "Running",
-            None,
+            &running_signature,
+            running_task.id,
+            &running_task.group,
+            vec![running_task.command.clone()],
+            &running_task.state,
+            Some(900),
             None,
             None,
             None,
@@ -563,22 +1087,35 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
         .expect("repeated running observation");
     assert_eq!(
         observations
-            .find("research-scheduler-project", &fixture.task_signature)
+            .find("research-scheduler-project", &running_signature)
             .expect("read repeated observation")
             .expect("observation remains persisted")
             .started_at,
+        None
+    );
+    assert_eq!(
+        observations
+            .first_observed_at("research-scheduler-project", &running_signature)
+            .expect("read first running observation time"),
         Some(4_000)
+    );
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("research state after repeated observation")
+            .next_due_at,
+        Some(5_800)
     );
     observations
         .upsert(&NewTaskObservation::new(
             "research-scheduler-project",
-            &fixture.task_signature,
-            41,
-            "research-scheduler-group",
-            vec!["python".to_owned(), "train.py".to_owned()],
-            "Running",
-            None,
-            Some(3_900),
+            &authoritative_signature,
+            authoritative_task.id,
+            &authoritative_task.group,
+            vec![authoritative_task.command.clone()],
+            &authoritative_task.state,
+            Some(900),
+            authoritative_task.started_at.as_deref().and_then(|value| value.parse().ok()),
             None,
             None,
             5_001,
@@ -586,7 +1123,7 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
         .expect("authoritative native start timestamp");
     assert_eq!(
         observations
-            .find("research-scheduler-project", &fixture.task_signature)
+            .find("research-scheduler-project", &authoritative_signature)
             .expect("read authoritative observation")
             .expect("observation remains persisted")
             .started_at,
@@ -595,13 +1132,13 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
     observations
         .upsert(&NewTaskObservation::new(
             "research-scheduler-project",
-            &fixture.task_signature,
-            41,
-            "research-scheduler-group",
-            vec!["python".to_owned(), "train.py".to_owned()],
-            "Done",
-            None,
-            Some(3_800),
+            &terminal_signature,
+            terminal_task.id,
+            &terminal_task.group,
+            vec![terminal_task.command.clone()],
+            &terminal_task.state,
+            Some(900),
+            terminal_task.started_at.as_deref().and_then(|value| value.parse().ok()),
             None,
             None,
             6_000,
@@ -609,7 +1146,7 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
         .expect("authoritative terminal start timestamp");
     assert_eq!(
         observations
-            .find("research-scheduler-project", &fixture.task_signature)
+            .find("research-scheduler-project", &terminal_signature)
             .expect("read terminal observation")
             .expect("terminal observation remains persisted")
             .started_at,

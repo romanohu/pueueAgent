@@ -1991,7 +1991,9 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     harness.register_project("project-b", "pb-project", "codex");
     let experiment_id = harness.campaign_experiment();
     let task = running_task();
-    let task_signature = pueue_agent::reconcile::task_signature(&task);
+    let live_task_signature = pueue_agent::reconcile::task_signature(&task);
+    let task_signature = pueue_agent::reconcile::managed_task_run_signature(&task)
+        .expect("managed research task identity");
     ExperimentRepository::new(&harness.db)
         .mark_submitting(&experiment_id, 190)
         .unwrap();
@@ -2001,10 +2003,10 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     TaskObservationRepository::new(&harness.db)
         .upsert(&NewTaskObservation::new(
             "project-a",
-            &task_signature,
+            &live_task_signature,
             task.id,
             &task.group,
-            vec!["python".to_owned(), "train.py".to_owned()],
+            vec![task.command.clone()],
             "Running",
             Some(100),
             Some(101),
@@ -2190,7 +2192,8 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     let mut later_task = running_task();
     later_task.id = 142;
     later_task.group = "pb-project".to_owned();
-    let later_task_signature = pueue_agent::reconcile::task_signature(&later_task);
+    let later_task_signature = pueue_agent::reconcile::managed_task_run_signature(&later_task)
+        .expect("managed later research task identity");
     harness
         .fake_pueue
         .set_tasks(vec![running_task(), later_task.clone()]);
@@ -2623,7 +2626,9 @@ fn seed_pidless_research_owner_for(
     task: &PueueTask,
 ) -> SeededPidlessResearchOwner {
     let experiment_id = harness.campaign_experiment_for(project_id, campaign_id, experiment_id);
-    let task_signature = pueue_agent::reconcile::task_signature(&task);
+    let live_task_signature = pueue_agent::reconcile::task_signature(task);
+    let task_signature = pueue_agent::reconcile::managed_task_run_signature(task)
+        .expect("managed research task identity");
     ExperimentRepository::new(&harness.db)
         .mark_submitting(&experiment_id, 190)
         .unwrap();
@@ -2633,13 +2638,13 @@ fn seed_pidless_research_owner_for(
     TaskObservationRepository::new(&harness.db)
         .upsert(&NewTaskObservation::new(
             project_id,
-            &task_signature,
+            &live_task_signature,
             task.id,
             &task.group,
-            vec!["python".to_owned(), "train.py".to_owned()],
-            "Running",
-            Some(100),
-            Some(101),
+            vec![task.command.clone()],
+            &task.state,
+            task.enqueued_at.as_deref().and_then(|value| value.parse().ok()),
+            task.started_at.as_deref().and_then(|value| value.parse().ok()),
             None,
             None,
             harness.now,
@@ -3485,7 +3490,9 @@ async fn research_controller_crash_restarts_only_after_group_quiescence() {
     prepare_healthy_research_fixture(&harness);
     let experiment_id = harness.campaign_experiment();
     let task = running_task();
-    let task_signature = pueue_agent::reconcile::task_signature(&task);
+    let live_task_signature = pueue_agent::reconcile::task_signature(&task);
+    let task_signature = pueue_agent::reconcile::managed_task_run_signature(&task)
+        .expect("managed research task identity");
     ExperimentRepository::new(&harness.db)
         .mark_submitting(&experiment_id, 190)
         .unwrap();
@@ -3495,10 +3502,10 @@ async fn research_controller_crash_restarts_only_after_group_quiescence() {
     TaskObservationRepository::new(&harness.db)
         .upsert(&NewTaskObservation::new(
             "project-a",
-            &task_signature,
+            &live_task_signature,
             task.id,
             &task.group,
-            vec!["python".to_owned(), "train.py".to_owned()],
+            vec![task.command.clone()],
             "Running",
             Some(100),
             Some(101),
