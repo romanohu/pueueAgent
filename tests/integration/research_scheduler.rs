@@ -1,17 +1,26 @@
 //! Task 4 scheduler contract tests.
 
-use std::{fs, path::Path};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path};
+
+#[cfg(unix)]
+use std::{os::unix::fs::PermissionsExt, process::Command};
 
 use pueue_agent::{
     db::{
-        CampaignRepository, Db, ExperimentRepository, ProjectRepository, ResearchRepository,
-        StartCampaignRequest, TaskObservationRepository,
+        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        ProjectRepository, ResearchRepository, StartCampaignRequest, TaskObservationRepository,
     },
     execution_policy::CampaignLimits,
-    models::{NewProject, NewTaskObservation, ProposalKind},
+    models::{
+        AgentContextMode, AgentRunStatus, EventStatus, ExecutionProjection, NewAgentRun,
+        NewProject, NewTaskObservation, ProposalKind,
+    },
     proposals::{self, ProposalInput},
+    research::recover_research,
+    retry::RetryPolicy,
     state::ObjectiveSnapshot,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use pueue_agent::db::next_research_due;
@@ -129,6 +138,112 @@ fn fixture() -> SchedulerFixture {
         experiment_id: experiment_id.to_owned(),
         task_signature: task_signature.to_owned(),
     }
+}
+
+fn seed_active_research_outcome(
+    fixture: &SchedulerFixture,
+    state: &str,
+) -> (String, i64, i64) {
+    let repository = ResearchRepository::new(&fixture.db);
+    repository
+        .schedule_running(&fixture.campaign_id, 1_000, 30, 2_799)
+        .expect("schedule research review");
+    let review = repository
+        .claim_due(
+            &fixture.campaign_id,
+            &fixture.experiment_id,
+            &fixture.task_signature,
+            2_800,
+        )
+        .expect("claim research review")
+        .expect("research review must be claimable");
+    let event_id = repository
+        .event_id(&review.review_id)
+        .expect("research event");
+    EventRepository::new(&fixture.db)
+        .claim_by_id("research-scheduler-project", event_id, 2_900)
+        .expect("claim research event")
+        .expect("research event must be pending");
+    let execution = ExecutionProjection::new("campaign_research", "/bin/sh", "fixture")
+        .expect("research execution projection");
+    let run = AgentRunRepository::new(&fixture.db)
+        .insert_with_events(
+            &NewAgentRun::with_context(
+                "research-scheduler-project",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                2_901,
+                fixture._temp.path().join("agent.log"),
+                AgentContextMode::Fresh,
+                None,
+                Vec::new(),
+            )
+            .with_execution(execution),
+            &[event_id],
+        )
+        .expect("insert active research run");
+    let context_json = "{}";
+    let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+    let session_id = "11111111-1111-4111-8111-111111111111";
+    let response_json = serde_json::json!({
+        "schema_version": 1,
+        "review_id": review.review_id,
+        "experiment_id": review.experiment_id,
+        "context_digest": context_digest,
+        "action": "continue",
+        "reason": "recovered response",
+        "evidence_refs": ["test"],
+        "notes": "recovered",
+        "next_direction": null,
+        "checkpoint": null,
+    })
+    .to_string();
+    fixture
+        .db
+        .connect()
+        .expect("database connection")
+        .execute(
+            "UPDATE agent_runs
+             SET status = 'running', pid = 4242, launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run.run_id],
+        )
+        .expect("mark research run active");
+    fixture
+        .db
+        .connect()
+        .expect("database connection")
+        .execute(
+            "UPDATE campaign_research
+             SET session_id = ?1, session_generation = 0
+             WHERE campaign_id = ?2",
+            rusqlite::params![session_id, &fixture.campaign_id],
+        )
+        .expect("persist research session lineage");
+    fixture
+        .db
+        .connect()
+        .expect("database connection")
+        .execute(
+            "UPDATE research_reviews
+             SET attempt = 1, state = ?1, agent_run_id = ?2,
+                 context_json = ?3, context_digest = ?4, response_json = ?5,
+                 failure_code = ?6, started_at = 2_901, finished_at = 2_902,
+                 not_before = 2_902, updated_at = 2_902
+             WHERE review_id = ?7",
+            rusqlite::params![
+                state,
+                run.run_id,
+                context_json,
+                context_digest,
+                (state == "ready").then_some(response_json),
+                (state == "retry_wait").then_some("research_output_invalid"),
+                &review.review_id,
+            ],
+        )
+        .expect("persist research outcome boundary");
+    (review.review_id, run.run_id, event_id)
 }
 
 #[test]
@@ -388,4 +503,327 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
             .started_at,
         Some(3_900)
     );
+    observations
+        .upsert(&NewTaskObservation::new(
+            "research-scheduler-project",
+            &fixture.task_signature,
+            41,
+            "research-scheduler-group",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "Done",
+            None,
+            Some(3_800),
+            None,
+            None,
+            6_000,
+        ))
+        .expect("authoritative terminal start timestamp");
+    assert_eq!(
+        observations
+            .find("research-scheduler-project", &fixture.task_signature)
+            .expect("read terminal observation")
+            .expect("terminal observation remains persisted")
+            .started_at,
+        Some(3_800)
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_ready_research_outcome_until_run_finalization() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "ready");
+    let policies = BTreeMap::from([(
+        "research-scheduler-project".to_owned(),
+        RetryPolicy { max_retries: 0 },
+    )]);
+    let empty_markers = BTreeSet::new();
+    let recovery = AgentRunRepository::new(&fixture.db)
+        .recover_interrupted_with_marker_evidence(
+            3_000,
+            "test restart",
+            &policies,
+            &empty_markers,
+            &empty_markers,
+            &empty_markers,
+            &empty_markers,
+        )
+        .expect("valid ready research lineage must survive generic recovery");
+    assert_eq!(recovery.preserved_research_run_ids, vec![run_id]);
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("ready review")
+            .state,
+        "ready"
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .state(&fixture.campaign_id)
+            .expect("campaign research state")
+            .blocked_reason,
+        None
+    );
+
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("ready event")
+            .expect("ready event row")
+            .status,
+        EventStatus::InFlight
+    );
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("research run")
+            .expect("research run row")
+            .status,
+        AgentRunStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_classified_research_failure_for_retry() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    let policies = BTreeMap::from([(
+        "research-scheduler-project".to_owned(),
+        RetryPolicy { max_retries: 0 },
+    )]);
+    let empty_markers = BTreeSet::new();
+    let recovery = AgentRunRepository::new(&fixture.db)
+        .recover_interrupted_with_marker_evidence(
+            3_000,
+            "test restart",
+            &policies,
+            &empty_markers,
+            &empty_markers,
+            &empty_markers,
+            &empty_markers,
+        )
+        .expect("valid retry-wait research lineage must survive generic recovery");
+    assert_eq!(recovery.preserved_research_run_ids, vec![run_id]);
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("retry review")
+            .state,
+        "retry_wait"
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .state(&fixture.campaign_id)
+            .expect("campaign research state")
+            .blocked_reason,
+        None
+    );
+
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("retry event")
+            .expect("retry event row")
+            .status,
+        EventStatus::InFlight
+    );
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("research run")
+            .expect("research run row")
+            .status,
+        AgentRunStatus::Running
+    );
+}
+
+#[cfg(unix)]
+fn prepare_research_temp(fixture: &SchedulerFixture, run_id: i64) -> std::path::PathBuf {
+    let temp_root = fixture
+        ._temp
+        .path()
+        .join("project")
+        .join(".pueue-agent")
+        .join("tmp");
+    fs::create_dir_all(&temp_root).expect("research temp root");
+    for path in [
+        temp_root.parent().expect("service root"),
+        temp_root.as_path(),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("research temp permissions");
+    }
+    let run_temp = temp_root.join(run_id.to_string());
+    fs::create_dir(&run_temp).expect("research run temp");
+    fs::set_permissions(&run_temp, fs::Permissions::from_mode(0o700))
+        .expect("research run temp permissions");
+    run_temp
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dead_research_owner_is_retried_after_process_group_and_temp_proof() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "running");
+    let run_temp = prepare_research_temp(&fixture, run_id);
+    let child = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("dead owner fixture");
+    let pid = i64::from(child.id());
+    child.wait_with_output().expect("reap dead owner fixture");
+    fixture
+        .db
+        .connect()
+        .expect("database connection")
+        .execute(
+            "UPDATE agent_runs SET pid = ?1 WHERE run_id = ?2",
+            rusqlite::params![pid, run_id],
+        )
+        .expect("persist dead owner pid");
+
+    recover_research(&fixture.db, 3_000, CampaignLimits::default())
+        .await
+        .expect("research startup owner recovery");
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("recovered review")
+            .state,
+        "retry_wait"
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("recovered event")
+            .expect("recovered event row")
+            .status,
+        EventStatus::RetryWait
+    );
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("recovered run")
+            .expect("recovered run row")
+            .status,
+        AgentRunStatus::Failed
+    );
+    assert!(run_temp.exists(), "recovery keeps the verified run directory");
+    assert_eq!(
+        fs::read_dir(run_temp)
+            .expect("read cleaned run directory")
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_research_owner_remains_bound_across_recovery_poll() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "running");
+    let mut child = Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("live owner fixture");
+    let pid = i64::from(child.id());
+    fixture
+        .db
+        .connect()
+        .expect("database connection")
+        .execute(
+            "UPDATE agent_runs SET pid = ?1 WHERE run_id = ?2",
+            rusqlite::params![pid, run_id],
+        )
+        .expect("persist live owner pid");
+
+    recover_research(&fixture.db, 3_000, CampaignLimits::default())
+        .await
+        .expect("research live owner recovery");
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("live review")
+            .state,
+        "running"
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("live event")
+            .expect("live event row")
+            .status,
+        EventStatus::InFlight
+    );
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("live run")
+            .expect("live run row")
+            .status,
+        AgentRunStatus::Running
+    );
+    child.kill().expect("stop live owner fixture");
+    child.wait().expect("reap live owner fixture");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_research_temp_retains_owner_instead_of_following_symlink() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "running");
+    let temp_root = fixture
+        ._temp
+        .path()
+        .join("project")
+        .join(".pueue-agent")
+        .join("tmp");
+    fs::create_dir_all(&temp_root).expect("research temp root");
+    for path in [
+        temp_root.parent().expect("service root"),
+        temp_root.as_path(),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("research temp permissions");
+    }
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).expect("outside directory");
+    let sentinel = outside.join("sentinel");
+    fs::write(&sentinel, b"retain").expect("outside sentinel");
+    std::os::unix::fs::symlink(&outside, temp_root.join(run_id.to_string()))
+        .expect("unsafe research temp symlink");
+    let child = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("dead owner fixture");
+    let pid = i64::from(child.id());
+    child.wait_with_output().expect("reap dead owner fixture");
+    fixture
+        .db
+        .connect()
+        .expect("database connection")
+        .execute(
+            "UPDATE agent_runs SET pid = ?1 WHERE run_id = ?2",
+            rusqlite::params![pid, run_id],
+        )
+        .expect("persist dead owner pid");
+
+    recover_research(&fixture.db, 3_000, CampaignLimits::default())
+        .await
+        .expect("research unsafe temp recovery");
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("retained review")
+            .state,
+        "running"
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("retained event")
+            .expect("retained event row")
+            .status,
+        EventStatus::InFlight
+    );
+    assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"retain");
 }
