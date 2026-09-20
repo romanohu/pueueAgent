@@ -7,6 +7,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+use pueue_agent::{
+    agent::{AgentRunner, AgentRunnerConfig},
+    codex_command::CodexCapabilities,
+    decision_protocol::parse_and_validate_decision,
+    execution_policy::{load_existing_policy, PolicyLoadInput},
+    scheduler::{Scheduler, SchedulerConfig},
+};
 use pueue_agent::{
     db::{
         AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
@@ -33,6 +41,8 @@ use pueue_agent::{
     AppError,
 };
 use serde_json::json;
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[path = "../support/execution_policy_fixture.rs"]
@@ -42,6 +52,7 @@ mod execution_policy_fixture;
 struct DelayedKillPueue {
     tasks: Arc<Mutex<Vec<PueueTask>>>,
     kill_calls: Arc<Mutex<Vec<i64>>>,
+    kill_error: Arc<Mutex<Option<String>>>,
     add_calls: Arc<Mutex<Vec<Vec<OsString>>>>,
 }
 
@@ -50,8 +61,13 @@ impl DelayedKillPueue {
         Self {
             tasks: Arc::new(Mutex::new(tasks)),
             kill_calls: Arc::new(Mutex::new(Vec::new())),
+            kill_error: Arc::new(Mutex::new(None)),
             add_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn set_kill_error(&self, message: impl Into<String>) {
+        *self.kill_error.lock().unwrap() = Some(message.into());
     }
 
     fn kill_calls(&self) -> Vec<i64> {
@@ -93,6 +109,11 @@ impl PueueApi for DelayedKillPueue {
 
     async fn kill(&self, task_id: i64) -> Result<(), AppError> {
         self.kill_calls.lock().unwrap().push(task_id);
+        if self.kill_error.lock().unwrap().is_some() {
+            return Err(AppError::Runtime {
+                operation: "research action fixture kill",
+            });
+        }
         // A successful kill command is intentionally not a terminal observation.
         Ok(())
     }
@@ -386,6 +407,71 @@ max_agent_runs = 10
             task_id: 41,
         }
     }
+    #[cfg(target_os = "linux")]
+    fn native_decision_policy(&self) -> Arc<ResolvedExecutionPolicy> {
+        let fixture_root = fs::canonicalize(self._temp.path()).unwrap();
+        let trusted_dir = fixture_root.join("execution-policy-bin");
+        let fake_codex = trusted_dir.join("research-action-native-codex");
+        let fake_codex_source = trusted_dir.join("research-action-native-codex.rs");
+        fs::write(
+            &fake_codex_source,
+            r##"use std::{env, fs, process::exit};
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let mut output = None;
+    while let Some(argument) = args.next() {
+        if argument == "--output-last-message" {
+            output = args.next();
+        }
+    }
+    let Some(output) = output else { exit(71); };
+    fs::write(
+        output,
+        br#"{"schema_version":1,"decision":"wait","proposal":null,"reason":"native fixture wait","requested_wait_minutes":1,"expected_evidence":[],"evidence_ref":null}"#,
+    )
+    .unwrap();
+}
+"##,
+        )
+        .unwrap();
+        let build = std::process::Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&fake_codex)
+            .arg(&fake_codex_source)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "native decision fixture failed to compile: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let launcher = self.policy.launcher_anchor.canonical_path.clone();
+        let policy_path = fixture_root
+            .join("execution-policy-state")
+            .join("execution-policy.toml");
+        let body = fs::read_to_string(&policy_path).unwrap();
+        let old_codex = format!("codex = {:?}", launcher.display().to_string());
+        let new_codex = format!("codex = {:?}", fake_codex.display().to_string());
+        assert!(body.contains(&old_codex), "fixture codex anchor must be replaceable");
+        fs::write(&policy_path, body.replacen(&old_codex, &new_codex, 1)).unwrap();
+
+        let trusted_path = std::env::join_paths([trusted_dir]).unwrap();
+        Arc::new(
+            load_existing_policy(&PolicyLoadInput {
+                state_dir: fixture_root.join("execution-policy-state"),
+                project_roots: self.policy.project_roots.clone(),
+                inherited_path: trusted_path,
+                startup_environment: self.policy.startup_environment.clone(),
+                codex_home: self.policy.codex_home.clone(),
+                pueue_config: self.policy.pueue_config_anchor.canonical_path.clone(),
+                launcher_path: launcher,
+            })
+            .unwrap(),
+        )
+    }
 
     fn set_answer_action(&self, action: &str) {
         let review = ResearchRepository::new(&self.db)
@@ -632,6 +718,175 @@ async fn delayed_kill_exit_zero_does_not_create_successor_or_cycle() {
         .unwrap();
     assert_eq!(successors, 0);
     assert_eq!(cycles, 0);
+}
+
+#[tokio::test]
+async fn owned_kill_timeout_keeps_research_owner_open_without_progression() {
+    let harness = Harness::new().await;
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let review = ResearchRepository::new(&harness.db)
+        .recent(&harness.campaign_id, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let request_id = review.termination_request_id.unwrap();
+    let reservations_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+            [&harness.campaign_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        TerminationManager::new(&harness.db, harness.pueue.clone())
+            .execute(request_id)
+            .await
+            .unwrap(),
+        pueue_agent::termination::TerminationOutcome::PendingConfirmation
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE termination_requests SET grace_until = 0 WHERE request_id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    assert_eq!(
+        TerminationManager::new(&harness.db, harness.pueue.clone())
+            .execute(request_id)
+            .await
+            .unwrap(),
+        pueue_agent::termination::TerminationOutcome::TimedOut
+    );
+
+    let mut disabled_policy = (*harness.policy).clone();
+    disabled_policy.campaign_limits.research_interval_minutes = 0;
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &disabled_policy, 500, 1)
+            .await
+            .unwrap(),
+        0
+    );
+    let retained = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(retained.state, "ready");
+    assert_eq!(retained.operation_stage.as_deref(), Some("stop_requested"));
+    assert_eq!(retained.termination_request_id, Some(request_id));
+    let connection = harness.db.connect().unwrap();
+    let successors: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM experiments WHERE resume_of_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cycles: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservations_after: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+            [&harness.campaign_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(successors, 0);
+    assert_eq!(cycles, 0);
+    assert_eq!(reservations_after, reservations_before);
+    assert!(harness.pueue.add_calls().is_empty());
+}
+
+#[tokio::test]
+async fn owned_kill_error_keeps_research_owner_open_without_progression() {
+    let harness = Harness::new().await;
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let review = ResearchRepository::new(&harness.db)
+        .recent(&harness.campaign_id, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let request_id = review.termination_request_id.unwrap();
+    let reservations_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+            [&harness.campaign_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    harness.pueue.set_kill_error("fixture kill failed");
+
+    assert_eq!(
+        TerminationManager::new(&harness.db, harness.pueue.clone())
+            .execute(request_id)
+            .await
+            .unwrap(),
+        pueue_agent::termination::TerminationOutcome::Failed
+    );
+
+    let mut disabled_policy = (*harness.policy).clone();
+    disabled_policy.campaign_limits.research_interval_minutes = 0;
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &disabled_policy, 500, 1)
+            .await
+            .unwrap(),
+        0
+    );
+    let retained = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(retained.state, "ready");
+    assert_eq!(retained.operation_stage.as_deref(), Some("intent"));
+    assert_eq!(retained.termination_request_id, Some(request_id));
+    let connection = harness.db.connect().unwrap();
+    let successors: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM experiments WHERE resume_of_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cycles: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservations_after: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+            [&harness.campaign_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(successors, 0);
+    assert_eq!(cycles, 0);
+    assert_eq!(reservations_after, reservations_before);
+    assert!(harness.pueue.add_calls().is_empty());
 }
 
 #[tokio::test]
@@ -950,6 +1205,283 @@ async fn confirmed_research_handoff_feeds_claimed_decision_context_v2_without_su
         .unwrap();
     assert_eq!(event_count, 1);
     assert_eq!(attempt_count, 1);
+    assert!(harness.pueue.add_calls().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_scheduler_runs_one_confirmed_research_decision_and_replays_without_second_run() {
+    let harness = Harness::new().await;
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let review = ResearchRepository::new(&harness.db)
+        .recent(&harness.campaign_id, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let request_id = review.termination_request_id.unwrap();
+    TerminationManager::new(&harness.db, harness.pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+
+    let mut task = harness.pueue.task(harness.task_id);
+    task.state = "Killed".to_owned();
+    task.ended_at = Some("500".to_owned());
+    task.result = Some(json!({"Success": 0}));
+    harness.set_task(task);
+    Reconciler::new(&harness.db, harness.pueue.clone())
+        .with_campaign_limits(CampaignLimits::default())
+        .run_once_at(500)
+        .await
+        .unwrap();
+    let mut disabled_policy = (*harness.policy).clone();
+    disabled_policy.campaign_limits.research_interval_minutes = 0;
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &disabled_policy, 600, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let runs_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE project_id = ?1",
+            [&harness.project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let policy = harness.native_decision_policy();
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production().with_codex_capabilities(CodexCapabilities::all()),
+        policy,
+    );
+    let mut scheduler = Scheduler::new(
+        harness.db.clone(),
+        runner,
+        SchedulerConfig {
+            now: 700,
+            lease_seconds: 60,
+            claim_limit: 100,
+        },
+    );
+    let mut report = scheduler.tick().await.unwrap();
+    assert_eq!(report.started.len(), 1);
+    assert_eq!(report.started[0].mode, "campaign_decision");
+    let mut started = report.started.pop().unwrap();
+    let started_run_id = started.run_id;
+    assert_eq!(
+        started.handle.wait(&harness.db, 701).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+
+    let cycle_id: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT decision_cycle_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let attempt_snapshot: (
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, agent_run_id, decision_kind, decision_json, decision_digest,
+                    context_schema_version, context_json, context_digest
+             FROM decision_attempts WHERE cycle_id = ?1 AND attempt_number = 1",
+            [&cycle_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(attempt_snapshot.0, "decided");
+    assert_eq!(attempt_snapshot.1, Some(started_run_id));
+    assert_eq!(attempt_snapshot.2.as_deref(), Some("wait"));
+    let expected_decision =
+        r#"{"schema_version":1,"decision":"wait","proposal":null,"reason":"native fixture wait","requested_wait_minutes":1,"expected_evidence":[],"evidence_ref":null}"#;
+    assert_eq!(attempt_snapshot.3.as_deref(), Some(expected_decision));
+    let validated = parse_and_validate_decision(
+        expected_decision.as_bytes(),
+        "objective-digest-research-actions",
+        CampaignLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_snapshot.4.as_deref(),
+        Some(validated.canonical_digest())
+    );
+    assert_eq!(attempt_snapshot.5, Some(2));
+    let context_json = attempt_snapshot.6.as_deref().unwrap();
+    let context_digest = attempt_snapshot.7.as_deref().unwrap();
+    assert_eq!(format!("{:x}", Sha256::digest(context_json.as_bytes())), context_digest);
+    let stored: serde_json::Value = serde_json::from_str(context_json).unwrap();
+    assert_eq!(stored["schema_version"], 2);
+    assert_eq!(stored["research"]["review_id"], review.review_id);
+    assert_eq!(stored["source_experiment"]["experiment_id"], harness.experiment_id);
+
+    let attempt_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = ?1",
+            [&cycle_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 1);
+    let event_snapshot: (String, Option<i64>, i64, Option<i64>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, completed_at, attempts, lease_until, last_error
+             FROM events
+             WHERE campaign_id = ?1 AND experiment_id = ?2 AND kind = 'campaign_decision'",
+            rusqlite::params![harness.campaign_id, harness.experiment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(event_snapshot.0, "completed");
+    assert!(event_snapshot.1.is_some());
+    assert_eq!(event_snapshot.2, 1);
+    assert!(event_snapshot.3.is_none());
+    assert!(event_snapshot.4.is_none());
+    let event_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE campaign_id = ?1 AND experiment_id = ?2 AND kind = 'campaign_decision'",
+            rusqlite::params![harness.campaign_id, harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1);
+    let run_snapshot: (String, Option<i64>, Option<i64>, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, finished_at, exit_code, launch_gate_state
+             FROM agent_runs WHERE run_id = ?1",
+            [started_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(run_snapshot.0, "completed");
+    assert!(run_snapshot.1.is_some());
+    assert_eq!(run_snapshot.2, Some(0));
+    assert_eq!(run_snapshot.3, "released");
+    let private_temp_path = harness.policy.project_roots[0]
+        .join(".pueue-agent/tmp")
+        .join(started_run_id.to_string());
+    assert!(private_temp_path.is_dir());
+    assert!(fs::read_dir(&private_temp_path).unwrap().next().is_none());
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .count_by_project(&harness.project_id)
+            .unwrap() as i64,
+        runs_before + 1
+    );
+    assert!(harness.pueue.add_calls().is_empty());
+
+    let replay = scheduler.tick().await.unwrap();
+    assert!(replay.started.is_empty());
+    let replay_attempt_snapshot: (
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, agent_run_id, decision_kind, decision_json, decision_digest,
+                    context_schema_version, context_json, context_digest
+             FROM decision_attempts WHERE cycle_id = ?1 AND attempt_number = 1",
+            [&cycle_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    let replay_event_snapshot: (String, Option<i64>, i64, Option<i64>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, completed_at, attempts, lease_until, last_error
+             FROM events
+             WHERE campaign_id = ?1 AND experiment_id = ?2 AND kind = 'campaign_decision'",
+            rusqlite::params![harness.campaign_id, harness.experiment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    let replay_run_snapshot: (String, Option<i64>, Option<i64>, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, finished_at, exit_code, launch_gate_state
+             FROM agent_runs WHERE run_id = ?1",
+            [started_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(replay_attempt_snapshot, attempt_snapshot);
+    assert_eq!(replay_event_snapshot, event_snapshot);
+    assert_eq!(replay_run_snapshot, run_snapshot);
+    assert_eq!(
+        AgentRunRepository::new(&harness.db)
+            .count_by_project(&harness.project_id)
+            .unwrap() as i64,
+        runs_before + 1
+    );
     assert!(harness.pueue.add_calls().is_empty());
 }
 
