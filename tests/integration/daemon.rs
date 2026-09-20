@@ -60,7 +60,8 @@ use pueue_agent::{
     config::{self, AgentConfig},
     execution_policy::{
         load_existing_policy, resolve_project_policy, NetworkMode, PolicyLoadInput,
-        ProjectRootAnchor, ResolvedProjectExecutionPolicy, StartupEnvironment,
+        PolicyViolationCode, PolicyViolationDetail, PolicyViolationStage, ProjectRootAnchor,
+        ResolvedProjectExecutionPolicy, StartupEnvironment, TempUnsafeReason,
     },
     models::{NewCodeChangeRun, Project},
 };
@@ -2139,12 +2140,37 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     }
     HealthRepository::set_state(&harness.db, &experiment_id, HealthState::Suspicious, harness.now)
         .unwrap();
+    let health_pending_before = health_admission_snapshot(&harness.db, "project-a");
+    let assert_cleanup_depth_error = |result: Result<DaemonReport, AppError>, label: &str| {
+        let error = result.expect_err(label);
+        match error {
+            AppError::PolicyViolation { violation } => {
+                assert_eq!(violation.code, PolicyViolationCode::TempUnsafe, "{label}");
+                assert_eq!(
+                    violation.stage,
+                    PolicyViolationStage::RunBoundPreMarker,
+                    "{label}"
+                );
+                assert_eq!(
+                    violation.detail,
+                    PolicyViolationDetail::TempUnsafe(TempUnsafeReason::DepthLimit),
+                    "{label}"
+                );
+            }
+            other => panic!("{label}: unexpected cleanup error: {other:?}"),
+        }
+    };
 
     // The second daemon was already started while the first owner was live.
     // Its later pass must still observe the durable cleanup boundary.
-    let warmup = Box::pin(second_daemon.run_once()).await.unwrap();
-    assert_eq!(warmup.research_started, 0);
-    assert_eq!(warmup.diagnoses, 0);
+    assert_cleanup_depth_error(
+        Box::pin(second_daemon.run_once()).await,
+        "warmup must return the retained cleanup depth error",
+    );
+    assert_eq!(
+        health_admission_snapshot(&harness.db, "project-a"),
+        health_pending_before
+    );
     assert_eq!(
         HealthRepository::get(&harness.db, &experiment_id)
             .unwrap()
@@ -2200,7 +2226,6 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     )
     .unwrap();
     let health_later_before = health_admission_snapshot(&harness.db, "project-b");
-    let health_pending_before = health_admission_snapshot(&harness.db, "project-a");
 
     let research_run_count = || {
         harness
@@ -2256,9 +2281,10 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
         )
         .unwrap();
 
-    let blocked_report = Box::pin(second_daemon.run_once()).await.unwrap();
-    assert_eq!(blocked_report.research_started, 0);
-    assert_eq!(blocked_report.diagnoses, 1);
+    assert_cleanup_depth_error(
+        Box::pin(second_daemon.run_once()).await,
+        "blocked pass must return the retained cleanup depth error",
+    );
     assert_eq!(research_run_count(), research_run_count_before);
     assert_eq!(reservation_count(), reservation_count_before);
     assert_eq!(
@@ -2565,7 +2591,6 @@ struct SeededPidlessResearchOwner {
     campaign_id: String,
     experiment_id: String,
     task_id: i64,
-    task_signature: String,
     review_id: String,
     event_id: i64,
     run_id: i64,
@@ -2759,7 +2784,6 @@ fn seed_pidless_research_owner_for(
         campaign_id,
         experiment_id,
         task_id: task.id,
-        task_signature,
         review_id: admitted.review_id,
         event_id,
         run_id: run.run_id,
@@ -2955,7 +2979,7 @@ async fn startup_pidless_research_marker_uncertainty_never_retires_owner() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
+async fn startup_pidless_recovery_claim_limit_does_not_starve_behind_retained_owner() {
     let harness = DaemonHarness::new();
     harness.register_project("project-b", "pb-project", "/bin/echo");
     harness.register_project("project-c", "pc-project", "/bin/echo");
@@ -2992,10 +3016,12 @@ async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
             &task_c,
         ),
     ];
-    // The recovery cursor advances over the retained startup map. With
-    // claim_limit=1, project B is the owner still present at the start of
-    // every bounded pass (the order is A, C, then B).
-    let blocked_owner = &owners[1];
+    fs::write(&owners[0].marker_path, b"authorized\n").unwrap();
+    fs::set_permissions(&owners[0].marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+    // The recovery cursor must advance past a retained prefix. With
+    // claim_limit=1, the expected selections are A (retained), B (retired),
+    // A (retained), then C (retired).
+    let blocked_owner = &owners[2];
     HealthRepository::ensure_running(
         &harness.db,
         &blocked_owner.project_id,
@@ -3083,7 +3109,9 @@ async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
     };
     let mut daemon = make_daemon();
 
-    for pass in 0..owners.len() {
+    // Each daemon pass polls the retained startup owners at both lifecycle
+    // boundaries, so two bounded passes cover A, B, A, C.
+    for pass in 0..2 {
         let report = Box::pin(daemon.run_once())
             .await
             .unwrap_or_else(|error| panic!("startup-owner fairness pass {pass} failed: {error}"));
@@ -3099,16 +3127,28 @@ async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
             health_blocked_before,
             "the retained project's suspicious health must stay blocked while startup owners remain"
         );
+        assert_eq!(
+            research_crash_snapshot(&harness.db, &owners[0].review_id),
+            owner_snapshots[0],
+            "retained prefix owner must remain unchanged on pass {pass}"
+        );
+        assert_eq!(fs::read(&owners[0].marker_path).unwrap(), b"authorized\n");
         if pass == 0 {
             assert_eq!(
                 research_crash_snapshot(&harness.db, &blocked_owner.review_id),
-                owner_snapshots[1],
-                "claim_limit=1 must retain the blocked startup owner for a later pass"
+                owner_snapshots[2],
+                "the suspicious owner must remain blocked behind the retained prefix"
             );
         }
     }
 
-    for owner in &owners {
+    assert_eq!(
+        research_crash_snapshot(&harness.db, &owners[0].review_id),
+        owner_snapshots[0]
+    );
+    assert_eq!(fs::read(&owners[0].marker_path).unwrap(), b"authorized\n");
+    assert!(owners[0].run_temp.is_dir());
+    for (index, owner) in owners.iter().enumerate().skip(1) {
         let snapshot = research_crash_snapshot(&harness.db, &owner.review_id);
         assert_eq!(snapshot.review_state, "retry_wait");
         assert_eq!(snapshot.event_status, "retry_wait");
@@ -3116,8 +3156,8 @@ async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
         assert_eq!(snapshot.run_pid, None);
         assert_eq!(snapshot.gate_state.as_deref(), Some("failed"));
         assert_eq!(snapshot.cleanup_phase.as_deref(), Some("complete"));
-        assert_eq!(snapshot.run_count, owner_snapshots[0].run_count);
-        assert_eq!(snapshot.reservation_count, owner_snapshots[0].reservation_count);
+        assert_eq!(snapshot.run_count, owner_snapshots[index].run_count);
+        assert_eq!(snapshot.reservation_count, owner_snapshots[index].reservation_count);
     }
     assert_eq!(
         harness
@@ -3132,7 +3172,7 @@ async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0
+        1
     );
     assert_eq!(
         HealthRepository::get(&harness.db, &blocked_owner.experiment_id)
@@ -3163,6 +3203,11 @@ async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
             .collect::<Vec<_>>(),
         retired_snapshots,
         "retired startup owners must be idempotent on the next pass"
+    );
+    assert_eq!(research_run_count(), research_run_count_before);
+    assert_eq!(
+        research_reservation_count(),
+        research_reservation_count_before
     );
 }
 
