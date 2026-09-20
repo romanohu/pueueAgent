@@ -3930,7 +3930,7 @@ impl<'db> ResearchRepository<'db> {
             .prepare(&format!(
                 "{REVIEW_SELECT}
                  WHERE state = 'ready' AND operation_stage IS NULL
-                 ORDER BY finished_at, updated_at, review_id
+                 ORDER BY updated_at, review_id
                  LIMIT ?1"
             ))
             .map_err(database_error("prepare ready research action query"))?;
@@ -3939,6 +3939,29 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("query ready research actions"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read ready research actions"))
+    }
+
+    pub(crate) fn rotate_ready_action_review(
+        &self,
+        review_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin ready research action rotation"))?;
+        transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET updated_at = CASE WHEN updated_at < ?1 THEN ?1 ELSE updated_at END
+                 WHERE review_id = ?2 AND state = 'ready'
+                   AND operation_stage IS NULL",
+                params![now, review_id],
+            )
+            .map_err(database_error("rotate ready research action"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit ready research action rotation"))
     }
 
     pub(crate) fn open_action_reviews(

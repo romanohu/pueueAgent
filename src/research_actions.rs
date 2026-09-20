@@ -52,19 +52,29 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
     if policy.campaign_limits.research_interval_minutes == 0 {
         return Ok(advanced);
     }
-    let reviews = repository.ready_reviews(limit.saturating_sub(advanced))?;
+    if advanced >= limit {
+        return Ok(advanced);
+    }
+    let reviews = repository.ready_reviews(limit.saturating_sub(advanced).max(32))?;
     for review in reviews {
+        if advanced >= limit {
+            break;
+        }
         let Some(campaign) = CampaignRepository::new(db).find_by_id(&review.campaign_id)? else {
+            repository.rotate_ready_action_review(&review.review_id, now)?;
             continue;
         };
         let Some(project) = ProjectRepository::new(db).find_by_id(&campaign.project_id)? else {
+            repository.rotate_ready_action_review(&review.review_id, now)?;
             continue;
         };
         let Some(experiment) = ExperimentRepository::new(db).find_by_id(&review.experiment_id)?
         else {
+            repository.rotate_ready_action_review(&review.review_id, now)?;
             continue;
         };
         let Some(task_id) = experiment.pueue_task_id else {
+            repository.rotate_ready_action_review(&review.review_id, now)?;
             continue;
         };
         let coordinator = CampaignCoordinator::new(db, pueue, policy.campaign_limits)
@@ -77,7 +87,10 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
             Ok(admission) => admission,
             Err(AppError::Runtime {
                 operation: "acquire project submission admission lock",
-            }) => continue,
+            }) => {
+                repository.rotate_ready_action_review(&review.review_id, now)?;
+                continue;
+            }
             Err(error) => return Err(error),
         };
         let tasks = pueue.status_json().await?;
@@ -104,11 +117,16 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
             transaction.commit().map_err(crate::db::database_error(
                 "commit stale research action discard",
             ))?;
-            advanced += usize::from(discarded);
+            if discarded {
+                advanced += 1;
+            } else {
+                repository.rotate_ready_action_review(&review.review_id, now)?;
+            }
             continue;
         };
         if !task.is_running() {
             if !task.is_terminal() {
+                repository.rotate_ready_action_review(&review.review_id, now)?;
                 continue;
             }
             let mut connection = db.connect()?;
@@ -127,7 +145,11 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
             transaction.commit().map_err(crate::db::database_error(
                 "commit natural research action discard",
             ))?;
-            advanced += usize::from(discarded);
+            if discarded {
+                advanced += 1;
+            } else {
+                repository.rotate_ready_action_review(&review.review_id, now)?;
+            }
             continue;
         }
 
@@ -145,6 +167,7 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
             transaction
                 .commit()
                 .map_err(crate::db::database_error("commit skipped research action"))?;
+            repository.rotate_ready_action_review(&review.review_id, now)?;
             continue;
         };
 
@@ -156,6 +179,7 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
                         transaction
                             .commit()
                             .map_err(crate::db::database_error("commit invalid research notes"))?;
+                        repository.rotate_ready_action_review(&review.review_id, now)?;
                         continue;
                     }
                 };
@@ -186,6 +210,7 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
                     transaction
                         .commit()
                         .map_err(crate::db::database_error("commit deferred research action"))?;
+                    repository.rotate_ready_action_review(&review.review_id, now)?;
                     continue;
                 }
                 let reason = format!(
@@ -225,6 +250,7 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
                     transaction.rollback().map_err(crate::db::database_error(
                         "rollback unbound research action",
                     ))?;
+                    repository.rotate_ready_action_review(&review.review_id, now)?;
                     continue;
                 }
                 true
@@ -237,6 +263,8 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
             .map_err(crate::db::database_error("commit research action"))?;
         if changed {
             advanced += 1;
+        } else {
+            repository.rotate_ready_action_review(&review.review_id, now)?;
         }
     }
     Ok(advanced)
