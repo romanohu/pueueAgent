@@ -2,7 +2,7 @@
 
 ## 共通ルール
 
-`PROJECT_ROOT` を省略したコマンドは通常はカレントディレクトリからプロジェクトを解決します。`--pueue-config PUEUE_CONFIG` は使用する Pueue 設定を明示します。`--json` は機械可読出力を選びます。失敗時は、まず対象プロジェクトで `pueue-agent doctor`、状態の確認に `pueue-agent status` を実行してください。
+`PROJECT_ROOT` を省略したコマンドは通常はカレントディレクトリからプロジェクトを解決します。`--pueue-config PUEUE_CONFIG` は使用する Pueue 設定を明示します。`--json` は機械可読出力を選びます。失敗時は、登録済みの対象プロジェクトならまず `pueue-agent doctor`、状態の確認に `pueue-agent status` を実行してください。`enable` の登録前解決で失敗した場合は、doctor/status は対象を解決できないため、表示されたエラーと config、policy、Pueue profile の入力を確認して原因を修正し、同じコマンドを再実行します。
 
 ## 人間向け出力と JSON 出力
 
@@ -40,7 +40,7 @@
 - **状態変更:** agent の状態 DB、プロジェクト登録、Pueue 設定およびサービス設定を更新します。
 - **主なオプション:** `--pueue-config`、任意の `PROJECT_ROOT`。
 - **例:** `pueue-agent enable --pueue-config ~/.config/pueue.yml .`
-- **失敗時の確認:** `pueue-agent doctor` を実行し、設定、実行ポリシー、Pueue 接続を確認します。
+- **失敗時の確認:** config、policy、Pueue の解決で登録前に失敗した場合は、doctor/status を実行せず、表示されたエラーと `--pueue-config`、config、policy の入力を確認して原因を修正し、同じ `enable` を再実行します。登録後の失敗は、同じ project/profile の `pueue-agent doctor` で設定、実行ポリシー、Pueue 接続を確認します。
 
 ### `pueue-agent disable`
 
