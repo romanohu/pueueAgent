@@ -19,7 +19,8 @@ use pueue_agent::{
     },
     environment::MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
     execution_policy::{
-        load_existing_policy, AgentKind, CampaignLimits, PolicyLoadInput, StartupEnvironment,
+        load_existing_policy, AgentKind, CampaignLimits, PolicyLoadInput, PolicyViolationCode,
+        StartupEnvironment,
     },
     models::{
         AgentContextMode, AgentRunStatus, EventStatus, ExperimentStatus, ExperimentTerminalOutcome,
@@ -53,6 +54,9 @@ struct ResearchHarness {
     runner: AgentRunner,
     campaign_id: String,
     experiment_id: String,
+    secondary_project_id: String,
+    secondary_root: PathBuf,
+    secondary_config_path: PathBuf,
     capture_path: PathBuf,
     control_path: PathBuf,
     codex_home: PathBuf,
@@ -87,8 +91,11 @@ impl ResearchHarness {
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let fixture_root = fs::canonicalize(temp.path()).unwrap();
         let project_root = fixture_root.join("project");
+        let secondary_root = fixture_root.join("secondary-project");
         let service_dir = project_root.join(".pueue-agent");
         let logs_dir = service_dir.join("logs");
+        let secondary_service_dir = secondary_root.join(".pueue-agent");
+        let secondary_logs_dir = secondary_service_dir.join("logs");
         let trusted_bin = fixture_root.join("trusted-bin");
         let policy_state = fixture_root.join("policy-state");
         let codex_home = fixture_root.join("codex-home");
@@ -98,8 +105,11 @@ impl ResearchHarness {
             ordinary_custom_agent.then(|| fixture_root.join("custom-agent-ran"));
         for directory in [
             &project_root,
+            &secondary_root,
             &service_dir,
             &logs_dir,
+            &secondary_service_dir,
+            &secondary_logs_dir,
             &trusted_bin,
             &policy_state,
             &codex_home,
@@ -125,6 +135,7 @@ impl ResearchHarness {
         fs::set_permissions(logs_dir.join("41.log"), fs::Permissions::from_mode(0o600)).unwrap();
 
         let project_id = format!("research-{label}-project");
+        let secondary_project_id = format!("research-{label}-secondary-project");
         let campaign_id = format!("research-{label}-campaign");
         let experiment_id = format!("research-{label}-experiment-1");
         let submission_id = format!("research-{label}-submission-1");
@@ -132,6 +143,7 @@ impl ResearchHarness {
         let task_signature = format!("pueue-task:v1:{label}:one");
         let objective_digest = format!("research-objective-digest-{label}");
         let config_path = service_dir.join("config.toml");
+        let secondary_config_path = secondary_service_dir.join("config.toml");
         let ordinary_program = custom_agent_path
             .as_ref()
             .map(|path| path.display().to_string())
@@ -170,7 +182,42 @@ max_agent_runs = 10
             ),
         )
         .unwrap();
+        fs::write(
+            &secondary_config_path,
+            format!(
+                r#"project_id = "{secondary_project_id}"
+pueue_group = "{secondary_project_id}"
+
+[agent]
+program = "codex"
+args = ["{{prompt}}"]
+timeout_minutes = 1
+max_retries = 0
+
+[agent.execution]
+network = "enabled"
+
+[check]
+interval_minutes = 10
+deep_check_interval_minutes = 0
+stall_minutes = 30
+log_tail_bytes = 4096
+extra_log_paths = []
+
+[check.stall]
+action = "notify"
+kill_after_minutes = 0
+
+[guardrails]
+max_consecutive_failures = 3
+max_experiments = 20
+max_agent_runs = 10
+"#
+            ),
+        )
+        .unwrap();
         config::load(&config_path).unwrap();
+        config::load(&secondary_config_path).unwrap();
 
         let db = Db::open(&fixture_root.join("state.sqlite3")).unwrap();
         let project = ProjectRepository::new(&db)
@@ -289,7 +336,10 @@ max_agent_runs = 10
         let policy = Arc::new(
             load_existing_policy(&PolicyLoadInput {
                 state_dir: policy_state,
-                project_roots: vec![fs::canonicalize(&project_root).unwrap()],
+                project_roots: vec![
+                    fs::canonicalize(&project_root).unwrap(),
+                    fs::canonicalize(&secondary_root).unwrap(),
+                ],
                 inherited_path: trusted_bin.clone().into_os_string(),
                 startup_environment: StartupEnvironment::from_pairs([
                     ("HOME", "/fixture"),
@@ -317,6 +367,9 @@ max_agent_runs = 10
             runner,
             campaign_id,
             experiment_id,
+            secondary_project_id,
+            secondary_root,
+            secondary_config_path,
             capture_path,
             control_path,
             codex_home,
@@ -1099,6 +1152,97 @@ max_agent_runs = 10
             review,
             evidence,
             claimed_at: NOW + 261,
+        }
+    }
+
+    fn prepare_secondary_campaign(&self) -> ClaimedReview {
+        let project = ProjectRepository::new(&self.db)
+            .register(&NewProject::new(
+                &self.secondary_project_id,
+                &self.secondary_root,
+                &self.secondary_project_id,
+                self.secondary_config_path.clone(),
+                NOW + 20,
+            ))
+            .unwrap();
+        let campaign_id = format!("{}-campaign", self.secondary_project_id);
+        let experiment_id = format!("{}-experiment", campaign_id);
+        let submission_id = format!("{}-submission", campaign_id);
+        let proposal_id = format!("{}-proposal", campaign_id);
+        let task_signature = format!("pueue-task:v1:{}", campaign_id);
+        let objective = ObjectiveSnapshot {
+            text: "Start a secondary campaign for queue fairness checks.".to_owned(),
+            digest: format!("{}-objective", campaign_id),
+        };
+        let initial_argv = vec!["python".to_owned(), "train-secondary.py".to_owned()];
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "Establish the secondary campaign baseline".to_owned(),
+                source_experiment_id: None,
+                argv: initial_argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["secondary validation loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&self.db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: &campaign_id,
+                    project_id: &self.secondary_project_id,
+                    objective: &objective,
+                    initial_argv: &initial_argv,
+                    baseline: &baseline,
+                    submission_id: &submission_id,
+                    experiment_id: &experiment_id,
+                    proposal_id: &proposal_id,
+                    metadata: &serde_json::json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: NOW + 21,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        ExperimentRepository::new(&self.db)
+            .mark_submitting(&experiment_id, NOW + 22)
+            .unwrap();
+        ExperimentRepository::new(&self.db)
+            .mark_accepted(&experiment_id, 142, &task_signature, NOW + 23)
+            .unwrap();
+        TaskObservationRepository::new(&self.db)
+            .upsert(&NewTaskObservation::new(
+                &project.project_id,
+                &task_signature,
+                142,
+                &project.pueue_group,
+                initial_argv,
+                "Running",
+                Some(NOW + 21),
+                Some(NOW + 22),
+                None,
+                None,
+                NOW + 24,
+            ))
+            .unwrap();
+        ResearchRepository::new(&self.db)
+            .ensure_campaign(&campaign_id)
+            .unwrap();
+        ResearchRepository::new(&self.db)
+            .schedule_running(&campaign_id, NOW + 22, 1, NOW + 25)
+            .unwrap();
+        let review = ResearchRepository::new(&self.db)
+            .claim_due(&campaign_id, &experiment_id, &task_signature, NOW + 26)
+            .unwrap()
+            .expect("secondary campaign baseline must produce a research review");
+        let evidence = build_research_evidence(&self.db, &review, NOW + 26).unwrap();
+        ClaimedReview {
+            event_id: review_event_id(&self.db, &review.review_id),
+            review,
+            evidence,
+            claimed_at: NOW + 26,
         }
     }
 }
@@ -2407,9 +2551,13 @@ async fn research_fresh_reconstruction_rejects_foreign_session_metadata() {
         error.stage,
         pueue_agent::agent::AgentSpawnStage::PreBinding
     ));
+    assert_eq!(
+        error.policy.map(|violation| violation.code),
+        Some(PolicyViolationCode::SessionNotOwned)
+    );
     assert!(matches!(
         error.source,
-        pueue_agent::AppError::CodexSessionMetadata { .. }
+        pueue_agent::AppError::PolicyViolation { .. }
     ));
     assert!(error.cleanup.is_none());
     assert_eq!(
@@ -2474,9 +2622,13 @@ async fn research_fresh_reconstruction_rejects_unsafe_session_store() {
         Ok(_) => panic!("unsafe store must reject fresh reconstruction"),
         Err(error) => error,
     };
+    assert_eq!(
+        error.policy.map(|violation| violation.code),
+        Some(PolicyViolationCode::SessionNotOwned)
+    );
     assert!(matches!(
         error.source,
-        pueue_agent::AppError::CodexSessionMetadata { .. }
+        pueue_agent::AppError::PolicyViolation { .. }
     ));
     assert!(error.cleanup.is_none());
     assert_eq!(
@@ -2502,6 +2654,120 @@ async fn research_fresh_reconstruction_rejects_unsafe_session_store() {
     assert_eq!(stored.state, "pending");
     assert!(stored.agent_run_id.is_none());
     assert!(stored.response_json.is_none());
+}
+
+#[tokio::test]
+async fn research_fresh_selection_to_spawn_owned_session_race_is_typed_and_terminal() {
+    let harness = ResearchHarness::new("fresh-selection-race", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET session_id = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![FIRST_SESSION, &harness.campaign_id],
+        )
+        .unwrap();
+
+    let context = harness
+        .runner
+        .research_context_for(&harness.project_policy, FIRST_SESSION)
+        .expect("a missing first probe must permit fresh reconstruction");
+    assert!(matches!(context, AgentContextMode::Fresh));
+    harness.seed_preexisting_owned_session(FIRST_SESSION);
+
+    let error = match harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            context,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            false,
+            "success",
+        )
+        .await
+    {
+        Ok(_) => panic!("an owned session discovered after fresh selection must block"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.policy.map(|violation| violation.code),
+        Some(PolicyViolationCode::SessionNotOwned)
+    );
+    assert!(matches!(
+        error.source,
+        pueue_agent::AppError::PolicyViolation { .. }
+    ));
+    assert!(error.cleanup.is_none());
+    assert!(!harness.capture_path.exists(), "the race must not spawn a child");
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "pending");
+    assert!(stored.agent_run_id.is_none());
+    assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
+}
+
+#[tokio::test]
+async fn research_resume_selection_to_spawn_unsafe_session_race_is_typed_and_terminal() {
+    let harness = ResearchHarness::new("resume-selection-race", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    harness.seed_preexisting_owned_session(FIRST_SESSION);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET session_id = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![FIRST_SESSION, &harness.campaign_id],
+        )
+        .unwrap();
+
+    let context = harness
+        .runner
+        .research_context_for(&harness.project_policy, FIRST_SESSION)
+        .expect("an owned first probe must select exact resume");
+    assert!(matches!(
+        context,
+        AgentContextMode::Resume { ref session_id } if session_id == FIRST_SESSION
+    ));
+    harness.replace_session_metadata_with_foreign_cwd(FIRST_SESSION);
+
+    let error = match harness
+        .try_launch_with_fixture_mode(
+            &claimed,
+            context,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            false,
+            "success",
+        )
+        .await
+    {
+        Ok(_) => panic!("an unsafe session discovered after resume selection must block"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.policy.map(|violation| violation.code),
+        Some(PolicyViolationCode::SessionNotOwned)
+    );
+    assert!(matches!(
+        error.source,
+        pueue_agent::AppError::PolicyViolation { .. }
+    ));
+    assert!(error.cleanup.is_none());
+    assert!(!harness.capture_path.exists(), "the race must not spawn a child");
+    let stored = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(stored.state, "pending");
+    assert!(stored.agent_run_id.is_none());
+    assert_eq!(harness.research_session().as_deref(), Some(FIRST_SESSION));
 }
 
 #[tokio::test]
@@ -3500,6 +3766,110 @@ async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundar
     );
     let capture = fs::read_to_string(&harness.capture_path).unwrap();
     assert_eq!(capture.matches("CALL_START\n").count(), 3);
+}
+
+#[tokio::test]
+async fn research_coordinator_prioritizes_due_retries_before_new_campaign_claims() {
+    let harness = ResearchHarness::new("due-before-new", FIRST_SESSION);
+    let durable = harness.initial_review();
+    harness.write_fixture_controls_with_mode(
+        &durable.review.review_id,
+        &durable.review.experiment_id,
+        &durable.evidence.digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        false,
+        "malformed",
+    );
+    let first_report = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        NOW + 80,
+        1,
+    )
+    .await
+    .expect("the durable review must launch its first attempt");
+    let mut first_handle = first_report
+        .started
+        .into_iter()
+        .next()
+        .expect("the durable review launch");
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Failed
+    );
+    let failed = ResearchRepository::new(&harness.db)
+        .find(&durable.review.review_id)
+        .unwrap();
+    assert_eq!(failed.state, "retry_wait");
+    let review_wake: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
+            [&failed.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_wake = EventRepository::new(&harness.db)
+        .find_by_id(durable.event_id)
+        .unwrap()
+        .unwrap()
+        .not_before;
+    let wake = review_wake.max(event_wake);
+
+    let new_campaign = harness.prepare_secondary_campaign();
+    assert_eq!(new_campaign.review.state, "pending");
+    let new_review_not_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
+            [&new_campaign.review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(new_review_not_before <= wake);
+
+    let report = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        wake,
+        1,
+    )
+    .await
+    .expect("the coordinator must process one due review");
+    assert_eq!(report.started.len(), 1);
+    let started_review_id: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT review_id FROM research_reviews WHERE agent_run_id = ?1",
+            [report.started[0].run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(started_review_id, durable.review.review_id);
+    let new_pending = ResearchRepository::new(&harness.db)
+        .find(&new_campaign.review.review_id)
+        .unwrap();
+    assert_eq!(new_pending.state, "pending");
+
+    let mut retry_handle = report
+        .started
+        .into_iter()
+        .next()
+        .expect("durable retry launch");
+    assert_eq!(
+        retry_handle.wait(&harness.db, wake + 20).await.unwrap(),
+        AgentRunStatus::Failed
+    );
 }
 
 #[tokio::test]
