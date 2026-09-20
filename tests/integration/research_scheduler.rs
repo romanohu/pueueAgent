@@ -2006,3 +2006,426 @@ async fn unsafe_research_temp_retains_owner_instead_of_following_symlink() {
     );
     assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"retain");
 }
+const I4_FIXTURE_SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn i4_research_binding(
+    fixture: &SchedulerFixture,
+    review_id: &str,
+    budget_reservation_id: &str,
+) -> pueue_agent::db::ResearchLaunchBinding {
+    let context_json = "{}".to_owned();
+    let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+    pueue_agent::db::ResearchLaunchBinding {
+        review_id: review_id.to_owned(),
+        campaign_id: fixture.campaign_id.clone(),
+        experiment_id: fixture.experiment_id.clone(),
+        attempt: 1,
+        session_generation: 0,
+        prior_session_generation: 0,
+        session_id: I4_FIXTURE_SESSION_ID.to_owned(),
+        prior_session_id: Some(I4_FIXTURE_SESSION_ID.to_owned()),
+        context_json,
+        context_digest,
+        budget_reservation_id: budget_reservation_id.to_owned(),
+        recovery_reason: None,
+    }
+}
+
+fn i4_fixture_identity() -> pueue_agent::environment::PrivateRunTempRecoveryIdentityV1 {
+    use pueue_agent::environment::{
+        PrivateRunTempRecoveryDirectoryIdentity, PrivateRunTempRecoveryRootIdentity,
+        PrivateRunTempRecoveryTempIdentity,
+    };
+    pueue_agent::environment::PrivateRunTempRecoveryIdentityV1 {
+        service_root_identity: PrivateRunTempRecoveryRootIdentity {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 448,
+            resolution_fingerprint: "fixture-root".to_owned(),
+        },
+        temp_identity: PrivateRunTempRecoveryTempIdentity {
+            device: 1,
+            inode: 4,
+            owner: 3,
+            mode: 448,
+            mount_identity: [1, 2],
+            service_identity: PrivateRunTempRecoveryDirectoryIdentity {
+                device: 1,
+                inode: 5,
+                owner: 3,
+                mode: 448,
+            },
+            parent_identity: PrivateRunTempRecoveryDirectoryIdentity {
+                device: 1,
+                inode: 6,
+                owner: 3,
+                mode: 448,
+            },
+        },
+    }
+}
+
+fn i4_reserve_initial_attempt(fixture: &SchedulerFixture, review_id: &str) -> String {
+    match CampaignRepository::new(&fixture.db)
+        .reserve_agent_run(
+            &fixture.campaign_id,
+            &format!("research:{review_id}:attempt:1"),
+            &CampaignLimits::default(),
+            2_902,
+        )
+        .expect("reserve I4 research attempt")
+    {
+        AgentDecisionReservation::Reserved(reservation) => reservation.reservation_id,
+        other => panic!("I4 research attempt must reserve a budget slot: {other:?}"),
+    }
+}
+
+fn i4_seed_bound_research(
+    fixture: &SchedulerFixture,
+    fresh_launch: bool,
+) -> (
+    String,
+    i64,
+    i64,
+    String,
+    pueue_agent::db::ResearchLaunchBinding,
+) {
+    let (review_id, run_id, event_id) = seed_active_research_outcome(fixture, "running");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET attempt = 0, state = 'pending', agent_run_id = NULL,
+                 context_json = NULL, context_digest = NULL, response_json = NULL,
+                 failure_code = NULL, started_at = NULL, finished_at = NULL,
+                 notes_json = NULL, not_before = 2_902, updated_at = 2_902
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("reset I4 review before real bind");
+    let reservation_id = i4_reserve_initial_attempt(fixture, &review_id);
+    let admitted = ResearchRepository::new(&fixture.db)
+        .prepare_attempt(&review_id, &reservation_id, 3, 2_902)
+        .expect("admit I4 research attempt")
+        .expect("I4 research attempt must be admitted");
+    assert_eq!(admitted.attempt, 1);
+    let binding = i4_research_binding(fixture, &review_id, &reservation_id);
+    ResearchRepository::new(&fixture.db)
+        .bind_agent_run(&binding, run_id, "research-scheduler-project", 2_903)
+        .expect("bind I4 research attempt");
+    ResearchRepository::new(&fixture.db)
+        .record_native_recovery_authority(
+            &binding,
+            run_id,
+            &i4_fixture_identity(),
+            fresh_launch,
+            2_904,
+        )
+        .expect("record I4 native authority");
+    if !fresh_launch {
+        ResearchRepository::new(&fixture.db)
+            .confirm_agent_run_session(&binding, run_id, I4_FIXTURE_SESSION_ID, 2_905)
+            .expect("confirm I4 resumed session");
+    }
+    (review_id, run_id, event_id, reservation_id, binding)
+}
+
+fn i4_set_ready_result(
+    fixture: &SchedulerFixture,
+    review_id: &str,
+    binding: &pueue_agent::db::ResearchLaunchBinding,
+) {
+    let response_json = serde_json::json!({
+        "schema_version": 1,
+        "review_id": review_id,
+        "experiment_id": fixture.experiment_id.clone(),
+        "context_digest": binding.context_digest.clone(),
+        "action": "continue",
+        "reason": "recovered response",
+        "evidence_refs": ["test"],
+        "notes": "recovered",
+        "next_direction": null,
+        "checkpoint": null,
+    })
+    .to_string();
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'ready', response_json = ?1, failure_code = NULL,
+                 finished_at = 2_906, not_before = 2_906, updated_at = 2_906
+             WHERE review_id = ?2",
+            rusqlite::params![response_json, review_id],
+        )
+        .expect("seed I4 ready result");
+}
+
+fn i4_reservation_status(fixture: &SchedulerFixture, reservation_id: &str) -> String {
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE reservation_id = ?1",
+            [reservation_id],
+            |row| row.get(0),
+        )
+        .expect("read I4 reservation status")
+}
+
+fn i4_update_notes(
+    fixture: &SchedulerFixture,
+    review_id: &str,
+    update: impl FnOnce(&mut serde_json::Value),
+) {
+    let notes_json: String = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [review_id],
+            |row| row.get(0),
+        )
+        .expect("read I4 research notes");
+    let mut notes: serde_json::Value = serde_json::from_str(&notes_json).expect("I4 notes JSON");
+    update(&mut notes);
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            rusqlite::params![notes.to_string(), review_id],
+        )
+        .expect("update I4 research notes");
+}
+
+fn i4_startup_recovery(
+    fixture: &SchedulerFixture,
+) -> Result<pueue_agent::db::AgentRunRecovery, pueue_agent::AppError> {
+    let policies = BTreeMap::from([(
+        "research-scheduler-project".to_owned(),
+        RetryPolicy { max_retries: 0 },
+    )]);
+    let empty_markers = BTreeSet::new();
+    AgentRunRepository::new(&fixture.db).recover_interrupted_with_marker_evidence(
+        3_000,
+        "test restart",
+        &policies,
+        &empty_markers,
+        &empty_markers,
+        &empty_markers,
+        &empty_markers,
+    )
+}
+
+#[tokio::test]
+async fn startup_recovery_accepts_fresh_failed_research_after_session_clear() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id, reservation_id, binding) =
+        i4_seed_bound_research(&fixture, true);
+    ResearchRepository::new(&fixture.db)
+        .fail_agent_run_and_clear_session(&binding, run_id, None, "research_output_invalid", 2_903)
+        .expect("persist genuine fresh failure window");
+
+    let recovery = i4_startup_recovery(&fixture).expect("startup recovery");
+    assert_eq!(recovery.preserved_research_run_ids, vec![run_id]);
+    assert_eq!(recovery.failed_runs, 0);
+    assert_eq!(recovery.requeued_events, 0);
+    assert_eq!(recovery.dead_lettered_events, 0);
+    assert_eq!(i4_reservation_status(&fixture, &reservation_id), "consumed");
+    let review = ResearchRepository::new(&fixture.db)
+        .find(&review_id)
+        .expect("fresh failed review");
+    assert_eq!(review.state, "retry_wait");
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .review_failure_code(&review_id)
+            .expect("fresh failure code"),
+        Some("research_output_invalid".to_owned())
+    );
+    let campaign = ResearchRepository::new(&fixture.db)
+        .state(&fixture.campaign_id)
+        .expect("fresh campaign state");
+    assert_eq!(campaign.session_id, None);
+    assert_eq!(campaign.blocked_reason, None);
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("fresh research run")
+            .expect("fresh research run row")
+            .status,
+        AgentRunStatus::Running
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("fresh research event")
+            .expect("fresh research event row")
+            .status,
+        EventStatus::InFlight
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_unsafe_research_failure_as_typed_outcome() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id, reservation_id, binding) =
+        i4_seed_bound_research(&fixture, false);
+    i4_update_notes(&fixture, &review_id, |notes| {
+        notes["business_note"] = serde_json::json!("retain this note");
+    });
+    ResearchRepository::new(&fixture.db)
+        .fail_agent_run(&binding, run_id, "research_session_unsafe", 2_903)
+        .expect("persist unsafe research failure window");
+
+    let recovery = i4_startup_recovery(&fixture).expect("startup recovery");
+    assert_eq!(recovery.preserved_research_run_ids, vec![run_id]);
+    assert_eq!(recovery.failed_runs, 0);
+    assert_eq!(i4_reservation_status(&fixture, &reservation_id), "consumed");
+    let review = ResearchRepository::new(&fixture.db)
+        .find(&review_id)
+        .expect("unsafe research review");
+    assert_eq!(review.state, "retry_wait");
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .review_failure_code(&review_id)
+            .expect("unsafe failure code"),
+        Some("research_session_unsafe".to_owned())
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .state(&fixture.campaign_id)
+            .expect("unsafe campaign state")
+            .blocked_reason,
+        None
+    );
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("unsafe research run")
+            .expect("unsafe research run row")
+            .status,
+        AgentRunStatus::Running
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("unsafe research event")
+            .expect("unsafe research event row")
+            .status,
+        EventStatus::InFlight
+    );
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_research_owner_for_missing_malformed_or_foreign_authority() {
+    for mutation in ["missing", "malformed", "foreign"] {
+        let fixture = fixture();
+        let (review_id, run_id, event_id, _reservation_id, binding) =
+            i4_seed_bound_research(&fixture, false);
+        i4_set_ready_result(&fixture, &review_id, &binding);
+        i4_update_notes(&fixture, &review_id, |notes| {
+            notes["business_note"] = serde_json::json!("retain this note");
+            match mutation {
+                "missing" => {
+                    notes
+                        .as_object_mut()
+                        .expect("I4 notes object")
+                        .remove("native_recovery");
+                    notes["legacy_recovery"] = serde_json::json!("v0");
+                }
+                "malformed" => {
+                    notes["native_recovery"]["unexpected"] = serde_json::json!(true);
+                }
+                "foreign" => {
+                    notes["native_recovery"]["run_id"] = serde_json::json!(run_id + 1);
+                }
+                _ => unreachable!(),
+            }
+        });
+        let before = ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("research review before fail-closed recovery");
+        let notes_before: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| row.get(0),
+            )
+            .expect("notes before fail-closed recovery");
+
+        let recovery = i4_startup_recovery(&fixture).expect("startup recovery");
+        assert_eq!(
+            recovery.preserved_research_run_ids,
+            vec![run_id],
+            "{mutation}"
+        );
+        assert_eq!(recovery.failed_runs, 0, "{mutation}");
+        assert_eq!(recovery.requeued_events, 0, "{mutation}");
+        assert_eq!(recovery.dead_lettered_events, 0, "{mutation}");
+        let after = ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("research review after fail-closed recovery");
+        assert_eq!(after.state, before.state, "{mutation} state");
+        assert_eq!(
+            after.response_json, before.response_json,
+            "{mutation} response"
+        );
+        assert_eq!(
+            after.context_json, before.context_json,
+            "{mutation} context"
+        );
+        assert_eq!(
+            after.context_digest, before.context_digest,
+            "{mutation} digest"
+        );
+        let notes_after: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| row.get(0),
+            )
+            .expect("notes after fail-closed recovery");
+        assert_eq!(notes_after, notes_before, "{mutation} notes");
+        assert_eq!(
+            ResearchRepository::new(&fixture.db)
+                .state(&fixture.campaign_id)
+                .expect("campaign after fail-closed recovery")
+                .blocked_reason
+                .as_deref(),
+            Some("research_recovery_required"),
+            "{mutation} recovery reason"
+        );
+        assert_eq!(
+            AgentRunRepository::new(&fixture.db)
+                .find_by_id(run_id)
+                .expect("research run after fail-closed recovery")
+                .expect("research run row")
+                .status,
+            AgentRunStatus::Running,
+            "{mutation} run ownership"
+        );
+        assert_eq!(
+            EventRepository::new(&fixture.db)
+                .find_by_id(event_id)
+                .expect("research event after fail-closed recovery")
+                .expect("research event row")
+                .status,
+            EventStatus::InFlight,
+            "{mutation} event ownership"
+        );
+    }
+}
