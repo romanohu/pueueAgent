@@ -932,6 +932,16 @@ max_agent_runs = 10
         serde_json::Value::Object(immutable)
     }
 
+    fn notes_without_cleanup(notes: &serde_json::Value) -> serde_json::Value {
+        let mut immutable = notes.clone();
+        immutable
+            .get_mut("native_recovery")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("native recovery authority notes")
+            .remove("cleanup");
+        immutable
+    }
+
     // Fixture-only simulation of the future Task 5 action consumer. Production
     // does not complete a ready review or save advice through this test helper.
     fn complete_ready_review(&self, review_id: &str) {
@@ -2811,7 +2821,22 @@ async fn research_terminal_agent_update_failure_does_not_replay_persisted_respon
         retried.response_json.as_deref(),
         Some(response_json.as_str())
     );
-    assert_eq!(retried_notes, notes_json);
+    let pending_notes: serde_json::Value = serde_json::from_str(&notes_json).unwrap();
+    let completed_notes: serde_json::Value = serde_json::from_str(&retried_notes).unwrap();
+    assert_eq!(
+        ResearchHarness::notes_without_cleanup(&completed_notes),
+        ResearchHarness::notes_without_cleanup(&pending_notes),
+        "cleanup retry must preserve immutable business, history, session, and authority notes"
+    );
+    assert_eq!(
+        pending_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("pending")
+    );
+    assert_eq!(
+        completed_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("complete")
+    );
+    assert!(completed_notes["native_recovery"]["cleanup"]["completed_at"].is_i64());
     assert_eq!(harness.reservation_status(&reservation_id), "consumed");
     assert!(AgentRunRepository::new(&harness.db)
         .find_active_by_project(&harness.project.project_id)
@@ -2924,7 +2949,22 @@ async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(retried_notes, notes_json);
+    let pending_notes: serde_json::Value = serde_json::from_str(&notes_json).unwrap();
+    let completed_notes: serde_json::Value = serde_json::from_str(&retried_notes).unwrap();
+    assert_eq!(
+        ResearchHarness::notes_without_cleanup(&completed_notes),
+        ResearchHarness::notes_without_cleanup(&pending_notes),
+        "cleanup retry must preserve immutable business, history, session, and authority notes"
+    );
+    assert_eq!(
+        pending_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("pending")
+    );
+    assert_eq!(
+        completed_notes["native_recovery"]["cleanup"]["phase"],
+        serde_json::json!("complete")
+    );
+    assert!(completed_notes["native_recovery"]["cleanup"]["completed_at"].is_i64());
     assert_eq!(
         harness.research_session().as_deref(),
         Some(session_id.as_str())

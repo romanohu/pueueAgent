@@ -457,17 +457,34 @@ impl BoundCleanupHandle {
                 *finalized = true;
             }
         }
+        let research_cleanup = self.research_failure.is_some();
         match &mut self.kind {
             BoundCleanupKind::LiveChild {
-                retained_authority: RetainedLaunchAuthority::Retained { temp, .. },
+                retained_authority:
+                    RetainedLaunchAuthority::Retained {
+                        project_policy,
+                        temp,
+                        ..
+                    },
                 ..
             }
             | BoundCleanupKind::RetainedTemp {
-                retained_authority: RetainedLaunchAuthority::Retained { temp, .. },
+                retained_authority:
+                    RetainedLaunchAuthority::Retained {
+                        project_policy,
+                        temp,
+                        ..
+                    },
                 ..
             } => {
+                if research_cleanup {
+                    revalidate_research_temp(temp, project_policy)?;
+                }
                 temp.cleanup_contents_before(deadline.map(Instant::into_std))
                     .map_err(AppError::from)?;
+                if research_cleanup {
+                    revalidate_research_temp(temp, project_policy)?;
+                }
             }
             BoundCleanupKind::LiveChild { .. }
             | BoundCleanupKind::RetainedTemp { .. }
@@ -2607,6 +2624,19 @@ fn resolve_retained_temp_failure(
     }
 }
 
+fn revalidate_research_temp(
+    temp: &PrivateRunTemp,
+    project_policy: &ResolvedProjectExecutionPolicy,
+) -> Result<(), AppError> {
+    let verified_root = project_policy
+        .root_anchor
+        .verify_identity()
+        .map_err(AppError::from)?;
+    temp.recovery_identity(&verified_root)
+        .map(|_| ())
+        .map_err(AppError::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_native_recovery_authority_failure(
     project: &Project,
@@ -3618,9 +3648,21 @@ impl AgentHandle {
             }
             TerminalPersistence::Persisted(status) => *status,
         };
-        if let RetainedLaunchAuthority::Retained { temp, .. } = &mut self.retained_authority {
+        let research_cleanup = self.research_persistence.is_some();
+        if let RetainedLaunchAuthority::Retained {
+            project_policy,
+            temp,
+            ..
+        } = &mut self.retained_authority
+        {
+            if research_cleanup {
+                revalidate_research_temp(temp, project_policy)?;
+            }
             temp.cleanup_contents_before(deadline.map(Instant::into_std))
                 .map_err(AppError::from)?;
+            if research_cleanup {
+                revalidate_research_temp(temp, project_policy)?;
+            }
         }
         if let Some(ResearchPersistence::Persisted {
             binding,
