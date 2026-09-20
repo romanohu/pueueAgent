@@ -4232,10 +4232,7 @@ mod v23_event_kind_tests {
                     "UPDATE sqlite_master
                         SET sql = replace(sql, ?1, ?2)
                       WHERE type = 'table' AND name = 'events'",
-                    params![
-                        EVENTS_V26_KIND_LIST,
-                        EVENTS_V18_KIND_LIST,
-                    ],
+                    params![EVENTS_V29_KIND_LIST, EVENTS_V18_KIND_LIST],
                 )
                 .unwrap();
             transaction
@@ -4253,6 +4250,7 @@ mod v23_event_kind_tests {
                 .unwrap(),
             22
         );
+        assert_eq!(events_kind_list(&connection), EVENTS_V18_KIND_LIST);
         drop(connection);
 
         let db = crate::db::Db::open(&db_path).unwrap();

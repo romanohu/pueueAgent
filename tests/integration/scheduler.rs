@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     fs::OpenOptions,
     path::PathBuf,
@@ -1005,14 +1005,16 @@ async fn claim_cap_rotates_ineligible_decisions_and_reaches_event_1002_on_the_ne
              UPDATE projects SET paused = 1 WHERE project_id = 'project-c';
              INSERT INTO campaigns (
                  campaign_id, project_id, objective_text, objective_digest,
-                 initial_argv_json, state, created_at, updated_at
+                 initial_argv_json, state, state_reason, baseline_experiment_id,
+                 next_eligible_at, objective_metric_json, base_revision_sha,
+                 created_at, updated_at
              ) VALUES
                  ('disabled-campaign', 'project-b', 'objective', 'disabled-digest',
-                  '[]', 'active', 1, 1),
+                  '[\"/bin/echo\",\"fixture\"]', 'active', NULL, NULL, NULL, NULL, NULL, 1, 1),
                  ('paused-project-campaign', 'project-c', 'objective', 'paused-project-digest',
-                  '[]', 'active', 1, 1),
+                  '[\"/bin/echo\",\"fixture\"]', 'active', NULL, NULL, NULL, NULL, NULL, 1, 1),
                  ('inactive-campaign', 'project-d', 'objective', 'inactive-digest',
-                  '[]', 'paused', 1, 1);
+                  '[\"/bin/echo\",\"fixture\"]', 'paused', 'fixture', NULL, NULL, NULL, NULL, 1, 1);
              CREATE TABLE decision_claim_audit (event_id INTEGER PRIMARY KEY);
              CREATE TRIGGER audit_ineligible_decision_claim
              AFTER UPDATE OF status ON events
@@ -1020,28 +1022,169 @@ async fn claim_cap_rotates_ineligible_decisions_and_reaches_event_1002_on_the_ne
                   AND OLD.project_id IN ('project-b', 'project-c', 'project-d')
              BEGIN
                  INSERT INTO decision_claim_audit (event_id) VALUES (NEW.event_id);
-             END;
-             PRAGMA foreign_keys = OFF;",
+             END;",
         )
         .unwrap();
     let transaction = connection.transaction().unwrap();
+    let mut previous_experiment_ids = BTreeMap::new();
+    let mut lineage = Vec::with_capacity(1_001);
     for ordinal in 1..=1_001_i64 {
-        let (project_id, campaign_id) = match ordinal % 3 {
-            0 => ("project-b", "disabled-campaign"),
-            1 => ("project-c", "paused-project-campaign"),
-            _ => ("project-d", "inactive-campaign"),
+        let (project_id, campaign_id, group, objective_digest) = match ordinal % 3 {
+            0 => (
+                "project-b",
+                "disabled-campaign",
+                "pb-project-b",
+                "disabled-digest",
+            ),
+            1 => (
+                "project-c",
+                "paused-project-campaign",
+                "pc-project-c",
+                "paused-project-digest",
+            ),
+            _ => (
+                "project-d",
+                "inactive-campaign",
+                "pd-project-d",
+                "inactive-digest",
+            ),
         };
-        let cycle_id = format!("ineligible-cycle-{ordinal:04}");
         let experiment_id = format!("ineligible-experiment-{ordinal:04}");
+        let proposal_id = format!("ineligible-proposal-{ordinal:04}");
+        let submission_id = format!("ineligible-submission-{ordinal:04}");
+        let source_experiment_id = previous_experiment_ids.get(campaign_id).cloned();
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: format!("Terminal scheduler fixture source {ordinal}"),
+                source_experiment_id: source_experiment_id.clone(),
+                argv: vec!["/bin/echo".to_owned(), "fixture".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: Vec::new(),
+            },
+            objective_digest,
+        )
+        .unwrap();
+        let argv_json = serde_json::to_string(proposal.argv()).unwrap();
+        let evidence_json = serde_json::to_string(proposal.expected_evidence()).unwrap();
+        let task_id = 10_000 + ordinal;
+        let task_signature = format!("pueue-task:v1:ineligible-{ordinal:04}");
         transaction
             .execute(
-                "INSERT INTO decision_cycles (
-                     cycle_id, campaign_id, source_experiment_id, source_terminal_at,
-                     state, consecutive_failed_attempts, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?4, ?4)",
-                params![cycle_id, campaign_id, experiment_id, ordinal],
+                "INSERT INTO proposals (
+                     proposal_id, campaign_id, kind, status, hypothesis, source_experiment_id,
+                     argv_json, working_directory, expected_evidence_json, canonical_digest,
+                     reject_reason, created_at, updated_at
+                 ) VALUES (?1, ?2, 'experiment', 'accepted', ?3, ?4, ?5, ?6, ?7, ?8,
+                           NULL, ?9, ?9)",
+                params![
+                    proposal_id,
+                    campaign_id,
+                    proposal.hypothesis(),
+                    source_experiment_id,
+                    argv_json,
+                    proposal.working_directory(),
+                    evidence_json,
+                    proposal.canonical_digest(),
+                    ordinal,
+                ],
             )
             .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO submissions (
+                     submission_id, project_id, argv_json, created_at, pueue_task_id,
+                     task_signature, status, kind, metadata_json, origin_agent_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', 'experiment', ?7, NULL)",
+                params![
+                    submission_id,
+                    project_id,
+                    argv_json,
+                    ordinal,
+                    task_id,
+                    task_signature,
+                    json!({
+                        "campaign_id": campaign_id,
+                        "proposal_id": proposal_id,
+                        "experiment_id": experiment_id,
+                    })
+                    .to_string(),
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO experiments (
+                     experiment_id, campaign_id, proposal_id, submission_id,
+                     parent_experiment_id, attempt, status, pueue_task_id, task_signature,
+                     failure_code, failure_fingerprint, created_at, updated_at, finished_at,
+                     resume_of_experiment_id, checkpoint_note, code_change_run_id,
+                     code_revision_sha
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 'succeeded', ?6, ?7, NULL, NULL,
+                           ?8, ?8, ?8, NULL, NULL, NULL, NULL)",
+                params![
+                    experiment_id,
+                    campaign_id,
+                    proposal_id,
+                    submission_id,
+                    source_experiment_id,
+                    task_id,
+                    task_signature,
+                    ordinal,
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO budget_reservations (
+                     reservation_id, campaign_id, experiment_id, dimension, subject_key,
+                     status, window_started_at, window_ends_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'experiment', ?3, 'consumed', ?4, ?5, ?4, ?4)",
+                params![
+                    format!("experiment:{experiment_id}"),
+                    campaign_id,
+                    experiment_id,
+                    ordinal,
+                    ordinal + 86_400,
+                ],
+            )
+            .unwrap();
+        if source_experiment_id.is_none() {
+            transaction
+                .execute(
+                    "UPDATE campaigns SET baseline_experiment_id = ?1 WHERE campaign_id = ?2",
+                    params![experiment_id, campaign_id],
+                )
+                .unwrap();
+        }
+        previous_experiment_ids.insert(campaign_id.to_owned(), experiment_id.clone());
+        lineage.push((
+            project_id.to_owned(),
+            campaign_id.to_owned(),
+            experiment_id,
+            group.to_owned(),
+            task_signature,
+            task_id,
+            ordinal,
+        ));
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let mut cycles = Vec::with_capacity(lineage.len());
+    for (_, campaign_id, experiment_id, _, _, _, ordinal) in &lineage {
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(campaign_id, experiment_id, *ordinal)
+            .unwrap();
+        cycles.push(cycle.cycle_id);
+    }
+    let mut connection = harness.db.connect().unwrap();
+    let transaction = connection.transaction().unwrap();
+    for (
+        (project_id, campaign_id, experiment_id, group, task_signature, task_id, ordinal),
+        cycle_id,
+    ) in lineage.iter().zip(cycles)
+    {
         transaction
             .execute(
                 "INSERT INTO events (
@@ -1058,6 +1201,16 @@ async fn claim_cap_rotates_ineligible_decisions_and_reaches_event_1002_on_the_ne
                         "source": "terminal_experiment",
                         "cycle_id": cycle_id,
                         "source_experiment_id": experiment_id,
+                        "terminal_observation": {
+                            "task_id": task_id,
+                            "task_signature": task_signature,
+                            "group": group,
+                            "state": "Done",
+                            "enqueued_at": ordinal - 2,
+                            "started_at": ordinal - 1,
+                            "ended_at": ordinal,
+                            "exit_code": 0,
+                        },
                     })
                     .to_string(),
                     ordinal,
@@ -1066,7 +1219,6 @@ async fn claim_cap_rotates_ineligible_decisions_and_reaches_event_1002_on_the_ne
             .unwrap();
     }
     transaction.commit().unwrap();
-    connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     drop(connection);
     let eligible_event = harness.enqueue(EventKind::DeepCheck, "project-a", "eligible-after-cap");
     harness
