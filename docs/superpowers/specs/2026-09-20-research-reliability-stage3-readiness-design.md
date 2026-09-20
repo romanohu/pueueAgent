@@ -2,7 +2,7 @@
 
 日付: 2026-09-20
 
-状態: Draft（Stage 2 受入後の実装候補）
+状態: 承認済み（Stage 2 受入後に実装）
 
 調査基準: Stage 2 worktree `9e29636`（Stage 2 完了commitを実装開始点とする）
 
