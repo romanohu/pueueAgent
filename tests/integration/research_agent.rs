@@ -2987,7 +2987,31 @@ async fn research_final_cleanup_entry_cap_retains_success_without_replay() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(retried_review_timestamps, persisted_review_timestamps);
+    assert_eq!(
+        retried_review_timestamps.0,
+        persisted_review_timestamps.0,
+        "cleanup completion must not change finished_at"
+    );
+    assert_eq!(
+        retried_review_timestamps.1,
+        NOW + 92,
+        "cleanup completion advances updated_at once"
+    );
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 93).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let idempotent_review_timestamps: (Option<i64>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT finished_at, updated_at FROM research_reviews WHERE review_id = ?1",
+            [&claimed.review.review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(idempotent_review_timestamps, retried_review_timestamps);
     assert!(fs::read_dir(&private_dir).unwrap().next().is_none());
     let capture = fs::read_to_string(&harness.capture_path).unwrap();
     assert_eq!(capture.matches("CALL_START\n").count(), 1);
