@@ -1324,7 +1324,6 @@ fn research_policy_with_codex_fixture(
     let _ = harness.policy();
     let fixture_root = fs::canonicalize(harness.temp.path()).unwrap();
     let state_dir = fixture_root.join("execution-policy-state");
-    let trusted_dir = fixture_root.join("execution-policy-bin");
     let policy_path = state_dir.join("execution-policy.toml");
     let body = fs::read_to_string(&policy_path).unwrap();
     let replacement = format!("codex = {:?}", codex.display().to_string());
