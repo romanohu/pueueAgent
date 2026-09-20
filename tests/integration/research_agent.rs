@@ -3193,6 +3193,45 @@ async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundar
     assert_eq!(failed.agent_run_id, Some(first_run_id));
     assert_eq!(failed.attempt, claimed.review.attempt + 1);
     let first_reservation = harness.reservation_id_for(&failed);
+    let first_context_json = failed
+        .context_json
+        .clone()
+        .expect("first failed attempt must retain its bound context");
+    let first_context_digest = failed
+        .context_digest
+        .clone()
+        .expect("first failed attempt must retain its context digest");
+    assert!(
+        harness
+            .review_notes(&failed.review_id)
+            .get("retry_history")
+            .is_none(),
+        "the first attempt has no prior retry history"
+    );
+    let assert_history_entry =
+        |entry: &serde_json::Value,
+         attempt: i64,
+         run_id: i64,
+         context_json: &str,
+         context_digest: &str| {
+            assert_eq!(entry.get("attempt").and_then(serde_json::Value::as_i64), Some(attempt));
+            assert_eq!(
+                entry.get("agent_run_id").and_then(serde_json::Value::as_i64),
+                Some(run_id)
+            );
+            assert_eq!(
+                entry.get("failure_code").and_then(serde_json::Value::as_str),
+                Some("research_output_invalid")
+            );
+            assert_eq!(
+                entry.get("context_json").and_then(serde_json::Value::as_str),
+                Some(context_json)
+            );
+            assert_eq!(
+                entry.get("context_digest").and_then(serde_json::Value::as_str),
+                Some(context_digest)
+            );
+        };
     let event_id = review_event_id(&harness.db, &failed.review_id);
     let review_wake: i64 = harness
         .db
@@ -3239,6 +3278,26 @@ async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundar
         .unwrap();
     assert_eq!(second.attempt, claimed.review.attempt + 2);
     assert_eq!(second.agent_run_id, Some(second_run_id));
+    let second_context_json = second
+        .context_json
+        .clone()
+        .expect("second failed attempt must retain its bound context");
+    let second_context_digest = second
+        .context_digest
+        .clone()
+        .expect("second failed attempt must retain its context digest");
+    let second_history = harness.review_notes(&second.review_id)["retry_history"]
+        .as_array()
+        .cloned()
+        .expect("second binding must preserve the first retry history");
+    assert_eq!(second_history.len(), 1);
+    assert_history_entry(
+        &second_history[0],
+        failed.attempt,
+        first_run_id,
+        &first_context_json,
+        &first_context_digest,
+    );
     let second_reservation = harness.reservation_id_for(&second);
     assert_ne!(first_reservation, second_reservation);
     assert_eq!(harness.reservation_status(&first_reservation), "consumed");
@@ -3253,6 +3312,194 @@ async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundar
         second_handle.wait(&harness.db, wake + 20).await.unwrap(),
         AgentRunStatus::Failed
     );
+
+    let second_failed = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(second_failed.state, "retry_wait");
+    assert_eq!(second_failed.agent_run_id, Some(second_run_id));
+    assert_eq!(second_failed.context_json.as_deref(), Some(second_context_json.as_str()));
+    assert_eq!(
+        second_failed.context_digest.as_deref(),
+        Some(second_context_digest.as_str())
+    );
+    let second_review_wake: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
+            [&second_failed.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let second_event_wake = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap()
+        .not_before;
+    let third_wake = second_review_wake.max(second_event_wake);
+    let third_report = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        third_wake,
+        1,
+    )
+    .await
+    .expect("the third bounded attempt must be admitted at its wake");
+    assert_eq!(third_report.started.len(), 1);
+    let third_run_id = third_report.started[0].run_id;
+    assert_ne!(third_run_id, first_run_id);
+    assert_ne!(third_run_id, second_run_id);
+    let third = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(third.attempt, claimed.review.attempt + 3);
+    assert_eq!(third.agent_run_id, Some(third_run_id));
+    let third_context_json = third
+        .context_json
+        .clone()
+        .expect("third attempt must retain its bound context");
+    let third_context_digest = third
+        .context_digest
+        .clone()
+        .expect("third attempt must retain its context digest");
+    let third_history = harness.review_notes(&third.review_id)["retry_history"]
+        .as_array()
+        .cloned()
+        .expect("third binding must preserve prior retry history");
+    assert_eq!(third_history.len(), 2);
+    assert_history_entry(
+        &third_history[0],
+        failed.attempt,
+        first_run_id,
+        &first_context_json,
+        &first_context_digest,
+    );
+    assert_history_entry(
+        &third_history[1],
+        second_failed.attempt,
+        second_run_id,
+        &second_context_json,
+        &second_context_digest,
+    );
+    let third_reservation = harness.reservation_id_for(&third);
+    for reservation in [&first_reservation, &second_reservation, &third_reservation] {
+        assert_eq!(harness.reservation_status(reservation), "consumed");
+    }
+    assert_ne!(first_reservation, third_reservation);
+    assert_ne!(second_reservation, third_reservation);
+
+    let mut third_handle = third_report
+        .started
+        .into_iter()
+        .next()
+        .expect("third coordinator launch");
+    assert_eq!(
+        third_handle.wait(&harness.db, third_wake + 20).await.unwrap(),
+        AgentRunStatus::Failed
+    );
+    let third_failed = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(third_failed.state, "retry_wait");
+    assert_eq!(third_failed.agent_run_id, Some(third_run_id));
+    assert_eq!(third_failed.context_json.as_deref(), Some(third_context_json.as_str()));
+    assert_eq!(
+        third_failed.context_digest.as_deref(),
+        Some(third_context_digest.as_str())
+    );
+    let third_review_wake: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
+            [&third_failed.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let third_event_wake = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap()
+        .not_before;
+    let cap_wake = third_review_wake.max(third_event_wake);
+    let capped = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        cap_wake,
+        1,
+    )
+    .await
+    .expect("the attempt cap must settle without launching a fourth child");
+    assert!(capped.started.is_empty());
+    assert_eq!(capped.blocked, 1);
+    let capped_review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(capped_review.state, "blocked");
+    let failure_code: Option<String> = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+            [&capped_review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failure_code.as_deref(), Some("research_attempt_limit"));
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&capped_review.campaign_id)
+            .unwrap()
+            .blocked_reason
+            .as_deref(),
+        Some("research_attempt_limit")
+    );
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Failed
+    );
+    assert!(
+        ResearchRepository::new(&harness.db)
+            .reservation_id_for_attempt(
+                &capped_review.campaign_id,
+                &capped_review.review_id,
+                claimed.review.attempt + 4,
+            )
+            .unwrap()
+            .is_none(),
+        "the cap must not consume a fourth budget reservation"
+    );
+    let capped_history = harness.review_notes(&capped_review.review_id)["retry_history"]
+        .as_array()
+        .cloned()
+        .expect("cap settlement must preserve retry history");
+    assert_eq!(capped_history.len(), 2);
+    assert_history_entry(
+        &capped_history[0],
+        failed.attempt,
+        first_run_id,
+        &first_context_json,
+        &first_context_digest,
+    );
+    assert_history_entry(
+        &capped_history[1],
+        second_failed.attempt,
+        second_run_id,
+        &second_context_json,
+        &second_context_digest,
+    );
+    let capture = fs::read_to_string(&harness.capture_path).unwrap();
+    assert_eq!(capture.matches("CALL_START\n").count(), 3);
 }
 
 #[tokio::test]
