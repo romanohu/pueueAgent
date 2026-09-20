@@ -9,9 +9,10 @@
 - **実験の反復:** 最初の実験を baseline として記録し、終了後に agent が次の実験、有限の待機、根拠付きの目標達成申告を判断します。
 - **コード改善:** 別の Git worktree で編集・チェック・候補 commit を行い、そのコードで実験します。数値改善を確認した候補は local `best` として次のコード修正の基準にできます。
 - **実行中の異常対応:** Pueue が Running でも、設定された OOM・エラー信号やログ停止を観測し、疑わしい場合に診断 agent を起動します。終了確認と予算の条件を満たした場合だけ後継実験を投入します。
+- **実験中の研究判断:** active campaign の研究担当は、`research_interval_minutes`（既定30分）の周期で healthy な実験も含めて進捗と改善見込みを確認し、`continue`、`stop_and_next`、`resume_from_checkpoint` のいずれかを提案します。停止、後継投入、checkpoint の採用は supervisor が状態・停止確認・予算を検証して実行します。
 - **制限と復旧:** 実験・agent 起動・コード変更の予算を管理し、一時停止、再開、再起動時の照合を行います。外部投入の成否が不明なら二重投入せず保留します。
 
-目標達成の最終承認、main への merge/push は人が行います。任意のリポジトリが無変更で動く保証、全異常の検知、目標達成の保証、OS/container による強制隔離はありません。また、定期観測は「30分ごとに同じ会話の研究 agent を起動する」機能ではありません。[監視とセッションの違い](docs/workflows-ja.md#監視とエージェントの起動を区別する)を確認してください。
+目標達成の最終承認、main への merge/push は人が行います。任意のリポジトリが無変更で動く保証、全異常の検知、目標達成の保証、OS/container による強制隔離はありません。既存の running-health observer は異常が疑われた場合に診断を起動する監視であり、毎30分に同じ研究 session を起動する機能ではありません。campaign の研究担当の周期は別の `research_interval_minutes` で決まり、Periodic DeepCheck も別の opt-in です。[監視とセッションの違い](docs/workflows-ja.md#監視とエージェントの起動を区別する)を確認してください。
 
 ## 全体像
 
@@ -118,6 +119,7 @@ pueue-agent submit --metric-name validation_loss --metric-direction minimize -- 
 - service policy の network 既定値は enabled ですが、network 利用許可と credential 継承許可は別です。allowlist にない credential/environment value は agent や agent task へ継承されません。
 - `status`、`events`、`runs`、`doctor` などの診断投影は bounded / redacted です。ただし、SQLite には submission の argv と任意 metadata、`steer` の intervention message が保存されます。これらの入力に credential や secret を含めないでください。
 - service、automation、agent run、Pueue task は別の lifecycle です。停止や取消は、対象に対応する `stop`、`pause`、`resume`、`cancel --task-id` を使ってください。
+- campaign の研究状態、予算、experiment の lineage、best、停止要求の authority は SQLite です。研究メモと会話は bounded な助言であり、status/doctor の表示には raw session や transcript を出しません。
 - 障害時も SQLite や immutable execution policy を直接修復せず、[トラブルシューティング](docs/troubleshooting-ja.md)の診断順序と supported CLI を使ってください。
 
 ## 開発と検証

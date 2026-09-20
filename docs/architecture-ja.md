@@ -9,6 +9,7 @@
 | submit 経路 | project と argv の検証、submission intent の先行永続化、Pueue add 結果の記録 | Pueue の task 実行 | [`submit.rs`](../src/submit.rs), [`pueue.rs`](../src/pueue.rs) |
 | campaign coordinator | 最初の submit と accepted decision proposal を durable intent に変換し、commit 後の Pueue add と accepted/unreconciled 遷移を調停 | decision evidence の構築や agent 実行 | [`campaign.rs`](../src/campaign.rs), [`db/campaigns.rs`](../src/db/campaigns.rs) |
 | decision coordinator | terminal experiment の decision cycle、bounded evidence、read-only analysis、proposal / finite wait / goal_reached の適用と再起動復旧 | running health/OOM の継続観測、コード編集自体（専用 coordinator へ渡す） | [`decision.rs`](../src/decision.rs), [`decision_evidence.rs`](../src/decision_evidence.rs), [`db/decisions.rs`](../src/db/decisions.rs) |
+| research scheduler / repository | running experiment の due 判定、研究 review の排他的 claim、campaign session 世代、bounded な研究回答・操作意図・次回時刻の永続化 | LLM の記憶からの正本復元、直接 kill/submit、目標・予算の変更 | [`research.rs`](../src/research.rs), [`research_evidence.rs`](../src/research_evidence.rs), [`db/research.rs`](../src/db/research.rs) |
 | code-change coordinator | `code_change` proposal の admission、Git candidate worktree、editor attempt/session、check、candidate commit/ref、候補 experiment、promotion、cleanup、restart recovery | main/checkout 中の source branch、remote、無関係な worktree、raw Pueue 操作 | [`code_change.rs`](../src/code_change.rs), [`db/code_changes.rs`](../src/db/code_changes.rs), [`campaign.rs`](../src/campaign.rs), [`promotion.rs`](../src/promotion.rs) |
 | Pueue adapter | 許可済み operation の argv 組み立て、検証済み Pueue/config の利用、timeout と stdout/stderr 上限 | event の永続化や retry 判定 | [`pueue.rs`](../src/pueue.rs), [`pueue_process.rs`](../src/pueue_process.rs) |
 | callback / reconciliation | callback の idempotent 取り込み、Pueue status の観測、terminal event の正規化、submission の突合 | agent dispatch | [`events.rs`](../src/events.rs), [`reconcile.rs`](../src/reconcile.rs) |
@@ -27,6 +28,7 @@
 | project 登録、submission、event、task observation、incident、termination request、intervention、agent run | service state directory の SQLite `state.sqlite3` | repository 層のみが状態遷移を書き込む。運用時に直接 SQL で編集しない |
 | agent、check、guardrail、Pueue group | project の `.pueue-agent/config.toml` | submit と daemon startup recovery は DB 登録の project ID/group と一致を検証する |
 | campaign、immutable objective snapshot、proposal、experiment、rolling budget reservation、submission/task lineage | service state directory の SQLite `state.sqlite3` | repository と coordinator が transaction 内で状態遷移する |
+| campaign research state、review、research session generation、operation stage、checkpoint confirmation | service state directory の SQLite `state.sqlite3` と検証済み experiment/task/termination lineage | research repository/coordinator と bounded status/doctor projection。研究メモ・会話は補助で、raw session/transcript は投影しない |
 | decision cycle、attempt、bounded context/output digest、finite wake | service state directory の SQLite `state.sqlite3` | decision repository/coordinator だけが遷移し、raw payload は status/doctor に投影しない |
 | code-change run、editor attempt/check、base/candidate SHA、candidate/best ref、worktree ownership、experiment linkage、cleanup marker | service state directory の SQLite `state.sqlite3` と検証済み local Git object/ref | code-change coordinator と status/doctor projection。raw prompt/diff/output は保存・投影しない |
 | current/historical facts、active lineage の bounded scratch projection | `.pueue-agent/state.json` | agent の補助 context。objective/budget/lineage の authority にはしない |
@@ -85,6 +87,26 @@ flowchart TD
 decision runner は startup-pinned built-in Codex だけを使い、project root を read-only、verified private temp を唯一の output capability とします。network は service policy に従いますが credential/auth environment は除外します。context JSON と decision JSON は各 128 KiB 以下で、output は schema 検証と digest 照合の後にだけ永続化されます。decision agent 自身は Pueue を呼ばず、source を編集しません。
 
 proposal は supervisor-owned ID と idempotency key で既存 coordinator に渡され、SQLite の accepted intent が外部 add より先です。finite wait は Pueue task を作らず、service-owned 上限内の絶対 `next_wake_at` だけを保存します。analysis は hourly agent-run budget、proposal は rolling experiment budget を消費します。連続失敗が `max_decision_attempts_per_cycle` に達すると cycle/campaign は `degraded` になり、自動 replay しません。
+
+## Campaign research の責務と状態遷移
+
+campaign research は terminal decision、running-health diagnosis、Periodic DeepCheck、code-change editor と別の research role です。research scheduler は service policy の `[campaign].research_interval_minutes`（既定30分、`0..=1440`、`0` は無効）を使い、running 開始後または完了した review の次回時刻を SQLite に保存します。healthy な experiment も対象にしますが、停止済み experiment だけの campaign では due review を作りません。project の active-agent 制約と既存の agent-run budget を共有し、research failure のために新しい並列枠や無料 retry を作りません。
+
+research evidence は対象 experiment/task の bounded な観測事実、既存の評価・health 参照、過去の研究メモから組み立てます。研究担当の解釈、仮説、推奨、次回メモは助言として保存し、SQLite の campaign、immutable objective、budget、lineage、best、termination を上書きしません。research database、context、status 投影は bounded な research evidence に限り、raw transcript を取り込みません。exact resume に使う native session storage は runtime が所有し、research evidence の投影とは別に管理します。credential は research evidence、context、status 投影に含めません。
+
+research role にも既存の native launch gate、private output、credential allowlist、runtime timeout を適用します。これは trusted-native の実行境界であり、OS namespace、container、VM、cgroup などの強制 containment や実 GPU OOM isolation を提供するものではありません。
+
+campaign には research session ID と generation を結び付けます。最初の review は fresh、その後は同じ campaign の所有 session だけを exact resume します。別 campaign の session や `resume_latest` を探索して流用しません。安全に欠落した session だけは保存済み事実・research notes・experiment 履歴から fresh に再構成できますが、これは reconstructed notes であり、失われた transcript の復元ではありません。foreign ownership、unsafe path、policy/credential、unsupported runtime の問題は fresh fallback ではなく research blocked です。
+
+構造化回答の action は次の境界を持ちます。
+
+- `continue` は新しい task や termination を作らず、検証済みの note と次回時刻だけを保存します。
+- `stop_and_next` は、回答の target と現在の campaign/health/budget を再検証し、既存 termination manager の停止要求を経て confirmed termination と terminal projection を待ちます。その後に fresh terminal decision へ渡しますが、proposal の受理、予算の空き、次候補の成功を保証しません。
+- `resume_from_checkpoint` は、loader と checkpoint の互換性、scope、サイズ、所有権/identity/content digest、後継投入までの retention を検証できる supported path だけを受理します。任意の framework や candidate worktree を一律に変換・再開せず、argv の resume flag や note だけでは load confirmation にしません。実際の matching load evidence がない状態は `unconfirmed` のままです。
+
+研究 agent の timeout、不正回答、通常の runtime failure は bounded retry に留め、安全に Missing と判定できた session の再構成も同じ attempt/budget 境界で扱います。研究失敗だけで learning task を kill しません。review ごとの retry cap は `max_decision_attempts_per_cycle`（既定3）を使いますが、terminal decision cycle の attempt とは別に数えます。session generation の変更や daemon restart で attempt、消費済み budget、既存の termination ownership を戻しません。上限、所有権、path、policy/credential、unsupported runtime の問題は research state だけを blocked にし、machine health observer/diagnosis は独立して動きます。
+
+operator の recovery は `pueue-agent campaign pause` → runtime/policy/instructions/binary の原因修正 → preflight 付き `pueue-agent campaign resume` の順です。resume は現在の runtime、policy、campaign session または安全に Missing と判定できる session を検証してから新しい review を予定します。daemon restart や `wake` は research blocked を解除せず、過去 review、attempt、budget、unresolved termination、exhausted terminal decision を消去しません。
 
 Phase 3 の `running OOM/stall observer` と実行中 experiment の `periodic observer` による campaign health-decision loop は terminal loop と併用される別経路として実装済みです。Phase 4 の evaluation と `goal review` も実装済みで、隔離された `code worktree` を使う Phase 5 pipeline は次の code-change coordinator が所有します。後続 phase に残るのは trusted native editor を OS レベルで containment する Phase 6 です。
 

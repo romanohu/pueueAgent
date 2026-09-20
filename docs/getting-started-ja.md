@@ -91,6 +91,32 @@ Git project では、`init` が tracked な `.gitignore` を変更せず、Git �
 
 現在の全設定は [`templates/config.toml`](../templates/config.toml) を参照してください。未知のキーや不正な値は無視されず、設定エラーになります。
 
+## Campaign の研究周期を設定する
+
+実験中の campaign research reviewer の周期は、project の `.pueue-agent/config.toml` ではなく service policy の `[campaign]` で設定します。例は次のとおりです。
+
+```toml
+[campaign]
+research_interval_minutes = 30
+```
+
+既定値は **30 分**、許容範囲は **0〜1440 分**です。`0` は研究担当の定期判断を無効にします。これは既存の `observer_interval_minutes`（running-health の観測）や `[check].deep_check_interval_minutes`（Periodic DeepCheck）を変更しません。`0` にしても、すでに行った停止要求を巻き戻したり、未確認の後継を追加したりはしません。
+
+この設定を含む binary / service policy を更新すると、すでに active な campaign も対象になります。更新前に、研究担当の起動と設定変更が混在しないよう campaign を一度 pause します。新しい設定キーを拒否する旧 binary から更新する場合は、次の順序で binary、policy、instructions を更新し、状態を確認してから意識的に resume してください。
+
+```bash
+pueue-agent campaign pause
+pueue-agent upgrade
+pueue-agent instructions update .
+# preview_token と差分を人が確認する
+pueue-agent instructions update --apply <PREVIEW_TOKEN> .
+pueue-agent doctor
+pueue-agent campaign status --json
+pueue-agent campaign resume
+```
+
+service policy の配布・更新は管理者の手順に従います。`instructions update` は preview と token を使い、実行中の agent の prompt を遡及変更しません。`campaign resume` は daemon の再起動や `wake` の代わりになる暗黙の解除ではなく、runtime、policy、campaign に結び付いた研究 session（または安全に欠落と判定できる session）が再検証された場合にだけ行います。研究が blocked のままなら、原因を解消してから同じ手順で再確認してください。
+
 ## Agent context を選ぶ
 
 `agent.context.mode` の既定値は `fresh` です。この設定は通常の agent run と Periodic DeepCheck に適用されます。campaign の decision / diagnosis agent は常に fresh、code-change editor は初回 fresh・修正時に同じ session を一度 resume という別の規則です。
@@ -224,13 +250,39 @@ def write_result(validation_loss: float) -> None:
 
 decision analysis も agent-run hourly budget を消費します。1 cycle の連続失敗は service-owned `max_decision_attempts_per_cycle`（既定 3）、wait は `max_decision_wait_minutes`（既定 1,440 分）で制限されます。上限まで失敗すると cycle と campaign は `degraded` になり、自動 proposal は止まります。`status --json` の `campaign.decision` で `cycle_id`、`source_experiment_id`、`state`、`attempt_count`、`last_decision_kind`、`next_wake_at`、bounded な failure code/summary を確認し、raw evidence や decision body を期待しないでください。
 
-実行中 experiment は既定30分の周期で信号を観測します。毎周期 agent を起動するのではなく、信号の反復やログ停止で `suspicious` になった場合に read-only diagnosis agent を起動します。診断は `continue` / `kill_and_resume` / `kill_and_escalate` を返し、停止確認と予算を満たした場合だけ後継実験を一つ投入します。`kill_and_resume` は同じ argv の再実行であり、自動的な batch size 変更や checkpoint 再開を意味しません。
+実行中 experiment は既定30分の周期で running-health signal を観測します。毎周期 diagnosis agent を起動するのではなく、信号の反復やログ停止で `suspicious` になった場合に read-only diagnosis agent を起動します。別に campaign research reviewer は `research_interval_minutes` の周期で healthy な実験も確認します。研究担当は `continue` / `stop_and_next` / `resume_from_checkpoint` を返しますが、停止、後継投入、checkpoint の採用は supervisor が検証して実行します。`kill_and_resume` は既存の diagnosis 経路による同じ argv の再実行であり、自動的な batch size 変更や checkpoint 再開を意味しません。
 
 観測間隔、通常 agent の Periodic DeepCheck、会話の引き継ぎは別の設定です。詳しくは[監視とエージェントの起動](workflows-ja.md#監視とエージェントの起動を区別する)を参照してください。
 
 終了後は結果 JSON の数値を評価し、有効な改善なら best を更新します。改善しない成功実験が続くと plateau を数え、閾値（既定3回）で方針の見直しを促します。`goal_reached` の申告には検証済み metrics row を指す根拠が必要で、campaign は `goal_reached_pending_review` になります。人が[goal review を承認または拒否](workflows-ja.md#目標達成を確認する)するまで、最終達成扱いにはしません。
 
 `goal review` は Phase 4 で `goal_reached` 決定を operator が承認/拒否するフローとして提供済みです。隔離された `code worktree` を使う Phase 5 の `code_change` pipeline も実装済みで、通常の decision agent が返した proposal を内部 coordinator が処理します。後続 phase に残るのは trusted native editor の OS レベル containment を扱う Phase 6 です。既存 detector/Periodic DeepCheck は別機能であり、legacy の kill pattern は running health を経由せず従来どおり incident と termination request を直接作ります。
+
+## agent の5つの role
+
+同じ project で動く agent でも、起動条件、会話 session、実行権限が異なります。研究担当の回答は supervisor が検証して使い、agent 自身が Pueue や SQLite を直接変更することはありません。
+
+| role | 役割と境界 |
+| --- | --- |
+| Standard | 通常の project 調査と bounded な助言を担当します。managed campaign 中は advisory-only で、source の直接編集、commit、job の直接投入をしません。 |
+| Research reviewer | 実験中の進捗・改善見込みを campaign 単位で確認し、`continue`、`stop_and_next`、`resume_from_checkpoint` の一つを返します。対象を停止・再投入せず、目標・予算も変更しません。 |
+| Diagnosis | OOM、エラー信号、stall など running-health が疑わしい場合だけ、fresh context で診断します。`continue`、`kill_and_resume`、`kill_and_escalate` を提案しますが、kill や後継投入は supervisor が行います。 |
+| Terminal decision | 実験の終了・照合後、または有限待機の期限後に、fresh context で次の proposal、wait、goal review を判断します。research session をそのまま引き継ぎません。 |
+| Code-change editor | supervisor が受理した code-change proposal の candidate worktree だけを編集します。初回は fresh、修正時だけ同じ session を一度継続し、commit、ref 更新、check の採否、実験投入は supervisor が所有します。 |
+
+## Campaign research の判断と履歴
+
+研究担当は campaign ごとに一つだけ due になり、running 中の experiment を一回答につき一つだけ対象にします。healthy な実験にも起動しますが、停止済み experiment だけの campaign では定期研究を起動しません。`research_interval_minutes = 0`、pause、halt、retire、goal review、予算待ちはそれぞれの停止条件を優先します。
+
+SQLite に保存される campaign、immutable objective、experiment、budget、lineage、best、停止要求が正本です。研究担当が返す事実参照、仮説、推奨、次回メモは助言であり、metric、best、予算、目標を上書きしません。入力は bounded な evidence で、直近の実験結果・研究メモ・log tail だけを上限付きで渡します。全 transcript や全ログを保存・表示する機能ではありません。
+
+同じ campaign の研究担当は、experiment が切り替わっても campaign に結び付いた同じ session を exact resume します。別 campaign の session や `resume_latest` は流用しません。安全に欠落したと判定できる場合だけ、保存済みの事実・研究メモ・実験履歴から新しい session を再構成します。これは reconstructed notes であり、失われた transcript の完全復元ではありません。session の所有権、path、policy を確認できない場合は fresh に切り替えず blocked にします。
+
+timeout、不正な回答、通常の runtime failure は有限の retry だけが許可されます。安全に Missing と判定できた session の再構成も、同じ attempt と既存の agent-run budget の範囲で行います。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく blocked です。上限は `max_decision_attempts_per_cycle`（既定3）を使いますが、terminal decision の cycle とは別に研究 review ごとに数えます。daemon 再起動や session 世代変更で試行数・予算を戻しません。研究担当の失敗だけを理由に learning task を kill せず、既存の機械的監視と health diagnosis は継続します。
+
+`continue` は実験をそのまま続け、次回時刻と検証済みメモだけを保存します。`stop_and_next` は、対象 task の停止要求、停止確認、terminal projection を順に確認した後に、fresh な terminal decision へ渡します。停止コマンドの終了だけでは停止確認とみなさず、後続の proposal が予算・policy・状態の理由で待機または拒否になることもあります。打ち切りを選んでも、次の experiment が受理されることを保証しません。
+
+`resume_from_checkpoint` は、対象コマンドの loader と checkpoint の互換性、scope、サイズ、所有権、内容 digest、後継が読むまでの retention を実際に検証できる場合だけ受理します。任意の ML framework やすべての candidate worktree を自動変換・再開する機能ではありません。argv に resume flag があるだけ、研究メモに `checkpoint_note` があるだけでは不十分です。実行時の対応する load evidence が観測できた場合だけ「再開確認済み」と表示し、それ以外は `unconfirmed` のまま扱います。
 
 ## 予算と自動化の上限
 

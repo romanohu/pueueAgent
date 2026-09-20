@@ -128,19 +128,48 @@ pueue-agent doctor --json
 
 `degraded` と `decision_attempts_exhausted` が表示された場合、`pueue-agent campaign pause` で自律動作を保持し、`status --json` と `doctor --json` の bounded failure facts を確認します。`campaign resume` は exhausted decision cycle を消去せず、SQLite を直接編集して retry してはいけません。継続を断念する場合は nonterminal/unreconciled experiment と reservation がないことを確認し、paused campaign を `campaign retire` してから、新しい objective と baseline を開始します。
 
+## Campaign research の定期判断と明示的な復旧
+
+campaign research reviewer は、service policy の `[campaign].research_interval_minutes`（既定30分、`0..=1440`、`0` は無効）に従って running experiment を確認します。running 開始からの最初の due と、完了した review の次の due は SQLite に保存され、pause 中の tick を resume 後に大量再生しません。healthy な実験も対象ですが、停止済み experiment しかない campaign では起動しません。campaign ごとに一つの研究 review、回答ごとに一つの対象 experiment、project ごとに既存の active-agent 制約を守ります。
+
+研究担当へ渡すのは bounded な観測事実と過去の研究メモです。対象 experiment/task identity、観測時刻、既存の評価値・health 状態への参照は事実として扱い、仮説、改善見込み、次回確認事項は助言として保存します。SQLite の campaign、objective、budget、lineage、best、termination が正本であり、研究メモや会話がこれらを上書きすることはありません。全 transcript や全ログを復元・表示する経路ではありません。
+
+同じ campaign の experiment を切り替えても、研究担当は campaign に所有された同じ session を exact resume します。別 campaign の session、他 role の session、`resume_latest` は流用しません。安全に欠落した session だけは、保存済みの事実、bounded notes、experiment 履歴から fresh な session を再構成できます。再構成後のメモは reconstructed notes であり、失われた transcript の完全復元ではありません。session の所有権、path、policy が確認できない場合は fresh に置き換えず blocked にします。
+
+研究回答の action は次の三つです。
+
+1. `continue`: 対象 experiment をそのまま続け、検証済みの研究メモと次回時刻を保存します。新しい task、proposal、termination は作りません。
+2. `stop_and_next`: 回答の target identity と現在の campaign/health/budget を再検証し、停止要求を永続化して既存 termination manager へ渡します。kill の終了コードだけで停止済みとはせず、確認済みの termination と terminal projection を待ってから、同じ終端 experiment の fresh な terminal decision に引き継ぎます。fresh decision が proposal を返すとは限らず、wait、budget 待ち、拒否になることもあるため、打ち切り後の次候補の受理を保証しません。
+3. `resume_from_checkpoint`: loader と checkpoint の互換性、scope、サイズ、所有権、identity/content digest、後継が読むまでの retention を検証できる場合だけ既存の resume admission へ渡します。任意の framework やすべての candidate を一律に再開する機能ではなく、argv の resume flag や `checkpoint_note` だけでは十分な根拠になりません。実際の load evidence が確認できる場合だけ再開確認済みとし、それ以外は `unconfirmed` のまま表示します。
+
+研究 agent の timeout、不正 JSON、通常の runtime failure は bounded な retry として扱い、安全に Missing と判定できた session の再構成も同じ attempt/budget 境界で行います。研究が失敗しただけで learning task を kill しません。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく研究担当だけを blocked にします。review ごとの試行上限には `max_decision_attempts_per_cycle`（既定3）を使いますが、terminal decision の cycle とは別に数えます。再試行・新 session・再構成も既存の agent-run budget を消費し、daemon restart や session generation の変更で試行数・budget をリセットしません。上限到達、所有権不一致、unsafe path、policy/credential、unsupported runtime の問題は機械的な異常検知と既存 health diagnosis を止めません。
+
+blocked の研究を復旧するときは、pause、原因修正、preflight 付き resume を明示的に行います。
+
+```bash
+pueue-agent campaign pause
+# runtime / policy / instructions / binary を確認・更新する
+pueue-agent doctor
+pueue-agent campaign status --json
+pueue-agent campaign resume
+```
+
+`campaign resume` は現在の runtime、policy、campaign session（または安全に Missing と判定できる session）を検証してから新しい review を予定します。過去 review の失敗・attempt・消費済み budget・未解決の termination・exhausted な terminal decision は消去しません。daemon の再起動、`pueue-agent wake --reason "<REASON>"`、`research_interval_minutes = 0` は research blocked を解除しません。
+
 ## 監視とエージェントの起動を区別する
 
 | 処理 | 起動・観測の条件 | 会話 context |
 | --- | --- | --- |
 | pattern / stall detector | `config.toml` の `[check]`。ログ信号や出力停止を機械的に確認 | 観測自体は agent を起動しない。action により event / termination request を作る |
 | running-health observer / diagnosis | service policy の `observer_interval_minutes`（既定30分）で観測し、疑わしい場合だけ診断 | diagnosis は常に fresh |
+| campaign research reviewer | service policy の `[campaign].research_interval_minutes`（既定30分）。healthy な running experiment も対象 | 同じ campaign の session を exact resume。安全な Missing だけ notes から fresh に再構成し、unsafe/所有権不一致は blocked |
 | terminal decision | 実験の終了・照合後、または有限待機の期限後 | decision は常に fresh。SQLite 由来の証拠を渡す |
 | Periodic DeepCheck（通常 agent） | `[check].deep_check_interval_minutes` を正の値に設定した場合。既定0は無効 | `[agent.context]` の fresh / resume / resume_latest に従う |
 | code-change editor | code-change proposal の受理後 | 初回 fresh、修正時だけ同じ session を一度 resume（合計最大2 attempts） |
 
-SQLite に履歴が残ることと、agent の会話 session が継続することは別です。`agent.context.mode = "resume_latest"` を指定しても、decision / diagnosis が同じ会話を引き継ぐようにはなりません。
+SQLite に履歴が残ることと、agent の会話 session が継続することは別です。research reviewer だけが campaign 所有の session を exact resume し、session 欠落時は安全に判定できる場合に限り notes から再構成します。`agent.context.mode = "resume_latest"` を指定しても、decision / diagnosis が同じ会話を引き継ぐようにはなりません。
 
-running health は OOM・エラー信号やログ停止の診断であり、毎30分に同じ研究 agent が収束見込みを判断して新しい設定へ切り替える機能ではありません。`kill_and_resume` は終了確認後の同一 argv の後継実験です。checkpoint から再開できるかどうかは、その学習コマンドと保存済み成果物次第です。
+running health は OOM・エラー信号やログ停止の診断であり、毎30分に同じ研究 agent が収束見込みを判断して新しい設定へ切り替える機能ではありません。campaign research reviewer は別の周期で healthy な実験を判断します。`kill_and_resume` は終了確認後の同一 argv の後継実験です。checkpoint から再開できるかどうかは、その学習コマンドと保存済み成果物の互換性・保持を検証できる場合に限られ、未確認の loader を「再開確認済み」とは表示しません。
 
 ## Periodic DeepCheck を有効化する
 
@@ -269,6 +298,8 @@ binary install の前に service を停止して SQLite の整合性境界を作
 
 upgrade は supervisor service と binary だけを扱います。Pueue daemon、group、実験 task を kill、stop、cancel しません。失敗時は report の rollback 状態と next diagnostic を確認し、安全な orchestration を迂回せずに原因を解消して同じ `pueue-agent upgrade` を再実行します。
 
+新しい binary または service policy が `research_interval_minutes` を読む更新では、既存の active campaign も研究周期の対象になります。更新元の binary が新しい config key を拒否する場合を含め、campaign を先に pause してから binary、policy、instructions を更新します。instructions は `pueue-agent instructions update .` の preview と token を確認して apply し、`pueue-agent doctor` と `pueue-agent campaign status --json` を確認した後に `pueue-agent campaign resume` を意識的に実行します。更新や service restart が research blocked を自動解除したり、停止確認前の後継を投入したりすることはありません。
+
 ## daemon 再起動後を確認する
 
 daemon は起動時に中断された agent run を recovery し、marker evidence に基づいて event を requeue または dead-letter にします。service を再起動した後は、project ごとに状態と履歴を確認します。
@@ -283,3 +314,5 @@ pueue-agent doctor --json
 `agent_runs:`、pending/retry event、termination の結果、Pueue task snapshot をそれぞれ確認します。service 再起動は Pueue task を停止する手順ではありません。再起動の原因や recovery 結果が不明な場合は `runs`、`events`、`inspect`、`explain` の範囲で調査してから次の操作を選びます。
 
 code-change run が再起動をまたぐ場合は、`status --json` の `code_changes[].state`、`attempts`、`candidate_sha`、`experiment_id`、`next_action`、`cleanup_pending` と `doctor --json` の `code_change.*` を確認します。worktree が publication 前にない場合は所有 descriptor から bounded に再作成し、予期しない path、ref、identity の置換は `recovery_required` にして停止します。editor は同じ session の未完了 attempt、candidate commit/ref、Pueue submission identity を再利用し、重複 editor、commit、task を作りません。terminal result 後の `cleanup_pending` は live process/task と所有権を確認した cleanup coordinator が処理し、unknown path を手動削除したり `git worktree prune` を実行したりしないでください。
+
+research が blocked のまま daemon を再起動しても、session の所有権や policy が再検証されるだけで自動解除にはなりません。`status --json` の研究投影と `campaign status --json` の bounded review 情報を確認し、原因を修正した後に `campaign pause` → `campaign resume` の preflight を明示的に行います。過去 review の attempt、消費済み budget、未解決の termination、exhausted な terminal decision はこの手順で消えません。

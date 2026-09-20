@@ -65,6 +65,48 @@ CLI ごとに別の profile を混在させないでください。profile の�
 
 decision の status/doctor projection は `cycle_id`、source experiment、state、attempt count、wake、bounded failure facts に限定されます。raw prompt、objective、decision JSON、environment、argv、log excerpt が表示されないことは意図した安全境界です。Phase 3 の `running OOM/stall observer` は実装済みですが、terminal loop の状態とは別に `status` の `health:` 行と `health.recent` で確認します。candidate の code-change 状態も同様に専用の bounded projection で確認します。
 
+## Campaign research が idle または blocked になった
+
+研究担当の状態は `pueue-agent campaign status --json` と `pueue-agent status --json` の bounded research projection で確認します。`state`、`next_due_at`、`last_review_id`、`experiment_id`、`last_action`、`blocked_reason`、`discarded_reason`、`session_generation`、`session_rebuilt`、`checkpoint_confirmation` は意味だけを示す投影で、raw session ID、prompt、transcript、credential は含みません。
+
+| 症状 | 想定原因 | 安全な対応 |
+| --- | --- | --- |
+| research が idle、または `next_due_at` がない | `research_interval_minutes = 0`、running experiment がない、pause/halt/retire/goal review、または予算待ち | service policy と `campaign status --json` を確認する。停止済み experiment だけの campaign に research reviewer を手動起動しない |
+| research が blocked | session の所有権・path、policy/credential、unsupported runtime の検証失敗、試行上限到達、または安全に Missing と判定できない欠落 | `campaign status --json`、`status --json`、`doctor --json` の bounded reason を保存し、raw session store や SQLite を直接修復しない |
+| research review が retry 待ちのまま | timeout、不正回答、通常の runtime failure | 有限 retry と既存 agent-run budget に任せる。研究失敗だけで learning task を kill したり、同じ review を手動で追加したりしない |
+| research が discarded | 対象 experiment の自然終了、task identity の変化、pause、health による別の停止、goal review などで回答の前提が失効した | 古い回答を新しい experiment に付け替えず、表示された target と lineage を確認して次の terminal decision を待つ |
+
+blocked の復旧は `campaign pause`、原因修正、preflight 付き `campaign resume` の順です。
+
+```bash
+pueue-agent campaign pause
+# runtime / service policy / binary / instructions の原因を修正する
+pueue-agent doctor
+pueue-agent campaign status --json
+pueue-agent campaign resume
+```
+
+daemon restart、`pueue-agent wake --reason "<REASON>"`、`research_interval_minutes = 0` は blocked を解除しません。resume が成功した場合も、過去 review の失敗・attempt・消費済み budget・未解決の termination・terminal decision の exhausted cycle は残ります。research reviewer が blocked であることだけを理由に実行中の学習を停止せず、既存の machine health observer と diagnosis を別に確認してください。
+
+## Research の判断後に後継がない
+
+`stop_and_next` は「次の experiment を必ず受理する」という要求ではありません。対象 task の停止要求、確認済み termination、terminal projection、fresh な terminal decision、通常の proposal admission、budget、policy の順に進むため、停止確認前は後継を投入しません。次の確認に使うコマンドは次のとおりです。
+
+```bash
+pueue-agent campaign status --json
+pueue-agent status --json
+pueue-agent experiment inspect <experiment-id> --json
+pueue-agent doctor --json
+```
+
+停止要求の終了コードだけで stopped と扱わず、未確認・失敗・予算待ちなら同じ task を手動で再投入しないでください。research timeout、不正 JSON、session 再構成失敗などの判断失敗は learning task の kill を意味しません。停止が確認できても、fresh decision が wait、拒否、budget 待ちを返すことがあります。
+
+## Checkpoint の再開が unconfirmed または unsupported になった
+
+`resume_from_checkpoint` は、対象 trainer の loader と checkpoint の互換性、scope、サイズ、所有権、identity/content digest、後継投入までの retention を検証できる supported path だけを受理します。任意の framework やすべての candidate worktree を自動変換・再開する機能ではありません。argv の resume flag、ファイル名、拡張子、`checkpoint_note`、研究担当の一文だけでは loader の実行を証明しません。
+
+`checkpoint_confirmation` が `unconfirmed` の場合は、実行時に対象 checkpoint を読み込んだ matching evidence が確認できていません。cold start に黙って切り替えたり、checkpoint path を SQL や argv へ手で差し替えたりせず、対象 experiment の `status --json`、`experiment inspect <experiment-id> --json`、`doctor --json` を保存して supported な対応可否を確認してください。scope/size/retention を検証できない、source/config が変わった、candidate cleanup と競合する場合は、元の experiment を勝手に停止せず不適用理由を残します。
+
 ## code_change proposal が reject された
 
 `code_change` は `submit --kind` で直接作る submission ではなく、decision agent が返す proposal kind です。まず次の読み取り専用投影を同じ project/profile で確認します。
@@ -145,11 +187,11 @@ Pueue task の正常終了と、評価指標の検証成功は別です。まず
 
 [結果出力のPython例](getting-started-ja.md#評価結果を出力する)を参照してください。保存済み metrics row や SQLite を書き換えて改善を作り出してはいけません。
 
-## 30分経っても agent が起動しない・会話を引き継がない
+## 30分経っても observer / research agent が起動しない・会話を引き継がない
 
-running-health observer の既定30分は信号の観測間隔で、毎回 agent を起動する約束ではありません。diagnosis は異常が疑われた場合に起動します。通常 agent の定期実行には、別途 `[check].deep_check_interval_minutes` の opt-in が必要です（既定0）。予算、一時停止、既存の実行や待機 event により dispatch は遅れることがあります。
+running-health observer の既定30分は信号の観測間隔で、毎回 agent を起動する約束ではありません。diagnosis は異常が疑われた場合に起動します。campaign research reviewer の既定30分は別の service policy `[campaign].research_interval_minutes` で、healthy な running experiment も対象ですが、`0` なら無効です。通常 agent の定期実行には、さらに `[check].deep_check_interval_minutes` の opt-in が必要です（既定0）。予算、一時停止、既存の実行や待機 event、active-agent 制約により dispatch は遅れることがあります。
 
-`[agent.context]` は通常 agent / Periodic DeepCheck の設定です。decision / diagnosis は常に fresh、code-change editor の修正は同じ session を一度だけ継続します。[起動条件とcontextの対応表](workflows-ja.md#監視とエージェントの起動を区別する)で対象を確認してください。`resume` / `resume_latest` で継続対象の session がない場合、自動で fresh には切り替わりません。
+`[agent.context]` は通常 agent / Periodic DeepCheck の設定です。decision / diagnosis は常に fresh、research reviewer は同じ campaign の所有 session だけを exact resume し、安全に Missing と判定できる場合だけ notes から再構成、code-change editor の修正は同じ session を一度だけ継続します。[起動条件とcontextの対応表](workflows-ja.md#監視とエージェントの起動を区別する)で対象を確認してください。`resume` / `resume_latest` で継続対象の session がない場合、decision/diagnosis は fresh に変わらず、research も所有権を確認できない session を fresh に置き換えません。
 
 ## Execution policy を読み込めない
 
@@ -221,6 +263,8 @@ callback の補償経路は reconciliation です。利用者が `pueue-agent ev
 | human 出力が `rollback=failed`、JSON が `"rollback":"failed"`、または service 状態が不明 | `version --json`、`status --compact`、`doctor --json` の bounded report | binary、database restore、service restart のいずれかが完了しなかった | `pueue-agent stop` で新規 dispatch を止め、report を信頼できる管理者へ渡す。管理者の復旧後に `pueue-agent start` と `doctor` で確認する |
 
 upgrade の transaction 境界、snapshot、再実行条件は[運用ワークフロー](workflows-ja.md#supervisor-を更新rollbackする)を参照してください。
+
+旧 binary が `research_interval_minutes` を未知の config key として拒否する状態から更新する場合、active campaign があるまま binary / policy / instructions を先に切り替えないでください。`pueue-agent campaign pause`、binary と service policy の更新、`pueue-agent instructions update .` の preview/token/apply、`pueue-agent doctor`、`pueue-agent campaign status --json` の順に確認してから、`pueue-agent campaign resume` を意識的に実行します。更新や rollback、daemon restart は研究 blocked を自動解除せず、確認前の後継を投入しません。
 
 ## 安全のため案内しない操作
 

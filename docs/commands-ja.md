@@ -162,6 +162,10 @@ git -C <project-root> worktree list --porcelain
 
 `status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。`campaign status --json` の `decision` も project status と同じ current cycle と 8 field を投影し、cycle がなければ `null` です。objective 本文、raw argv、raw decision evidence は既定出力と JSON に含めません。
 
+同じ campaign scope の研究担当の状態も bounded に表示します。JSON 出力では、研究状態、次回の予定時刻、直近 review と対象 experiment、最後の action、blocked / discarded の理由、session 世代、session 再構成の有無、checkpoint の確認状態を意味する field として投影します。実装上の planned field 名は `state`、`next_due_at`、`last_review_id`、`experiment_id`、`last_action`、`blocked_reason`、`discarded_reason`、`session_generation`、`session_rebuilt`、`checkpoint_confirmation` です。研究が存在しない campaign は idle として扱われ、次回予定日を作りません。値は bounded / redacted で、raw session ID、prompt、transcript、credential は表示しません。
+
+研究 review の履歴を広域の新しい history CLI で取得することはできません。`campaign status --json` または campaign に scope された表示に含まれる直近最大32件の bounded representation だけを使い、別 campaign の review を混ぜないでください。対象 experiment の実体は既存の `pueue-agent experiment inspect <experiment-id> --json` で確認します。
+
 `review accept` は `goal_reached_pending_review` の campaign を `retired`（`goal_accepted`）へ、`review reject` は `active` へ戻し、該当 `goal_reached` 決定イベントを `dead_letter` 化します。いずれも同一トランザクションで operator log を残し、非終端 experiment や予約が残る場合は失敗します。`accept` は idempotent で、`reject` は pending-review 以外では失敗します。
 
 公開 action は次のとおりです。
@@ -174,6 +178,24 @@ pueue-agent campaign retire
 pueue-agent campaign review accept [--note TEXT]
 pueue-agent campaign review reject [--note TEXT]
 ```
+
+研究担当が blocked になった場合は、原因確認なしに `wake` や daemon restart で解除しません。まず campaign の自律処理を明示的に止め、runtime、policy、instructions、campaign に結び付いた research session を確認してから再開します。
+
+```bash
+pueue-agent campaign pause
+# 原因を修正し、必要なら binary / service policy / instructions を更新する
+pueue-agent doctor
+pueue-agent campaign status --json
+pueue-agent campaign resume
+```
+
+`campaign resume` は preflight が成功した場合だけ研究の blocked を解除して新しい review を予定します。安全に欠落した session は保存済みの bounded notes から再構成できますが、所有権を確認できない session は fresh に置き換えません。過去 review の失敗、試行数、消費済み budget、未解決の停止要求、terminal decision の exhausted cycle は消去しません。
+
+研究担当の action は `continue`、`stop_and_next`、`resume_from_checkpoint` の三つです。`continue` は新しい task を作らず、`stop_and_next` は対象 task の停止確認と terminal projection の後に fresh な terminal decision へ渡し、`resume_from_checkpoint` は互換性・scope・サイズ・retention を検証できる checkpoint だけを対象にします。停止コマンドの終了だけでは後継投入の前提を満たさず、fresh decision が待機・拒否を返すこともあります。研究の timeout や不正回答だけで learning task を kill することはありません。
+
+研究担当の周期は service policy の `[campaign].research_interval_minutes` で、既定30、`0..=1440` の範囲、`0` は無効です。`observer_interval_minutes` と `[check].deep_check_interval_minutes` とは別の値です。timeout、不正回答、通常の runtime failure と、安全に Missing と判定できた session の再構成は `max_decision_attempts_per_cycle`（既定3）の有限上限と既存 agent-run budget を使います。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく blocked です。上限到達後は bounded な blocked reason を残し、無限 retry や budget の返却は行いません。
+
+checkpoint は、対象コマンドの loader と保存物の対応、検証可能な scope/サイズ、所有権・identity・内容 digest、後継が読むまでの retention を確認できる supported path に限ります。任意の framework や candidate を一律に扱う機能ではなく、argv の resume flag や研究メモだけでは「再開確認済み」になりません。実際の load evidence が確認できない場合は `checkpoint_confirmation` を `unconfirmed` として扱います。
 
 ### `pueue-agent proposal`
 
@@ -366,6 +388,8 @@ code-change の read-only probe は次の8 checksです: `code_change.cleanup`�
 - **主なオプション:** `--source` はソースルート、`--pueue-config` は Pueue 設定、`--json` は報告を JSON にします。
 - **例:** `pueue-agent upgrade --source /path/to/source --pueue-config ~/.config/pueue.yml --json`
 - **失敗時の確認:** エラーに示される `pueue-agent version` を実行し、ソース、実行ポリシー、Pueue 設定を確認します。
+
+既存の active campaign も binary / service policy の更新後に `research_interval_minutes` の対象になります。新しい config key を拒否する旧 binary から更新する場合は、先に `pueue-agent campaign pause` を実行し、binary と policy を更新し、必要なら `pueue-agent instructions update .` の preview/token/apply を完了してから `pueue-agent doctor` と `pueue-agent campaign status --json` を確認します。その後だけ `pueue-agent campaign resume` を意識的に実行してください。upgrade、daemon restart、`wake` は research blocked を自動解除せず、実行中 task の停止確認や後継の受理も保証しません。
 
 ## 内部・連携用
 
