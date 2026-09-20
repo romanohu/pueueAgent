@@ -11,9 +11,9 @@ use uuid::Uuid;
 use crate::{
     code_change,
     db::{
-        CampaignRepository, CodeChangeReentry, CodeChangeRepository, Db, ExperimentRepository,
-        ManagedSubmissionIntent, ProjectRepository, ProposalAcceptance, ProposalRepository,
-        StartCampaignRequest, SubmissionRepository,
+        CampaignRepository, CodeChangeReentry, CodeChangeRepository, Db, DecisionReservation,
+        ExperimentRepository, ManagedSubmissionIntent, ProjectRepository, ProposalAcceptance,
+        ProposalRepository, StartCampaignRequest, SubmissionRepository,
     },
     environment::ProjectAdmissionLock,
     execution_policy::{
@@ -617,6 +617,56 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         proposal: &proposals::ValidatedProposal,
         now: i64,
     ) -> Result<CampaignProposalAdmission, AppError> {
+        self.admit_proposal_inner(
+            project,
+            campaign_id,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            now,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn admit_decision_proposal(
+        &self,
+        project: &Project,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &proposals::ValidatedProposal,
+        reservation: &DecisionReservation,
+        now: i64,
+    ) -> Result<CampaignProposalAdmission, AppError> {
+        self.admit_proposal_inner(
+            project,
+            campaign_id,
+            proposal_id,
+            experiment_id,
+            submission_id,
+            proposal,
+            now,
+            Some(reservation),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_proposal_inner(
+        &self,
+        project: &Project,
+        campaign_id: &str,
+        proposal_id: &str,
+        experiment_id: &str,
+        submission_id: &str,
+        proposal: &proposals::ValidatedProposal,
+        now: i64,
+        decision_reservation: Option<&DecisionReservation>,
+    ) -> Result<CampaignProposalAdmission, AppError> {
         let admission = self.acquire_admission(project)?;
         if proposal.kind() == ProposalKind::CodeChange {
             return self
@@ -629,6 +679,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                     submission_id,
                     proposal,
                     now,
+                    decision_reservation,
                 )
                 .await;
         }
@@ -648,15 +699,30 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &runtime_argv,
         );
         validate_add_argv(&add_args)?;
-        match CampaignRepository::new(self.db).accept_proposal(
-            campaign_id,
-            proposal_id,
-            experiment_id,
-            submission_id,
-            proposal,
-            &self.limits,
-            now,
-        )? {
+        let accepted = match decision_reservation {
+            Some(reservation) => CampaignRepository::new(self.db).accept_decision_proposal(
+                campaign_id,
+                proposal_id,
+                experiment_id,
+                submission_id,
+                proposal,
+                &self.limits,
+                now,
+                reservation,
+                None,
+                None,
+            )?,
+            None => CampaignRepository::new(self.db).accept_proposal(
+                campaign_id,
+                proposal_id,
+                experiment_id,
+                submission_id,
+                proposal,
+                &self.limits,
+                now,
+            )?,
+        };
+        match accepted {
             ProposalAcceptance::Accepted(intent) => {
                 let matches_requested_intent = intent.proposal.proposal_id == proposal_id;
                 Ok(CampaignProposalAdmission::Experiment(
@@ -687,13 +753,19 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         submission_id: &str,
         proposal: &proposals::ValidatedProposal,
         now: i64,
+        decision_reservation: Option<&DecisionReservation>,
     ) -> Result<CampaignProposalAdmission, AppError> {
         let proposals_repository = ProposalRepository::new(self.db);
         match CampaignRepository::new(self.db).resolve_code_change_reentry(
             campaign_id,
             proposal_id,
             proposal.canonical_digest(),
+            experiment_id,
+            submission_id,
+            proposal,
+            &self.limits,
             now,
+            decision_reservation,
         )? {
             CodeChangeReentry::Missing => {}
             CodeChangeReentry::Deferred => return Ok(CampaignProposalAdmission::Deferred),
@@ -751,17 +823,31 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         } else {
             None
         };
-        let accepted = CampaignRepository::new(self.db).accept_code_change_proposal(
-            campaign_id,
-            proposal_id,
-            experiment_id,
-            submission_id,
-            proposal,
-            &self.limits,
-            now,
-            code_change_run.as_ref(),
-            rejection_reason,
-        )?;
+        let accepted = match decision_reservation {
+            Some(reservation) => CampaignRepository::new(self.db).accept_decision_proposal(
+                campaign_id,
+                proposal_id,
+                experiment_id,
+                submission_id,
+                proposal,
+                &self.limits,
+                now,
+                reservation,
+                code_change_run.as_ref(),
+                rejection_reason,
+            )?,
+            None => CampaignRepository::new(self.db).accept_code_change_proposal(
+                campaign_id,
+                proposal_id,
+                experiment_id,
+                submission_id,
+                proposal,
+                &self.limits,
+                now,
+                code_change_run.as_ref(),
+                rejection_reason,
+            )?,
+        };
         match accepted {
             ProposalAcceptance::BudgetWaiting { .. } | ProposalAcceptance::CapacityDeferred => {
                 Ok(CampaignProposalAdmission::Deferred)

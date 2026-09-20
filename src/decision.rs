@@ -232,13 +232,14 @@ impl<'a, P: PueueApi + ?Sized> DecisionCoordinator<'a, P> {
                     let experiment_id = decision_resource_id("experiment", &stored.reservation);
                     let submission_id = decision_resource_id("submission", &stored.reservation);
                     let admission = match coordinator
-                        .admit_proposal(
+                        .admit_decision_proposal(
                             &project,
                             &campaign.campaign_id,
                             &proposal_id,
                             &experiment_id,
                             &submission_id,
                             &proposal,
+                            &stored.reservation,
                             now,
                         )
                         .await

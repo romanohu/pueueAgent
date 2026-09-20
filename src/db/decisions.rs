@@ -4523,7 +4523,7 @@ mod decision_successor_tests {
         Ok(())
     }
 
-    fn attached_fixture() -> Fixture {
+    fn attached_unlinked_fixture() -> Fixture {
         let BaseFixture {
             _temp: temp,
             db,
@@ -4652,11 +4652,16 @@ mod decision_successor_tests {
             proposal,
         };
         assert_initial_attached_authority(&fixture);
+        fixture
+    }
+
+    fn attached_fixture() -> Fixture {
+        let fixture = attached_unlinked_fixture();
         persist_ordinary_successor_fixture(&fixture);
         fixture
     }
 
-    fn attached_code_change_fixture() -> Fixture {
+    fn attached_code_change_unlinked_fixture() -> Fixture {
         let BaseFixture {
             _temp: temp,
             db,
@@ -4785,9 +4790,473 @@ mod decision_successor_tests {
             proposal,
         };
         assert_initial_attached_authority(&fixture);
+        fixture
+    }
+
+    fn attached_code_change_editor_fixture() -> Fixture {
+        let fixture = attached_code_change_unlinked_fixture();
         persist_code_change_editor_fixture(&fixture);
+        fixture
+    }
+
+    fn attached_code_change_fixture() -> Fixture {
+        let fixture = attached_code_change_editor_fixture();
         persist_code_change_successor_fixture(&fixture);
         fixture
+    }
+
+    fn attached_review_successor(fixture: &Fixture) -> Option<String> {
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT successor_experiment_id FROM research_reviews
+                 WHERE review_id = 'review-attached'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn attached_admission_counts(fixture: &Fixture) -> (i64, i64, i64, i64) {
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM proposals WHERE campaign_id = 'campaign-1'),
+                    (SELECT COUNT(*) FROM submissions WHERE project_id = 'project-1'),
+                    (SELECT COUNT(*) FROM experiments WHERE campaign_id = 'campaign-1'),
+                    (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = 'campaign-1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn decision_admission_links_attached_ordinary_successor_and_replays_exact_intent() {
+        let fixture = attached_unlinked_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let repository = CampaignRepository::new(&fixture.db);
+        let before = attached_admission_counts(&fixture);
+
+        let first = repository
+            .accept_decision_proposal(
+                &fixture.reservation.campaign_id,
+                &proposal_id,
+                &experiment_id,
+                &submission_id,
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                119,
+                &fixture.reservation,
+                None,
+                None,
+            )
+            .unwrap()
+            .accepted()
+            .unwrap();
+        assert_eq!(first.experiment.experiment_id, experiment_id);
+        assert_eq!(attached_review_successor(&fixture), Some(experiment_id.clone()));
+        assert_eq!(
+            attached_admission_counts(&fixture),
+            (before.0 + 1, before.1 + 1, before.2 + 1, before.3 + 1)
+        );
+        let lineage: (String, Option<String>, Option<String>, Option<String>) = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT review.state, review.operation_stage,
+                        experiment.parent_experiment_id,
+                        experiment.resume_of_experiment_id
+                 FROM research_reviews AS review
+                 JOIN experiments AS experiment
+                   ON experiment.experiment_id = review.successor_experiment_id
+                 WHERE review.review_id = 'review-attached'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(lineage.0, "completed");
+        assert!(lineage.1.is_none());
+        assert_eq!(lineage.2.as_deref(), Some("experiment-1"));
+        assert!(lineage.3.is_none());
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(matches!(
+            research_ownership_in_transaction(
+                &transaction,
+                "project-1",
+                "campaign-1",
+                "experiment-1",
+            )
+            .unwrap(),
+            ResearchOwnership::Attached(_)
+        ));
+        transaction.commit().unwrap();
+        let counts = attached_admission_counts(&fixture);
+
+        let replay = repository
+            .accept_decision_proposal(
+                &fixture.reservation.campaign_id,
+                &proposal_id,
+                &experiment_id,
+                &submission_id,
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                120,
+                &fixture.reservation,
+                None,
+                None,
+            )
+            .unwrap()
+            .accepted()
+            .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(attached_review_successor(&fixture), Some(experiment_id));
+        assert_eq!(attached_admission_counts(&fixture), counts);
+    }
+
+    #[test]
+    fn decision_admission_rejects_changed_ids_or_digest_without_mutation() {
+        let fixture = attached_unlinked_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let repository = CampaignRepository::new(&fixture.db);
+        let before = attached_admission_counts(&fixture);
+
+        assert!(repository
+            .accept_decision_proposal(
+                &fixture.reservation.campaign_id,
+                &proposal_id,
+                "wrong-experiment",
+                &submission_id,
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                119,
+                &fixture.reservation,
+                None,
+                None,
+            )
+            .is_err());
+        assert_eq!(attached_admission_counts(&fixture), before);
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE decision_attempts SET decision_digest = 'changed'
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+            )
+            .unwrap();
+        assert!(repository
+            .accept_decision_proposal(
+                &fixture.reservation.campaign_id,
+                &proposal_id,
+                &experiment_id,
+                &submission_id,
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                120,
+                &fixture.reservation,
+                None,
+                None,
+            )
+            .is_err());
+        assert_eq!(attached_admission_counts(&fixture), before);
+        assert!(attached_review_successor(&fixture).is_none());
+    }
+
+    #[test]
+    fn decision_admission_defers_exhausted_rolling_budget_before_successor_mutation() {
+        let fixture = attached_unlinked_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let repository = CampaignRepository::new(&fixture.db);
+        let before = attached_admission_counts(&fixture);
+
+        let live_reservations: i64 = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = 'campaign-1' AND dimension = 'experiment'
+                   AND status IN ('reserved', 'consumed') AND window_ends_at > ?1",
+                [119_i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(live_reservations > 0);
+        let mut limits = CampaignLimits::default();
+        limits.max_new_experiments_per_24h = u32::try_from(live_reservations).unwrap();
+        assert!(matches!(
+            repository
+                .accept_decision_proposal(
+                    &fixture.reservation.campaign_id,
+                    &proposal_id,
+                    &experiment_id,
+                    &submission_id,
+                    &fixture.proposal,
+                    &limits,
+                    119,
+                    &fixture.reservation,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ProposalAcceptance::BudgetWaiting { .. }
+        ));
+        assert_eq!(attached_admission_counts(&fixture), before);
+        assert!(attached_review_successor(&fixture).is_none());
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(matches!(
+            research_ownership_in_transaction(
+                &transaction,
+                "project-1",
+                "campaign-1",
+                "experiment-1",
+            )
+            .unwrap(),
+            ResearchOwnership::Attached(_)
+        ));
+        transaction.commit().unwrap();
+    }
+
+    fn insert_live_parallel_experiment(fixture: &Fixture) {
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+                 ) VALUES ('parallel-proposal', 'campaign-1', 'experiment', 'pending',
+                           'parallel', 'experiment-1', '[\"python\",\"parallel.py\"]',
+                           '.', '[\"validation loss\"]', 'parallel-digest', NULL, 119, 119)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at,
+                    pueue_task_id, task_signature, status, kind, metadata_json,
+                    origin_agent_run_id
+                 ) VALUES ('parallel-submission', 'project-1',
+                           '[\"python\",\"parallel.py\"]', 119, NULL, NULL,
+                           'pending', 'experiment', '{}', NULL)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id,
+                    task_signature, failure_code, failure_fingerprint,
+                    created_at, updated_at, finished_at, resume_of_experiment_id,
+                    checkpoint_note, code_change_run_id, code_revision_sha
+                 ) VALUES ('parallel-experiment', 'campaign-1', 'parallel-proposal',
+                           'parallel-submission', 'experiment-1', 0, 'reserved',
+                           NULL, NULL, NULL, NULL, 119, 119, NULL, NULL, NULL, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn decision_admission_defers_actual_parallel_capacity_before_successor_mutation() {
+        let fixture = attached_unlinked_fixture();
+        insert_live_parallel_experiment(&fixture);
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let repository = CampaignRepository::new(&fixture.db);
+        let before = attached_admission_counts(&fixture);
+        let decision_before: (String, String, Option<i64>) = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT cycle.state, attempt.state, cycle.next_wake_at
+                 FROM decision_cycles AS cycle
+                 JOIN decision_attempts AS attempt ON attempt.cycle_id = cycle.cycle_id
+                 WHERE cycle.cycle_id = ?1 AND attempt.attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 1;
+
+        assert!(matches!(
+            repository
+                .accept_decision_proposal(
+                    &fixture.reservation.campaign_id,
+                    &proposal_id,
+                    &experiment_id,
+                    &submission_id,
+                    &fixture.proposal,
+                    &limits,
+                    119,
+                    &fixture.reservation,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ProposalAcceptance::CapacityDeferred
+        ));
+        assert_eq!(attached_admission_counts(&fixture), before);
+        let decision_after: (String, String, Option<i64>) = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT cycle.state, attempt.state, cycle.next_wake_at
+                 FROM decision_cycles AS cycle
+                 JOIN decision_attempts AS attempt ON attempt.cycle_id = cycle.cycle_id
+                 WHERE cycle.cycle_id = ?1 AND attempt.attempt_number = ?2",
+                params![fixture.reservation.cycle_id, fixture.reservation.attempt_number],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(decision_after, decision_before);
+        assert!(attached_review_successor(&fixture).is_none());
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(matches!(
+            research_ownership_in_transaction(
+                &transaction,
+                "project-1",
+                "campaign-1",
+                "experiment-1",
+            )
+            .unwrap(),
+            ResearchOwnership::Attached(_)
+        ));
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn decision_code_change_admission_replays_exact_pending_editor_without_successor() {
+        let fixture = attached_code_change_unlinked_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        let run = NewCodeChangeRun::new(
+            "decision-code-change-run",
+            &proposal_id,
+            &fixture.reservation.campaign_id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            crate::code_change::candidate_ref(
+                &fixture.reservation.campaign_id,
+                &proposal_id,
+            )
+            .unwrap(),
+            crate::code_change::best_ref(&fixture.reservation.campaign_id).unwrap(),
+            "decision-code-change-worktree",
+            format!(".pueue-agent/worktrees/campaign-1/{proposal_id}"),
+            119,
+        );
+        let repository = CampaignRepository::new(&fixture.db);
+        assert!(matches!(
+            repository
+                .accept_decision_proposal(
+                    &fixture.reservation.campaign_id,
+                    &proposal_id,
+                    &experiment_id,
+                    &submission_id,
+                    &fixture.proposal,
+                    &CampaignLimits::default(),
+                    119,
+                    &fixture.reservation,
+                    Some(&run),
+                    None,
+                )
+                .unwrap(),
+            ProposalAcceptance::PendingCodeChange
+        ));
+        let counts = attached_admission_counts(&fixture);
+        assert!(attached_review_successor(&fixture).is_none());
+        assert_eq!(
+            fixture
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT experiment_id FROM code_change_runs
+                     WHERE code_change_run_id = ?1",
+                    [&run.code_change_run_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None
+        );
+
+        assert!(matches!(
+            repository
+                .accept_decision_proposal(
+                    &fixture.reservation.campaign_id,
+                    &proposal_id,
+                    &experiment_id,
+                    &submission_id,
+                    &fixture.proposal,
+                    &CampaignLimits::default(),
+                    120,
+                    &fixture.reservation,
+                    Some(&run),
+                    None,
+                )
+                .unwrap(),
+            ProposalAcceptance::PendingCodeChange
+        ));
+        assert_eq!(attached_admission_counts(&fixture), counts);
+        assert!(attached_review_successor(&fixture).is_none());
+    }
+
+    #[test]
+    fn decision_code_change_reentry_rejects_a_selected_proposal_with_the_wrong_source() {
+        let fixture = attached_code_change_editor_fixture();
+        let (proposal_id, experiment_id, submission_id) = ids(&fixture.reservation);
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE proposals
+                 SET source_experiment_id = NULL
+                 WHERE proposal_id = ?1 AND campaign_id = ?2",
+                params![proposal_id, fixture.reservation.campaign_id],
+            )
+            .unwrap();
+        let before = attached_admission_counts(&fixture);
+        let error = CampaignRepository::new(&fixture.db)
+            .resolve_code_change_reentry(
+                &fixture.reservation.campaign_id,
+                &proposal_id,
+                fixture.proposal.canonical_digest(),
+                &experiment_id,
+                &submission_id,
+                &fixture.proposal,
+                &CampaignLimits::default(),
+                120,
+                Some(&fixture.reservation),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "proposal_id",
+                ..
+            }
+        ));
+        assert_eq!(attached_admission_counts(&fixture), before);
+        assert!(attached_review_successor(&fixture).is_none());
     }
 
     #[test]
