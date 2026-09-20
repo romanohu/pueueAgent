@@ -2051,8 +2051,8 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     let mut first_daemon = make_daemon();
     let first_report = first_daemon.run_once().await.unwrap();
     assert_eq!(first_report.research_started, 1);
-    let mut second_daemon = make_daemon();
-    let early_report = second_daemon.run_once().await.unwrap();
+    let mut second_daemon = Box::new(make_daemon());
+    let early_report = Box::pin(second_daemon.run_once()).await.unwrap();
     assert_eq!(early_report.research_started, 0);
     assert_eq!(early_report.diagnoses, 0);
     let run_id: i64 = harness
