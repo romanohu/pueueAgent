@@ -661,6 +661,79 @@ fn process_group_exists(
     })
 }
 
+/// Read-only startup ownership classification for a persisted native helper.
+///
+/// Quiescence requires both the recorded leader and its process group to be
+/// absent.  A leader-only disappearance is still live ownership because a
+/// descendant may retain the group and the private run authority.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupProcessQuiescence {
+    Quiescent,
+    Live,
+    Unknown,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupProcessProbe {
+    Present,
+    Absent,
+    Error(i32),
+}
+
+#[cfg(unix)]
+fn startup_process_probe(pid: libc::pid_t) -> StartupProcessProbe {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return StartupProcessProbe::Present;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => StartupProcessProbe::Absent,
+        Some(errno) => StartupProcessProbe::Error(errno),
+        None => StartupProcessProbe::Error(libc::EIO),
+    }
+}
+
+#[cfg(unix)]
+fn classify_startup_process_quiescence(
+    leader: StartupProcessProbe,
+    group: StartupProcessProbe,
+) -> StartupProcessQuiescence {
+    match leader {
+        StartupProcessProbe::Present | StartupProcessProbe::Error(libc::EPERM) => {
+            StartupProcessQuiescence::Live
+        }
+        StartupProcessProbe::Error(_) => StartupProcessQuiescence::Unknown,
+        StartupProcessProbe::Absent => match group {
+            StartupProcessProbe::Absent => StartupProcessQuiescence::Quiescent,
+            StartupProcessProbe::Present | StartupProcessProbe::Error(libc::EPERM) => {
+                StartupProcessQuiescence::Live
+            }
+            StartupProcessProbe::Error(_) => StartupProcessQuiescence::Unknown,
+        },
+    }
+}
+
+/// Probe a persisted helper leader and its process group without signaling.
+///
+/// PID 1 is excluded because negating it would probe process group -1, which
+/// means every permitted process rather than the helper's own group.
+#[cfg(unix)]
+pub(crate) fn startup_process_quiescence(pid: i64) -> StartupProcessQuiescence {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return StartupProcessQuiescence::Unknown;
+    };
+    if pid <= 1 {
+        return StartupProcessQuiescence::Unknown;
+    }
+
+    let leader = startup_process_probe(pid);
+    if !matches!(leader, StartupProcessProbe::Absent) {
+        return classify_startup_process_quiescence(leader, StartupProcessProbe::Absent);
+    }
+    classify_startup_process_quiescence(leader, startup_process_probe(-pid))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalObservation {
     Running,
@@ -4293,6 +4366,122 @@ mod tests {
         }
 
         let _ = accepts_public_api as fn(VerifiedCommandSpec);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_process_quiescence_reports_current_process_live() {
+        assert_eq!(
+            startup_process_quiescence(std::process::id() as i64),
+            StartupProcessQuiescence::Live
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_process_quiescence_reports_owned_live_leader_live() {
+        let mut child = observation_child("hold");
+        assert_eq!(
+            startup_process_quiescence(child.id()),
+            StartupProcessQuiescence::Live
+        );
+        terminate_process_group(&mut child).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_process_quiescence_requires_reaped_leader_and_absent_group() {
+        let mut child = observation_child("exit");
+        let pid = child.id();
+        await_terminal_observation(&mut child).await;
+        child.reap_observed_terminal().await.unwrap();
+        assert_eq!(
+            startup_process_quiescence(pid),
+            StartupProcessQuiescence::Quiescent
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_process_quiescence_keeps_leader_dead_group_live() {
+        use std::os::unix::process::CommandExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let descendant_pid_path = temporary.path().join("descendant.pid");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::failed_helper_cleanup_subprocess",
+                "--nocapture",
+            ])
+            .env("PUEUE_AGENT_FAILED_HELPER_MODE", "helper")
+            .env("PUEUE_AGENT_DESCENDANT_PID_PATH", &descendant_pid_path)
+            .process_group(0);
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(false);
+        let mut child = command.spawn().unwrap();
+        let pid = i64::from(child.id().unwrap());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !descendant_pid_path.is_file() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        child.wait().await.unwrap();
+        assert_eq!(
+            startup_process_quiescence(pid),
+            StartupProcessQuiescence::Live
+        );
+
+        cleanup_failed_tokio_helper(&mut child, pid);
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        while unsafe { libc::kill(descendant_pid, 0) } == 0 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_process_quiescence_rejects_invalid_pid_without_probe() {
+        for pid in [i64::MIN, -1, 0, 1, i64::from(i32::MAX) + 1] {
+            assert_eq!(
+                startup_process_quiescence(pid),
+                StartupProcessQuiescence::Unknown,
+                "invalid pid must not be probed: {pid}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_process_quiescence_classifies_probe_errors_fail_closed() {
+        assert_eq!(
+            classify_startup_process_quiescence(
+                StartupProcessProbe::Error(libc::EPERM),
+                StartupProcessProbe::Absent,
+            ),
+            StartupProcessQuiescence::Live
+        );
+        assert_eq!(
+            classify_startup_process_quiescence(
+                StartupProcessProbe::Absent,
+                StartupProcessProbe::Error(libc::EPERM),
+            ),
+            StartupProcessQuiescence::Live
+        );
+        assert_eq!(
+            classify_startup_process_quiescence(
+                StartupProcessProbe::Absent,
+                StartupProcessProbe::Error(libc::EIO),
+            ),
+            StartupProcessQuiescence::Unknown
+        );
     }
 
     #[cfg(unix)]
