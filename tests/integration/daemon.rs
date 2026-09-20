@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -38,8 +38,10 @@ use pueue_agent::{
 #[cfg(target_os = "linux")]
 use pueue_agent::{
     agent::AgentHandle,
-    db::{CodeChangeRepository, ResearchRepository, TaskObservationRepository},
-    models::{CodeChangeCheckStatus, NewTaskObservation},
+    db::{
+        CodeChangeRepository, HealthRepository, ResearchRepository, TaskObservationRepository,
+    },
+    models::{CodeChangeCheckStatus, HealthState, NewTaskObservation, SignalSummaryEntry},
 };
 
 #[cfg(target_os = "linux")]
@@ -1201,6 +1203,91 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+struct ResearchCrashFixturePaths {
+    invocation: PathBuf,
+    target_ready: PathBuf,
+    target_release: PathBuf,
+    descendant_pid: PathBuf,
+    descendant_ready: PathBuf,
+    descendant_release: PathBuf,
+    controller_ready: PathBuf,
+    crash_now: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ResearchCrashFixturePaths {
+    fn new(root: &Path) -> Self {
+        Self {
+            invocation: root.join("research-crash-fixture.invocation"),
+            target_ready: root.join("research-crash-fixture.target-ready"),
+            target_release: root.join("research-crash-fixture.target-release"),
+            descendant_pid: root.join("research-crash-fixture.descendant-pid"),
+            descendant_ready: root.join("research-crash-fixture.descendant-ready"),
+            descendant_release: root.join("research-crash-fixture.descendant-release"),
+            controller_ready: root.join("research-crash-fixture.controller-ready"),
+            crash_now: root.join("research-crash-fixture.crash-now"),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compile_research_crash_codex_fixture(target: &Path, paths: &ResearchCrashFixturePaths) {
+    let source = target.with_extension("rs");
+    fs::write(
+        &source,
+        format!(
+            r#"use std::{{env, fs, process::Command, thread, time::Duration}};
+
+fn wait_for(path: &str) {{
+    while !std::path::Path::new(path).is_file() {{
+        thread::sleep(Duration::from_millis(10));
+    }}
+}}
+
+fn main() {{
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("--fixture-descendant") {{
+        fs::write({descendant_ready:?}, "ready").unwrap();
+        wait_for({descendant_release:?});
+        return;
+    }}
+
+    if !std::path::Path::new({invocation:?}).exists() {{
+        fs::write({invocation:?}, "first").unwrap();
+        let child = Command::new(env::current_exe().unwrap())
+            .arg("--fixture-descendant")
+            .spawn()
+            .unwrap();
+        fs::write({descendant_pid:?}, child.id().to_string()).unwrap();
+        fs::write({target_ready:?}, "ready").unwrap();
+        wait_for({target_release:?});
+    }}
+}}
+"#,
+            invocation = paths.invocation.display().to_string(),
+            target_ready = paths.target_ready.display().to_string(),
+            target_release = paths.target_release.display().to_string(),
+            descendant_pid = paths.descendant_pid.display().to_string(),
+            descendant_ready = paths.descendant_ready.display().to_string(),
+            descendant_release = paths.descendant_release.display().to_string(),
+        ),
+    )
+    .unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(target)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated research crash Codex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
 fn prepare_healthy_research_fixture(harness: &DaemonHarness) {
     let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
     let body = fs::read_to_string(&config_path).unwrap();
@@ -1258,7 +1345,19 @@ fn research_policy_with_codex_fixture(
     fs::write(&policy_path, format!("{body}\n")).unwrap();
     fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let project_roots = ProjectRepository::new(&harness.db)
+    research_policy_from_fixture_paths(&harness.db, &fixture_root)
+}
+
+#[cfg(target_os = "linux")]
+fn research_policy_from_fixture_paths(
+    db: &Db,
+    fixture_root: &Path,
+) -> Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy> {
+    let fixture_root = fs::canonicalize(fixture_root).unwrap();
+    let state_dir = fixture_root.join("execution-policy-state");
+    let trusted_dir = fixture_root.join("execution-policy-bin");
+
+    let project_roots = ProjectRepository::new(db)
         .list_all()
         .unwrap()
         .into_iter()
@@ -1989,12 +2088,47 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     }
     assert!(overflow_subtree.is_dir());
 
+    HealthRepository::ensure_running(
+        &harness.db,
+        "project-a",
+        "daemon-campaign",
+        &experiment_id,
+        task.id,
+        harness.now,
+    )
+    .unwrap();
+    for observed_at in [harness.now - 2, harness.now - 1] {
+        HealthRepository::record_observation(
+            &harness.db,
+            &experiment_id,
+            observed_at,
+            SignalSummaryEntry {
+                class: "oom".to_owned(),
+                source: "fixture".to_owned(),
+                evidence_digest: format!("cleanup-fixture-{observed_at}"),
+                observed_at,
+            },
+        )
+        .unwrap();
+    }
+    HealthRepository::set_state(&harness.db, &experiment_id, HealthState::Suspicious, harness.now)
+        .unwrap();
+
     // Complete startup recovery before making the retry due. This keeps the
     // second daemon's wake at the explicit boundary below instead of having
     // startup retry scheduling move it forward during this test.
     let mut second_daemon = make_daemon();
     let warmup = second_daemon.run_once().await.unwrap();
     assert_eq!(warmup.research_started, 0);
+    assert_eq!(warmup.diagnoses, 0);
+    assert_eq!(
+        HealthRepository::get(&harness.db, &experiment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        HealthState::Suspicious
+    );
+    let health_pending_before = health_admission_snapshot(&harness.db, "project-a");
 
     let research_run_count = || {
         harness
@@ -2052,8 +2186,13 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
 
     let blocked_report = second_daemon.run_once().await.unwrap();
     assert_eq!(blocked_report.research_started, 0);
+    assert_eq!(blocked_report.diagnoses, 0);
     assert_eq!(research_run_count(), research_run_count_before);
     assert_eq!(reservation_count(), reservation_count_before);
+    assert_eq!(
+        health_admission_snapshot(&harness.db, "project-a"),
+        health_pending_before
+    );
     assert_eq!(
         ResearchRepository::new(&harness.db)
             .find(&review.review_id)
@@ -2091,6 +2230,591 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
         first_daemon.run_once().await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    let health_eligible_before = health_admission_snapshot(&harness.db, "project-a");
+    let diagnosis_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let report = second_daemon.run_once().await.unwrap();
+        let health_after = health_admission_snapshot(&harness.db, "project-a");
+        if health_after.0 > health_eligible_before.0 {
+            assert_eq!(report.diagnoses, 1);
+            assert_eq!(health_after.1, health_eligible_before.1 + 1);
+            assert_eq!(health_after.2, health_eligible_before.2 + 1);
+            break;
+        }
+        assert!(
+            Instant::now() < diagnosis_deadline,
+            "health diagnosis did not become eligible after cleanup completion"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let diagnosis_settle_deadline = Instant::now() + Duration::from_secs(10);
+    while harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs
+             WHERE project_id = 'project-a' AND execution_kind = 'diagnosis'
+               AND status IN ('starting', 'running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        > 0
+    {
+        assert!(
+            Instant::now() < diagnosis_settle_deadline,
+            "eligible health diagnosis did not settle"
+        );
+        second_daemon.run_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    HealthRepository::set_state(&harness.db, &experiment_id, HealthState::Healthy, harness.now)
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_exists(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: std::os::raw::c_int, signal: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    pid > 1 && unsafe { kill(-pid, 0) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_id(pid: i32) -> Option<i32> {
+    unsafe extern "C" {
+        fn getpgid(pid: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    let group = unsafe { getpgid(pid) };
+    (group > 1).then_some(group)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct ResearchCrashSnapshot {
+    run_count: i64,
+    reservation_count: i64,
+    review_state: String,
+    event_status: String,
+    agent_run_id: Option<i64>,
+    run_status: Option<String>,
+    run_pid: Option<i64>,
+    gate_state: Option<String>,
+    cleanup_phase: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn research_crash_snapshot(db: &Db, review_id: &str) -> ResearchCrashSnapshot {
+    let connection = db.connect().unwrap();
+    let (review_state, event_id, agent_run_id, notes_json): (String, i64, Option<i64>, String) =
+        connection
+            .query_row(
+                "SELECT state, event_id, agent_run_id, notes_json
+                 FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    let event_status: String = connection
+        .query_row(
+            "SELECT status FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let run_details = agent_run_id.map(|run_id| {
+        connection
+            .query_row(
+                "SELECT status, pid, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    });
+    let run_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reservation_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations
+             WHERE dimension = 'agent_run' AND subject_key LIKE ?1",
+            [format!("research:{review_id}:%")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cleanup_phase = serde_json::from_str::<serde_json::Value>(&notes_json)
+        .ok()
+        .and_then(|notes| {
+            notes
+                .get("native_recovery")
+                .and_then(|authority| authority.get("cleanup"))
+                .and_then(|cleanup| cleanup.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    ResearchCrashSnapshot {
+        run_count,
+        reservation_count,
+        review_state,
+        event_status,
+        agent_run_id,
+        run_status: run_details.as_ref().map(|details| details.0.clone()),
+        run_pid: run_details.as_ref().and_then(|details| details.1),
+        gate_state: run_details.map(|details| details.2),
+        cleanup_phase,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn health_admission_snapshot(db: &Db, project_id: &str) -> (i64, i64, i64) {
+    let connection = db.connect().unwrap();
+    let diagnosis_runs = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs
+             WHERE project_id = ?1 AND execution_kind = 'diagnosis'",
+            [project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let diagnosis_events = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND kind = 'health_diagnosis'",
+            [project_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let private_temp_generations = fs::read_dir(
+        PathBuf::from(
+            ProjectRepository::new(db)
+                .find_by_id(project_id)
+                .unwrap()
+                .unwrap()
+                .root_path,
+        )
+        .join(".pueue-agent/tmp"),
+    )
+    .map(|entries| entries.count() as i64)
+    .unwrap_or(0);
+    (
+        diagnosis_runs,
+        diagnosis_events,
+        private_temp_generations,
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct ResearchCrashScope {
+    db: Db,
+    paths: ResearchCrashFixturePaths,
+    controller: Option<std::process::Child>,
+    helper_pid: Option<i32>,
+    cleanup_needed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ResearchCrashScope {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.paths.target_release, b"release\n");
+        let _ = fs::write(&self.paths.descendant_release, b"release\n");
+        if self.cleanup_needed {
+            let pid = self.helper_pid.or_else(|| {
+                self.db.connect().ok().and_then(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT pid FROM agent_runs
+                             WHERE execution_kind = 'campaign_research'
+                             ORDER BY run_id DESC LIMIT 1",
+                            [],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )
+                        .ok()
+                        .flatten()
+                        .and_then(|pid| pid.try_into().ok())
+                })
+            });
+            if let Some(pid) = pid {
+                unsafe extern "C" {
+                    fn kill(
+                        pid: std::os::raw::c_int,
+                        signal: std::os::raw::c_int,
+                    ) -> std::os::raw::c_int;
+                }
+                if pid > 1 {
+                    unsafe {
+                        let _ = kill(-pid, 9);
+                    }
+                }
+            }
+        }
+        if let Some(mut controller) = self.controller.take() {
+            let _ = controller.kill();
+            let _ = controller.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ResearchCrashScope {
+    fn disarm(&mut self) {
+        self.cleanup_needed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore]
+fn research_controller_crash_subprocess() {
+    let db_path = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_CRASH_DB").expect("crash controller database path"),
+    );
+    let fixture_root = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_CRASH_ROOT").expect("crash controller fixture root"),
+    );
+    let review_id = std::env::var("PUEUE_AGENT_TEST_CRASH_REVIEW")
+        .expect("crash controller review id");
+    let controller_ready = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_CRASH_READY").expect("crash controller ready path"),
+    );
+    let crash_now = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_CRASH_NOW").expect("crash controller crash path"),
+    );
+    let paths = ResearchCrashFixturePaths::new(&fixture_root);
+    let db = Db::open(&db_path).expect("open shared research database");
+    let policy = research_policy_from_fixture_paths(&db, &fixture_root);
+    let runner = AgentRunner::new(
+        AgentRunnerConfig::production()
+            .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+        Arc::clone(&policy),
+    );
+    let mut daemon = Daemon::new(
+        db.clone(),
+        FakePueue::with_tasks(vec![running_task()]),
+        Arc::clone(&policy),
+        runner,
+        DaemonConfig {
+            interval: Duration::from_millis(10),
+            lease_seconds: 60,
+            claim_limit: 100,
+            now_override: Some(200),
+            shutdown_grace_period: Duration::from_secs(30),
+        },
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build crash controller runtime");
+    runtime.block_on(async {
+        let report = daemon
+            .run_once()
+            .await
+            .expect("crash controller must launch research");
+        assert_eq!(report.research_started, 1);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let fixture_ready = paths.target_ready.is_file()
+                && paths.descendant_ready.is_file()
+                && paths.descendant_pid.is_file();
+            let native_ready = db
+                .connect()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT run.run_id, run.pid, run.launch_gate_state, run.log_path
+                             FROM research_reviews AS review
+                             JOIN agent_runs AS run ON run.run_id = review.agent_run_id
+                             WHERE review.review_id = ?1
+                               AND run.execution_kind = 'campaign_research'",
+                            [&review_id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, Option<i64>>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                ))
+                            },
+                        )
+                        .ok()
+                })
+                .is_some_and(|(_run_id, pid, gate, log_path)| {
+                    pid.is_some()
+                        && gate == "released"
+                        && PathBuf::from(format!("{log_path}.gate-started")).is_file()
+                });
+            let authority_pending = db
+                .connect()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                            [&review_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                })
+                .and_then(|notes| serde_json::from_str::<serde_json::Value>(&notes).ok())
+                .and_then(|notes| notes.get("native_recovery").cloned())
+                .and_then(|authority| authority.get("cleanup").cloned())
+                .and_then(|cleanup| cleanup.get("phase").cloned())
+                .is_some_and(|phase| phase == serde_json::json!("pending"));
+            if fixture_ready && native_ready && authority_pending {
+                fs::write(&controller_ready, b"ready\n").expect("publish controller readiness");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real research helper did not reach crash fixture readiness"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while !crash_now.is_file() {
+            assert!(
+                Instant::now() < deadline + Duration::from_secs(30),
+                "parent did not request the controller crash"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    std::process::exit(97);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn research_controller_crash_restarts_only_after_group_quiescence() {
+    let harness = DaemonHarness::new();
+    prepare_healthy_research_fixture(&harness);
+    let experiment_id = harness.campaign_experiment();
+    let task = running_task();
+    let task_signature = pueue_agent::reconcile::task_signature(&task);
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&experiment_id, 190)
+        .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .mark_accepted(&experiment_id, task.id, &task_signature, 191)
+        .unwrap();
+    TaskObservationRepository::new(&harness.db)
+        .upsert(&NewTaskObservation::new(
+            "project-a",
+            &task_signature,
+            task.id,
+            &task.group,
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "Running",
+            Some(100),
+            Some(101),
+            None,
+            None,
+            harness.now,
+        ))
+        .unwrap();
+    ResearchRepository::new(&harness.db)
+        .ensure_campaign("daemon-campaign")
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET next_due_at = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![harness.now, "daemon-campaign"],
+        )
+        .unwrap();
+    let review = ResearchRepository::new(&harness.db)
+        .claim_due(
+            "daemon-campaign",
+            &experiment_id,
+            &task_signature,
+            harness.now,
+        )
+        .unwrap()
+        .expect("the seeded running campaign must claim one research review");
+
+    let fixture_root = fs::canonicalize(harness.temp.path()).unwrap();
+    let paths = ResearchCrashFixturePaths::new(&fixture_root);
+    let codex = fixture_root.join("execution-policy-bin/research-crash-codex");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    compile_research_crash_codex_fixture(&codex, &paths);
+    let policy = research_policy_with_codex_fixture(&harness, &codex);
+    let db_path = fixture_root.join("state.sqlite3");
+    let mut scope = ResearchCrashScope {
+        db: harness.db.clone(),
+        paths,
+        controller: None,
+        helper_pid: None,
+        cleanup_needed: true,
+    };
+    let controller_exe = std::env::current_exe().unwrap();
+    scope.controller = Some(
+        Command::new(controller_exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "research_controller_crash_subprocess",
+                "--nocapture",
+            ])
+            .env("PUEUE_AGENT_TEST_CRASH_DB", &db_path)
+            .env("PUEUE_AGENT_TEST_CRASH_ROOT", &fixture_root)
+            .env("PUEUE_AGENT_TEST_CRASH_REVIEW", &review.review_id)
+            .env("PUEUE_AGENT_TEST_CRASH_READY", &scope.paths.controller_ready)
+            .env("PUEUE_AGENT_TEST_CRASH_NOW", &scope.paths.crash_now)
+            .spawn()
+            .expect("spawn separate research controller"),
+    );
+
+    let ready_deadline = Instant::now() + Duration::from_secs(35);
+    while !scope.paths.controller_ready.is_file() {
+        if let Some(status) = scope.controller.as_mut().unwrap().try_wait().unwrap() {
+            panic!("research controller exited before readiness: {status}");
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "research controller did not publish readiness"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let helper_pid: i32 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT pid FROM agent_runs
+             WHERE execution_kind = 'campaign_research'
+             ORDER BY run_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+        .expect("controller must persist the native helper pid")
+        .try_into()
+        .unwrap();
+    let descendant_pid: i32 = fs::read_to_string(&scope.paths.descendant_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    scope.helper_pid = Some(helper_pid);
+    assert!(process_exists(helper_pid));
+    assert!(process_exists(descendant_pid));
+    assert!(process_group_exists(helper_pid));
+    assert_eq!(process_group_id(descendant_pid), Some(helper_pid));
+
+    fs::write(&scope.paths.crash_now, b"crash\n").unwrap();
+    let crash_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = scope.controller.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < crash_deadline, "controller did not exit after crash request");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status.code(), Some(97));
+
+    let make_daemon = |now: i64| {
+        let runner = AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            Arc::clone(&policy),
+        );
+        Daemon::new(
+            harness.db.clone(),
+            harness.fake_pueue.clone(),
+            Arc::clone(&policy),
+            runner,
+            DaemonConfig {
+                interval: Duration::from_millis(10),
+                lease_seconds: 60,
+                claim_limit: 100,
+                now_override: Some(now),
+                shutdown_grace_period: Duration::from_secs(30),
+            },
+        )
+    };
+    let mut daemon = make_daemon(harness.now);
+    let live_snapshot = research_crash_snapshot(&harness.db, &review.review_id);
+    assert_eq!(live_snapshot.cleanup_phase.as_deref(), Some("pending"));
+    assert_eq!(live_snapshot.run_pid, Some(i64::from(helper_pid)));
+    assert_eq!(live_snapshot.gate_state.as_deref(), Some("released"));
+    assert_eq!(daemon.run_once().await.unwrap().research_started, 0);
+    assert_eq!(research_crash_snapshot(&harness.db, &review.review_id), live_snapshot);
+
+    fs::write(&scope.paths.target_release, b"release\n").unwrap();
+    let leader_deadline = Instant::now() + Duration::from_secs(10);
+    while process_exists(helper_pid) {
+        assert!(Instant::now() < leader_deadline, "native helper leader did not exit");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(process_exists(descendant_pid));
+    assert!(process_group_exists(helper_pid));
+    assert_eq!(process_group_id(descendant_pid), Some(helper_pid));
+    let leader_dead_snapshot = research_crash_snapshot(&harness.db, &review.review_id);
+    assert_eq!(daemon.run_once().await.unwrap().research_started, 0);
+    assert_eq!(
+        research_crash_snapshot(&harness.db, &review.review_id),
+        leader_dead_snapshot
+    );
+
+    fs::write(&scope.paths.descendant_release, b"release\n").unwrap();
+    let group_deadline = Instant::now() + Duration::from_secs(10);
+    while process_exists(helper_pid) || process_group_exists(helper_pid) {
+        assert!(Instant::now() < group_deadline, "native research group did not quiesce");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    scope.helper_pid = None;
+    scope.cleanup_needed = false;
+    let first_cleanup_report = daemon.run_once().await.unwrap();
+    assert_eq!(first_cleanup_report.research_started, 0);
+    let retired_snapshot = research_crash_snapshot(&harness.db, &review.review_id);
+    assert_eq!(retired_snapshot.review_state, "retry_wait");
+    assert_eq!(retired_snapshot.cleanup_phase.as_deref(), Some("complete"));
+    assert_ne!(retired_snapshot.run_status.as_deref(), Some("starting"));
+    assert_ne!(retired_snapshot.run_status.as_deref(), Some("running"));
+
+    let (review_not_before, event_not_before): (Option<i64>, Option<i64>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT review.not_before, event.not_before
+             FROM research_reviews AS review
+             JOIN events AS event ON event.event_id = review.event_id
+             WHERE review.review_id = ?1",
+            [&review.review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let retry_now = review_not_before
+        .into_iter()
+        .chain(event_not_before)
+        .max()
+        .unwrap_or(harness.now)
+        .max(harness.now);
+    let mut retry_daemon = make_daemon(retry_now);
+    let before_retry = research_crash_snapshot(&harness.db, &review.review_id);
+    assert_eq!(before_retry.review_state, "retry_wait");
+    assert_eq!(before_retry.event_status, "retry_wait");
+    let retry_report = retry_daemon.run_once().await.unwrap();
+    assert_eq!(retry_report.research_started, 1);
+    let after_retry = research_crash_snapshot(&harness.db, &review.review_id);
+    assert_eq!(after_retry.run_count, before_retry.run_count + 1);
+    assert_eq!(
+        after_retry.reservation_count,
+        before_retry.reservation_count + 1
+    );
+    assert_eq!(retry_daemon.run_once().await.unwrap().research_started, 0);
+    assert_eq!(
+        research_crash_snapshot(&harness.db, &review.review_id).run_count,
+        after_retry.run_count
+    );
+    scope.disarm();
 }
 
 #[tokio::test]
