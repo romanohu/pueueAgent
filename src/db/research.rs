@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::AppError;
+use crate::{models::EventStatus, AppError};
 
 use super::{database_error, Db};
 
@@ -70,6 +70,16 @@ const REVIEW_SELECT: &str = "SELECT review_id, campaign_id, experiment_id,
         event_id, not_before, notes_json, failure_code, decision_cycle_id,
         checkpoint_json, created_at, started_at, finished_at, updated_at
     FROM research_reviews";
+const LAUNCH_REVIEW_SELECT: &str = "SELECT review.review_id, review.campaign_id,
+        review.experiment_id, review.task_signature, review.attempt, review.state,
+        review.operation_stage, review.agent_run_id, review.context_json,
+        review.context_digest, review.response_json, review.termination_request_id,
+        review.successor_experiment_id, review.evidence_schema_version,
+        review.session_generation, review.event_id, review.not_before,
+        review.notes_json, review.failure_code, review.decision_cycle_id,
+        review.checkpoint_json, review.created_at, review.started_at,
+        review.finished_at, review.updated_at
+    FROM research_reviews AS review";
 
 impl<'db> ResearchRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
@@ -291,6 +301,100 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("read due research reviews"))
     }
 
+    /// Return launchable research reviews without allowing a structurally
+    /// deferred row to consume the bounded coordinator prefix.  Terminal
+    /// capped or unsafe rows remain visible so the coordinator can settle
+    /// them without reserving another budget slot.
+    pub fn due_launch_reviews(
+        &self,
+        now: i64,
+        limit: usize,
+        max_attempts: u32,
+    ) -> Result<Vec<ResearchReview>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{LAUNCH_REVIEW_SELECT}
+                 JOIN campaign_research AS research_state
+                   ON research_state.campaign_id = review.campaign_id
+                 JOIN campaigns AS campaign
+                   ON campaign.campaign_id = review.campaign_id
+                 JOIN projects AS project
+                   ON project.project_id = campaign.project_id
+                 JOIN events AS event
+                   ON event.event_id = review.event_id
+                 WHERE review.state IN ('pending','retry_wait')
+                   AND review.not_before <= ?1
+                   AND NOT (review.state = 'pending' AND review.agent_run_id IS NOT NULL)
+                   AND (
+                       (
+                           campaign.state = 'active'
+                           AND project.enabled = 1
+                           AND project.paused = 0
+                           AND project.halted_reason IS NULL
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM agent_runs AS busy
+                               WHERE busy.project_id = campaign.project_id
+                                 AND busy.status IN ('starting','running')
+                           )
+                           AND event.status IN ('pending','retry_wait')
+                           AND event.not_before <= ?1
+                           AND NOT (
+                               review.state = 'retry_wait'
+                               AND (
+                                   review.attempt >= ?3
+                                   OR review.failure_code IN (
+                                       'research_session_unsafe',
+                                       'research_policy_blocked'
+                                   )
+                               )
+                           )
+                       )
+                       OR (
+                           review.state = 'retry_wait'
+                           AND (
+                               review.attempt >= ?3
+                               OR review.failure_code IN (
+                                   'research_session_unsafe',
+                                   'research_policy_blocked'
+                               )
+                           )
+                           AND event.status IN ('pending','retry_wait','failed','dead_letter')
+                           AND (
+                               event.status IN ('failed','dead_letter')
+                               OR event.not_before <= ?1
+                           )
+                       )
+                   )
+                   AND (
+                       review.agent_run_id IS NULL
+                       OR EXISTS (
+                           SELECT 1
+                           FROM agent_runs AS owner
+                           WHERE owner.run_id = review.agent_run_id
+                             AND owner.status IN ('completed','failed','timed_out','cancelled')
+                             AND owner.launch_gate_state IN ('released','failed')
+                       )
+                   )
+                 ORDER BY review.not_before, review.created_at, review.review_id
+                 LIMIT ?2"
+            ))
+            .map_err(database_error("prepare launchable research review query"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    now,
+                    limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64,
+                    i64::from(max_attempts),
+                ],
+                review_from_row,
+            )
+            .map_err(database_error("query launchable research reviews"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read launchable research reviews"))
+    }
+
     /// Claim the oldest authoritative running experiment for each campaign
     /// whose durable interval has elapsed.  The claim itself remains the
     /// transactional source of truth; this method only supplies the bounded
@@ -497,6 +601,204 @@ impl<'db> ResearchRepository<'db> {
                 .checked_add(1)
                 .ok_or_else(|| validation_error("research.attempt", "cannot advance review attempt"))
         }
+    }
+
+    /// Atomically settle a capped retry and its linked event.  The caller's
+    /// state, attempt, owner, and event status are all compare-and-swap
+    /// predicates; a stale coordinator therefore leaves every row untouched.
+    pub fn settle_attempt_limit(
+        &self,
+        review_id: &str,
+        expected_state: &str,
+        expected_attempt: i64,
+        expected_run_id: Option<i64>,
+        expected_event_status: EventStatus,
+        max_attempts: u32,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        if review_id.is_empty() || expected_state.is_empty() {
+            return Err(validation_error(
+                "research.review",
+                "review and expected state must be non-empty",
+            ));
+        }
+        if !matches!(expected_state, "pending" | "retry_wait") {
+            return Err(validation_error(
+                "research.state",
+                "attempt cap settlement requires pending or retry_wait",
+            ));
+        }
+        if !matches!(
+            expected_event_status,
+            EventStatus::Pending
+                | EventStatus::Claimed
+                | EventStatus::RetryWait
+                | EventStatus::Failed
+                | EventStatus::DeadLetter
+        ) {
+            return Err(validation_error(
+                "event_status",
+                "attempt cap settlement requires a claimable or terminal event",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research attempt cap settlement"))?;
+        let current: Option<(
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            i64,
+            EventStatus,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = transaction
+            .query_row(
+                "SELECT review.campaign_id, review.state, review.attempt,
+                        review.agent_run_id, review.failure_code, event.event_id,
+                        event.status, owner.status, owner.launch_gate_state,
+                        research_state.blocked_reason
+                 FROM research_reviews AS review
+                 JOIN campaign_research AS research_state
+                   ON research_state.campaign_id = review.campaign_id
+                 JOIN campaigns AS campaign
+                   ON campaign.campaign_id = review.campaign_id
+                 JOIN events AS event
+                   ON event.event_id = review.event_id
+                 LEFT JOIN agent_runs AS owner
+                   ON owner.run_id = review.agent_run_id
+                 WHERE review.review_id = ?1",
+                [review_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("read research attempt cap settlement"))?;
+        let Some((
+            campaign_id,
+            state,
+            attempt,
+            run_id,
+            failure_code,
+            event_id,
+            event_status,
+            owner_status,
+            owner_gate,
+            campaign_blocked_reason,
+        )) = current
+        else {
+            transaction
+                .commit()
+                .map_err(database_error("commit missing research cap settlement"))?;
+            return Ok(false);
+        };
+        if state != expected_state
+            || attempt != expected_attempt
+            || run_id != expected_run_id
+            || event_status != expected_event_status
+            || campaign_blocked_reason.is_some()
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit stale research cap settlement"))?;
+            return Ok(false);
+        }
+        if run_id.is_some() {
+            if !matches!(
+                owner_status.as_deref(),
+                Some("completed" | "failed" | "timed_out" | "cancelled")
+            ) || !matches!(owner_gate.as_deref(), Some("released" | "failed"))
+            {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit active research cap owner"))?;
+                return Ok(false);
+            }
+        }
+        let target_attempt = if attempt > 0 && run_id.is_none() && failure_code.is_none() {
+            attempt
+        } else {
+            attempt.checked_add(1).ok_or_else(|| {
+                validation_error("research.attempt", "cannot advance review attempt")
+            })?
+        };
+        if target_attempt <= i64::from(max_attempts) {
+            transaction
+                .commit()
+                .map_err(database_error("commit non-capped research review"))?;
+            return Ok(false);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'blocked', failure_code = 'research_attempt_limit',
+                     finished_at = ?1, not_before = ?1, updated_at = ?1
+                 WHERE review_id = ?2 AND state = ?3 AND attempt = ?4
+                   AND ((agent_run_id IS NULL AND ?5 IS NULL) OR agent_run_id = ?5)
+                   AND event_id = ?6",
+                params![
+                    now,
+                    review_id,
+                    expected_state,
+                    expected_attempt,
+                    expected_run_id,
+                    event_id,
+                ],
+            )
+            .map_err(database_error("settle capped research review"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "settle capped research review CAS",
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = 'research_attempt_limit', next_due_at = NULL,
+                     updated_at = ?1
+                 WHERE campaign_id = ?2 AND blocked_reason IS NULL",
+                params![now, campaign_id],
+            )
+            .map_err(database_error("block capped research campaign"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "settle capped research campaign CAS",
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE events
+                 SET status = 'failed', lease_until = NULL,
+                     completed_at = ?1, last_error = 'research_attempt_limit'
+                 WHERE event_id = ?2 AND status = ?3",
+                params![now, event_id, expected_event_status],
+            )
+            .map_err(database_error("settle capped research event"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "settle capped research event CAS",
+            });
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit capped research settlement"))?;
+        Ok(true)
     }
 
     pub fn claimed_unbound_event_ids(&self) -> Result<Vec<i64>, AppError> {

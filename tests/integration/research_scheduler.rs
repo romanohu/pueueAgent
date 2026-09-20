@@ -640,6 +640,455 @@ fn retry_admission_moves_native_recovery_proof_into_history_and_clears_top_level
     assert_eq!(reservation_status, "consumed");
 }
 
+fn prepare_due_secondary_campaign(fixture: &SchedulerFixture, now: i64) -> String {
+    let (campaign_id, _experiment_id, _task_signature) =
+        add_running_campaign(&fixture.db, fixture._temp.path(), "secondary", 2_000);
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .schedule_running_campaigns(1, now, 8)
+            .expect("schedule secondary campaign"),
+        1
+    );
+    campaign_id
+}
+
+fn make_old_review_ineligible(
+    fixture: &SchedulerFixture,
+    event_not_before: i64,
+    project_paused: bool,
+    owner_status: &str,
+) -> (String, i64) {
+    let (review_id, run_id, event_id) = seed_active_research_outcome(fixture, "retry_wait");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events
+             SET status = 'retry_wait', not_before = ?1, lease_until = NULL
+             WHERE event_id = ?2",
+            rusqlite::params![event_not_before, event_id],
+        )
+        .expect("make old event retryable");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE projects SET paused = ?1 WHERE project_id = ?2",
+            rusqlite::params![project_paused, "research-scheduler-project"],
+        )
+        .expect("set old project pause state");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = ?1, launch_gate_state = 'released'
+             WHERE run_id = ?2",
+            rusqlite::params![owner_status, run_id],
+        )
+        .expect("set old owner state");
+    (review_id, run_id)
+}
+
+#[test]
+fn launch_queue_skips_paused_old_review_before_claiming_new_campaign() {
+    let fixture = fixture();
+    let (_old_review_id, _old_run_id) = make_old_review_ineligible(&fixture, 2_800, true, "failed");
+    let secondary_campaign = prepare_due_secondary_campaign(&fixture, 3_000);
+    let repository = ResearchRepository::new(&fixture.db);
+
+    assert!(
+        repository
+            .due_launch_reviews(3_000, 1, 3)
+            .expect("launch candidates")
+            .is_empty(),
+        "a paused old review must not consume the bounded launch prefix"
+    );
+    let claims = repository
+        .claim_due_campaigns(3_000, 1)
+        .expect("claim eligible new campaign");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].campaign_id, secondary_campaign);
+}
+
+#[test]
+fn launch_queue_skips_review_whose_event_wake_is_still_future() {
+    let fixture = fixture();
+    let (_old_review_id, _old_run_id) = make_old_review_ineligible(&fixture, 5_000, false, "failed");
+    let secondary_campaign = prepare_due_secondary_campaign(&fixture, 3_000);
+    let repository = ResearchRepository::new(&fixture.db);
+
+    assert!(
+        repository
+            .due_launch_reviews(3_000, 1, 3)
+            .expect("launch candidates")
+            .is_empty(),
+        "an event wake in the future must not consume the bounded launch prefix"
+    );
+    let claims = repository
+        .claim_due_campaigns(3_000, 1)
+        .expect("claim eligible new campaign");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].campaign_id, secondary_campaign);
+}
+
+#[test]
+fn launch_queue_skips_active_old_owner_before_claiming_new_campaign() {
+    let fixture = fixture();
+    let (_old_review_id, _old_run_id) = make_old_review_ineligible(&fixture, 2_800, false, "running");
+    let secondary_campaign = prepare_due_secondary_campaign(&fixture, 3_000);
+    let repository = ResearchRepository::new(&fixture.db);
+
+    assert!(
+        repository
+            .due_launch_reviews(3_000, 1, 3)
+            .expect("launch candidates")
+            .is_empty(),
+        "an active old owner must not consume the bounded launch prefix"
+    );
+    let claims = repository
+        .claim_due_campaigns(3_000, 1)
+        .expect("claim eligible new campaign");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].campaign_id, secondary_campaign);
+}
+
+#[test]
+fn launch_queue_skips_unbound_review_when_project_has_other_active_run() {
+    let fixture = fixture();
+    let (review_id, run_id) = make_old_review_ineligible(&fixture, 2_800, false, "running");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET agent_run_id = NULL
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("unbound the old review");
+    let secondary_campaign = prepare_due_secondary_campaign(&fixture, 3_000);
+    let repository = ResearchRepository::new(&fixture.db);
+
+    assert!(
+        repository
+            .due_launch_reviews(3_000, 1, 3)
+            .expect("launch candidates")
+            .is_empty(),
+        "an unbound review must not consume the prefix while its project has an active run"
+    );
+    let claims = repository
+        .claim_due_campaigns(3_000, 1)
+        .expect("claim eligible new campaign");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].campaign_id, secondary_campaign);
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("active project run")
+            .expect("active project run row")
+            .status,
+        AgentRunStatus::Running
+    );
+}
+
+#[test]
+fn launch_queue_retains_terminal_capped_review_for_settlement() {
+    let fixture = fixture();
+    let (review_id, run_id) = make_old_review_ineligible(&fixture, 2_800, true, "failed");
+    let event_id = ResearchRepository::new(&fixture.db)
+        .event_id(&review_id)
+        .expect("capped review event");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET attempt = 3, failure_code = 'research_output_invalid'
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("seed capped attempt");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', not_before = 0, lease_until = NULL
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .expect("seed terminal research event");
+    assert_eq!(
+        AgentRunRepository::new(&fixture.db)
+            .find_by_id(run_id)
+            .expect("capped owner")
+            .expect("capped owner row")
+            .status,
+        AgentRunStatus::Failed
+    );
+
+    let candidates = ResearchRepository::new(&fixture.db)
+        .due_launch_reviews(3_000, 1, 3)
+        .expect("terminal settlement candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].review_id, review_id);
+}
+
+#[test]
+fn attempt_cap_settlement_rolls_back_all_rows_on_event_failure() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal cap owner");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', lease_until = NULL
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .expect("seed terminal research event");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_cap_event_update
+             BEFORE UPDATE OF status ON events
+             WHEN OLD.event_id = {event_id} AND NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'injected cap event failure'); END;"
+        ))
+        .expect("install cap event failure");
+
+    let failed = ResearchRepository::new(&fixture.db).settle_attempt_limit(
+        &review_id,
+        "retry_wait",
+        1,
+        Some(run_id),
+        EventStatus::DeadLetter,
+        1,
+        3_001,
+    );
+    assert!(failed.is_err(), "event failure must abort the cap transaction");
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("review after rollback")
+            .state,
+        "retry_wait"
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .state(&fixture.campaign_id)
+            .expect("campaign after rollback")
+            .blocked_reason,
+        None
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("event after rollback")
+            .expect("event row")
+            .status,
+        EventStatus::DeadLetter
+    );
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_cap_event_update")
+        .expect("remove cap event failure");
+    assert!(
+        ResearchRepository::new(&fixture.db)
+            .settle_attempt_limit(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::DeadLetter,
+                1,
+                3_002,
+            )
+            .expect("cap settlement")
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("settled review")
+            .state,
+        "blocked"
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("settled event")
+            .expect("event row")
+            .status,
+        EventStatus::Failed
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .settle_attempt_limit(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::DeadLetter,
+                1,
+                3_003,
+            )
+            .expect("repeated cap settlement"),
+        false
+    );
+}
+
+#[test]
+fn attempt_cap_settlement_rejects_stale_attempt_without_mutation() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal cap owner");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', lease_until = NULL
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .expect("seed terminal research event");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET attempt = 2 WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("mutate review attempt after selection");
+
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .settle_attempt_limit(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::DeadLetter,
+                1,
+                3_001,
+            )
+            .expect("stale cap settlement"),
+        false
+    );
+    let review = ResearchRepository::new(&fixture.db)
+        .find(&review_id)
+        .expect("unchanged review");
+    assert_eq!(review.state, "retry_wait");
+    assert_eq!(review.attempt, 2);
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .state(&fixture.campaign_id)
+            .expect("unchanged campaign")
+            .blocked_reason,
+        None
+    );
+}
+
+#[test]
+fn attempt_cap_settlement_rejects_immutable_review_and_event_phases() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal cap owner");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'dead_letter', lease_until = NULL
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .expect("seed terminal research event");
+
+    assert!(
+        ResearchRepository::new(&fixture.db)
+            .settle_attempt_limit(
+                &review_id,
+                "ready",
+                1,
+                Some(run_id),
+                EventStatus::DeadLetter,
+                1,
+                3_001,
+            )
+            .is_err(),
+        "cap settlement must reject immutable ready review state"
+    );
+    assert!(
+        ResearchRepository::new(&fixture.db)
+            .settle_attempt_limit(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::Completed,
+                1,
+                3_001,
+            )
+            .is_err(),
+        "cap settlement must reject unrelated completed event state"
+    );
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("unchanged review")
+            .state,
+        "retry_wait"
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("unchanged event")
+            .expect("event row")
+            .status,
+        EventStatus::DeadLetter
+    );
+}
+
 #[tokio::test]
 async fn startup_recovery_preserves_ready_research_outcome_until_run_finalization() {
     let fixture = fixture();
