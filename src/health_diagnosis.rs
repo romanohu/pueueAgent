@@ -8,12 +8,17 @@
 //! spawns and every failed run dead-letters with reason
 //! `health_diagnosis_missing`.
 
+use std::collections::BTreeSet;
+
 use sha2::{Digest, Sha256};
 
 use crate::{
     agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage},
     config,
-    db::{CampaignRepository, Db, EventRepository, HealthRepository, ProjectRepository},
+    db::{
+        CampaignRepository, Db, EventRepository, HealthRepository, ProjectRepository,
+        ResearchRepository,
+    },
     execution_policy::preflight_decision_runtime,
     health::{campaign_defers, read_task_tail},
     models::{EventKind, EventStatus, HealthState, NewEvent, RunningHealthRow},
@@ -203,15 +208,20 @@ pub async fn run_due_diagnoses(
     runner: &AgentRunner,
     claim_limit: usize,
     now: i64,
+    blocked_projects: &BTreeSet<String>,
 ) -> Result<DiagnosisPassReport, AppError> {
     let mut report = DiagnosisPassReport::default();
     if preflight_decision_runtime().is_err() {
         return Ok(report);
     }
     HealthRepository::requeue_interrupted_diagnoses(db, now)?;
-    let candidates = HealthRepository::due_diagnoses(db, claim_limit)?;
+    let candidates = HealthRepository::due_diagnoses_excluding_projects(
+        db,
+        claim_limit,
+        blocked_projects,
+    )?;
     for row in candidates {
-        diagnose_row(db, runner, &row, now, &mut report).await?;
+        diagnose_row(db, runner, &row, now, blocked_projects, &mut report).await?;
     }
     Ok(report)
 }
@@ -221,8 +231,13 @@ async fn diagnose_row(
     runner: &AgentRunner,
     row: &RunningHealthRow,
     now: i64,
+    blocked_projects: &BTreeSet<String>,
     report: &mut DiagnosisPassReport,
 ) -> Result<(), AppError> {
+    if blocked_projects.contains(&row.project_id) {
+        report.deferred += 1;
+        return Ok(());
+    }
     let Some(project) = ProjectRepository::new(db).find_by_id(&row.project_id)? else {
         report.deferred += 1;
         return Ok(());
@@ -262,6 +277,32 @@ async fn diagnose_row(
         snapshot.as_ref().map(|snapshot| snapshot.evidence.as_str()),
     )?;
 
+    let run_id_guard = match runner.try_acquire_run_id_admission_guard(db).map_err(AppError::from)?
+    {
+        Some(guard) => guard,
+        None => {
+            report.deferred += 1;
+            return Ok(());
+        }
+    };
+    let project_lock = match runner
+        .try_acquire_project_admission_lock(&project_policy)
+        .map_err(AppError::from)?
+    {
+        Some(lock) => lock,
+        None => {
+            report.deferred += 1;
+            return Ok(());
+        }
+    };
+    if ResearchRepository::project_has_unresolved_native_research_owner(
+        &db.connect()?,
+        &row.project_id,
+    )? {
+        report.deferred += 1;
+        return Ok(());
+    }
+
     let attempt_number = row.diagnosis_attempt_count();
     let event = EventRepository::new(db)
         .insert_idempotent(
@@ -289,27 +330,6 @@ async fn diagnose_row(
         report.deferred += 1;
         return Ok(());
     }
-
-    let run_id_guard = match runner.try_acquire_run_id_admission_guard(db).map_err(AppError::from)?
-    {
-        Some(guard) => guard,
-        None => {
-            release_claimed_event(db, &[event.event_id], now, now + 60)?;
-            report.deferred += 1;
-            return Ok(());
-        }
-    };
-    let project_lock = match runner
-        .try_acquire_project_admission_lock(&project_policy)
-        .map_err(AppError::from)?
-    {
-        Some(lock) => lock,
-        None => {
-            release_claimed_event(db, &[event.event_id], now, now + 60)?;
-            report.deferred += 1;
-            return Ok(());
-        }
-    };
 
     HealthRepository::set_state(db, &row.experiment_id, HealthState::Diagnosing, now)?;
 

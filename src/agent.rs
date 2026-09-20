@@ -773,7 +773,9 @@ impl AgentRunner {
             let relative_log = recovery_relative_log_path(&policy, stored_log_path)?;
             let relative_marker = launch_gate_marker_path(&relative_log);
             match inspect_startup_gate_marker(&reader, &relative_marker)? {
-                StartupGateMarkerInspection::Absent => {}
+                StartupGateMarkerInspection::Absent => {
+                    evidence.absent.insert(*run_id);
+                }
                 StartupGateMarkerInspection::Valid => {
                     evidence.confirmed.insert(*run_id);
                 }
@@ -1599,8 +1601,9 @@ impl AgentRunner {
                 }));
             }
         }
-        let run = repository
-            .insert_with_events_and_reservation_with_guard(
+        let run_insert = AgentRunRepository::insert_native_with_events_and_reservation_with_guard;
+        let run = run_insert(
+                &repository,
                 &NewAgentRun::with_context(
                     &project.project_id,
                     primary_event_id,
@@ -2298,6 +2301,7 @@ fn validate_project_decision_authority(
 pub(crate) struct StartupGateMarkerEvidence {
     pub(crate) confirmed: BTreeSet<i64>,
     pub(crate) indeterminate: BTreeSet<i64>,
+    pub(crate) absent: BTreeSet<i64>,
 }
 
 pub fn relative_log_path(primary_event_id: i64, now: i64) -> PathBuf {

@@ -15,17 +15,20 @@ use crate::{
     campaign::{CampaignCoordinator, CampaignSubmission},
     config,
     db::{
-        AgentRunRepository, CampaignRepository, Db, DecisionRepository, ProjectRepository,
+        startup_research_owner_snapshot, AgentRunRepository, CampaignRepository, Db,
+        DecisionRepository, ProjectRepository, ResearchRepository, StartupResearchOwner,
         TerminationRequestRepository,
     },
     decision::{DecisionCoordinator, DecisionLoopReport, DecisionRecoveryReport},
     detect::Detector,
     execution_policy::ResolvedExecutionPolicy,
+    environment::RecoveredPrivateRunTempCleanup,
     health::{DetectionSignals, HealthEngine, HealthReport},
     health_diagnosis::run_due_diagnoses,
     incidents::IncidentStore,
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
+    process::{startup_process_quiescence, StartupProcessQuiescence},
     reconcile::{ReconcileReport, Reconciler},
     research::{recover_research, run_due_research_with_cleanup_blocked_projects},
     retry::RetryPolicy,
@@ -103,6 +106,8 @@ pub struct Daemon<P> {
     active_agents: Vec<AgentHandle>,
     active_cleanups: Vec<BoundCleanupHandle>,
     startup_recovery_pending: bool,
+    startup_research_owners: BTreeMap<i64, StartupResearchOwner>,
+    startup_research_cursor: usize,
 }
 
 impl<P> Daemon<P>
@@ -125,6 +130,8 @@ where
             active_agents: Vec::new(),
             active_cleanups: Vec::new(),
             startup_recovery_pending: true,
+            startup_research_owners: BTreeMap::new(),
+            startup_research_cursor: 0,
         }
     }
 
@@ -164,6 +171,7 @@ where
                 confirmed_release_requested_ids,
                 indeterminate_pending_marker_ids,
                 indeterminate_release_requested_ids,
+                absent_pending_marker_ids,
             ) = self.load_startup_recovery_inputs()?;
             let recovery = AgentRunRepository::new(&self.db)
                 .recover_interrupted_with_marker_evidence(
@@ -176,6 +184,19 @@ where
                     &indeterminate_release_requested_ids,
                 )?;
             recover_research(&self.db, now, self.policy.campaign_limits).await?;
+            let startup_owners = startup_research_owner_snapshot(
+                &self.db,
+                &recovery.preserved_research_run_ids,
+                &absent_pending_marker_ids,
+            )?;
+            let research_repository = crate::db::ResearchRepository::new(&self.db);
+            for owner in startup_owners.values() {
+                if owner.authority.is_none() {
+                    research_repository.mark_startup_recovery_required(owner.run_id, now)?;
+                }
+            }
+            self.startup_research_owners = startup_owners;
+            self.startup_research_cursor = 0;
 
             #[cfg(unix)]
             {
@@ -271,7 +292,10 @@ where
         let mut health = self.run_health_observer(&reconciliation, &detection_signals, now)?;
         health.executed_actions = self.run_health_actions(now).await?;
         report.health = health;
-        report.diagnoses = self.run_health_diagnoses(now).await?;
+        let health_blocked_projects = self.cleanup_blocked_projects()?;
+        report.diagnoses = self
+            .run_health_diagnoses(now, &health_blocked_projects)
+            .await?;
         report.termination_outcomes = self.run_termination().await?;
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(&reconciliation.observed_tasks)?;
@@ -320,16 +344,7 @@ where
         CampaignRepository::new(&self.db)
             .wake_eligible_campaigns_with_limits(&self.policy.campaign_limits, now)?;
 
-        let cleanup_blocked_projects = self
-            .active_agents
-            .iter()
-            .filter_map(|agent| agent.cleanup_blocked_project().map(str::to_owned))
-            .chain(
-                self.active_cleanups
-                    .iter()
-                    .filter_map(|cleanup| cleanup.cleanup_blocked_project().map(str::to_owned)),
-            )
-            .collect::<BTreeSet<_>>();
+        let cleanup_blocked_projects = self.cleanup_blocked_projects()?;
         let mut scheduler = Scheduler::new(
             self.db.clone(),
             self.runner.take().ok_or(AppError::Runtime {
@@ -488,6 +503,7 @@ where
             BTreeSet<i64>,
             BTreeSet<i64>,
             BTreeSet<i64>,
+            BTreeSet<i64>,
         ),
         AppError,
     > {
@@ -500,6 +516,7 @@ where
         let mut confirmed_release_requested_ids = BTreeSet::new();
         let mut indeterminate_pending_marker_ids = BTreeSet::new();
         let mut indeterminate_release_requested_ids = BTreeSet::new();
+        let mut absent_pending_marker_ids = BTreeSet::new();
         for project in projects {
             let project_config = config::load(&project.config_path)?;
             if project_config.project_id != project.project_id {
@@ -531,6 +548,9 @@ where
                 for (run_id, gate_state, _) in candidates {
                     let confirmed = marker_evidence.confirmed.contains(&run_id);
                     let indeterminate = marker_evidence.indeterminate.contains(&run_id);
+                    if gate_state == "pending" && marker_evidence.absent.contains(&run_id) {
+                        absent_pending_marker_ids.insert(run_id);
+                    }
                     if !confirmed && !indeterminate {
                         continue;
                     }
@@ -565,6 +585,7 @@ where
             confirmed_release_requested_ids,
             indeterminate_pending_marker_ids,
             indeterminate_release_requested_ids,
+            absent_pending_marker_ids,
         ))
     }
 
@@ -641,12 +662,44 @@ where
         .await
     }
 
+    fn cleanup_blocked_projects(&self) -> Result<BTreeSet<String>, AppError> {
+        let mut blocked = ResearchRepository::new(&self.db)
+            .native_cleanup_blocked_project_ids()?;
+        blocked.extend(
+            self.startup_research_owners
+                .values()
+                .map(|owner| owner.project_id.clone()),
+        );
+        blocked.extend(
+            self.active_agents
+                .iter()
+                .filter_map(|agent| agent.cleanup_blocked_project().map(str::to_owned)),
+        );
+        blocked.extend(
+            self.active_cleanups
+                .iter()
+                .filter_map(|cleanup| cleanup.cleanup_blocked_project().map(str::to_owned)),
+        );
+        Ok(blocked)
+    }
+
     /// Spawn bounded diagnosis agents for suspicious running-health rows.
-    async fn run_health_diagnoses(&mut self, now: i64) -> Result<usize, AppError> {
+    async fn run_health_diagnoses(
+        &mut self,
+        now: i64,
+        blocked_projects: &BTreeSet<String>,
+    ) -> Result<usize, AppError> {
         let runner = self.runner.take().ok_or(AppError::Runtime {
             operation: "take daemon health-diagnosis runner",
         })?;
-        let outcome = run_due_diagnoses(&self.db, &runner, self.config.claim_limit, now).await;
+        let outcome = run_due_diagnoses(
+            &self.db,
+            &runner,
+            self.config.claim_limit,
+            now,
+            blocked_projects,
+        )
+        .await;
         self.runner = Some(runner);
         let report = outcome?;
         let spawned = report.started.len();
@@ -657,17 +710,7 @@ where
     }
 
     async fn run_due_research(&mut self, now: i64) -> Result<(usize, usize, usize), AppError> {
-        let cleanup_blocked_projects = self
-            .active_agents
-            .iter()
-            .filter_map(AgentHandle::cleanup_blocked_project)
-            .chain(
-                self.active_cleanups
-                    .iter()
-                    .filter_map(BoundCleanupHandle::cleanup_blocked_project),
-            )
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
+        let cleanup_blocked_projects = self.cleanup_blocked_projects()?;
         let runner = self.runner.take().ok_or(AppError::Runtime {
             operation: "take daemon research runner",
         })?;
@@ -753,13 +796,257 @@ where
     }
 
     async fn poll_retained_ownership_at(&mut self, now: i64) -> Result<usize, AppError> {
+        let (startup, mut first_error) = match self.poll_startup_research_owners_at(now).await {
+            Ok(finished) => (finished, None),
+            Err(error) => (0, Some(error)),
+        };
         let agents = self.poll_agents_at(now).await;
         let cleanups = self.poll_cleanups_at(now).await;
-        match (agents, cleanups) {
-            (Ok(finished_agents), Ok(_finished_cleanups)) => Ok(finished_agents),
-            (Err(first_error), _) => Err(first_error),
-            (Ok(_), Err(first_error)) => Err(first_error),
+        let finished_agents = match agents {
+            Ok(finished) => finished,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                0
+            }
+        };
+        if let Err(error) = cleanups {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
+        first_error.map_or(Ok(finished_agents + startup), Err)
+    }
+
+    async fn poll_startup_research_owners_at(&mut self, now: i64) -> Result<usize, AppError> {
+        let owner_ids = self
+            .startup_research_owners
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        if owner_ids.is_empty() {
+            self.startup_research_cursor = 0;
+            return Ok(0);
+        }
+        let start = self.startup_research_cursor % owner_ids.len();
+        let count = self.config.claim_limit.max(1).min(owner_ids.len());
+        let owners = (0..count)
+            .filter_map(|offset| {
+                self.startup_research_owners
+                    .get(&owner_ids[(start + offset) % owner_ids.len()])
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        self.startup_research_cursor = (start + owners.len())
+            % self.startup_research_owners.len().max(1);
+        let mut retired = 0;
+        let mut first_error = None;
+        let repository = crate::db::ResearchRepository::new(&self.db);
+        for startup_owner in owners {
+            let owner_result = repository.startup_native_owner(
+                startup_owner.run_id,
+                startup_owner.marker_absent,
+            );
+            let Some(mut owner) = (match owner_result {
+                Ok(owner) => owner,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            }) else {
+                continue;
+            };
+            let authority_unchanged = startup_owner
+                .authority
+                .as_ref()
+                .zip(owner.authority.as_ref())
+                .is_some_and(|(original, current)| {
+                    crate::db::native_research_authority_immutable_matches(original, current)
+                });
+            if startup_owner.authority.is_none() || !authority_unchanged {
+                match repository.mark_startup_recovery_required(owner.run_id, now) {
+                    Ok(_) => {}
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+                // Keep the startup snapshot's immutable authority and notes
+                // as the only recovery proof.  Refreshing mutable status is
+                // safe, but a missing or substituted current proof must not
+                // become the next poll's original.
+                owner.authority = startup_owner.authority.clone();
+                owner.notes_json = startup_owner.notes_json.clone();
+                owner.marker_absent = startup_owner.marker_absent;
+                self.startup_research_owners.insert(owner.run_id, owner);
+                continue;
+            }
+            owner.marker_absent = startup_owner.marker_absent;
+            self.startup_research_owners.insert(owner.run_id, owner.clone());
+            let quiescent = if matches!(
+                owner.status.as_str(),
+                "completed" | "failed" | "timed_out" | "cancelled"
+            ) {
+                true
+            } else if let Some(pid) = owner.pid {
+                #[cfg(unix)]
+                {
+                    matches!(
+                        startup_process_quiescence(pid),
+                        StartupProcessQuiescence::Quiescent
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid;
+                    false
+                }
+            } else {
+                startup_owner_is_safe_pre_exec(&owner)
+            };
+            if !quiescent {
+                continue;
+            }
+            let project_result = ProjectRepository::new(&self.db).find_by_id(&owner.project_id);
+            let Some(project) = (match project_result {
+                Ok(project) => project,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            }) else {
+                if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                continue;
+            };
+            let project_config = match config::load(&project.config_path) {
+                Ok(config) => config,
+                Err(_) => {
+                    if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    continue;
+                }
+            };
+            let Some(runner) = self.runner.as_ref() else {
+                if first_error.is_none() {
+                    first_error = Some(AppError::Runtime {
+                        operation: "borrow daemon runner for startup research recovery",
+                    });
+                }
+                break;
+            };
+            let project_policy = match runner.resolve_project_policy(&project, &project_config) {
+                Ok(policy) => policy,
+                Err(_) => {
+                    if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    continue;
+                }
+            };
+            let project_lock = match runner.try_acquire_project_admission_lock(&project_policy) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(AppError::from(error));
+                    }
+                    continue;
+                }
+            };
+            let Some(_project_lock) = project_lock else {
+                continue;
+            };
+            if owner.pid.is_none() {
+                let Some(log_path) = owner.log_path.as_ref() else {
+                    if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    continue;
+                };
+                let marker = runner.inspect_startup_gate_markers(
+                    &project,
+                    &project_config,
+                    &[(owner.run_id, owner.gate_state.clone(), log_path.clone())],
+                );
+                let marker_absent = match marker {
+                    Ok(evidence) => evidence.absent.contains(&owner.run_id),
+                    Err(_) => false,
+                };
+                if !marker_absent {
+                    if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    continue;
+                }
+            }
+            let mut cleanup = match owner.authority.as_ref() {
+                Some(authority) => {
+                    if authority.cleanup_complete {
+                        None
+                    } else {
+                    let verified_root = match project_policy.root_anchor.verify_identity() {
+                        Ok(root) => root,
+                        Err(_) => {
+                            if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    match RecoveredPrivateRunTempCleanup::open(
+                        &verified_root,
+                        owner.run_id,
+                        &authority.identity,
+                    ) {
+                        Ok(cleanup) => Some(cleanup),
+                        Err(_) => {
+                            if let Err(error) = repository.mark_startup_recovery_required(owner.run_id, now) {
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    }
+                }
+                None => None,
+            };
+            match repository.retire_startup_native_owner(
+                &owner,
+                cleanup.as_mut(),
+                now,
+            ) {
+                Ok(true) => {
+                    self.startup_research_owners.remove(&owner.run_id);
+                    retired += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        first_error.map_or(Ok(retired), Err)
     }
 
     async fn drain_agents_on_shutdown(&mut self) -> Result<usize, AppError> {
@@ -930,4 +1217,13 @@ fn unix_timestamp() -> Result<i64, AppError> {
         .map_err(|_| AppError::Runtime {
             operation: "convert current daemon time",
         })
+}
+
+fn startup_owner_is_safe_pre_exec(owner: &StartupResearchOwner) -> bool {
+    owner.marker_absent
+        && owner.pid.is_none()
+        && owner.status == "starting"
+        && owner.gate_state == "pending"
+        && owner.policy_code.is_none()
+        && owner.failure_stage.is_none()
 }

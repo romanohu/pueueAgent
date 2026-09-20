@@ -24,6 +24,10 @@ pub use migrations::LATEST_SCHEMA_VERSION;
 pub use research::{
     next_research_due, ResearchLaunchBinding, ResearchRepository, ResearchReview, ResearchState,
 };
+pub(crate) use research::{
+    native_research_authority_immutable_matches, startup_research_owner_snapshot,
+    StartupResearchOwner,
+};
 pub use running_health::HealthRepository;
 
 use std::{fs, path::Path, path::PathBuf, sync::{Arc, Mutex}, time::Duration};

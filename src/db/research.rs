@@ -1,4 +1,8 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::Deserialize;
@@ -9,6 +13,7 @@ use crate::{
     environment::{
         PrivateRunTempRecoveryIdentityV1, PrivateRunTempRecoveryRootIdentity,
         PrivateRunTempRecoveryTempIdentity,
+        RecoveredPrivateRunTempCleanup,
     },
     models::EventStatus,
     AppError,
@@ -98,6 +103,116 @@ const LAUNCH_REVIEW_SELECT: &str = "SELECT review.review_id, review.campaign_id,
 impl<'db> ResearchRepository<'db> {
     pub fn new(db: &'db Db) -> Self {
         Self { db }
+    }
+
+    /// Return every project with a bound native research owner whose
+    /// immutable authority is not an exact cleanup-complete proof.  This is
+    /// observation only; startup ownership is adopted separately.
+    pub(crate) fn native_cleanup_blocked_project_ids(
+        &self,
+    ) -> Result<BTreeSet<String>, AppError> {
+        let connection = self.db.connect()?;
+        native_cleanup_blocked_project_ids(&connection)
+    }
+
+    /// Transaction-scoped durable owner gate.  The insertion transaction uses
+    /// this directly so terminal cleanup and a new generation cannot race
+    /// between separate connections.
+    pub(crate) fn project_has_unresolved_native_research_owner(
+        connection: &Connection,
+        project_id: &str,
+    ) -> Result<bool, AppError> {
+        project_has_unresolved_native_research_owner(connection, project_id)
+    }
+
+    pub(crate) fn startup_native_owner(
+        &self,
+        run_id: i64,
+        marker_absent: bool,
+    ) -> Result<Option<StartupResearchOwner>, AppError> {
+        let connection = self.db.connect()?;
+        if let Some(owner) = native_research_owner_rows(&connection, None)?
+            .into_iter()
+            .find(|row| row.agent_run_id == run_id)
+            .map(|row| startup_research_owner_from_row(row, marker_absent))
+        {
+            return Ok(Some(owner));
+        }
+        let unknown = connection
+            .query_row(
+                "SELECT project_id, status, launch_gate_state, pid, log_path,
+                        policy_code, failure_stage
+                 FROM agent_runs
+                 WHERE run_id = ?1 AND execution_kind = 'campaign_research'",
+                [run_id],
+                |row| {
+                    Ok(StartupResearchOwner {
+                        run_id,
+                        project_id: row.get(0)?,
+                        review_id: String::new(),
+                        pid: row.get(3)?,
+                        status: row.get(1)?,
+                        gate_state: row.get(2)?,
+                        policy_code: row.get(5)?,
+                        failure_stage: row.get(6)?,
+                        log_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                        review_state: String::new(),
+                        failure_code: None,
+                        notes_json: None,
+                        marker_absent,
+                        authority: None,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error("read unbound native research startup owner"))?;
+        Ok(unknown)
+    }
+
+    pub(crate) fn list_native_cleanup_pending_terminal_runs(
+        &self,
+    ) -> Result<Vec<StartupResearchOwner>, AppError> {
+        let connection = self.db.connect()?;
+        Ok(native_research_owner_rows(&connection, None)?
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.owner_status.as_deref(),
+                    Some("completed" | "failed" | "timed_out" | "cancelled")
+                ) && !native_research_owner_is_complete(row)
+            })
+            .map(|row| startup_research_owner_from_row(row, false))
+            .collect())
+    }
+
+    pub(crate) fn mark_startup_recovery_required(
+        &self,
+        run_id: i64,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin native research recovery block"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = 'research_recovery_required',
+                     next_due_at = NULL, updated_at = ?1
+                 WHERE campaign_id = (
+                     SELECT review.campaign_id
+                     FROM research_reviews AS review
+                     WHERE review.agent_run_id = ?2
+                 )
+                   AND (blocked_reason IS NULL
+                        OR blocked_reason = 'research_recovery_required')",
+                params![now, run_id],
+            )
+            .map_err(database_error("block native research recovery owner"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit native research recovery block"))?;
+        Ok(changed != 0)
     }
 
     pub fn ensure_campaign(&self, campaign_id: &str) -> Result<(), AppError> {
@@ -1667,6 +1782,378 @@ impl<'db> ResearchRepository<'db> {
         Ok(recovered)
     }
 
+    /// Atomically retire one startup-preserved research owner.  The caller
+    /// opens the original recovery capability while holding the project
+    /// admission lock; this method revalidates the immutable row snapshot,
+    /// performs bounded cleanup while the IMMEDIATE transaction is held, and
+    /// commits the phase/run/review/event CAS as one unit.
+    pub(crate) fn retire_startup_native_owner(
+        &self,
+        owner: &StartupResearchOwner,
+        mut cleanup: Option<&mut RecoveredPrivateRunTempCleanup>,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        let run_id = owner.run_id;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin startup research owner retirement"))?;
+        let Some(current) = native_research_owner_rows(&transaction, None)?
+            .into_iter()
+            .find(|row| row.agent_run_id == run_id)
+        else {
+            transaction
+                .commit()
+                .map_err(database_error("commit missing startup research owner"))?;
+            return Ok(false);
+        };
+        if !native_research_owner_lineage_valid(&current)
+            || current.project_id != owner.project_id
+            || current.review_id != owner.review_id
+            || current.owner_pid != owner.pid
+            || current.owner_status.as_deref() != Some(owner.status.as_str())
+            || current.owner_gate_state.as_deref() != Some(owner.gate_state.as_str())
+            || current.owner_policy_code != owner.policy_code
+            || current.owner_failure_stage != owner.failure_stage
+            || current.owner_log_path != owner.log_path
+            || current.state != owner.review_state
+            || current.failure_code != owner.failure_code
+            || !matches!(
+                current.owner_status.as_deref(),
+                Some("starting" | "running" | "completed" | "failed" | "timed_out" | "cancelled")
+            )
+            || native_recovery_immutable_notes(current.notes_json.as_deref())
+                != native_recovery_immutable_notes(owner.notes_json.as_deref())
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit changed startup research owner"))?;
+            return Ok(false);
+        }
+
+        let expected = NativeResearchBindingExpectation {
+            review_id: &current.review_id,
+            campaign_id: &current.campaign_id,
+            experiment_id: &current.experiment_id,
+            attempt: current.attempt,
+            session_generation: current.review_generation,
+            agent_run_id: current.agent_run_id,
+            state: &current.state,
+            failure_code: current.failure_code.as_deref(),
+            campaign_session: current.campaign_session.as_deref(),
+        };
+        let parsed_authority = if matches!(current.state.as_str(), "completed" | "discarded") {
+            native_research_historical_authority(current.notes_json.as_deref(), &expected)
+        } else {
+            native_research_authority(current.notes_json.as_deref(), &expected)
+        };
+        let Some(parsed_authority) = parsed_authority else {
+            return Err(validation_error(
+                "research.native_recovery",
+                "startup owner lacks a strict cleanup authority",
+            ));
+        };
+        let Some(original_authority) = owner.authority.as_ref() else {
+            return Err(validation_error(
+                "research.native_recovery",
+                "startup owner lacks its original cleanup authority",
+            ));
+        };
+        if !native_research_authority_immutable_matches(original_authority, &parsed_authority) {
+            return Err(validation_error(
+                "research.native_recovery",
+                "startup owner cleanup authority changed generations",
+            ));
+        }
+
+        let owner_status = current.owner_status.as_deref().unwrap_or_default();
+        let event_id = current.event_id.ok_or_else(|| {
+            validation_error("research.event_id", "startup owner event binding is missing")
+        })?;
+        let event_status: EventStatus = transaction
+            .query_row(
+                "SELECT status FROM events WHERE project_id = ?1 AND event_id = ?2",
+                params![current.project_id, event_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read startup research event state"))?;
+        let active_owner = matches!(owner_status, "starting" | "running");
+        let terminal_owner = matches!(
+            owner_status,
+            "completed" | "failed" | "timed_out" | "cancelled"
+        );
+        let review_running = current.state == "running";
+        let review_ready = current.state == "ready";
+        let review_retry = matches!(current.state.as_str(), "retry_wait" | "blocked");
+        let review_terminal = matches!(current.state.as_str(), "completed" | "discarded");
+        if !matches!(current.state.as_str(), "running" | "ready" | "retry_wait" | "blocked" | "completed" | "discarded")
+            || (!active_owner && !terminal_owner)
+            || (review_terminal && active_owner)
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit startup research state mismatch"))?;
+            return Ok(false);
+        }
+        if !active_owner
+            && !matches!(current.owner_gate_state.as_deref(), Some("released" | "failed"))
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit startup research gate mismatch"))?;
+            return Ok(false);
+        }
+        let event_transient = matches!(
+            event_status,
+            EventStatus::Claimed | EventStatus::InFlight | EventStatus::Dispatched
+        );
+        let event_already_terminal = matches!(
+            event_status,
+            EventStatus::Completed | EventStatus::RetryWait | EventStatus::Failed | EventStatus::DeadLetter
+        );
+        let event_state_valid = if review_running {
+            event_transient
+        } else if review_ready {
+            event_transient || event_status == EventStatus::Completed
+        } else if review_retry {
+            event_transient || event_already_terminal
+        } else {
+            event_already_terminal
+        };
+        if !event_state_valid {
+            return Err(validation_error(
+                "research.event",
+                "startup owner event is in an unexpected state",
+            ));
+        }
+        if review_retry && current.failure_code.is_none() {
+            return Err(validation_error(
+                "research.failure_code",
+                "typed startup retry must retain its failure code",
+            ));
+        }
+        if !parsed_authority.cleanup_complete && cleanup.is_none() {
+            return Err(validation_error(
+                "research.native_recovery.cleanup",
+                "original cleanup capability is required",
+            ));
+        }
+
+        let mut notes_json = current.notes_json.clone();
+        if !parsed_authority.cleanup_complete {
+            cleanup
+                .as_mut()
+                .expect("pending authority requires cleanup capability")
+                .cleanup_contents_before(Some(
+                    Instant::now() + Duration::from_secs(30),
+                ))
+                .map_err(AppError::from)?;
+            let mut notes = parse_research_notes(current.notes_json.as_deref())?;
+            let cleanup_object = notes
+                .get_mut("native_recovery")
+                .and_then(Value::as_object_mut)
+                .and_then(|authority| authority.get_mut("cleanup"))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    validation_error(
+                        "research.native_recovery.cleanup",
+                        "phase is missing",
+                    )
+                })?;
+            if cleanup_object.get("phase").and_then(Value::as_str) != Some("pending") {
+                return Err(validation_error(
+                    "research.native_recovery.cleanup",
+                    "phase must remain pending before startup completion",
+                ));
+            }
+            cleanup_object.insert("phase".to_owned(), Value::String("complete".to_owned()));
+            cleanup_object.insert("completed_at".to_owned(), json!(now));
+            notes_json = Some(notes.to_string());
+        }
+
+        if active_owner && (review_running || review_ready || review_retry) {
+            let (run_status, run_error, final_gate) = if review_ready {
+                ("completed", None, "released")
+            } else if review_retry {
+                (
+                    "failed",
+                    current.failure_code.as_deref(),
+                    "failed",
+                )
+            } else {
+                let final_gate = if owner.gate_state == "released" {
+                    "released"
+                } else {
+                    "failed"
+                };
+                ("failed", Some("research_interrupted"), final_gate)
+            };
+            let changed = transaction
+                .execute(
+                    "UPDATE agent_runs
+                     SET status = ?1, finished_at = ?2,
+                         last_error = ?3,
+                         launch_gate_state = ?4
+                     WHERE run_id = ?5 AND status IN ('starting','running')
+                       AND pid IS ?6",
+                    params![run_status, now, run_error, final_gate, run_id, current.owner_pid],
+                )
+                .map_err(database_error("retire startup research run"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "retire startup research run CAS",
+                });
+            }
+        }
+        if review_running {
+            let retry_at = now.saturating_add(
+                crate::retry::retry_backoff_seconds(current.attempt.max(1)),
+            );
+            let changed = transaction
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'retry_wait', failure_code = 'research_interrupted',
+                         finished_at = ?1, not_before = ?2, updated_at = ?1,
+                         notes_json = ?3
+                     WHERE review_id = ?4 AND state = 'running'
+                       AND agent_run_id = ?5 AND attempt = ?6
+                       AND session_generation = ?7
+                       AND ((notes_json IS NULL AND ?3 IS NULL) OR notes_json = ?8)",
+                    params![
+                        now,
+                        retry_at,
+                        notes_json,
+                        current.review_id,
+                        run_id,
+                        current.attempt,
+                        current.review_generation,
+                        current.notes_json,
+                    ],
+                )
+                .map_err(database_error("retry startup research review"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "retry startup research review CAS",
+                });
+            }
+        } else if notes_json != current.notes_json {
+            let changed = transaction
+                .execute(
+                    "UPDATE research_reviews
+                     SET notes_json = ?1, updated_at = ?2
+                     WHERE review_id = ?3 AND agent_run_id = ?4
+                       AND ((notes_json IS NULL AND ?5 IS NULL) OR notes_json = ?5)",
+                    params![
+                        notes_json,
+                        now,
+                        current.review_id,
+                        run_id,
+                        current.notes_json,
+                    ],
+                )
+                .map_err(database_error("complete startup research authority"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "complete startup research authority CAS",
+                });
+            }
+        }
+        if review_running {
+            let retry_at = now.saturating_add(
+                crate::retry::retry_backoff_seconds(current.attempt.max(1)),
+            );
+            let changed = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'retry_wait', lease_until = NULL,
+                         not_before = ?1, last_error = 'research_interrupted'
+                     WHERE event_id = ?2 AND status = ?3",
+                    params![retry_at, event_id, event_status],
+                )
+                .map_err(database_error("retry startup research event"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "retry startup research event CAS",
+                });
+            }
+        }
+        if review_ready && event_transient {
+            let changed = transaction
+                .execute(
+                    "UPDATE events
+                     SET status = 'completed', lease_until = NULL,
+                         completed_at = ?1, last_error = NULL
+                     WHERE project_id = ?2 AND event_id = ?3 AND status = ?4",
+                    params![now, current.project_id, event_id, event_status],
+                )
+                .map_err(database_error("complete startup ready research event"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "complete startup ready research event CAS",
+                });
+            }
+        }
+        if review_retry && event_transient {
+            let retry_at = now.saturating_add(
+                crate::retry::retry_backoff_seconds(current.attempt.max(1)),
+            );
+            let changed = if current.state == "blocked" {
+                transaction
+                    .execute(
+                        "UPDATE events
+                         SET status = 'failed', lease_until = NULL,
+                             completed_at = ?1, last_error = ?2
+                         WHERE event_id = ?3 AND status = ?4",
+                        params![now, current.failure_code, event_id, event_status],
+                    )
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE events
+                         SET status = 'retry_wait', lease_until = NULL,
+                             not_before = ?1, completed_at = NULL, last_error = ?2
+                         WHERE event_id = ?3 AND status = ?4",
+                        params![retry_at, current.failure_code, event_id, event_status],
+                    )
+            }
+            .map_err(database_error("settle startup research event policy"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "settle startup research event policy CAS",
+                });
+            }
+        }
+        if review_running && parsed_authority.fresh_launch && !parsed_authority.session_confirmed {
+            let campaign_session = current.campaign_session.clone();
+            let campaign_generation = current.campaign_generation;
+            if campaign_session.is_some() {
+            let changed = transaction
+                .execute(
+                    "UPDATE campaign_research
+                     SET session_id = NULL, updated_at = ?1
+                     WHERE campaign_id = ?2 AND session_generation = ?3
+                       AND session_id = ?4",
+                    params![
+                        now,
+                        current.campaign_id,
+                        campaign_generation,
+                        campaign_session,
+                    ],
+                )
+                .map_err(database_error("clear interrupted fresh research session"))?;
+            if changed != 1 {
+                return Err(AppError::Runtime {
+                    operation: "clear interrupted fresh research session CAS",
+                });
+            }
+            }
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit startup research owner retirement"))?;
+        Ok(true)
+    }
+
     pub fn block_review(
         &self,
         review_id: &str,
@@ -2509,6 +2996,12 @@ impl<'db> ResearchRepository<'db> {
             .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| json!({}));
+        if let Some(notes) = recovery_notes.as_object_mut() {
+            // A new bind starts with a pending proof.  A prior confirmed
+            // session belongs to the previous attempt and must not survive
+            // as if this run had already confirmed its session.
+            notes.remove("confirmed_session_id");
+        }
         recovery_notes["session_binding"] = json!("pending");
         recovery_notes["planned_session_id"] = json!(binding.session_id);
         recovery_notes["attempt"] = json!(binding.attempt);
@@ -3246,8 +3739,100 @@ struct NativeRecoveryAuthority {
 struct NativeRecoveryCleanup {
     phase: String,
     #[serde(default)]
-    #[serde(rename = "completed_at")]
-    _completed_at: Option<i64>,
+    completed_at: Option<i64>,
+}
+
+/// The joined database fields used to validate one persisted native research
+/// owner.  The authority itself is intentionally validated separately from
+/// SQL lineage and project joins so every recovery/admission caller shares the
+/// same strict notes parser.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeResearchBindingExpectation<'a> {
+    pub review_id: &'a str,
+    pub campaign_id: &'a str,
+    pub experiment_id: &'a str,
+    pub attempt: i64,
+    pub session_generation: i64,
+    pub agent_run_id: i64,
+    pub state: &'a str,
+    pub failure_code: Option<&'a str>,
+    pub campaign_session: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeResearchAuthorityView {
+    pub fresh_launch: bool,
+    pub session_id: String,
+    pub session_confirmed: bool,
+    pub cleanup_complete: bool,
+    pub identity: PrivateRunTempRecoveryIdentityV1,
+}
+
+struct NativeResearchOwnerRow {
+    review_id: String,
+    campaign_id: String,
+    experiment_id: String,
+    attempt: i64,
+    review_generation: i64,
+    agent_run_id: i64,
+    state: String,
+    failure_code: Option<String>,
+    campaign_session: Option<String>,
+    campaign_generation: i64,
+    notes_json: Option<String>,
+    event_id: Option<i64>,
+    project_id: String,
+    owner_project_id: Option<String>,
+    owner_execution_kind: Option<String>,
+    owner_status: Option<String>,
+    owner_gate_state: Option<String>,
+    owner_pid: Option<i64>,
+    owner_primary_event_id: Option<i64>,
+    owner_log_path: Option<PathBuf>,
+    owner_policy_code: Option<String>,
+    owner_failure_stage: Option<String>,
+    event_project_id: Option<String>,
+    event_kind: Option<String>,
+    event_campaign_id: Option<String>,
+    event_experiment_id: Option<String>,
+    experiment_campaign_id: Option<String>,
+    review_event_link_count: i64,
+    total_event_link_count: i64,
+    bound_review_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StartupResearchOwner {
+    pub run_id: i64,
+    pub project_id: String,
+    pub review_id: String,
+    pub pid: Option<i64>,
+    pub status: String,
+    pub gate_state: String,
+    pub policy_code: Option<String>,
+    pub failure_stage: Option<String>,
+    pub log_path: Option<PathBuf>,
+    pub review_state: String,
+    pub failure_code: Option<String>,
+    pub notes_json: Option<String>,
+    pub marker_absent: bool,
+    pub authority: Option<NativeResearchAuthorityView>,
+}
+
+fn native_recovery_immutable_notes(notes_json: Option<&str>) -> Option<String> {
+    let mut notes = serde_json::from_str::<Value>(notes_json?).ok()?;
+    let authority = notes.get_mut("native_recovery")?.as_object_mut()?;
+    authority.remove("cleanup");
+    serde_json::to_string(&notes).ok()
+}
+
+pub(crate) fn native_research_authority_immutable_matches(
+    expected: &NativeResearchAuthorityView,
+    current: &NativeResearchAuthorityView,
+) -> bool {
+    expected.fresh_launch == current.fresh_launch
+        && expected.session_id == current.session_id
+        && expected.identity == current.identity
 }
 
 fn parse_native_recovery_authority(value: &Value) -> Result<NativeRecoveryAuthority, AppError> {
@@ -3255,6 +3840,502 @@ fn parse_native_recovery_authority(value: &Value) -> Result<NativeRecoveryAuthor
         operation: "parse native research recovery authority",
         source,
     })
+}
+
+/// Strictly validate the immutable native recovery proof against the current
+/// joined research row.  Missing, malformed, foreign, and substituted proof
+/// all fail closed as `None`; SQL callers classify a row with no binding
+/// separately when needed.
+pub(crate) fn native_research_authority(
+    notes_json: Option<&str>,
+    expected: &NativeResearchBindingExpectation<'_>,
+) -> Option<NativeResearchAuthorityView> {
+    let notes = serde_json::from_str::<Value>(notes_json?).ok()?;
+    let parsed = parse_native_recovery_authority(notes.get("native_recovery")?).ok()?;
+    if parsed.version != PrivateRunTempRecoveryIdentityV1::VERSION
+        || parsed.run_id != expected.agent_run_id
+        || parsed.review_id != expected.review_id
+        || parsed.campaign_id != expected.campaign_id
+        || parsed.experiment_id != expected.experiment_id
+        || parsed.attempt != expected.attempt
+        || parsed.session_generation != expected.session_generation
+        || parsed.session_id.is_empty()
+        || validate_session_id(&parsed.session_id).is_err()
+        || !matches!(parsed.cleanup.phase.as_str(), "pending" | "complete")
+        || (parsed.cleanup.phase == "complete" && parsed.cleanup.completed_at.is_none())
+    {
+        return None;
+    }
+
+    let planned_session = notes.get("planned_session_id").and_then(Value::as_str);
+    let confirmed_session = notes.get("confirmed_session_id").and_then(Value::as_str);
+    let session_binding = notes.get("session_binding").and_then(Value::as_str);
+    let session_shape_matches = if parsed.fresh_launch {
+        match expected.campaign_session {
+            Some(campaign_session)
+                if confirmed_session == Some(campaign_session)
+                    && session_binding == Some("confirmed") =>
+            {
+                planned_session == Some(parsed.session_id.as_str())
+                    && validate_session_id(campaign_session).is_ok()
+                    && confirmed_session.is_some_and(|session| validate_session_id(session).is_ok())
+            }
+            Some(campaign_session)
+                if expected.state == "running"
+                    && campaign_session == parsed.session_id
+                    && confirmed_session.is_none()
+                    && session_binding == Some("pending") =>
+            {
+                planned_session == Some(parsed.session_id.as_str())
+            }
+            _ => false,
+        }
+    } else {
+        let resumed_pending = matches!(expected.state, "running" | "retry_wait" | "blocked")
+            && expected.campaign_session == Some(parsed.session_id.as_str())
+            && planned_session == Some(parsed.session_id.as_str())
+            && session_binding == Some("pending")
+            && confirmed_session.is_none();
+        let resumed_confirmed = expected.campaign_session == Some(parsed.session_id.as_str())
+            && expected
+                .campaign_session
+                .is_some_and(|session| validate_session_id(session).is_ok())
+            && planned_session == Some(parsed.session_id.as_str())
+            && session_binding == Some("confirmed")
+            && confirmed_session == Some(parsed.session_id.as_str())
+            && confirmed_session
+                .is_some_and(|session| validate_session_id(session).is_ok());
+        resumed_pending || resumed_confirmed
+    };
+    let fresh_cleared = parsed.fresh_launch
+        && expected.campaign_session.is_none()
+        && matches!(expected.state, "retry_wait" | "blocked")
+        && expected.failure_code.is_some()
+        && confirmed_session.is_none()
+        && planned_session == Some(parsed.session_id.as_str())
+        && session_binding == Some("pending");
+    if !session_shape_matches && !fresh_cleared {
+        return None;
+    }
+    let session_confirmed = if parsed.fresh_launch {
+        session_binding == Some("confirmed")
+            && confirmed_session.is_some()
+            && expected.campaign_session.is_some()
+    } else {
+        session_binding == Some("confirmed")
+            && confirmed_session == Some(parsed.session_id.as_str())
+    };
+
+    Some(NativeResearchAuthorityView {
+        fresh_launch: parsed.fresh_launch,
+        session_id: parsed.session_id,
+        session_confirmed,
+        cleanup_complete: parsed.cleanup.phase == "complete",
+        identity: PrivateRunTempRecoveryIdentityV1 {
+            service_root_identity: parsed.service_root_identity,
+            temp_identity: parsed.temp_identity,
+        },
+    })
+}
+
+fn native_research_historical_authority(
+    notes_json: Option<&str>,
+    expected: &NativeResearchBindingExpectation<'_>,
+) -> Option<NativeResearchAuthorityView> {
+    let notes = serde_json::from_str::<Value>(notes_json?).ok()?;
+    let parsed = parse_native_recovery_authority(notes.get("native_recovery")?).ok()?;
+    if parsed.version != PrivateRunTempRecoveryIdentityV1::VERSION
+        || parsed.run_id != expected.agent_run_id
+        || parsed.review_id != expected.review_id
+        || parsed.campaign_id != expected.campaign_id
+        || parsed.experiment_id != expected.experiment_id
+        || parsed.attempt != expected.attempt
+        || parsed.session_generation != expected.session_generation
+        || parsed.session_id.is_empty()
+        || validate_session_id(&parsed.session_id).is_err()
+        || !matches!(parsed.cleanup.phase.as_str(), "pending" | "complete")
+        || (parsed.cleanup.phase == "complete" && parsed.cleanup.completed_at.is_none())
+        || notes.get("planned_session_id").and_then(Value::as_str)
+            != Some(parsed.session_id.as_str())
+        || notes.get("session_binding").and_then(Value::as_str) != Some("confirmed")
+    {
+        return None;
+    }
+    let confirmed_session = notes.get("confirmed_session_id").and_then(Value::as_str)?;
+    if validate_session_id(confirmed_session).is_err()
+        || (!parsed.fresh_launch && confirmed_session != parsed.session_id)
+    {
+        return None;
+    }
+    Some(NativeResearchAuthorityView {
+        fresh_launch: parsed.fresh_launch,
+        session_id: parsed.session_id,
+        session_confirmed: true,
+        cleanup_complete: parsed.cleanup.phase == "complete",
+        identity: PrivateRunTempRecoveryIdentityV1 {
+            service_root_identity: parsed.service_root_identity,
+            temp_identity: parsed.temp_identity,
+        },
+    })
+}
+
+pub(crate) fn project_has_unresolved_native_research_owner(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<bool, AppError> {
+    for row in native_research_owner_rows(connection, Some(project_id))? {
+        if !native_research_owner_is_complete(&row) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn native_cleanup_blocked_project_ids(
+    connection: &Connection,
+) -> Result<BTreeSet<String>, AppError> {
+    let mut blocked = BTreeSet::new();
+    for row in native_research_owner_rows(connection, None)? {
+        if !native_research_owner_is_complete(&row) {
+            blocked.insert(row.project_id);
+        }
+    }
+    Ok(blocked)
+}
+
+fn native_research_owner_rows(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<Vec<NativeResearchOwnerRow>, AppError> {
+    let filter = if project_id.is_some() {
+        " AND campaign.project_id = ?1"
+    } else {
+        ""
+    };
+    let query = format!(
+        "SELECT review.review_id, review.campaign_id, review.experiment_id,
+                review.attempt, review.session_generation,
+                review.agent_run_id, review.state, review.failure_code,
+                research_state.session_id, research_state.session_generation,
+                review.notes_json, review.event_id, campaign.project_id,
+                owner.project_id, owner.execution_kind, owner.status,
+                owner.launch_gate_state, owner.pid, owner.primary_event_id,
+                owner.log_path, owner.policy_code, owner.failure_stage,
+                event.project_id, event.kind, event.campaign_id,
+                event.experiment_id,
+                experiment.campaign_id,
+                (SELECT COUNT(*) FROM agent_run_events AS link
+                   WHERE link.project_id = owner.project_id
+                     AND link.run_id = owner.run_id
+                     AND link.event_id = review.event_id),
+                (SELECT COUNT(*) FROM agent_run_events AS link
+                   WHERE link.project_id = owner.project_id
+                     AND link.run_id = owner.run_id),
+                (SELECT COUNT(*) FROM research_reviews AS bound_review
+                   WHERE bound_review.agent_run_id = owner.run_id)
+         FROM research_reviews AS review
+         JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id
+         JOIN campaign_research AS research_state
+           ON research_state.campaign_id = review.campaign_id
+         LEFT JOIN experiments AS experiment
+           ON experiment.experiment_id = review.experiment_id
+         LEFT JOIN agent_runs AS owner ON owner.run_id = review.agent_run_id
+         LEFT JOIN events AS event ON event.event_id = review.event_id
+         WHERE review.agent_run_id IS NOT NULL{filter}
+         ORDER BY campaign.project_id, review.review_id"
+    );
+    let mut statement = connection
+        .prepare(&query)
+        .map_err(database_error("prepare native research owner query"))?;
+    let rows = match project_id {
+        Some(project_id) => statement
+            .query_map([project_id], native_research_owner_row_from_sql),
+        None => statement.query_map([], native_research_owner_row_from_sql),
+    }
+    .map_err(database_error("query native research owners"))?;
+    let mut owners = rows
+        .map(|row| row.map_err(database_error("read native research owner")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Keep malformed or unbound native runs in the blocker universe.  The
+    // joined review query above intentionally exposes the full lineage when
+    // it exists, while this owner-rooted arm preserves a run whose review,
+    // campaign, or campaign_research row has disappeared or never bound.
+    let owner_filter = if project_id.is_some() {
+        " AND owner.project_id = ?1"
+    } else {
+        ""
+    };
+    let unknown_query = format!(
+        "SELECT owner.run_id, owner.project_id, owner.status,
+                owner.launch_gate_state, owner.pid, owner.log_path,
+                owner.policy_code, owner.failure_stage
+         FROM agent_runs AS owner
+         WHERE owner.execution_kind = 'campaign_research'{owner_filter}
+           AND NOT EXISTS (
+               SELECT 1
+               FROM research_reviews AS review
+               JOIN campaigns AS campaign
+                 ON campaign.campaign_id = review.campaign_id
+               JOIN campaign_research AS research_state
+                 ON research_state.campaign_id = review.campaign_id
+               WHERE review.agent_run_id = owner.run_id
+           )
+         ORDER BY owner.project_id, owner.run_id"
+    );
+    let mut statement = connection
+        .prepare(&unknown_query)
+        .map_err(database_error("prepare unbound native research owner query"))?;
+    let mut unknown_rows = Vec::new();
+    match project_id {
+        Some(project_id) => {
+            let rows = statement
+                .query_map([project_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })
+                .map_err(database_error("query unbound native research owners"))?;
+            unknown_rows.extend(
+                rows.map(|row| row.map_err(database_error("read unbound native research owner")))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        None => {
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })
+                .map_err(database_error("query unbound native research owners"))?;
+            unknown_rows.extend(
+                rows.map(|row| row.map_err(database_error("read unbound native research owner")))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+    }
+    for unknown in unknown_rows {
+        let (
+            agent_run_id,
+            project_id,
+            owner_status,
+            owner_gate_state,
+            owner_pid,
+            owner_log_path,
+            owner_policy_code,
+            owner_failure_stage,
+        ) = unknown;
+        owners.push(NativeResearchOwnerRow {
+            review_id: String::new(),
+            campaign_id: String::new(),
+            experiment_id: String::new(),
+            attempt: 0,
+            review_generation: -1,
+            agent_run_id,
+            state: String::new(),
+            failure_code: None,
+            campaign_session: None,
+            campaign_generation: -1,
+            notes_json: None,
+            event_id: None,
+            project_id: project_id.clone(),
+            owner_project_id: Some(project_id.clone()),
+            owner_execution_kind: Some("campaign_research".to_owned()),
+            owner_status: Some(owner_status),
+            owner_gate_state: Some(owner_gate_state),
+            owner_pid,
+            owner_primary_event_id: None,
+            owner_log_path: owner_log_path.map(PathBuf::from),
+            owner_policy_code,
+            owner_failure_stage,
+            event_project_id: None,
+            event_kind: None,
+            event_campaign_id: None,
+            event_experiment_id: None,
+            experiment_campaign_id: None,
+            review_event_link_count: 0,
+            total_event_link_count: 0,
+            bound_review_count: 0,
+        });
+    }
+    Ok(owners)
+}
+
+fn native_research_owner_row_from_sql(
+    row: &Row<'_>,
+) -> rusqlite::Result<NativeResearchOwnerRow> {
+    Ok(NativeResearchOwnerRow {
+        review_id: row.get(0)?,
+        campaign_id: row.get(1)?,
+        experiment_id: row.get(2)?,
+        attempt: row.get(3)?,
+        review_generation: row.get(4)?,
+        agent_run_id: row.get(5)?,
+        state: row.get(6)?,
+        failure_code: row.get(7)?,
+        campaign_session: row.get(8)?,
+        campaign_generation: row.get(9)?,
+        notes_json: row.get(10)?,
+        event_id: row.get(11)?,
+        project_id: row.get(12)?,
+        owner_project_id: row.get(13)?,
+        owner_execution_kind: row.get(14)?,
+        owner_status: row.get(15)?,
+        owner_gate_state: row.get(16)?,
+        owner_pid: row.get(17)?,
+        owner_primary_event_id: row.get(18)?,
+        owner_log_path: row.get::<_, Option<String>>(19)?.map(PathBuf::from),
+        owner_policy_code: row.get(20)?,
+        owner_failure_stage: row.get(21)?,
+        event_project_id: row.get(22)?,
+        event_kind: row.get(23)?,
+        event_campaign_id: row.get(24)?,
+        event_experiment_id: row.get(25)?,
+        experiment_campaign_id: row.get(26)?,
+        review_event_link_count: row.get(27)?,
+        total_event_link_count: row.get(28)?,
+        bound_review_count: row.get(29)?,
+    })
+}
+
+fn native_research_owner_lineage_valid(row: &NativeResearchOwnerRow) -> bool {
+    row.event_id.is_some()
+        && row.owner_project_id.as_deref() == Some(row.project_id.as_str())
+        && row.owner_execution_kind.as_deref() == Some("campaign_research")
+        && row.owner_primary_event_id == row.event_id
+        && row.event_project_id.as_deref() == Some(row.project_id.as_str())
+        && row.event_kind.as_deref() == Some("campaign_research")
+        && row.event_campaign_id.as_deref() == Some(row.campaign_id.as_str())
+        && row.event_experiment_id.as_deref() == Some(row.experiment_id.as_str())
+        && row.experiment_campaign_id.as_deref() == Some(row.campaign_id.as_str())
+        && row.review_event_link_count == 1
+        && row.total_event_link_count == 1
+        && row.bound_review_count == 1
+}
+
+fn native_research_owner_is_complete(row: &NativeResearchOwnerRow) -> bool {
+    if !native_research_owner_lineage_valid(row)
+        || !matches!(
+            row.owner_status.as_deref(),
+            Some("completed" | "failed" | "timed_out" | "cancelled")
+        )
+        || !matches!(row.owner_gate_state.as_deref(), Some("released" | "failed"))
+    {
+        return false;
+    }
+    if matches!(row.state.as_str(), "completed" | "discarded") {
+        return native_research_historical_authority_complete(row);
+    }
+    if row.review_generation != row.campaign_generation {
+        return false;
+    }
+    let expected = NativeResearchBindingExpectation {
+        review_id: &row.review_id,
+        campaign_id: &row.campaign_id,
+        experiment_id: &row.experiment_id,
+        attempt: row.attempt,
+        session_generation: row.review_generation,
+        agent_run_id: row.agent_run_id,
+        state: &row.state,
+        failure_code: row.failure_code.as_deref(),
+        campaign_session: row.campaign_session.as_deref(),
+    };
+    native_research_authority(row.notes_json.as_deref(), &expected)
+        .is_some_and(|authority| authority.cleanup_complete)
+}
+
+fn native_research_historical_authority_complete(row: &NativeResearchOwnerRow) -> bool {
+    let Some(notes_json) = row.notes_json.as_deref() else {
+        return false;
+    };
+    let expected = NativeResearchBindingExpectation {
+        review_id: &row.review_id,
+        campaign_id: &row.campaign_id,
+        experiment_id: &row.experiment_id,
+        attempt: row.attempt,
+        session_generation: row.review_generation,
+        agent_run_id: row.agent_run_id,
+        state: &row.state,
+        failure_code: row.failure_code.as_deref(),
+        campaign_session: None,
+    };
+    native_research_historical_authority(Some(notes_json), &expected).is_some_and(|authority| {
+        authority.cleanup_complete
+    })
+}
+
+fn startup_research_owner_from_row(
+    row: NativeResearchOwnerRow,
+    marker_absent: bool,
+) -> StartupResearchOwner {
+    let expected = NativeResearchBindingExpectation {
+        review_id: &row.review_id,
+        campaign_id: &row.campaign_id,
+        experiment_id: &row.experiment_id,
+        attempt: row.attempt,
+        session_generation: row.review_generation,
+        agent_run_id: row.agent_run_id,
+        state: &row.state,
+        failure_code: row.failure_code.as_deref(),
+        campaign_session: row.campaign_session.as_deref(),
+    };
+    let authority = if matches!(row.state.as_str(), "completed" | "discarded") {
+        native_research_historical_authority(row.notes_json.as_deref(), &expected)
+    } else {
+        native_research_authority(row.notes_json.as_deref(), &expected)
+    };
+    StartupResearchOwner {
+        run_id: row.agent_run_id,
+        project_id: row.project_id,
+        review_id: row.review_id,
+        pid: row.owner_pid,
+        status: row.owner_status.unwrap_or_default(),
+        gate_state: row.owner_gate_state.unwrap_or_default(),
+        policy_code: row.owner_policy_code,
+        failure_stage: row.owner_failure_stage,
+        log_path: row.owner_log_path,
+        review_state: row.state,
+        failure_code: row.failure_code,
+        notes_json: row.notes_json,
+        marker_absent,
+        authority,
+    }
+}
+
+pub(crate) fn startup_research_owner_snapshot(
+    db: &Db,
+    preserved_run_ids: &[i64],
+    absent_pending_marker_ids: &BTreeSet<i64>,
+) -> Result<std::collections::BTreeMap<i64, StartupResearchOwner>, AppError> {
+    let repository = ResearchRepository::new(db);
+    let mut owners = std::collections::BTreeMap::new();
+    for run_id in preserved_run_ids {
+        if let Some(owner) = repository.startup_native_owner(
+            *run_id,
+            absent_pending_marker_ids.contains(run_id),
+        )? {
+            owners.insert(*run_id, owner);
+        }
+    }
+    for owner in repository.list_native_cleanup_pending_terminal_runs()? {
+        owners.entry(owner.run_id).or_insert(owner);
+    }
+    Ok(owners)
 }
 
 struct NativeRecoveryCleanupExpectation<'a> {
@@ -3273,51 +4354,21 @@ fn native_recovery_cleanup_complete(
     notes_json: Option<&str>,
     expected: &NativeRecoveryCleanupExpectation<'_>,
 ) -> bool {
-    notes_json
-        .and_then(|notes| serde_json::from_str::<Value>(notes).ok())
-        .and_then(|notes| {
-            let authority = notes.get("native_recovery")?;
-            let parsed = parse_native_recovery_authority(authority).ok()?;
-            let planned_session = notes
-                .get("planned_session_id")
-                .and_then(Value::as_str);
-            let confirmed_session = notes
-                .get("confirmed_session_id")
-                .and_then(Value::as_str);
-            let session_binding = notes
-                .get("session_binding")
-                .and_then(Value::as_str);
-            let session_shape_matches = if parsed.fresh_launch {
-                match expected.campaign_session {
-                    Some(campaign_session) => {
-                        planned_session == Some(parsed.session_id.as_str())
-                            && confirmed_session == Some(campaign_session)
-                            && session_binding == Some("confirmed")
-                    }
-                    None => {
-                        matches!(expected.state, "retry_wait" | "blocked")
-                            && expected.failure_code.is_some()
-                            && confirmed_session.is_none()
-                            && planned_session == Some(parsed.session_id.as_str())
-                            && session_binding == Some("pending")
-                    }
-                }
-            } else {
-                expected.campaign_session == Some(parsed.session_id.as_str())
-            };
-            (parsed.cleanup.phase == "complete"
-                && parsed.version == PrivateRunTempRecoveryIdentityV1::VERSION
-                && parsed.run_id == expected.agent_run_id
-                && parsed.review_id == expected.review_id
-                && parsed.campaign_id == expected.campaign_id
-                && parsed.experiment_id == expected.experiment_id
-                && parsed.attempt == expected.attempt
-                && parsed.session_generation == expected.session_generation
-                && !parsed.session_id.is_empty()
-                && session_shape_matches)
-            .then_some(())
-        })
-        .is_some()
+    native_research_authority(
+        notes_json,
+        &NativeResearchBindingExpectation {
+            review_id: expected.review_id,
+            campaign_id: expected.campaign_id,
+            experiment_id: expected.experiment_id,
+            attempt: expected.attempt,
+            session_generation: expected.session_generation,
+            agent_run_id: expected.agent_run_id,
+            state: expected.state,
+            failure_code: expected.failure_code,
+            campaign_session: expected.campaign_session,
+        },
+    )
+    .is_some_and(|authority| authority.cleanup_complete)
 }
 
 fn parse_research_notes(notes_json: Option<&str>) -> Result<Value, AppError> {

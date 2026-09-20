@@ -50,6 +50,7 @@ use crate::{
 use super::{
     database_error,
     decisions::{campaign_decision_dedup_key, DecisionRepository, DecisionReservation},
+    research::{native_research_authority, NativeResearchBindingExpectation, ResearchRepository},
     Db,
 };
 
@@ -3671,21 +3672,30 @@ fn editor_recovery_binding(
     Ok((true, valid))
 }
 
-/// Validate the immutable durable identity of a campaign-research owner.  An
-/// active native row is preserved only when exactly one review points to it,
-/// the campaign still belongs to this project, and the review/session/context
-/// lineage is complete.  Unknown or contradictory ownership fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResearchRecoveryBindingStatus {
+    Missing,
+    Valid,
+    RecoveryRequired,
+    LineageCorrupt,
+}
+
+/// Validate the immutable durable identity of a campaign-research owner.  A
+/// structurally sound SQL binding with missing or malformed native authority
+/// is preserved for dedicated recovery; only contradictory SQL lineage is
+/// classified as corrupt.
 fn research_recovery_binding(
     transaction: &Transaction<'_>,
     project_id: &str,
     agent_run_id: i64,
-) -> Result<(bool, bool), AppError> {
+) -> Result<ResearchRecoveryBindingStatus, AppError> {
     let mut statement = transaction
         .prepare(
             "SELECT r.review_id, r.campaign_id, r.experiment_id, r.attempt,
                     r.state, r.agent_run_id, r.context_json, r.context_digest,
                     r.session_generation, c.session_id, c.session_generation,
                     r.event_id, r.response_json, r.failure_code, r.finished_at,
+                    r.notes_json,
                     campaign.project_id
              FROM research_reviews AS r
              JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
@@ -3711,14 +3721,18 @@ fn research_recovery_binding(
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, Option<String>>(13)?,
                 row.get::<_, Option<i64>>(14)?,
-                row.get::<_, String>(15)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, String>(16)?,
             ))
         })
         .map_err(database_error("query campaign research recovery binding"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(database_error("read campaign research recovery binding"))?;
+    if rows.is_empty() {
+        return Ok(ResearchRecoveryBindingStatus::Missing);
+    }
     if rows.len() != 1 {
-        return Ok((!rows.is_empty(), false));
+        return Ok(ResearchRecoveryBindingStatus::LineageCorrupt);
     }
     let (
         review_id,
@@ -3736,6 +3750,7 @@ fn research_recovery_binding(
         response_json,
         failure_code,
         finished_at,
+        notes_json,
         bound_project_id,
     ) = &rows[0];
     let context_valid = context_json.as_deref().is_some_and(|context| {
@@ -3777,13 +3792,36 @@ fn research_recovery_binding(
                             | "research_exit"
                             | "research_launch"
                             | "research_session_missing"
+                            | "research_session_unsafe"
                             | "research_interrupted"
                     )
                 })
         }
         _ => false,
     };
-    let valid = !review_id.is_empty()
+    let session_lineage_valid = session_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || (session_id.is_none()
+            && state == "retry_wait"
+            && failure_code.as_ref().is_some_and(|code| !code.is_empty()));
+    let event_link_valid = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM agent_run_events AS binding
+                 JOIN events AS event
+                   ON event.project_id = binding.project_id
+                  AND event.event_id = binding.event_id
+                 WHERE binding.project_id = ?1 AND binding.run_id = ?2
+                   AND binding.event_id = ?3
+                   AND event.kind = 'campaign_research'
+             )",
+            params![project_id, agent_run_id, event_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error("validate campaign research event lineage"))?;
+    let valid_lineage = !review_id.is_empty()
         && !campaign_id.is_empty()
         && !experiment_id.is_empty()
         && transaction
@@ -3804,18 +3842,30 @@ fn research_recovery_binding(
         && context_valid
         && terminal_payload_valid
         && *review_generation == *campaign_generation
-        && session_id.as_deref().is_some_and(|value| !value.is_empty());
-    let event_link_valid = transaction
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM agent_run_events
-                 WHERE project_id = ?1 AND run_id = ?2 AND event_id = ?3
-             )",
-            params![project_id, agent_run_id, event_id],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(database_error("validate campaign research event lineage"))?;
-    Ok((true, valid && event_link_valid))
+        && session_lineage_valid
+        && event_link_valid;
+    if !valid_lineage {
+        return Ok(ResearchRecoveryBindingStatus::LineageCorrupt);
+    }
+    let authority = native_research_authority(
+        notes_json.as_deref(),
+        &NativeResearchBindingExpectation {
+            review_id,
+            campaign_id,
+            experiment_id,
+            attempt: *attempt,
+            session_generation: *review_generation,
+            agent_run_id,
+            state,
+            failure_code: failure_code.as_deref(),
+            campaign_session: session_id.as_deref(),
+        },
+    );
+    Ok(if authority.is_some() {
+        ResearchRecoveryBindingStatus::Valid
+    } else {
+        ResearchRecoveryBindingStatus::RecoveryRequired
+    })
 }
 
 impl From<RetryPolicy> for GateFailurePolicy {
@@ -3908,12 +3958,59 @@ impl<'db> AgentRunRepository<'db> {
         reservation_token: Option<&str>,
         _run_id_guard: &RunIdAdmissionGuard,
     ) -> Result<AgentRun, AppError> {
+        self.insert_with_events_and_reservation_with_guard_inner(
+            run,
+            event_ids,
+            reservation_token,
+            _run_id_guard,
+            false,
+        )
+    }
+
+    /// Insert a native run only when the durable research-cleanup owner gate
+    /// is clear.  The check is inside this insertion transaction so another
+    /// daemon cannot publish a run or consume its event/intervention binding
+    /// between the owner query and the insertion CAS.
+    pub(crate) fn insert_native_with_events_and_reservation_with_guard(
+        &self,
+        run: &NewAgentRun,
+        event_ids: &[i64],
+        reservation_token: Option<&str>,
+        run_id_guard: &RunIdAdmissionGuard,
+    ) -> Result<AgentRun, AppError> {
+        self.insert_with_events_and_reservation_with_guard_inner(
+            run,
+            event_ids,
+            reservation_token,
+            run_id_guard,
+            true,
+        )
+    }
+
+    fn insert_with_events_and_reservation_with_guard_inner(
+        &self,
+        run: &NewAgentRun,
+        event_ids: &[i64],
+        reservation_token: Option<&str>,
+        _run_id_guard: &RunIdAdmissionGuard,
+        require_native_gate: bool,
+    ) -> Result<AgentRun, AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error(
                 "begin agent run, event, and intervention insertion",
             ))?;
+        if require_native_gate
+            && ResearchRepository::project_has_unresolved_native_research_owner(
+                &transaction,
+                &run.project_id,
+            )?
+        {
+            return Err(AppError::Runtime {
+                operation: "defer native launch while research cleanup owner is unresolved",
+            });
+        }
         let reservation_count = if let Some(reservation_token) = reservation_token {
             let (total, bound): (i64, i64) = transaction
                 .query_row(
@@ -4361,38 +4458,63 @@ impl<'db> AgentRunRepository<'db> {
                         message: "durable code-change editor binding requires code_change_editor execution kind",
                     });
                 }
-                let (has_research_binding, valid_research_binding) =
+                let research_binding =
                     research_recovery_binding(&transaction, &project.project_id, *run_id)?;
-                if execution_kind.as_deref() == Some("campaign_research")
-                    && !valid_research_binding
-                {
-                    // Do not hand an uncertain research owner to generic
-                    // recovery.  If a review row is still discoverable,
-                    // block it durably; the active run remains untouched so
-                    // an unknown PID/gate cannot be resumed elsewhere.
-                    transaction
-                        .execute(
-                            "UPDATE research_reviews
-                             SET state = 'blocked', failure_code = 'research_lineage_corrupt',
-                                 finished_at = ?1, updated_at = ?1
-                             WHERE agent_run_id = ?2 AND state <> 'ready'",
-                            params![finished_at, *run_id],
-                        )
-                        .map_err(database_error("block corrupt campaign research binding"))?;
-                    transaction
-                        .execute(
-                            "UPDATE campaign_research
-                             SET blocked_reason = 'research_lineage_corrupt',
-                                 next_due_at = NULL, updated_at = ?1
-                             WHERE campaign_id IN (
-                                 SELECT campaign_id FROM research_reviews
-                                 WHERE agent_run_id = ?2
-                             )",
-                            params![finished_at, *run_id],
-                        )
-                        .map_err(database_error("block corrupt campaign research campaign"))?;
-                }
-                if execution_kind.as_deref() != Some("campaign_research") && has_research_binding {
+                if execution_kind.as_deref() == Some("campaign_research") {
+                    match research_binding {
+                        ResearchRecoveryBindingStatus::Valid => {}
+                        ResearchRecoveryBindingStatus::RecoveryRequired => {
+                            // Preserve the review, result, context, event,
+                            // and generic owner while making the campaign
+                            // ineligible until its native authority is
+                            // repaired.  Generic recovery must not guess a
+                            // process or session from incomplete proof.
+                            transaction
+                                .execute(
+                                    "UPDATE campaign_research
+                                     SET blocked_reason = 'research_recovery_required',
+                                         next_due_at = NULL, updated_at = ?1
+                                     WHERE campaign_id IN (
+                                         SELECT campaign_id FROM research_reviews
+                                         WHERE agent_run_id = ?2
+                                     )",
+                                    params![finished_at, *run_id],
+                                )
+                                .map_err(database_error(
+                                    "block campaign research pending authority recovery",
+                                ))?;
+                        }
+                        ResearchRecoveryBindingStatus::Missing
+                        | ResearchRecoveryBindingStatus::LineageCorrupt => {
+                            // A contradictory SQL binding is a durable
+                            // lineage failure.  Keep the active owner out of
+                            // generic recovery and block the linked review.
+                            transaction
+                                .execute(
+                                    "UPDATE research_reviews
+                                     SET state = 'blocked', failure_code = 'research_lineage_corrupt',
+                                         finished_at = ?1, updated_at = ?1
+                                     WHERE agent_run_id = ?2 AND state <> 'ready'",
+                                    params![finished_at, *run_id],
+                                )
+                                .map_err(database_error(
+                                    "block corrupt campaign research binding",
+                                ))?;
+                            transaction
+                                .execute(
+                                    "UPDATE campaign_research
+                                     SET blocked_reason = 'research_lineage_corrupt',
+                                         next_due_at = NULL, updated_at = ?1
+                                     WHERE campaign_id IN (
+                                         SELECT campaign_id FROM research_reviews
+                                         WHERE agent_run_id = ?2
+                                     )",
+                                    params![finished_at, *run_id],
+                                )
+                                .map_err(database_error("block corrupt campaign research campaign"))?;
+                        }
+                    }
+                } else if !matches!(research_binding, ResearchRecoveryBindingStatus::Missing) {
                     return Err(AppError::Validation {
                         field: "execution_kind",
                         message: "durable campaign-research binding requires campaign_research execution kind",

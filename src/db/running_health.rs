@@ -1,4 +1,6 @@
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use std::collections::BTreeSet;
+
+use rusqlite::{params, params_from_iter, OptionalExtension, ToSql, Transaction, TransactionBehavior};
 
 use crate::{
     models::{HealthState, RunningHealthRow, SignalSummaryEntry},
@@ -258,21 +260,45 @@ impl HealthRepository {
 
     /// Suspicious rows with diagnosis attempts left, oldest update first.
     pub fn due_diagnoses(db: &Db, limit: usize) -> Result<Vec<RunningHealthRow>, AppError> {
+        Self::due_diagnoses_excluding_projects(db, limit, &BTreeSet::new())
+    }
+
+    /// Suspicious rows excluding projects whose native cleanup owner is still
+    /// unresolved.  The project filter is part of the bounded SQL prefix so a
+    /// blocked oldest row cannot consume this pass's diagnosis capacity.
+    pub fn due_diagnoses_excluding_projects(
+        db: &Db,
+        limit: usize,
+        blocked_projects: &BTreeSet<String>,
+    ) -> Result<Vec<RunningHealthRow>, AppError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let fetch_limit = i64::try_from(limit.saturating_mul(4).max(limit)).unwrap_or(i64::MAX);
         let connection = db.connect()?;
+        let mut query = format!(
+            "{RUNNING_HEALTH_SELECT}
+             WHERE state = 'suspicious'"
+        );
+        if !blocked_projects.is_empty() {
+            query.push_str(" AND project_id NOT IN (");
+            query.push_str(
+                &(0..blocked_projects.len())
+                    .map(|index| format!("?{}", index + 2))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            query.push(')');
+        }
+        query.push_str(" ORDER BY updated_at, experiment_id LIMIT ?1");
         let mut statement = connection
-            .prepare(&format!(
-                "{RUNNING_HEALTH_SELECT}
-                 WHERE state = 'suspicious'
-                 ORDER BY updated_at, experiment_id
-                 LIMIT ?1"
-            ))
+            .prepare(&query)
             .map_err(database_error("prepare due running health diagnoses query"))?;
+        let mut values: Vec<&dyn ToSql> = Vec::with_capacity(blocked_projects.len() + 1);
+        values.push(&fetch_limit);
+        values.extend(blocked_projects.iter().map(|project| project as &dyn ToSql));
         let rows = statement
-            .query_map([fetch_limit], read_running_health_row)
+            .query_map(params_from_iter(values), read_running_health_row)
             .map_err(database_error("query due running health diagnoses"))?;
         let rows = rows
             .collect::<Result<Vec<_>, _>>()
