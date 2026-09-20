@@ -4631,7 +4631,18 @@ async fn campaign_submit_attached_candidate_links_deterministic_successor_and_re
     assert_eq!(experiment.status, ExperimentStatus::Accepted);
     assert_eq!(experiment.pueue_task_id, Some(41));
     assert_eq!(experiment.parent_experiment_id.as_deref(), Some(fixture.harness.source_experiment_id.as_str()));
-    assert!(experiment.resume_of_experiment_id.is_none());
+    let resume_of_experiment_id: Option<String> = fixture
+        .harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT resume_of_experiment_id FROM experiments WHERE experiment_id = ?1",
+            [expected_experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(resume_of_experiment_id.is_none());
     assert_eq!(
         attached_review_link(&fixture.harness.db, review_id),
         (Some(expected_experiment_id.to_owned()), "completed".to_owned(), None)
