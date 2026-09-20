@@ -27,6 +27,7 @@ use pueue_agent::{
     },
     process::MAX_FIELD_SIZE,
     proposals::{self, ProposalInput},
+    research::run_due_research,
     research_evidence::{build_research_evidence, ResearchEvidence},
     retry::RetryPolicy,
     state::ObjectiveSnapshot,
@@ -3147,4 +3148,166 @@ async fn research_finalization_retains_authority_when_campaign_generation_change
         )
         .unwrap();
     assert_eq!(campaign_generation, bound.session_generation + 1);
+}
+
+#[tokio::test]
+async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundary() {
+    let harness = ResearchHarness::new("coordinator-retry", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    harness.write_fixture_controls_with_mode(
+        &claimed.review.review_id,
+        &claimed.review.experiment_id,
+        &claimed.evidence.digest,
+        FIRST_SESSION,
+        true,
+        FIRST_SESSION,
+        false,
+        "malformed",
+    );
+
+    let first_report = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        NOW + 80,
+        1,
+    )
+    .await
+    .expect("coordinator must admit the first review attempt");
+    assert_eq!(first_report.started.len(), 1);
+    let first_run_id = first_report.started[0].run_id;
+    let mut first_handle = first_report
+        .started
+        .into_iter()
+        .next()
+        .expect("first coordinator launch");
+    assert_eq!(
+        first_handle.wait(&harness.db, NOW + 91).await.unwrap(),
+        AgentRunStatus::Failed
+    );
+
+    let failed = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(failed.state, "retry_wait");
+    assert_eq!(failed.agent_run_id, Some(first_run_id));
+    assert_eq!(failed.attempt, claimed.review.attempt);
+    let first_reservation = harness.reservation_id_for(&failed);
+    let event_id = review_event_id(&harness.db, &failed.review_id);
+    let review_wake: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
+            [&failed.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_wake = EventRepository::new(&harness.db)
+        .find_by_id(event_id)
+        .unwrap()
+        .unwrap()
+        .not_before;
+    let wake = review_wake.max(event_wake);
+
+    let before = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        wake - 1,
+        1,
+    )
+    .await
+    .expect("a retry before its wake must be a successful no-op");
+    assert!(before.started.is_empty());
+
+    let at_wake = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        wake,
+        1,
+    )
+    .await
+    .expect("the retry must be admitted at its durable wake");
+    assert_eq!(at_wake.started.len(), 1);
+    let second_run_id = at_wake.started[0].run_id;
+    assert_ne!(second_run_id, first_run_id);
+    let second = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(second.attempt, claimed.review.attempt + 1);
+    assert_eq!(second.agent_run_id, Some(second_run_id));
+    let second_reservation = harness.reservation_id_for(&second);
+    assert_ne!(first_reservation, second_reservation);
+    assert_eq!(harness.reservation_status(&first_reservation), "consumed");
+    assert_eq!(harness.reservation_status(&second_reservation), "consumed");
+
+    let mut second_handle = at_wake
+        .started
+        .into_iter()
+        .next()
+        .expect("second coordinator launch");
+    assert_eq!(
+        second_handle.wait(&harness.db, wake + 20).await.unwrap(),
+        AgentRunStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn research_coordinator_blocks_unsafe_session_probe_without_failing_the_pass() {
+    let harness = ResearchHarness::new("coordinator-unsafe-session", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    harness.seed_preexisting_owned_session(FIRST_SESSION);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET session_id = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![FIRST_SESSION, &harness.campaign_id],
+        )
+        .unwrap();
+    harness.replace_session_store_with_symlink();
+
+    let report = run_due_research(
+        &harness.db,
+        &harness.runner,
+        CampaignLimits::default(),
+        NOW + 80,
+        1,
+    )
+    .await
+    .expect("unsafe research session metadata must be durably handled");
+    assert!(report.started.is_empty());
+    assert_eq!(report.blocked, 1);
+    assert!(!harness.capture_path.exists());
+    let blocked = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(blocked.state, "blocked");
+    let failure_code: Option<String> = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+            [&blocked.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failure_code.as_deref(), Some("research_session_unsafe"));
+    let state = ResearchRepository::new(&harness.db)
+        .state(&harness.campaign_id)
+        .unwrap();
+    assert_eq!(state.blocked_reason.as_deref(), Some("research_session_unsafe"));
+    assert_eq!(
+        EventRepository::new(&harness.db)
+            .find_by_id(claimed.event_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        EventStatus::Failed
+    );
 }
