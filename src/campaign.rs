@@ -572,13 +572,18 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 candidate_submission_id(run_id),
             ),
         };
-        let acceptance = CampaignRepository::new(self.db).accept_code_change_candidate(
-            run_id,
-            &experiment_id,
-            &submission_id,
-            now,
-            &self.limits,
-        )?;
+        let campaign_repository = CampaignRepository::new(self.db);
+        let acceptance = if campaign_repository.candidate_requires_decision_route(run_id)? {
+            campaign_repository.accept_decision_code_change_candidate(run_id, now, &self.limits)?
+        } else {
+            campaign_repository.accept_code_change_candidate(
+                run_id,
+                &experiment_id,
+                &submission_id,
+                now,
+                &self.limits,
+            )?
+        };
         let intent = match acceptance {
             ProposalAcceptance::Accepted(intent) => intent,
             ProposalAcceptance::BudgetWaiting { .. } | ProposalAcceptance::CapacityDeferred => {

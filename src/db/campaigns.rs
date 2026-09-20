@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     code_change,
+    decision::decision_resource_id,
     execution_policy::CampaignLimits,
     models::{
         BudgetDimension, BudgetReservation, BudgetReservationStatus, Campaign, CampaignState,
@@ -18,14 +19,14 @@ use crate::{
         ProposalKind, ProposalStatus, Submission, SubmissionKind, SubmissionStatus,
     },
     output::bounded_redacted_text,
-    proposals::ValidatedProposal,
+    proposals::{self, ProposalInput, ValidatedProposal},
     state::ObjectiveSnapshot,
     AppError,
 };
 
 use super::{
     code_changes::validate_sha, database_error, research_ownership_in_transaction, Db,
-    DecisionReservation, ResearchOwnership, ResearchOwnershipSnapshot,
+    DecisionRepository, DecisionReservation, ResearchOwnership, ResearchOwnershipSnapshot,
 };
 
 const ROLLING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
@@ -745,6 +746,76 @@ impl<'db> CampaignRepository<'db> {
         validate_code_change_identifier("code_change_run_id", run_id)?;
         validate_code_change_identifier("experiment_id", experiment_id)?;
         validate_code_change_identifier("submission_id", submission_id)?;
+        self.accept_code_change_candidate_inner(
+            run_id,
+            Some((experiment_id, submission_id)),
+            now,
+            limits,
+        )
+    }
+
+    pub(crate) fn accept_decision_code_change_candidate(
+        &self,
+        run_id: &str,
+        now: i64,
+        limits: &CampaignLimits,
+    ) -> Result<ProposalAcceptance, AppError> {
+        validate_code_change_identifier("code_change_run_id", run_id)?;
+        self.accept_code_change_candidate_inner(run_id, None, now, limits)
+    }
+
+    pub(crate) fn candidate_requires_decision_route(
+        &self,
+        run_id: &str,
+    ) -> Result<bool, AppError> {
+        validate_code_change_identifier("code_change_run_id", run_id)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(database_error("begin code-change candidate route lookup"))?;
+        let (campaign_id, proposal_id): (String, String) = transaction
+            .query_row(
+                "SELECT campaign_id, proposal_id FROM code_change_runs
+                 WHERE code_change_run_id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read code-change candidate route"))?
+            .ok_or_else(|| {
+                validation_error(
+                    "code_change_run_id",
+                    "does not identify a persisted code-change run",
+                )
+            })?;
+        let campaign = read_campaign(&transaction, &campaign_id)?;
+        let proposal = read_proposal(&transaction, &proposal_id)?;
+        let attached = proposal
+            .source_experiment_id
+            .as_deref()
+            .map(|source_experiment_id| {
+                research_ownership_in_transaction(
+                    &transaction,
+                    &campaign.project_id,
+                    &campaign_id,
+                    source_experiment_id,
+                )
+            })
+            .transpose()?
+            .is_some_and(|ownership| matches!(ownership, ResearchOwnership::Attached(_)));
+        transaction
+            .commit()
+            .map_err(database_error("commit code-change candidate route lookup"))?;
+        Ok(attached)
+    }
+
+    fn accept_code_change_candidate_inner(
+        &self,
+        run_id: &str,
+        requested_ids: Option<(&str, &str)>,
+        now: i64,
+        limits: &CampaignLimits,
+    ) -> Result<ProposalAcceptance, AppError> {
         let window_ends_at = rolling_window_end(now)?;
         let mut connection = self.db.connect()?;
         let transaction = connection
@@ -811,14 +882,60 @@ impl<'db> CampaignRepository<'db> {
                 "must belong to a code-change proposal in the campaign",
             ));
         }
-        if research_owner_blocks_admission(
-            &transaction,
-            &campaign.project_id,
-            &run_campaign_id,
-            proposal.source_experiment_id.as_deref(),
-        )? {
-            return Ok(ProposalAcceptance::CapacityDeferred);
-        }
+        let ownership = proposal
+            .source_experiment_id
+            .as_deref()
+            .map(|source_experiment_id| {
+                research_ownership_in_transaction(
+                    &transaction,
+                    &campaign.project_id,
+                    &run_campaign_id,
+                    source_experiment_id,
+                )
+            })
+            .transpose()?;
+        let mut attached_owner = None;
+        let mut decision_authority = None;
+        let (experiment_id, submission_id) = match requested_ids {
+            Some((experiment_id, submission_id)) => {
+                if !matches!(ownership, None | Some(ResearchOwnership::None)) {
+                    return Ok(ProposalAcceptance::CapacityDeferred);
+                }
+                (experiment_id.to_owned(), submission_id.to_owned())
+            }
+            None => match ownership {
+                None | Some(ResearchOwnership::None) => {
+                    if let Some(bound_experiment_id) = bound_experiment_id.as_deref() {
+                        let experiment = read_experiment(&transaction, bound_experiment_id)?;
+                        (experiment.experiment_id, experiment.submission_id)
+                    } else {
+                        (
+                            format!("code-change-experiment:{run_id}"),
+                            format!("code-change-submission:{run_id}"),
+                        )
+                    }
+                }
+                Some(ResearchOwnership::Open(_)) => {
+                    return Ok(ProposalAcceptance::CapacityDeferred);
+                }
+                Some(ResearchOwnership::Attached(owner)) => {
+                    let authority = decision_candidate_authority(
+                        &transaction,
+                        &campaign,
+                        &run_campaign_id,
+                        &run_proposal_id,
+                        &proposal,
+                        limits,
+                    )?;
+                    attached_owner = Some(owner);
+                    let ids = (authority.experiment_id.clone(), authority.submission_id.clone());
+                    decision_authority = Some(authority);
+                    ids
+                }
+            },
+        };
+        let experiment_id = experiment_id.as_str();
+        let submission_id = submission_id.as_str();
         let expected_candidate_ref =
             code_change::candidate_ref(&run_campaign_id, &run_proposal_id)?;
         if candidate_ref != expected_candidate_ref {
@@ -867,6 +984,9 @@ impl<'db> CampaignRepository<'db> {
                     "submission_id",
                     "does not match the persisted submitted candidate intent",
                 ));
+            }
+            if let Some(owner) = attached_owner.as_ref() {
+                validate_attached_successor_reentry(&transaction, owner, experiment_id)?;
             }
             let intent = read_intent_by_experiment(&transaction, experiment_id)?;
             transaction
@@ -1088,6 +1208,16 @@ impl<'db> CampaignRepository<'db> {
         )
         .with_campaign_lineage(run_campaign_id.clone(), Option::<String>::None);
         super::insert_event_completed_in_transaction(&transaction, &event)?;
+        if let (Some(owner), Some(authority)) =
+            (attached_owner.as_ref(), decision_authority.as_ref())
+        {
+            attach_decision_successor_in_transaction(
+                &transaction,
+                owner,
+                &authority.reservation,
+                authority.experiment_id.as_str(),
+            )?;
+        }
         let intent = read_intent_by_experiment(&transaction, experiment_id)?;
         transaction
             .commit()
@@ -3801,6 +3931,117 @@ fn research_owner_blocks_admission(
         )?,
         ResearchOwnership::None
     ))
+}
+
+fn decision_candidate_authority(
+    transaction: &Transaction<'_>,
+    campaign: &Campaign,
+    campaign_id: &str,
+    proposal_id: &str,
+    proposal: &Proposal,
+    limits: &CampaignLimits,
+) -> Result<super::decisions::DecisionSuccessorAuthority, AppError> {
+    let source_experiment_id = proposal.source_experiment_id.as_deref().ok_or_else(|| {
+        validation_error(
+            "source_experiment_id",
+            "is required for a decision code-change candidate",
+        )
+    })?;
+    let cycle_id = DecisionRepository::terminal_cycle_id(campaign_id, source_experiment_id);
+    let (
+        cycle_campaign_id,
+        cycle_source_experiment_id,
+        attempt_number,
+        attempt_created_at,
+        attempt_state,
+        decision_kind,
+    ): (String, String, i64, i64, String, Option<String>) = transaction
+        .query_row(
+            "SELECT cycle.campaign_id, cycle.source_experiment_id,
+                    attempt.attempt_number, attempt.created_at,
+                    attempt.state, attempt.decision_kind
+             FROM decision_cycles AS cycle
+             JOIN decision_attempts AS attempt ON attempt.cycle_id = cycle.cycle_id
+             WHERE cycle.cycle_id = ?1
+               AND attempt.attempt_number = (
+                   SELECT MAX(latest.attempt_number)
+                   FROM decision_attempts AS latest
+                   WHERE latest.cycle_id = cycle.cycle_id
+               )",
+            [cycle_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read decision candidate attempt"))?
+        .ok_or_else(|| {
+            validation_error(
+                "decision_cycle",
+                "does not identify a persisted terminal decision attempt",
+            )
+        })?;
+    if cycle_campaign_id != campaign_id || cycle_source_experiment_id != source_experiment_id {
+        return Err(validation_error(
+            "decision_cycle",
+            "does not match the candidate campaign and source experiment",
+        ));
+    }
+    if attempt_state != "decided" || decision_kind.as_deref() != Some("proposal") {
+        return Err(validation_error(
+            "decision_attempt",
+            "must be the latest decided proposal attempt",
+        ));
+    }
+    let reservation = DecisionReservation {
+        cycle_id,
+        campaign_id: cycle_campaign_id,
+        source_experiment_id: cycle_source_experiment_id,
+        attempt_number,
+        created_at: attempt_created_at,
+    };
+    let expected_proposal_id = decision_resource_id("proposal", &reservation);
+    if proposal_id != expected_proposal_id {
+        return Err(validation_error(
+            "decision_resources",
+            "candidate run is not bound to the decision proposal ID",
+        ));
+    }
+    let expected_experiment_id = decision_resource_id("experiment", &reservation);
+    let expected_submission_id = decision_resource_id("submission", &reservation);
+    let validated_proposal = proposals::validate(
+        ProposalInput {
+            kind: proposal.kind,
+            hypothesis: proposal.hypothesis.clone(),
+            source_experiment_id: proposal.source_experiment_id.clone(),
+            argv: proposal.argv.clone(),
+            working_directory: proposal.working_directory.clone(),
+            expected_evidence: proposal.expected_evidence.clone(),
+        },
+        &campaign.objective_digest,
+    )?;
+    if validated_proposal.canonical_digest() != proposal.canonical_digest {
+        return Err(validation_error(
+            "proposal.canonical_digest",
+            "does not match the durable proposal fields",
+        ));
+    }
+    super::decisions::validate_decision_successor_in_transaction(
+        transaction,
+        &reservation,
+        &validated_proposal,
+        &expected_proposal_id,
+        &expected_experiment_id,
+        &expected_submission_id,
+        *limits,
+    )
 }
 
 fn validate_attached_successor_reentry(
