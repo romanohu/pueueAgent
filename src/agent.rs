@@ -3969,6 +3969,99 @@ mod tests {
         }
     }
 
+    fn seed_terminal_decision_campaign(db: &crate::db::Db) {
+        let objective = crate::state::ObjectiveSnapshot {
+            text: "Reach validation loss below 0.20\n".to_owned(),
+            digest: "objective-digest".to_owned(),
+        };
+        let baseline = crate::proposals::validate_initial_baseline(
+            crate::proposals::ProposalInput {
+                kind: crate::models::ProposalKind::Experiment,
+                hypothesis: "Measure the initial command".to_owned(),
+                source_experiment_id: None,
+                argv: vec!["python".to_owned(), "train.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["validation loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        crate::db::CampaignRepository::new(db)
+            .start_with_baseline(
+                crate::db::StartCampaignRequest {
+                    campaign_id: "campaign-a",
+                    project_id: "project-a",
+                    objective: &objective,
+                    initial_argv: baseline.argv(),
+                    baseline: &baseline,
+                    submission_id: "submission-a",
+                    experiment_id: "experiment-a",
+                    proposal_id: "proposal-a",
+                    metadata: &serde_json::json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: 2,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        let experiments = crate::db::ExperimentRepository::new(db);
+        experiments.mark_submitting("experiment-a", 3).unwrap();
+        experiments
+            .mark_accepted("experiment-a", 41, "pueue-task:v1:bind-failure", 4)
+            .unwrap();
+        experiments
+            .project_terminal_submission(
+                "experiment-a",
+                41,
+                crate::models::ExperimentTerminalOutcome::Succeeded,
+                5,
+            )
+            .unwrap();
+    }
+
+    fn publish_terminal_decision_event(db: &crate::db::Db, now: i64) -> crate::models::Event {
+        let event = DecisionRepository::terminal_decision_event(
+            "project-a",
+            "campaign-a",
+            "experiment-a",
+            crate::db::TerminalDecisionEventProjection {
+                task_id: 41,
+                managed_task_signature: "pueue-task:v1:bind-failure",
+                group: "pa-project-a",
+                state: "Done",
+                enqueued_at: Some(3),
+                started_at: Some(4),
+                ended_at: Some(5),
+                exit_code: Some(0),
+            },
+            now,
+        );
+        DecisionRepository::new(db)
+            .publish_terminal_cycle_event("campaign-a", "experiment-a", &event, now)
+            .unwrap()
+            .1
+    }
+
+    fn claim_terminal_decision_event(
+        db: &crate::db::Db,
+        expected: &crate::models::Event,
+        now: i64,
+    ) {
+        let claimed = crate::db::EventRepository::new(db)
+            .claim_batch(now, now + 100, 1)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let claimed = &claimed[0];
+        assert_eq!(claimed.event_id, expected.event_id);
+        assert_eq!(claimed.kind, crate::models::EventKind::CampaignDecision);
+        assert_eq!(claimed.campaign_id, expected.campaign_id);
+        assert_eq!(claimed.experiment_id, expected.experiment_id);
+        assert_eq!(claimed.dedup_key, expected.dedup_key);
+        assert_eq!(claimed.payload, expected.payload);
+        assert_eq!(claimed.status, crate::models::EventStatus::Claimed);
+    }
+
     #[test]
     fn decision_output_schema_is_a_supported_strict_root_object() {
         let schema: serde_json::Value = serde_json::from_slice(DECISION_OUTPUT_SCHEMA).unwrap();
@@ -4102,13 +4195,9 @@ mod tests {
                 root.join(".pueue-agent/config.toml"), 1,
             ))
             .unwrap();
-        let event = crate::db::EventRepository::new(&db)
-            .insert_idempotent(&crate::models::NewEvent::new(
-                "project-a", crate::models::EventKind::CampaignDecision,
-                "bind-failure", serde_json::json!({}), 1, 1,
-            ))
-            .unwrap();
-        crate::db::EventRepository::new(&db).claim_batch(1, 100, 1).unwrap();
+        seed_terminal_decision_campaign(&db);
+        let event = publish_terminal_decision_event(&db, 6);
+        claim_terminal_decision_event(&db, &event, 6);
         let repository = AgentRunRepository::new(&db);
         let run = repository
             .insert_with_events(
@@ -4153,54 +4242,7 @@ mod tests {
                 1,
             ))
             .unwrap();
-        let objective = crate::state::ObjectiveSnapshot {
-            text: "Reach validation loss below 0.20\n".to_owned(),
-            digest: "objective-digest".to_owned(),
-        };
-        let baseline = crate::proposals::validate_initial_baseline(
-            crate::proposals::ProposalInput {
-                kind: crate::models::ProposalKind::Experiment,
-                hypothesis: "Measure the initial command".to_owned(),
-                source_experiment_id: None,
-                argv: vec!["python".to_owned(), "train.py".to_owned()],
-                working_directory: ".".to_owned(),
-                expected_evidence: vec!["validation loss".to_owned()],
-            },
-            &objective.digest,
-        )
-        .unwrap();
-        crate::db::CampaignRepository::new(&db)
-            .start_with_baseline(
-                crate::db::StartCampaignRequest {
-                    campaign_id: "campaign-a",
-                    project_id: "project-a",
-                    objective: &objective,
-                    initial_argv: baseline.argv(),
-                    baseline: &baseline,
-                    submission_id: "submission-a",
-                    experiment_id: "experiment-a",
-                    proposal_id: "proposal-a",
-                    metadata: &serde_json::json!({}),
-                    origin_agent_run_id: None,
-                    objective_metric: None,
-                    now: 2,
-                },
-                &CampaignLimits::default(),
-            )
-            .unwrap();
-        let experiments = crate::db::ExperimentRepository::new(&db);
-        experiments.mark_submitting("experiment-a", 3).unwrap();
-        experiments
-            .mark_accepted("experiment-a", 41, "pueue-task:v1:bind-failure", 4)
-            .unwrap();
-        experiments
-            .project_terminal_submission(
-                "experiment-a",
-                41,
-                crate::models::ExperimentTerminalOutcome::Succeeded,
-                5,
-            )
-            .unwrap();
+        seed_terminal_decision_campaign(&db);
         let decisions = DecisionRepository::new(&db);
         let cycle = decisions
             .ensure_cycle_for_terminal("campaign-a", "experiment-a", 6)
@@ -4210,19 +4252,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let event = crate::db::EventRepository::new(&db)
-            .insert_idempotent(&crate::models::NewEvent::new(
-                "project-a",
-                crate::models::EventKind::CampaignDecision,
-                "bind-finalization-failure",
-                serde_json::json!({}),
-                8,
-                8,
-            ))
-            .unwrap();
-        crate::db::EventRepository::new(&db)
-            .claim_batch(8, 100, 1)
-            .unwrap();
+        let event = publish_terminal_decision_event(&db, 8);
+        claim_terminal_decision_event(&db, &event, 8);
         let repository = AgentRunRepository::new(&db);
         let run = repository
             .insert_with_events(

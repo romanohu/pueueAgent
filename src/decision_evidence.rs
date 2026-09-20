@@ -3,8 +3,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     db::{
-        CampaignRepository, Db, DecisionReservation, ExperimentRepository, InterventionRepository,
-        ProjectRepository, ProposalRepository,
+        database_error, completed_research_handoff_in_transaction, CampaignRepository, Db,
+        DecisionReservation, ExperimentRepository, InterventionRepository, ProjectRepository,
+        ProposalRepository,
     },
     environment::{collect_decision_artifact_hints, DecisionArtifactHint},
     execution_policy::ProjectRootAnchor,
@@ -60,7 +61,7 @@ struct StoredDecisionContextV2 {
 }
 
 #[allow(dead_code)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredResearchSupplement {
     review_id: String,
@@ -70,7 +71,7 @@ struct StoredResearchSupplement {
 }
 
 #[allow(dead_code)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredResearchAdvice {
     evidence_ref: String,
@@ -433,6 +434,59 @@ impl<'db> DecisionEvidenceBuilder<'db> {
         Self { db }
     }
 
+    fn research_supplement(
+        &self,
+        project_id: &str,
+        campaign_id: &str,
+        source_experiment_id: &str,
+        decision_cycle_id: &str,
+    ) -> Result<Option<StoredResearchSupplement>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(database_error("begin decision research evidence snapshot"))?;
+        let handoff = completed_research_handoff_in_transaction(
+            &transaction,
+            project_id,
+            campaign_id,
+            source_experiment_id,
+            decision_cycle_id,
+        )?;
+        let Some(handoff) = handoff else {
+            transaction
+                .commit()
+                .map_err(database_error("commit decision research evidence snapshot"))?;
+            return Ok(None);
+        };
+        let (notes, _) = crate::research_evidence::research_notes_in_transaction(
+            &transaction,
+            campaign_id,
+            crate::research_evidence::MAX_RESEARCH_NOTES,
+        )?;
+        let recent_advice = notes
+            .into_iter()
+            .map(|note| {
+                serde_json::from_value::<StoredResearchAdvice>(note).map_err(|source| {
+                    AppError::Serialization {
+                        operation: "parse stored research note",
+                        source,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let research = StoredResearchSupplement {
+            review_id: handoff.owner.review_id,
+            reason: handoff.answer.reason,
+            next_direction: handoff.answer.next_direction,
+            recent_advice,
+        };
+        validate_research_supplement(&research)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit decision research evidence snapshot"))?;
+        Ok(Some(research))
+    }
+
     pub fn build(
         &self,
         request: &DecisionEvidenceRequest<'_>,
@@ -508,8 +562,18 @@ impl<'db> DecisionEvidenceBuilder<'db> {
             MAX_ARTIFACT_HINT_DEPTH,
             MAX_ARTIFACT_HINT_FIELD_BYTES,
         )?;
+        let research = self.research_supplement(
+            &campaign.project_id,
+            &campaign.campaign_id,
+            &source.experiment_id,
+            &request.reservation.cycle_id,
+        )?;
         let context = DecisionContext {
-            schema_version: DECISION_CONTEXT_SCHEMA_VERSION,
+            schema_version: if research.is_some() {
+                DECISION_CONTEXT_SCHEMA_VERSION_V2
+            } else {
+                DECISION_CONTEXT_SCHEMA_VERSION
+            },
             objective: ObjectiveSection {
                 text: &campaign.objective_text,
                 digest: &campaign.objective_digest,
@@ -545,6 +609,7 @@ impl<'db> DecisionEvidenceBuilder<'db> {
                     .collect(),
             },
             artifact_hints,
+            research,
         };
         let bytes = serde_json::to_vec(&context).map_err(|source| AppError::Serialization {
             operation: "serialize decision context",
@@ -572,6 +637,8 @@ struct DecisionContext<'a> {
     budgets: BudgetSection,
     intervention: InterventionSection,
     artifact_hints: Vec<DecisionArtifactHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    research: Option<StoredResearchSupplement>,
 }
 
 #[derive(Serialize)]

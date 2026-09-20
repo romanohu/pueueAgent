@@ -15,7 +15,7 @@ use crate::{
     db::{
         database_error, CodeChangeRepository, Db, DecisionRepository, EventRepository,
         ExperimentRepository, HealthRepository, ProjectRepository, ProposalRepository,
-        SubmissionRepository, TaskObservationRepository,
+        SubmissionRepository, TaskObservationRepository, TerminalDecisionEventProjection,
     },
     detect::Observation,
     events::{callback_dedup_key, result_is_failure},
@@ -372,37 +372,29 @@ where
                     now,
                 )?;
                 if let Some(experiment) = experiment.as_ref() {
-                    let cycle_id = DecisionRepository::terminal_cycle_id(
+                    let managed_task_signature = experiment.task_signature.as_deref().ok_or(
+                        AppError::Validation {
+                            field: "experiment.task_signature",
+                            message: "must identify the resolved managed terminal run",
+                        },
+                    )?;
+                    let decision_event = DecisionRepository::terminal_decision_event(
+                        &project.project_id,
                         &experiment.campaign_id,
                         &experiment.experiment_id,
-                    );
-                    let decision_event = NewEvent::new(
-                        &project.project_id,
-                        EventKind::CampaignDecision,
-                        format!("campaign-decision:v1:{cycle_id}"),
-                        json!({
-                            "source": "terminal_experiment",
-                            "cycle_id": cycle_id,
-                            "source_experiment_id": experiment.experiment_id,
-                            "terminal_observation": {
-                                "task_id": task.id,
-                                "task_signature": experiment.task_signature,
-                                "group": task.group,
-                                "state": task.state,
-                                "enqueued_at": task.enqueued_at.as_deref().and_then(parse_timestamp),
-                                "started_at": task.started_at.as_deref().and_then(parse_timestamp),
-                                "ended_at": task.ended_at.as_deref().and_then(parse_timestamp),
-                                "exit_code": task.result.as_ref().and_then(terminal_exit_code),
-                            },
-                        }),
+                        TerminalDecisionEventProjection {
+                            task_id: task.id,
+                            managed_task_signature,
+                            group: &task.group,
+                            state: &task.state,
+                            enqueued_at: task.enqueued_at.as_deref().and_then(parse_timestamp),
+                            started_at: task.started_at.as_deref().and_then(parse_timestamp),
+                            ended_at: task.ended_at.as_deref().and_then(parse_timestamp),
+                            exit_code: task.result.as_ref().and_then(terminal_exit_code),
+                        },
                         now,
-                        now,
-                    )
-                    .with_campaign_lineage(
-                        experiment.campaign_id.clone(),
-                        Some(experiment.experiment_id.clone()),
                     );
-                    DecisionRepository::new(self.db).publish_terminal_cycle_event(
+                    DecisionRepository::new(self.db).publish_terminal_cycle_event_outcome(
                         &experiment.campaign_id,
                         &experiment.experiment_id,
                         &decision_event,

@@ -4822,7 +4822,7 @@ pub(crate) fn ready_research_action_in_transaction(
     }))
 }
 
-fn research_context_identity_matches(
+pub(super) fn research_context_identity_matches(
     context: &Value,
     project_id: &str,
     campaign_id: &str,
@@ -4895,7 +4895,7 @@ fn research_context_identity_matches(
             == Some(managed_task_signature)
 }
 
-fn context_evidence_refs(value: &Value) -> BTreeSet<String> {
+pub(super) fn context_evidence_refs(value: &Value) -> BTreeSet<String> {
     let mut refs = BTreeSet::new();
     fn visit(value: &Value, refs: &mut BTreeSet<String>) {
         match value {

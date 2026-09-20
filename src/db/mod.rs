@@ -18,6 +18,7 @@ pub(crate) use repositories::{insert_event_completed_in_transaction, insert_even
 pub use decisions::{
     DecisionDoctorProjection, DecisionRecovery, DecisionRepository, DecisionReservation,
 };
+pub(crate) use decisions::TerminalDecisionEventProjection;
 pub(crate) use decisions::ReadyDecision;
 pub use experiment_metrics::MetricsRepository;
 pub use migrations::LATEST_SCHEMA_VERSION;

@@ -9,12 +9,22 @@ use crate::{
     execution_policy::CampaignLimits,
     models::{
         AgentRunStatus, CampaignState, DecisionAttempt, DecisionAttemptState, DecisionCycle,
-        DecisionCycleState, Event, EventKind, ExperimentStatus, NewEvent,
+        DecisionCycleState, Event, EventKind, EventStatus, ExperimentStatus, NewEvent,
     },
+    output::bounded_redacted_text,
+    research_protocol::parse_research_answer,
     AppError,
 };
 
-use super::{database_error, repositories::insert_event_idempotent_in_transaction, Db};
+use super::{
+    database_error,
+    repositories::insert_event_idempotent_in_transaction,
+    research::{
+        context_evidence_refs, research_context_identity_matches,
+        research_ownership_in_transaction, ResearchOwnership, ResearchOwnershipSnapshot,
+    },
+    Db,
+};
 
 const MAX_DECISION_PAYLOAD_BYTES: usize = 128 * 1024;
 const MAX_DECISION_DIGEST_BYTES: usize = 256;
@@ -24,6 +34,17 @@ const MAX_TERMINAL_DECISION_BACKFILL: i64 = 128;
 
 pub(crate) fn campaign_decision_dedup_key(cycle_id: &str) -> String {
     format!("campaign-decision:v1:{cycle_id}")
+}
+
+pub(crate) struct TerminalDecisionEventProjection<'a> {
+    pub task_id: i64,
+    pub managed_task_signature: &'a str,
+    pub group: &'a str,
+    pub state: &'a str,
+    pub enqueued_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub exit_code: Option<i32>,
 }
 
 const DECISION_CYCLE_SELECT: &str = "SELECT
@@ -123,6 +144,19 @@ struct TerminalDecisionBackfill {
     terminal_result_json: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResearchCycleAttachment {
+    pub cycle: DecisionCycle,
+    pub event: Event,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TerminalCyclePublication {
+    Published { cycle: DecisionCycle, event: Event },
+    Existing { cycle: DecisionCycle, event: Event },
+    Deferred { cycle: DecisionCycle },
+}
+
 struct DecisionAuthority {
     cycle: DecisionCycle,
     project_id: String,
@@ -220,8 +254,352 @@ impl<'db> DecisionRepository<'db> {
         Ok(cycle)
     }
 
+    /// Attach one confirmed research stop to the deterministic terminal
+    /// decision cycle while the caller's transaction is still open.  The
+    /// caller owns the transaction and therefore also owns the final commit.
+    pub(crate) fn attach_research_terminal_cycle_in_transaction(
+        transaction: &Transaction<'_>,
+        expected: &ResearchOwnershipSnapshot,
+        terminal_event: &NewEvent,
+        now: i64,
+    ) -> Result<ResearchCycleAttachment, AppError> {
+        if !matches!(
+            expected.operation_stage.as_deref(),
+            Some("stop_confirmed") | None
+        )
+            || expected.recovery_required
+            || expected.successor_experiment_id.is_some()
+            || expected.agent_run_id.is_none()
+            || expected.event_id.is_none()
+            || expected.termination_request_id.is_none()
+        {
+            return Err(validation_error(
+                "research.handoff",
+                "must be the exact confirmed research owner without a successor",
+            ));
+        }
+
+        let ownership = research_ownership_in_transaction(
+            transaction,
+            &expected.project_id,
+            &expected.campaign_id,
+            &expected.source_experiment_id,
+        )?;
+        let (owner, already_attached) = match ownership {
+            ResearchOwnership::Open(Some(owner)) => {
+                if !research_snapshot_matches(&owner, expected)
+                    || owner.operation_stage.as_deref() != Some("stop_confirmed")
+                    || owner.recovery_required
+                {
+                    return Err(validation_error(
+                        "research.handoff",
+                        "research ownership changed before terminal attachment",
+                    ));
+                }
+                (owner, false)
+            }
+            ResearchOwnership::Attached(owner) => {
+                if !research_snapshot_stable_matches(&owner, expected)
+                    || owner.decision_cycle_id.as_deref()
+                        != Some(decision_cycle_id(
+                            &expected.campaign_id,
+                            &expected.source_experiment_id,
+                        )
+                            .as_str())
+                    || owner.successor_experiment_id.is_some()
+                {
+                    return Err(validation_error(
+                        "research.handoff",
+                        "already attached research ownership has conflicting lineage",
+                    ));
+                }
+                (owner, true)
+            }
+            ResearchOwnership::None | ResearchOwnership::Open(None) => {
+                return Err(validation_error(
+                    "research.handoff",
+                    "confirmed research ownership is missing or ambiguous",
+                ));
+            }
+        };
+
+        let source_status: Option<ExperimentStatus> = transaction
+            .query_row(
+                "SELECT status FROM experiments
+                 WHERE experiment_id = ?1 AND campaign_id = ?2",
+                params![owner.source_experiment_id, owner.campaign_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read confirmed research source"))?;
+        if !source_status.is_some_and(is_terminal) {
+            return Err(validation_error(
+                "research.handoff",
+                "source experiment must be terminal before attachment",
+            ));
+        }
+        let confirmed_request: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM termination_requests
+                     WHERE request_id = ?1 AND project_id = ?2
+                       AND status = 'confirmed'
+                       AND task_signature LIKE 'pueue-task:v1:%'
+                 )",
+                params![owner.termination_request_id, owner.project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read confirmed research termination"))?;
+        if !confirmed_request {
+            return Err(validation_error(
+                "research.handoff",
+                "research termination request must be confirmed",
+            ));
+        }
+
+        let campaign_project: String = transaction
+            .query_row(
+                "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
+                [&owner.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read research handoff campaign project"))?;
+        if campaign_project != owner.project_id {
+            return Err(validation_error(
+                "research.handoff",
+                "research campaign project does not match its owner",
+            ));
+        }
+
+        let cycle_id = decision_cycle_id(&owner.campaign_id, &owner.source_experiment_id);
+        validate_research_terminal_event_input(
+            terminal_event,
+            &owner.project_id,
+            &owner.campaign_id,
+            &owner.source_experiment_id,
+            &cycle_id,
+        )?;
+        let cycle = ensure_terminal_cycle_in_transaction(
+            transaction,
+            &owner.campaign_id,
+            &owner.source_experiment_id,
+            now,
+        )?;
+
+        let (
+            state,
+            operation_stage,
+            context_json,
+            context_digest,
+            response_json,
+            notes_json,
+            linked_cycle_id,
+            successor_experiment_id,
+            objective_digest,
+        ): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = transaction
+            .query_row(
+                "SELECT research_reviews.state, operation_stage, context_json, context_digest,
+                        response_json, notes_json, decision_cycle_id,
+                        successor_experiment_id, campaigns.objective_digest
+                 FROM research_reviews
+                 JOIN campaigns ON campaigns.campaign_id = research_reviews.campaign_id
+                 WHERE research_reviews.review_id = ?1",
+                [&owner.review_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .map_err(database_error("read research handoff review"))?;
+        if successor_experiment_id.is_some() {
+            return Err(validation_error(
+                "research.handoff",
+                "research handoff cannot already have a successor",
+            ));
+        }
+
+        let expected_cycle = Some(cycle_id.as_str());
+        if already_attached {
+            if state != "completed"
+                || operation_stage.is_some()
+                || linked_cycle_id.as_deref() != expected_cycle
+            {
+                return Err(validation_error(
+                    "research.handoff",
+                    "already attached research review is not complete",
+                ));
+            }
+        } else if state != "ready"
+            || operation_stage.as_deref() != Some("stop_confirmed")
+            || linked_cycle_id.is_some()
+        {
+            return Err(validation_error(
+                "research.handoff",
+                "research review is not at the exact stop-confirmed stage",
+            ));
+        }
+
+        let notes_json = research_handoff_notes(
+            &owner,
+            context_json.as_deref(),
+            context_digest.as_deref(),
+            response_json.as_deref(),
+            notes_json.as_deref(),
+            &objective_digest,
+        )?;
+
+        let existing_event = read_research_terminal_event_in_transaction(
+            transaction,
+            &owner.project_id,
+            &cycle_id,
+        )?;
+        let event = if let Some(event) = existing_event {
+            validate_research_terminal_event(
+                &event,
+                terminal_event,
+                &owner.project_id,
+                &owner.campaign_id,
+                &owner.source_experiment_id,
+                &cycle_id,
+            )?;
+            if !already_attached {
+                validate_unclaimed_research_terminal_event(transaction, &event, &cycle_id)?;
+            }
+            event
+        } else {
+            if already_attached {
+                return Err(validation_error(
+                    "research.handoff",
+                    "attached research review is missing its terminal event",
+                ));
+            }
+            // The event is inserted only after the review CAS below.  Both
+            // mutations remain in this caller-owned transaction.
+            Event {
+                event_id: 0,
+                project_id: terminal_event.project_id.clone(),
+                campaign_id: terminal_event.campaign_id.clone(),
+                experiment_id: terminal_event.experiment_id.clone(),
+                kind: terminal_event.kind,
+                dedup_key: terminal_event.dedup_key.clone(),
+                payload: terminal_event.payload.clone(),
+                status: EventStatus::Pending,
+                attempts: 0,
+                not_before: terminal_event.not_before,
+                lease_until: None,
+                created_at: terminal_event.created_at,
+                completed_at: None,
+                last_error: None,
+            }
+        };
+
+        if already_attached {
+            return Ok(ResearchCycleAttachment { cycle, event });
+        }
+
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET decision_cycle_id = ?1, state = 'completed',
+                     operation_stage = NULL, notes_json = ?2,
+                     finished_at = ?3, updated_at = ?3
+                 WHERE review_id = ?4 AND campaign_id = ?5
+                   AND experiment_id = ?6 AND task_signature = ?7
+                   AND attempt = ?8 AND session_generation = ?9
+                   AND agent_run_id = ?10 AND event_id = ?11
+                   AND termination_request_id = ?12
+                   AND state = 'ready' AND operation_stage = 'stop_confirmed'
+                   AND decision_cycle_id IS NULL
+                   AND successor_experiment_id IS NULL",
+                params![
+                    cycle_id,
+                    notes_json,
+                    now,
+                    owner.review_id,
+                    owner.campaign_id,
+                    owner.source_experiment_id,
+                    owner.managed_task_signature,
+                    owner.attempt,
+                    owner.session_generation,
+                    owner.agent_run_id,
+                    owner.event_id,
+                    owner.termination_request_id,
+                ],
+            )
+            .map_err(database_error("attach research terminal decision cycle"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.handoff",
+                "research review changed before terminal attachment",
+            ));
+        }
+
+        let event = if event.event_id == 0 {
+            let (event, _) = insert_event_idempotent_in_transaction(transaction, terminal_event)?;
+            event
+        } else {
+            event
+        };
+        Ok(ResearchCycleAttachment { cycle, event })
+    }
+
     pub(crate) fn terminal_cycle_id(campaign_id: &str, experiment_id: &str) -> String {
         decision_cycle_id(campaign_id, experiment_id)
+    }
+
+    pub(crate) fn terminal_decision_event(
+        project_id: &str,
+        campaign_id: &str,
+        source_experiment_id: &str,
+        observation: TerminalDecisionEventProjection<'_>,
+        now: i64,
+    ) -> NewEvent {
+        let cycle_id = Self::terminal_cycle_id(campaign_id, source_experiment_id);
+        NewEvent::new(
+            project_id,
+            EventKind::CampaignDecision,
+            campaign_decision_dedup_key(&cycle_id),
+            serde_json::json!({
+                "source": "terminal_experiment",
+                "cycle_id": cycle_id,
+                "source_experiment_id": source_experiment_id,
+                "terminal_observation": {
+                    "task_id": observation.task_id,
+                    "task_signature": observation.managed_task_signature,
+                    "group": observation.group,
+                    "state": observation.state,
+                    "enqueued_at": observation.enqueued_at,
+                    "started_at": observation.started_at,
+                    "ended_at": observation.ended_at,
+                    "exit_code": observation.exit_code,
+                },
+            }),
+            now,
+            now,
+        )
+        .with_campaign_lineage(
+            campaign_id.to_owned(),
+            Some(source_experiment_id.to_owned()),
+        )
     }
 
     pub fn publish_terminal_cycle_event(
@@ -231,8 +609,25 @@ impl<'db> DecisionRepository<'db> {
         event: &NewEvent,
         now: i64,
     ) -> Result<(DecisionCycle, Event), AppError> {
+        match self.publish_terminal_cycle_event_outcome(campaign_id, experiment_id, event, now)? {
+            TerminalCyclePublication::Published { cycle, event }
+            | TerminalCyclePublication::Existing { cycle, event } => Ok((cycle, event)),
+            TerminalCyclePublication::Deferred { .. } => Err(AppError::Runtime {
+                operation: "defer terminal decision publication",
+            }),
+        }
+    }
+
+    pub(crate) fn publish_terminal_cycle_event_outcome(
+        &self,
+        campaign_id: &str,
+        experiment_id: &str,
+        event: &NewEvent,
+        now: i64,
+    ) -> Result<TerminalCyclePublication, AppError> {
         let expected_cycle_id = decision_cycle_id(campaign_id, experiment_id);
-        if event.kind != EventKind::CampaignDecision
+        if event.project_id.is_empty()
+            || event.kind != EventKind::CampaignDecision
             || event.dedup_key != campaign_decision_dedup_key(&expected_cycle_id)
             || event.campaign_id.as_deref() != Some(campaign_id)
             || event.experiment_id.as_deref() != Some(experiment_id)
@@ -262,7 +657,37 @@ impl<'db> DecisionRepository<'db> {
             experiment_id,
             now,
         )?;
-        let (event, _) = insert_event_idempotent_in_transaction(&transaction, event)?;
+        let expected_project_id: String = transaction
+            .query_row(
+                "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read terminal decision project lineage"))?;
+        if event.project_id != expected_project_id {
+            return Err(validation_error(
+                "project_id",
+                "terminal decision event must belong to the campaign project",
+            ));
+        }
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            &event.project_id,
+            campaign_id,
+            experiment_id,
+        )?;
+        if matches!(ownership, ResearchOwnership::Open(_)) {
+            validate_existing_terminal_event_in_transaction(
+                &transaction,
+                event,
+                &expected_cycle_id,
+            )?;
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred terminal decision publication"))?;
+            return Ok(TerminalCyclePublication::Deferred { cycle });
+        }
+        let (event, inserted) = insert_event_idempotent_in_transaction(&transaction, event)?;
         if event.kind != EventKind::CampaignDecision
             || event.payload != expected_payload
             || event.payload.get("source").and_then(serde_json::Value::as_str)
@@ -283,7 +708,11 @@ impl<'db> DecisionRepository<'db> {
         transaction
             .commit()
             .map_err(database_error("commit terminal decision publication"))?;
-        Ok((cycle, event))
+        Ok(if inserted {
+            TerminalCyclePublication::Published { cycle, event }
+        } else {
+            TerminalCyclePublication::Existing { cycle, event }
+        })
     }
 
     pub fn backfill_terminal_cycle_events(&self, now: i64) -> Result<usize, AppError> {
@@ -360,7 +789,6 @@ impl<'db> DecisionRepository<'db> {
 
         let mut count = 0;
         for backfill in backfills {
-            let cycle_id = decision_cycle_id(&backfill.campaign_id, &backfill.experiment_id);
             let terminal_result = match backfill
                 .terminal_result_json
                 .as_deref()
@@ -378,39 +806,35 @@ impl<'db> DecisionRepository<'db> {
                 continue;
             }
             let exit_code = terminal_result.as_ref().and_then(stored_terminal_exit_code);
-            let event = NewEvent::new(
+            let event = Self::terminal_decision_event(
                 &backfill.project_id,
-                EventKind::CampaignDecision,
-                campaign_decision_dedup_key(&cycle_id),
-                serde_json::json!({
-                    "source": "terminal_experiment",
-                    "cycle_id": cycle_id,
-                    "source_experiment_id": backfill.experiment_id,
-                    "terminal_observation": {
-                        "task_id": backfill.pueue_task_id,
-                        "task_signature": backfill.managed_task_signature,
-                        "group": backfill.pueue_group,
-                        "state": backfill.state,
-                        "enqueued_at": backfill.enqueued_at,
-                        "started_at": backfill.started_at,
-                        "ended_at": backfill.ended_at,
-                        "exit_code": exit_code,
-                    },
-                }),
+                &backfill.campaign_id,
+                &backfill.experiment_id,
+                TerminalDecisionEventProjection {
+                    task_id: backfill.pueue_task_id,
+                    managed_task_signature: &backfill.managed_task_signature,
+                    group: &backfill.pueue_group,
+                    state: &backfill.state,
+                    enqueued_at: backfill.enqueued_at,
+                    started_at: backfill.started_at,
+                    ended_at: backfill.ended_at,
+                    exit_code,
+                },
                 now,
-                now,
-            )
-            .with_campaign_lineage(
-                backfill.campaign_id.clone(),
-                Some(backfill.experiment_id.clone()),
             );
-            self.publish_terminal_cycle_event(
+            let outcome = self.publish_terminal_cycle_event_outcome(
                 &backfill.campaign_id,
                 &backfill.experiment_id,
                 &event,
                 now,
             )?;
-            count += 1;
+            if matches!(
+                outcome,
+                TerminalCyclePublication::Published { .. }
+                    | TerminalCyclePublication::Existing { .. }
+            ) {
+                count += 1;
+            }
         }
         Ok(count)
     }
@@ -427,6 +851,7 @@ impl<'db> DecisionRepository<'db> {
             .map_err(database_error("begin decision attempt reservation"))?;
         let authority = read_authority(&transaction, cycle_id)?;
         validate_active_authority(&authority, Some(project_id))?;
+        validate_research_decision_ownership(&transaction, &authority, cycle_id)?;
 
         if authority.cycle.state != DecisionCycleState::Pending {
             transaction
@@ -780,6 +1205,11 @@ impl<'db> DecisionRepository<'db> {
         let authority = read_authority(&transaction, &reservation.cycle_id)?;
         validate_reservation_lineage(&authority, reservation)?;
         validate_active_authority(&authority, None)?;
+        validate_research_decision_ownership(
+            &transaction,
+            &authority,
+            &reservation.cycle_id,
+        )?;
         validate_payload("context_json", context_json)?;
         validate_token("context_digest", context_digest, MAX_DECISION_DIGEST_BYTES)?;
         let context_schema_version = decision_context_schema_version(context_json)?;
@@ -843,6 +1273,7 @@ impl<'db> DecisionRepository<'db> {
         let authority = read_authority(&transaction, &reservation.cycle_id)?;
         validate_reservation_lineage(&authority, reservation)?;
         validate_active_authority(&authority, None)?;
+        validate_research_decision_ownership(&transaction, &authority, &reservation.cycle_id)?;
         let run_project_id: Option<String> = transaction
             .query_row(
                 "SELECT project_id FROM agent_runs
@@ -1384,6 +1815,23 @@ impl<'db> DecisionRepository<'db> {
         )?;
         let mut cycles = Vec::with_capacity(cycle_ids.len());
         for cycle_id in cycle_ids {
+            let cycle = read_cycle(&transaction, &cycle_id)?;
+            let project_id: String = transaction
+                .query_row(
+                    "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
+                    [&cycle.campaign_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error("read due decision event project"))?;
+            if !research_decision_work_allowed(
+                &transaction,
+                &project_id,
+                &cycle.campaign_id,
+                &cycle.source_experiment_id,
+                &cycle_id,
+            )? {
+                continue;
+            }
             let promoted = transaction
                 .execute(
                     "UPDATE decision_cycles
@@ -1399,13 +1847,6 @@ impl<'db> DecisionRepository<'db> {
                 ));
             }
             let cycle = read_cycle(&transaction, &cycle_id)?;
-            let project_id: String = transaction
-                .query_row(
-                    "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
-                    [&cycle.campaign_id],
-                    |row| row.get(0),
-                )
-                .map_err(database_error("read due decision event project"))?;
             let dedup_key = campaign_decision_dedup_key(&cycle_id);
             let promoted_event = transaction
                 .execute(
@@ -1482,6 +1923,18 @@ impl<'db> DecisionRepository<'db> {
         };
         let authority = read_authority(&transaction, &cycle_id)?;
         validate_active_authority(&authority, Some(project_id))?;
+        if !research_decision_work_allowed(
+            &transaction,
+            project_id,
+            &authority.cycle.campaign_id,
+            &authority.cycle.source_experiment_id,
+            &authority.cycle.cycle_id,
+        )? {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred oldest decision cycle query"))?;
+            return Ok(None);
+        }
         let cycle = authority.cycle;
         transaction
             .commit()
@@ -1802,6 +2255,332 @@ fn ensure_terminal_cycle_in_transaction(
     read_cycle_for_source(transaction, campaign_id, experiment_id)
 }
 
+fn research_snapshot_matches(
+    current: &ResearchOwnershipSnapshot,
+    expected: &ResearchOwnershipSnapshot,
+) -> bool {
+    current == expected
+}
+
+fn research_snapshot_stable_matches(
+    current: &ResearchOwnershipSnapshot,
+    expected: &ResearchOwnershipSnapshot,
+) -> bool {
+    current.review_id == expected.review_id
+        && current.project_id == expected.project_id
+        && current.campaign_id == expected.campaign_id
+        && current.source_experiment_id == expected.source_experiment_id
+        && current.managed_task_signature == expected.managed_task_signature
+        && current.source_task_id == expected.source_task_id
+        && current.attempt == expected.attempt
+        && current.session_generation == expected.session_generation
+        && current.event_id == expected.event_id
+        && current.agent_run_id == expected.agent_run_id
+        && current.termination_request_id == expected.termination_request_id
+        && current.successor_experiment_id == expected.successor_experiment_id
+        && !current.recovery_required
+        && !expected.recovery_required
+}
+
+fn validate_research_terminal_event_input(
+    event: &NewEvent,
+    project_id: &str,
+    campaign_id: &str,
+    experiment_id: &str,
+    cycle_id: &str,
+) -> Result<(), AppError> {
+    if event.project_id != project_id
+        || event.kind != EventKind::CampaignDecision
+        || event.campaign_id.as_deref() != Some(campaign_id)
+        || event.experiment_id.as_deref() != Some(experiment_id)
+        || event.dedup_key != campaign_decision_dedup_key(cycle_id)
+        || event.payload.get("source").and_then(serde_json::Value::as_str)
+            != Some("terminal_experiment")
+        || event.payload.get("cycle_id").and_then(serde_json::Value::as_str)
+            != Some(cycle_id)
+        || event
+            .payload
+            .get("source_experiment_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(experiment_id)
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "terminal event must carry the exact research cycle lineage",
+        ));
+    }
+    Ok(())
+}
+
+fn read_research_terminal_event_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    cycle_id: &str,
+) -> Result<Option<Event>, AppError> {
+    transaction
+        .query_row(
+            "SELECT event_id, project_id, campaign_id, experiment_id, kind,
+                    dedup_key, payload_json, status, attempts, not_before,
+                    lease_until, created_at, completed_at, last_error
+             FROM events
+             WHERE project_id = ?1 AND dedup_key = ?2",
+            params![project_id, campaign_decision_dedup_key(cycle_id)],
+            |row| {
+                let payload_json: String = row.get(6)?;
+                let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(Event {
+                    event_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    campaign_id: row.get(2)?,
+                    experiment_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    dedup_key: row.get(5)?,
+                    payload,
+                    status: row.get(7)?,
+                    attempts: row.get(8)?,
+                    not_before: row.get(9)?,
+                    lease_until: row.get(10)?,
+                    created_at: row.get(11)?,
+                    completed_at: row.get(12)?,
+                    last_error: row.get(13)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(database_error("read research terminal event"))
+}
+
+fn validate_research_terminal_event(
+    existing: &Event,
+    expected: &NewEvent,
+    project_id: &str,
+    campaign_id: &str,
+    experiment_id: &str,
+    cycle_id: &str,
+) -> Result<(), AppError> {
+    validate_research_terminal_event_input(
+        expected,
+        project_id,
+        campaign_id,
+        experiment_id,
+        cycle_id,
+    )?;
+    if existing.project_id != project_id
+        || existing.campaign_id.as_deref() != Some(campaign_id)
+        || existing.experiment_id.as_deref() != Some(experiment_id)
+        || existing.kind != EventKind::CampaignDecision
+        || existing.dedup_key != expected.dedup_key
+        || existing.payload != expected.payload
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "existing terminal event conflicts with the research lineage",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unclaimed_research_terminal_event(
+    transaction: &Transaction<'_>,
+    event: &Event,
+    cycle_id: &str,
+) -> Result<(), AppError> {
+    if !matches!(event.status, EventStatus::Pending | EventStatus::RetryWait)
+        || event.attempts != 0
+        || event.lease_until.is_some()
+        || event.completed_at.is_some()
+        || event.last_error.is_some()
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "existing terminal event is already claimed or resolved",
+        ));
+    }
+    let owned: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_run_events
+                 WHERE project_id = ?1 AND event_id = ?2
+             ) OR EXISTS(
+                 SELECT 1 FROM agent_runs
+                 WHERE project_id = ?1 AND primary_event_id = ?2
+             ) OR EXISTS(
+                 SELECT 1 FROM decision_attempts
+                 WHERE cycle_id = ?3
+             ) OR EXISTS(
+                 SELECT 1 FROM decision_attempts
+                 WHERE agent_run_id IN (
+                     SELECT run_id FROM agent_run_events
+                     WHERE project_id = ?1 AND event_id = ?2
+                 )
+             )",
+            params![event.project_id, event.event_id, cycle_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check research terminal event ownership"))?;
+    if owned {
+        return Err(validation_error(
+            "research.handoff",
+            "existing terminal event has durable run ownership",
+        ));
+    }
+    Ok(())
+}
+
+fn research_handoff_notes(
+    owner: &ResearchOwnershipSnapshot,
+    context_json: Option<&str>,
+    context_digest: Option<&str>,
+    response_json: Option<&str>,
+    notes_json: Option<&str>,
+    objective_digest: &str,
+) -> Result<String, AppError> {
+    let Some(context_json) = context_json else {
+        return Err(validation_error(
+            "research.handoff",
+            "research context is missing",
+        ));
+    };
+    if context_json.is_empty()
+        || context_json.len() > crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "research context is empty or oversized",
+        ));
+    }
+    let Some(context_digest) = context_digest else {
+        return Err(validation_error(
+            "research.handoff",
+            "research context digest is missing",
+        ));
+    };
+    if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+        return Err(validation_error(
+            "research.handoff",
+            "research context digest is invalid",
+        ));
+    }
+    let context = serde_json::from_str::<serde_json::Value>(context_json).map_err(|_| {
+        validation_error("research.handoff", "research context is invalid JSON")
+    })?;
+    if !research_context_identity_matches(
+        &context,
+        &owner.project_id,
+        &owner.campaign_id,
+        &owner.review_id,
+        &owner.source_experiment_id,
+        &owner.managed_task_signature,
+        owner.source_task_id,
+        objective_digest,
+    ) {
+        return Err(validation_error(
+            "research.handoff",
+            "research context identity does not match the confirmed owner",
+        ));
+    }
+    let Some(response_json) = response_json else {
+        return Err(validation_error(
+            "research.handoff",
+            "research response is missing",
+        ));
+    };
+    let answer = parse_research_answer(response_json.as_bytes()).map_err(|_| {
+        validation_error("research.handoff", "research response is invalid")
+    })?;
+    if answer.action != "stop_and_next"
+        || answer.review_id != owner.review_id
+        || answer.experiment_id != owner.source_experiment_id
+        || answer.context_digest != context_digest
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "research response does not match the confirmed owner",
+        ));
+    }
+    let context_evidence_refs = context_evidence_refs(&context);
+    if answer
+        .evidence_refs
+        .iter()
+        .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
+        || answer.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .support_evidence_refs
+                .iter()
+                .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
+        })
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "research response cites evidence outside its context",
+        ));
+    }
+    let mut notes = notes_json
+        .map(|value| {
+            serde_json::from_str::<serde_json::Value>(value).map_err(|_| {
+                validation_error("research.handoff", "research notes are invalid JSON")
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !notes.is_object() {
+        return Err(validation_error(
+            "research.handoff",
+            "research notes must be a JSON object",
+        ));
+    }
+    notes["saved_advice"] = serde_json::json!(bounded_redacted_text(&answer.notes));
+    serde_json::to_string(&notes).map_err(|source| AppError::Serialization {
+        operation: "serialize research handoff notes",
+        source,
+    })
+}
+
+fn validate_existing_terminal_event_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &NewEvent,
+    cycle_id: &str,
+) -> Result<(), AppError> {
+    let existing: Option<(EventKind, Option<String>, Option<String>, String)> = transaction
+        .query_row(
+            "SELECT kind, campaign_id, experiment_id, payload_json
+             FROM events
+             WHERE project_id = ?1 AND dedup_key = ?2",
+            params![expected.project_id, expected.dedup_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(database_error("read deferred terminal decision event"))?;
+    let Some((kind, campaign_id, experiment_id, payload_json)) = existing else {
+        return Ok(());
+    };
+    let payload: serde_json::Value = serde_json::from_str(&payload_json).map_err(|source| {
+        AppError::Serialization {
+            operation: "parse deferred terminal decision event",
+            source,
+        }
+    })?;
+    if kind != EventKind::CampaignDecision
+        || campaign_id.as_deref() != expected.campaign_id.as_deref()
+        || experiment_id.as_deref() != expected.experiment_id.as_deref()
+        || payload != expected.payload
+        || payload.get("cycle_id").and_then(serde_json::Value::as_str)
+            != Some(cycle_id)
+    {
+        return Err(validation_error(
+            "campaign_decision_event",
+            "conflicts with the existing terminal decision projection",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_authority_lineage(authority: &DecisionAuthority) -> Result<(), AppError> {
     if authority.experiment_campaign_id != authority.cycle.campaign_id
         || !is_terminal(authority.experiment_status)
@@ -1855,6 +2634,49 @@ fn validate_reservation_lineage(
     } else {
         Ok(())
     }
+}
+
+fn validate_research_decision_ownership(
+    transaction: &Transaction<'_>,
+    authority: &DecisionAuthority,
+    cycle_id: &str,
+) -> Result<(), AppError> {
+    if research_decision_work_allowed(
+        transaction,
+        &authority.project_id,
+        &authority.cycle.campaign_id,
+        &authority.cycle.source_experiment_id,
+        cycle_id,
+    )? {
+        Ok(())
+    } else {
+        Err(validation_error(
+            "research_ownership",
+            "must be attached to the exact terminal decision cycle before decision work",
+        ))
+    }
+}
+
+fn research_decision_work_allowed(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    campaign_id: &str,
+    source_experiment_id: &str,
+    cycle_id: &str,
+) -> Result<bool, AppError> {
+    let ownership = research_ownership_in_transaction(
+        transaction,
+        project_id,
+        campaign_id,
+        source_experiment_id,
+    )?;
+    Ok(match ownership {
+        ResearchOwnership::None => true,
+        ResearchOwnership::Attached(snapshot) => {
+            snapshot.decision_cycle_id.as_deref() == Some(cycle_id)
+        }
+        ResearchOwnership::Open(_) => false,
+    })
 }
 
 fn read_cycle(connection: &Connection, cycle_id: &str) -> Result<DecisionCycle, AppError> {
@@ -2038,6 +2860,277 @@ fn validation_error(
     message: &'static str,
 ) -> AppError {
     AppError::Validation { field, message }
+}
+
+#[cfg(test)]
+mod research_attachment_tests {
+    use super::*;
+    use crate::db::EventRepository;
+    use tempfile::TempDir;
+
+    fn snapshot() -> ResearchOwnershipSnapshot {
+        ResearchOwnershipSnapshot {
+            review_id: "review-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            campaign_id: "campaign-1".to_owned(),
+            source_experiment_id: "experiment-1".to_owned(),
+            managed_task_signature: "pueue-managed-run:v1:signature".to_owned(),
+            source_task_id: Some(41),
+            attempt: 1,
+            session_generation: 0,
+            event_id: Some(1),
+            operation_stage: Some("stop_confirmed".to_owned()),
+            agent_run_id: Some(7),
+            termination_request_id: Some(9),
+            decision_cycle_id: None,
+            successor_experiment_id: None,
+            recovery_required: false,
+        }
+    }
+
+    #[test]
+    fn attachment_rejects_missing_exact_owner_without_mutating_cycle_or_event() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        let mut connection = db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let owner = snapshot();
+        let event = NewEvent::new(
+            owner.project_id.clone(),
+            EventKind::CampaignDecision,
+            campaign_decision_dedup_key("decision-cycle:missing"),
+            serde_json::json!({
+                "source": "terminal_experiment",
+                "cycle_id": "decision-cycle:missing",
+                "source_experiment_id": owner.source_experiment_id,
+            }),
+            100,
+            100,
+        )
+        .with_campaign_lineage(owner.campaign_id.clone(), Some(owner.source_experiment_id.clone()));
+
+        assert!(DecisionRepository::attach_research_terminal_cycle_in_transaction(
+            &transaction,
+            &owner,
+            &event,
+            100,
+        )
+        .is_err());
+        transaction.commit().unwrap();
+        assert_eq!(
+            db.connect()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM decision_cycles", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.connect()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn handoff_notes_preserve_the_session_envelope_and_save_bounded_advice() {
+        let owner = snapshot();
+        let context_json = serde_json::json!({
+            "schema_version": 1,
+            "facts": {
+                "review": {
+                    "review_id": owner.review_id.clone(),
+                    "experiment_id": owner.source_experiment_id.clone(),
+                    "task_signature": owner.managed_task_signature.clone(),
+                },
+                "campaign": {"campaign_id": owner.campaign_id.clone()},
+                "project": {"project_id": owner.project_id.clone()},
+                "objective": {"digest": "objective-digest"},
+                "target": {
+                    "experiment_id": owner.source_experiment_id.clone(),
+                    "pueue_task_id": owner.source_task_id,
+                    "task_signature": owner.managed_task_signature.clone(),
+                },
+                "evidence": [{"evidence_ref": "research:review-1"}],
+            },
+        })
+        .to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let response_json = serde_json::json!({
+            "schema_version": 1,
+            "review_id": owner.review_id.clone(),
+            "experiment_id": owner.source_experiment_id.clone(),
+            "context_digest": context_digest.clone(),
+            "action": "stop_and_next",
+            "reason": "confirmed",
+            "evidence_refs": ["research:review-1"],
+            "notes": "bounded advice",
+            "next_direction": "continue",
+            "checkpoint": null,
+        })
+        .to_string();
+        let notes = research_handoff_notes(
+            &owner,
+            Some(&context_json),
+            Some(&context_digest),
+            Some(&response_json),
+            Some(r#"{"session_binding":"confirmed"}"#),
+            "objective-digest",
+        )
+        .unwrap();
+        let notes: serde_json::Value = serde_json::from_str(&notes).unwrap();
+        assert_eq!(
+            notes.get("session_binding").and_then(serde_json::Value::as_str),
+            Some("confirmed")
+        );
+        assert_eq!(
+            notes.get("saved_advice").and_then(serde_json::Value::as_str),
+            Some("bounded advice")
+        );
+    }
+
+    #[test]
+    fn handoff_notes_reject_context_without_exact_owner_identity() {
+        let owner = snapshot();
+        let context_json = r#"{"schema_version":1}"#;
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let response_json = serde_json::json!({
+            "schema_version": 1,
+            "review_id": owner.review_id.clone(),
+            "experiment_id": owner.source_experiment_id.clone(),
+            "context_digest": context_digest.clone(),
+            "action": "stop_and_next",
+            "reason": "confirmed",
+            "evidence_refs": ["unrelated"],
+            "notes": "bounded advice",
+            "next_direction": "continue",
+            "checkpoint": null,
+        })
+        .to_string();
+
+        assert!(research_handoff_notes(
+            &owner,
+            Some(context_json),
+            Some(&context_digest),
+            Some(&response_json),
+            Some(r#"{"session_binding":"confirmed"}"#),
+            "objective-digest",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn existing_pending_event_is_eligible_for_unclaimed_adoption() {
+        let temp = TempDir::new().unwrap();
+        let db = Db::open(&temp.path().join("state.sqlite3")).unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO projects (
+                     project_id, root_path, pueue_group, config_path,
+                     enabled, paused, created_at, updated_at
+                 ) VALUES ('project-1', '/tmp/project-1', 'group-1',
+                           '/tmp/project-1/config.toml', 1, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+        let expected = NewEvent::new(
+            "project-1",
+            EventKind::CampaignDecision,
+            "campaign-decision:v1:cycle-1",
+            serde_json::json!({"source": "terminal_experiment"}),
+            100,
+            100,
+        );
+        let stored = EventRepository::new(&db)
+            .insert_idempotent(&expected)
+            .unwrap();
+        let mut connection = db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let event = read_research_terminal_event_in_transaction(
+            &transaction,
+            "project-1",
+            "cycle-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(event.event_id, stored.event_id);
+        validate_unclaimed_research_terminal_event(&transaction, &event, "cycle-1").unwrap();
+        transaction.commit().unwrap();
+
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_attempts
+                     (cycle_id, attempt_number, state, created_at)
+                 VALUES ('cycle-1', 1, 'reserved', 100)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut connection = db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let event = read_research_terminal_event_in_transaction(
+            &transaction,
+            "project-1",
+            "cycle-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(validate_unclaimed_research_terminal_event(&transaction, &event, "cycle-1").is_err());
+    }
+
+    #[test]
+    fn terminal_decision_event_uses_the_exact_managed_observation_projection() {
+        let event = DecisionRepository::terminal_decision_event(
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+            TerminalDecisionEventProjection {
+                task_id: 41,
+                managed_task_signature: "pueue-managed-run:v1:managed",
+                group: "research",
+                state: "Killed",
+                enqueued_at: Some(10),
+                started_at: Some(20),
+                ended_at: Some(30),
+                exit_code: Some(0),
+            },
+            100,
+        );
+
+        let cycle_id = DecisionRepository::terminal_cycle_id("campaign-1", "experiment-1");
+        assert_eq!(event.kind, EventKind::CampaignDecision);
+        assert_eq!(
+            event.dedup_key,
+            campaign_decision_dedup_key(&cycle_id)
+        );
+        assert_eq!(event.campaign_id.as_deref(), Some("campaign-1"));
+        assert_eq!(event.experiment_id.as_deref(), Some("experiment-1"));
+        assert_eq!(
+            event.payload,
+            serde_json::json!({
+                "source": "terminal_experiment",
+                "cycle_id": cycle_id,
+                "source_experiment_id": "experiment-1",
+                "terminal_observation": {
+                    "task_id": 41,
+                    "task_signature": "pueue-managed-run:v1:managed",
+                    "group": "research",
+                    "state": "Killed",
+                    "enqueued_at": 10,
+                    "started_at": 20,
+                    "ended_at": 30,
+                    "exit_code": 0,
+                },
+            })
+        );
+    }
 }
 
 #[cfg(test)]

@@ -4860,6 +4860,610 @@ mod decision_context {
     }
 
     #[test]
+    fn decision_context_rejects_an_open_research_handoff_without_v1_fallback() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_101)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'stop_confirmed'
+                 WHERE review_id = ?1",
+                [&review.review_id],
+            )
+            .unwrap();
+
+        let reservation = pueue_agent::db::DecisionReservation {
+            cycle_id: cycle.cycle_id.clone(),
+            campaign_id: harness.campaign_id.clone(),
+            source_experiment_id: harness.experiment_id.clone(),
+            attempt_number: 1,
+            created_at: 1_101,
+        };
+        let project = ProjectRepository::new(&harness.db)
+            .find_by_id(&harness.project_id)
+            .unwrap()
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let pueue_tasks = [DecisionPueueTaskProjection {
+            task_id: 41,
+            task_signature: review.task_signature.clone(),
+            group: project.pueue_group.clone(),
+            state: "done".to_owned(),
+            enqueued_at: Some(999),
+            started_at: Some(1_000),
+            ended_at: Some(1_100),
+            exit_code: Some(0),
+        }];
+
+        let error = DecisionEvidenceBuilder::new(&harness.db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &pueue_tasks,
+                observed_at: 1_102,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                field: "research.handoff",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decision_context_v1_bytes_remain_unchanged_without_a_research_handoff() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let project = ProjectRepository::new(&harness.db)
+            .find_by_id(&harness.project_id)
+            .unwrap()
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let pueue_tasks = [DecisionPueueTaskProjection {
+            task_id: 41,
+            task_signature: "pueue-task:v1:decision-fixture".to_owned(),
+            group: project.pueue_group.clone(),
+            state: "done".to_owned(),
+            enqueued_at: Some(100),
+            started_at: Some(101),
+            ended_at: Some(103),
+            exit_code: Some(0),
+        }];
+        let bundle = DecisionEvidenceBuilder::new(&harness.db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &pueue_tasks,
+                observed_at: 200,
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&bundle.json).unwrap()["schema_version"],
+            1
+        );
+        assert!(!bundle.json.contains("\"research\""));
+        assert_eq!(
+            bundle.digest,
+            "8ef46966264517f8d4df9675d562a09af2ab1dcdfacecc07648ba845533272f4"
+        );
+    }
+
+    #[test]
+    fn decision_reservation_defers_an_open_research_terminal_handoff() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_101)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = 'stop_confirmed',
+                     finished_at = 1_102, updated_at = 1_102
+                 WHERE review_id = ?1 AND campaign_id = ?2
+                   AND experiment_id = ?3",
+                params![review.review_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+
+        let result = DecisionRepository::new(&harness.db).reserve_next_attempt(
+            &harness.project_id,
+            &cycle.cycle_id,
+            1_103,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM decision_attempts"), 0);
+    }
+
+    #[test]
+    fn event_claim_defers_an_open_research_terminal_handoff() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_101)
+            .unwrap();
+        DecisionRepository::new(&harness.db)
+            .publish_terminal_cycle_event(
+                &harness.campaign_id,
+                &harness.experiment_id,
+                &NewEvent::new(
+                    &harness.project_id,
+                    EventKind::CampaignDecision,
+                    format!("campaign-decision:v1:{}", cycle.cycle_id),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle.cycle_id,
+                        "source_experiment_id": harness.experiment_id,
+                    }),
+                    1_102,
+                    1_102,
+                )
+                .with_campaign_lineage(
+                    harness.campaign_id.clone(),
+                    Some(harness.experiment_id.clone()),
+                ),
+                1_102,
+            )
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = 'stop_confirmed',
+                     finished_at = 1_103, updated_at = 1_103
+                 WHERE review_id = ?1 AND campaign_id = ?2
+                   AND experiment_id = ?3",
+                params![review.review_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+
+        let claimed = EventRepository::new(&harness.db)
+            .claim_batch(1_103, 1_163, 1)
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        let event = EventRepository::new(&harness.db)
+            .find_by_dedup_key(
+                &harness.project_id,
+                &format!("campaign-decision:v1:{}", cycle.cycle_id),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, EventStatus::RetryWait);
+        assert_eq!(event.not_before, 1_163);
+        assert_eq!(event.attempts, 0);
+    }
+
+    #[test]
+    fn decision_wake_defers_an_open_research_terminal_handoff() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_101)
+            .unwrap();
+        let event = DecisionRepository::new(&harness.db)
+            .publish_terminal_cycle_event(
+                &harness.campaign_id,
+                &harness.experiment_id,
+                &NewEvent::new(
+                    &harness.project_id,
+                    EventKind::CampaignDecision,
+                    format!("campaign-decision:v1:{}", cycle.cycle_id),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle.cycle_id,
+                        "source_experiment_id": harness.experiment_id,
+                    }),
+                    1_102,
+                    1_102,
+                )
+                .with_campaign_lineage(
+                    harness.campaign_id.clone(),
+                    Some(harness.experiment_id.clone()),
+                ),
+                1_102,
+            )
+            .unwrap()
+            .1;
+        let connection = harness.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = 'stop_confirmed',
+                     finished_at = 1_103, updated_at = 1_103
+                 WHERE review_id = ?1 AND campaign_id = ?2
+                   AND experiment_id = ?3",
+                params![review.review_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE decision_cycles
+                 SET state = 'waiting', next_wake_at = 1_200
+                 WHERE cycle_id = ?1",
+                [&cycle.cycle_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE events SET status = 'retry_wait', not_before = 1_200
+                 WHERE event_id = ?1",
+                [event.event_id],
+            )
+            .unwrap();
+
+        let promoted = DecisionRepository::new(&harness.db)
+            .due_cycles(1_200, 1)
+            .unwrap();
+
+        assert!(promoted.is_empty());
+        let state: String = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM decision_cycles WHERE cycle_id = ?1",
+                [&cycle.cycle_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "waiting");
+        assert_eq!(
+            EventRepository::new(&harness.db)
+                .find_by_id(event.event_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            EventStatus::RetryWait
+        );
+    }
+
+    #[test]
+    fn oldest_pending_decision_defers_an_open_research_terminal_handoff() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_101)
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = 'stop_confirmed',
+                     finished_at = 1_102, updated_at = 1_102
+                 WHERE review_id = ?1 AND campaign_id = ?2
+                   AND experiment_id = ?3",
+                params![review.review_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+
+        let pending = DecisionRepository::new(&harness.db)
+            .oldest_pending_cycle_for_campaign(&harness.project_id, &harness.campaign_id)
+            .unwrap();
+
+        assert!(pending.is_none());
+        assert_eq!(
+            harness
+                .db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM decision_cycles WHERE cycle_id = ?1",
+                    [&cycle.cycle_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending"
+        );
+    }
+
+    #[test]
+    fn terminal_backfill_defers_an_open_research_terminal_handoff() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        let (_, raw_signature, _) = canonical_research_task(
+            41,
+            "research",
+            "pa-campaign-project",
+            1_000,
+        );
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        TaskObservationRepository::new(&harness.db)
+            .upsert(&NewTaskObservation::new(
+                &harness.project_id,
+                raw_signature,
+                41,
+                "pa-campaign-project",
+                vec!["python research.py".to_owned()],
+                "Done",
+                Some(999),
+                Some(1_000),
+                Some(1_100),
+                Some(json!({"Success": 0}).to_string()),
+                1_101,
+            ))
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = 'stop_confirmed',
+                     finished_at = 1_102, updated_at = 1_102
+                 WHERE review_id = ?1 AND campaign_id = ?2
+                   AND experiment_id = ?3",
+                params![review.review_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+
+        let backfilled = DecisionRepository::new(&harness.db)
+            .backfill_terminal_cycle_events(1_103)
+            .unwrap();
+
+        assert_eq!(backfilled, 0);
+        assert_eq!(
+            harness.scalar("SELECT COUNT(*) FROM events WHERE kind = 'campaign_decision'"),
+            0
+        );
+    }
+
+    #[test]
+    fn ordinary_terminal_publication_remains_idempotent_without_research_owner() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let cycle_id = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_099)
+            .unwrap()
+            .cycle_id;
+        let event = NewEvent::new(
+            &harness.project_id,
+            EventKind::CampaignDecision,
+            format!("campaign-decision:v1:{cycle_id}"),
+            json!({
+                "source": "terminal_experiment",
+                "cycle_id": cycle_id,
+                "source_experiment_id": harness.experiment_id,
+            }),
+            1_100,
+            1_100,
+        )
+        .with_campaign_lineage(
+            harness.campaign_id.clone(),
+            Some(harness.experiment_id.clone()),
+        );
+        let first = DecisionRepository::new(&harness.db)
+            .publish_terminal_cycle_event(
+                &harness.campaign_id,
+                &harness.experiment_id,
+                &event,
+                1_100,
+            )
+            .unwrap();
+        let second = DecisionRepository::new(&harness.db)
+            .publish_terminal_cycle_event(
+                &harness.campaign_id,
+                &harness.experiment_id,
+                &event,
+                1_101,
+            )
+            .unwrap();
+
+        assert_eq!(first.0.cycle_id, second.0.cycle_id);
+        assert_eq!(first.1.event_id, second.1.event_id);
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM events WHERE kind = 'campaign_decision'"), 1);
+    }
+
+    #[test]
+    fn canonical_terminal_event_with_missing_lineage_is_deferred_before_claim() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let cycle = DecisionRepository::new(&harness.db)
+            .ensure_cycle_for_terminal(&harness.campaign_id, &harness.experiment_id, 1_100)
+            .unwrap();
+        let event = EventRepository::new(&harness.db)
+            .insert_idempotent(&NewEvent::new(
+                &harness.project_id,
+                EventKind::CampaignDecision,
+                format!("campaign-decision:v1:{}", cycle.cycle_id),
+                json!({
+                    "source": "terminal_experiment",
+                    "cycle_id": cycle.cycle_id,
+                    "source_experiment_id": harness.experiment_id,
+                }),
+                1_101,
+                1_101,
+            ))
+            .unwrap();
+
+        let claimed = EventRepository::new(&harness.db)
+            .claim_batch(1_101, 1_161, 1)
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        let stored = EventRepository::new(&harness.db)
+            .find_by_id(event.event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, EventStatus::RetryWait);
+        assert_eq!(stored.not_before, 1_161);
+        assert_eq!(stored.attempts, 0);
+    }
+
+    #[test]
+    fn canonical_terminal_event_for_nonterminal_source_is_deferred_before_claim() {
+        let harness = CampaignDbHarness::with_experiment(ExperimentStatus::Accepted);
+        let cycle_id = format!(
+            "decision-cycle:{:x}",
+            Sha256::digest(format!("{}\0{}", harness.campaign_id, harness.experiment_id).as_bytes())
+        );
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO decision_cycles (
+                    cycle_id, campaign_id, source_experiment_id, state, next_wake_at,
+                    consecutive_failed_attempts, last_decision_kind, last_failure_code,
+                    last_failure_summary, created_at, updated_at, source_terminal_at
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, 100, 100, 1)",
+                params![cycle_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+        let event = EventRepository::new(&harness.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    &harness.project_id,
+                    EventKind::CampaignDecision,
+                    format!("campaign-decision:v1:{cycle_id}"),
+                    json!({
+                        "source": "terminal_experiment",
+                        "cycle_id": cycle_id,
+                        "source_experiment_id": harness.experiment_id,
+                    }),
+                    1_101,
+                    1_101,
+                )
+                .with_campaign_lineage(
+                    harness.campaign_id.clone(),
+                    Some(harness.experiment_id.clone()),
+                ),
+            )
+            .unwrap();
+
+        let claimed = EventRepository::new(&harness.db)
+            .claim_batch(1_101, 1_161, 1)
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        let stored = EventRepository::new(&harness.db)
+            .find_by_id(event.event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, EventStatus::RetryWait);
+        assert_eq!(stored.not_before, 1_161);
+        assert_eq!(stored.attempts, 0);
+    }
+
+    #[test]
+    fn noncanonical_campaign_decision_defers_an_open_research_owner() {
+        let harness = CampaignDbHarness::new();
+        let review = harness.running_research_review();
+        ExperimentRepository::new(&harness.db)
+            .project_terminal_submission(
+                &harness.experiment_id,
+                41,
+                ExperimentTerminalOutcome::Succeeded,
+                1_100,
+            )
+            .unwrap();
+        let event = EventRepository::new(&harness.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    &harness.project_id,
+                    EventKind::CampaignDecision,
+                    "research-owned-noncanonical-decision",
+                    json!({"source": "research_action"}),
+                    1_101,
+                    1_101,
+                )
+                .with_campaign_lineage(
+                    harness.campaign_id.clone(),
+                    Some(harness.experiment_id.clone()),
+                ),
+            )
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = 'stop_confirmed',
+                     finished_at = 1_102, updated_at = 1_102
+                 WHERE review_id = ?1 AND campaign_id = ?2
+                   AND experiment_id = ?3",
+                params![review.review_id, harness.campaign_id, harness.experiment_id],
+            )
+            .unwrap();
+
+        let claimed = EventRepository::new(&harness.db)
+            .claim_batch(1_102, 1_162, 1)
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        let stored = EventRepository::new(&harness.db)
+            .find_by_id(event.event_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, EventStatus::RetryWait);
+        assert_eq!(stored.not_before, 1_162);
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(harness.scalar("SELECT COUNT(*) FROM agent_runs"), 0);
+    }
+
+    #[test]
     fn decision_launch_context_must_exactly_match_strict_persisted_evidence() {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let (_cycle, reservation) = harness.reserved_decision_attempt();
@@ -5061,7 +5665,7 @@ mod decision_context {
         let first_event = events
             .insert_idempotent(&NewEvent::new(
                 &harness.project_id,
-                EventKind::CampaignDecision,
+                EventKind::OperatorWake,
                 "decision-owner-first",
                 serde_json::json!({}),
                 200,
@@ -5099,7 +5703,7 @@ mod decision_context {
         let second_event = events
             .insert_idempotent(&NewEvent::new(
                 &harness.project_id,
-                EventKind::CampaignDecision,
+                EventKind::OperatorWake,
                 "decision-owner-second",
                 serde_json::json!({}),
                 203,

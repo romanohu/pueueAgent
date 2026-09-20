@@ -50,7 +50,10 @@ use crate::{
 use super::{
     database_error,
     decisions::{campaign_decision_dedup_key, DecisionRepository, DecisionReservation},
-    research::{native_research_authority, NativeResearchBindingExpectation, ResearchRepository},
+    research::{
+        native_research_authority, research_ownership_in_transaction,
+        NativeResearchBindingExpectation, ResearchOwnership, ResearchRepository,
+    },
     Db,
 };
 
@@ -64,7 +67,8 @@ fn event_claim_candidate_sql(status: EventStatus) -> String {
         _ => unreachable!("event claim probes only pending and retry-wait states"),
     };
     format!(
-        "SELECT event_id, project_id, not_before, created_at
+        "SELECT event_id, project_id, campaign_id, experiment_id, kind,
+                not_before, created_at
          FROM events INDEXED BY events_claimable_idx
          WHERE status IN ('pending', 'retry_wait')
            AND status = '{status}' AND not_before <= ?1
@@ -72,6 +76,106 @@ fn event_claim_candidate_sql(status: EventStatus) -> String {
          ORDER BY not_before, created_at, event_id
          LIMIT ?2"
     )
+}
+
+fn research_claim_is_deferred(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    campaign_id: Option<&str>,
+    experiment_id: Option<&str>,
+    kind: &EventKind,
+    event_id: i64,
+    ) -> Result<bool, AppError> {
+    let dedup_key: String = transaction
+        .query_row(
+            "SELECT dedup_key FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+    )
+        .map_err(database_error("read research-owned event deduplication key"))?;
+    if *kind == EventKind::CampaignDecision {
+        let Some(cycle_id) = dedup_key.strip_prefix("campaign-decision:v1:") else {
+            return Ok(true);
+        };
+        let Some(campaign_id) = campaign_id else {
+            return Ok(true);
+        };
+        let Some(experiment_id) = experiment_id else {
+            return Ok(true);
+        };
+        let canonical_lineage: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT campaign_id, source_experiment_id
+                 FROM decision_cycles WHERE cycle_id = ?1",
+                [cycle_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read canonical decision cycle for event claim"))?;
+        let Some((canonical_campaign_id, canonical_experiment_id)) = canonical_lineage else {
+            return Ok(true);
+        };
+        if DecisionRepository::terminal_cycle_id(
+            &canonical_campaign_id,
+            &canonical_experiment_id,
+        ) != cycle_id
+            || campaign_id != canonical_campaign_id
+            || experiment_id != canonical_experiment_id
+        {
+            return Ok(true);
+        }
+        let project_matches: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM campaigns
+                     WHERE campaign_id = ?1 AND project_id = ?2
+                 )",
+                params![canonical_campaign_id, project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("validate canonical decision campaign project"))?;
+        let source_terminal: bool = transaction
+            .query_row(
+                "SELECT status IN ('succeeded','failed','cancelled')
+                 FROM experiments
+                 WHERE experiment_id = ?1 AND campaign_id = ?2",
+                params![canonical_experiment_id, canonical_campaign_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("validate canonical decision source status"))?
+            .unwrap_or(false);
+        if !project_matches || !source_terminal {
+            return Ok(true);
+        }
+        let ownership = research_ownership_in_transaction(
+            transaction,
+            project_id,
+            &canonical_campaign_id,
+            &canonical_experiment_id,
+        )?;
+        return Ok(match ownership {
+            ResearchOwnership::None => false,
+            ResearchOwnership::Open(_) => true,
+            ResearchOwnership::Attached(snapshot) => {
+                snapshot.decision_cycle_id.as_deref() != Some(cycle_id)
+            }
+        });
+    }
+    let (Some(campaign_id), Some(experiment_id)) = (campaign_id, experiment_id) else {
+        return Ok(false);
+    };
+    let ownership = research_ownership_in_transaction(
+        transaction,
+        project_id,
+        campaign_id,
+        experiment_id,
+    )?;
+    match ownership {
+        ResearchOwnership::None => Ok(false),
+        ResearchOwnership::Open(_) => Ok(true),
+        ResearchOwnership::Attached(_) => Ok(true),
+    }
 }
 
 pub struct ProjectRepository<'db> {
@@ -1171,8 +1275,11 @@ impl<'db> EventRepository<'db> {
                             Ok((
                                 row.get::<_, i64>(0)?,
                                 row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, EventKind>(4)?,
+                                row.get::<_, i64>(5)?,
+                                row.get::<_, i64>(6)?,
                                 status,
                             ))
                         })
@@ -1181,14 +1288,24 @@ impl<'db> EventRepository<'db> {
                         .map_err(database_error("read claimable events"))?,
                 );
             }
-            candidates.sort_by_key(|(event_id, _, not_before, created_at, _)| {
+            candidates.sort_by_key(|(event_id, _, _, _, _, not_before, created_at, _)| {
                 (*not_before, *created_at, *event_id)
             });
             candidates.truncate(EVENT_CLAIM_WORK_LIMIT);
             if candidates.is_empty() {
                 break;
             }
-            for (event_id, project_id, _, _, expected_status) in candidates {
+            for (
+                event_id,
+                project_id,
+                campaign_id,
+                experiment_id,
+                kind,
+                _,
+                _,
+                expected_status,
+            ) in candidates
+            {
                 if blocked_project_ids.contains(&project_id) {
                     let rotated = transaction
                         .execute(
@@ -1202,6 +1319,28 @@ impl<'db> EventRepository<'db> {
                     if rotated != 1 {
                         return Err(AppError::Runtime {
                             operation: "rotate blocked event claim candidate",
+                        });
+                    }
+                } else if research_claim_is_deferred(
+                    &transaction,
+                    &project_id,
+                    campaign_id.as_deref(),
+                    experiment_id.as_deref(),
+                    &kind,
+                    event_id,
+                )? {
+                    let rotated = transaction
+                        .execute(
+                            "UPDATE events
+                             SET status = 'retry_wait', not_before = ?1, lease_until = NULL
+                             WHERE project_id = ?2 AND event_id = ?3 AND status = ?4
+                               AND not_before <= ?5",
+                            params![lease_until, project_id, event_id, expected_status, now],
+                        )
+                        .map_err(database_error("rotate research-owned event claim candidate"))?;
+                    if rotated != 1 {
+                        return Err(AppError::Runtime {
+                            operation: "rotate research-owned event claim candidate",
                         });
                     }
                 } else if event_ids.len() < limit {
