@@ -3754,8 +3754,6 @@ async fn research_safe_missing_session_reconstructs_lineage_without_resetting_at
     assert_eq!(harness.reservation_status(&second_reservation), "consumed");
 
     harness.complete_ready_review(&changed.review.review_id);
-    let sibling_experiment_id = harness.admit_sibling_experiment();
-    let sibling_task_signature = format!("pueue-task:v1:{}:three", harness.campaign_id);
     harness
         .db
         .connect()
@@ -3768,12 +3766,12 @@ async fn research_safe_missing_session_reconstructs_lineage_without_resetting_at
     let sibling_review = ResearchRepository::new(&harness.db)
         .claim_due(
             &harness.campaign_id,
-            &sibling_experiment_id,
-            &sibling_task_signature,
+            &changed.review.experiment_id,
+            &changed.review.task_signature,
             NOW + 130,
         )
         .unwrap()
-        .expect("the sibling running experiment must produce a review");
+        .expect("the changed running experiment must produce a review");
     let sibling = ClaimedReview {
         event_id: review_event_id(&harness.db, &sibling_review.review_id),
         evidence: build_research_evidence(&harness.db, &sibling_review, NOW + 130).unwrap(),

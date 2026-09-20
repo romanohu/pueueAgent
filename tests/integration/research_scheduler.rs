@@ -316,6 +316,14 @@ fn set_fixture_native_cleanup_phase(fixture: &SchedulerFixture, review_id: &str,
         .expect("read fixture recovery authority");
     let mut notes: serde_json::Value = serde_json::from_str(&notes_json).expect("fixture notes");
     notes["native_recovery"]["cleanup"]["phase"] = serde_json::json!(phase);
+    if phase == "complete" {
+        notes["native_recovery"]["cleanup"]["completed_at"] = serde_json::json!(3_000);
+    } else {
+        notes["native_recovery"]["cleanup"]
+            .as_object_mut()
+            .expect("fixture cleanup object")
+            .remove("completed_at");
+    }
     fixture
         .db
         .connect()
@@ -649,7 +657,7 @@ fn retry_admission_moves_native_recovery_proof_into_history_and_clears_top_level
                 "mode": 448,
             },
         },
-        "cleanup": {"phase": "complete"},
+        "cleanup": {"phase": "complete", "completed_at": 3_000},
     });
     let original_notes = serde_json::json!({
         "business_note": "preserve this note",
