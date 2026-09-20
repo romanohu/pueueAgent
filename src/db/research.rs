@@ -1,10 +1,18 @@
 use std::collections::BTreeSet;
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{models::EventStatus, AppError};
+use crate::{
+    environment::{
+        PrivateRunTempRecoveryIdentityV1, PrivateRunTempRecoveryRootIdentity,
+        PrivateRunTempRecoveryTempIdentity,
+    },
+    models::EventStatus,
+    AppError,
+};
 
 use super::{database_error, Db};
 
@@ -381,6 +389,50 @@ impl<'db> ResearchRepository<'db> {
                            WHERE owner.run_id = review.agent_run_id
                              AND owner.status IN ('completed','failed','timed_out','cancelled')
                              AND owner.launch_gate_state IN ('released','failed')
+                             AND owner.project_id = campaign.project_id
+                             AND owner.execution_kind = 'campaign_research'
+                       )
+                   )
+                   AND (
+                       review.agent_run_id IS NULL
+                       OR (
+                           json_valid(review.notes_json) = 1
+                           AND json_extract(review.notes_json, '$.native_recovery.cleanup.phase') = 'complete'
+                           AND json_extract(review.notes_json, '$.native_recovery.version') = 1
+                           AND json_extract(review.notes_json, '$.native_recovery.run_id') = review.agent_run_id
+                           AND json_extract(review.notes_json, '$.native_recovery.review_id') = review.review_id
+                           AND json_extract(review.notes_json, '$.native_recovery.campaign_id') = review.campaign_id
+                           AND json_extract(review.notes_json, '$.native_recovery.experiment_id') = review.experiment_id
+                           AND json_extract(review.notes_json, '$.native_recovery.attempt') = review.attempt
+                           AND json_extract(review.notes_json, '$.native_recovery.session_generation') = review.session_generation
+                           AND json_type(review.notes_json, '$.native_recovery.session_id') = 'text'
+                           AND json_extract(review.notes_json, '$.native_recovery.session_id') <> ''
+                           AND research_state.session_generation = review.session_generation
+                           AND (
+                               (
+                                   json_extract(review.notes_json, '$.native_recovery.fresh_launch') = 0
+                                   AND research_state.session_id = json_extract(review.notes_json, '$.native_recovery.session_id')
+                               )
+                               OR (
+                                   json_extract(review.notes_json, '$.native_recovery.fresh_launch') = 1
+                                   AND (
+                                       (
+                                           research_state.session_id IS NOT NULL
+                                           AND json_extract(review.notes_json, '$.session_binding') = 'confirmed'
+                                           AND json_extract(review.notes_json, '$.planned_session_id') = json_extract(review.notes_json, '$.native_recovery.session_id')
+                                           AND json_extract(review.notes_json, '$.confirmed_session_id') = research_state.session_id
+                                       )
+                                       OR (
+                                           research_state.session_id IS NULL
+                                           AND review.state IN ('retry_wait','blocked')
+                                           AND review.failure_code IS NOT NULL
+                                           AND json_extract(review.notes_json, '$.confirmed_session_id') IS NULL
+                                           AND json_extract(review.notes_json, '$.session_binding') = 'pending'
+                                           AND json_extract(review.notes_json, '$.planned_session_id') = json_extract(review.notes_json, '$.native_recovery.session_id')
+                                       )
+                                   )
+                               )
+                           )
                        )
                    )
                  ORDER BY review.not_before, review.created_at, review.review_id
@@ -550,11 +602,53 @@ impl<'db> ResearchRepository<'db> {
     /// unknown owner.
     pub fn retry_owner_ready(&self, review_id: &str) -> Result<bool, AppError> {
         let connection = self.db.connect()?;
-        let Some((state, agent_run_id)) = connection
+        let Some((
+            campaign_id,
+            experiment_id,
+            state,
+            attempt,
+            session_generation,
+            agent_run_id,
+            notes_json,
+            failure_code,
+            campaign_session,
+            campaign_generation,
+            campaign_project_id,
+            owner_project_id,
+            owner_execution_kind,
+        )) = connection
             .query_row(
-                "SELECT state, agent_run_id FROM research_reviews WHERE review_id = ?1",
+                "SELECT review.campaign_id, review.experiment_id, review.state,
+                        review.attempt, review.session_generation,
+                        review.agent_run_id, review.notes_json, review.failure_code,
+                        research_state.session_id, research_state.session_generation,
+                        campaign.project_id, owner.project_id, owner.execution_kind
+                 FROM research_reviews AS review
+                 JOIN campaign_research AS research_state
+                   ON research_state.campaign_id = review.campaign_id
+                 JOIN campaigns AS campaign
+                   ON campaign.campaign_id = review.campaign_id
+                 LEFT JOIN agent_runs AS owner
+                   ON owner.run_id = review.agent_run_id
+                 WHERE review.review_id = ?1",
                 [review_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ))
+                },
             )
             .optional()
             .map_err(database_error("read research retry owner"))?
@@ -564,12 +658,12 @@ impl<'db> ResearchRepository<'db> {
                 "does not identify a persisted research review",
             ));
         };
-        if state != "retry_wait" {
-            return Ok(true);
-        }
         let Some(agent_run_id) = agent_run_id else {
             return Ok(true);
         };
+        if state != "retry_wait" {
+            return Ok(false);
+        }
         let Some((status, gate_state)) = connection
             .query_row(
                 "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
@@ -584,7 +678,24 @@ impl<'db> ResearchRepository<'db> {
         Ok(matches!(
             status.as_str(),
             "completed" | "failed" | "timed_out" | "cancelled"
-        ) && matches!(gate_state.as_str(), "released" | "failed"))
+        ) && matches!(gate_state.as_str(), "released" | "failed")
+            && campaign_generation == session_generation
+            && owner_project_id.as_deref() == Some(campaign_project_id.as_str())
+            && owner_execution_kind.as_deref() == Some("campaign_research")
+            && native_recovery_cleanup_complete(
+                notes_json.as_deref(),
+                &NativeRecoveryCleanupExpectation {
+                    review_id,
+                    campaign_id: &campaign_id,
+                    experiment_id: &experiment_id,
+                    attempt,
+                    session_generation,
+                    agent_run_id,
+                    state: &state,
+                    failure_code: failure_code.as_deref(),
+                    campaign_session: campaign_session.as_deref(),
+                },
+            ))
     }
 
     pub fn next_attempt_for_launch(&self, review_id: &str) -> Result<i64, AppError> {
@@ -804,8 +915,16 @@ impl<'db> ResearchRepository<'db> {
         let current: Option<(
             String,
             String,
+            String,
             i64,
             Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+            Option<String>,
             Option<String>,
             i64,
             EventStatus,
@@ -814,8 +933,12 @@ impl<'db> ResearchRepository<'db> {
             Option<String>,
         )> = transaction
             .query_row(
-                "SELECT review.campaign_id, review.state, review.attempt,
-                        review.agent_run_id, review.failure_code, event.event_id,
+                "SELECT review.campaign_id, review.experiment_id, review.state,
+                        review.attempt, review.agent_run_id, review.session_generation,
+                        review.failure_code, review.notes_json,
+                        research_state.session_id, research_state.session_generation,
+                        campaign.project_id, owner.project_id, owner.execution_kind,
+                        event.event_id,
                         event.status, owner.status, owner.launch_gate_state,
                         research_state.blocked_reason
                  FROM research_reviews AS review
@@ -841,6 +964,14 @@ impl<'db> ResearchRepository<'db> {
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
                     ))
                 },
             )
@@ -848,10 +979,18 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("read research retry settlement"))?;
         let Some((
             campaign_id,
+            experiment_id,
             state,
             attempt,
             run_id,
+            review_generation,
             current_failure_code,
+            notes_json,
+            campaign_session,
+            campaign_generation,
+            campaign_project_id,
+            owner_project_id,
+            owner_execution_kind,
             event_id,
             event_status,
             owner_status,
@@ -887,6 +1026,23 @@ impl<'db> ResearchRepository<'db> {
                 owner_status.as_deref(),
                 Some("completed" | "failed" | "timed_out" | "cancelled")
             ) || !matches!(owner_gate.as_deref(), Some("released" | "failed"))
+                || review_generation != campaign_generation
+                || owner_project_id.as_deref() != Some(campaign_project_id.as_str())
+                || owner_execution_kind.as_deref() != Some("campaign_research")
+                || !native_recovery_cleanup_complete(
+                    notes_json.as_deref(),
+                    &NativeRecoveryCleanupExpectation {
+                        review_id,
+                        campaign_id: &campaign_id,
+                        experiment_id: &experiment_id,
+                        attempt,
+                        session_generation: review_generation,
+                        agent_run_id: run_id.expect("run id checked above"),
+                        state: &state,
+                        failure_code: current_failure_code.as_deref(),
+                        campaign_session: campaign_session.as_deref(),
+                    },
+                )
             {
                 transaction
                     .commit()
@@ -1026,17 +1182,33 @@ impl<'db> ResearchRepository<'db> {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
         ) = transaction
             .query_row(
-                "SELECT campaign_id, state, attempt, agent_run_id,
-                        session_generation, experiment_id, failure_code,
-                        context_json, context_digest, notes_json
-                 FROM research_reviews WHERE review_id = ?1",
+                "SELECT review.campaign_id, review.state, review.attempt,
+                        review.agent_run_id, review.session_generation,
+                        review.experiment_id, review.failure_code,
+                        review.context_json, review.context_digest, review.notes_json,
+                        campaign_research.session_id, campaign_research.session_generation,
+                        campaign.project_id, owner.project_id, owner.execution_kind
+                 FROM research_reviews AS review
+                 JOIN campaign_research
+                   ON campaign_research.campaign_id = review.campaign_id
+                 JOIN campaigns AS campaign
+                   ON campaign.campaign_id = review.campaign_id
+                 LEFT JOIN agent_runs AS owner
+                   ON owner.run_id = review.agent_run_id
+                 WHERE review.review_id = ?1",
                 [review_id],
                 |row| Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                     row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
-                    row.get(8)?, row.get(9)?,
+                    row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+                    row.get(12)?, row.get(13)?, row.get(14)?,
                 )),
             )
             .optional()
@@ -1053,6 +1225,11 @@ impl<'db> ResearchRepository<'db> {
             context_json,
             context_digest,
             notes_json,
+            campaign_session,
+            campaign_generation,
+            campaign_project_id,
+            owner_project_id,
+            owner_execution_kind,
         ) = current;
         if !matches!(state.as_str(), "pending" | "retry_wait") {
             transaction
@@ -1075,7 +1252,26 @@ impl<'db> ResearchRepository<'db> {
                     "completed" | "failed" | "timed_out" | "cancelled"
                 ) && matches!(gate_state.as_str(), "released" | "failed")
             });
-            if state != "retry_wait" || !owner_ready {
+            if state != "retry_wait"
+                || !owner_ready
+                || campaign_generation != _generation
+                || owner_project_id.as_deref() != Some(campaign_project_id.as_str())
+                || owner_execution_kind.as_deref() != Some("campaign_research")
+                || !native_recovery_cleanup_complete(
+                    notes_json.as_deref(),
+                    &NativeRecoveryCleanupExpectation {
+                        review_id,
+                        campaign_id: &campaign_id,
+                        experiment_id: &_experiment_id,
+                        attempt: current_attempt,
+                        session_generation: _generation,
+                        agent_run_id: current_run,
+                        state: &state,
+                        failure_code: failure_code.as_deref(),
+                        campaign_session: campaign_session.as_deref(),
+                    },
+                )
+            {
                 transaction
                     .commit()
                     .map_err(database_error("commit skipped bound research retry"))?;
@@ -1136,17 +1332,25 @@ impl<'db> ResearchRepository<'db> {
             {
                 notes["retry_history"] = json!([]);
             }
-            let history = notes
-                .get_mut("retry_history")
-                .and_then(serde_json::Value::as_array_mut)
-                .expect("retry history array just created");
-            history.push(json!({
+            let mut history_entry = json!({
                 "attempt": current_attempt,
                 "agent_run_id": previous_run_id,
                 "failure_code": failure_code,
                 "context_json": context_json,
                 "context_digest": context_digest,
-            }));
+            });
+            if let Some(native_recovery) = notes.get("native_recovery").cloned() {
+                history_entry["native_recovery"] = native_recovery;
+                notes
+                    .as_object_mut()
+                    .expect("research notes object")
+                    .remove("native_recovery");
+            }
+            let history = notes
+                .get_mut("retry_history")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("retry history array just created");
+            history.push(history_entry);
             Some(notes.to_string())
         } else {
             notes_json
@@ -1814,6 +2018,381 @@ impl<'db> ResearchRepository<'db> {
             "commit research session reconstruction check",
         ))?;
         Ok(next_generation)
+    }
+
+    /// Record the immutable native research recovery authority after the
+    /// private generation exists and before schema or child activity starts.
+    /// The existing notes object is merged under one dedicated key and the
+    /// joined review/session/run binding is a compare-and-swap predicate.
+    pub fn record_native_recovery_authority(
+        &self,
+        binding: &ResearchLaunchBinding,
+        agent_run_id: i64,
+        identity: &PrivateRunTempRecoveryIdentityV1,
+        fresh_launch: bool,
+        now: i64,
+    ) -> Result<(), AppError> {
+        validate_research_binding(binding)?;
+        let authority = json!({
+            "version": PrivateRunTempRecoveryIdentityV1::VERSION,
+            "run_id": agent_run_id,
+            "review_id": binding.review_id,
+            "campaign_id": binding.campaign_id,
+            "experiment_id": binding.experiment_id,
+            "attempt": binding.attempt,
+            "session_generation": binding.session_generation,
+            "fresh_launch": fresh_launch,
+            "session_id": binding.session_id,
+            "service_root_identity": identity.service_root_identity,
+            "temp_identity": identity.temp_identity,
+            "cleanup": {"phase": "pending"},
+        });
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin native research recovery authority"))?;
+        let current: (
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+            String,
+            String,
+            String,
+        ) = transaction
+            .query_row(
+                "SELECT r.campaign_id, r.experiment_id, r.state, r.attempt,
+                        r.agent_run_id, r.session_generation, r.context_json,
+                        r.context_digest, r.notes_json, c.session_id,
+                        c.session_generation, run.status, run.execution_kind,
+                        campaign.project_id, run.project_id
+                 FROM research_reviews AS r
+                 JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
+                 JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
+                 JOIN agent_runs AS run ON run.run_id = r.agent_run_id
+                 WHERE r.review_id = ?1",
+                [&binding.review_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                    ))
+                },
+            )
+            .map_err(database_error("read native research recovery binding"))?;
+        let (
+            campaign_id,
+            experiment_id,
+            state,
+            attempt,
+            current_run,
+            review_generation,
+            context_json,
+            context_digest,
+            current_notes,
+            current_session,
+            current_generation,
+            run_status,
+            execution_kind,
+            campaign_project_id,
+            run_project_id,
+        ) = current;
+        if campaign_id != binding.campaign_id
+            || experiment_id != binding.experiment_id
+            || state != "running"
+            || attempt != binding.attempt
+            || current_run != Some(agent_run_id)
+            || review_generation != binding.session_generation
+            || context_json.as_deref() != Some(binding.context_json.as_str())
+            || context_digest.as_deref() != Some(binding.context_digest.as_str())
+            || current_session.as_deref() != Some(binding.session_id.as_str())
+            || current_generation != binding.session_generation
+            || !matches!(run_status.as_str(), "starting" | "running")
+            || execution_kind != "campaign_research"
+            || campaign_project_id != run_project_id
+        {
+            return Err(validation_error(
+                "research.native_recovery",
+                "cannot record authority for a changed native research binding",
+            ));
+        }
+        let mut notes = parse_research_notes(current_notes.as_deref())?;
+        if let Some(existing) = notes.get("native_recovery") {
+            let parsed = parse_native_recovery_authority(existing)?;
+            let expected_identity = identity;
+            if native_recovery_authority_matches(
+                &parsed,
+                binding,
+                agent_run_id,
+                expected_identity,
+                fresh_launch,
+            ) {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit idempotent native research authority"))?;
+                return Ok(());
+            }
+            return Err(validation_error(
+                "research.native_recovery",
+                "an immutable recovery authority already exists for this run",
+            ));
+        }
+        notes["native_recovery"] = authority;
+        let notes_json = notes.to_string();
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1, updated_at = ?2
+                 WHERE review_id = ?3 AND campaign_id = ?4 AND experiment_id = ?5
+                   AND state = 'running' AND attempt = ?6 AND agent_run_id = ?7
+                   AND session_generation = ?8 AND context_json = ?9
+                   AND context_digest = ?10
+                   AND ((notes_json IS NULL AND ?11 IS NULL) OR notes_json = ?11)",
+                params![
+                    notes_json,
+                    now,
+                    binding.review_id,
+                    binding.campaign_id,
+                    binding.experiment_id,
+                    binding.attempt,
+                    agent_run_id,
+                    binding.session_generation,
+                    binding.context_json,
+                    binding.context_digest,
+                    current_notes,
+                ],
+            )
+            .map_err(database_error("persist native research recovery authority"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "persist native research recovery authority CAS",
+            });
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit native research recovery authority"))
+    }
+
+    /// Mark only the mutable cleanup phase of a recorded native authority.
+    /// Terminal research outcomes and business notes remain compare-and-swap
+    /// protected and are never rewritten by this operation.
+    pub fn mark_native_cleanup_complete(
+        &self,
+        binding: &ResearchLaunchBinding,
+        agent_run_id: i64,
+        identity: &PrivateRunTempRecoveryIdentityV1,
+        fresh_launch: bool,
+        now: i64,
+    ) -> Result<(), AppError> {
+        validate_research_binding(binding)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin native research cleanup completion"))?;
+        let current: (
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+        ) = transaction
+            .query_row(
+                "SELECT r.campaign_id, r.experiment_id, r.state, r.attempt,
+                        r.agent_run_id, r.session_generation, r.context_json,
+                        r.context_digest, r.notes_json, r.failure_code,
+                        c.session_id, run.status,
+                        run.launch_gate_state, c.session_generation,
+                        campaign.project_id, run.project_id, run.execution_kind
+                 FROM research_reviews AS r
+                 JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
+                 JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
+                 JOIN agent_runs AS run ON run.run_id = r.agent_run_id
+                 WHERE r.review_id = ?1",
+                [&binding.review_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                    ))
+                },
+            )
+            .map_err(database_error("read native research cleanup binding"))?;
+        let (
+            campaign_id,
+            experiment_id,
+            state,
+            attempt,
+            current_run,
+            review_generation,
+            context_json,
+            context_digest,
+            current_notes,
+            failure_code,
+            campaign_session,
+            run_status,
+            launch_gate_state,
+            campaign_generation,
+            campaign_project_id,
+            run_project_id,
+            execution_kind,
+        ) = current;
+        if campaign_id != binding.campaign_id
+            || experiment_id != binding.experiment_id
+            || !matches!(state.as_str(), "ready" | "retry_wait" | "blocked")
+            || attempt != binding.attempt
+            || current_run != Some(agent_run_id)
+            || review_generation != binding.session_generation
+            || context_json.as_deref() != Some(binding.context_json.as_str())
+            || context_digest.as_deref() != Some(binding.context_digest.as_str())
+            || campaign_generation != binding.session_generation
+            || (!fresh_launch && campaign_session.as_deref() != Some(binding.session_id.as_str()))
+            || (fresh_launch
+                && campaign_session.is_none()
+                && (!matches!(state.as_str(), "retry_wait" | "blocked")
+                    || failure_code.is_none()))
+            || !matches!(run_status.as_str(), "completed" | "failed" | "timed_out" | "cancelled")
+            || !matches!(launch_gate_state.as_str(), "released" | "failed")
+            || campaign_project_id != run_project_id
+            || execution_kind != "campaign_research"
+        {
+            return Err(validation_error(
+                "research.native_recovery",
+                "cannot complete cleanup for a changed native research binding",
+            ));
+        }
+        let mut notes = parse_research_notes(current_notes.as_deref())?;
+        let authority = notes
+            .get("native_recovery")
+            .ok_or_else(|| validation_error("research.native_recovery", "authority is missing"))?;
+        let parsed = parse_native_recovery_authority(authority)?;
+        if !native_recovery_authority_matches(
+            &parsed,
+            binding,
+            agent_run_id,
+            identity,
+            fresh_launch,
+        ) {
+            return Err(validation_error(
+                "research.native_recovery",
+                "cleanup authority identity does not match the bound native run",
+            ));
+        }
+        if fresh_launch && campaign_session.is_some() {
+            let confirmed_session = notes
+                .get("confirmed_session_id")
+                .and_then(Value::as_str);
+            if confirmed_session != campaign_session.as_deref() {
+                return Err(validation_error(
+                    "research.session",
+                    "fresh native cleanup requires the confirmed campaign session",
+                ));
+            }
+        }
+        let cleanup = notes
+            .get_mut("native_recovery")
+            .and_then(Value::as_object_mut)
+            .and_then(|authority| authority.get_mut("cleanup"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| validation_error("research.native_recovery.cleanup", "phase is missing"))?;
+        match cleanup.get("phase").and_then(Value::as_str) {
+            Some("complete") => {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit idempotent native cleanup completion"))?;
+                return Ok(());
+            }
+            Some("pending") => {}
+            _ => {
+                return Err(validation_error(
+                    "research.native_recovery.cleanup",
+                    "phase must be pending or complete",
+                ));
+            }
+        }
+        cleanup.insert("phase".to_owned(), Value::String("complete".to_owned()));
+        cleanup.insert("completed_at".to_owned(), json!(now));
+        let notes_json = notes.to_string();
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1, updated_at = ?2
+                 WHERE review_id = ?3 AND campaign_id = ?4 AND experiment_id = ?5
+                   AND state = ?6 AND attempt = ?7 AND agent_run_id = ?8
+                   AND session_generation = ?9 AND context_json = ?10
+                   AND context_digest = ?11
+                   AND ((notes_json IS NULL AND ?12 IS NULL) OR notes_json = ?12)",
+                params![
+                    notes_json,
+                    now,
+                    binding.review_id,
+                    binding.campaign_id,
+                    binding.experiment_id,
+                    state,
+                    binding.attempt,
+                    agent_run_id,
+                    binding.session_generation,
+                    binding.context_json,
+                    binding.context_digest,
+                    current_notes,
+                ],
+            )
+            .map_err(database_error("persist native cleanup completion"))?;
+        if changed != 1 {
+            return Err(AppError::Runtime {
+                operation: "persist native cleanup completion CAS",
+            });
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit native cleanup completion"))
     }
 
     /// Bind one native research run before its launch gate is released.  The
@@ -2643,6 +3222,142 @@ fn has_open_review(transaction: &Transaction<'_>, campaign_id: &str) -> Result<b
             |row| row.get(0),
         )
         .map_err(database_error("check open campaign research review"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRecoveryAuthority {
+    version: u8,
+    run_id: i64,
+    review_id: String,
+    campaign_id: String,
+    experiment_id: String,
+    attempt: i64,
+    session_generation: i64,
+    fresh_launch: bool,
+    session_id: String,
+    service_root_identity: PrivateRunTempRecoveryRootIdentity,
+    temp_identity: PrivateRunTempRecoveryTempIdentity,
+    cleanup: NativeRecoveryCleanup,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRecoveryCleanup {
+    phase: String,
+    #[serde(default)]
+    #[serde(rename = "completed_at")]
+    _completed_at: Option<i64>,
+}
+
+fn parse_native_recovery_authority(value: &Value) -> Result<NativeRecoveryAuthority, AppError> {
+    serde_json::from_value(value.clone()).map_err(|source| AppError::Serialization {
+        operation: "parse native research recovery authority",
+        source,
+    })
+}
+
+struct NativeRecoveryCleanupExpectation<'a> {
+    review_id: &'a str,
+    campaign_id: &'a str,
+    experiment_id: &'a str,
+    attempt: i64,
+    session_generation: i64,
+    agent_run_id: i64,
+    state: &'a str,
+    failure_code: Option<&'a str>,
+    campaign_session: Option<&'a str>,
+}
+
+fn native_recovery_cleanup_complete(
+    notes_json: Option<&str>,
+    expected: &NativeRecoveryCleanupExpectation<'_>,
+) -> bool {
+    notes_json
+        .and_then(|notes| serde_json::from_str::<Value>(notes).ok())
+        .and_then(|notes| {
+            let authority = notes.get("native_recovery")?;
+            let parsed = parse_native_recovery_authority(authority).ok()?;
+            let planned_session = notes
+                .get("planned_session_id")
+                .and_then(Value::as_str);
+            let confirmed_session = notes
+                .get("confirmed_session_id")
+                .and_then(Value::as_str);
+            let session_binding = notes
+                .get("session_binding")
+                .and_then(Value::as_str);
+            let session_shape_matches = if parsed.fresh_launch {
+                match expected.campaign_session {
+                    Some(campaign_session) => {
+                        planned_session == Some(parsed.session_id.as_str())
+                            && confirmed_session == Some(campaign_session)
+                            && session_binding == Some("confirmed")
+                    }
+                    None => {
+                        matches!(expected.state, "retry_wait" | "blocked")
+                            && expected.failure_code.is_some()
+                            && confirmed_session.is_none()
+                            && planned_session == Some(parsed.session_id.as_str())
+                            && session_binding == Some("pending")
+                    }
+                }
+            } else {
+                expected.campaign_session == Some(parsed.session_id.as_str())
+            };
+            (parsed.cleanup.phase == "complete"
+                && parsed.version == PrivateRunTempRecoveryIdentityV1::VERSION
+                && parsed.run_id == expected.agent_run_id
+                && parsed.review_id == expected.review_id
+                && parsed.campaign_id == expected.campaign_id
+                && parsed.experiment_id == expected.experiment_id
+                && parsed.attempt == expected.attempt
+                && parsed.session_generation == expected.session_generation
+                && !parsed.session_id.is_empty()
+                && session_shape_matches)
+            .then_some(())
+        })
+        .is_some()
+}
+
+fn parse_research_notes(notes_json: Option<&str>) -> Result<Value, AppError> {
+    let notes = notes_json
+        .map(|notes| {
+            serde_json::from_str::<Value>(notes).map_err(|source| AppError::Serialization {
+                operation: "parse research review notes",
+                source,
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| json!({}));
+    if !notes.is_object() {
+        return Err(validation_error(
+            "research.notes_json",
+            "must contain a JSON object",
+        ));
+    }
+    Ok(notes)
+}
+
+fn native_recovery_authority_matches(
+    authority: &NativeRecoveryAuthority,
+    binding: &ResearchLaunchBinding,
+    agent_run_id: i64,
+    identity: &PrivateRunTempRecoveryIdentityV1,
+    fresh_launch: bool,
+) -> bool {
+    authority.version == PrivateRunTempRecoveryIdentityV1::VERSION
+        && authority.run_id == agent_run_id
+        && authority.review_id == binding.review_id
+        && authority.campaign_id == binding.campaign_id
+        && authority.experiment_id == binding.experiment_id
+        && authority.attempt == binding.attempt
+        && authority.session_generation == binding.session_generation
+        && authority.fresh_launch == fresh_launch
+        && authority.session_id == binding.session_id
+        && authority.service_root_identity == identity.service_root_identity
+        && authority.temp_identity == identity.temp_identity
+        && matches!(authority.cleanup.phase.as_str(), "pending" | "complete")
 }
 
 fn block_review_in_transaction(

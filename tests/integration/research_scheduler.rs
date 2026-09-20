@@ -244,7 +244,87 @@ fn seed_active_research_outcome(
             ],
         )
         .expect("persist research outcome boundary");
+    seed_native_recovery_authority(fixture, &review.review_id, run.run_id, "pending");
     (review.review_id, run.run_id, event_id)
+}
+
+fn seed_native_recovery_authority(
+    fixture: &SchedulerFixture,
+    review_id: &str,
+    run_id: i64,
+    cleanup_phase: &str,
+) {
+    let authority = serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "review_id": review_id,
+        "campaign_id": fixture.campaign_id,
+        "experiment_id": fixture.experiment_id,
+        "attempt": 1,
+        "session_generation": 0,
+        "fresh_launch": true,
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "service_root_identity": {
+            "device": 1,
+            "inode": 2,
+            "owner": 3,
+            "mode": 448,
+            "resolution": "fixture-root",
+        },
+        "temp_identity": {
+            "device": 1,
+            "inode": 4,
+            "owner": 3,
+            "mode": 448,
+            "mount": [1, 2],
+            "service_identity": {"device": 1, "inode": 5, "owner": 3, "mode": 448},
+            "parent_identity": {"device": 1, "inode": 6, "owner": 3, "mode": 448},
+        },
+        "cleanup": {"phase": cleanup_phase},
+    });
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2 AND agent_run_id = ?3",
+            rusqlite::params![
+                serde_json::json!({
+                    "native_recovery": authority,
+                    "session_binding": "confirmed",
+                    "planned_session_id": "11111111-1111-4111-8111-111111111111",
+                    "confirmed_session_id": "11111111-1111-4111-8111-111111111111",
+                })
+                .to_string(),
+                review_id,
+                run_id,
+            ],
+        )
+        .expect("seed native recovery authority");
+}
+
+fn set_fixture_native_cleanup_phase(fixture: &SchedulerFixture, review_id: &str, phase: &str) {
+    let notes_json: String = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [review_id],
+            |row| row.get(0),
+        )
+        .expect("read fixture recovery authority");
+    let mut notes: serde_json::Value = serde_json::from_str(&notes_json).expect("fixture notes");
+    notes["native_recovery"]["cleanup"]["phase"] = serde_json::json!(phase);
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            rusqlite::params![notes.to_string(), review_id],
+        )
+        .expect("update fixture cleanup phase");
 }
 
 #[test]
@@ -556,12 +636,27 @@ fn retry_admission_moves_native_recovery_proof_into_history_and_clears_top_level
             "owner": 3,
             "mode": 448,
             "mount": [1, 2],
+            "service_identity": {
+                "device": 1,
+                "inode": 5,
+                "owner": 3,
+                "mode": 448,
+            },
+            "parent_identity": {
+                "device": 1,
+                "inode": 6,
+                "owner": 3,
+                "mode": 448,
+            },
         },
         "cleanup": {"phase": "complete"},
     });
     let original_notes = serde_json::json!({
         "business_note": "preserve this note",
         "native_recovery": authority,
+        "session_binding": "confirmed",
+        "planned_session_id": "11111111-1111-4111-8111-111111111111",
+        "confirmed_session_id": "11111111-1111-4111-8111-111111111111",
     });
     fixture
         .db
@@ -581,6 +676,7 @@ fn retry_admission_moves_native_recovery_proof_into_history_and_clears_top_level
             [run_id],
         )
         .expect("seed terminal retry owner");
+    set_fixture_native_cleanup_phase(&fixture, &review_id, "complete");
 
     let reservation = match CampaignRepository::new(&fixture.db)
         .reserve_agent_run(
@@ -689,6 +785,9 @@ fn make_old_review_ineligible(
             rusqlite::params![owner_status, run_id],
         )
         .expect("set old owner state");
+    if owner_status != "running" {
+        set_fixture_native_cleanup_phase(fixture, &review_id, "complete");
+    }
     (review_id, run_id)
 }
 
@@ -796,6 +895,154 @@ fn launch_queue_skips_unbound_review_when_project_has_other_active_run() {
 }
 
 #[test]
+fn retry_owner_rejects_foreign_native_recovery_proof() {
+    let fixture = fixture();
+    let (review_id, run_id, _event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs
+             SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal retry owner");
+    set_fixture_native_cleanup_phase(&fixture, &review_id, "complete");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research
+             SET session_id = ?1
+             WHERE campaign_id = ?2",
+            rusqlite::params![
+                "22222222-2222-4222-8222-222222222222",
+                &fixture.campaign_id,
+            ],
+        )
+        .expect("seed confirmed native session");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(
+                 json_set(notes_json, '$.planned_session_id', ?1),
+                 '$.confirmed_session_id', ?2
+             )
+             WHERE review_id = ?3",
+            rusqlite::params![
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+                &review_id,
+            ],
+        )
+        .expect("seed confirmed session notes");
+    let repository = ResearchRepository::new(&fixture.db);
+    assert!(repository.retry_owner_ready(&review_id).expect("valid proof"));
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.native_recovery.version', 2)
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("substitute proof version");
+    assert!(!repository
+        .retry_owner_ready(&review_id)
+        .expect("version-substituted proof readiness"));
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.native_recovery.version', 1)
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("restore proof version");
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.planned_session_id', 'foreign')
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("substitute planned session");
+    assert!(!repository
+        .retry_owner_ready(&review_id)
+        .expect("session-substituted proof readiness"));
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.planned_session_id', ?1)
+             WHERE review_id = ?2",
+            rusqlite::params![
+                "11111111-1111-4111-8111-111111111111",
+                &review_id,
+            ],
+        )
+        .expect("restore planned session");
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.session_binding', 'pending')
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("substitute session binding");
+    assert!(!repository
+        .retry_owner_ready(&review_id)
+        .expect("binding-substituted proof readiness"));
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.session_binding', 'confirmed')
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("restore session binding");
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.native_recovery.run_id', ?1)
+             WHERE review_id = ?2",
+            rusqlite::params![run_id + 1, &review_id],
+        )
+        .expect("substitute proof owner");
+    assert!(!repository
+        .retry_owner_ready(&review_id)
+        .expect("foreign proof readiness"));
+}
+
+#[test]
 fn launch_queue_retains_terminal_capped_review_for_settlement() {
     let fixture = fixture();
     let (review_id, run_id) = make_old_review_ineligible(&fixture, 2_800, true, "failed");
@@ -812,6 +1059,17 @@ fn launch_queue_retains_terminal_capped_review_for_settlement() {
             [&review_id],
         )
         .expect("seed capped attempt");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET notes_json = json_set(notes_json, '$.native_recovery.attempt', 3)
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("align capped authority attempt");
     fixture
         .db
         .connect()
@@ -852,6 +1110,7 @@ fn attempt_cap_settlement_rolls_back_all_rows_on_event_failure() {
             [run_id],
         )
         .expect("seed terminal cap owner");
+    set_fixture_native_cleanup_phase(&fixture, &review_id, "complete");
     fixture
         .db
         .connect()
@@ -1105,6 +1364,7 @@ fn seed_retry_settlement_case(
             [run_id],
         )
         .expect("seed terminal retry owner");
+    set_fixture_native_cleanup_phase(&fixture, &review_id, "complete");
     fixture
         .db
         .connect()

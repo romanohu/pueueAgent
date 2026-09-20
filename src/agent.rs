@@ -23,8 +23,8 @@ use crate::{
     decision_evidence::DecisionContextBundle,
     decision_protocol::{parse_and_validate_decision, ValidatedDecision},
     environment::{
-        PrivateRunTemp, ProjectAdmissionLock, RunIdAdmissionGuard, SanitizedEnvironment,
-        TempInventoryReport, VerifiedPrivateTemp,
+        PrivateRunTemp, PrivateRunTempRecoveryIdentityV1, ProjectAdmissionLock,
+        RunIdAdmissionGuard, SanitizedEnvironment, TempInventoryReport, VerifiedPrivateTemp,
     },
     execution_policy::{
         resolve_decision_project_policy, resolve_project_policy, AgentKind, CodeChangeTool,
@@ -474,6 +474,21 @@ impl BoundCleanupHandle {
             | BoundCleanupKind::PendingFinalization
             | BoundCleanupKind::PendingMarker => {}
         }
+        if let Some(research_failure) = self.research_failure.as_ref() {
+            if let Some(authority) = research_failure
+                .recovery_authority
+                .as_ref()
+                .filter(|authority| authority.persisted)
+            {
+                ResearchRepository::new(db).mark_native_cleanup_complete(
+                    &research_failure.binding,
+                    self.run_id,
+                    &authority.identity,
+                    research_failure.fresh_launch,
+                    finished_at,
+                )?;
+            }
+        }
         match &mut self.kind {
             BoundCleanupKind::LiveChild {
                 retained_authority,
@@ -519,8 +534,13 @@ enum ResearchPersistence {
     Pending {
         binding: ResearchLaunchBinding,
         fresh_launch: bool,
+        recovery_identity: PrivateRunTempRecoveryIdentityV1,
     },
-    Persisted,
+    Persisted {
+        binding: ResearchLaunchBinding,
+        fresh_launch: bool,
+        recovery_identity: PrivateRunTempRecoveryIdentityV1,
+    },
 }
 
 enum ResearchSessionError {
@@ -532,12 +552,19 @@ struct ResearchFailurePersistence {
     binding: ResearchLaunchBinding,
     fresh_launch: bool,
     persisted: bool,
+    recovery_authority: Option<ResearchRecoveryAuthorityPersistence>,
+}
+
+struct ResearchRecoveryAuthorityPersistence {
+    identity: PrivateRunTempRecoveryIdentityV1,
+    persisted: bool,
 }
 
 #[derive(Clone)]
 struct ResearchLaunchContext {
     binding: ResearchLaunchBinding,
     fresh_launch: bool,
+    recovery_identity: Option<PrivateRunTempRecoveryIdentityV1>,
 }
 
 impl ResearchFailurePersistence {
@@ -546,10 +573,28 @@ impl ResearchFailurePersistence {
             binding: context.binding.clone(),
             fresh_launch: context.fresh_launch,
             persisted: false,
+            recovery_authority: context.recovery_identity.clone().map(|identity| {
+                ResearchRecoveryAuthorityPersistence {
+                    identity,
+                    persisted: false,
+                }
+            }),
         }
     }
 
     fn persist(&mut self, db: &crate::db::Db, run_id: i64, now: i64) -> Result<(), AppError> {
+        if let Some(authority) = self.recovery_authority.as_mut() {
+            if !authority.persisted {
+                ResearchRepository::new(db).record_native_recovery_authority(
+                    &self.binding,
+                    run_id,
+                    &authority.identity,
+                    self.fresh_launch,
+                    now,
+                )?;
+                authority.persisted = true;
+            }
+        }
         if self.persisted {
             return Ok(());
         }
@@ -1261,6 +1306,7 @@ impl AgentRunner {
                 recovery_reason,
             },
             fresh_launch,
+            recovery_identity: None,
         };
         self.spawn_with_role(
             db,
@@ -1404,7 +1450,7 @@ impl AgentRunner {
         role: AgentRunRole,
         objective_digest: Option<String>,
         decision_capabilities: Option<CodexCapabilities>,
-        research_context: Option<ResearchLaunchContext>,
+        mut research_context: Option<ResearchLaunchContext>,
         prompt: &str,
         now: i64,
         run_id_guard: RunIdAdmissionGuard,
@@ -1672,6 +1718,54 @@ impl AgentRunner {
                     error,
                 )
             })?;
+        if let Some(context) = research_context.as_mut() {
+            let identity = match temp.recovery_identity(&service_root) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let error = AppError::from(error);
+                    return Err(resolve_retained_temp_failure(
+                        db,
+                        project,
+                        run.run_id,
+                        now,
+                        RetainedLaunchAuthority::Retained {
+                            global_policy: self.policy.clone(),
+                            project_policy: project_policy.clone(),
+                            temp,
+                            execution,
+                        },
+                        decision_failure,
+                        research_context.as_ref(),
+                        BoundFinalizationIntent::from_failure(&error, retry_policy),
+                        editor_launch_failure_for_role(&role, run.run_id, &error),
+                        error,
+                    ));
+                }
+            };
+            context.recovery_identity = Some(identity.clone());
+            if let Err(error) = ResearchRepository::new(db).record_native_recovery_authority(
+                &context.binding,
+                run.run_id,
+                &identity,
+                context.fresh_launch,
+                now,
+            ) {
+                return Err(resolve_native_recovery_authority_failure(
+                    project,
+                    run.run_id,
+                    RetainedLaunchAuthority::Retained {
+                        global_policy: self.policy.clone(),
+                        project_policy: project_policy.clone(),
+                        temp,
+                        execution,
+                    },
+                    decision_failure,
+                    context,
+                    retry_policy,
+                    error,
+                ));
+            }
+        }
         if matches!(&role, AgentRunRole::Decision { .. }) {
             if let Err(error) = temp.prepare_decision_schema(DECISION_OUTPUT_SCHEMA) {
                 let error = AppError::from(error);
@@ -2147,9 +2241,13 @@ impl AgentRunner {
                 _ => None,
             },
             research_persistence: research_context.map(|context| {
+                let recovery_identity = context
+                    .recovery_identity
+                    .expect("research launch must record native recovery authority");
                 ResearchPersistence::Pending {
                     binding: context.binding,
                     fresh_launch: context.fresh_launch,
+                    recovery_identity,
                 }
             }),
             role,
@@ -2506,6 +2604,39 @@ fn resolve_retained_temp_failure(
             policy,
             cleanup: Some(cleanup),
         },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_native_recovery_authority_failure(
+    project: &Project,
+    run_id: i64,
+    retained_authority: RetainedLaunchAuthority,
+    decision_failure: Option<DecisionFailureContext>,
+    research_context: &ResearchLaunchContext,
+    retry_policy: RetryPolicy,
+    source: AppError,
+) -> AgentSpawnError {
+    let intent = BoundFinalizationIntent::from_failure(&source, retry_policy);
+    AgentSpawnError {
+        stage: AgentSpawnStage::RunBoundPreMarker {
+            run_id,
+            resolved: false,
+        },
+        policy: policy_from_error(&source),
+        source,
+        cleanup: Some(BoundCleanupHandle {
+            project_id: project.project_id.clone(),
+            run_id,
+            intent,
+            decision_failure,
+            kind: BoundCleanupKind::RetainedTemp {
+                retained_authority,
+                finalized: false,
+            },
+            editor_failure: None,
+            research_failure: Some(ResearchFailurePersistence::from_context(research_context)),
+        }),
     }
 }
 
@@ -3103,8 +3234,9 @@ impl AgentHandle {
             Some(ResearchPersistence::Pending {
                 binding,
                 fresh_launch,
+                recovery_identity: _,
             }) => (binding.clone(), *fresh_launch),
-            Some(ResearchPersistence::Persisted) | None => return Ok(()),
+            Some(ResearchPersistence::Persisted { .. }) | None => return Ok(()),
         };
         let mut failure_code = match self.terminal_outcome.as_ref().map(|outcome| outcome.status) {
             Some(AgentRunStatus::Completed) => None,
@@ -3237,7 +3369,22 @@ impl AgentHandle {
                 outcome.last_error = Some(failure_code.to_owned());
             }
         }
-        self.research_persistence = Some(ResearchPersistence::Persisted);
+        let recovery_identity = match self.research_persistence.as_ref() {
+            Some(ResearchPersistence::Pending {
+                recovery_identity,
+                ..
+            }) => recovery_identity.clone(),
+            Some(ResearchPersistence::Persisted { .. }) | None => {
+                return Err(AppError::Runtime {
+                    operation: "research recovery authority disappeared before terminal persistence",
+                });
+            }
+        };
+        self.research_persistence = Some(ResearchPersistence::Persisted {
+            binding,
+            fresh_launch,
+            recovery_identity,
+        });
         Ok(())
     }
 
@@ -3459,6 +3606,8 @@ impl AgentHandle {
 
     fn retry_terminal_cleanup(
         &mut self,
+        db: &crate::db::Db,
+        finished_at: i64,
         deadline: Option<Instant>,
     ) -> Result<AgentRunStatus, AppError> {
         let status = match &self.terminal_persistence {
@@ -3472,6 +3621,21 @@ impl AgentHandle {
         if let RetainedLaunchAuthority::Retained { temp, .. } = &mut self.retained_authority {
             temp.cleanup_contents_before(deadline.map(Instant::into_std))
                 .map_err(AppError::from)?;
+        }
+        if let Some(ResearchPersistence::Persisted {
+            binding,
+            fresh_launch,
+            recovery_identity,
+        }) =
+            self.research_persistence.as_ref()
+        {
+            ResearchRepository::new(db).mark_native_cleanup_complete(
+                binding,
+                self.run_id,
+                recovery_identity,
+                *fresh_launch,
+                finished_at,
+            )?;
         }
         // Release retained launch authority only after terminal persistence.
         let retained = std::mem::replace(
@@ -3496,7 +3660,7 @@ impl AgentHandle {
         now: i64,
     ) -> Result<AgentRunStatus, AppError> {
         self.persist_terminal_outcome(db, now)?;
-        self.retry_terminal_cleanup(None)
+        self.retry_terminal_cleanup(db, now, None)
     }
 
     fn finalize_stored_outcome_before(
@@ -3508,7 +3672,7 @@ impl AgentHandle {
         let scoped_db = deadline_scoped_db(db, Some(deadline))?;
         let db = scoped_db.as_ref().expect("deadline-scoped database");
         self.persist_terminal_outcome(db, now)?;
-        self.retry_terminal_cleanup(Some(deadline))
+        self.retry_terminal_cleanup(db, now, Some(deadline))
     }
 
     fn store_outcome(
