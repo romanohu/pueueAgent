@@ -38,8 +38,8 @@ use pueue_agent::{
 #[cfg(target_os = "linux")]
 use pueue_agent::{
     agent::AgentHandle,
-    db::CodeChangeRepository,
-    models::CodeChangeCheckStatus,
+    db::{CodeChangeRepository, ResearchRepository, TaskObservationRepository},
+    models::{CodeChangeCheckStatus, NewTaskObservation},
 };
 
 #[cfg(target_os = "linux")]
@@ -50,8 +50,8 @@ use pueue_agent::{
     },
     config::{self, AgentConfig},
     execution_policy::{
-        resolve_project_policy, NetworkMode, ProjectRootAnchor,
-        ResolvedProjectExecutionPolicy,
+        load_existing_policy, resolve_project_policy, NetworkMode, PolicyLoadInput,
+        ProjectRootAnchor, ResolvedProjectExecutionPolicy, StartupEnvironment,
     },
     models::{NewCodeChangeRun, Project},
 };
@@ -1171,6 +1171,118 @@ fn create_cleanup_depth_overflow(run_temp: &PathBuf) -> PathBuf {
     nested.parent().unwrap().to_path_buf()
 }
 
+#[cfg(target_os = "linux")]
+fn compile_sleeping_codex_fixture(target: &std::path::Path) {
+    let source = target.with_extension("rs");
+    fs::write(
+        &source,
+        r#"
+use std::{process, thread, time::Duration};
+
+fn main() {
+    thread::sleep(Duration::from_secs(2));
+    process::exit(17);
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(target)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "generated sleeping Codex fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_healthy_research_fixture(harness: &DaemonHarness) {
+    let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+    let body = fs::read_to_string(&config_path).unwrap();
+    assert!(body.contains(r#"program = "/bin/echo""#));
+    let body = body.replace(r#"program = "/bin/echo""#, r#"program = "codex""#);
+    let oom_pattern = r#"[[check.patterns]]
+name = "oom"
+regex = "CUDA out of memory"
+action = "kill"
+confirm_matches = 1
+
+"#;
+    assert!(body.contains(oom_pattern));
+    let body = body.replace(oom_pattern, "");
+    fs::write(config_path, body).unwrap();
+    let config = config::load(&config_path).unwrap();
+    assert_eq!(config.agent.program, "codex");
+    assert!(config.check.patterns.is_empty());
+    fs::write(
+        harness.root("project-a").join(".pueue-agent/logs/41.log"),
+        "validation loss 0.52\n",
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn research_policy_with_codex_fixture(
+    harness: &DaemonHarness,
+    codex: &std::path::Path,
+) -> Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy> {
+    // Reuse the daemon fixture's policy setup so the bootstrap launcher stays
+    // the real descriptor-bound pueue-agent executable. Only the built-in
+    // Codex executable is replaced with the bounded sleeping fixture.
+    let _ = harness.policy();
+    let fixture_root = fs::canonicalize(harness.temp.path()).unwrap();
+    let state_dir = fixture_root.join("execution-policy-state");
+    let trusted_dir = fixture_root.join("execution-policy-bin");
+    let policy_path = state_dir.join("execution-policy.toml");
+    let body = fs::read_to_string(&policy_path).unwrap();
+    let replacement = format!("codex = {:?}", codex.display().to_string());
+    let mut replaced = false;
+    let body = body
+        .lines()
+        .map(|line| {
+            if !replaced && line.starts_with("codex = ") {
+                replaced = true;
+                replacement.clone()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(replaced, "policy fixture must declare a built-in Codex executable");
+    fs::write(&policy_path, format!("{body}\n")).unwrap();
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let project_roots = ProjectRepository::new(&harness.db)
+        .list_all()
+        .unwrap()
+        .into_iter()
+        .map(|project| project.root_path)
+        .collect();
+    let inherited_path = std::env::join_paths([trusted_dir.clone()]).unwrap();
+    let policy = load_existing_policy(&PolicyLoadInput {
+        state_dir,
+        project_roots,
+        inherited_path,
+        startup_environment: StartupEnvironment::from_pairs([
+            ("HOME", "/fixture"),
+            ("AWS_SECRET_ACCESS_KEY", "fixture-aws-secret"),
+            ("WANDB_API_KEY", "fixture-wandb-key"),
+            ("SSH_AUTH_SOCK", "/fixture/ssh-agent.sock"),
+        ]),
+        codex_home: fixture_root.join("execution-policy-codex-home"),
+        pueue_config: fixture_root.join("execution-policy-pueue.yml"),
+        launcher_path: trusted_dir.join("pueue-agent-launcher"),
+    })
+    .unwrap();
+    Arc::new(policy)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn startup_temp_inventory_rejects_symlink_weak_and_over_limit_without_mutation() {
@@ -1748,6 +1860,237 @@ async fn bound_cleanup_pending_project_defers_without_attempt_while_other_projec
         .await
         .expect("bound cleanup owner shutdown must remain bounded")
         .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases() {
+    let harness = DaemonHarness::new();
+    prepare_healthy_research_fixture(&harness);
+    let experiment_id = harness.campaign_experiment();
+    let task = running_task();
+    let task_signature = pueue_agent::reconcile::task_signature(&task);
+    ExperimentRepository::new(&harness.db)
+        .mark_submitting(&experiment_id, 190)
+        .unwrap();
+    ExperimentRepository::new(&harness.db)
+        .mark_accepted(&experiment_id, task.id, &task_signature, 191)
+        .unwrap();
+    TaskObservationRepository::new(&harness.db)
+        .upsert(&NewTaskObservation::new(
+            "project-a",
+            &task_signature,
+            task.id,
+            &task.group,
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "Running",
+            Some(100),
+            Some(101),
+            None,
+            None,
+            harness.now,
+        ))
+        .unwrap();
+    ResearchRepository::new(&harness.db)
+        .ensure_campaign("daemon-campaign")
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET next_due_at = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![harness.now, "daemon-campaign"],
+        )
+        .unwrap();
+    let review = ResearchRepository::new(&harness.db)
+        .claim_due(
+            "daemon-campaign",
+            &experiment_id,
+            &task_signature,
+            harness.now,
+        )
+        .unwrap()
+        .expect("the seeded running campaign must claim one research review");
+    let experiment = ExperimentRepository::new(&harness.db)
+        .find_by_id(&experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(experiment.status, ExperimentStatus::Accepted);
+    assert_eq!(experiment.task_signature.as_deref(), Some(task_signature.as_str()));
+    assert_eq!(review.experiment_id, experiment_id);
+    assert_eq!(review.task_signature, task_signature);
+
+    let codex = harness
+        .temp
+        .path()
+        .join("execution-policy-bin/research-codex");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    compile_sleeping_codex_fixture(&codex);
+    let policy = research_policy_with_codex_fixture(&harness, &codex);
+    let make_daemon = || {
+        let runner = AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            Arc::clone(&policy),
+        );
+        Daemon::new(
+            harness.db.clone(),
+            harness.fake_pueue.clone(),
+            Arc::clone(&policy),
+            runner,
+            DaemonConfig {
+                interval: Duration::from_millis(10),
+                lease_seconds: 60,
+                claim_limit: 100,
+                now_override: Some(harness.now),
+                shutdown_grace_period: Duration::from_secs(30),
+            },
+        )
+    };
+
+    let mut first_daemon = make_daemon();
+    let first_report = first_daemon.run_once().await.unwrap();
+    assert_eq!(first_report.research_started, 1);
+    let run_id: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT run_id FROM agent_runs
+             WHERE execution_kind = 'campaign_research'
+             ORDER BY run_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let run_temp = harness
+        .root("project-a")
+        .join(".pueue-agent/tmp")
+        .join(run_id.to_string());
+    let overflow_subtree = create_cleanup_depth_overflow(&run_temp);
+
+    let terminal_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ResearchRepository::new(&harness.db)
+            .find(&review.review_id)
+            .unwrap()
+            .state
+            == "retry_wait"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < terminal_deadline,
+            "first research owner did not reach retained cleanup"
+        );
+        first_daemon.run_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(overflow_subtree.is_dir());
+
+    // Complete startup recovery before making the retry due. This keeps the
+    // second daemon's wake at the explicit boundary below instead of having
+    // startup retry scheduling move it forward during this test.
+    let mut second_daemon = make_daemon();
+    let warmup = second_daemon.run_once().await.unwrap();
+    assert_eq!(warmup.research_started, 0);
+
+    let research_run_count = || {
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let reservation_count = || {
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE campaign_id = ?1 AND dimension = 'agent_run'
+                   AND subject_key LIKE ?2",
+                rusqlite::params![
+                    "daemon-campaign",
+                    format!("research:{}:%", review.review_id),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let research_run_count_before = research_run_count();
+    let reservation_count_before = reservation_count();
+    let event_id = ResearchRepository::new(&harness.db)
+        .event_id(&review.review_id)
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET not_before = ?1, updated_at = ?1 WHERE review_id = ?2",
+            rusqlite::params![harness.now, review.review_id],
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = 'retry_wait', lease_until = NULL, not_before = ?1
+             WHERE event_id = ?2",
+            rusqlite::params![harness.now, event_id],
+        )
+        .unwrap();
+
+    let blocked_report = second_daemon.run_once().await.unwrap();
+    assert_eq!(blocked_report.research_started, 0);
+    assert_eq!(research_run_count(), research_run_count_before);
+    assert_eq!(reservation_count(), reservation_count_before);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&review.review_id)
+            .unwrap()
+            .state,
+        "retry_wait"
+    );
+
+    fs::remove_dir_all(overflow_subtree).unwrap();
+    let released_report = first_daemon.run_once().await.unwrap();
+    assert_eq!(released_report.research_started, 1);
+    assert_eq!(research_run_count(), research_run_count_before + 1);
+    assert_eq!(reservation_count(), reservation_count_before + 1);
+
+    let active_research_count = || {
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE execution_kind = 'campaign_research'
+                   AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if active_research_count() == 0 {
+            break;
+        }
+        assert!(Instant::now() < settle_deadline, "research retry did not settle");
+        first_daemon.run_once().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
