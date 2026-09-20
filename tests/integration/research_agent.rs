@@ -25,8 +25,8 @@ use pueue_agent::{
         StartupEnvironment,
     },
     models::{
-        AgentContextMode, AgentRunStatus, EventStatus, ExperimentStatus, ExperimentTerminalOutcome,
-        NewProject, NewTaskObservation, ProposalKind,
+        AgentContextMode, AgentRunStatus, EventKind, EventStatus, ExperimentStatus,
+        ExperimentTerminalOutcome, NewEvent, NewProject, NewTaskObservation, ProposalKind,
     },
     process::MAX_FIELD_SIZE,
     proposals::{self, ProposalInput},
@@ -3752,6 +3752,237 @@ async fn research_safe_missing_session_reconstructs_lineage_without_resetting_at
     let second_reservation = harness.reservation_id_for(&changed.review);
     assert_eq!(harness.reservation_status(&first_reservation), "consumed");
     assert_eq!(harness.reservation_status(&second_reservation), "consumed");
+
+    harness.complete_ready_review(&changed.review.review_id);
+    let sibling_experiment_id = harness.admit_sibling_experiment();
+    let sibling_task_signature = format!("pueue-task:v1:{}:three", harness.campaign_id);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research SET next_due_at = ?1 WHERE campaign_id = ?2",
+            rusqlite::params![NOW + 130, &harness.campaign_id],
+        )
+        .unwrap();
+    let sibling_review = ResearchRepository::new(&harness.db)
+        .claim_due(
+            &harness.campaign_id,
+            &sibling_experiment_id,
+            &sibling_task_signature,
+            NOW + 130,
+        )
+        .unwrap()
+        .expect("the sibling running experiment must produce a review");
+    let sibling = ClaimedReview {
+        event_id: review_event_id(&harness.db, &sibling_review.review_id),
+        evidence: build_research_evidence(&harness.db, &sibling_review, NOW + 130).unwrap(),
+        review: sibling_review,
+        claimed_at: NOW + 130,
+    };
+    let mut third = harness
+        .try_launch_with_options(
+            &sibling,
+            AgentContextMode::Resume {
+                session_id: SECOND_SESSION.to_owned(),
+            },
+            SECOND_SESSION,
+            true,
+            None,
+        )
+        .await
+        .expect("a completed historical owner must not block the next resumed review");
+    assert_eq!(
+        third.wait(&harness.db, NOW + 240).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(harness.research_session().as_deref(), Some(SECOND_SESSION));
+    assert_eq!(
+        harness.reservation_status(&harness.reservation_id_for(&sibling.review)),
+        "consumed"
+    );
+}
+
+#[tokio::test]
+async fn research_cleanup_pending_owner_blocks_diagnosis_before_binding() {
+    let harness = ResearchHarness::new("native-gate-diagnosis", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let mut research_handle = harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+        .expect("research launch must bind before cleanup gating");
+    harness.wait_for_child_ready().await;
+    let private_dir = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(research_handle.run_id.to_string());
+    for ordinal in 0..=MAX_PRIVATE_TEMP_CLEANUP_ENTRIES {
+        fs::write(
+            private_dir.join(format!("recovery-overflow-{ordinal}")),
+            b"fixture overflow",
+        )
+        .unwrap();
+    }
+    harness.release_child();
+    assert!(
+        research_handle.wait(&harness.db, NOW + 91).await.is_err(),
+        "cleanup overflow must retain the terminal research owner"
+    );
+
+    let run_count_before: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+        .unwrap();
+    let temp_count_before = fs::read_dir(
+        harness
+            .project
+            .root_path
+            .join(".pueue-agent")
+            .join("tmp"),
+    )
+    .unwrap()
+    .count();
+    let reservation_count_before = harness.campaign_reservation_count(&harness.campaign_id);
+    let capture_before = fs::read_to_string(&harness.capture_path).unwrap();
+    let diagnosis_event = EventRepository::new(&harness.db)
+        .insert_idempotent(
+            &NewEvent::new(
+                &harness.project.project_id,
+                EventKind::HealthDiagnosis,
+                "health-diagnosis:native-gate-test",
+                serde_json::json!({
+                    "experiment_id": harness.experiment_id,
+                    "attempt": 1,
+                }),
+                NOW + 92,
+                NOW + 92,
+            )
+            .with_campaign_lineage(&harness.campaign_id, Some(&harness.experiment_id)),
+        )
+        .unwrap();
+    EventRepository::new(&harness.db)
+        .claim_by_id(
+            &harness.project.project_id,
+            diagnosis_event.event_id,
+            NOW + 152,
+        )
+        .unwrap()
+        .expect("diagnosis event must be claimable");
+    let run_id_guard = harness
+        .runner
+        .try_acquire_run_id_admission_guard(&harness.db)
+        .unwrap()
+        .expect("run-id admission must be free");
+    let project_lock = harness
+        .runner
+        .try_acquire_project_admission_lock(&harness.project_policy)
+        .unwrap()
+        .expect("project admission must be free");
+    let result = harness
+        .runner
+        .spawn_diagnosis(
+            &harness.db,
+            &harness.project,
+            &harness.project_policy,
+            &harness.project_config.agent,
+            RetryPolicy { max_retries: 0 },
+            diagnosis_event.event_id,
+            &[diagnosis_event.event_id],
+            &harness.experiment_id,
+            "{}",
+            NOW + 92,
+            run_id_guard,
+            project_lock,
+        )
+        .await;
+    let bypassed_gate = match result {
+        Err(error) => {
+            assert!(matches!(
+                error.stage,
+                pueue_agent::agent::AgentSpawnStage::PreBinding
+            ));
+            assert!(error.cleanup.is_none());
+            false
+        }
+        Ok(mut handle) => {
+            let _ = handle.wait(&harness.db, NOW + 153).await;
+            true
+        }
+    };
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+            .unwrap(),
+        run_count_before,
+        "a blocked diagnosis must not persist another run"
+    );
+    assert_eq!(
+        fs::read_dir(
+            harness
+                .project
+                .root_path
+                .join(".pueue-agent")
+                .join("tmp"),
+        )
+        .unwrap()
+        .count(),
+        temp_count_before,
+        "a blocked diagnosis must not create another private generation"
+    );
+    assert_eq!(
+        fs::read_to_string(&harness.capture_path).unwrap(),
+        capture_before,
+        "a blocked diagnosis must not execute a child"
+    );
+    assert_eq!(
+        harness.campaign_reservation_count(&harness.campaign_id),
+        reservation_count_before,
+        "a blocked diagnosis must not consume a budget reservation"
+    );
+    assert!(!bypassed_gate, "diagnosis must be rejected before native binding");
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM events WHERE event_id = ?1",
+                [diagnosis_event.event_id],
+                |row| row.get::<_, EventStatus>(0),
+            )
+            .unwrap(),
+        EventStatus::Claimed
+    );
+
+    for entry in fs::read_dir(&private_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("recovery-overflow-")
+        {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    assert_eq!(
+        research_handle.wait(&harness.db, NOW + 154).await.unwrap(),
+        AgentRunStatus::Completed
+    );
 }
 
 #[tokio::test]
