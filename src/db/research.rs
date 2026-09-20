@@ -19,8 +19,12 @@ use crate::{
         PrivateRunTempRecoveryTempIdentity,
         RecoveredPrivateRunTempCleanup,
     },
-    models::{EventStatus, TaskObservation},
-    reconcile::managed_task_run_signature_for_observation,
+    models::{EventStatus, Incident, TaskObservation, TerminationRequest},
+    pueue::PueueTask,
+    reconcile::{
+        managed_task_run_signature, managed_task_run_signature_for_observation, task_signature,
+    },
+    research_protocol::{parse_research_answer, ResearchAnswer},
     AppError,
 };
 
@@ -122,6 +126,54 @@ pub struct ResearchReview {
     pub termination_request_id: Option<i64>,
     pub successor_experiment_id: Option<String>,
     pub session_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResearchOwnership {
+    None,
+    Open(Option<ResearchOwnershipSnapshot>),
+    Attached(ResearchOwnershipSnapshot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResearchOwnershipSnapshot {
+    pub review_id: String,
+    pub project_id: String,
+    pub campaign_id: String,
+    pub source_experiment_id: String,
+    pub managed_task_signature: String,
+    pub source_task_id: Option<i64>,
+    pub attempt: i64,
+    pub session_generation: i64,
+    pub event_id: Option<i64>,
+    pub operation_stage: Option<String>,
+    pub agent_run_id: Option<i64>,
+    pub termination_request_id: Option<i64>,
+    pub decision_cycle_id: Option<String>,
+    pub successor_experiment_id: Option<String>,
+    pub recovery_required: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadyResearchAction {
+    pub owner: ResearchOwnershipSnapshot,
+    pub context_json: String,
+    pub context_digest: String,
+    pub response_json: String,
+    pub answer: ResearchAnswer,
+    pub notes_json: String,
+    pub campaign_objective_digest: String,
+    pub raw_task_signature: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedResearchHandoff {
+    pub owner: ResearchOwnershipSnapshot,
+    pub context_json: String,
+    pub context_digest: String,
+    pub response_json: String,
+    pub answer: ResearchAnswer,
+    pub notes_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3836,19 +3888,1234 @@ impl<'db> ResearchRepository<'db> {
     }
 
     pub fn owns_successor(&self, experiment_id: &str) -> Result<bool, AppError> {
-        let connection = self.db.connect()?;
-        connection
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(database_error("begin research successor ownership check"))?;
+        let lineage: Option<(String, String)> = transaction
             .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM research_reviews
-                     WHERE experiment_id = ?1
-                       AND successor_experiment_id IS NOT NULL
-                 )",
+                "SELECT source.campaign_id, campaign.project_id
+                 FROM experiments AS source
+                 JOIN campaigns AS campaign ON campaign.campaign_id = source.campaign_id
+                 WHERE source.experiment_id = ?1",
                 [experiment_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(database_error("check research successor ownership"))
+            .optional()
+            .map_err(database_error("read research successor lineage"))?;
+        let Some((campaign_id, project_id)) = lineage else {
+            transaction
+                .commit()
+                .map_err(database_error("commit absent research successor ownership"))?;
+            return Ok(false);
+        };
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            &project_id,
+            &campaign_id,
+            experiment_id,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit research successor ownership check"))?;
+        Ok(!matches!(ownership, ResearchOwnership::None))
     }
+
+    pub(crate) fn ready_reviews(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ResearchReview>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{REVIEW_SELECT}
+                 WHERE state = 'ready' AND operation_stage IS NULL
+                 ORDER BY finished_at, updated_at, review_id
+                 LIMIT ?1"
+            ))
+            .map_err(database_error("prepare ready research action query"))?;
+        let rows = statement
+            .query_map([limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64], review_from_row)
+            .map_err(database_error("query ready research actions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read ready research actions"))
+    }
+}
+
+#[derive(Debug)]
+struct ResearchOwnershipCandidate {
+    review_id: String,
+    project_id: Option<String>,
+    campaign_id: String,
+    source_experiment_id: String,
+    managed_task_signature: String,
+    source_task_id: Option<i64>,
+    source_campaign_id: Option<String>,
+    attempt: i64,
+    session_generation: i64,
+    event_id: Option<i64>,
+    event_project_id: Option<String>,
+    event_campaign_id: Option<String>,
+    event_experiment_id: Option<String>,
+    event_kind: Option<String>,
+    event_status: Option<String>,
+    operation_stage: Option<String>,
+    agent_run_id: Option<i64>,
+    run_project_id: Option<String>,
+    run_execution_kind: Option<String>,
+    run_status: Option<String>,
+    run_gate_state: Option<String>,
+    termination_request_id: Option<i64>,
+    termination_project_id: Option<String>,
+    termination_signature: Option<String>,
+    termination_status: Option<String>,
+    decision_cycle_id: Option<String>,
+    cycle_campaign_id: Option<String>,
+    cycle_source_experiment_id: Option<String>,
+    successor_experiment_id: Option<String>,
+    successor_campaign_id: Option<String>,
+    successor_source_experiment_id: Option<String>,
+    notes_json: Option<String>,
+    failure_code: Option<String>,
+    campaign_session: Option<String>,
+    campaign_generation: Option<i64>,
+    state: String,
+}
+
+fn research_ownership_candidate_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<ResearchOwnershipCandidate> {
+    Ok(ResearchOwnershipCandidate {
+        review_id: row.get(0)?,
+        project_id: row.get(1)?,
+        campaign_id: row.get(2)?,
+        source_experiment_id: row.get(3)?,
+        managed_task_signature: row.get(4)?,
+        source_task_id: row.get(5)?,
+        source_campaign_id: row.get(6)?,
+        attempt: row.get(7)?,
+        session_generation: row.get(8)?,
+        event_id: row.get(9)?,
+        event_project_id: row.get(10)?,
+        event_campaign_id: row.get(11)?,
+        event_experiment_id: row.get(12)?,
+        event_kind: row.get(13)?,
+        event_status: row.get(14)?,
+        operation_stage: row.get(15)?,
+        agent_run_id: row.get(16)?,
+        run_project_id: row.get(17)?,
+        run_execution_kind: row.get(18)?,
+        run_status: row.get(19)?,
+        run_gate_state: row.get(20)?,
+        termination_request_id: row.get(21)?,
+        termination_project_id: row.get(22)?,
+        termination_signature: row.get(23)?,
+        termination_status: row.get(24)?,
+        decision_cycle_id: row.get(25)?,
+        cycle_campaign_id: row.get(26)?,
+        cycle_source_experiment_id: row.get(27)?,
+        successor_experiment_id: row.get(28)?,
+        successor_campaign_id: row.get(29)?,
+        successor_source_experiment_id: row.get(30)?,
+        notes_json: row.get(31)?,
+        failure_code: row.get(32)?,
+        campaign_session: row.get(33)?,
+        campaign_generation: row.get(34)?,
+        state: row.get(35)?,
+    })
+}
+
+/// Read the exclusive research owner while already inside the caller's
+/// transaction.  Candidate filtering intentionally precedes cardinality and
+/// lineage validation: a malformed owner must block discovery instead of
+/// disappearing from the owner set.
+pub(crate) fn research_ownership_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    campaign_id: &str,
+    source_experiment_id: &str,
+) -> Result<ResearchOwnership, AppError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT review.review_id, campaign.project_id, review.campaign_id,
+                    review.experiment_id, review.task_signature,
+                    source.pueue_task_id, source.campaign_id,
+                    review.attempt, review.session_generation, review.event_id,
+                    event.project_id, event.campaign_id, event.experiment_id,
+                    event.kind, event.status, review.operation_stage, review.agent_run_id,
+                    run.project_id, run.execution_kind, run.status,
+                    run.launch_gate_state, review.termination_request_id,
+                    termination.project_id, termination.task_signature,
+                    termination.status, review.decision_cycle_id,
+                    cycle.campaign_id, cycle.source_experiment_id,
+                    review.successor_experiment_id, successor.campaign_id,
+                    successor.resume_of_experiment_id, review.notes_json,
+                    review.failure_code, campaign_research.session_id,
+                    campaign_research.session_generation, review.state
+             FROM research_reviews AS review
+             LEFT JOIN campaigns AS campaign
+               ON campaign.campaign_id = review.campaign_id
+             LEFT JOIN campaign_research
+               ON campaign_research.campaign_id = review.campaign_id
+             LEFT JOIN experiments AS source
+               ON source.experiment_id = review.experiment_id
+             LEFT JOIN events AS event
+               ON event.event_id = review.event_id
+             LEFT JOIN agent_runs AS run
+               ON run.run_id = review.agent_run_id
+             LEFT JOIN termination_requests AS termination
+               ON termination.request_id = review.termination_request_id
+             LEFT JOIN decision_cycles AS cycle
+               ON cycle.cycle_id = review.decision_cycle_id
+             LEFT JOIN experiments AS successor
+               ON successor.experiment_id = review.successor_experiment_id
+             WHERE review.experiment_id = ?1
+               AND (
+                   review.operation_stage IN ('intent','stop_requested',
+                       'stop_confirmed','successor_reserved')
+                   OR (
+                       review.state = 'completed'
+                       AND (review.decision_cycle_id IS NOT NULL
+                            OR review.successor_experiment_id IS NOT NULL)
+                   )
+               )
+             ORDER BY review.review_id
+             LIMIT 2",
+        )
+        .map_err(database_error("prepare research ownership query"))?;
+    let candidates = statement
+        .query_map([source_experiment_id], research_ownership_candidate_from_row)
+        .map_err(database_error("query research ownership candidates"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read research ownership candidates"))?;
+    if candidates.is_empty() {
+        return Ok(ResearchOwnership::None);
+    }
+    if candidates.len() != 1 {
+        return Ok(ResearchOwnership::Open(None));
+    }
+    let candidate = candidates.into_iter().next().expect("one candidate");
+    let snapshot = ResearchOwnershipSnapshot {
+        review_id: candidate.review_id.clone(),
+        project_id: project_id.to_owned(),
+        campaign_id: candidate.campaign_id.clone(),
+        source_experiment_id: candidate.source_experiment_id.clone(),
+        managed_task_signature: candidate.managed_task_signature.clone(),
+        source_task_id: candidate.source_task_id,
+        attempt: candidate.attempt,
+        session_generation: candidate.session_generation,
+        event_id: candidate.event_id,
+        operation_stage: candidate.operation_stage.clone(),
+        agent_run_id: candidate.agent_run_id,
+        termination_request_id: candidate.termination_request_id,
+        decision_cycle_id: candidate.decision_cycle_id.clone(),
+        successor_experiment_id: candidate.successor_experiment_id.clone(),
+        recovery_required: false,
+    };
+    let completed_handoff = candidate.state == "completed"
+        && (candidate.decision_cycle_id.is_some() || candidate.successor_experiment_id.is_some());
+
+    let mut recovery_required = candidate.project_id.as_deref() != Some(project_id)
+        || candidate.campaign_id != campaign_id
+        || candidate.source_experiment_id != source_experiment_id
+        || candidate.source_campaign_id.as_deref() != Some(campaign_id)
+        || candidate
+            .managed_task_signature
+            .strip_prefix("pueue-managed-run:v1:")
+            .is_none()
+        || candidate.event_id.is_none()
+        || candidate.event_project_id.as_deref() != Some(project_id)
+        || candidate.event_campaign_id.as_deref() != Some(campaign_id)
+        || candidate.event_experiment_id.as_deref() != Some(source_experiment_id)
+        || candidate.event_kind.as_deref() != Some("campaign_research")
+        || candidate.event_status.as_deref() != Some("completed")
+        || (!completed_handoff
+            && candidate.campaign_generation != Some(candidate.session_generation));
+
+    if let Some(run_id) = candidate.agent_run_id {
+        let run_ready = if completed_handoff {
+            true
+        } else {
+            matches!(
+                candidate.run_status.as_deref(),
+                Some("completed" | "failed" | "timed_out" | "cancelled")
+            ) && matches!(candidate.run_gate_state.as_deref(), Some("released" | "failed"))
+                && candidate.run_project_id.as_deref() == Some(project_id)
+                && candidate.run_execution_kind.as_deref() == Some("campaign_research")
+                && native_recovery_cleanup_complete(
+                    candidate.notes_json.as_deref(),
+                    &NativeRecoveryCleanupExpectation {
+                        review_id: &candidate.review_id,
+                        campaign_id,
+                        experiment_id: source_experiment_id,
+                        attempt: candidate.attempt,
+                        session_generation: candidate.session_generation,
+                        agent_run_id: run_id,
+                        state: &candidate.state,
+                        failure_code: candidate.failure_code.as_deref(),
+                        campaign_session: candidate.campaign_session.as_deref(),
+                    },
+                )
+        };
+        recovery_required |= !run_ready;
+        let strict_owner = native_research_owner_rows(transaction, None)?
+            .into_iter()
+            .find(|row| row.review_id == candidate.review_id && row.agent_run_id == run_id);
+        recovery_required |=
+            !strict_owner.is_some_and(|row| native_research_owner_is_complete(&row));
+    } else {
+        recovery_required = true;
+    }
+
+    let source_identity_matches = transaction
+        .query_row(
+            "SELECT source.campaign_id, source.task_signature,
+                    source.pueue_task_id, submission.project_id,
+                    submission.task_signature, submission.pueue_task_id,
+                    submission.status
+             FROM experiments AS source
+             JOIN submissions AS submission
+               ON submission.submission_id = source.submission_id
+             WHERE source.experiment_id = ?1",
+            [source_experiment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read research ownership source identity"))?
+        .is_some_and(
+            |(
+                source_campaign,
+                source_signature,
+                source_task_id,
+                submission_project,
+                submission_signature,
+                submission_task_id,
+                submission_status,
+            )| {
+                source_campaign == campaign_id
+                    && source_signature.as_deref() == Some(candidate.managed_task_signature.as_str())
+                    && submission_project == project_id
+                    && submission_signature.as_deref()
+                        == Some(candidate.managed_task_signature.as_str())
+                    && submission_task_id == source_task_id
+                    && submission_status == "accepted"
+            },
+        );
+    recovery_required |= !source_identity_matches;
+
+    let open_stage = matches!(
+        candidate.operation_stage.as_deref(),
+        Some("intent" | "stop_requested" | "stop_confirmed" | "successor_reserved")
+    );
+    if open_stage || completed_handoff {
+        let request_matches = candidate
+            .termination_request_id
+            .is_some()
+            && candidate.termination_project_id.as_deref() == Some(project_id)
+            && candidate
+                .termination_signature
+                .as_deref()
+                .is_some_and(|signature| signature.starts_with("pueue-task:v1:"));
+        recovery_required |= !request_matches;
+        if candidate.operation_stage.as_deref() == Some("stop_confirmed") || completed_handoff {
+            recovery_required |= candidate.termination_status.as_deref() != Some("confirmed");
+        }
+        if request_matches {
+            recovery_required |= !research_termination_signature_matches(
+                transaction,
+                project_id,
+                candidate.source_task_id,
+                candidate.termination_signature.as_deref(),
+                &candidate.managed_task_signature,
+            )?;
+        }
+    }
+
+    let expected_cycle = super::decisions::DecisionRepository::terminal_cycle_id(
+        campaign_id,
+        source_experiment_id,
+    );
+    if let Some(cycle_id) = candidate.decision_cycle_id.as_deref() {
+        recovery_required |= cycle_id != expected_cycle
+            || candidate.cycle_campaign_id.as_deref() != Some(campaign_id)
+            || candidate.cycle_source_experiment_id.as_deref() != Some(source_experiment_id);
+    }
+    if let Some(successor_id) = candidate.successor_experiment_id.as_deref() {
+        recovery_required |= candidate.successor_campaign_id.as_deref() != Some(campaign_id)
+            || candidate.successor_source_experiment_id.as_deref() != Some(source_experiment_id)
+            || successor_id.is_empty();
+    }
+
+    let attached = candidate.state == "completed"
+        && candidate.operation_stage.is_none()
+        && candidate.decision_cycle_id.as_deref() == Some(expected_cycle.as_str())
+        && !recovery_required;
+    let mut snapshot = snapshot;
+    snapshot.recovery_required = recovery_required;
+    if attached {
+        Ok(ResearchOwnership::Attached(snapshot))
+    } else {
+        Ok(ResearchOwnership::Open(Some(snapshot)))
+    }
+}
+
+/// Project one completed research handoff for the decision evidence builder
+/// while retaining the caller's transaction and the historical Task 4 proof.
+/// No owner returns `None`; an open, duplicate, stale, or malformed linked
+/// handoff returns a validation error so callers cannot silently fall back to
+/// a v1 decision context.
+pub(crate) fn completed_research_handoff_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    campaign_id: &str,
+    source_experiment_id: &str,
+    decision_cycle_id: &str,
+) -> Result<Option<CompletedResearchHandoff>, AppError> {
+    let ownership = research_ownership_in_transaction(
+        transaction,
+        project_id,
+        campaign_id,
+        source_experiment_id,
+    )?;
+    let owner = match ownership {
+        ResearchOwnership::None => return Ok(None),
+        ResearchOwnership::Open(_) => {
+            return Err(validation_error(
+                "research.handoff",
+                "linked research ownership is still open or ambiguous",
+            ));
+        }
+        ResearchOwnership::Attached(owner) => owner,
+    };
+    if owner.decision_cycle_id.as_deref() != Some(decision_cycle_id) {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research cycle does not match the requested cycle",
+        ));
+    };
+    let Some(agent_run_id) = owner.agent_run_id else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research run is missing",
+        ));
+    };
+    let Some(event_id) = owner.event_id else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research event is missing",
+        ));
+    };
+    let Some(termination_request_id) = owner.termination_request_id else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research termination request is missing",
+        ));
+    };
+
+    // `research_ownership_in_transaction` already applies this oracle while
+    // classifying an attached owner.  Reselect it here as part of the
+    // projection so this helper cannot silently weaken the historical proof
+    // if the ownership classifier later gains another attached path.
+    let strict_owner = native_research_owner_rows(transaction, None)?
+        .into_iter()
+        .find(|row| row.review_id == owner.review_id && row.agent_run_id == agent_run_id);
+    if !strict_owner.is_some_and(|row| native_research_owner_is_complete(&row)) {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research owner lacks the historical cleanup proof",
+        ));
+    }
+
+    let objective_digest: Option<String> = transaction
+        .query_row(
+            "SELECT objective_digest FROM campaigns
+             WHERE campaign_id = ?1 AND project_id = ?2",
+            params![campaign_id, project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read completed research campaign objective"))?;
+    let Some(objective_digest) = objective_digest else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research campaign is missing",
+        ));
+    };
+
+    let mut statement = transaction
+        .prepare(
+            "SELECT review_id, task_signature, attempt, session_generation,
+                    agent_run_id, event_id, termination_request_id,
+                    context_json, context_digest, response_json, notes_json
+             FROM research_reviews
+             WHERE campaign_id = ?1 AND experiment_id = ?2
+               AND decision_cycle_id = ?3
+               AND state = 'completed' AND operation_stage IS NULL
+             ORDER BY review_id
+             LIMIT 2",
+        )
+        .map_err(database_error("prepare completed research handoff query"))?;
+    let rows = statement
+        .query_map(
+            params![campaign_id, source_experiment_id, decision_cycle_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .map_err(database_error("query completed research handoff"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read completed research handoff"))?;
+    if rows.len() != 1 {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research handoff is missing or duplicated",
+        ));
+    }
+    let (
+        review_id,
+        managed_task_signature,
+        attempt,
+        session_generation,
+        persisted_agent_run_id,
+        persisted_event_id,
+        persisted_termination_request_id,
+        context_json,
+        context_digest,
+        response_json,
+        notes_json,
+    ) = rows.into_iter().next().expect("one completed research handoff");
+    if review_id != owner.review_id
+        || managed_task_signature != owner.managed_task_signature
+        || attempt != owner.attempt
+        || session_generation != owner.session_generation
+        || persisted_agent_run_id != Some(agent_run_id)
+        || persisted_event_id != Some(event_id)
+        || persisted_termination_request_id != Some(termination_request_id)
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research row does not match its owner snapshot",
+        ));
+    }
+    let Some(context_json) = context_json else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research context is missing",
+        ));
+    };
+    let Some(context_digest) = context_digest else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research context digest is missing",
+        ));
+    };
+    if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research context digest is invalid",
+        ));
+    }
+    let Ok(context) = serde_json::from_str::<Value>(&context_json) else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research context is invalid JSON",
+        ));
+    };
+    if !research_context_identity_matches(
+        &context,
+        project_id,
+        campaign_id,
+        &owner.review_id,
+        source_experiment_id,
+        &owner.managed_task_signature,
+        owner.source_task_id,
+        &objective_digest,
+    ) {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research context identity does not match its owner",
+        ));
+    }
+    let Some(response_json) = response_json else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research response is missing",
+        ));
+    };
+    let Ok(answer) = parse_research_answer(response_json.as_bytes()) else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research response is invalid",
+        ));
+    };
+    if answer.action != "stop_and_next"
+        || answer.review_id != owner.review_id
+        || answer.experiment_id != source_experiment_id
+        || answer.context_digest != context_digest
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research response does not match its owner",
+        ));
+    }
+    let context_evidence_refs = context_evidence_refs(&context);
+    if answer
+        .evidence_refs
+        .iter()
+        .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
+        || answer.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .support_evidence_refs
+                .iter()
+                .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
+        })
+    {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research response cites evidence outside its context",
+        ));
+    }
+    let Some(notes_json) = notes_json else {
+        return Err(validation_error(
+            "research.handoff",
+            "linked research notes are missing",
+        ));
+    };
+    Ok(Some(CompletedResearchHandoff {
+        owner,
+        context_json,
+        context_digest,
+        response_json,
+        answer,
+        notes_json,
+    }))
+}
+
+/// Reselect and validate a ready answer against the live native task while
+/// holding the caller's transaction.  A stale task, answer, cleanup proof, or
+/// campaign gate simply produces no consumable action; it never authorizes a
+/// kill from historical rows alone.
+pub(crate) fn ready_research_action_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    review_id: &str,
+    live_task: &PueueTask,
+) -> Result<Option<ReadyResearchAction>, AppError> {
+    let current = transaction
+        .query_row(
+            "SELECT review.campaign_id, review.experiment_id,
+                    review.task_signature, review.attempt, review.state,
+                    review.operation_stage, review.agent_run_id,
+                    review.context_json, review.context_digest,
+                    review.response_json, review.termination_request_id,
+                    review.session_generation, review.event_id,
+                    review.notes_json, review.failure_code,
+                    campaign.project_id, campaign.objective_digest, campaign.state,
+                    project.pueue_group, project.enabled, project.paused,
+                    project.halted_reason, source.campaign_id,
+                    source.pueue_task_id, source.task_signature, source.status,
+                    source.submission_id, research_state.session_id,
+                    research_state.session_generation, run.project_id,
+                    run.execution_kind, run.status, run.launch_gate_state,
+                    event.project_id, event.kind, event.campaign_id,
+                    event.experiment_id, event.status
+             FROM research_reviews AS review
+             JOIN campaigns AS campaign
+               ON campaign.campaign_id = review.campaign_id
+             JOIN projects AS project
+               ON project.project_id = campaign.project_id
+             LEFT JOIN experiments AS source
+               ON source.experiment_id = review.experiment_id
+             LEFT JOIN campaign_research AS research_state
+               ON research_state.campaign_id = review.campaign_id
+             LEFT JOIN agent_runs AS run
+               ON run.run_id = review.agent_run_id
+             LEFT JOIN events AS event
+               ON event.event_id = review.event_id
+             WHERE review.review_id = ?1
+               AND campaign.project_id = ?2",
+            params![review_id, project_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, i64>(20)?,
+                    row.get::<_, Option<String>>(21)?,
+                    row.get::<_, Option<String>>(22)?,
+                    row.get::<_, Option<i64>>(23)?,
+                    row.get::<_, Option<String>>(24)?,
+                    row.get::<_, Option<String>>(25)?,
+                    row.get::<_, Option<String>>(26)?,
+                    row.get::<_, Option<String>>(27)?,
+                    row.get::<_, Option<i64>>(28)?,
+                    row.get::<_, Option<String>>(29)?,
+                    row.get::<_, Option<String>>(30)?,
+                    row.get::<_, Option<String>>(31)?,
+                    row.get::<_, Option<String>>(32)?,
+                    row.get::<_, Option<String>>(33)?,
+                    row.get::<_, Option<String>>(34)?,
+                    row.get::<_, Option<String>>(35)?,
+                    row.get::<_, Option<String>>(36)?,
+                    row.get::<_, Option<String>>(37)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read ready research action"))?;
+    let Some((
+        campaign_id,
+        experiment_id,
+        managed_task_signature,
+        attempt,
+        state,
+        operation_stage,
+        agent_run_id,
+        context_json,
+        context_digest,
+        response_json,
+        termination_request_id,
+        session_generation,
+        event_id,
+        notes_json,
+        failure_code,
+        persisted_project_id,
+        campaign_objective_digest,
+        campaign_state,
+        expected_group,
+        project_enabled,
+        project_paused,
+        halted_reason,
+        source_campaign_id,
+        source_task_id,
+        source_task_signature,
+        source_status,
+        source_submission_id,
+        campaign_session,
+        campaign_generation,
+        run_project_id,
+        run_execution_kind,
+        run_status,
+        run_gate_state,
+        event_project_id,
+        event_kind,
+        event_campaign_id,
+        event_experiment_id,
+        event_status,
+    )) = current
+    else {
+        return Ok(None);
+    };
+    let static_ok = state == "ready"
+        && operation_stage.is_none()
+        && termination_request_id.is_none()
+        && persisted_project_id == project_id
+        && campaign_state == "active"
+        && project_enabled == 1
+        && project_paused == 0
+        && halted_reason.is_none()
+        && source_campaign_id.as_deref() == Some(campaign_id.as_str())
+        && source_status.as_deref() == Some("accepted")
+        && source_task_signature.as_deref() == Some(managed_task_signature.as_str())
+        && source_task_id == Some(live_task.id)
+        && expected_group == live_task.group
+        && live_task.is_running()
+        && event_id.is_some()
+        && event_project_id.as_deref() == Some(project_id)
+        && event_kind.as_deref() == Some("campaign_research")
+        && event_campaign_id.as_deref() == Some(campaign_id.as_str())
+        && event_experiment_id.as_deref() == Some(experiment_id.as_str())
+        && event_status.as_deref() == Some("completed")
+        && agent_run_id.is_some()
+        && run_project_id.as_deref() == Some(project_id)
+        && run_execution_kind.as_deref() == Some("campaign_research")
+        && matches!(run_status.as_deref(), Some("completed" | "failed" | "timed_out" | "cancelled"))
+        && matches!(run_gate_state.as_deref(), Some("released" | "failed"))
+        && campaign_generation == Some(session_generation);
+    if !static_ok {
+        return Ok(None);
+    }
+    let managed_live = managed_task_run_signature(live_task);
+    if managed_live.as_deref() != Some(managed_task_signature.as_str()) {
+        return Ok(None);
+    }
+    let raw_task_signature = task_signature(live_task);
+    let Some(context_json) = context_json else {
+        return Ok(None);
+    };
+    let Some(context_digest) = context_digest else {
+        return Ok(None);
+    };
+    if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+        return Ok(None);
+    }
+    let Some(response_json) = response_json else {
+        return Ok(None);
+    };
+    let Ok(answer) = parse_research_answer(response_json.as_bytes()) else {
+        return Ok(None);
+    };
+    if answer.review_id != review_id
+        || answer.experiment_id != experiment_id
+        || answer.context_digest != context_digest
+    {
+        return Ok(None);
+    }
+    let Ok(context) = serde_json::from_str::<Value>(&context_json) else {
+        return Ok(None);
+    };
+    if !research_context_identity_matches(
+        &context,
+        project_id,
+        &campaign_id,
+        review_id,
+        &experiment_id,
+        &managed_task_signature,
+        source_task_id,
+        &campaign_objective_digest,
+    ) {
+        return Ok(None);
+    }
+    let evidence_refs = context_evidence_refs(&context);
+    if answer
+        .evidence_refs
+        .iter()
+        .any(|evidence_ref| !evidence_refs.contains(evidence_ref))
+        || answer.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .support_evidence_refs
+                .iter()
+                .any(|evidence_ref| !evidence_refs.contains(evidence_ref))
+        })
+    {
+        return Ok(None);
+    }
+    let agent_run_id = agent_run_id.expect("validated ready agent run");
+    if !native_recovery_cleanup_complete(
+        notes_json.as_deref(),
+        &NativeRecoveryCleanupExpectation {
+            review_id,
+            campaign_id: &campaign_id,
+            experiment_id: &experiment_id,
+            attempt,
+            session_generation,
+            agent_run_id,
+            state: &state,
+            failure_code: failure_code.as_deref(),
+            campaign_session: campaign_session.as_deref(),
+        },
+    ) {
+        return Ok(None);
+    }
+    let strict_owner = native_research_owner_rows(transaction, None)?
+        .into_iter()
+        .find(|row| row.review_id == review_id && row.agent_run_id == agent_run_id);
+    if !strict_owner.is_some_and(|row| native_research_owner_is_complete(&row)) {
+        return Ok(None);
+    }
+    let health_owned: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM running_health
+                 WHERE experiment_id = ?1 AND state = 'action_pending'
+             )",
+            [experiment_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check research health ownership"))?;
+    if health_owned {
+        return Ok(None);
+    }
+    let Some(source_submission_id) = source_submission_id else {
+        return Ok(None);
+    };
+    let submission_matches = transaction
+        .query_row(
+            "SELECT project_id, pueue_task_id, task_signature, status
+             FROM submissions WHERE submission_id = ?1",
+            [source_submission_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read ready research submission"))?
+        .is_some_and(|(submission_project, submission_task_id, submission_signature, status)| {
+            submission_project == project_id
+                && submission_task_id == source_task_id
+                && submission_signature.as_deref() == Some(managed_task_signature.as_str())
+                && status == "accepted"
+        });
+    if !submission_matches {
+        return Ok(None);
+    }
+    let owner = ResearchOwnershipSnapshot {
+        review_id: review_id.to_owned(),
+        project_id: project_id.to_owned(),
+        campaign_id,
+        source_experiment_id: experiment_id,
+        managed_task_signature,
+        source_task_id,
+        attempt,
+        session_generation,
+        event_id,
+        operation_stage,
+        agent_run_id: Some(agent_run_id),
+        termination_request_id,
+        decision_cycle_id: None,
+        successor_experiment_id: None,
+        recovery_required: false,
+    };
+    Ok(Some(ReadyResearchAction {
+        owner,
+        context_json,
+        context_digest,
+        response_json,
+        answer,
+        notes_json: notes_json.unwrap_or_else(|| "{}".to_owned()),
+        campaign_objective_digest,
+        raw_task_signature,
+    }))
+}
+
+fn research_context_identity_matches(
+    context: &Value,
+    project_id: &str,
+    campaign_id: &str,
+    review_id: &str,
+    experiment_id: &str,
+    managed_task_signature: &str,
+    source_task_id: Option<i64>,
+    objective_digest: &str,
+) -> bool {
+    let Some(source_task_id) = source_task_id else {
+        return false;
+    };
+    context
+        .get("schema_version")
+        .and_then(Value::as_i64)
+        == Some(1)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("review"))
+            .and_then(|review| review.get("review_id"))
+            .and_then(Value::as_str)
+            == Some(review_id)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("review"))
+            .and_then(|review| review.get("experiment_id"))
+            .and_then(Value::as_str)
+            == Some(experiment_id)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("review"))
+            .and_then(|review| review.get("task_signature"))
+            .and_then(Value::as_str)
+            == Some(managed_task_signature)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("campaign"))
+            .and_then(|campaign| campaign.get("campaign_id"))
+            .and_then(Value::as_str)
+            == Some(campaign_id)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("project"))
+            .and_then(|project| project.get("project_id"))
+            .and_then(Value::as_str)
+            == Some(project_id)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("objective"))
+            .and_then(|objective| objective.get("digest"))
+            .and_then(Value::as_str)
+            == Some(objective_digest)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("target"))
+            .and_then(|target| target.get("experiment_id"))
+            .and_then(Value::as_str)
+            == Some(experiment_id)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("target"))
+            .and_then(|target| target.get("pueue_task_id"))
+            .and_then(Value::as_i64)
+            == Some(source_task_id)
+        && context
+            .get("facts")
+            .and_then(|facts| facts.get("target"))
+            .and_then(|target| target.get("task_signature"))
+            .and_then(Value::as_str)
+            == Some(managed_task_signature)
+}
+
+fn context_evidence_refs(value: &Value) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    fn visit(value: &Value, refs: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(reference) = object.get("evidence_ref").and_then(Value::as_str) {
+                    refs.insert(reference.to_owned());
+                }
+                for child in object.values() {
+                    visit(child, refs);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    visit(child, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(value, &mut refs);
+    refs
+}
+
+pub(crate) fn bind_research_termination_intent_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ReadyResearchAction,
+    incident: &Incident,
+    request: &TerminationRequest,
+    now: i64,
+) -> Result<bool, AppError> {
+    if incident.project_id != expected.owner.project_id
+        || request.incident_id != incident.incident_id
+        || request.project_id != expected.owner.project_id
+        || request.task_signature != expected.raw_task_signature
+        || !request
+            .reason
+            .starts_with(format!("research_action:{}:", expected.owner.review_id).as_str())
+    {
+        return Err(validation_error(
+            "research.termination",
+            "incident and request do not match the ready research owner",
+        ));
+    }
+    let Some(event_id) = expected.owner.event_id else {
+        return Ok(false);
+    };
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET operation_stage = 'intent', termination_request_id = ?1,
+                 updated_at = ?2
+             WHERE review_id = ?3 AND campaign_id = ?4
+               AND experiment_id = ?5 AND task_signature = ?6
+               AND attempt = ?7 AND session_generation = ?8
+               AND agent_run_id = ?9 AND context_digest = ?10
+               AND event_id = ?11 AND state = 'ready'
+               AND operation_stage IS NULL
+               AND termination_request_id IS NULL",
+            params![
+                request.request_id,
+                now,
+                expected.owner.review_id,
+                expected.owner.campaign_id,
+                expected.owner.source_experiment_id,
+                expected.owner.managed_task_signature,
+                expected.owner.attempt,
+                expected.owner.session_generation,
+                expected.owner.agent_run_id,
+                expected.context_digest,
+                event_id,
+            ],
+        )
+        .map_err(database_error("bind research termination intent"))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn complete_research_continue_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ReadyResearchAction,
+    notes_json: &str,
+    next_due_at: Option<i64>,
+    now: i64,
+) -> Result<bool, AppError> {
+    let Some(event_id) = expected.owner.event_id else {
+        return Ok(false);
+    };
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'completed', operation_stage = NULL,
+                 notes_json = ?1, finished_at = ?2, updated_at = ?2
+             WHERE review_id = ?3 AND campaign_id = ?4
+               AND experiment_id = ?5 AND task_signature = ?6
+               AND attempt = ?7 AND session_generation = ?8
+               AND agent_run_id = ?9 AND context_digest = ?10
+               AND event_id = ?11 AND state = 'ready'
+               AND operation_stage IS NULL
+               AND termination_request_id IS NULL",
+            params![
+                notes_json,
+                now,
+                expected.owner.review_id,
+                expected.owner.campaign_id,
+                expected.owner.source_experiment_id,
+                expected.owner.managed_task_signature,
+                expected.owner.attempt,
+                expected.owner.session_generation,
+                expected.owner.agent_run_id,
+                expected.context_digest,
+                event_id,
+            ],
+        )
+        .map_err(database_error("complete continuing research review"))?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    let campaign_changed = transaction
+        .execute(
+            "UPDATE campaign_research
+             SET next_due_at = ?1, updated_at = ?2
+             WHERE campaign_id = ?3 AND session_generation = ?4",
+            params![
+                next_due_at,
+                now,
+                expected.owner.campaign_id,
+                expected.owner.session_generation,
+            ],
+        )
+        .map_err(database_error("schedule continuing research campaign"))?;
+    if campaign_changed != 1 {
+        return Err(AppError::Runtime {
+            operation: "schedule continuing research campaign",
+        });
+    }
+    Ok(true)
+}
+
+pub(crate) fn mark_research_stop_requested_if_sent(
+    db: &Db,
+    request_id: i64,
+    now: i64,
+) -> Result<(), AppError> {
+    let mut connection = db.connect()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error("begin research stop request transition"))?;
+    transaction
+        .execute(
+            "UPDATE research_reviews
+             SET operation_stage = 'stop_requested', updated_at = ?1
+             WHERE termination_request_id = ?2 AND state = 'ready'
+               AND operation_stage = 'intent'
+               AND EXISTS (
+                   SELECT 1 FROM termination_requests
+                   WHERE request_id = ?2 AND status = 'sent'
+               )",
+            params![now, request_id],
+        )
+        .map_err(database_error("mark research stop request dispatched"))?;
+    transaction
+        .commit()
+        .map_err(database_error("commit research stop request transition"))
+}
+
+fn research_termination_signature_matches(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    source_task_id: Option<i64>,
+    raw_signature: Option<&str>,
+    managed_signature: &str,
+) -> Result<bool, AppError> {
+    let (Some(source_task_id), Some(raw_signature)) = (source_task_id, raw_signature) else {
+        return Ok(false);
+    };
+    let expected_group: Option<String> = transaction
+        .query_row(
+            "SELECT pueue_group FROM projects WHERE project_id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read research termination group"))?;
+    let Some(expected_group) = expected_group else {
+        return Ok(false);
+    };
+    let observation = transaction
+        .query_row(
+            "SELECT task_signature, pueue_task_id, pueue_group, command_json,
+                    state, enqueued_at, started_at, ended_at, result,
+                    observed_at
+             FROM task_observations
+             WHERE project_id = ?1 AND task_signature = ?2
+               AND pueue_task_id = ?3",
+            params![project_id, raw_signature, source_task_id],
+            |row| {
+                let command_json: String = row.get(3)?;
+                let command = serde_json::from_str(&command_json).map_err(|source| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(source))
+                })?;
+                Ok(TaskObservation {
+                    project_id: project_id.to_owned(),
+                    task_signature: row.get(0)?,
+                    pueue_task_id: row.get(1)?,
+                    pueue_group: row.get(2)?,
+                    command,
+                    state: row.get(4)?,
+                    enqueued_at: row.get(5)?,
+                    started_at: row.get(6)?,
+                    ended_at: row.get(7)?,
+                    result: row.get(8)?,
+                    observed_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(database_error("read research termination observation"))?;
+    Ok(observation.is_some_and(|observation| {
+        managed_task_run_signature_for_observation(&observation, &expected_group).as_deref()
+            == Some(managed_signature)
+    }))
 }
 
 fn ensure_campaign_in_transaction(
@@ -5541,5 +6808,137 @@ mod tests {
         assert!(!detached.detached_cleanup_complete);
         assert!(detached.detached_campaign_project_ids.contains(&project_id));
         assert!(!native_research_owner_is_complete(detached));
+    }
+
+    #[test]
+    fn completed_handoff_projection_requires_exact_attached_cycle() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let mut connection = db.connect().expect("handoff projection connection");
+        let transaction = connection
+            .transaction()
+            .expect("handoff projection transaction");
+        let projection = completed_research_handoff_in_transaction(
+            &transaction,
+            "detached-history-project",
+            "detached-history-campaign",
+            "detached-history-experiment",
+            "research-terminal-cycle:detached-history-campaign:detached-history-experiment",
+        )
+        .expect("handoff projection query");
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn completed_handoff_projection_rejects_linked_open_owner() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let connection = db.connect().expect("open handoff projection connection");
+        let review_id: String = connection
+            .query_row(
+                "SELECT review_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("open handoff review");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'intent'
+                 WHERE review_id = ?1",
+                [&review_id],
+            )
+            .expect("open handoff owner");
+        drop(connection);
+
+        let mut connection = db.connect().expect("open handoff transaction connection");
+        let transaction = connection
+            .transaction()
+            .expect("open handoff transaction");
+        let result = completed_research_handoff_in_transaction(
+            &transaction,
+            "detached-history-project",
+            "detached-history-campaign",
+            "detached-history-experiment",
+            "research-terminal-cycle:detached-history-campaign:detached-history-experiment",
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::Validation {
+                field: "research.handoff",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn research_context_identity_requires_current_schema_and_target_binding() {
+        let context = json!({
+            "schema_version": 1,
+            "facts": {
+                "review": {
+                    "review_id": "review",
+                    "experiment_id": "experiment",
+                    "task_signature": "pueue-managed-run:v1:managed"
+                },
+                "campaign": {"campaign_id": "campaign"},
+                "project": {"project_id": "project"},
+                "objective": {"digest": "objective"},
+                "target": {
+                    "experiment_id": "experiment",
+                    "pueue_task_id": 41,
+                    "task_signature": "pueue-managed-run:v1:managed"
+                }
+            }
+        });
+        assert!(research_context_identity_matches(
+            &context,
+            "project",
+            "campaign",
+            "review",
+            "experiment",
+            "pueue-managed-run:v1:managed",
+            Some(41),
+            "objective",
+        ));
+
+        let mut wrong_schema = context.clone();
+        wrong_schema["schema_version"] = json!(2);
+        assert!(!research_context_identity_matches(
+            &wrong_schema,
+            "project",
+            "campaign",
+            "review",
+            "experiment",
+            "pueue-managed-run:v1:managed",
+            Some(41),
+            "objective",
+        ));
+
+        let mut wrong_review_signature = context.clone();
+        wrong_review_signature["facts"]["review"]["task_signature"] =
+            json!("pueue-managed-run:v1:other");
+        assert!(!research_context_identity_matches(
+            &wrong_review_signature,
+            "project",
+            "campaign",
+            "review",
+            "experiment",
+            "pueue-managed-run:v1:managed",
+            Some(41),
+            "objective",
+        ));
+
+        let mut wrong_target = context.clone();
+        wrong_target["facts"]["target"]["pueue_task_id"] = json!(42);
+        assert!(!research_context_identity_matches(
+            &wrong_target,
+            "project",
+            "campaign",
+            "review",
+            "experiment",
+            "pueue-managed-run:v1:managed",
+            Some(41),
+            "objective",
+        ));
     }
 }

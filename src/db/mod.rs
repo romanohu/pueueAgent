@@ -25,8 +25,12 @@ pub use research::{
     next_research_due, ResearchLaunchBinding, ResearchRepository, ResearchReview, ResearchState,
 };
 pub(crate) use research::{
-    native_research_authority_immutable_matches, startup_research_owner_snapshot,
-    StartupResearchOwner,
+    bind_research_termination_intent_in_transaction, complete_research_continue_in_transaction,
+    completed_research_handoff_in_transaction,
+    mark_research_stop_requested_if_sent,
+    native_research_authority_immutable_matches, ready_research_action_in_transaction,
+    research_ownership_in_transaction, startup_research_owner_snapshot, ReadyResearchAction,
+    CompletedResearchHandoff, ResearchOwnership, ResearchOwnershipSnapshot, StartupResearchOwner,
 };
 pub use running_health::HealthRepository;
 
