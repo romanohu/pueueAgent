@@ -108,6 +108,10 @@ name = "health_actions"
 path = "tests/integration/health_actions.rs"
 
 [[test]]
+name = "research_actions"
+path = "tests/integration/research_actions.rs"
+
+[[test]]
 name = "promotion"
 path = "tests/integration/promotion.rs"
 

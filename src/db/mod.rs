@@ -13,7 +13,7 @@ pub use campaigns::{
     ProposalAcceptance, StartCampaignRequest,
 };
 pub use code_changes::{CodeChangeRepository, NewCodeChangeCheck};
-pub(crate) use campaigns::count_live_repair_descendants;
+pub(crate) use campaigns::{count_live_repair_descendants, count_live_reservations};
 pub(crate) use repositories::{insert_event_completed_in_transaction, insert_event_idempotent_in_transaction};
 pub use decisions::{
     DecisionDoctorProjection, DecisionRecovery, DecisionRepository, DecisionReservation,
@@ -28,6 +28,9 @@ pub use research::{
 pub(crate) use research::{
     bind_research_termination_intent_in_transaction, complete_research_continue_in_transaction,
     completed_research_handoff_in_transaction,
+    discard_ready_research_action_in_transaction,
+    discard_missing_undispatched_research_action_in_transaction,
+    discard_undispatched_research_action_in_transaction,
     mark_research_stop_requested_if_sent,
     native_research_authority_immutable_matches, ready_research_action_in_transaction,
     research_ownership_in_transaction, startup_research_owner_snapshot, ReadyResearchAction,

@@ -17,6 +17,7 @@ pub type TerminationRequestId = i64;
 pub const DEFAULT_CONFIRMATION_GRACE_SECONDS: i64 = 120;
 pub const MAX_KILL_DURATION_SECONDS: u64 = 30;
 pub const DISPATCH_LEASE_SECONDS: i64 = 120;
+pub(crate) const UNDISPATCHED_CONFIRMATION_PREFIX: &str = "termination_undispatched:";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TerminationPolicy;
@@ -131,6 +132,8 @@ where
             .ok_or(AppError::Runtime {
                 operation: "find project for termination request",
             })?;
+        let research_action_bound = request.status == TerminationRequestStatus::Requested
+            && research_action_request_is_bound(self.db, request.request_id, &request.project_id)?;
         let tasks = self.pueue.status_json().await?;
         let matching = tasks
             .iter()
@@ -140,23 +143,41 @@ where
             })
             .cloned();
         let Some(task) = matching else {
+            if request.status == TerminationRequestStatus::Dispatching {
+                return Ok(TerminationOutcome::PendingConfirmation);
+            }
+            if research_action_bound
+                && tasks.iter().any(|task| {
+                    request_matches_terminal_task(&request, task) && !task.is_terminal()
+                })
+            {
+                return Ok(TerminationOutcome::PendingConfirmation);
+            }
             let now = unix_timestamp()?;
             return confirm_requested_already_terminal(
                 self.db,
                 &repository,
                 request.request_id,
                 request.status,
+                research_action_bound,
                 now,
                 "task signature is no longer active",
             );
         };
         if !task.is_running() {
+            if request.status == TerminationRequestStatus::Dispatching {
+                return Ok(TerminationOutcome::PendingConfirmation);
+            }
+            if research_action_bound && !task.is_terminal() {
+                return Ok(TerminationOutcome::PendingConfirmation);
+            }
             let now = unix_timestamp()?;
             return confirm_requested_already_terminal(
                 self.db,
                 &repository,
                 request.request_id,
                 request.status,
+                research_action_bound,
                 now,
                 "task is already terminal or non-running",
             );
@@ -198,6 +219,11 @@ where
                     )?
                     .is_some()
                 {
+                    crate::db::mark_research_stop_requested_if_sent(
+                        self.db,
+                        claimed_request.request_id,
+                        unix_timestamp()?,
+                    )?;
                     Ok(TerminationOutcome::PendingConfirmation)
                 } else {
                     let current = repository.find_by_id(claimed_request.request_id)?.ok_or(
@@ -242,16 +268,23 @@ fn confirm_requested_already_terminal(
     repository: &TerminationRequestRepository<'_>,
     request_id: i64,
     current_status: TerminationRequestStatus,
+    mark_undispatched: bool,
     confirmed_at: i64,
     message: &str,
 ) -> Result<TerminationOutcome, AppError> {
+    let persisted_error =
+        if current_status == TerminationRequestStatus::Requested && mark_undispatched {
+            format!("{UNDISPATCHED_CONFIRMATION_PREFIX}{message}")
+        } else {
+            message.to_owned()
+        };
     if repository
         .update_result_if_current(
             request_id,
             current_status,
             TerminationRequestStatus::Confirmed,
             Some(confirmed_at),
-            Some(message),
+            Some(&persisted_error),
         )?
         .is_some()
     {
@@ -263,6 +296,39 @@ fn confirm_requested_already_terminal(
             operation: "reload concurrently completed termination request",
         })?;
     outcome_for_non_requested(db, repository, &current)
+}
+
+fn research_action_request_is_bound(
+    db: &Db,
+    request_id: i64,
+    project_id: &str,
+) -> Result<bool, AppError> {
+    let connection = db.connect()?;
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM research_reviews AS review
+                 JOIN campaigns AS campaign
+                   ON campaign.campaign_id = review.campaign_id
+                 JOIN experiments AS source
+                   ON source.experiment_id = review.experiment_id
+                  AND source.campaign_id = review.campaign_id
+                 WHERE review.termination_request_id = ?1
+                   AND review.state = 'ready'
+                   AND review.operation_stage = 'intent'
+                   AND review.decision_cycle_id IS NULL
+                   AND review.successor_experiment_id IS NULL
+                   AND campaign.project_id = ?2
+                   AND source.pueue_task_id IS NOT NULL
+                   AND source.task_signature = review.task_signature
+             )",
+            rusqlite::params![request_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(crate::db::database_error(
+            "check research termination ownership",
+        ))
 }
 
 fn outcome_for_non_requested(

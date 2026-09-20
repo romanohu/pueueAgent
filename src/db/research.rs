@@ -3940,6 +3940,50 @@ impl<'db> ResearchRepository<'db> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read ready research actions"))
     }
+
+    pub(crate) fn open_action_reviews(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ResearchReview>, AppError> {
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{REVIEW_SELECT}
+                 WHERE state = 'ready' AND operation_stage IN {OPEN_OPERATION_STAGES}
+                 ORDER BY updated_at, review_id
+                 LIMIT ?1"
+            ))
+            .map_err(database_error("prepare open research action query"))?;
+        let rows = statement
+            .query_map([limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64], review_from_row)
+            .map_err(database_error("query open research actions"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read open research actions"))
+    }
+
+    pub(crate) fn rotate_open_action_review(
+        &self,
+        review_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin open research action rotation"))?;
+        transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET updated_at = CASE WHEN updated_at < ?1 THEN ?1 ELSE updated_at END
+                 WHERE review_id = ?2 AND state = 'ready'
+                   AND operation_stage IN ('intent','stop_requested',
+                       'stop_confirmed','successor_reserved')",
+                params![now, review_id],
+            )
+            .map_err(database_error("rotate open research action"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit open research action rotation"))
+    }
 }
 
 #[derive(Debug)]
@@ -4820,6 +4864,103 @@ pub(crate) fn ready_research_action_in_transaction(
         campaign_objective_digest,
         raw_task_signature,
     }))
+}
+
+/// Discard a ready answer whose source task has naturally terminated or whose
+/// live numeric identity no longer matches the persisted managed target.  The
+/// project and campaign gates are repeated in this CAS so a pause or disable
+/// preserves the ready answer for a later admission pass.
+pub(crate) fn discard_ready_research_action_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    review_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    if reason.is_empty() || reason.len() > 128 || reason.chars().any(char::is_control) {
+        return Err(validation_error("research.failure_code", "must be bounded"));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'discarded', failure_code = ?1,
+                 finished_at = ?2, not_before = ?2, updated_at = ?2
+             WHERE review_id = ?3 AND state = 'ready'
+               AND operation_stage IS NULL
+               AND termination_request_id IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM campaigns AS campaign
+                   JOIN projects AS project ON project.project_id = campaign.project_id
+                   WHERE campaign.campaign_id = research_reviews.campaign_id
+                     AND campaign.project_id = ?4
+                     AND campaign.state = 'active'
+                     AND project.enabled = 1
+                     AND project.paused = 0
+                     AND project.halted_reason IS NULL
+               )",
+            params![reason, now, review_id, project_id],
+        )
+        .map_err(database_error("discard stale research action"))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn discard_undispatched_research_action_in_transaction(
+    transaction: &Transaction<'_>,
+    review_id: &str,
+    request_id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    if reason.is_empty() || reason.len() > 128 || reason.chars().any(char::is_control) {
+        return Err(validation_error("research.failure_code", "must be bounded"));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'discarded', operation_stage = NULL, failure_code = ?1,
+                 finished_at = ?2, not_before = ?2, updated_at = ?2
+             WHERE review_id = ?3 AND state = 'ready'
+               AND operation_stage = 'intent'
+               AND termination_request_id = ?4
+               AND decision_cycle_id IS NULL
+               AND successor_experiment_id IS NULL",
+            params![reason, now, review_id, request_id],
+        )
+        .map_err(database_error("discard undispatched research action"))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn discard_missing_undispatched_research_action_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    review_id: &str,
+    request_id: i64,
+    now: i64,
+) -> Result<bool, AppError> {
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'discarded', operation_stage = NULL,
+                 failure_code = 'research_natural_finish_before_dispatch',
+                 finished_at = ?1, not_before = ?1, updated_at = ?1
+             WHERE review_id = ?2 AND state = 'ready'
+               AND operation_stage = 'intent'
+               AND termination_request_id = ?3
+               AND decision_cycle_id IS NULL
+               AND successor_experiment_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM termination_requests
+                   WHERE request_id = ?3 AND project_id = ?4
+                     AND status = 'confirmed' AND grace_until IS NULL
+                     AND last_error LIKE 'termination_undispatched:%'
+               )",
+            params![now, review_id, request_id, project_id],
+        )
+        .map_err(database_error(
+            "discard missing undispatched research action",
+        ))?;
+    Ok(changed == 1)
 }
 
 pub(super) fn research_context_identity_matches(

@@ -3338,7 +3338,7 @@ fn reject_code_change_in_transaction(
     Ok(())
 }
 
-fn count_live_reservations(
+pub(crate) fn count_live_reservations(
     transaction: &Transaction<'_>,
     campaign_id: &str,
     dimension: BudgetDimension,

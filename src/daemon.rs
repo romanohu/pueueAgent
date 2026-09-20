@@ -30,6 +30,7 @@ use crate::{
     periodic::PeriodicDeepCheckScheduler,
     process::{startup_process_quiescence, StartupProcessQuiescence},
     reconcile::{ReconcileReport, Reconciler},
+    research_actions::advance_research_actions,
     research::{recover_research, run_due_research_with_cleanup_blocked_projects},
     retry::RetryPolicy,
     scheduler::{Scheduler, SchedulerConfig, SchedulerReport},
@@ -305,6 +306,14 @@ where
         report.research_started += research.0;
         report.research_deferred += research.1;
         report.research_blocked += research.2;
+        let _research_actions = advance_research_actions(
+            &self.db,
+            &self.pueue,
+            self.policy.as_ref(),
+            now,
+            self.config.claim_limit,
+        )
+        .await?;
         #[cfg(unix)]
         {
             let runner = self.runner.as_ref().ok_or(AppError::Runtime {
