@@ -226,6 +226,8 @@ impl<'db> ResearchRepository<'db> {
                   AND observation.pueue_task_id = e.pueue_task_id
                   AND observation.pueue_group = p.pueue_group
                   AND lower(observation.state) = 'running'
+                 LEFT JOIN campaign_research AS research_state
+                   ON research_state.campaign_id = c.campaign_id
                  WHERE c.state = 'active'
                    AND p.enabled = 1 AND p.paused = 0
                    AND p.halted_reason IS NULL
@@ -234,6 +236,18 @@ impl<'db> ResearchRepository<'db> {
                    AND s.status = 'accepted'
                    AND s.pueue_task_id = e.pueue_task_id
                    AND s.task_signature = e.task_signature
+                   AND (
+                       research_state.campaign_id IS NULL
+                       OR (
+                           research_state.next_due_at IS NULL
+                           AND research_state.blocked_reason IS NULL
+                           AND NOT EXISTS (
+                               SELECT 1 FROM research_reviews AS open_review
+                               WHERE open_review.campaign_id = c.campaign_id
+                                 AND open_review.state IN ('pending','running','ready','retry_wait')
+                           )
+                       )
+                   )
                  GROUP BY c.campaign_id
                  ORDER BY MIN(COALESCE(observation.started_at,
                                         observation.first_observed_at)),
@@ -416,6 +430,49 @@ impl<'db> ResearchRepository<'db> {
         }))
     }
 
+    /// A bound retry may be admitted only after its previous native owner is
+    /// durably terminal.  Missing or active rows are deliberately treated as
+    /// not ready so a wake cannot consume a second reservation around an
+    /// unknown owner.
+    pub fn retry_owner_ready(&self, review_id: &str) -> Result<bool, AppError> {
+        let connection = self.db.connect()?;
+        let Some((state, agent_run_id)) = connection
+            .query_row(
+                "SELECT state, agent_run_id FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read research retry owner"))?
+        else {
+            return Err(validation_error(
+                "review_id",
+                "does not identify a persisted research review",
+            ));
+        };
+        if state != "retry_wait" {
+            return Ok(true);
+        }
+        let Some(agent_run_id) = agent_run_id else {
+            return Ok(true);
+        };
+        let Some((status, gate_state)) = connection
+            .query_row(
+                "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+                [agent_run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(database_error("read research retry owner state"))?
+        else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            status.as_str(),
+            "completed" | "failed" | "timed_out" | "cancelled"
+        ) && matches!(gate_state.as_str(), "released" | "failed"))
+    }
+
     pub fn next_attempt_for_launch(&self, review_id: &str) -> Result<i64, AppError> {
         let connection = self.db.connect()?;
         let row: Option<(i64, Option<i64>, Option<String>)> = connection
@@ -490,15 +547,28 @@ impl<'db> ResearchRepository<'db> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error("begin research attempt admission"))?;
-        let current: (String, String, i64, Option<i64>, i64, String, Option<String>) = transaction
+        let current: (
+            String,
+            String,
+            i64,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = transaction
             .query_row(
                 "SELECT campaign_id, state, attempt, agent_run_id,
-                        session_generation, experiment_id, failure_code
+                        session_generation, experiment_id, failure_code,
+                        context_json, context_digest, notes_json
                  FROM research_reviews WHERE review_id = ?1",
                 [review_id],
                 |row| Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?,
+                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                    row.get(8)?, row.get(9)?,
                 )),
             )
             .optional()
@@ -512,12 +582,37 @@ impl<'db> ResearchRepository<'db> {
             _generation,
             _experiment_id,
             failure_code,
+            context_json,
+            context_digest,
+            notes_json,
         ) = current;
-        if !matches!(state.as_str(), "pending" | "retry_wait") || current_run.is_some() {
+        if !matches!(state.as_str(), "pending" | "retry_wait") {
             transaction
                 .commit()
                 .map_err(database_error("commit skipped research attempt admission"))?;
             return Ok(None);
+        }
+        if let Some(current_run) = current_run {
+            let owner_ready: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT status, launch_gate_state FROM agent_runs WHERE run_id = ?1",
+                    [current_run],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(database_error("read bound research retry owner"))?;
+            let owner_ready = owner_ready.is_some_and(|(status, gate_state)| {
+                matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "timed_out" | "cancelled"
+                ) && matches!(gate_state.as_str(), "released" | "failed")
+            });
+            if state != "retry_wait" || !owner_ready {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit skipped bound research retry"))?;
+                return Ok(None);
+            }
         }
         let reservation_matches = budget_reservation_matches(
             &transaction,
@@ -561,16 +656,43 @@ impl<'db> ResearchRepository<'db> {
                 "must be the consumed campaign reservation for this research review attempt",
             ));
         }
+        let notes_json = if let Some(previous_run_id) = current_run {
+            let mut notes = notes_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            if !notes
+                .get("retry_history")
+                .is_some_and(serde_json::Value::is_array)
+            {
+                notes["retry_history"] = json!([]);
+            }
+            let history = notes
+                .get_mut("retry_history")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("retry history array just created");
+            history.push(json!({
+                "attempt": current_attempt,
+                "agent_run_id": previous_run_id,
+                "failure_code": failure_code,
+                "context_json": context_json,
+                "context_digest": context_digest,
+            }));
+            Some(notes.to_string())
+        } else {
+            notes_json
+        };
         let changed = transaction
             .execute(
                 "UPDATE research_reviews
                  SET attempt = ?1, state = 'pending', operation_stage = NULL,
                      agent_run_id = NULL, context_json = NULL, context_digest = NULL,
                      response_json = NULL, failure_code = NULL, started_at = NULL,
-                     finished_at = NULL, not_before = ?2, updated_at = ?2
-                 WHERE review_id = ?3 AND state IN ('pending','retry_wait')
-                   AND agent_run_id IS NULL AND attempt = ?4",
-                params![target_attempt, now, review_id, current_attempt],
+                     finished_at = NULL, notes_json = ?2, not_before = ?3, updated_at = ?3
+                 WHERE review_id = ?4 AND state IN ('pending','retry_wait')
+                   AND attempt = ?5",
+                params![target_attempt, notes_json, now, review_id, current_attempt],
             )
             .map_err(database_error("admit research review attempt"))?;
         if changed != 1 {
@@ -1250,10 +1372,11 @@ impl<'db> ResearchRepository<'db> {
             current_attempt,
             current_run,
             current_review_generation,
-            ): (String, String, Option<String>, i64, i64, Option<i64>, i64) = transaction
+            current_notes,
+            ): (String, String, Option<String>, i64, i64, Option<i64>, i64, Option<String>) = transaction
             .query_row(
                 "SELECT r.campaign_id, r.experiment_id, c.session_id, c.session_generation,
-                        r.attempt, r.agent_run_id, r.session_generation
+                        r.attempt, r.agent_run_id, r.session_generation, r.notes_json
                  FROM research_reviews AS r
                  JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
                  JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
@@ -1268,6 +1391,7 @@ impl<'db> ResearchRepository<'db> {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -1333,14 +1457,17 @@ impl<'db> ResearchRepository<'db> {
                 "cannot reconstruct while a prior research run has active or unknown ownership",
             ));
         }
-        let recovery_notes = json!({
-            "session_binding": "pending",
-            "planned_session_id": binding.session_id,
-            "attempt": binding.attempt,
-            "budget_reservation_id": binding.budget_reservation_id,
-            "recovery_reason": binding.recovery_reason,
-        })
-        .to_string();
+        let mut recovery_notes = current_notes
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        recovery_notes["session_binding"] = json!("pending");
+        recovery_notes["planned_session_id"] = json!(binding.session_id);
+        recovery_notes["attempt"] = json!(binding.attempt);
+        recovery_notes["budget_reservation_id"] = json!(binding.budget_reservation_id);
+        recovery_notes["recovery_reason"] = json!(binding.recovery_reason);
+        let recovery_notes = recovery_notes.to_string();
         let changed = transaction
             .execute(
                 "UPDATE research_reviews

@@ -27,7 +27,7 @@ use crate::{
     pueue::PueueApi,
     periodic::PeriodicDeepCheckScheduler,
     reconcile::{ReconcileReport, Reconciler},
-    research::{recover_research, run_due_research},
+    research::{recover_research, run_due_research_with_cleanup_blocked_projects},
     retry::RetryPolicy,
     scheduler::{Scheduler, SchedulerConfig, SchedulerReport},
     termination::{TerminationManager, TerminationOutcome},
@@ -657,15 +657,27 @@ where
     }
 
     async fn run_due_research(&mut self, now: i64) -> Result<(usize, usize, usize), AppError> {
+        let cleanup_blocked_projects = self
+            .active_agents
+            .iter()
+            .filter_map(AgentHandle::cleanup_blocked_project)
+            .chain(
+                self.active_cleanups
+                    .iter()
+                    .filter_map(BoundCleanupHandle::cleanup_blocked_project),
+            )
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         let runner = self.runner.take().ok_or(AppError::Runtime {
             operation: "take daemon research runner",
         })?;
-        let outcome = run_due_research(
+        let outcome = run_due_research_with_cleanup_blocked_projects(
             &self.db,
             &runner,
             self.policy.campaign_limits,
             now,
             self.config.claim_limit,
+            &cleanup_blocked_projects,
         )
         .await;
         self.runner = Some(runner);

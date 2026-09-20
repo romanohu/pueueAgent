@@ -42,6 +42,7 @@ use crate::{
         TerminationRequestStatus,
     },
     output::bounded_redacted_text,
+    research_protocol::parse_research_answer,
     retry::{retry_backoff_seconds, retry_decision, EventResolution, RetryDecision, RetryPolicy},
     AppError,
 };
@@ -3684,7 +3685,8 @@ fn research_recovery_binding(
             "SELECT r.review_id, r.campaign_id, r.experiment_id, r.attempt,
                     r.state, r.agent_run_id, r.context_json, r.context_digest,
                     r.session_generation, c.session_id, c.session_generation,
-                    r.event_id, campaign.project_id
+                    r.event_id, r.response_json, r.failure_code, r.finished_at,
+                    campaign.project_id
              FROM research_reviews AS r
              JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
              JOIN campaigns AS campaign ON campaign.campaign_id = r.campaign_id
@@ -3706,7 +3708,10 @@ fn research_recovery_binding(
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, i64>(10)?,
                 row.get::<_, i64>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, String>(15)?,
             ))
         })
         .map_err(database_error("query campaign research recovery binding"))?
@@ -3728,8 +3733,56 @@ fn research_recovery_binding(
         session_id,
         campaign_generation,
         event_id,
+        response_json,
+        failure_code,
+        finished_at,
         bound_project_id,
     ) = &rows[0];
+    let context_valid = context_json.as_deref().is_some_and(|context| {
+        context_digest.as_deref().is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+                && format!("{:x}", Sha256::digest(context.as_bytes())) == digest
+        })
+    });
+    let terminal_payload_valid = match state.as_str() {
+        "running" => response_json.is_none() && failure_code.is_none() && finished_at.is_none(),
+        "ready" => {
+            match (
+                response_json.as_deref(),
+                context_digest.as_deref(),
+                failure_code,
+                finished_at,
+            ) {
+                (Some(response_json), Some(context_digest), None, Some(_)) => {
+                    parse_research_answer(response_json.as_bytes()).is_ok_and(|answer| {
+                        answer.review_id == *review_id
+                            && answer.experiment_id == *experiment_id
+                            && answer.context_digest == context_digest
+                    })
+                }
+                _ => false,
+            }
+        }
+        "retry_wait" => {
+            response_json.is_none()
+                && finished_at.is_some()
+                && failure_code.as_deref().is_some_and(|code| {
+                    matches!(
+                        code,
+                        "research_output_invalid"
+                            | "research_timeout"
+                            | "research_exit"
+                            | "research_launch"
+                            | "research_session_missing"
+                            | "research_interrupted"
+                    )
+                })
+        }
+        _ => false,
+    };
     let valid = !review_id.is_empty()
         && !campaign_id.is_empty()
         && !experiment_id.is_empty()
@@ -3744,19 +3797,12 @@ fn research_recovery_binding(
             )
             .map_err(database_error("validate campaign research experiment lineage"))?
         && *attempt > 0
-        && state == "running"
+        && matches!(state.as_str(), "running" | "ready" | "retry_wait")
         && *bound_run_id == Some(agent_run_id)
         && bound_project_id == project_id
         && context_json.as_deref().is_some_and(|value| !value.is_empty())
-        && context_digest
-            .as_deref()
-            .is_some_and(|value| {
-                value.len() == 64
-                    && value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-                    && context_json.as_deref().is_some_and(|context| {
-                        format!("{:x}", Sha256::digest(context.as_bytes())) == value
-                    })
-            })
+        && context_valid
+        && terminal_payload_valid
         && *review_generation == *campaign_generation
         && session_id.as_deref().is_some_and(|value| !value.is_empty());
     let event_link_valid = transaction
@@ -6793,7 +6839,18 @@ impl<'db> TaskObservationRepository<'db> {
                     command_json = excluded.command_json,
                     state = excluded.state,
                     enqueued_at = excluded.enqueued_at,
-                    started_at = excluded.started_at,
+                    started_at = CASE
+                      WHEN excluded.started_at IS NOT NULL THEN excluded.started_at
+                      WHEN lower(excluded.state) = 'running' THEN
+                        COALESCE(
+                          task_observations.started_at,
+                          CASE
+                            WHEN lower(task_observations.state) <> 'running'
+                              THEN excluded.observed_at
+                          END
+                        )
+                      ELSE task_observations.started_at
+                    END,
                     ended_at = excluded.ended_at,
                     result = excluded.result,
                     observed_at = excluded.observed_at",

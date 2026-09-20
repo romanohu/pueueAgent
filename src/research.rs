@@ -5,6 +5,8 @@
 //! that claims those events, reserves their bounded campaign budget, and
 //! hands the exact review/evidence identity to the native research role.
 
+use std::collections::BTreeSet;
+
 use crate::{
     agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle},
     config,
@@ -12,7 +14,7 @@ use crate::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
         ProjectRepository, ResearchRepository,
     },
-    execution_policy::{preflight_decision_runtime, CampaignLimits},
+    execution_policy::{preflight_decision_runtime, CampaignLimits, PolicyViolationCode},
     models::{CampaignState, EventStatus},
     research_evidence::build_research_evidence,
     retry::{retry_backoff_seconds, RetryPolicy},
@@ -35,7 +37,30 @@ pub async fn run_due_research(
     now: i64,
     limit: usize,
 ) -> Result<ResearchPassReport, AppError> {
+    run_due_research_with_cleanup_blocked_projects(
+        db,
+        runner,
+        limits,
+        now,
+        limit,
+        &BTreeSet::new(),
+    )
+    .await
+}
+
+/// Schedule research while honoring in-memory cleanup owners retained by the
+/// daemon. A terminal database row is not sufficient admission evidence until
+/// its native owner has released the private run authority.
+pub(crate) async fn run_due_research_with_cleanup_blocked_projects(
+    db: &Db,
+    runner: &AgentRunner,
+    limits: CampaignLimits,
+    now: i64,
+    limit: usize,
+    cleanup_blocked_projects: &BTreeSet<String>,
+) -> Result<ResearchPassReport, AppError> {
     let mut report = ResearchPassReport::default();
+    let mut cleanup_blocked_projects = cleanup_blocked_projects.clone();
     if limit == 0 || limits.research_interval_minutes == 0 {
         return Ok(report);
     }
@@ -48,7 +73,11 @@ pub async fn run_due_research(
     let repository = ResearchRepository::new(db);
     repository.schedule_running_campaigns(limits.research_interval_minutes, now, limit)?;
     let mut due_reviews = repository.claim_due_campaigns(now, limit)?;
-    for review in repository.due_reviews(now, limit)? {
+    let remaining = limit.saturating_sub(due_reviews.len());
+    for review in repository.due_reviews(now, remaining)? {
+        if due_reviews.len() >= limit {
+            break;
+        }
         if due_reviews
             .iter()
             .all(|claimed| claimed.review_id != review.review_id)
@@ -79,9 +108,15 @@ pub async fn run_due_research(
             limits,
             now,
             review.review_id.as_str(),
+            &cleanup_blocked_projects,
             &mut report,
         )
         .await?;
+        for cleanup in &report.cleanups {
+            if let Some(project_id) = cleanup.cleanup_blocked_project() {
+                cleanup_blocked_projects.insert(project_id.to_owned());
+            }
+        }
     }
     Ok(report)
 }
@@ -116,11 +151,14 @@ async fn launch_review(
     limits: CampaignLimits,
     now: i64,
     review_id: &str,
+    cleanup_blocked_projects: &BTreeSet<String>,
     report: &mut ResearchPassReport,
 ) -> Result<(), AppError> {
     let repository = ResearchRepository::new(db);
     let review = repository.find(review_id)?;
-    if review.state != "pending" || review.agent_run_id.is_some() {
+    if !matches!(review.state.as_str(), "pending" | "retry_wait")
+        || (review.state == "pending" && review.agent_run_id.is_some())
+    {
         return Ok(());
     }
     let event_id = repository.event_id(review_id)?;
@@ -149,6 +187,16 @@ async fn launch_review(
         || project.paused
         || project.halted_reason.is_some()
     {
+        EventRepository::new(db).defer_claimed(&[event_id])?;
+        report.deferred += 1;
+        return Ok(());
+    }
+    if cleanup_blocked_projects.contains(&project.project_id) {
+        EventRepository::new(db).defer_claimed(&[event_id])?;
+        report.deferred += 1;
+        return Ok(());
+    }
+    if review.state == "retry_wait" && !repository.retry_owner_ready(review_id)? {
         EventRepository::new(db).defer_claimed(&[event_id])?;
         report.deferred += 1;
         return Ok(());
@@ -284,9 +332,31 @@ async fn launch_review(
         // Once a campaign session is owned, every later review must use the
         // exact durable resume identity.  Fresh is reserved for the first
         // review or a confirmed missing-session reconstruction.
-        research_agent_config.context = runner
-            .research_context_for(&project_policy, &session_id)
-            .map_err(AppError::from)?;
+        research_agent_config.context = match runner.research_context_for(&project_policy, &session_id) {
+            Ok(context) => context,
+            Err(_) => {
+                let blocked = repository.fail_unbound_attempt(
+                    review_id,
+                    "research_session_unsafe",
+                    now,
+                    limits.max_decision_attempts_per_cycle,
+                    true,
+                )?;
+                if blocked {
+                    let _ = EventRepository::new(db).transition_many(
+                        &[event_id],
+                        EventStatus::Failed,
+                        now,
+                        None,
+                        Some("research_session_unsafe"),
+                    )?;
+                    report.blocked += 1;
+                } else {
+                    report.deferred += 1;
+                }
+                return Ok(());
+            }
+        };
     }
 
     let retry_policy = RetryPolicy {
@@ -337,7 +407,7 @@ fn handle_spawn_error(
 ) -> Result<(), AppError> {
     let AgentSpawnError {
         stage,
-        source: _source,
+        source,
         policy,
         cleanup,
     } = error;
@@ -354,6 +424,35 @@ fn handle_spawn_error(
         return Ok(());
     }
     let repository = ResearchRepository::new(db);
+    let unsafe_session_probe = matches!(
+        source,
+        AppError::CodexSessionMetadata { .. }
+    ) || matches!(
+        policy.as_ref().map(|violation| violation.code),
+        Some(PolicyViolationCode::SessionMissing | PolicyViolationCode::SessionNotOwned)
+    );
+    if unsafe_session_probe {
+        let blocked = repository.fail_unbound_attempt(
+            review_id,
+            "research_session_unsafe",
+            now,
+            limits.max_decision_attempts_per_cycle,
+            true,
+        )?;
+        if blocked {
+            let _ = EventRepository::new(db).transition_many(
+                &[event_id],
+                EventStatus::Failed,
+                now,
+                None,
+                Some("research_session_unsafe"),
+            )?;
+            report.blocked += 1;
+        } else {
+            report.deferred += 1;
+        }
+        return Ok(());
+    }
     if let Some(violation) = policy {
         repository.block_review(review_id, "research_policy_blocked", now)?;
         let project_id = EventRepository::new(db)
