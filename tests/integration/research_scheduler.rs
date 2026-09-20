@@ -7,7 +7,8 @@ use std::{os::unix::fs::PermissionsExt, process::Command};
 
 use pueue_agent::{
     db::{
-        AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
+        AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
+        ExperimentRepository,
         ProjectRepository, ResearchRepository, StartCampaignRequest, TaskObservationRepository,
     },
     execution_policy::CampaignLimits,
@@ -526,6 +527,117 @@ fn missing_started_at_uses_first_confirmed_running_observation() {
             .started_at,
         Some(3_800)
     );
+}
+
+#[test]
+fn retry_admission_moves_native_recovery_proof_into_history_and_clears_top_level() {
+    let fixture = fixture();
+    let (review_id, run_id, _event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    let authority = serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "review_id": review_id,
+        "campaign_id": fixture.campaign_id,
+        "experiment_id": fixture.experiment_id,
+        "attempt": 1,
+        "session_generation": 0,
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "fresh_launch": true,
+        "service_root_identity": {
+            "device": 1,
+            "inode": 2,
+            "owner": 3,
+            "mode": 448,
+            "resolution": "fixture-root",
+        },
+        "temp_identity": {
+            "device": 1,
+            "inode": 4,
+            "owner": 3,
+            "mode": 448,
+            "mount": [1, 2],
+        },
+        "cleanup": {"phase": "complete"},
+    });
+    let original_notes = serde_json::json!({
+        "business_note": "preserve this note",
+        "native_recovery": authority,
+    });
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            rusqlite::params![original_notes.to_string(), &review_id],
+        )
+        .expect("seed native recovery proof");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'failed' WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal retry owner");
+
+    let reservation = match CampaignRepository::new(&fixture.db)
+        .reserve_agent_run(
+            &fixture.campaign_id,
+            &format!("research:{review_id}:attempt:2"),
+            &CampaignLimits::default(),
+            3_001,
+        )
+        .expect("reserve next research attempt")
+    {
+        AgentDecisionReservation::Reserved(reservation) => reservation,
+        other => panic!("next research attempt must reserve a budget slot: {other:?}"),
+    };
+    let admitted = ResearchRepository::new(&fixture.db)
+        .prepare_attempt(&review_id, &reservation.reservation_id, 3, 3_002)
+        .expect("retry admission");
+    assert!(admitted.is_some(), "the bounded retry must be admitted");
+
+    let notes_json: String = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&review_id],
+            |row| row.get(0),
+        )
+        .expect("read admitted retry notes");
+    let notes: serde_json::Value = serde_json::from_str(&notes_json).expect("notes object");
+    assert_eq!(
+        notes.get("business_note"),
+        original_notes.get("business_note")
+    );
+    assert!(
+        notes.get("native_recovery").is_none(),
+        "the next attempt must not inherit the prior run's top-level generation proof"
+    );
+    let history = notes
+        .get("retry_history")
+        .and_then(serde_json::Value::as_array)
+        .expect("the prior attempt must be retained in retry history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].get("native_recovery"),
+        original_notes.get("native_recovery")
+    );
+    let reservation_status: String = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM budget_reservations WHERE reservation_id = ?1",
+            [&reservation.reservation_id],
+            |row| row.get(0),
+        )
+        .expect("read retry reservation");
+    assert_eq!(reservation_status, "consumed");
 }
 
 #[tokio::test]
