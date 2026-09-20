@@ -1815,83 +1815,125 @@ async fn startup_recovery_preserves_classified_research_failure_for_retry() {
     );
 }
 
-#[cfg(unix)]
-fn prepare_research_temp(fixture: &SchedulerFixture, run_id: i64) -> std::path::PathBuf {
-    let temp_root = fixture
-        ._temp
-        .path()
-        .join("project")
-        .join(".pueue-agent")
-        .join("tmp");
-    fs::create_dir_all(&temp_root).expect("research temp root");
-    for path in [
-        temp_root.parent().expect("service root"),
-        temp_root.as_path(),
-    ] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .expect("research temp permissions");
-    }
-    let run_temp = temp_root.join(run_id.to_string());
-    fs::create_dir(&run_temp).expect("research run temp");
-    fs::set_permissions(&run_temp, fs::Permissions::from_mode(0o700))
-        .expect("research run temp permissions");
-    run_temp
-}
-
-#[cfg(unix)]
 #[tokio::test]
-async fn dead_research_owner_is_retried_after_process_group_and_temp_proof() {
+async fn standalone_research_recovery_requires_startup_owner_evidence() {
     let fixture = fixture();
     let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "running");
-    let run_temp = prepare_research_temp(&fixture, run_id);
-    let child = Command::new("sh")
-        .args(["-c", "exit 0"])
-        .spawn()
-        .expect("dead owner fixture");
-    let pid = i64::from(child.id());
-    child.wait_with_output().expect("reap dead owner fixture");
     fixture
         .db
         .connect()
         .expect("database connection")
         .execute(
-            "UPDATE agent_runs SET pid = ?1 WHERE run_id = ?2",
-            rusqlite::params![pid, run_id],
+            "UPDATE agent_runs SET pid = NULL WHERE run_id = ?1",
+            [run_id],
         )
-        .expect("persist dead owner pid");
+        .expect("remove startup-only process identity from standalone fixture");
+    let reservation_id = match CampaignRepository::new(&fixture.db)
+        .reserve_agent_run(
+            &fixture.campaign_id,
+            &format!("research:{review_id}:attempt:1"),
+            &CampaignLimits::default(),
+            2_902,
+        )
+        .expect("reserve standalone research budget")
+    {
+        AgentDecisionReservation::Reserved(reservation) => reservation.reservation_id,
+        other => panic!("standalone research budget must reserve: {other:?}"),
+    };
+    let review_before = ResearchRepository::new(&fixture.db)
+        .find(&review_id)
+        .expect("standalone review before recovery");
+    let run_before = AgentRunRepository::new(&fixture.db)
+        .find_by_id(run_id)
+        .expect("standalone run before recovery")
+        .expect("standalone run row");
+    let event_before = EventRepository::new(&fixture.db)
+        .find_by_id(event_id)
+        .expect("standalone event before recovery")
+        .expect("standalone event row");
+    let state_before = ResearchRepository::new(&fixture.db)
+        .state(&fixture.campaign_id)
+        .expect("standalone session before recovery");
+    let notes_before: String = fixture
+        .db
+        .connect()
+        .expect("notes database connection")
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&review_id],
+            |row| row.get(0),
+        )
+        .expect("standalone notes before recovery");
+    let reservation_before: (String, String) = fixture
+        .db
+        .connect()
+        .expect("reservation database connection")
+        .query_row(
+            "SELECT reservation_id, status FROM budget_reservations
+             WHERE reservation_id = ?1",
+            [&reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("standalone reservation before recovery");
 
     recover_research(&fixture.db, 3_000, CampaignLimits::default())
         .await
-        .expect("research startup owner recovery");
+        .expect("standalone research recovery pass");
     assert_eq!(
         ResearchRepository::new(&fixture.db)
             .find(&review_id)
-            .expect("recovered review")
-            .state,
-        "retry_wait"
+            .expect("standalone review after recovery"),
+        review_before
     );
     assert_eq!(
         EventRepository::new(&fixture.db)
             .find_by_id(event_id)
-            .expect("recovered event")
-            .expect("recovered event row")
-            .status,
-        EventStatus::RetryWait
+            .expect("standalone event after recovery")
+            .expect("standalone event row"),
+        event_before
     );
     assert_eq!(
         AgentRunRepository::new(&fixture.db)
             .find_by_id(run_id)
-            .expect("recovered run")
-            .expect("recovered run row")
-            .status,
-        AgentRunStatus::Failed
+            .expect("standalone run after recovery")
+            .expect("standalone run row"),
+        run_before
     );
-    assert!(run_temp.exists(), "recovery keeps the verified run directory");
     assert_eq!(
-        fs::read_dir(run_temp)
-            .expect("read cleaned run directory")
-            .count(),
-        0
+        ResearchRepository::new(&fixture.db)
+            .state(&fixture.campaign_id)
+            .expect("standalone session after recovery"),
+        state_before
+    );
+    let notes_after: String = fixture
+        .db
+        .connect()
+        .expect("notes database connection")
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&review_id],
+            |row| row.get(0),
+        )
+        .expect("standalone notes after recovery");
+    assert_eq!(notes_after, notes_before);
+    let reservation_after: (String, String) = fixture
+        .db
+        .connect()
+        .expect("reservation database connection")
+        .query_row(
+            "SELECT reservation_id, status FROM budget_reservations
+             WHERE reservation_id = ?1",
+            [&reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("standalone reservation after recovery");
+    assert_eq!(reservation_after, reservation_before);
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("standalone review remains bound")
+            .agent_run_id,
+        Some(run_id)
     );
 }
 

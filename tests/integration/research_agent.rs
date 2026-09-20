@@ -3843,7 +3843,7 @@ async fn research_cleanup_pending_owner_blocks_diagnosis_before_binding() {
         .db
         .connect()
         .unwrap()
-        .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get::<_, i64>(0))
         .unwrap();
     let temp_count_before = fs::read_dir(
         harness
@@ -3926,7 +3926,7 @@ async fn research_cleanup_pending_owner_blocks_diagnosis_before_binding() {
             .db
             .connect()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get::<_, i64>(0))
             .unwrap(),
         run_count_before,
         "a blocked diagnosis must not persist another run"
