@@ -3305,7 +3305,8 @@ async fn research_replacement_daemon_retires_classified_retry_after_terminal_fai
     assert_eq!(before.state, "retry_wait");
     assert_eq!(before_failure_code.as_deref(), Some("research_output_invalid"));
     assert!(before.response_json.is_none());
-    assert_eq!(harness.research_session(), None);
+    let confirmed_session = harness.research_session();
+    assert_eq!(confirmed_session.as_deref(), Some(FIRST_SESSION));
     assert_eq!(before_run.status, AgentRunStatus::Running);
     assert_eq!(before_run.launch_gate_state, "released");
     assert_eq!(before_event.status, EventStatus::Dispatched);
@@ -3360,7 +3361,7 @@ async fn research_replacement_daemon_retires_classified_retry_after_terminal_fai
     assert_eq!(after_failure_code.as_deref(), Some("research_output_invalid"));
     assert!(after.response_json.is_none());
     assert_eq!(after_retry_wake, Some(retry_wake));
-    assert_eq!(harness.research_session(), None);
+    assert_eq!(harness.research_session(), confirmed_session);
     assert_eq!(after.attempt, before.attempt);
     assert_eq!(after_run.status, AgentRunStatus::Failed);
     assert!(after_run.finished_at.is_some());
@@ -3505,9 +3506,19 @@ async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_termin
             .find(&claimed.review.review_id)
             .unwrap()
             .state,
-        "retry_wait"
+        "blocked"
     );
-    assert_eq!(retired_event.status, EventStatus::RetryWait);
+    let (_, first_failure_code) = harness.review_retry_metadata(&claimed.review.review_id);
+    assert_eq!(first_failure_code.as_deref(), Some("research_session_unsafe"));
+    assert_eq!(retired_event.status, EventStatus::Failed);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&harness.campaign_id)
+            .unwrap()
+            .blocked_reason
+            .as_deref(),
+        Some("research_session_unsafe")
+    );
     assert!(!private_output.exists());
 
     drop(replacement);
@@ -3584,6 +3595,8 @@ async fn research_replacement_daemon_blocks_unsafe_classified_retry_after_termin
 #[tokio::test]
 async fn research_replacement_daemon_launches_pending_claim_once() {
     let harness = ResearchHarness::new_for_replacement_daemon("restart-pending", FIRST_SESSION);
+    let baseline_reservation_count =
+        harness.campaign_reservation_count(&harness.campaign_id);
     let claimed = harness.initial_review();
     assert_eq!(claimed.review.attempt, 0);
     assert!(claimed.review.agent_run_id.is_none());
@@ -3595,7 +3608,10 @@ async fn research_replacement_daemon_launches_pending_claim_once() {
             .status,
         EventStatus::Pending
     );
-    assert_eq!(harness.campaign_reservation_count(&claimed.review.campaign_id), 0);
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        baseline_reservation_count
+    );
     harness.write_fixture_controls(
         &claimed.review.review_id,
         &claimed.review.experiment_id,
@@ -3675,7 +3691,10 @@ async fn research_replacement_daemon_launches_pending_claim_once() {
     );
     let reservation_id = harness.reservation_id_for(&review);
     assert_eq!(harness.reservation_status(&reservation_id), "consumed");
-    assert_eq!(harness.campaign_reservation_count(&review.campaign_id), 1);
+    assert_eq!(
+        harness.campaign_reservation_count(&review.campaign_id),
+        baseline_reservation_count + 1
+    );
     assert!(AgentRunRepository::new(&harness.db)
         .find_active_by_project(&harness.project.project_id)
         .unwrap()
@@ -3685,6 +3704,8 @@ async fn research_replacement_daemon_launches_pending_claim_once() {
 #[tokio::test]
 async fn research_replacement_daemon_reuses_reservation_without_binding() {
     let harness = ResearchHarness::new_for_replacement_daemon("restart-reservation", FIRST_SESSION);
+    let baseline_reservation_count =
+        harness.campaign_reservation_count(&harness.campaign_id);
     let claimed = harness.initial_review();
     let admitted = harness.reserve_budget_for_attempt(&claimed.review, 1, NOW + 80);
     let prepared = ResearchRepository::new(&harness.db)
@@ -3706,7 +3727,10 @@ async fn research_replacement_daemon_reuses_reservation_without_binding() {
         true,
     );
     assert_eq!(harness.reservation_status(&admitted.reservation_id), "consumed");
-    assert_eq!(harness.campaign_reservation_count(&claimed.review.campaign_id), 1);
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        baseline_reservation_count + 1
+    );
     assert!(prepared.agent_run_id.is_none());
     assert_eq!(prepared.attempt, 1);
     assert_eq!(prepared.state, "pending");
@@ -3776,7 +3800,10 @@ async fn research_replacement_daemon_reuses_reservation_without_binding() {
         "the replacement daemon must reuse the admitted reservation"
     );
     assert_eq!(harness.reservation_status(&admitted.reservation_id), "consumed");
-    assert_eq!(harness.campaign_reservation_count(&review.campaign_id), 1);
+    assert_eq!(
+        harness.campaign_reservation_count(&review.campaign_id),
+        baseline_reservation_count + 1
+    );
     assert_eq!(
         EventRepository::new(&harness.db)
             .find_by_id(claimed.event_id)
