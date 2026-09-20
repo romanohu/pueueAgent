@@ -1215,7 +1215,7 @@ confirm_matches = 1
 "#;
     assert!(body.contains(oom_pattern));
     let body = body.replace(oom_pattern, "");
-    fs::write(config_path, body).unwrap();
+    fs::write(&config_path, body).unwrap();
     let config = config::load(&config_path).unwrap();
     assert_eq!(config.agent.program, "codex");
     assert!(config.check.patterns.is_empty());
