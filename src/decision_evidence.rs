@@ -15,12 +15,14 @@ use crate::{
 };
 
 pub const DECISION_CONTEXT_SCHEMA_VERSION: u8 = 1;
+pub const DECISION_CONTEXT_SCHEMA_VERSION_V2: u8 = 2;
 pub const MAX_DECISION_CONTEXT_BYTES: usize = 128 * 1024;
 pub const MAX_ARTIFACT_HINTS: usize = 64;
 pub const MAX_ARTIFACT_HINT_DEPTH: usize = 4;
 pub const MAX_ARTIFACT_HINT_FIELD_BYTES: usize = 4 * 1024;
 
 const MAX_RECENT_OUTCOMES: usize = 32;
+const MAX_RECENT_RESEARCH_ADVICE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionContextBundle {
@@ -40,6 +42,47 @@ struct StoredDecisionContext {
     budgets: StoredBudgets,
     intervention: StoredIntervention,
     artifact_hints: Vec<StoredArtifactHint>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDecisionContextV2 {
+    schema_version: u8,
+    objective: StoredObjective,
+    source_experiment: StoredSourceExperiment,
+    terminal_observation: StoredTerminalObservation,
+    recent_outcomes: StoredRecentOutcomes,
+    budgets: StoredBudgets,
+    intervention: StoredIntervention,
+    artifact_hints: Vec<StoredArtifactHint>,
+    research: StoredResearchSupplement,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredResearchSupplement {
+    review_id: String,
+    reason: String,
+    next_direction: Option<String>,
+    recent_advice: Vec<StoredResearchAdvice>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredResearchAdvice {
+    evidence_ref: String,
+    review_id: String,
+    attempt: i64,
+    state: String,
+    notes: String,
+}
+
+#[derive(Deserialize)]
+struct StoredSchemaVersion {
+    schema_version: u8,
 }
 
 #[allow(dead_code)]
@@ -164,30 +207,187 @@ pub(crate) fn validate_stored_decision_context(
             "must not contain control characters",
         ));
     }
-    let context: StoredDecisionContext =
-        serde_json::from_value(value).map_err(|source| AppError::Serialization {
-            operation: "validate stored decision context schema",
+    let schema_version: StoredSchemaVersion =
+        serde_json::from_value(value.clone()).map_err(|source| AppError::Serialization {
+            operation: "validate stored decision context schema version",
             source,
         })?;
-    if context.schema_version != DECISION_CONTEXT_SCHEMA_VERSION {
+    let objective_digest = match schema_version.schema_version {
+        DECISION_CONTEXT_SCHEMA_VERSION => {
+            let context: StoredDecisionContext =
+                serde_json::from_value(value).map_err(|source| AppError::Serialization {
+                    operation: "validate stored decision context schema",
+                    source,
+                })?;
+            if context.objective.digest != expected_objective_digest {
+                return Err(validation_error(
+                    "decision_context.objective.digest",
+                    "does not match the immutable campaign objective digest",
+                ));
+            }
+            if context.source_experiment.experiment_id != expected_source_experiment_id {
+                return Err(validation_error(
+                    "decision_context.source_experiment.experiment_id",
+                    "does not match the reserved source experiment",
+                ));
+            }
+            context.objective.digest
+        }
+        DECISION_CONTEXT_SCHEMA_VERSION_V2 => {
+            let context: StoredDecisionContextV2 =
+                serde_json::from_value(value).map_err(|source| AppError::Serialization {
+                    operation: "validate stored decision context schema",
+                    source,
+                })?;
+            validate_research_supplement(&context.research)?;
+            if context.objective.digest != expected_objective_digest {
+                return Err(validation_error(
+                    "decision_context.objective.digest",
+                    "does not match the immutable campaign objective digest",
+                ));
+            }
+            if context.source_experiment.experiment_id != expected_source_experiment_id {
+                return Err(validation_error(
+                    "decision_context.source_experiment.experiment_id",
+                    "does not match the reserved source experiment",
+                ));
+            }
+            context.objective.digest
+        }
+        _ => {
+            return Err(validation_error(
+                "decision_context.schema_version",
+                "does not match the supported schema version",
+            ));
+        }
+    };
+    Ok(objective_digest)
+}
+
+pub(crate) fn decision_context_schema_version(json: &str) -> Result<u8, AppError> {
+    if json.is_empty() || json.len() > MAX_DECISION_CONTEXT_BYTES {
+        return Err(validation_error(
+            "decision_context",
+            "must fit the serialized context limit",
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|source| AppError::Serialization {
+            operation: "parse stored decision context",
+            source,
+        })?;
+    if contains_control_character(&value) {
+        return Err(validation_error(
+            "decision_context",
+            "must not contain control characters",
+        ));
+    }
+    let version: StoredSchemaVersion =
+        serde_json::from_value(value).map_err(|source| AppError::Serialization {
+            operation: "validate stored decision context schema version",
+            source,
+        })?;
+    if !matches!(
+        version.schema_version,
+        DECISION_CONTEXT_SCHEMA_VERSION | DECISION_CONTEXT_SCHEMA_VERSION_V2
+    ) {
         return Err(validation_error(
             "decision_context.schema_version",
             "does not match the supported schema version",
         ));
     }
-    if context.objective.digest != expected_objective_digest {
+    Ok(version.schema_version)
+}
+
+fn validate_research_supplement(
+    research: &StoredResearchSupplement,
+) -> Result<(), AppError> {
+    validate_context_text(
+        "decision_context.research.review_id",
+        &research.review_id,
+        crate::research_protocol::MAX_RESEARCH_ID_BYTES,
+        true,
+    )?;
+    validate_context_text(
+        "decision_context.research.reason",
+        &research.reason,
+        crate::research_protocol::MAX_RESEARCH_REASON_BYTES,
+        false,
+    )?;
+    if let Some(next_direction) = research.next_direction.as_deref() {
+        validate_context_text(
+            "decision_context.research.next_direction",
+            next_direction,
+            crate::research_protocol::MAX_RESEARCH_NEXT_DIRECTION_BYTES,
+            false,
+        )?;
+    }
+    if research.recent_advice.len() > MAX_RECENT_RESEARCH_ADVICE {
         return Err(validation_error(
-            "decision_context.objective.digest",
-            "does not match the immutable campaign objective digest",
+            "decision_context.research.recent_advice",
+            "contains too many research notes",
         ));
     }
-    if context.source_experiment.experiment_id != expected_source_experiment_id {
+    for advice in &research.recent_advice {
+        validate_context_text(
+            "decision_context.research.recent_advice.review_id",
+            &advice.review_id,
+            crate::research_protocol::MAX_RESEARCH_ID_BYTES,
+            true,
+        )?;
+        validate_context_text(
+            "decision_context.research.recent_advice.evidence_ref",
+            &advice.evidence_ref,
+            crate::research_protocol::MAX_RESEARCH_EVIDENCE_REF_BYTES,
+            true,
+        )?;
+        if advice.evidence_ref != format!("research:{}:note", advice.review_id) {
+            return Err(validation_error(
+                "decision_context.research.recent_advice.evidence_ref",
+                "must match the canonical saved-advice reference for its review",
+            ));
+        }
+        if advice.attempt < 0 {
+            return Err(validation_error(
+                "decision_context.research.recent_advice.attempt",
+                "must not be negative",
+            ));
+        }
+        if !matches!(
+            advice.state.as_str(),
+            "pending" | "running" | "ready" | "retry_wait" | "blocked" | "completed"
+        ) {
+            return Err(validation_error(
+                "decision_context.research.recent_advice.state",
+                "is not a supported research review state",
+            ));
+        }
+        validate_context_text(
+            "decision_context.research.recent_advice.notes",
+            &advice.notes,
+            crate::research_protocol::MAX_RESEARCH_NOTES_BYTES,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_context_text(
+    field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+    require_nonempty: bool,
+) -> Result<(), AppError> {
+    if (require_nonempty && value.is_empty())
+        || value.len() > maximum_bytes
+        || value.chars().any(char::is_control)
+    {
         return Err(validation_error(
-            "decision_context.source_experiment.experiment_id",
-            "does not match the reserved source experiment",
+            field,
+            "is empty, oversized, or contains control characters",
         ));
     }
-    Ok(context.objective.digest)
+    Ok(())
 }
 
 fn contains_control_character(value: &serde_json::Value) -> bool {
@@ -577,4 +777,139 @@ fn is_terminal(status: ExperimentStatus) -> bool {
 
 fn validation_error(field: &'static str, message: &'static str) -> AppError {
     AppError::Validation { field, message }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_stored_decision_context;
+    use serde_json::{json, Value};
+
+    fn valid_v2_context() -> Value {
+        json!({
+            "schema_version": 2,
+            "objective": {"text": "Reach the objective", "digest": "objective-digest"},
+            "source_experiment": {
+                "experiment_id": "experiment-1", "proposal_id": "proposal-1",
+                "proposal_kind": "experiment", "status": "succeeded", "attempt": 1,
+                "command_digest": "command-digest", "failure_code": null,
+                "failure_fingerprint": null, "created_at": 100, "updated_at": 103,
+                "finished_at": 103
+            },
+            "terminal_observation": {
+                "task_id": 41, "task_signature": "pueue-task:v1:terminal",
+                "state": "done", "enqueued_at": 100, "started_at": 101,
+                "ended_at": 103, "exit_code": 0
+            },
+            "recent_outcomes": {"proposals": [], "experiments": []},
+            "budgets": {"campaign_state": "active", "next_eligible_at": null,
+                "rolling_usage": {}, "experiment_counts": {}},
+            "intervention": {"pending": []}, "artifact_hints": [],
+            "research": {
+                "review_id": "review-1",
+                "reason": "continue from the confirmed terminal result",
+                "next_direction": "try the lower learning rate",
+                "recent_advice": [{
+                    "evidence_ref": "research:review-1:note",
+                    "review_id": "review-1",
+                    "attempt": 0,
+                    "state": "completed",
+                    "notes": "the loss improved"
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn strict_v2_context_accepts_bounded_research_handoff() {
+        let context = valid_v2_context();
+        let json = serde_json::to_string(&context).unwrap();
+
+        assert_eq!(
+            validate_stored_decision_context(&json, "objective-digest", "experiment-1")
+                .unwrap(),
+            "objective-digest"
+        );
+    }
+
+    #[test]
+    fn strict_v2_context_rejects_untrusted_research_fields_and_bounds() {
+        let mut cases = Vec::new();
+
+        let mut mismatched_ref = valid_v2_context();
+        mismatched_ref["research"]["recent_advice"][0]["evidence_ref"] =
+            json!("research:other-review:note");
+        cases.push(("mismatched evidence reference", mismatched_ref));
+
+        let mut malformed_ref = valid_v2_context();
+        malformed_ref["research"]["recent_advice"][0]["evidence_ref"] = json!("unrelated");
+        cases.push(("malformed evidence reference", malformed_ref));
+
+        let mut omitted_ref = valid_v2_context();
+        omitted_ref["research"]["recent_advice"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence_ref");
+        cases.push(("omitted evidence reference", omitted_ref));
+
+        let mut unknown_top_level = valid_v2_context();
+        unknown_top_level["unknown"] = json!(true);
+        cases.push(("unknown top-level field", unknown_top_level));
+
+        let mut unknown_research = valid_v2_context();
+        unknown_research["research"]["unknown"] = json!(true);
+        cases.push(("unknown research field", unknown_research));
+
+        let mut unknown_advice = valid_v2_context();
+        unknown_advice["research"]["recent_advice"][0]["unknown"] = json!(true);
+        cases.push(("unknown advice field", unknown_advice));
+
+        let mut oversized_review_id = valid_v2_context();
+        oversized_review_id["research"]["review_id"] =
+            json!("r".repeat(crate::research_protocol::MAX_RESEARCH_ID_BYTES + 1));
+        cases.push(("oversized research review id", oversized_review_id));
+
+        let mut oversized_advice_review_id = valid_v2_context();
+        let advice_review_id = "a".repeat(crate::research_protocol::MAX_RESEARCH_ID_BYTES + 1);
+        oversized_advice_review_id["research"]["recent_advice"][0]["review_id"] =
+            json!(&advice_review_id);
+        oversized_advice_review_id["research"]["recent_advice"][0]["evidence_ref"] =
+            json!(format!("research:{advice_review_id}:note"));
+        cases.push((
+            "oversized advice review id",
+            oversized_advice_review_id,
+        ));
+
+        let mut oversized_reason = valid_v2_context();
+        oversized_reason["research"]["reason"] =
+            json!("r".repeat(crate::research_protocol::MAX_RESEARCH_REASON_BYTES + 1));
+        cases.push(("oversized research reason", oversized_reason));
+
+        let mut oversized_direction = valid_v2_context();
+        oversized_direction["research"]["next_direction"] =
+            json!("d".repeat(crate::research_protocol::MAX_RESEARCH_NEXT_DIRECTION_BYTES + 1));
+        cases.push(("oversized next direction", oversized_direction));
+
+        let mut oversized_notes = valid_v2_context();
+        oversized_notes["research"]["recent_advice"][0]["notes"] =
+            json!("n".repeat(crate::research_protocol::MAX_RESEARCH_NOTES_BYTES + 1));
+        cases.push(("oversized advice notes", oversized_notes));
+
+        let mut too_many_notes = valid_v2_context();
+        let advice = too_many_notes["research"]["recent_advice"][0].clone();
+        too_many_notes["research"]["recent_advice"] = Value::Array(
+            std::iter::repeat(advice)
+                .take(super::MAX_RECENT_RESEARCH_ADVICE + 1)
+                .collect(),
+        );
+        cases.push(("too many advice notes", too_many_notes));
+
+        for (label, context) in cases {
+            let json = serde_json::to_string(&context).unwrap();
+            assert!(
+                validate_stored_decision_context(&json, "objective-digest", "experiment-1")
+                    .is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
 }

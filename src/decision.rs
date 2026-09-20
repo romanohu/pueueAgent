@@ -6,7 +6,9 @@ use crate::{
         CampaignRepository, DecisionRepository, DecisionReservation, ExperimentRepository,
         ProjectRepository, ReadyDecision,
     },
-    decision_evidence::{validate_stored_decision_context, DECISION_CONTEXT_SCHEMA_VERSION},
+    decision_evidence::{
+        decision_context_schema_version, validate_stored_decision_context,
+    },
     decision_protocol::{ValidatedDecision, parse_and_validate_decision},
     execution_policy::{CampaignLimits, ResolvedExecutionPolicy},
     models::{
@@ -470,16 +472,17 @@ fn validate_ready_context(
     objective_digest: &str,
     source_experiment_id: &str,
 ) -> Result<(), AppError> {
-    if stored.context_schema_version != Some(i64::from(DECISION_CONTEXT_SCHEMA_VERSION)) {
+    let context_json = stored.context_json.as_deref().ok_or(AppError::Validation {
+        field: "decision_context",
+        message: "must be persisted on the decided attempt",
+    })?;
+    let context_schema_version = decision_context_schema_version(context_json)?;
+    if stored.context_schema_version != Some(i64::from(context_schema_version)) {
         return Err(AppError::Validation {
             field: "decision_context.schema_version",
             message: "does not match the persisted decision attempt schema version",
         });
     }
-    let context_json = stored.context_json.as_deref().ok_or(AppError::Validation {
-        field: "decision_context",
-        message: "must be persisted on the decided attempt",
-    })?;
     let context_digest = stored.context_digest.as_deref().ok_or(AppError::Validation {
         field: "context_digest",
         message: "must be persisted on the decided attempt",

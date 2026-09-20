@@ -3819,7 +3819,7 @@ mod decision_cycle {
             .unwrap()
             .unwrap();
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 192)
             .unwrap();
         EventRepository::new(&harness.db)
             .claim_batch(192, 252, 1)
@@ -3915,7 +3915,7 @@ mod decision_cycle {
             .unwrap()
             .unwrap();
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 192)
             .unwrap();
         EventRepository::new(&harness.db)
             .claim_batch(192, 252, 1)
@@ -4188,7 +4188,7 @@ mod decision_cycle {
         let repository = DecisionRepository::new(&harness.db);
         let (cycle, reservation) = harness.reserved_decision_attempt();
         repository
-            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 192)
             .unwrap();
 
         let requeued = repository
@@ -4269,7 +4269,7 @@ mod decision_cycle {
             .unwrap()
             .unwrap();
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 192)
             .unwrap();
         let budget_key = format!(
             "campaign-decision-attempt:v1:{}:{}",
@@ -4408,7 +4408,7 @@ mod decision_cycle {
             .unwrap()
             .unwrap();
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 192)
             .unwrap();
         EventRepository::new(&harness.db)
             .claim_batch(192, 252, 1)
@@ -4559,7 +4559,7 @@ mod decision_cycle {
 
         for now in [192, 194] {
             decisions
-                .store_evidence(&reservation, "{}", "context-digest", now)
+                .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", now)
                 .unwrap();
             CampaignRepository::new(&harness.db)
                 .reserve_agent_decision(
@@ -4588,7 +4588,7 @@ mod decision_cycle {
         }
 
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 196)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 196)
             .unwrap();
         EventRepository::new(&harness.db)
             .claim_batch(196, 256, 1)
@@ -4656,7 +4656,7 @@ mod decision_cycle {
             .unwrap()
             .unwrap();
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 192)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 192)
             .unwrap();
         harness
             .db
@@ -4975,12 +4975,87 @@ mod decision_context {
     }
 
     #[test]
+    fn decision_v2_evidence_persists_schema_and_validates_strict_shape() {
+        let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
+        let (_cycle, reservation) = harness.reserved_decision_attempt();
+        let campaign = CampaignRepository::new(&harness.db)
+            .find_by_id(&harness.campaign_id)
+            .unwrap()
+            .unwrap();
+        let context = serde_json::json!({
+            "schema_version": 2,
+            "objective": {"text": campaign.objective_text, "digest": campaign.objective_digest},
+            "source_experiment": {
+                "experiment_id": harness.experiment_id, "proposal_id": "proposal-baseline",
+                "proposal_kind": "experiment", "status": "succeeded", "attempt": 1,
+                "command_digest": "command-digest", "failure_code": null,
+                "failure_fingerprint": null, "created_at": 100, "updated_at": 103,
+                "finished_at": 103
+            },
+            "terminal_observation": {
+                "task_id": 41, "task_signature": "pueue-task:v1:decision-fixture",
+                "state": "done", "enqueued_at": 100, "started_at": 101,
+                "ended_at": 103, "exit_code": 0
+            },
+            "recent_outcomes": {"proposals": [], "experiments": []},
+            "budgets": {"campaign_state": "active", "next_eligible_at": null,
+                "rolling_usage": {}, "experiment_counts": {}},
+            "intervention": {"pending": []}, "artifact_hints": [],
+            "research": {
+                "review_id": "review-1",
+                "reason": "confirmed research stop",
+                "next_direction": "try the lower learning rate",
+                "recent_advice": [{
+                    "evidence_ref": "research:review-1:note",
+                    "review_id": "review-1",
+                    "attempt": 0,
+                    "state": "completed",
+                    "notes": "the loss improved"
+                }]
+            }
+        });
+        let context_json = serde_json::to_string(&context).unwrap();
+        let context_digest = format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(context_json.as_bytes())
+        );
+        let repository = DecisionRepository::new(&harness.db);
+        repository
+            .store_evidence(&reservation, &context_json, &context_digest, 201)
+            .unwrap();
+
+        let stored_schema: i64 = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT context_schema_version FROM decision_attempts
+                 WHERE cycle_id = ?1 AND attempt_number = ?2",
+                params![reservation.cycle_id, reservation.attempt_number],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_schema, 2);
+        assert_eq!(
+            repository
+                .validate_launch_context(
+                    &harness.project_id,
+                    &reservation,
+                    &context_json,
+                    &context_digest,
+                )
+                .unwrap(),
+            context["objective"]["digest"].as_str().unwrap()
+        );
+    }
+
+    #[test]
     fn conflicting_decision_bind_does_not_change_the_existing_attempt_owner() {
         let harness = CampaignDbHarness::with_terminal_experiment(ExperimentStatus::Succeeded);
         let (_cycle, reservation) = harness.reserved_decision_attempt();
         let decisions = DecisionRepository::new(&harness.db);
         decisions
-            .store_evidence(&reservation, "{}", "context-digest", 200)
+            .store_evidence(&reservation, r#"{"schema_version":1}"#, "context-digest", 200)
             .unwrap();
         let events = EventRepository::new(&harness.db);
         let first_event = events

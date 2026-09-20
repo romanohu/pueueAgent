@@ -2,7 +2,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use sha2::{Digest, Sha256};
 
 use crate::{
-    decision_evidence::{validate_stored_decision_context, DECISION_CONTEXT_SCHEMA_VERSION},
+    decision_evidence::{
+        decision_context_schema_version, validate_stored_decision_context,
+    },
     diagnostics::MAX_EVENT_LIST_LIMIT,
     execution_policy::CampaignLimits,
     models::{
@@ -170,9 +172,9 @@ impl<'db> DecisionRepository<'db> {
             &reservation.cycle_id,
             reservation.attempt_number,
         )?;
+        let context_schema_version = decision_context_schema_version(context_json)?;
         if attempt.state != DecisionAttemptState::EvidenceReady
-            || attempt.context_schema_version
-                != Some(i64::from(DECISION_CONTEXT_SCHEMA_VERSION))
+            || attempt.context_schema_version != Some(i64::from(context_schema_version))
             || attempt.context_json.as_deref() != Some(context_json)
             || attempt.context_digest.as_deref() != Some(context_digest)
         {
@@ -780,13 +782,14 @@ impl<'db> DecisionRepository<'db> {
         validate_active_authority(&authority, None)?;
         validate_payload("context_json", context_json)?;
         validate_token("context_digest", context_digest, MAX_DECISION_DIGEST_BYTES)?;
+        let context_schema_version = decision_context_schema_version(context_json)?;
         let attempt = read_attempt(
             &transaction,
             &reservation.cycle_id,
             reservation.attempt_number,
         )?;
         if attempt.state == DecisionAttemptState::EvidenceReady
-            && attempt.context_schema_version == Some(1)
+            && attempt.context_schema_version == Some(i64::from(context_schema_version))
             && attempt.context_json.as_deref() == Some(context_json)
             && attempt.context_digest.as_deref() == Some(context_digest)
         {
@@ -804,10 +807,11 @@ impl<'db> DecisionRepository<'db> {
         transaction
             .execute(
                 "UPDATE decision_attempts
-                 SET state = 'evidence_ready', context_schema_version = 1,
-                     context_json = ?1, context_digest = ?2
-                 WHERE cycle_id = ?3 AND attempt_number = ?4 AND state = 'reserved'",
+                 SET state = 'evidence_ready', context_schema_version = ?1,
+                     context_json = ?2, context_digest = ?3
+                 WHERE cycle_id = ?4 AND attempt_number = ?5 AND state = 'reserved'",
                 params![
+                    i64::from(context_schema_version),
                     context_json,
                     context_digest,
                     reservation.cycle_id,
