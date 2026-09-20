@@ -2311,7 +2311,15 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
 
     fs::remove_dir_all(overflow_subtree).unwrap();
     let released_report = Box::pin(first_daemon.run_once()).await.unwrap();
-    assert_eq!(released_report.research_started, 1);
+    assert_eq!(
+        released_report.research_started,
+        1,
+        "research retry was not admitted after cleanup release: started={} deferred={} blocked={}; {}",
+        released_report.research_started,
+        released_report.research_deferred,
+        released_report.research_blocked,
+        research_retry_diagnostic(&harness.db, &review.review_id)
+    );
     assert_eq!(research_run_count(), research_run_count_before + 1);
     assert_eq!(reservation_count(), reservation_count_before + 1);
 
@@ -2477,6 +2485,116 @@ fn research_crash_snapshot(db: &Db, review_id: &str) -> ResearchCrashSnapshot {
         gate_state: run_details.map(|details| details.2),
         cleanup_phase,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn research_retry_diagnostic(db: &Db, review_id: &str) -> String {
+    let connection = db.connect().unwrap();
+    let row: (
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        i64,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT review.state, review.attempt, review.agent_run_id,
+                    review.failure_code, review.not_before,
+                    review.event_id, event.status, event.not_before,
+                    run.status, run.launch_gate_state, run.pid,
+                    run.execution_kind,
+                    state.session_generation, state.session_id,
+                    json_extract(review.notes_json, '$.native_recovery.cleanup.completed_at'),
+                    json_extract(review.notes_json, '$.native_recovery.cleanup.phase')
+             FROM research_reviews AS review
+             JOIN events AS event ON event.event_id = review.event_id
+             LEFT JOIN agent_runs AS run ON run.run_id = review.agent_run_id
+             LEFT JOIN campaign_research AS state
+               ON state.campaign_id = review.campaign_id
+             WHERE review.review_id = ?1",
+            [review_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                ))
+            },
+        )
+        .unwrap();
+    let retry_owner_ready = ResearchRepository::new(db)
+        .retry_owner_ready(review_id)
+        .map(|ready| ready.to_string())
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let evidence = ResearchRepository::new(db)
+        .find(review_id)
+        .and_then(|review| build_research_evidence(db, &review, row.4.unwrap_or(0)))
+        .map(|_| "ok".to_owned())
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let unbound_or_incomplete_top_level_projects = connection
+        .prepare(
+            "SELECT DISTINCT owner.project_id
+             FROM agent_runs AS owner
+             LEFT JOIN research_reviews AS bound_review
+               ON bound_review.agent_run_id = owner.run_id
+             WHERE owner.execution_kind = 'campaign_research'
+               AND (
+                   bound_review.review_id IS NULL
+                   OR json_extract(bound_review.notes_json, '$.native_recovery.cleanup.phase') IS NULL
+                   OR json_extract(bound_review.notes_json, '$.native_recovery.cleanup.phase') <> 'complete'
+               )
+             ORDER BY owner.project_id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut diagnostic = format!(
+        "review state={} attempt={} run={:?} failure={:?} wake={:?} event={} event_status={} event_wake={:?}; run_status={:?} gate={:?} pid={:?} kind={:?} cleanup_at={:?}; session_gen={:?} session={:?} cleanup_phase={:?}; unbound_or_incomplete_top_level_projects={unbound_or_incomplete_top_level_projects:?}; retry_owner_ready={retry_owner_ready}; evidence={evidence}",
+        row.0,
+        row.1,
+        row.2,
+        row.3,
+        row.4,
+        row.5,
+        row.6,
+        row.7,
+        row.8,
+        row.9,
+        row.10,
+        row.11,
+        row.14,
+        row.12,
+        row.13,
+        row.15,
+    );
+    diagnostic.truncate(2_000);
+    diagnostic
 }
 
 #[cfg(target_os = "linux")]
@@ -3700,7 +3818,15 @@ async fn research_controller_crash_restarts_only_after_group_quiescence() {
     assert_eq!(before_retry.review_state, "retry_wait");
     assert_eq!(before_retry.event_status, "retry_wait");
     let retry_report = retry_daemon.run_once().await.unwrap();
-    assert_eq!(retry_report.research_started, 1);
+    assert_eq!(
+        retry_report.research_started,
+        1,
+        "research retry was not admitted after native group quiescence: started={} deferred={} blocked={}; {}",
+        retry_report.research_started,
+        retry_report.research_deferred,
+        retry_report.research_blocked,
+        research_retry_diagnostic(&harness.db, &review.review_id)
+    );
     let after_retry = research_crash_snapshot(&harness.db, &review.review_id);
     assert_eq!(after_retry.run_count, before_retry.run_count + 1);
     assert_eq!(
