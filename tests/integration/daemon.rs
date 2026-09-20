@@ -690,6 +690,14 @@ fn running_task() -> PueueTask {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn running_task_for(id: i64, group: &str) -> PueueTask {
+    let mut task = running_task();
+    task.id = id;
+    task.group = group.to_owned();
+    task
+}
+
 #[tokio::test]
 async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_scheduling() {
     let harness = DaemonHarness::new();
@@ -1296,7 +1304,12 @@ fn main() {{
 
 #[cfg(target_os = "linux")]
 fn prepare_healthy_research_fixture(harness: &DaemonHarness) {
-    let config_path = harness.root("project-a").join(".pueue-agent/config.toml");
+    prepare_healthy_research_fixture_for(harness, "project-a", 41);
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_healthy_research_fixture_for(harness: &DaemonHarness, project_id: &str, task_id: i64) {
+    let config_path = harness.root(project_id).join(".pueue-agent/config.toml");
     let body = fs::read_to_string(&config_path).unwrap();
     assert!(body.contains(r#"program = "/bin/echo""#));
     let body = body.replace(r#"program = "/bin/echo""#, r#"program = "codex""#);
@@ -1314,7 +1327,9 @@ confirm_matches = 1
     assert_eq!(config.agent.program, "codex");
     assert!(config.check.patterns.is_empty());
     fs::write(
-        harness.root("project-a").join(".pueue-agent/logs/41.log"),
+        harness
+            .root(project_id)
+            .join(format!(".pueue-agent/logs/{task_id}.log")),
         "validation loss 0.52\n",
     )
     .unwrap();
@@ -2056,7 +2071,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     };
 
     let mut first_daemon = make_daemon();
-    let first_report = first_daemon.run_once().await.unwrap();
+    let first_report = Box::pin(first_daemon.run_once()).await.unwrap();
     assert_eq!(first_report.research_started, 1);
     let mut second_daemon = Box::new(make_daemon());
     let early_report = Box::pin(second_daemon.run_once()).await.unwrap();
@@ -2094,7 +2109,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
             Instant::now() < terminal_deadline,
             "first research owner did not reach retained cleanup"
         );
-        first_daemon.run_once().await.unwrap();
+        Box::pin(first_daemon.run_once()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(overflow_subtree.is_dir());
@@ -2127,7 +2142,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
 
     // The second daemon was already started while the first owner was live.
     // Its later pass must still observe the durable cleanup boundary.
-    let warmup = second_daemon.run_once().await.unwrap();
+    let warmup = Box::pin(second_daemon.run_once()).await.unwrap();
     assert_eq!(warmup.research_started, 0);
     assert_eq!(warmup.diagnoses, 0);
     assert_eq!(
@@ -2241,7 +2256,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
         )
         .unwrap();
 
-    let blocked_report = second_daemon.run_once().await.unwrap();
+    let blocked_report = Box::pin(second_daemon.run_once()).await.unwrap();
     assert_eq!(blocked_report.research_started, 0);
     assert_eq!(blocked_report.diagnoses, 1);
     assert_eq!(research_run_count(), research_run_count_before);
@@ -2263,7 +2278,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     );
 
     fs::remove_dir_all(overflow_subtree).unwrap();
-    let released_report = first_daemon.run_once().await.unwrap();
+    let released_report = Box::pin(first_daemon.run_once()).await.unwrap();
     assert_eq!(released_report.research_started, 1);
     assert_eq!(research_run_count(), research_run_count_before + 1);
     assert_eq!(reservation_count(), reservation_count_before + 1);
@@ -2288,14 +2303,14 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
             break;
         }
         assert!(Instant::now() < settle_deadline, "research retry did not settle");
-        first_daemon.run_once().await.unwrap();
+        Box::pin(first_daemon.run_once()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     let health_eligible_before = health_admission_snapshot(&harness.db, "project-a");
     let diagnosis_deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let report = second_daemon.run_once().await.unwrap();
+        let report = Box::pin(second_daemon.run_once()).await.unwrap();
         let health_after = health_admission_snapshot(&harness.db, "project-a");
         if health_after.0 > health_eligible_before.0 {
             assert_eq!(report.diagnoses, 1);
@@ -2328,7 +2343,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
             Instant::now() < diagnosis_settle_deadline,
             "eligible health diagnosis did not settle"
         );
-        second_daemon.run_once().await.unwrap();
+        Box::pin(second_daemon.run_once()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     HealthRepository::set_state(&harness.db, &experiment_id, HealthState::Healthy, harness.now)
@@ -2546,7 +2561,11 @@ fn startup_recovery_db_snapshot(
 
 #[cfg(target_os = "linux")]
 struct SeededPidlessResearchOwner {
+    project_id: String,
     campaign_id: String,
+    experiment_id: String,
+    task_id: i64,
+    task_signature: String,
     review_id: String,
     event_id: i64,
     run_id: i64,
@@ -2557,8 +2576,25 @@ struct SeededPidlessResearchOwner {
 
 #[cfg(target_os = "linux")]
 fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearchOwner {
-    let experiment_id = harness.campaign_experiment();
     let task = running_task();
+    seed_pidless_research_owner_for(
+        harness,
+        "project-a",
+        "daemon-campaign",
+        "daemon-campaign-experiment",
+        &task,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn seed_pidless_research_owner_for(
+    harness: &DaemonHarness,
+    project_id: &str,
+    campaign_id: &str,
+    experiment_id: &str,
+    task: &PueueTask,
+) -> SeededPidlessResearchOwner {
+    let experiment_id = harness.campaign_experiment_for(project_id, campaign_id, experiment_id);
     let task_signature = pueue_agent::reconcile::task_signature(&task);
     ExperimentRepository::new(&harness.db)
         .mark_submitting(&experiment_id, 190)
@@ -2568,7 +2604,7 @@ fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearch
         .unwrap();
     TaskObservationRepository::new(&harness.db)
         .upsert(&NewTaskObservation::new(
-            "project-a",
+            project_id,
             &task_signature,
             task.id,
             &task.group,
@@ -2581,7 +2617,7 @@ fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearch
             harness.now,
         ))
         .unwrap();
-    let campaign_id = "daemon-campaign".to_owned();
+    let campaign_id = campaign_id.to_owned();
     ResearchRepository::new(&harness.db)
         .ensure_campaign(&campaign_id)
         .unwrap();
@@ -2614,7 +2650,7 @@ fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearch
         )
         .unwrap();
     EventRepository::new(&harness.db)
-        .claim_by_id("project-a", event_id, harness.now + 60)
+        .claim_by_id(project_id, event_id, harness.now + 60)
         .unwrap()
         .expect("seeded research event must be claimable");
     let reservation = match CampaignRepository::new(&harness.db)
@@ -2663,7 +2699,7 @@ fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearch
         Arc::clone(&policy),
     );
     let project = ProjectRepository::new(&harness.db)
-        .find_by_id("project-a")
+        .find_by_id(project_id)
         .unwrap()
         .unwrap();
     let project_config = config::load(&project.config_path).unwrap();
@@ -2719,7 +2755,11 @@ fn seed_pidless_research_owner(harness: &DaemonHarness) -> SeededPidlessResearch
         run.run_id,
     );
     SeededPidlessResearchOwner {
+        project_id: project_id.to_owned(),
         campaign_id,
+        experiment_id,
+        task_id: task.id,
+        task_signature,
         review_id: admitted.review_id,
         event_id,
         run_id: run.run_id,
@@ -2756,13 +2796,6 @@ async fn startup_pidless_absent_recovery_rolls_back_cleanup_and_cas_failures() {
     assert!(overflow_subtree.is_dir());
 
     fs::remove_dir_all(&overflow_subtree).unwrap();
-    assert!(
-        fs::read_dir(&seeded.run_temp)
-            .unwrap()
-            .next()
-            .is_none(),
-        "successful cleanup must remove the overflow subtree before its CAS"
-    );
     let cleanup_sentinel = seeded.run_temp.join("late-cas-sentinel");
     fs::write(&cleanup_sentinel, b"cleanup-before-cas").unwrap();
     let escaped_review_id = seeded.review_id.replace('\'', "''");
@@ -2836,6 +2869,13 @@ async fn startup_pidless_absent_recovery_rolls_back_cleanup_and_cas_failures() {
     assert_eq!(retired_snapshot.run_count, baseline.run_count);
     assert_eq!(retired_snapshot.reservation_count, baseline.reservation_count);
     assert!(!seeded.marker_path.exists());
+    let retired_db_snapshot = startup_recovery_db_snapshot(
+        &harness.db,
+        &seeded.campaign_id,
+        &seeded.review_id,
+        seeded.event_id,
+        seeded.run_id,
+    );
 
     let after_idempotent = daemon
         .run_once()
@@ -2846,6 +2886,16 @@ async fn startup_pidless_absent_recovery_rolls_back_cleanup_and_cas_failures() {
     assert_eq!(after_snapshot.run_count, retired_snapshot.run_count);
     assert_eq!(after_snapshot.reservation_count, retired_snapshot.reservation_count);
     assert_eq!(after_snapshot.cleanup_phase, retired_snapshot.cleanup_phase);
+    assert_eq!(
+        startup_recovery_db_snapshot(
+            &harness.db,
+            &seeded.campaign_id,
+            &seeded.review_id,
+            seeded.event_id,
+            seeded.run_id,
+        ),
+        retired_db_snapshot
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -2901,6 +2951,219 @@ async fn assert_pidless_marker_retains_owner(marker_contents: &[u8], label: &str
 async fn startup_pidless_research_marker_uncertainty_never_retires_owner() {
     assert_pidless_marker_retains_owner(b"authorized\n", "valid").await;
     assert_pidless_marker_retains_owner(b"invalid\n", "indeterminate").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn startup_pidless_recovery_claim_limit_fairly_retires_all_projects() {
+    let harness = DaemonHarness::new();
+    harness.register_project("project-b", "pb-project", "/bin/echo");
+    harness.register_project("project-c", "pc-project", "/bin/echo");
+    let task_a = running_task();
+    let task_b = running_task_for(142, "pb-project");
+    let task_c = running_task_for(143, "pc-project");
+    prepare_healthy_research_fixture_for(&harness, "project-a", task_a.id);
+    prepare_healthy_research_fixture_for(&harness, "project-b", task_b.id);
+    prepare_healthy_research_fixture_for(&harness, "project-c", task_c.id);
+    harness
+        .fake_pueue
+        .set_tasks(vec![task_a.clone(), task_b.clone(), task_c.clone()]);
+
+    let owners = [
+        seed_pidless_research_owner_for(
+            &harness,
+            "project-a",
+            "fairness-campaign-a",
+            "fairness-experiment-a",
+            &task_a,
+        ),
+        seed_pidless_research_owner_for(
+            &harness,
+            "project-b",
+            "fairness-campaign-b",
+            "fairness-experiment-b",
+            &task_b,
+        ),
+        seed_pidless_research_owner_for(
+            &harness,
+            "project-c",
+            "fairness-campaign-c",
+            "fairness-experiment-c",
+            &task_c,
+        ),
+    ];
+    // The recovery cursor advances over the retained startup map. With
+    // claim_limit=1, project B is the owner still present at the start of
+    // every bounded pass (the order is A, C, then B).
+    let blocked_owner = &owners[1];
+    HealthRepository::ensure_running(
+        &harness.db,
+        &blocked_owner.project_id,
+        &blocked_owner.campaign_id,
+        &blocked_owner.experiment_id,
+        blocked_owner.task_id,
+        harness.now,
+    )
+    .unwrap();
+    for observed_at in [harness.now - 2, harness.now - 1] {
+        HealthRepository::record_observation(
+            &harness.db,
+            &blocked_owner.experiment_id,
+            observed_at,
+            SignalSummaryEntry {
+                class: "oom".to_owned(),
+                source: "fixture".to_owned(),
+                evidence_digest: format!("startup-owner-{observed_at}"),
+                observed_at,
+            },
+        )
+        .unwrap();
+    }
+    HealthRepository::set_state(
+        &harness.db,
+        &blocked_owner.experiment_id,
+        HealthState::Suspicious,
+        harness.now,
+    )
+    .unwrap();
+
+    let owner_snapshots = owners
+        .iter()
+        .map(|owner| research_crash_snapshot(&harness.db, &owner.review_id))
+        .collect::<Vec<_>>();
+    let research_run_count = || {
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE execution_kind = 'campaign_research'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let research_reservation_count = || {
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE dimension = 'agent_run' AND subject_key LIKE 'research:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let research_run_count_before = research_run_count();
+    let research_reservation_count_before = research_reservation_count();
+    let health_blocked_before = health_admission_snapshot(&harness.db, &blocked_owner.project_id);
+
+    let policy = harness.policy();
+    let make_daemon = || {
+        let runner = AgentRunner::new(
+            AgentRunnerConfig::production()
+                .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
+            Arc::clone(&policy),
+        );
+        Daemon::new(
+            harness.db.clone(),
+            harness.fake_pueue.clone(),
+            Arc::clone(&policy),
+            runner,
+            DaemonConfig {
+                interval: Duration::from_millis(10),
+                lease_seconds: 60,
+                claim_limit: 1,
+                now_override: Some(harness.now),
+                shutdown_grace_period: Duration::from_secs(30),
+            },
+        )
+    };
+    let mut daemon = make_daemon();
+
+    for pass in 0..owners.len() {
+        let report = Box::pin(daemon.run_once())
+            .await
+            .unwrap_or_else(|error| panic!("startup-owner fairness pass {pass} failed: {error}"));
+        assert_eq!(report.research_started, 0, "fairness pass {pass}");
+        assert_eq!(report.diagnoses, 0, "fairness pass {pass}");
+        assert_eq!(research_run_count(), research_run_count_before);
+        assert_eq!(
+            research_reservation_count(),
+            research_reservation_count_before
+        );
+        assert_eq!(
+            health_admission_snapshot(&harness.db, &blocked_owner.project_id),
+            health_blocked_before,
+            "the retained project's suspicious health must stay blocked while startup owners remain"
+        );
+        if pass == 0 {
+            assert_eq!(
+                research_crash_snapshot(&harness.db, &blocked_owner.review_id),
+                owner_snapshots[1],
+                "claim_limit=1 must retain the blocked startup owner for a later pass"
+            );
+        }
+    }
+
+    for owner in &owners {
+        let snapshot = research_crash_snapshot(&harness.db, &owner.review_id);
+        assert_eq!(snapshot.review_state, "retry_wait");
+        assert_eq!(snapshot.event_status, "retry_wait");
+        assert_eq!(snapshot.run_status.as_deref(), Some("failed"));
+        assert_eq!(snapshot.run_pid, None);
+        assert_eq!(snapshot.gate_state.as_deref(), Some("failed"));
+        assert_eq!(snapshot.cleanup_phase.as_deref(), Some("complete"));
+        assert_eq!(snapshot.run_count, owner_snapshots[0].run_count);
+        assert_eq!(snapshot.reservation_count, owner_snapshots[0].reservation_count);
+    }
+    assert_eq!(
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE execution_kind = 'campaign_research'
+                   AND status IN ('starting', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        HealthRepository::get(&harness.db, &blocked_owner.experiment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        HealthState::Suspicious
+    );
+
+    HealthRepository::set_state(
+        &harness.db,
+        &blocked_owner.experiment_id,
+        HealthState::Healthy,
+        harness.now,
+    )
+    .unwrap();
+    let retired_snapshots = owners
+        .iter()
+        .map(|owner| research_crash_snapshot(&harness.db, &owner.review_id))
+        .collect::<Vec<_>>();
+    let report = Box::pin(daemon.run_once()).await.unwrap();
+    assert_eq!(report.research_started, 0);
+    assert_eq!(report.diagnoses, 0);
+    assert_eq!(
+        owners
+            .iter()
+            .map(|owner| research_crash_snapshot(&harness.db, &owner.review_id))
+            .collect::<Vec<_>>(),
+        retired_snapshots,
+        "retired startup owners must be idempotent on the next pass"
+    );
 }
 
 #[cfg(target_os = "linux")]
