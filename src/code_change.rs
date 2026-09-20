@@ -42,10 +42,8 @@ use crate::{
     models::{
         AgentContextMode, AgentRunStatus, CampaignState, CodeChangeCheck, CodeChangeCheckStatus,
         CodeChangeRun, CodeChangeState, EventKind, EventStatus, NewEvent, ExperimentStatus,
-        TaskObservation,
     },
-    pueue::PueueTask,
-    reconcile::{managed_task_run_signature, parse_timestamp, task_signature},
+    reconcile::managed_task_run_signature_for_observation,
     retry::RetryPolicy,
     output::bounded_redacted_text,
 };
@@ -5128,7 +5126,7 @@ impl WorktreeManager {
             {
                 return Err(recovery_required());
             }
-            let managed_identity = cleanup_task_observation_managed_identity(
+            let managed_identity = managed_task_run_signature_for_observation(
                 observation,
                 &self.project.pueue_group,
             )
@@ -8259,58 +8257,6 @@ fn recovery_required() -> AppError {
     AppError::Runtime {
         operation: "recover code-change ownership",
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct CleanupTaskSignature {
-    group: String,
-    id: i64,
-    enqueued_at: Option<String>,
-    started_at: Option<String>,
-    ended_at: Option<String>,
-    state: String,
-}
-
-fn cleanup_task_timestamp_matches(raw: &Option<String>, stored: Option<i64>) -> bool {
-    match (raw.as_deref(), stored) {
-        (None, None) => true,
-        (Some(raw), Some(stored)) => parse_timestamp(raw) == Some(stored),
-        _ => false,
-    }
-}
-
-fn cleanup_task_observation_managed_identity(
-    observation: &TaskObservation,
-    expected_group: &str,
-) -> Option<String> {
-    if observation.command.len() != 1 || observation.pueue_group != expected_group {
-        return None;
-    }
-    let encoded = observation.task_signature.strip_prefix("pueue-task:v1:")?;
-    let identity = serde_json::from_str::<CleanupTaskSignature>(encoded).ok()?;
-    if identity.group != observation.pueue_group
-        || identity.id != observation.pueue_task_id
-        || !cleanup_task_timestamp_matches(&identity.enqueued_at, observation.enqueued_at)
-        || !cleanup_task_timestamp_matches(&identity.started_at, observation.started_at)
-        || !cleanup_task_timestamp_matches(&identity.ended_at, observation.ended_at)
-        || identity.state != observation.state
-    {
-        return None;
-    }
-    let task = PueueTask {
-        id: identity.id,
-        group: identity.group,
-        command: observation.command[0].clone(),
-        state: identity.state,
-        enqueued_at: identity.enqueued_at,
-        started_at: identity.started_at,
-        ended_at: identity.ended_at,
-        result: None,
-    };
-    if task_signature(&task) != observation.task_signature {
-        return None;
-    }
-    managed_task_run_signature(&task)
 }
 
 fn is_terminal_experiment_status(status: ExperimentStatus) -> bool {

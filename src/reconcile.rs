@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, ffi::OsString, path::Path, sync::Arc, time::SystemTime};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -24,7 +25,7 @@ use crate::{
     incidents::IncidentStore,
     models::{
         EventKind, Experiment, ExperimentStatus, ExperimentTerminalOutcome, NewEvent,
-        NewTaskObservation, Submission, SubmissionStatus,
+        NewTaskObservation, Submission, SubmissionStatus, TaskObservation,
     },
     project_logs::ProjectRootLogReader,
     pueue::{PueueApi, PueueTask},
@@ -633,6 +634,65 @@ pub fn managed_task_run_signature(task: &PueueTask) -> Option<TaskSignature> {
             serde_json::to_vec(&identity).expect("managed task identity JSON is serializable")
         )
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservedTaskSignature {
+    group: String,
+    id: i64,
+    enqueued_at: Option<String>,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+    state: String,
+}
+
+fn observed_task_timestamp_matches(raw: &Option<String>, stored: Option<i64>) -> bool {
+    match (raw.as_deref(), stored) {
+        (None, None) => true,
+        (Some(raw), Some(stored)) => parse_timestamp(raw) == Some(stored),
+        _ => false,
+    }
+}
+
+/// Derive the bounded managed run identity from a raw lifecycle observation.
+///
+/// Task observations intentionally retain the raw `pueue-task:v1` snapshot for
+/// lifecycle consumers.  Research lineage uses the separate bounded managed
+/// identity, so every field that feeds that identity is checked against the raw
+/// snapshot before it is derived.
+pub(crate) fn managed_task_run_signature_for_observation(
+    observation: &TaskObservation,
+    expected_group: &str,
+) -> Option<TaskSignature> {
+    if observation.command.len() != 1 || observation.pueue_group != expected_group {
+        return None;
+    }
+    let encoded = observation.task_signature.strip_prefix("pueue-task:v1:")?;
+    let identity = serde_json::from_str::<ObservedTaskSignature>(encoded).ok()?;
+    if identity.group != observation.pueue_group
+        || identity.id != observation.pueue_task_id
+        || identity.state != observation.state
+        || !observed_task_timestamp_matches(&identity.enqueued_at, observation.enqueued_at)
+        || !observed_task_timestamp_matches(&identity.started_at, observation.started_at)
+        || !observed_task_timestamp_matches(&identity.ended_at, observation.ended_at)
+    {
+        return None;
+    }
+    let task = PueueTask {
+        id: identity.id,
+        group: identity.group,
+        command: observation.command[0].clone(),
+        state: identity.state,
+        enqueued_at: identity.enqueued_at,
+        started_at: identity.started_at,
+        ended_at: identity.ended_at,
+        result: None,
+    };
+    if task_signature(&task) != observation.task_signature {
+        return None;
+    }
+    managed_task_run_signature(&task)
 }
 
 fn failure_fingerprint(task: &PueueTask, failure_code: &str) -> String {

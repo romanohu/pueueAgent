@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rusqlite::params;
+use rusqlite::{params, types::Type, Row};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +19,7 @@ use crate::{
     },
     output::{bounded_redacted_text, redact_sensitive_text},
     project_logs::{inspect_agent_log_dir, ProjectRootLogReader},
+    reconcile::managed_task_run_signature_for_observation,
     AppError,
 };
 
@@ -100,18 +101,13 @@ pub fn build_research_evidence(
         ));
     }
 
-    let observation = TaskObservationRepository::new(db)
-        .find(&project.project_id, &review.task_signature)?
-        .ok_or_else(|| validation_error("task_signature", "has no persisted observation"))?;
-    if observation.pueue_task_id != task_id
-        || observation.pueue_group != project.pueue_group
-        || !observation.state.eq_ignore_ascii_case("running")
-    {
-        return Err(validation_error(
-            "task_signature",
-            "does not identify the persisted running task",
-        ));
-    }
+    let observation = current_managed_running_observation(
+        db,
+        &project.project_id,
+        &project.pueue_group,
+        task_id,
+        &review.task_signature,
+    )?;
 
     let root_anchor = ProjectRootAnchor::resolve(&project.root_path)?;
     if root_anchor.canonical_path != project.root_path {
@@ -130,7 +126,11 @@ pub fn build_research_evidence(
         .len()
         .saturating_sub(MAX_RESEARCH_ARTIFACT_HINTS);
     let artifact_hints_complete = artifact_hints_omitted_at_least == 0;
-    let (running, running_omitted) = running_observations(db, &project.project_id)?;
+    let (running, running_omitted) = running_observations(
+        db,
+        &project.project_id,
+        &project.pueue_group,
+    )?;
     let target_proposal = ProposalRepository::new(db)
         .find_for_campaign(&campaign.campaign_id, &target.proposal_id)?
         .ok_or_else(|| validation_error("proposal_id", "does not identify the target proposal"))?;
@@ -161,6 +161,7 @@ pub fn build_research_evidence(
         &target_proposal,
         target_metric.as_ref(),
         &observation,
+        &review.task_signature,
         now,
     )?;
     let review_value = json!({
@@ -353,93 +354,169 @@ fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), App
         .map(|values| (values, omitted))
 }
 
-fn running_observations(db: &Db, project_id: &str) -> Result<(Vec<Value>, usize), AppError> {
+fn current_managed_running_observation(
+    db: &Db,
+    project_id: &str,
+    expected_group: &str,
+    task_id: i64,
+    expected_signature: &str,
+) -> Result<TaskObservation, AppError> {
+    let observations = TaskObservationRepository::new(db).find_by_pueue_task(
+        project_id,
+        task_id,
+        2,
+    )?;
+    let latest_at = observations
+        .first()
+        .map(|observation| observation.observed_at)
+        .ok_or_else(|| validation_error("task_signature", "has no persisted observation"))?;
+    let current = observations
+        .into_iter()
+        .filter(|observation| observation.observed_at == latest_at)
+        .collect::<Vec<_>>();
+    if current.len() != 1 {
+        return Err(validation_error(
+            "task_signature",
+            "has ambiguous current task observations",
+        ));
+    }
+    let observation = current.into_iter().next().expect("checked one observation");
+    if observation.pueue_task_id != task_id
+        || observation.pueue_group != expected_group
+        || !observation.state.eq_ignore_ascii_case("running")
+        || managed_task_run_signature_for_observation(&observation, expected_group).as_deref()
+            != Some(expected_signature)
+    {
+        return Err(validation_error(
+            "task_signature",
+            "does not identify the persisted running task",
+        ));
+    }
+    Ok(observation)
+}
+
+fn task_observation_from_evidence_row(row: &Row<'_>) -> rusqlite::Result<TaskObservation> {
+    let command_json: String = row.get(3)?;
+    let command = serde_json::from_str(&command_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(source))
+    })?;
+    Ok(TaskObservation {
+        project_id: row.get(0)?,
+        task_signature: row.get(1)?,
+        pueue_task_id: row.get(2)?,
+        pueue_group: row.get(4)?,
+        command,
+        state: row.get(5)?,
+        enqueued_at: row.get(6)?,
+        started_at: row.get(7)?,
+        ended_at: row.get(8)?,
+        result: row.get(9)?,
+        observed_at: row.get(10)?,
+    })
+}
+
+fn running_observations(
+    db: &Db,
+    project_id: &str,
+    expected_group: &str,
+) -> Result<(Vec<Value>, usize), AppError> {
     let mut connection = db.connect()?;
     let transaction = connection.transaction().map_err(database_error(
         "begin research running observations snapshot",
     ))?;
     let count: i64 = transaction
         .query_row(
-            "SELECT COUNT(*) FROM task_observations
-             WHERE project_id = ?1 AND lower(state) = 'running'",
-            [project_id],
+            "SELECT COUNT(*) FROM task_observations AS observation
+             WHERE observation.project_id = ?1
+               AND observation.pueue_group = ?2
+               AND lower(observation.state) = 'running'
+               AND observation.observed_at = (
+                   SELECT MAX(current.observed_at)
+                   FROM task_observations AS current
+                   WHERE current.project_id = observation.project_id
+                     AND current.pueue_task_id = observation.pueue_task_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_observations AS tied_observation
+                   WHERE tied_observation.project_id = observation.project_id
+                     AND tied_observation.pueue_task_id = observation.pueue_task_id
+                     AND tied_observation.observed_at = observation.observed_at
+                     AND tied_observation.task_signature <> observation.task_signature
+               )",
+            params![project_id, expected_group],
             |row| row.get(0),
         )
         .map_err(database_error("count research running observations"))?;
     let count = bounded_count("running", count)?;
-    let rows = {
+    let mut values = Vec::new();
+    {
         let mut statement = transaction
             .prepare(
-                "SELECT task_signature, pueue_task_id, pueue_group, command_json, state,
-                        enqueued_at, started_at, ended_at, result, observed_at
-                 FROM task_observations
-                 WHERE project_id = ?1 AND lower(state) = 'running'
-                 ORDER BY COALESCE(started_at, enqueued_at, observed_at) DESC,
-                          task_signature DESC
-                 LIMIT ?2",
+                "SELECT project_id, task_signature, pueue_task_id, command_json,
+                        pueue_group, state, enqueued_at, started_at, ended_at,
+                        result, observed_at
+                 FROM task_observations AS observation
+                 WHERE observation.project_id = ?1
+                   AND observation.pueue_group = ?2
+                   AND lower(observation.state) = 'running'
+                   AND observation.observed_at = (
+                       SELECT MAX(current.observed_at)
+                       FROM task_observations AS current
+                       WHERE current.project_id = observation.project_id
+                         AND current.pueue_task_id = observation.pueue_task_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_observations AS tied_observation
+                       WHERE tied_observation.project_id = observation.project_id
+                         AND tied_observation.pueue_task_id = observation.pueue_task_id
+                         AND tied_observation.observed_at = observation.observed_at
+                         AND tied_observation.task_signature <> observation.task_signature
+                   )
+                 ORDER BY COALESCE(observation.started_at,
+                                   observation.enqueued_at,
+                                   observation.observed_at) DESC,
+                          observation.pueue_task_id,
+                          observation.task_signature DESC",
             )
             .map_err(database_error("prepare research running observations"))?;
         let rows = statement
-            .query_map(params![project_id, MAX_RESEARCH_RUNNING as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, i64>(9)?,
-                ))
-            })
-            .map_err(database_error("query research running observations"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error("read research running observations"))?;
-        rows
-    };
+            .query_map(params![project_id, expected_group], task_observation_from_evidence_row)
+            .map_err(database_error("query research running observations"))?;
+        for row in rows {
+            let observation = row
+                .map_err(database_error("read research running observation"))?;
+            let Some(managed_signature) = managed_task_run_signature_for_observation(
+                &observation,
+                expected_group,
+            ) else {
+                continue;
+            };
+            values.push(json!({
+                "evidence_ref": format!("task:{managed_signature}:observation"),
+                "task_signature": persisted_id("task_signature", &managed_signature)?,
+                "pueue_task_id": observation.pueue_task_id,
+                "pueue_group": bounded_redacted_text(&observation.pueue_group),
+                "command": observation
+                    .command
+                    .iter()
+                    .map(|item| bounded_redacted_text(item))
+                    .collect::<Vec<_>>(),
+                "state": observation.state,
+                "enqueued_at": observation.enqueued_at,
+                "started_at": observation.started_at,
+                "ended_at": observation.ended_at,
+                "result": observation.result.as_deref().map(bounded_redacted_text),
+                "observed_at": observation.observed_at,
+            }));
+            if values.len() >= MAX_RESEARCH_RUNNING {
+                break;
+            }
+        }
+    }
     transaction.commit().map_err(database_error(
         "commit research running observations snapshot",
     ))?;
-    let omitted = count.saturating_sub(rows.len());
-    let values = rows
-        .into_iter()
-        .map(
-            |(
-                task_signature,
-                pueue_task_id,
-                pueue_group,
-                command_json,
-                state,
-                enqueued_at,
-                started_at,
-                ended_at,
-                result,
-                observed_at,
-            )| {
-                let command = serde_json::from_str::<Vec<String>>(&command_json).map_err(|source| {
-                    AppError::Serialization {
-                        operation: "parse research task observation command",
-                        source,
-                    }
-                })?;
-                Ok(json!({
-                    "evidence_ref": format!("task:{task_signature}:observation"),
-                    "task_signature": persisted_id("task_signature", &task_signature)?,
-                    "pueue_task_id": pueue_task_id,
-                    "pueue_group": bounded_redacted_text(&pueue_group),
-                    "command": command.iter().map(|item| bounded_redacted_text(item)).collect::<Vec<_>>(),
-                    "state": state,
-                    "enqueued_at": enqueued_at,
-                    "started_at": started_at,
-                    "ended_at": ended_at,
-                    "result": result.as_deref().map(bounded_redacted_text),
-                    "observed_at": observed_at,
-                }))
-            },
-        )
-        .collect::<Result<Vec<_>, AppError>>()?;
+    let omitted = count.saturating_sub(values.len());
     Ok((values, omitted))
 }
 
@@ -508,6 +585,7 @@ fn target_value(
     proposal: &crate::models::Proposal,
     metrics: Option<&ExperimentMetricsRow>,
     observation: &TaskObservation,
+    managed_task_signature: &str,
     observed_at: i64,
 ) -> Result<Value, AppError> {
     Ok(json!({
@@ -518,7 +596,7 @@ fn target_value(
         "status": experiment.status,
         "attempt": experiment.attempt,
         "pueue_task_id": observation.pueue_task_id,
-        "task_signature": persisted_id("task_signature", &observation.task_signature)?,
+        "task_signature": persisted_id("task_signature", managed_task_signature)?,
         "hypothesis": bounded_redacted_text(&proposal.hypothesis),
         "working_directory": bounded_redacted_text(&proposal.working_directory),
         "argv": proposal.argv.iter().map(|argument| bounded_redacted_text(argument)).collect::<Vec<_>>(),

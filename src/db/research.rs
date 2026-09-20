@@ -4,7 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    params,
+    types::Type,
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -15,7 +19,8 @@ use crate::{
         PrivateRunTempRecoveryTempIdentity,
         RecoveredPrivateRunTempCleanup,
     },
-    models::EventStatus,
+    models::{EventStatus, TaskObservation},
+    reconcile::managed_task_run_signature_for_observation,
     AppError,
 };
 
@@ -28,6 +33,63 @@ const OPEN_OPERATION_STAGES: &str =
     "('intent','stop_requested','stop_confirmed','successor_reserved')";
 const RESEARCH_RETRY_FAILURE_UNSAFE: &str = "research_session_unsafe";
 const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
+
+#[derive(Debug)]
+struct RunningResearchCandidate {
+    campaign_id: String,
+    experiment_id: String,
+    managed_signature: String,
+    pueue_task_id: i64,
+    expected_group: String,
+    order_at: i64,
+    observation: TaskObservation,
+}
+
+impl RunningResearchCandidate {
+    fn has_managed_identity(&self) -> bool {
+        managed_task_run_signature_for_observation(&self.observation, &self.expected_group)
+            .as_deref()
+            == Some(self.managed_signature.as_str())
+    }
+}
+
+fn running_research_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<RunningResearchCandidate> {
+    let campaign_id = row.get(0)?;
+    let experiment_id = row.get(1)?;
+    let managed_signature = row.get(2)?;
+    let pueue_task_id = row.get(3)?;
+    let expected_group = row.get(4)?;
+    let order_at = row.get(5)?;
+    let project_id: String = row.get(6)?;
+    let task_signature = row.get(7)?;
+    let observed_pueue_task_id = row.get(8)?;
+    let pueue_group = row.get(9)?;
+    let command_json: String = row.get(10)?;
+    let command = serde_json::from_str(&command_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(source))
+    })?;
+    Ok(RunningResearchCandidate {
+        campaign_id,
+        experiment_id,
+        managed_signature,
+        pueue_task_id,
+        expected_group,
+        order_at,
+        observation: TaskObservation {
+            project_id,
+            task_signature,
+            pueue_task_id: observed_pueue_task_id,
+            pueue_group,
+            command,
+            state: row.get(11)?,
+            enqueued_at: row.get(12)?,
+            started_at: row.get(13)?,
+            ended_at: row.get(14)?,
+            result: row.get(15)?,
+            observed_at: row.get(16)?,
+        },
+    })
+}
 
 enum RetryFailureExpectation<'a> {
     Any,
@@ -356,9 +418,16 @@ impl<'db> ResearchRepository<'db> {
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT c.campaign_id,
-                        MIN(COALESCE(observation.started_at,
-                                     observation.first_observed_at))
+                "SELECT c.campaign_id, e.experiment_id, e.task_signature,
+                        e.pueue_task_id, p.pueue_group,
+                        COALESCE(observation.started_at,
+                                 observation.first_observed_at),
+                        c.project_id, observation.task_signature,
+                        observation.pueue_task_id, observation.pueue_group,
+                        observation.command_json, observation.state,
+                        observation.enqueued_at, observation.started_at,
+                        observation.ended_at, observation.result,
+                        observation.observed_at
                  FROM campaigns AS c
                  JOIN projects AS p ON p.project_id = c.project_id
                  JOIN experiments AS e ON e.campaign_id = c.campaign_id
@@ -367,10 +436,22 @@ impl<'db> ResearchRepository<'db> {
                   AND s.project_id = c.project_id
                  JOIN task_observations AS observation
                    ON observation.project_id = c.project_id
-                  AND observation.task_signature = e.task_signature
                   AND observation.pueue_task_id = e.pueue_task_id
                   AND observation.pueue_group = p.pueue_group
                   AND lower(observation.state) = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_observations AS newer_observation
+                      WHERE newer_observation.project_id = observation.project_id
+                        AND newer_observation.pueue_task_id = observation.pueue_task_id
+                        AND newer_observation.observed_at > observation.observed_at
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_observations AS tied_observation
+                      WHERE tied_observation.project_id = observation.project_id
+                        AND tied_observation.pueue_task_id = observation.pueue_task_id
+                        AND tied_observation.observed_at = observation.observed_at
+                        AND tied_observation.task_signature <> observation.task_signature
+                  )
                  LEFT JOIN campaign_research AS research_state
                    ON research_state.campaign_id = c.campaign_id
                  WHERE c.state = 'active'
@@ -393,24 +474,34 @@ impl<'db> ResearchRepository<'db> {
                            )
                        )
                    )
-                 GROUP BY c.campaign_id
-                 ORDER BY MIN(COALESCE(observation.started_at,
-                                        observation.first_observed_at)),
-                          c.campaign_id
-                 LIMIT ?1",
+                 ORDER BY COALESCE(observation.started_at,
+                                   observation.first_observed_at),
+                          c.campaign_id, e.experiment_id,
+                          observation.observed_at DESC,
+                          observation.task_signature DESC",
             )
             .map_err(database_error("prepare running research campaign query"))?;
-        let campaigns = statement
-            .query_map([limit.min(MAX_RESEARCH_CANDIDATES as usize) as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(database_error("query running research campaigns"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error("read running research campaigns"))?;
+        let candidates = statement
+            .query_map([], running_research_candidate_from_row)
+            .map_err(database_error("query running research campaigns"))?;
+        let mut accepted = Vec::new();
+        let mut seen_campaigns = BTreeSet::new();
+        for candidate in candidates {
+            let candidate = candidate
+                .map_err(database_error("read running research campaign candidate"))?;
+            if candidate.has_managed_identity()
+                && seen_campaigns.insert(candidate.campaign_id.clone())
+            {
+                accepted.push((candidate.campaign_id, candidate.order_at));
+                if accepted.len() >= limit.min(MAX_RESEARCH_CANDIDATES as usize) {
+                    break;
+                }
+            }
+        }
         drop(statement);
         let mut scheduled = 0;
-        for (campaign_id, started_at) in campaigns {
-            self.schedule_running(&campaign_id, started_at, interval_minutes, now)?;
+        for (campaign_id, order_at) in accepted {
+            self.schedule_running(&campaign_id, order_at, interval_minutes, now)?;
             scheduled += 1;
         }
         Ok(scheduled)
@@ -589,7 +680,16 @@ impl<'db> ResearchRepository<'db> {
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT c.campaign_id, e.experiment_id, e.task_signature
+                "SELECT c.campaign_id, e.experiment_id, e.task_signature,
+                        e.pueue_task_id, p.pueue_group,
+                        COALESCE(observation.started_at,
+                                 observation.first_observed_at),
+                        c.project_id, observation.task_signature,
+                        observation.pueue_task_id, observation.pueue_group,
+                        observation.command_json, observation.state,
+                        observation.enqueued_at, observation.started_at,
+                        observation.ended_at, observation.result,
+                        observation.observed_at
                  FROM campaign_research AS state
                  JOIN campaigns AS c ON c.campaign_id = state.campaign_id
                  JOIN projects AS p ON p.project_id = c.project_id
@@ -599,10 +699,22 @@ impl<'db> ResearchRepository<'db> {
                   AND s.project_id = c.project_id
                  JOIN task_observations AS observation
                    ON observation.project_id = c.project_id
-                  AND observation.task_signature = e.task_signature
                   AND observation.pueue_task_id = e.pueue_task_id
                   AND observation.pueue_group = p.pueue_group
                   AND lower(observation.state) = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_observations AS newer_observation
+                      WHERE newer_observation.project_id = observation.project_id
+                        AND newer_observation.pueue_task_id = observation.pueue_task_id
+                        AND newer_observation.observed_at > observation.observed_at
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_observations AS tied_observation
+                      WHERE tied_observation.project_id = observation.project_id
+                        AND tied_observation.pueue_task_id = observation.pueue_task_id
+                        AND tied_observation.observed_at = observation.observed_at
+                        AND tied_observation.task_signature <> observation.task_signature
+                  )
                  WHERE state.next_due_at <= ?1
                    AND state.blocked_reason IS NULL
                    AND c.state = 'active'
@@ -619,35 +731,39 @@ impl<'db> ResearchRepository<'db> {
                    )
                  ORDER BY state.next_due_at,
                           COALESCE(observation.started_at, observation.first_observed_at),
-                          e.experiment_id
-                 LIMIT ?2",
+                          c.campaign_id, e.experiment_id,
+                          observation.observed_at DESC,
+                          observation.task_signature DESC",
             )
             .map_err(database_error("prepare due research campaign claims"))?;
         let rows = statement
-            .query_map(
-                params![now, limit.min(MAX_RESEARCH_CANDIDATES as usize) as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .map_err(database_error("query due research campaign claims"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error("read due research campaign claims"))?;
-        drop(statement);
+            .query_map([now], running_research_candidate_from_row)
+            .map_err(database_error("query due research campaign claims"))?;
+        let mut accepted = Vec::new();
         let mut seen_campaigns = BTreeSet::new();
-        let mut reviews = Vec::new();
-        for (campaign_id, experiment_id, task_signature) in rows {
-            if !seen_campaigns.insert(campaign_id.clone()) {
-                continue;
+        for candidate in rows {
+            let candidate = candidate
+                .map_err(database_error("read due research campaign candidate"))?;
+            if candidate.has_managed_identity()
+                && seen_campaigns.insert(candidate.campaign_id.clone())
+            {
+                accepted.push((
+                    candidate.campaign_id,
+                    candidate.experiment_id,
+                    candidate.managed_signature,
+                ));
+                if accepted.len() >= limit.min(MAX_RESEARCH_CANDIDATES as usize) {
+                    break;
+                }
             }
+        }
+        drop(statement);
+        let mut reviews = Vec::new();
+        for (campaign_id, experiment_id, managed_signature) in accepted {
             if let Some(review) = self.claim_due(
                 &campaign_id,
                 &experiment_id,
-                &task_signature,
+                &managed_signature,
                 now,
             )? {
                 reviews.push(review);
@@ -2247,7 +2363,16 @@ impl<'db> ResearchRepository<'db> {
         // campaign, project, submission, experiment, and observed task
         // identity before a review is created.
         let candidate_query = format!(
-            "SELECT c.project_id, e.experiment_id, e.task_signature, e.pueue_task_id
+            "SELECT c.campaign_id, e.experiment_id, e.task_signature,
+                    e.pueue_task_id, p.pueue_group,
+                    COALESCE(observation.started_at,
+                             observation.first_observed_at),
+                    c.project_id, observation.task_signature,
+                    observation.pueue_task_id, observation.pueue_group,
+                    observation.command_json, observation.state,
+                    observation.enqueued_at, observation.started_at,
+                    observation.ended_at, observation.result,
+                    observation.observed_at
              FROM campaigns c
              JOIN projects p ON p.project_id = c.project_id
              JOIN experiments e ON e.campaign_id = c.campaign_id
@@ -2256,10 +2381,22 @@ impl<'db> ResearchRepository<'db> {
               AND s.project_id = c.project_id
              JOIN task_observations observation
                ON observation.project_id = c.project_id
-              AND observation.task_signature = e.task_signature
               AND observation.pueue_task_id = e.pueue_task_id
               AND observation.pueue_group = p.pueue_group
               AND lower(observation.state) = 'running'
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_observations AS newer_observation
+                  WHERE newer_observation.project_id = observation.project_id
+                    AND newer_observation.pueue_task_id = observation.pueue_task_id
+                    AND newer_observation.observed_at > observation.observed_at
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_observations AS tied_observation
+                  WHERE tied_observation.project_id = observation.project_id
+                    AND tied_observation.pueue_task_id = observation.pueue_task_id
+                    AND tied_observation.observed_at = observation.observed_at
+                    AND tied_observation.task_signature <> observation.task_signature
+              )
              WHERE c.campaign_id = ?1
                AND c.state = 'active'
                AND p.enabled = 1
@@ -2276,35 +2413,39 @@ impl<'db> ResearchRepository<'db> {
                      AND ownership.operation_stage IN {OPEN_OPERATION_STAGES}
                )
              ORDER BY COALESCE(observation.started_at, observation.first_observed_at),
-                      e.experiment_id
-             LIMIT ?2"
+                      e.experiment_id, observation.observed_at DESC,
+                      observation.task_signature DESC"
         );
         let authority = {
             let mut statement = transaction
                 .prepare(&candidate_query)
                 .map_err(database_error("prepare authoritative research candidates"))?;
-            let mut candidates = statement
-                .query_map(params![campaign_id, MAX_RESEARCH_CANDIDATES], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                })
+            let candidates = statement
+                .query_map([campaign_id], running_research_candidate_from_row)
                 .map_err(database_error("read authoritative research candidates"))?;
-            candidates.next().transpose().map_err(database_error(
-                "read oldest authoritative research candidate",
-            ))?
-        };
-        let Some((project_id, canonical_experiment_id, canonical_signature, pueue_task_id)) =
+            let mut authority = None;
+            for candidate in candidates {
+                let candidate = candidate.map_err(database_error(
+                    "read authoritative research candidate",
+                ))?;
+                if candidate.has_managed_identity() {
+                    authority = Some(candidate);
+                    break;
+                }
+            }
             authority
+        };
+        let Some(authority) = authority
         else {
             transaction
                 .commit()
                 .map_err(database_error("commit deferred research review claim"))?;
             return Ok(None);
         };
+        let project_id = authority.observation.project_id.clone();
+        let canonical_experiment_id = authority.experiment_id;
+        let canonical_signature = authority.managed_signature;
+        let pueue_task_id = authority.pueue_task_id;
         if canonical_experiment_id != experiment_id || canonical_signature != task_signature {
             transaction
                 .commit()
@@ -4998,6 +5139,8 @@ mod tests {
             NewTaskObservation, ProposalKind,
         },
         proposals::{self, ProposalInput},
+        pueue::PueueTask,
+        reconcile::{managed_task_run_signature, task_signature},
         state::ObjectiveSnapshot,
     };
 
@@ -5011,7 +5154,19 @@ mod tests {
         let project_id = "detached-history-project";
         let campaign_id = "detached-history-campaign";
         let experiment_id = "detached-history-experiment";
-        let task_signature = "detached-history-task";
+        let task = PueueTask {
+            id: 41,
+            group: "detached-history-group".to_owned(),
+            command: "python train.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("900".to_owned()),
+            started_at: Some("1000".to_owned()),
+            ended_at: None,
+            result: None,
+        };
+        let raw_task_signature = task_signature(&task);
+        let task_signature = managed_task_run_signature(&task)
+            .expect("detached history managed task signature");
         ProjectRepository::new(&db)
             .register(&NewProject::new(
                 project_id,
@@ -5025,7 +5180,7 @@ mod tests {
             text: "detached history objective".to_owned(),
             digest: "detached-history-objective".to_owned(),
         };
-        let argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let argv = vec![task.command.clone()];
         let baseline = proposals::validate_initial_baseline(
             ProposalInput {
                 kind: ProposalKind::Experiment,
@@ -5061,12 +5216,12 @@ mod tests {
             .mark_submitting(experiment_id, 901)
             .expect("detached history submission");
         ExperimentRepository::new(&db)
-            .mark_accepted(experiment_id, 41, task_signature, 902)
+            .mark_accepted(experiment_id, 41, &task_signature, 902)
             .expect("detached history experiment");
         TaskObservationRepository::new(&db)
             .upsert(&NewTaskObservation::new(
                 project_id,
-                task_signature,
+                raw_task_signature,
                 41,
                 "detached-history-group",
                 argv,
@@ -5086,7 +5241,7 @@ mod tests {
             .schedule_running(campaign_id, 1_000, 30, 2_799)
             .expect("detached history schedule");
         let review = repository
-            .claim_due(campaign_id, experiment_id, task_signature, 2_800)
+            .claim_due(campaign_id, experiment_id, &task_signature, 2_800)
             .expect("detached history claim")
             .expect("detached history review");
         let event_id = repository
