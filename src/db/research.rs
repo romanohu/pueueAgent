@@ -131,12 +131,14 @@ impl<'db> ResearchRepository<'db> {
         marker_absent: bool,
     ) -> Result<Option<StartupResearchOwner>, AppError> {
         let connection = self.db.connect()?;
-        if let Some(owner) = native_research_owner_rows(&connection, None)?
+        if let Some(row) = native_research_owner_rows(&connection, None)?
             .into_iter()
             .find(|row| row.agent_run_id == run_id)
-            .map(|row| startup_research_owner_from_row(row, marker_absent))
         {
-            return Ok(Some(owner));
+            if native_research_owner_is_complete(&row) {
+                return Ok(None);
+            }
+            return Ok(Some(startup_research_owner_from_row(row, marker_absent)));
         }
         let unknown = connection
             .query_row(
@@ -161,6 +163,10 @@ impl<'db> ResearchRepository<'db> {
                         notes_json: None,
                         marker_absent,
                         authority: None,
+                        original_status: row.get(1)?,
+                        original_gate_state: row.get(2)?,
+                        original_policy_code: row.get(5)?,
+                        original_failure_stage: row.get(6)?,
                     })
                 },
             )
@@ -1454,6 +1460,15 @@ impl<'db> ResearchRepository<'db> {
                 "context_json": context_json,
                 "context_digest": context_digest,
             });
+            for field in [
+                "planned_session_id",
+                "confirmed_session_id",
+                "session_binding",
+            ] {
+                if let Some(value) = notes.get(field).cloned() {
+                    history_entry[field] = value;
+                }
+            }
             if let Some(native_recovery) = notes.get("native_recovery").cloned() {
                 history_entry["native_recovery"] = native_recovery;
                 notes
@@ -3761,6 +3776,13 @@ pub(crate) struct NativeResearchBindingExpectation<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeResearchAuthorityView {
+    pub version: u8,
+    pub run_id: i64,
+    pub review_id: String,
+    pub campaign_id: String,
+    pub experiment_id: String,
+    pub attempt: i64,
+    pub session_generation: i64,
     pub fresh_launch: bool,
     pub session_id: String,
     pub session_confirmed: bool,
@@ -3799,6 +3821,8 @@ struct NativeResearchOwnerRow {
     review_event_link_count: i64,
     total_event_link_count: i64,
     bound_review_count: i64,
+    detached_cleanup_complete: bool,
+    detached_campaign_project_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3817,6 +3841,10 @@ pub(crate) struct StartupResearchOwner {
     pub notes_json: Option<String>,
     pub marker_absent: bool,
     pub authority: Option<NativeResearchAuthorityView>,
+    pub original_status: String,
+    pub original_gate_state: String,
+    pub original_policy_code: Option<String>,
+    pub original_failure_stage: Option<String>,
 }
 
 fn native_recovery_immutable_notes(notes_json: Option<&str>) -> Option<String> {
@@ -3830,7 +3858,14 @@ pub(crate) fn native_research_authority_immutable_matches(
     expected: &NativeResearchAuthorityView,
     current: &NativeResearchAuthorityView,
 ) -> bool {
-    expected.fresh_launch == current.fresh_launch
+    expected.version == current.version
+        && expected.run_id == current.run_id
+        && expected.review_id == current.review_id
+        && expected.campaign_id == current.campaign_id
+        && expected.experiment_id == current.experiment_id
+        && expected.attempt == current.attempt
+        && expected.session_generation == current.session_generation
+        && expected.fresh_launch == current.fresh_launch
         && expected.session_id == current.session_id
         && expected.identity == current.identity
 }
@@ -3927,6 +3962,13 @@ pub(crate) fn native_research_authority(
     };
 
     Some(NativeResearchAuthorityView {
+        version: parsed.version,
+        run_id: parsed.run_id,
+        review_id: parsed.review_id,
+        campaign_id: parsed.campaign_id,
+        experiment_id: parsed.experiment_id,
+        attempt: parsed.attempt,
+        session_generation: parsed.session_generation,
         fresh_launch: parsed.fresh_launch,
         session_id: parsed.session_id,
         session_confirmed,
@@ -3968,6 +4010,13 @@ fn native_research_historical_authority(
         return None;
     }
     Some(NativeResearchAuthorityView {
+        version: parsed.version,
+        run_id: parsed.run_id,
+        review_id: parsed.review_id,
+        campaign_id: parsed.campaign_id,
+        experiment_id: parsed.experiment_id,
+        attempt: parsed.attempt,
+        session_generation: parsed.session_generation,
         fresh_launch: parsed.fresh_launch,
         session_id: parsed.session_id,
         session_confirmed: true,
@@ -3983,8 +4032,11 @@ pub(crate) fn project_has_unresolved_native_research_owner(
     connection: &Connection,
     project_id: &str,
 ) -> Result<bool, AppError> {
-    for row in native_research_owner_rows(connection, Some(project_id))? {
-        if !native_research_owner_is_complete(&row) {
+    for row in native_research_owner_rows(connection, None)? {
+        let implicated = row.project_id == project_id
+            || row.owner_project_id.as_deref() == Some(project_id)
+            || row.detached_campaign_project_ids.contains(project_id);
+        if implicated && !native_research_owner_is_complete(&row) {
             return Ok(true);
         }
     }
@@ -3997,7 +4049,11 @@ fn native_cleanup_blocked_project_ids(
     let mut blocked = BTreeSet::new();
     for row in native_research_owner_rows(connection, None)? {
         if !native_research_owner_is_complete(&row) {
-            blocked.insert(row.project_id);
+            blocked.insert(row.project_id.clone());
+            if let Some(owner_project_id) = row.owner_project_id {
+                blocked.insert(owner_project_id);
+            }
+            blocked.extend(row.detached_campaign_project_ids);
         }
     }
     Ok(blocked)
@@ -4008,7 +4064,7 @@ fn native_research_owner_rows(
     project_id: Option<&str>,
 ) -> Result<Vec<NativeResearchOwnerRow>, AppError> {
     let filter = if project_id.is_some() {
-        " AND campaign.project_id = ?1"
+        " AND (campaign.project_id = ?1 OR owner.project_id = ?1)"
     } else {
         ""
     };
@@ -4171,7 +4227,23 @@ fn native_research_owner_rows(
             review_event_link_count: 0,
             total_event_link_count: 0,
             bound_review_count: 0,
+            detached_cleanup_complete: false,
+            detached_campaign_project_ids: BTreeSet::new(),
         });
+    }
+    drop(statement);
+    for owner in &mut owners {
+        if owner.review_id.is_empty()
+            && matches!(
+                owner.owner_status.as_deref(),
+                Some("completed" | "failed" | "timed_out" | "cancelled")
+            )
+        {
+            let evidence = detached_native_cleanup_evidence(connection, owner.agent_run_id)?;
+            owner.detached_cleanup_complete = evidence.candidate_count == 1
+                && evidence.valid_count == 1;
+            owner.detached_campaign_project_ids = evidence.project_ids;
+        }
     }
     Ok(owners)
 }
@@ -4210,7 +4282,247 @@ fn native_research_owner_row_from_sql(
         review_event_link_count: row.get(27)?,
         total_event_link_count: row.get(28)?,
         bound_review_count: row.get(29)?,
+        detached_cleanup_complete: false,
+        detached_campaign_project_ids: BTreeSet::new(),
     })
+}
+
+#[derive(Default)]
+struct DetachedNativeCleanupEvidence {
+    project_ids: BTreeSet<String>,
+    candidate_count: usize,
+    valid_count: usize,
+}
+
+fn retry_history_native_cleanup_counts(
+    connection: &Connection,
+    notes_json: Option<&str>,
+    run_id: i64,
+    review_id: &str,
+    campaign_id: &str,
+    experiment_id: &str,
+    event_id: i64,
+    campaign_project_id: &str,
+) -> Result<(usize, usize), AppError> {
+    let Some(notes_json) = notes_json else {
+        return Ok((0, 0));
+    };
+    let Ok(notes) = serde_json::from_str::<Value>(notes_json) else {
+        return Ok((0, 0));
+    };
+    let Some(history) = notes.get("retry_history").and_then(Value::as_array) else {
+        return Ok((0, 0));
+    };
+    let mut candidate_entries = 0;
+    let mut valid_entries = 0;
+    for entry in history {
+        if entry.get("agent_run_id").and_then(Value::as_i64) != Some(run_id) {
+            continue;
+        }
+        candidate_entries += 1;
+        let Some(attempt) = entry.get("attempt").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(native_recovery) = entry.get("native_recovery") else {
+            continue;
+        };
+        let Some(failure_code) = entry
+            .get("failure_code")
+            .and_then(Value::as_str)
+            .filter(|code| !code.is_empty())
+        else {
+            continue;
+        };
+        let Ok(authority) = parse_native_recovery_authority(native_recovery) else {
+            continue;
+        };
+        if authority.run_id != run_id
+            || authority.attempt != attempt
+            || authority.review_id != review_id
+            || authority.campaign_id != campaign_id
+            || authority.experiment_id != experiment_id
+        {
+            continue;
+        }
+        let Some(entry_notes) = serde_json::to_string(entry).ok() else {
+            continue;
+        };
+        let expected = NativeResearchBindingExpectation {
+            review_id,
+            campaign_id,
+            experiment_id,
+            attempt,
+            session_generation: authority.session_generation,
+            agent_run_id: run_id,
+            state: "completed",
+            failure_code: Some(failure_code),
+            campaign_session: None,
+        };
+        let confirmed = native_research_historical_authority(Some(&entry_notes), &expected)
+            .is_some_and(|parsed| parsed.cleanup_complete);
+        let pending_campaign_session = if authority.fresh_launch {
+            entry
+                .get("confirmed_session_id")
+                .and_then(Value::as_str)
+        } else {
+            Some(authority.session_id.as_str())
+        };
+        let pending = native_research_authority(
+            Some(&entry_notes),
+            &NativeResearchBindingExpectation {
+                state: "retry_wait",
+                campaign_session: pending_campaign_session,
+                ..expected
+            },
+        )
+        .is_some_and(|parsed| parsed.cleanup_complete);
+        if (confirmed || pending)
+            && detached_native_cleanup_lineage_valid(
+                connection,
+                run_id,
+                campaign_id,
+                experiment_id,
+                event_id,
+                campaign_project_id,
+            )?
+        {
+            valid_entries += 1;
+        }
+    }
+    Ok((candidate_entries, valid_entries))
+}
+
+fn detached_native_cleanup_lineage_valid(
+    connection: &Connection,
+    run_id: i64,
+    campaign_id: &str,
+    experiment_id: &str,
+    event_id: i64,
+    campaign_project_id: &str,
+) -> Result<bool, AppError> {
+    let lineage = connection
+        .query_row(
+            "SELECT owner.project_id, owner.execution_kind, owner.status,
+                    owner.launch_gate_state, owner.primary_event_id,
+                    event.project_id, event.kind, event.campaign_id,
+                    event.experiment_id, experiment.campaign_id,
+                    (SELECT COUNT(*) FROM campaign_research AS research_state
+                       WHERE research_state.campaign_id = ?3),
+                    (SELECT COUNT(*) FROM agent_run_events AS link
+                       WHERE link.project_id = owner.project_id
+                         AND link.run_id = owner.run_id
+                         AND link.event_id = ?2),
+                    (SELECT COUNT(*) FROM agent_run_events AS link
+                       WHERE link.project_id = owner.project_id
+                         AND link.run_id = owner.run_id)
+             FROM agent_runs AS owner
+             LEFT JOIN events AS event
+               ON event.project_id = owner.project_id AND event.event_id = ?2
+             LEFT JOIN experiments AS experiment
+               ON experiment.experiment_id = ?4
+             WHERE owner.run_id = ?1",
+            params![run_id, event_id, campaign_id, experiment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read detached native research lineage"))?;
+    let Some((
+        owner_project_id,
+        owner_execution_kind,
+        owner_status,
+        owner_gate_state,
+        owner_primary_event_id,
+        event_project_id,
+        event_kind,
+        event_campaign_id,
+        event_experiment_id,
+        experiment_campaign_id,
+        campaign_research_count,
+        review_event_link_count,
+        total_event_link_count,
+    )) = lineage
+    else {
+        return Ok(false);
+    };
+    Ok(owner_project_id == campaign_project_id
+        && owner_execution_kind == "campaign_research"
+        && matches!(
+            owner_status.as_str(),
+            "completed" | "failed" | "timed_out" | "cancelled"
+        )
+        && matches!(owner_gate_state.as_str(), "released" | "failed")
+        && owner_primary_event_id == event_id
+        && event_project_id.as_deref() == Some(campaign_project_id)
+        && event_kind.as_deref() == Some("campaign_research")
+        && event_campaign_id.as_deref() == Some(campaign_id)
+        && event_experiment_id.as_deref() == Some(experiment_id)
+        && experiment_campaign_id.as_deref() == Some(campaign_id)
+        && campaign_research_count == 1
+        && review_event_link_count == 1
+        && total_event_link_count == 1)
+}
+
+fn detached_native_cleanup_evidence(
+    connection: &Connection,
+    run_id: i64,
+) -> Result<DetachedNativeCleanupEvidence, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT review.review_id, review.campaign_id, review.experiment_id,
+                    review.event_id, review.notes_json, campaign.project_id
+             FROM research_reviews AS review
+             JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id",
+        )
+        .map_err(database_error("prepare detached native research history query"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(database_error("query detached native research history"))?;
+    let mut evidence = DetachedNativeCleanupEvidence::default();
+    for row in rows {
+        let (review_id, campaign_id, experiment_id, event_id, notes_json, project_id) =
+            row.map_err(database_error("read detached native research history"))?;
+        let (candidate_count, valid_count) = retry_history_native_cleanup_counts(
+            connection,
+            notes_json.as_deref(),
+            run_id,
+            &review_id,
+            &campaign_id,
+            &experiment_id,
+            event_id,
+            &project_id,
+        )?;
+        if candidate_count > 0 {
+            evidence.project_ids.insert(project_id);
+            evidence.candidate_count += candidate_count;
+            evidence.valid_count += valid_count;
+        }
+    }
+    Ok(evidence)
 }
 
 fn native_research_owner_lineage_valid(row: &NativeResearchOwnerRow) -> bool {
@@ -4229,13 +4541,20 @@ fn native_research_owner_lineage_valid(row: &NativeResearchOwnerRow) -> bool {
 }
 
 fn native_research_owner_is_complete(row: &NativeResearchOwnerRow) -> bool {
-    if !native_research_owner_lineage_valid(row)
-        || !matches!(
-            row.owner_status.as_deref(),
-            Some("completed" | "failed" | "timed_out" | "cancelled")
-        )
-        || !matches!(row.owner_gate_state.as_deref(), Some("released" | "failed"))
-    {
+    let terminal_owner = matches!(
+        row.owner_status.as_deref(),
+        Some("completed" | "failed" | "timed_out" | "cancelled")
+    );
+    let gate_released = matches!(row.owner_gate_state.as_deref(), Some("released" | "failed"));
+    if !terminal_owner || !gate_released {
+        return false;
+    }
+    if row.review_id.is_empty() {
+        return row.detached_cleanup_complete
+            && row.detached_campaign_project_ids.len() == 1
+            && row.detached_campaign_project_ids.contains(&row.project_id);
+    }
+    if !native_research_owner_lineage_valid(row) {
         return false;
     }
     if matches!(row.state.as_str(), "completed" | "discarded") {
@@ -4299,21 +4618,31 @@ fn startup_research_owner_from_row(
     } else {
         native_research_authority(row.notes_json.as_deref(), &expected)
     };
+    let status = row.owner_status.unwrap_or_default();
+    let gate_state = row.owner_gate_state.unwrap_or_default();
+    let policy_code = row.owner_policy_code;
+    let failure_stage = row.owner_failure_stage;
+    let review_state = row.state;
+    let failure_code = row.failure_code;
     StartupResearchOwner {
         run_id: row.agent_run_id,
         project_id: row.project_id,
         review_id: row.review_id,
         pid: row.owner_pid,
-        status: row.owner_status.unwrap_or_default(),
-        gate_state: row.owner_gate_state.unwrap_or_default(),
-        policy_code: row.owner_policy_code,
-        failure_stage: row.owner_failure_stage,
+        status: status.clone(),
+        gate_state: gate_state.clone(),
+        policy_code: policy_code.clone(),
+        failure_stage: failure_stage.clone(),
         log_path: row.owner_log_path,
-        review_state: row.state,
-        failure_code: row.failure_code,
+        review_state: review_state.clone(),
+        failure_code: failure_code.clone(),
         notes_json: row.notes_json,
         marker_absent,
         authority,
+        original_status: status,
+        original_gate_state: gate_state,
+        original_policy_code: policy_code,
+        original_failure_stage: failure_stage,
     }
 }
 
@@ -4628,4 +4957,297 @@ fn research_has_active_or_unknown_owner(
 
 fn validate_session_id(session_id: &str) -> Result<(), AppError> {
     crate::codex_session::normalize_session_id(session_id).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::{
+        db::{
+            AgentRunRepository, CampaignRepository, EventRepository, ExperimentRepository,
+            ProjectRepository, StartCampaignRequest, TaskObservationRepository,
+        },
+        execution_policy::CampaignLimits,
+        models::{
+            AgentContextMode, AgentRunStatus, ExecutionProjection, NewAgentRun, NewProject,
+            NewTaskObservation, ProposalKind,
+        },
+        proposals::{self, ProposalInput},
+        state::ObjectiveSnapshot,
+    };
+
+    fn detached_history_fixture() -> (tempfile::TempDir, Db, i64, String) {
+        let temp = tempfile::tempdir().expect("detached history tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("detached history project");
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, "fixture").expect("detached history config");
+        let db = Db::open(&temp.path().join("state.sqlite3")).expect("detached history db");
+        let project_id = "detached-history-project";
+        let campaign_id = "detached-history-campaign";
+        let experiment_id = "detached-history-experiment";
+        let task_signature = "detached-history-task";
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                project_id,
+                root,
+                "detached-history-group",
+                config_path,
+                900,
+            ))
+            .expect("detached history project registration");
+        let objective = ObjectiveSnapshot {
+            text: "detached history objective".to_owned(),
+            digest: "detached-history-objective".to_owned(),
+        };
+        let argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "detached history baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .expect("detached history baseline proposal");
+        CampaignRepository::new(&db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id,
+                    project_id,
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &baseline,
+                    submission_id: "detached-history-submission",
+                    experiment_id,
+                    proposal_id: "detached-history-proposal",
+                    metadata: &json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: 900,
+                },
+                &CampaignLimits::default(),
+            )
+            .expect("detached history campaign");
+        ExperimentRepository::new(&db)
+            .mark_submitting(experiment_id, 901)
+            .expect("detached history submission");
+        ExperimentRepository::new(&db)
+            .mark_accepted(experiment_id, 41, task_signature, 902)
+            .expect("detached history experiment");
+        TaskObservationRepository::new(&db)
+            .upsert(&NewTaskObservation::new(
+                project_id,
+                task_signature,
+                41,
+                "detached-history-group",
+                argv,
+                "Running",
+                Some(900),
+                Some(1_000),
+                None,
+                None,
+                1_001,
+            ))
+            .expect("detached history observation");
+        let repository = ResearchRepository::new(&db);
+        repository
+            .ensure_campaign(campaign_id)
+            .expect("detached history state");
+        repository
+            .schedule_running(campaign_id, 1_000, 30, 2_799)
+            .expect("detached history schedule");
+        let review = repository
+            .claim_due(campaign_id, experiment_id, task_signature, 2_800)
+            .expect("detached history claim")
+            .expect("detached history review");
+        let event_id = repository
+            .event_id(&review.review_id)
+            .expect("detached history event");
+        EventRepository::new(&db)
+            .claim_by_id(project_id, event_id, 2_900)
+            .expect("detached history event claim")
+            .expect("detached history event row");
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events(
+                &NewAgentRun::with_context(
+                    project_id,
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    2_901,
+                    temp.path().join("agent.log"),
+                    AgentContextMode::Fresh,
+                    None,
+                    Vec::new(),
+                )
+                .with_execution(
+                    ExecutionProjection::new("campaign_research", "/bin/sh", "fixture")
+                        .expect("detached history execution"),
+                ),
+                &[event_id],
+            )
+            .expect("detached history run");
+        let authority = json!({
+            "version": 1,
+            "run_id": run.run_id,
+            "review_id": review.review_id,
+            "campaign_id": campaign_id,
+            "experiment_id": experiment_id,
+            "attempt": 1,
+            "session_generation": 0,
+            "fresh_launch": true,
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "service_root_identity": {
+                "device": 1, "inode": 2, "owner": 3, "mode": 448,
+                "resolution": "fixture-root"
+            },
+            "temp_identity": {
+                "device": 1, "inode": 4, "owner": 3, "mode": 448,
+                "mount": [1, 2],
+                "service_identity": {"device": 1, "inode": 5, "owner": 3, "mode": 448},
+                "parent_identity": {"device": 1, "inode": 6, "owner": 3, "mode": 448}
+            },
+            "cleanup": {"phase": "complete", "completed_at": 3_000}
+        });
+        let notes = json!({
+            "retry_history": [{
+                "attempt": 1,
+                "agent_run_id": run.run_id,
+                "failure_code": "research_output_invalid",
+                "planned_session_id": "11111111-1111-4111-8111-111111111111",
+                "confirmed_session_id": "11111111-1111-4111-8111-111111111111",
+                "session_binding": "confirmed",
+                "native_recovery": authority
+            }]
+        });
+        let connection = db
+            .connect()
+            .expect("detached history update connection");
+        connection
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', finished_at = 3_001,
+                     launch_gate_state = 'failed'
+                 WHERE run_id = ?1",
+                [run.run_id],
+            )
+            .expect("detached history terminal run");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'retry_wait', attempt = 2, agent_run_id = NULL,
+                     failure_code = 'research_output_invalid', notes_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![notes.to_string(), review.review_id],
+            )
+            .expect("detached history review");
+        connection
+            .execute(
+                "UPDATE events SET status = 'retry_wait', lease_until = NULL,
+                     not_before = 3_001, last_error = 'research_output_invalid'
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .expect("detached history event");
+        (temp, db, run.run_id, project_id.to_owned())
+    }
+
+    fn complete_owner_row() -> NativeResearchOwnerRow {
+        NativeResearchOwnerRow {
+            review_id: "review".to_owned(),
+            campaign_id: "campaign".to_owned(),
+            experiment_id: "experiment".to_owned(),
+            attempt: 1,
+            review_generation: 0,
+            agent_run_id: 7,
+            state: "completed".to_owned(),
+            failure_code: None,
+            campaign_session: Some("session".to_owned()),
+            campaign_generation: 0,
+            notes_json: None,
+            event_id: Some(11),
+            project_id: "project".to_owned(),
+            owner_project_id: Some("project".to_owned()),
+            owner_execution_kind: Some("campaign_research".to_owned()),
+            owner_status: Some("completed".to_owned()),
+            owner_gate_state: Some("released".to_owned()),
+            owner_pid: None,
+            owner_primary_event_id: Some(11),
+            owner_log_path: Some(PathBuf::from("/tmp/research.log")),
+            owner_policy_code: None,
+            owner_failure_stage: None,
+            event_project_id: Some("project".to_owned()),
+            event_kind: Some("campaign_research".to_owned()),
+            event_campaign_id: Some("campaign".to_owned()),
+            event_experiment_id: Some("experiment".to_owned()),
+            experiment_campaign_id: Some("campaign".to_owned()),
+            review_event_link_count: 1,
+            total_event_link_count: 1,
+            bound_review_count: 1,
+            detached_cleanup_complete: false,
+            detached_campaign_project_ids: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn native_owner_lineage_rejects_extra_or_mismatched_event_links() {
+        let mut row = complete_owner_row();
+        assert!(native_research_owner_lineage_valid(&row));
+        row.total_event_link_count = 2;
+        assert!(!native_research_owner_lineage_valid(&row));
+        row.total_event_link_count = 1;
+        row.owner_primary_event_id = Some(12);
+        assert!(!native_research_owner_lineage_valid(&row));
+    }
+
+    #[test]
+    fn detached_cleanup_requires_one_valid_history_project() {
+        let mut row = complete_owner_row();
+        row.review_id.clear();
+        row.event_id = None;
+        row.detached_cleanup_complete = true;
+        row.detached_campaign_project_ids
+            .insert("project".to_owned());
+        assert!(native_research_owner_is_complete(&row));
+
+        row.detached_campaign_project_ids
+            .insert("campaign-project".to_owned());
+        assert!(!native_research_owner_is_complete(&row));
+    }
+
+    #[test]
+    fn detached_history_missing_campaign_state_remains_a_blocker() {
+        let (_temp, db, run_id, project_id) = detached_history_fixture();
+        let connection = db.connect().expect("detached history read connection");
+        let owners = native_research_owner_rows(&connection, None)
+            .expect("read detached history owners");
+        let detached = owners
+            .iter()
+            .find(|owner| owner.agent_run_id == run_id && owner.review_id.is_empty())
+            .expect("old detached owner must remain in blocker universe");
+        assert!(detached.detached_cleanup_complete);
+        assert!(detached.detached_campaign_project_ids.contains(&project_id));
+
+        connection
+            .execute(
+                "DELETE FROM campaign_research WHERE campaign_id = ?1",
+                ["detached-history-campaign"],
+            )
+            .expect("remove campaign research state");
+        let owners = native_research_owner_rows(&connection, None)
+            .expect("read missing-state detached owners");
+        let detached = owners
+            .iter()
+            .find(|owner| owner.agent_run_id == run_id && owner.review_id.is_empty())
+            .expect("missing-state detached owner must remain");
+        assert!(!detached.detached_cleanup_complete);
+        assert!(detached.detached_campaign_project_ids.contains(&project_id));
+        assert!(!native_research_owner_is_complete(detached));
+    }
 }

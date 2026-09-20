@@ -3,6 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    collections::BTreeSet,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -256,7 +257,9 @@ max_agent_runs = 10
     }
 
     async fn spawn_once(&self, runner: &AgentRunner) -> Option<StartedDiagnosis> {
-        let mut report = run_due_diagnoses(&self.db, runner, 4, NOW).await.unwrap();
+        let mut report = run_due_diagnoses(&self.db, runner, 4, NOW, &BTreeSet::new())
+            .await
+            .unwrap();
         assert_eq!(report.failed_spawns, 0);
         assert!(report.started.len() <= 1);
         let started = report.started.pop()?;

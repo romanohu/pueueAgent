@@ -857,6 +857,8 @@ where
                     continue;
                 }
             }) else {
+                self.startup_research_owners.remove(&startup_owner.run_id);
+                retired += 1;
                 continue;
             };
             let authority_unchanged = startup_owner
@@ -866,23 +868,50 @@ where
                 .is_some_and(|(original, current)| {
                     crate::db::native_research_authority_immutable_matches(original, current)
                 });
-            if startup_owner.authority.is_none() || !authority_unchanged {
+            let authority_progress = startup_owner
+                .authority
+                .as_ref()
+                .zip(owner.authority.as_ref())
+                .is_some_and(|(previous, current)| {
+                    (!previous.session_confirmed || current.session_confirmed)
+                        && (!previous.cleanup_complete || current.cleanup_complete)
+                });
+            let safety_snapshot_unchanged = authority_unchanged
+                && startup_owner.project_id == owner.project_id
+                && startup_owner.review_id == owner.review_id
+                && startup_owner.pid == owner.pid
+                && startup_owner.log_path == owner.log_path;
+            let lifecycle_unchanged_or_advanced =
+                startup_owner_lifecycle_transition_allowed(&startup_owner, &owner);
+            if !safety_snapshot_unchanged
+                || !authority_progress
+                || !lifecycle_unchanged_or_advanced
+            {
                 match repository.mark_startup_recovery_required(owner.run_id, now) {
                     Ok(_) => {}
                     Err(error) if first_error.is_none() => first_error = Some(error),
                     Err(_) => {}
                 }
-                // Keep the startup snapshot's immutable authority and notes
-                // as the only recovery proof.  Refreshing mutable status is
-                // safe, but a missing or substituted current proof must not
-                // become the next poll's original.
-                owner.authority = startup_owner.authority.clone();
-                owner.notes_json = startup_owner.notes_json.clone();
-                owner.marker_absent = startup_owner.marker_absent;
-                self.startup_research_owners.insert(owner.run_id, owner);
+                // Keep the original safety evidence and immutable lineage as
+                // the only recovery proof.  A changed PID or log path may be
+                // a replacement generation, and a changed authority must
+                // never become the next poll's baseline.
+                self.startup_research_owners
+                    .insert(startup_owner.run_id, startup_owner.clone());
                 continue;
             }
+            // Refresh only the one-poll mutable lifecycle state.  The run,
+            // project/review lineage, PID, log path, marker evidence, and
+            // strict authority remain pinned to the startup snapshot.
+            owner.project_id = startup_owner.project_id.clone();
+            owner.review_id = startup_owner.review_id.clone();
+            owner.pid = startup_owner.pid;
+            owner.log_path = startup_owner.log_path.clone();
             owner.marker_absent = startup_owner.marker_absent;
+            owner.original_status = startup_owner.original_status.clone();
+            owner.original_gate_state = startup_owner.original_gate_state.clone();
+            owner.original_policy_code = startup_owner.original_policy_code.clone();
+            owner.original_failure_stage = startup_owner.original_failure_stage.clone();
             self.startup_research_owners.insert(owner.run_id, owner.clone());
             let quiescent = if matches!(
                 owner.status.as_str(),
@@ -1226,4 +1255,197 @@ fn startup_owner_is_safe_pre_exec(owner: &StartupResearchOwner) -> bool {
         && owner.gate_state == "pending"
         && owner.policy_code.is_none()
         && owner.failure_stage.is_none()
+}
+
+fn startup_owner_lifecycle_transition_allowed(
+    original: &StartupResearchOwner,
+    current: &StartupResearchOwner,
+) -> bool {
+    if original.pid != current.pid || original.log_path != current.log_path {
+        return false;
+    }
+    if original.pid.is_none()
+        && startup_owner_is_safe_pre_exec(current)
+        && !startup_owner_initially_safe_pre_exec(original)
+    {
+        return false;
+    }
+    if !agent_status_transition_allowed(&original.status, &current.status) {
+        return false;
+    }
+    if !launch_gate_transition_allowed(&original.gate_state, &current.gate_state) {
+        return false;
+    }
+    if !research_review_transition_allowed(&original.review_state, &current.review_state) {
+        return false;
+    }
+    if original.failure_code.is_some() && original.failure_code != current.failure_code {
+        return false;
+    }
+    if original.failure_code.is_none()
+        && current.failure_code.is_some()
+        && !matches!(
+            current.review_state.as_str(),
+            "retry_wait" | "blocked" | "completed" | "discarded"
+        )
+    {
+        return false;
+    }
+    for (original_code, current_code) in [
+        (&original.policy_code, &current.policy_code),
+        (&original.failure_stage, &current.failure_stage),
+    ] {
+        if original_code.is_some() && original_code != current_code {
+            return false;
+        }
+        if original_code.is_none()
+            && current_code.is_some()
+            && !matches!(
+                current.review_state.as_str(),
+                "retry_wait" | "blocked" | "completed" | "discarded"
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn startup_owner_initially_safe_pre_exec(owner: &StartupResearchOwner) -> bool {
+    owner.marker_absent
+        && owner.pid.is_none()
+        && owner.original_status == "starting"
+        && owner.original_gate_state == "pending"
+        && owner.original_policy_code.is_none()
+        && owner.original_failure_stage.is_none()
+}
+
+fn agent_status_transition_allowed(original: &str, current: &str) -> bool {
+    if original == current {
+        return true;
+    }
+    match (original, current) {
+        ("starting", "running")
+        | ("starting", "completed" | "failed" | "timed_out" | "cancelled")
+        | ("running", "completed" | "failed" | "timed_out" | "cancelled") => true,
+        ("starting" | "running", _) => false,
+        ("completed" | "failed" | "timed_out" | "cancelled", _) => false,
+        _ => false,
+    }
+}
+
+fn launch_gate_transition_allowed(original: &str, current: &str) -> bool {
+    if original == current {
+        return true;
+    }
+    matches!(
+        (original, current),
+        ("pending", "release_requested" | "released" | "failed")
+            | ("release_requested", "released" | "failed")
+    )
+}
+
+fn research_review_transition_allowed(original: &str, current: &str) -> bool {
+    if original == current {
+        return true;
+    }
+    matches!(
+        (original, current),
+        ("pending", "running")
+            | ("running", "ready" | "retry_wait" | "blocked" | "completed" | "discarded")
+            | ("ready", "completed" | "discarded")
+            | ("retry_wait", "blocked" | "completed" | "discarded")
+            | ("blocked", "completed" | "discarded")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn startup_owner(
+        status: &str,
+        gate_state: &str,
+        review_state: &str,
+        pid: Option<i64>,
+        log_path: &str,
+    ) -> StartupResearchOwner {
+        StartupResearchOwner {
+            run_id: 1,
+            project_id: "project".to_owned(),
+            review_id: "review".to_owned(),
+            pid,
+            status: status.to_owned(),
+            gate_state: gate_state.to_owned(),
+            policy_code: None,
+            failure_stage: None,
+            log_path: Some(PathBuf::from(log_path)),
+            review_state: review_state.to_owned(),
+            failure_code: None,
+            notes_json: None,
+            marker_absent: false,
+            authority: None,
+            original_status: status.to_owned(),
+            original_gate_state: gate_state.to_owned(),
+            original_policy_code: None,
+            original_failure_stage: None,
+        }
+    }
+
+    #[test]
+    fn startup_owner_snapshot_rejects_replaced_pid_or_log_path() {
+        let original = startup_owner("running", "pending", "running", Some(41), "/run/a.log");
+        let mut replacement = original.clone();
+        replacement.pid = Some(42);
+        assert!(!startup_owner_lifecycle_transition_allowed(
+            &original,
+            &replacement
+        ));
+
+        replacement = original.clone();
+        replacement.log_path = Some(PathBuf::from("/run/replaced.log"));
+        assert!(!startup_owner_lifecycle_transition_allowed(
+            &original,
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn startup_owner_lifecycle_only_advances_and_keeps_preexec_evidence() {
+        let original = startup_owner("running", "pending", "running", None, "/run/a.log");
+        let mut ready = original.clone();
+        ready.review_state = "ready".to_owned();
+        ready.gate_state = "released".to_owned();
+        assert!(startup_owner_lifecycle_transition_allowed(&original, &ready));
+
+        let mut regressed = ready.clone();
+        regressed.review_state = "running".to_owned();
+        assert!(!startup_owner_lifecycle_transition_allowed(
+            &ready,
+            &regressed
+        ));
+
+        let terminal = startup_owner("completed", "released", "completed", None, "/run/a.log");
+        let mut alternate_terminal = terminal.clone();
+        alternate_terminal.status = "failed".to_owned();
+        assert!(!startup_owner_lifecycle_transition_allowed(
+            &terminal,
+            &alternate_terminal
+        ));
+        let mut failed_gate = terminal.clone();
+        failed_gate.gate_state = "failed".to_owned();
+        assert!(!startup_owner_lifecycle_transition_allowed(
+            &terminal,
+            &failed_gate
+        ));
+
+        let mut preexec = original.clone();
+        preexec.status = "starting".to_owned();
+        assert!(!startup_owner_lifecycle_transition_allowed(
+            &original,
+            &preexec
+        ));
+    }
 }
