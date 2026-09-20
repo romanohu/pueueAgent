@@ -16,6 +16,12 @@ const OPEN_OPERATION_STAGES: &str =
 const RESEARCH_RETRY_FAILURE_UNSAFE: &str = "research_session_unsafe";
 const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
 
+enum RetryFailureExpectation<'a> {
+    Any,
+    Missing,
+    Exact(Option<&'a str>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResearchState {
     pub campaign_id: String,
@@ -518,17 +524,21 @@ impl<'db> ResearchRepository<'db> {
         Ok(self.retry_failure_code(review_id)?.is_some())
     }
 
-    pub fn retry_failure_code(&self, review_id: &str) -> Result<Option<String>, AppError> {
+    pub fn review_failure_code(&self, review_id: &str) -> Result<Option<String>, AppError> {
         let connection = self.db.connect()?;
-        let failure_code: Option<String> = connection
+        connection
             .query_row(
                 "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
                 [review_id],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(database_error("read research retry policy"))?
-            .flatten();
+            .map_err(database_error("read research review failure"))
+            .map(|failure_code| failure_code.flatten())
+    }
+
+    pub fn retry_failure_code(&self, review_id: &str) -> Result<Option<String>, AppError> {
+        let failure_code = self.review_failure_code(review_id)?;
         Ok(failure_code.filter(|code| {
             code == RESEARCH_RETRY_FAILURE_UNSAFE || code == RESEARCH_RETRY_FAILURE_POLICY
         }))
@@ -616,6 +626,152 @@ impl<'db> ResearchRepository<'db> {
         max_attempts: u32,
         now: i64,
     ) -> Result<bool, AppError> {
+        self.settle_retry_block(
+            review_id,
+            expected_state,
+            expected_attempt,
+            expected_run_id,
+            expected_event_status,
+            "research_attempt_limit",
+            RetryFailureExpectation::Any,
+            Some(max_attempts),
+            now,
+        )
+    }
+
+    /// Atomically settle a retry blocked by a research session or policy
+    /// safety failure.  The review, campaign state, and linked event are
+    /// committed together, so a stale or partially failing coordinator cannot
+    /// leave a retry permanently claimable or consume a second budget slot.
+    pub fn settle_retry_failure(
+        &self,
+        review_id: &str,
+        expected_state: &str,
+        expected_attempt: i64,
+        expected_run_id: Option<i64>,
+        expected_event_status: EventStatus,
+        failure_code: &str,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        if !matches!(failure_code, RESEARCH_RETRY_FAILURE_UNSAFE | RESEARCH_RETRY_FAILURE_POLICY) {
+            return Err(validation_error(
+                "research.failure_code",
+                "retry settlement requires a session or policy safety failure",
+            ));
+        }
+        if expected_state != "retry_wait" {
+            return Err(validation_error(
+                "research.state",
+                "persisted safety retry settlement requires retry_wait",
+            ));
+        }
+        self.settle_retry_block(
+            review_id,
+            expected_state,
+            expected_attempt,
+            expected_run_id,
+            expected_event_status,
+            failure_code,
+            RetryFailureExpectation::Exact(Some(failure_code)),
+            None,
+            now,
+        )
+    }
+
+    /// Atomically settle a pre-admission safety failure.  The caller supplies
+    /// the exact failure code observed before claiming the event, so a stale
+    /// retry cannot overwrite a newer ordinary failure.
+    pub fn settle_pre_admission_failure(
+        &self,
+        review_id: &str,
+        expected_state: &str,
+        expected_attempt: i64,
+        expected_run_id: Option<i64>,
+        expected_event_status: EventStatus,
+        expected_failure_code: Option<&str>,
+        failure_code: &str,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        if !matches!(failure_code, RESEARCH_RETRY_FAILURE_UNSAFE | RESEARCH_RETRY_FAILURE_POLICY) {
+            return Err(validation_error(
+                "research.failure_code",
+                "retry settlement requires a session or policy safety failure",
+            ));
+        }
+        if !matches!(expected_state, "pending" | "retry_wait")
+            || expected_event_status != EventStatus::Claimed
+        {
+            return Err(validation_error(
+                "research.state",
+                "pre-admission safety settlement requires a pending or retry_wait review and claimed event",
+            ));
+        }
+        self.settle_retry_block(
+            review_id,
+            expected_state,
+            expected_attempt,
+            expected_run_id,
+            expected_event_status,
+            failure_code,
+            RetryFailureExpectation::Exact(expected_failure_code),
+            None,
+            now,
+        )
+    }
+
+    /// Atomically settle an unbound first-attempt safety failure.  The
+    /// expected review must still be pending, have no owner or prior failure,
+    /// and have a claimed linked event.
+    pub fn settle_unbound_failure(
+        &self,
+        review_id: &str,
+        expected_state: &str,
+        expected_attempt: i64,
+        expected_run_id: Option<i64>,
+        expected_event_status: EventStatus,
+        failure_code: &str,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        if !matches!(failure_code, RESEARCH_RETRY_FAILURE_UNSAFE | RESEARCH_RETRY_FAILURE_POLICY) {
+            return Err(validation_error(
+                "research.failure_code",
+                "retry settlement requires a session or policy safety failure",
+            ));
+        }
+        if expected_state != "pending"
+            || expected_run_id.is_some()
+            || expected_event_status != EventStatus::Claimed
+        {
+            return Err(validation_error(
+                "research.state",
+                "unbound safety settlement requires a pending review with no owner and claimed event",
+            ));
+        }
+        self.settle_retry_block(
+            review_id,
+            expected_state,
+            expected_attempt,
+            expected_run_id,
+            expected_event_status,
+            failure_code,
+            RetryFailureExpectation::Missing,
+            None,
+            now,
+        )
+    }
+
+    fn settle_retry_block(
+        &self,
+        review_id: &str,
+        expected_state: &str,
+        expected_attempt: i64,
+        expected_run_id: Option<i64>,
+        expected_event_status: EventStatus,
+        failure_code: &str,
+        failure_expectation: RetryFailureExpectation<'_>,
+        max_attempts: Option<u32>,
+        now: i64,
+    ) -> Result<bool, AppError> {
         if review_id.is_empty() || expected_state.is_empty() {
             return Err(validation_error(
                 "research.review",
@@ -625,7 +781,7 @@ impl<'db> ResearchRepository<'db> {
         if !matches!(expected_state, "pending" | "retry_wait") {
             return Err(validation_error(
                 "research.state",
-                "attempt cap settlement requires pending or retry_wait",
+                "research retry settlement requires pending or retry_wait",
             ));
         }
         if !matches!(
@@ -638,13 +794,13 @@ impl<'db> ResearchRepository<'db> {
         ) {
             return Err(validation_error(
                 "event_status",
-                "attempt cap settlement requires a claimable or terminal event",
+                "research retry settlement requires a claimable or terminal event",
             ));
         }
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error("begin research attempt cap settlement"))?;
+            .map_err(database_error("begin research retry settlement"))?;
         let current: Option<(
             String,
             String,
@@ -689,13 +845,13 @@ impl<'db> ResearchRepository<'db> {
                 },
             )
             .optional()
-            .map_err(database_error("read research attempt cap settlement"))?;
+            .map_err(database_error("read research retry settlement"))?;
         let Some((
             campaign_id,
             state,
             attempt,
             run_id,
-            failure_code,
+            current_failure_code,
             event_id,
             event_status,
             owner_status,
@@ -705,7 +861,7 @@ impl<'db> ResearchRepository<'db> {
         else {
             transaction
                 .commit()
-                .map_err(database_error("commit missing research cap settlement"))?;
+                .map_err(database_error("commit missing research retry settlement"))?;
             return Ok(false);
         };
         if state != expected_state
@@ -713,10 +869,17 @@ impl<'db> ResearchRepository<'db> {
             || run_id != expected_run_id
             || event_status != expected_event_status
             || campaign_blocked_reason.is_some()
+            || !match failure_expectation {
+                RetryFailureExpectation::Any => true,
+                RetryFailureExpectation::Missing => current_failure_code.is_none(),
+                RetryFailureExpectation::Exact(expected) => {
+                    current_failure_code.as_deref() == expected
+                }
+            }
         {
             transaction
                 .commit()
-                .map_err(database_error("commit stale research cap settlement"))?;
+                .map_err(database_error("commit stale research retry settlement"))?;
             return Ok(false);
         }
         if run_id.is_some() {
@@ -727,32 +890,35 @@ impl<'db> ResearchRepository<'db> {
             {
                 transaction
                     .commit()
-                    .map_err(database_error("commit active research cap owner"))?;
+                    .map_err(database_error("commit active research retry owner"))?;
                 return Ok(false);
             }
         }
-        let target_attempt = if attempt > 0 && run_id.is_none() && failure_code.is_none() {
-            attempt
-        } else {
-            attempt.checked_add(1).ok_or_else(|| {
-                validation_error("research.attempt", "cannot advance review attempt")
-            })?
-        };
-        if target_attempt <= i64::from(max_attempts) {
-            transaction
-                .commit()
-                .map_err(database_error("commit non-capped research review"))?;
-            return Ok(false);
+        if let Some(max_attempts) = max_attempts {
+            let target_attempt = if attempt > 0 && run_id.is_none() && current_failure_code.is_none() {
+                attempt
+            } else {
+                attempt.checked_add(1).ok_or_else(|| {
+                    validation_error("research.attempt", "cannot advance review attempt")
+                })?
+            };
+            if target_attempt <= i64::from(max_attempts) {
+                transaction
+                    .commit()
+                    .map_err(database_error("commit non-capped research review"))?;
+                return Ok(false);
+            }
         }
         let changed = transaction
             .execute(
                 "UPDATE research_reviews
-                 SET state = 'blocked', failure_code = 'research_attempt_limit',
-                     finished_at = ?1, not_before = ?1, updated_at = ?1
-                 WHERE review_id = ?2 AND state = ?3 AND attempt = ?4
-                   AND ((agent_run_id IS NULL AND ?5 IS NULL) OR agent_run_id = ?5)
-                   AND event_id = ?6",
+                 SET state = 'blocked', failure_code = ?1,
+                     finished_at = ?2, not_before = ?2, updated_at = ?2
+                 WHERE review_id = ?3 AND state = ?4 AND attempt = ?5
+                   AND ((agent_run_id IS NULL AND ?6 IS NULL) OR agent_run_id = ?6)
+                   AND event_id = ?7",
                 params![
+                    failure_code,
                     now,
                     review_id,
                     expected_state,
@@ -761,43 +927,43 @@ impl<'db> ResearchRepository<'db> {
                     event_id,
                 ],
             )
-            .map_err(database_error("settle capped research review"))?;
+            .map_err(database_error("settle research retry review"))?;
         if changed != 1 {
             return Err(AppError::Runtime {
-                operation: "settle capped research review CAS",
+                operation: "settle research retry review CAS",
             });
         }
         let changed = transaction
             .execute(
                 "UPDATE campaign_research
-                 SET blocked_reason = 'research_attempt_limit', next_due_at = NULL,
-                     updated_at = ?1
-                 WHERE campaign_id = ?2 AND blocked_reason IS NULL",
-                params![now, campaign_id],
+                 SET blocked_reason = ?1, next_due_at = NULL,
+                     updated_at = ?2
+                 WHERE campaign_id = ?3 AND blocked_reason IS NULL",
+                params![failure_code, now, campaign_id],
             )
-            .map_err(database_error("block capped research campaign"))?;
+            .map_err(database_error("block research retry campaign"))?;
         if changed != 1 {
             return Err(AppError::Runtime {
-                operation: "settle capped research campaign CAS",
+                operation: "settle research retry campaign CAS",
             });
         }
         let changed = transaction
             .execute(
                 "UPDATE events
                  SET status = 'failed', lease_until = NULL,
-                     completed_at = ?1, last_error = 'research_attempt_limit'
-                 WHERE event_id = ?2 AND status = ?3",
-                params![now, event_id, expected_event_status],
+                     completed_at = ?1, last_error = ?2
+                 WHERE event_id = ?3 AND status = ?4",
+                params![now, failure_code, event_id, expected_event_status],
             )
-            .map_err(database_error("settle capped research event"))?;
+            .map_err(database_error("settle research retry event"))?;
         if changed != 1 {
             return Err(AppError::Runtime {
-                operation: "settle capped research event CAS",
+                operation: "settle research retry event CAS",
             });
         }
         transaction
             .commit()
-            .map_err(database_error("commit capped research settlement"))?;
+            .map_err(database_error("commit research retry settlement"))?;
         Ok(true)
     }
 

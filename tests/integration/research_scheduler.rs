@@ -1089,6 +1089,364 @@ fn attempt_cap_settlement_rejects_immutable_review_and_event_phases() {
     );
 }
 
+fn seed_retry_settlement_case(
+    failure_code: &str,
+    event_status: &str,
+) -> (SchedulerFixture, String, i64, i64) {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal retry owner");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET failure_code = ?1 WHERE review_id = ?2",
+            rusqlite::params![failure_code, &review_id],
+        )
+        .expect("seed retry settlement reason");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events SET status = ?1,
+                 lease_until = CASE WHEN ?1 = 'claimed' THEN 4_000 ELSE NULL END,
+                 not_before = 0
+             WHERE event_id = ?2",
+            rusqlite::params![event_status, event_id],
+        )
+        .expect("seed retry settlement event");
+    (fixture, review_id, run_id, event_id)
+}
+
+#[test]
+fn unsafe_retry_settlement_rolls_back_all_rows_on_event_failure() {
+    let (fixture, review_id, run_id, event_id) =
+        seed_retry_settlement_case("research_session_unsafe", "dead_letter");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_unsafe_event_update
+             BEFORE UPDATE OF status ON events
+             WHEN OLD.event_id = {event_id} AND NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'injected unsafe event failure'); END;"
+        ))
+        .expect("install unsafe event failure");
+
+    let failed = ResearchRepository::new(&fixture.db).settle_retry_failure(
+        &review_id,
+        "retry_wait",
+        1,
+        Some(run_id),
+        EventStatus::DeadLetter,
+        "research_session_unsafe",
+        3_001,
+    );
+    assert!(failed.is_err(), "event failure must abort unsafe settlement");
+    let repository = ResearchRepository::new(&fixture.db);
+    let review = repository.find(&review_id).expect("review after rollback");
+    assert_eq!(review.state, "retry_wait");
+    assert_eq!(
+        repository
+            .retry_failure_code(&review_id)
+            .expect("retry reason after rollback")
+            .as_deref(),
+        Some("research_session_unsafe")
+    );
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("campaign after rollback")
+            .blocked_reason,
+        None
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("event after rollback")
+            .expect("event row")
+            .status,
+        EventStatus::DeadLetter
+    );
+
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_unsafe_event_update")
+        .expect("remove unsafe event failure");
+    assert!(
+        repository
+            .settle_retry_failure(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::DeadLetter,
+                "research_session_unsafe",
+                3_002,
+            )
+            .expect("unsafe settlement")
+    );
+    let settled = repository.find(&review_id).expect("settled review");
+    assert_eq!(settled.state, "blocked");
+    assert_eq!(
+        repository
+            .retry_failure_code(&review_id)
+            .expect("settled retry reason")
+            .as_deref(),
+        Some("research_session_unsafe")
+    );
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("settled campaign")
+            .blocked_reason
+            .as_deref(),
+        Some("research_session_unsafe")
+    );
+    let settled_event = EventRepository::new(&fixture.db)
+        .find_by_id(event_id)
+        .expect("settled event")
+        .expect("event row");
+    assert_eq!(settled_event.status, EventStatus::Failed);
+    assert_eq!(settled_event.last_error.as_deref(), Some("research_session_unsafe"));
+    assert_eq!(
+        repository
+            .settle_retry_failure(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::DeadLetter,
+                "research_session_unsafe",
+                3_003,
+            )
+            .expect("repeated unsafe settlement"),
+        false
+    );
+}
+
+#[test]
+fn policy_retry_settlement_preserves_distinct_reason() {
+    let (fixture, review_id, run_id, event_id) =
+        seed_retry_settlement_case("research_policy_blocked", "retry_wait");
+    let repository = ResearchRepository::new(&fixture.db);
+    assert!(
+        repository
+            .settle_retry_failure(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::RetryWait,
+                "research_policy_blocked",
+                3_001,
+            )
+            .expect("policy settlement")
+    );
+    assert_eq!(
+        repository
+            .find(&review_id)
+            .expect("settled policy review")
+            .state,
+        "blocked"
+    );
+    assert_eq!(
+        repository
+            .retry_failure_code(&review_id)
+            .expect("settled policy reason")
+            .as_deref(),
+        Some("research_policy_blocked")
+    );
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("settled policy campaign")
+            .blocked_reason
+            .as_deref(),
+        Some("research_policy_blocked")
+    );
+    let event = EventRepository::new(&fixture.db)
+        .find_by_id(event_id)
+        .expect("settled policy event")
+        .expect("event row");
+    assert_eq!(event.status, EventStatus::Failed);
+    assert_eq!(event.last_error.as_deref(), Some("research_policy_blocked"));
+}
+
+#[test]
+fn pre_admission_policy_settlement_preserves_exact_prior_failure() {
+    let (fixture, review_id, run_id, event_id) =
+        seed_retry_settlement_case("research_output_invalid", "claimed");
+    let repository = ResearchRepository::new(&fixture.db);
+    assert!(
+        repository
+            .settle_pre_admission_failure(
+                &review_id,
+                "retry_wait",
+                1,
+                Some(run_id),
+                EventStatus::Claimed,
+                Some("research_output_invalid"),
+                "research_policy_blocked",
+                3_001,
+            )
+            .expect("pre-admission policy settlement")
+    );
+    assert_eq!(
+        repository
+            .state(&fixture.campaign_id)
+            .expect("policy campaign")
+            .blocked_reason
+            .as_deref(),
+        Some("research_policy_blocked")
+    );
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("policy event")
+            .expect("event row")
+            .last_error
+            .as_deref(),
+        Some("research_policy_blocked")
+    );
+}
+
+#[test]
+fn unbound_safety_settlement_rejects_bound_or_unclaimed_inputs() {
+    let (fixture, review_id, run_id, event_id) =
+        seed_retry_settlement_case("research_session_unsafe", "dead_letter");
+    let repository = ResearchRepository::new(&fixture.db);
+    assert!(repository
+        .settle_unbound_failure(
+            &review_id,
+            "retry_wait",
+            1,
+            Some(run_id),
+            EventStatus::DeadLetter,
+            "research_session_unsafe",
+            3_001,
+        )
+        .is_err());
+    assert!(repository
+        .settle_unbound_failure(
+            &review_id,
+            "pending",
+            1,
+            Some(run_id),
+            EventStatus::Claimed,
+            "research_session_unsafe",
+            3_001,
+        )
+        .is_err());
+    assert!(repository
+        .settle_unbound_failure(
+            &review_id,
+            "pending",
+            1,
+            None,
+            EventStatus::DeadLetter,
+            "research_session_unsafe",
+            3_001,
+        )
+        .is_err());
+    assert_eq!(
+        EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("unchanged event")
+            .expect("event row")
+            .status,
+        EventStatus::DeadLetter
+    );
+}
+
+#[test]
+fn retry_settlement_rejects_stale_attempt_owner_and_event_without_mutation() {
+    for mutation in ["attempt", "owner", "event", "reason"] {
+        let (fixture, review_id, run_id, event_id) =
+            seed_retry_settlement_case("research_session_unsafe", "dead_letter");
+        match mutation {
+            "attempt" => fixture
+                .db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE research_reviews SET attempt = 2 WHERE review_id = ?1",
+                    [&review_id],
+                )
+                .expect("mutate retry attempt after selection"),
+            "owner" => fixture
+                .db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE agent_runs SET status = 'running' WHERE run_id = ?1",
+                    [run_id],
+                )
+                .expect("mutate retry owner after selection"),
+            "event" => fixture
+                .db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE events SET status = 'failed' WHERE event_id = ?1",
+                    [event_id],
+                )
+                .expect("mutate retry event after selection"),
+            "reason" => fixture
+                .db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE research_reviews SET failure_code = NULL WHERE review_id = ?1",
+                    [&review_id],
+                )
+                .expect("mutate retry reason after selection"),
+            _ => unreachable!(),
+        };
+        let repository = ResearchRepository::new(&fixture.db);
+        assert_eq!(
+            repository
+                .settle_retry_failure(
+                    &review_id,
+                    "retry_wait",
+                    1,
+                    Some(run_id),
+                    EventStatus::DeadLetter,
+                    "research_session_unsafe",
+                    3_001,
+                )
+                .expect("stale retry settlement"),
+            false,
+            "{mutation} mutation must make settlement stale"
+        );
+        assert_eq!(
+            repository.find(&review_id).expect("unchanged review").state,
+            "retry_wait"
+        );
+        assert_eq!(
+            repository
+                .state(&fixture.campaign_id)
+                .expect("unchanged campaign")
+                .blocked_reason,
+            None
+        );
+    }
+}
+
 #[tokio::test]
 async fn startup_recovery_preserves_ready_research_outcome_until_run_finalization() {
     let fixture = fixture();

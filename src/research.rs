@@ -91,19 +91,28 @@ pub(crate) async fn run_due_research_with_cleanup_blocked_projects(
     }
     for review in due_reviews {
         if review.state == "retry_wait" && repository.retry_is_blocked(&review.review_id)? {
-            let reason = repository
-                .retry_failure_code(&review.review_id)?
-                .unwrap_or_else(|| "research_policy_blocked".to_owned());
-            repository.block_review(&review.review_id, &reason, now)?;
+            let Some(reason) = repository.retry_failure_code(&review.review_id)? else {
+                report.deferred += 1;
+                continue;
+            };
             let event_id = repository.event_id(&review.review_id)?;
-            EventRepository::new(db).transition_many(
-                &[event_id],
-                EventStatus::Failed,
+            let Some(event) = EventRepository::new(db).find_by_id(event_id)? else {
+                report.deferred += 1;
+                continue;
+            };
+            if repository.settle_retry_failure(
+                &review.review_id,
+                &review.state,
+                review.attempt,
+                review.agent_run_id,
+                event.status,
+                &reason,
                 now,
-                None,
-                Some(&reason),
-            )?;
-            report.blocked += 1;
+            )? {
+                report.blocked += 1;
+            } else {
+                report.deferred += 1;
+            }
             continue;
         }
         launch_review(
@@ -237,29 +246,45 @@ async fn launch_review(
     let project_config = match config::load(&project.config_path) {
         Ok(config) => config,
         Err(_) => {
-            repository.block_review(review_id, "research_policy_blocked", now)?;
-            let _ = EventRepository::new(db).transition_many(
-                &[event_id],
-                EventStatus::Failed,
+            let expected_failure_code = repository.review_failure_code(review_id)?;
+            if repository.settle_pre_admission_failure(
+                review_id,
+                &review.state,
+                review.attempt,
+                review.agent_run_id,
+                event.status,
+                expected_failure_code.as_deref(),
+                "research_policy_blocked",
                 now,
-                None,
-                Some("research_policy_blocked"),
-            )?;
-            report.blocked += 1;
+            )? {
+                report.blocked += 1;
+            } else {
+                EventRepository::new(db).defer_claimed(&[event_id])?;
+                report.deferred += 1;
+            }
             return Ok(());
         }
     };
     let project_policy = match runner.resolve_project_policy(&project, &project_config) {
         Ok(policy) => policy,
         Err(violation) => {
-            repository.block_review(review_id, "research_policy_blocked", now)?;
-            EventRepository::new(db).dead_letter_claimed_without_run(
-                &project.project_id,
-                &[event_id],
+            let _ = violation;
+            let expected_failure_code = repository.review_failure_code(review_id)?;
+            if repository.settle_pre_admission_failure(
+                review_id,
+                &review.state,
+                review.attempt,
+                review.agent_run_id,
+                event.status,
+                expected_failure_code.as_deref(),
+                "research_policy_blocked",
                 now,
-                &violation,
-            )?;
-            report.blocked += 1;
+            )? {
+                report.blocked += 1;
+            } else {
+                EventRepository::new(db).defer_claimed(&[event_id])?;
+                report.deferred += 1;
+            }
             return Ok(());
         }
     };
@@ -364,23 +389,18 @@ async fn launch_review(
         research_agent_config.context = match runner.research_context_for(&project_policy, &session_id) {
             Ok(context) => context,
             Err(_) => {
-                let blocked = repository.fail_unbound_attempt(
+                if repository.settle_unbound_failure(
                     review_id,
+                    &admitted_review.state,
+                    admitted_review.attempt,
+                    admitted_review.agent_run_id,
+                    event.status,
                     "research_session_unsafe",
                     now,
-                    limits.max_decision_attempts_per_cycle,
-                    true,
-                )?;
-                if blocked {
-                    let _ = EventRepository::new(db).transition_many(
-                        &[event_id],
-                        EventStatus::Failed,
-                        now,
-                        None,
-                        Some("research_session_unsafe"),
-                    )?;
+                )? {
                     report.blocked += 1;
                 } else {
+                    EventRepository::new(db).defer_claimed(&[event_id])?;
                     report.deferred += 1;
                 }
                 return Ok(());
@@ -461,43 +481,48 @@ fn handle_spawn_error(
         Some(PolicyViolationCode::SessionMissing | PolicyViolationCode::SessionNotOwned)
     );
     if unsafe_session_probe {
-        let blocked = repository.fail_unbound_attempt(
+        let review = repository.find(review_id)?;
+        let Some(event) = EventRepository::new(db).find_by_id(event_id)? else {
+            report.deferred += 1;
+            return Ok(());
+        };
+        let blocked = repository.settle_unbound_failure(
             review_id,
+            &review.state,
+            review.attempt,
+            review.agent_run_id,
+            event.status,
             "research_session_unsafe",
             now,
-            limits.max_decision_attempts_per_cycle,
-            true,
         )?;
         if blocked {
-            let _ = EventRepository::new(db).transition_many(
-                &[event_id],
-                EventStatus::Failed,
-                now,
-                None,
-                Some("research_session_unsafe"),
-            )?;
             report.blocked += 1;
         } else {
+            EventRepository::new(db).defer_claimed(&[event_id])?;
             report.deferred += 1;
         }
         return Ok(());
     }
-    if let Some(violation) = policy {
-        repository.block_review(review_id, "research_policy_blocked", now)?;
-        let project_id = EventRepository::new(db)
-            .find_by_id(event_id)?
-            .map(|event| event.project_id)
-            .ok_or(AppError::Validation {
-                field: "event_id",
-                message: "does not identify a persisted research event",
-            })?;
-        EventRepository::new(db).dead_letter_claimed_without_run(
-            &project_id,
-            &[event_id],
+    if policy.is_some() {
+        let review = repository.find(review_id)?;
+        let Some(event) = EventRepository::new(db).find_by_id(event_id)? else {
+            report.deferred += 1;
+            return Ok(());
+        };
+        if repository.settle_unbound_failure(
+            review_id,
+            &review.state,
+            review.attempt,
+            review.agent_run_id,
+            event.status,
+            "research_policy_blocked",
             now,
-            &violation,
-        )?;
-        report.blocked += 1;
+        )? {
+            report.blocked += 1;
+        } else {
+            EventRepository::new(db).defer_claimed(&[event_id])?;
+            report.deferred += 1;
+        }
         return Ok(());
     }
     let failure_code = match stage {
