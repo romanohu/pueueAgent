@@ -44,7 +44,7 @@ use pueue_agent::{
     },
     environment::PrivateRunTemp,
     models::{
-        CodeChangeCheckStatus, ExecutionProjection, HealthState, NewAgentRun,
+        CodeChangeCheckStatus, ExecutionProjection, HealthState,
         NewTaskObservation, SignalSummaryEntry,
     },
 };
@@ -2846,6 +2846,61 @@ async fn startup_pidless_absent_recovery_rolls_back_cleanup_and_cas_failures() {
     assert_eq!(after_snapshot.run_count, retired_snapshot.run_count);
     assert_eq!(after_snapshot.reservation_count, retired_snapshot.reservation_count);
     assert_eq!(after_snapshot.cleanup_phase, retired_snapshot.cleanup_phase);
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_pidless_marker_retains_owner(marker_contents: &[u8], label: &str) {
+    let harness = DaemonHarness::new();
+    prepare_healthy_research_fixture(&harness);
+    let seeded = seed_pidless_research_owner(&harness);
+    fs::write(&seeded.marker_path, marker_contents).unwrap();
+    fs::set_permissions(&seeded.marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let sentinel = seeded.run_temp.join(format!("{label}-retained"));
+    fs::write(&sentinel, b"startup-marker-owner-retained").unwrap();
+    let baseline = research_crash_snapshot(&harness.db, &seeded.review_id);
+    let mut daemon = harness.daemon();
+
+    for pass in 0..2 {
+        let report = daemon
+            .run_once()
+            .await
+            .unwrap_or_else(|error| panic!("{label} marker pass {pass} must retain owner: {error}"));
+        assert_eq!(report.research_started, 0, "{label} marker pass {pass}");
+        assert_eq!(
+            startup_recovery_db_snapshot(
+                &harness.db,
+                &seeded.campaign_id,
+                &seeded.review_id,
+                seeded.event_id,
+                seeded.run_id,
+            ),
+            seeded.snapshot,
+            "{label} marker pass {pass} must preserve all linked durable state"
+        );
+        assert_eq!(
+            research_crash_snapshot(&harness.db, &seeded.review_id),
+            baseline,
+            "{label} marker pass {pass} must not retire the owner"
+        );
+        assert_eq!(fs::read(&seeded.marker_path).unwrap(), marker_contents);
+        assert!(sentinel.is_file(), "{label} marker pass {pass} cleaned the generation");
+        assert!(seeded.run_temp.is_dir());
+        assert_eq!(
+            AgentRunRepository::new(&harness.db)
+                .find_by_id(seeded.run_id)
+                .unwrap()
+                .unwrap()
+                .pid,
+            None
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn startup_pidless_research_marker_uncertainty_never_retires_owner() {
+    assert_pidless_marker_retains_owner(b"authorized\n", "valid").await;
+    assert_pidless_marker_retains_owner(b"invalid\n", "indeterminate").await;
 }
 
 #[cfg(target_os = "linux")]
