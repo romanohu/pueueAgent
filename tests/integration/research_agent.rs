@@ -3634,7 +3634,7 @@ async fn research_replacement_daemon_reuses_reservation_without_binding() {
     );
     assert_eq!(harness.reservation_status(&admitted.reservation_id), "consumed");
     assert_eq!(harness.campaign_reservation_count(&claimed.review.campaign_id), 1);
-    assert!(claimed.review.agent_run_id.is_none());
+    assert!(prepared.agent_run_id.is_none());
     assert_eq!(prepared.attempt, 1);
     assert_eq!(prepared.state, "pending");
 

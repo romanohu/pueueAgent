@@ -1947,6 +1947,29 @@ impl<'db> ResearchRepository<'db> {
                 "typed startup retry must retain its failure code",
             ));
         }
+        let persisted_retry_wake = if current.state == "retry_wait" {
+            Some(
+                transaction
+                    .query_row(
+                        "SELECT not_before
+                         FROM research_reviews
+                         WHERE review_id = ?1 AND state = 'retry_wait'
+                           AND agent_run_id = ?2 AND attempt = ?3
+                           AND session_generation = ?4 AND failure_code = ?5",
+                        params![
+                            current.review_id,
+                            current.agent_run_id,
+                            current.attempt,
+                            current.review_generation,
+                            current.failure_code,
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(database_error("read classified research retry wake"))?,
+            )
+        } else {
+            None
+        };
         if !parsed_authority.cleanup_complete && cleanup.is_none() {
             return Err(validation_error(
                 "research.native_recovery.cleanup",
@@ -2109,9 +2132,6 @@ impl<'db> ResearchRepository<'db> {
             }
         }
         if review_retry && event_transient {
-            let retry_at = now.saturating_add(
-                crate::retry::retry_backoff_seconds(current.attempt.max(1)),
-            );
             let changed = if current.state == "blocked" {
                 transaction
                     .execute(
@@ -2122,6 +2142,9 @@ impl<'db> ResearchRepository<'db> {
                         params![now, current.failure_code, event_id, event_status],
                     )
             } else {
+                let retry_at = persisted_retry_wake.ok_or_else(|| AppError::Runtime {
+                    operation: "read classified research retry wake",
+                })?;
                 transaction
                     .execute(
                         "UPDATE events
@@ -5219,6 +5242,119 @@ mod tests {
         row.detached_campaign_project_ids
             .insert("campaign-project".to_owned());
         assert!(!native_research_owner_is_complete(&row));
+    }
+
+    #[test]
+    fn retire_startup_native_owner_preserves_classified_retry_wake() {
+        let (_temp, db, run_id, project_id) = detached_history_fixture();
+        let connection = db.connect().expect("classified retry read connection");
+        let (review_id, event_id, notes_json): (String, i64, String) = connection
+            .query_row(
+                "SELECT review_id, event_id, notes_json
+                 FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("classified retry review");
+        let mut notes: Value = serde_json::from_str(&notes_json).expect("classified retry notes");
+        let authority = notes["retry_history"][0]["native_recovery"].clone();
+        let planned_session = authority["session_id"]
+            .as_str()
+            .expect("classified retry planned session")
+            .to_owned();
+        let confirmed_session = "22222222-2222-4222-8222-222222222222";
+        notes["native_recovery"] = authority;
+        notes["planned_session_id"] = json!(planned_session);
+        notes["confirmed_session_id"] = json!(confirmed_session);
+        notes["session_binding"] = json!("confirmed");
+        let notes_json = notes.to_string();
+        let original_wake = 3_001_i64;
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [confirmed_session],
+            )
+            .expect("classified retry campaign session");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'retry_wait', attempt = 1, agent_run_id = ?1,
+                     failure_code = 'research_output_invalid', not_before = ?2,
+                     notes_json = ?3
+                 WHERE review_id = ?4",
+                rusqlite::params![run_id, original_wake, notes_json, review_id],
+            )
+            .expect("classified retry review binding");
+        connection
+            .execute(
+                "UPDATE events
+                 SET status = 'dispatched', lease_until = NULL, not_before = ?1,
+                     last_error = NULL
+                 WHERE event_id = ?2",
+                rusqlite::params![original_wake, event_id],
+            )
+            .expect("classified retry event binding");
+        drop(connection);
+
+        let connection = db.connect().expect("classified retry owner connection");
+        let row = native_research_owner_rows(&connection, None)
+            .expect("read classified retry owner")
+            .into_iter()
+            .find(|row| row.agent_run_id == run_id)
+            .expect("classified retry owner row");
+        let owner = startup_research_owner_from_row(row, false);
+        assert_eq!(owner.review_state, "retry_wait");
+        assert!(owner.authority.is_some());
+        drop(connection);
+
+        let repository = ResearchRepository::new(&db);
+        assert!(repository
+            .retire_startup_native_owner(&owner, None, 5_000)
+            .expect("retire classified retry owner"));
+
+        let connection = db.connect().expect("classified retry result connection");
+        let (event_status, event_not_before): (EventStatus, i64) = connection
+            .query_row(
+                "SELECT status, not_before FROM events WHERE event_id = ?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("classified retry event result");
+        let (review_state, review_failure, review_not_before, review_session, after_notes): (
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT state, failure_code, not_before,
+                        (SELECT session_id FROM campaign_research
+                         WHERE campaign_id = 'detached-history-campaign'), notes_json
+                 FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("classified retry review result");
+        assert_eq!(event_status, EventStatus::RetryWait);
+        assert_eq!(event_not_before, original_wake);
+        assert_eq!(review_state, "retry_wait");
+        assert_eq!(review_failure.as_deref(), Some("research_output_invalid"));
+        assert_eq!(review_not_before, original_wake);
+        assert_eq!(review_session.as_deref(), Some(confirmed_session));
+        assert_eq!(after_notes, notes_json);
+        assert_eq!(project_id, "detached-history-project");
     }
 
     #[test]
