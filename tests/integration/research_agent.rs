@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -17,7 +17,9 @@ use pueue_agent::{
         ExperimentRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
         TaskObservationRepository,
     },
-    environment::MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+    environment::{
+        PrivateRunTempRecoveryIdentityV1, MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+    },
     execution_policy::{
         load_existing_policy, AgentKind, CampaignLimits, PolicyLoadInput, PolicyViolationCode,
         StartupEnvironment,
@@ -823,6 +825,18 @@ max_agent_runs = 10
             .unwrap()
     }
 
+    fn campaign_reservation_count(&self, campaign_id: &str) -> i64 {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn review_notes(&self, review_id: &str) -> serde_json::Value {
         let notes_json: String = self
             .db
@@ -835,6 +849,87 @@ max_agent_runs = 10
             )
             .unwrap();
         serde_json::from_str(&notes_json).unwrap()
+    }
+
+    fn assert_recovery_identity(
+        &self,
+        authority: &serde_json::Value,
+        run_id: i64,
+    ) -> PrivateRunTempRecoveryIdentityV1 {
+        let identity: PrivateRunTempRecoveryIdentityV1 = serde_json::from_value(
+            serde_json::json!({
+                "service_root_identity": authority
+                    .get("service_root_identity")
+                    .expect("recovery authority service-root identity"),
+                "temp_identity": authority
+                    .get("temp_identity")
+                    .expect("recovery authority temp identity"),
+            }),
+        )
+        .expect("strict recovery identity projection");
+        let service_root = self.project.root_path.join(".pueue-agent");
+        let temp_parent = service_root.join("tmp");
+        let run_temp = temp_parent.join(run_id.to_string());
+        let root_metadata = fs::metadata(&self.project.root_path).expect("project root metadata");
+        let service_metadata = fs::metadata(&service_root).expect("service root metadata");
+        let parent_metadata = fs::metadata(&temp_parent).expect("private temp parent metadata");
+        let temp_metadata = fs::metadata(&run_temp).expect("private temp metadata");
+        let root_mode = root_metadata.mode() & 0o7777;
+        assert_eq!(identity.service_root_identity.device, root_metadata.dev());
+        assert_eq!(identity.service_root_identity.inode, root_metadata.ino());
+        assert_eq!(identity.service_root_identity.owner, root_metadata.uid());
+        assert_eq!(identity.service_root_identity.mode, root_mode);
+        assert_eq!(
+            identity.service_root_identity.resolution_fingerprint,
+            self.project_policy.root_anchor.resolution_fingerprint
+        );
+        assert_eq!(identity.temp_identity.device, temp_metadata.dev());
+        assert_eq!(identity.temp_identity.inode, temp_metadata.ino());
+        assert_eq!(identity.temp_identity.owner, temp_metadata.uid());
+        assert_eq!(identity.temp_identity.mode, temp_metadata.mode() & 0o7777);
+        assert_eq!(
+            identity.temp_identity.service_identity.device,
+            service_metadata.dev()
+        );
+        assert_eq!(
+            identity.temp_identity.service_identity.inode,
+            service_metadata.ino()
+        );
+        assert_eq!(
+            identity.temp_identity.service_identity.owner,
+            service_metadata.uid()
+        );
+        assert_eq!(
+            identity.temp_identity.service_identity.mode,
+            service_metadata.mode() & 0o7777
+        );
+        assert_eq!(
+            identity.temp_identity.parent_identity.device,
+            parent_metadata.dev()
+        );
+        assert_eq!(
+            identity.temp_identity.parent_identity.inode,
+            parent_metadata.ino()
+        );
+        assert_eq!(
+            identity.temp_identity.parent_identity.owner,
+            parent_metadata.uid()
+        );
+        assert_eq!(
+            identity.temp_identity.parent_identity.mode,
+            parent_metadata.mode() & 0o7777
+        );
+        assert_eq!(identity.temp_identity.mount_identity.len(), 2);
+        identity
+    }
+
+    fn authority_without_cleanup(authority: &serde_json::Value) -> serde_json::Value {
+        let mut immutable = authority
+            .as_object()
+            .expect("native recovery authority object")
+            .clone();
+        immutable.remove("cleanup");
+        serde_json::Value::Object(immutable)
     }
 
     // Fixture-only simulation of the future Task 5 action consumer. Production
@@ -1567,26 +1662,12 @@ async fn research_native_launch_records_recovery_authority_before_child_activity
         notes_while_child_is_held.get("planned_session_id")
     );
 
-    let service_root_identity = authority
-        .get("service_root_identity")
-        .and_then(serde_json::Value::as_object)
-        .expect("recovery authority must retain the original service-root identity");
-    for field in ["device", "inode", "owner", "mode", "resolution"] {
-        assert!(
-            service_root_identity.contains_key(field),
-            "service-root identity must include {field}"
-        );
-    }
-    let temp_identity = authority
-        .get("temp_identity")
-        .and_then(serde_json::Value::as_object)
-        .expect("recovery authority must retain the original private-temp identity");
-    for field in ["device", "inode", "owner", "mode", "mount"] {
-        assert!(
-            temp_identity.contains_key(field),
-            "private-temp identity must include {field}"
-        );
-    }
+    harness.assert_recovery_identity(
+        notes_while_child_is_held
+            .get("native_recovery")
+            .expect("native recovery authority value"),
+        handle.run_id,
+    );
     assert_eq!(
         notes_while_child_is_held.get("business_note"),
         seed_notes.get("business_note")
@@ -1728,6 +1809,410 @@ async fn research_cleanup_gate_stays_pending_until_retained_cleanup_completes() 
         completed_notes,
         "repeated cleanup polling must be idempotent"
     );
+}
+
+#[tokio::test]
+async fn research_recovery_authority_write_failure_retains_original_token_until_retry() {
+    let harness = ResearchHarness::new("native-recovery-authority-write-failure", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let seed_notes = serde_json::json!({
+        "business_note": "preserve across authority write retry",
+        "retry_history": [{"attempt": -1, "proof": "prior-native-proof"}],
+    });
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            rusqlite::params![seed_notes.to_string(), &claimed.review.review_id],
+        )
+        .unwrap();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_research_recovery_authority_write
+             BEFORE UPDATE OF notes_json ON research_reviews
+             WHEN NEW.notes_json LIKE '%\"native_recovery\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected native recovery authority write failure'); END;",
+        )
+        .unwrap();
+
+    let result = harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await;
+    let mut cleanup = match result {
+        Ok(mut handle) => {
+            harness.release_child();
+            let _ = handle.wait(&harness.db, NOW + 91).await;
+            panic!("authority persistence failure must prevent native child launch");
+        }
+        Err(error) => error
+            .cleanup
+            .expect("authority persistence failure must retain cleanup authority"),
+    };
+    let run_id = cleanup.run_id();
+    let private_dir = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string());
+    let original_temp_metadata = fs::metadata(&private_dir).expect("retained temp metadata");
+    let original_temp_snapshot = (
+        original_temp_metadata.dev(),
+        original_temp_metadata.ino(),
+        original_temp_metadata.uid(),
+        original_temp_metadata.mode() & 0o7777,
+    );
+    assert!(
+        !harness.capture_path.exists(),
+        "authority must be durable before the native child can execute"
+    );
+    let run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("bound run must persist before retained cleanup");
+    assert_eq!(run.pid, None, "authority failure must precede helper publication");
+    let mut marker_path = run.log_path.as_os_str().to_os_string();
+    marker_path.push(".gate-started");
+    assert!(
+        !PathBuf::from(marker_path).exists(),
+        "authority failure must precede launch-marker publication"
+    );
+    assert_eq!(
+        fs::read_dir(&private_dir).unwrap().count(),
+        0,
+        "authority failure must precede schema/output preparation"
+    );
+    let reservation_count = harness.campaign_reservation_count(&claimed.review.campaign_id);
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+
+    let temp_parent = private_dir.parent().expect("private temp parent");
+    let displaced_original = temp_parent.join(format!("{}.original", run_id));
+    let replacement_sentinel = "replacement-must-remain-untouched";
+    fs::rename(&private_dir, &displaced_original).unwrap();
+    fs::create_dir(&private_dir).unwrap();
+    fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        private_dir.join("sentinel.txt"),
+        replacement_sentinel.as_bytes(),
+    )
+    .unwrap();
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_research_recovery_authority_write")
+        .unwrap();
+    assert!(
+        cleanup.retry(&harness.db, NOW + 92).await.is_err(),
+        "retained original authority must reject a replacement generation"
+    );
+    assert_eq!(
+        fs::read_to_string(private_dir.join("sentinel.txt")).unwrap(),
+        replacement_sentinel,
+        "replacement generation must remain untouched"
+    );
+    if let Some(authority) = harness
+        .review_notes(&claimed.review.review_id)
+        .get("native_recovery")
+        .cloned()
+    {
+        let identity: PrivateRunTempRecoveryIdentityV1 = serde_json::from_value(
+            serde_json::json!({
+                "service_root_identity": authority
+                    .get("service_root_identity")
+                    .expect("recovery authority service-root identity"),
+                "temp_identity": authority
+                    .get("temp_identity")
+                    .expect("recovery authority temp identity"),
+            }),
+        )
+        .expect("strict retained recovery identity");
+        assert_eq!(
+            (
+                identity.temp_identity.device,
+                identity.temp_identity.inode,
+                identity.temp_identity.owner,
+                identity.temp_identity.mode,
+            ),
+            original_temp_snapshot,
+            "a rejected replacement must never become the persisted recovery identity"
+        );
+    }
+    fs::remove_dir_all(&private_dir).unwrap();
+    fs::rename(&displaced_original, &private_dir).unwrap();
+    cleanup
+        .retry(&harness.db, NOW + 93)
+        .await
+        .expect("retained authority must retry finalization and cleanup");
+
+    let review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(review.state, "retry_wait");
+    assert_eq!(
+        review.response_json, None,
+        "a pre-child authority failure must not create a research answer"
+    );
+    let notes = harness.review_notes(&claimed.review.review_id);
+    assert_eq!(notes["business_note"], seed_notes["business_note"]);
+    assert_eq!(notes["retry_history"], seed_notes["retry_history"]);
+    let authority = notes
+        .get("native_recovery")
+        .and_then(serde_json::Value::as_object)
+        .expect("retry must persist the retained original authority");
+    assert_eq!(
+        authority
+            .get("cleanup")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|cleanup| cleanup.get("phase")),
+        Some(&serde_json::json!("complete"))
+    );
+    let persisted_identity =
+        harness.assert_recovery_identity(&serde_json::Value::Object(authority.clone()), run_id);
+    assert_eq!(
+        (
+            persisted_identity.temp_identity.device,
+            persisted_identity.temp_identity.inode,
+            persisted_identity.temp_identity.owner,
+            persisted_identity.temp_identity.mode,
+        ),
+        original_temp_snapshot,
+        "retry must persist the retained original generation identity"
+    );
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count,
+        "cleanup retry must not reserve another budget slot"
+    );
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert!(!harness.capture_path.exists());
+
+    cleanup
+        .retry(&harness.db, NOW + 94)
+        .await
+        .expect("repeated retained cleanup retry must be idempotent");
+    assert_eq!(harness.review_notes(&claimed.review.review_id), notes);
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count
+    );
+}
+
+#[tokio::test]
+async fn research_cleanup_authority_write_failure_preserves_ready_result_until_retry() {
+    let harness = ResearchHarness::new("native-recovery-cleanup-write-failure", FIRST_SESSION);
+    let claimed = harness.initial_review();
+    let seed_notes = serde_json::json!({
+        "business_note": "ready result must remain immutable",
+        "retry_history": [{"attempt": -1, "proof": "prior-native-proof"}],
+    });
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+            rusqlite::params![seed_notes.to_string(), &claimed.review.review_id],
+        )
+        .unwrap();
+    let mut handle = match harness
+        .try_launch_with_thread_id_barrier(
+            &claimed,
+            AgentContextMode::Fresh,
+            FIRST_SESSION,
+            FIRST_SESSION,
+            true,
+            None,
+            true,
+        )
+        .await
+    {
+        Ok(handle) => handle,
+        Err(error) => panic!("research launch must bind before cleanup fault injection: {error}"),
+    };
+    harness.wait_for_child_ready().await;
+    let run_id = handle.run_id;
+    let authority_before = harness.review_notes(&claimed.review.review_id);
+    let authority_before_value = match authority_before.get("native_recovery").cloned() {
+        Some(value) => value,
+        None => {
+            harness.release_child();
+            let _ = handle.wait(&harness.db, NOW + 91).await;
+            panic!("native launch must persist authority before child activity");
+        }
+    };
+    let authority_before_identity = harness.assert_recovery_identity(&authority_before_value, run_id);
+    let immutable_authority_before =
+        ResearchHarness::authority_without_cleanup(&authority_before_value);
+    let reservation_id = harness.reservation_id_for(&claimed.review);
+    let reservation_count = harness.campaign_reservation_count(&claimed.review.campaign_id);
+    let private_dir = harness
+        .project
+        .root_path
+        .join(".pueue-agent")
+        .join("tmp")
+        .join(run_id.to_string());
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_research_recovery_cleanup_write
+             BEFORE UPDATE OF notes_json ON research_reviews
+             WHEN NEW.notes_json LIKE '%\"native_recovery\"%'
+               AND NEW.notes_json LIKE '%\"phase\":\"complete\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected native recovery cleanup write failure'); END;",
+        )
+        .unwrap();
+    harness.release_child();
+    let first_error = match handle.wait(&harness.db, NOW + 91).await {
+        Ok(status) => {
+            let _ = handle.wait(&harness.db, NOW + 92).await;
+            panic!("cleanup authority write failure must retain the handle, got {status:?}");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&first_error, pueue_agent::AppError::Database { .. }),
+        "cleanup completion must fail at the injected database transition: {first_error:?}"
+    );
+    assert!(
+        first_error
+            .to_string()
+            .contains("injected native recovery cleanup write failure"),
+        "cleanup completion must report the injected trigger: {first_error}"
+    );
+    let persisted_run = AgentRunRepository::new(&harness.db)
+        .find_by_id(run_id)
+        .unwrap()
+        .expect("terminal research run must persist before cleanup gate completion");
+    assert_eq!(persisted_run.status, AgentRunStatus::Completed);
+    assert_eq!(
+        fs::read_dir(&private_dir).unwrap().count(),
+        0,
+        "cleanup completion failure must occur after private contents are removed"
+    );
+
+    let pending_review = ResearchRepository::new(&harness.db)
+        .find(&claimed.review.review_id)
+        .unwrap();
+    assert_eq!(pending_review.state, "ready");
+    let response_json = pending_review
+        .response_json
+        .clone()
+        .expect("ready response must remain persisted");
+    let pending_notes = harness.review_notes(&claimed.review.review_id);
+    assert_eq!(pending_notes["business_note"], seed_notes["business_note"]);
+    assert_eq!(pending_notes["retry_history"], seed_notes["retry_history"]);
+    assert_eq!(
+        ResearchHarness::authority_without_cleanup(
+            pending_notes
+                .get("native_recovery")
+                .expect("pending cleanup must retain authority")
+        ),
+        immutable_authority_before,
+        "cleanup retry must mutate only the cleanup phase"
+    );
+    assert_eq!(
+        pending_notes
+            .get("native_recovery")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|authority| authority.get("cleanup"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|cleanup| cleanup.get("phase")),
+        Some(&serde_json::json!("pending"))
+    );
+    let token_after_failure = harness.assert_recovery_identity(
+        pending_notes
+            .get("native_recovery")
+            .expect("pending cleanup must retain authority"),
+        run_id,
+    );
+    assert_eq!(
+        token_after_failure,
+        authority_before_identity
+    );
+    let session_after_failure = harness
+        .research_session()
+        .expect("ready result must retain its confirmed session");
+    let reservation_status = harness.reservation_status(&reservation_id);
+    assert_eq!(reservation_status, "consumed");
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_research_recovery_cleanup_write")
+        .unwrap();
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 92).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    let completed_notes = harness.review_notes(&claimed.review.review_id);
+    assert_eq!(completed_notes["business_note"], pending_notes["business_note"]);
+    assert_eq!(completed_notes["retry_history"], pending_notes["retry_history"]);
+    assert_eq!(
+        ResearchHarness::authority_without_cleanup(
+            completed_notes
+                .get("native_recovery")
+                .expect("completed cleanup must retain authority")
+        ),
+        immutable_authority_before,
+        "cleanup completion must mutate only the cleanup phase"
+    );
+    assert_eq!(
+        completed_notes
+            .get("native_recovery")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|authority| authority.get("cleanup"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|cleanup| cleanup.get("phase")),
+        Some(&serde_json::json!("complete"))
+    );
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&claimed.review.review_id)
+            .unwrap()
+            .response_json
+            .as_deref(),
+        Some(response_json.as_str())
+    );
+    assert_eq!(harness.research_session().as_deref(), Some(session_after_failure.as_str()));
+    assert_eq!(
+        harness.campaign_reservation_count(&claimed.review.campaign_id),
+        reservation_count
+    );
+    assert_eq!(harness.reservation_status(&reservation_id), "consumed");
+    assert_eq!(
+        harness.assert_recovery_identity(
+            completed_notes
+                .get("native_recovery")
+                .expect("completed cleanup must retain authority"),
+            run_id,
+        ),
+        token_after_failure
+    );
+
+    assert_eq!(
+        handle.wait(&harness.db, NOW + 93).await.unwrap(),
+        AgentRunStatus::Completed
+    );
+    assert_eq!(harness.review_notes(&claimed.review.review_id), completed_notes);
 }
 
 #[tokio::test]
