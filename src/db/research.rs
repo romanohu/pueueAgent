@@ -1849,7 +1849,7 @@ impl<'db> ResearchRepository<'db> {
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT r.review_id, r.agent_run_id, run.status
+                "SELECT r.review_id, r.agent_run_id, r.attempt, run.status
                  FROM research_reviews AS r
                  LEFT JOIN agent_runs AS run ON run.run_id = r.agent_run_id
                  WHERE r.state = 'running'",
@@ -1860,7 +1860,8 @@ impl<'db> ResearchRepository<'db> {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(database_error("query research terminal recovery"))?
@@ -1868,7 +1869,7 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("read research terminal recovery"))?;
         drop(statement);
         let mut recovered = 0;
-        for (review_id, run_id, status) in rows {
+        for (review_id, run_id, attempt, status) in rows {
             let Some(run_id) = run_id else {
                 self.block_review(&review_id, "research_lineage_corrupt", now)?;
                 recovered += 1;
@@ -1882,15 +1883,15 @@ impl<'db> ResearchRepository<'db> {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(database_error("begin terminal research retry"))?;
-                let retry_at = now.saturating_add(crate::retry::retry_backoff_seconds(1));
+                let retry_at = now.saturating_add(crate::retry::retry_backoff_seconds(attempt.max(1)));
                 let changed = transaction
                     .execute(
                         "UPDATE research_reviews
                          SET state = 'retry_wait', failure_code = 'research_interrupted',
-                             finished_at = ?1, not_before = ?1, updated_at = ?1
-                         WHERE review_id = ?2 AND state = 'running'
-                           AND agent_run_id = ?3",
-                        params![now, review_id, run_id],
+                             finished_at = ?1, not_before = ?2, updated_at = ?1
+                         WHERE review_id = ?3 AND state = 'running'
+                           AND agent_run_id = ?4",
+                        params![now, retry_at, review_id, run_id],
                     )
                     .map_err(database_error("record terminal research retry"))?;
                 transaction

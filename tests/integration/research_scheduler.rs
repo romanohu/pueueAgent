@@ -2361,6 +2361,231 @@ async fn startup_recovery_preserves_classified_research_failure_for_retry() {
 }
 
 #[tokio::test]
+async fn research_recovery_preserves_due_review_and_event_wakes() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+    set_fixture_native_cleanup_phase(&fixture, &review_id, "complete");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs
+             SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal retry owner");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET not_before = 260, updated_at = 260
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("seed durable review wake");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events
+             SET status = 'retry_wait', not_before = 260, lease_until = NULL
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .expect("seed durable event wake");
+
+    recover_research(&fixture.db, 260, CampaignLimits::default())
+        .await
+        .expect("startup research recovery");
+
+    let review = ResearchRepository::new(&fixture.db)
+        .find(&review_id)
+        .expect("read recovered review");
+    let review_not_before: i64 = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
+            [&review_id],
+            |row| row.get(0),
+        )
+        .expect("read recovered review wake");
+    let event = EventRepository::new(&fixture.db)
+        .find_by_id(event_id)
+        .expect("read recovered event")
+        .expect("research event row");
+    assert_eq!(review_not_before, 260, "recovery must preserve the durable review wake");
+    assert_eq!(event.not_before, 260, "recovery must preserve the durable event wake");
+    assert_eq!(review.state, "retry_wait");
+    assert_eq!(event.status, EventStatus::RetryWait);
+    assert_eq!(
+        ResearchRepository::new(&fixture.db)
+            .due_launch_reviews(260, 1, 3)
+            .expect("due research reviews")
+            .iter()
+            .map(|candidate| candidate.review_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![review_id.as_str()],
+        "a due retry must remain eligible after startup recovery"
+    );
+}
+
+#[tokio::test]
+async fn research_recovery_uses_attempt_backoff_once_for_terminal_owner() {
+    let fixture = fixture();
+    let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "running");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews
+             SET attempt = 2,
+                 notes_json = json_set(notes_json, '$.native_recovery.attempt', 2)
+             WHERE review_id = ?1",
+            [&review_id],
+        )
+        .expect("seed second research attempt");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs
+             SET status = 'failed', launch_gate_state = 'released'
+             WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("seed terminal owner");
+    fixture
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE events
+             SET status = 'in_flight', not_before = 0, lease_until = NULL
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .expect("seed in-flight event");
+
+    recover_research(&fixture.db, 3_000, CampaignLimits::default())
+        .await
+        .expect("recover terminal research owner");
+    let first_wakes: (i64, i64) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT review.not_before, event.not_before
+             FROM research_reviews AS review
+             JOIN events AS event ON event.event_id = review.event_id
+             WHERE review.review_id = ?1",
+            [&review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read first recovery wakes");
+    assert_eq!(first_wakes, (3_120, 3_120));
+
+    recover_research(&fixture.db, 3_120, CampaignLimits::default())
+        .await
+        .expect("repeat research recovery");
+    let second_wakes: (i64, i64) = fixture
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT review.not_before, event.not_before
+             FROM research_reviews AS review
+             JOIN events AS event ON event.event_id = review.event_id
+             WHERE review.review_id = ?1",
+            [&review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read repeated recovery wakes");
+    assert_eq!(second_wakes, first_wakes);
+}
+
+#[tokio::test]
+async fn research_recovery_leaves_unsafe_and_capped_retries_for_atomic_settlement() {
+    for (failure_code, capped) in [
+        ("research_session_unsafe", false),
+        ("research_output_invalid", true),
+    ] {
+        let fixture = fixture();
+        let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "retry_wait");
+        set_fixture_native_cleanup_phase(&fixture, &review_id, "complete");
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', launch_gate_state = 'released'
+                 WHERE run_id = ?1",
+                [run_id],
+            )
+            .expect("seed terminal retry owner");
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET attempt = CASE WHEN ?1 THEN 3 ELSE attempt END,
+                     failure_code = ?2, not_before = 260, updated_at = 260,
+                     notes_json = CASE WHEN ?1
+                         THEN json_set(notes_json, '$.native_recovery.attempt', 3)
+                         ELSE notes_json END
+                 WHERE review_id = ?3",
+                rusqlite::params![capped, failure_code, &review_id],
+            )
+            .expect("seed typed retry boundary");
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE events
+                 SET status = 'dead_letter', not_before = 260, lease_until = NULL
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .expect("seed terminal retry event");
+
+        recover_research(&fixture.db, 260, CampaignLimits::default())
+            .await
+            .expect("startup research recovery");
+
+        let review = ResearchRepository::new(&fixture.db)
+            .find(&review_id)
+            .expect("read recovered typed retry");
+        let event = EventRepository::new(&fixture.db)
+            .find_by_id(event_id)
+            .expect("read recovered typed event")
+            .expect("typed research event row");
+        assert_eq!(review.state, "retry_wait", "{failure_code} must remain settleable");
+        assert_eq!(event.status, EventStatus::DeadLetter);
+        assert_eq!(
+            ResearchRepository::new(&fixture.db)
+                .due_launch_reviews(260, 1, 3)
+                .expect("typed retry candidates")
+                .iter()
+                .map(|candidate| candidate.review_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![review_id.as_str()],
+            "{failure_code} must remain visible to atomic settlement"
+        );
+    }
+}
+
+#[tokio::test]
 async fn standalone_research_recovery_requires_startup_owner_evidence() {
     let fixture = fixture();
     let (review_id, run_id, event_id) = seed_active_research_outcome(&fixture, "running");

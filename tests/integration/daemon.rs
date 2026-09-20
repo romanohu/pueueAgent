@@ -2052,7 +2052,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     fs::create_dir_all(codex.parent().unwrap()).unwrap();
     compile_sleeping_codex_fixture(&codex);
     let policy = research_policy_with_codex_fixture(&harness, &codex);
-    let make_daemon = || {
+    let make_daemon = |now: i64| {
         let runner = AgentRunner::new(
             AgentRunnerConfig::production()
                 .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
@@ -2067,16 +2067,16 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
                 interval: Duration::from_millis(10),
                 lease_seconds: 60,
                 claim_limit: 1,
-                now_override: Some(harness.now),
+                now_override: Some(now),
                 shutdown_grace_period: Duration::from_secs(30),
             },
         )
     };
 
-    let mut first_daemon = make_daemon();
+    let mut first_daemon = make_daemon(harness.now);
     let first_report = Box::pin(first_daemon.run_once()).await.unwrap();
     assert_eq!(first_report.research_started, 1);
-    let mut second_daemon = Box::new(make_daemon());
+    let mut second_daemon = Box::new(make_daemon(harness.now + 60));
     let early_report = Box::pin(second_daemon.run_once()).await.unwrap();
     assert_eq!(early_report.research_started, 0);
     assert_eq!(early_report.diagnoses, 0);
@@ -2264,28 +2264,20 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     };
     let research_run_count_before = research_run_count();
     let reservation_count_before = reservation_count();
-    let event_id = ResearchRepository::new(&harness.db)
-        .event_id(&review.review_id)
-        .unwrap();
-    harness
+    let retry_wakes: (i64, i64) = harness
         .db
         .connect()
         .unwrap()
-        .execute(
-            "UPDATE research_reviews SET not_before = ?1, updated_at = ?1 WHERE review_id = ?2",
-            rusqlite::params![harness.now, review.review_id],
+        .query_row(
+            "SELECT review.not_before, event.not_before
+             FROM research_reviews AS review
+             JOIN events AS event ON event.event_id = review.event_id
+             WHERE review.review_id = ?1",
+            [&review.review_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    harness
-        .db
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE events SET status = 'retry_wait', lease_until = NULL, not_before = ?1
-             WHERE event_id = ?2",
-            rusqlite::params![harness.now, event_id],
-        )
-        .unwrap();
+    assert_eq!(retry_wakes, (harness.now + 60, harness.now + 60));
 
     assert_cleanup_depth_error(
         Box::pin(second_daemon.run_once()).await,
@@ -2313,11 +2305,22 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     let released_report = Box::pin(first_daemon.run_once()).await.unwrap();
     assert_eq!(
         released_report.research_started,
+        0,
+        "cleanup release at the old clock must not launch before the durable wake"
+    );
+    assert_eq!(research_run_count(), research_run_count_before);
+    assert_eq!(reservation_count(), reservation_count_before);
+
+    let released_snapshot = research_crash_snapshot(&harness.db, &review.review_id);
+    assert_eq!(released_snapshot.cleanup_phase.as_deref(), Some("complete"));
+    let retry_report = Box::pin(second_daemon.run_once()).await.unwrap();
+    assert_eq!(
+        retry_report.research_started,
         1,
         "research retry was not admitted after cleanup release: started={} deferred={} blocked={}; {}",
-        released_report.research_started,
-        released_report.research_deferred,
-        released_report.research_blocked,
+        retry_report.research_started,
+        retry_report.research_deferred,
+        retry_report.research_blocked,
         research_retry_diagnostic(&harness.db, &review.review_id)
     );
     assert_eq!(research_run_count(), research_run_count_before + 1);

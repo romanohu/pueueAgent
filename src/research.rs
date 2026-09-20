@@ -138,7 +138,7 @@ pub(crate) async fn run_due_research_with_cleanup_blocked_projects(
 /// preserved campaign-research owners.  Active/unknown native ownership is
 /// intentionally left untouched; only terminal child rows can become retry
 /// candidates here.
-pub async fn recover_research(db: &Db, now: i64, limits: CampaignLimits) -> Result<(), AppError> {
+pub async fn recover_research(db: &Db, now: i64, _limits: CampaignLimits) -> Result<(), AppError> {
     let repository = ResearchRepository::new(db);
     repository.block_invalid_lineage(now)?;
     let claimed = repository.claimed_unbound_event_ids()?;
@@ -146,15 +146,6 @@ pub async fn recover_research(db: &Db, now: i64, limits: CampaignLimits) -> Resu
         EventRepository::new(db).defer_claimed(&claimed)?;
     }
     repository.recover_terminal_runs(now)?;
-    for review in repository.due_reviews(now, 32)? {
-        if review.state == "retry_wait" {
-            repository.schedule_retry(
-                &review.review_id,
-                limits.max_decision_attempts_per_cycle,
-                now,
-            )?;
-        }
-    }
     Ok(())
 }
 
