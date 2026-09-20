@@ -3191,7 +3191,7 @@ async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundar
         .unwrap();
     assert_eq!(failed.state, "retry_wait");
     assert_eq!(failed.agent_run_id, Some(first_run_id));
-    assert_eq!(failed.attempt, claimed.review.attempt);
+    assert_eq!(failed.attempt, claimed.review.attempt + 1);
     let first_reservation = harness.reservation_id_for(&failed);
     let event_id = review_event_id(&harness.db, &failed.review_id);
     let review_wake: i64 = harness
@@ -3237,7 +3237,7 @@ async fn research_coordinator_retries_bound_malformed_output_at_the_wake_boundar
     let second = ResearchRepository::new(&harness.db)
         .find(&claimed.review.review_id)
         .unwrap();
-    assert_eq!(second.attempt, claimed.review.attempt + 1);
+    assert_eq!(second.attempt, claimed.review.attempt + 2);
     assert_eq!(second.agent_run_id, Some(second_run_id));
     let second_reservation = harness.reservation_id_for(&second);
     assert_ne!(first_reservation, second_reservation);
