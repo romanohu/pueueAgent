@@ -2142,7 +2142,10 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
         .unwrap();
     let health_pending_before = health_admission_snapshot(&harness.db, "project-a");
     let assert_cleanup_depth_error = |result: Result<DaemonReport, AppError>, label: &str| {
-        let error = result.expect_err(label);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("{label}: daemon pass unexpectedly succeeded"),
+        };
         match error {
             AppError::PolicyViolation { violation } => {
                 assert_eq!(violation.code, PolicyViolationCode::TempUnsafe, "{label}");
@@ -2975,6 +2978,92 @@ async fn assert_pidless_marker_retains_owner(marker_contents: &[u8], label: &str
 async fn startup_pidless_research_marker_uncertainty_never_retires_owner() {
     assert_pidless_marker_retains_owner(b"authorized\n", "valid").await;
     assert_pidless_marker_retains_owner(b"invalid\n", "indeterminate").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn startup_pidless_recovery_rejects_late_backward_status_adoption() {
+    let harness = DaemonHarness::new();
+    prepare_healthy_research_fixture(&harness);
+    let seeded = seed_pidless_research_owner(&harness);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs
+             SET status = 'running', launch_gate_state = 'pending'
+             WHERE run_id = ?1",
+            [seeded.run_id],
+        )
+        .unwrap();
+    let mut daemon = harness.daemon();
+
+    let first_report = Box::pin(daemon.run_once()).await.unwrap();
+    assert_eq!(first_report.research_started, 0);
+    assert_eq!(first_report.diagnoses, 0);
+    let first_snapshot = research_crash_snapshot(&harness.db, &seeded.review_id);
+    assert_eq!(first_snapshot.run_status.as_deref(), Some("running"));
+    assert_eq!(first_snapshot.run_pid, None);
+    assert_eq!(first_snapshot.gate_state.as_deref(), Some("pending"));
+    assert_eq!(first_snapshot.cleanup_phase.as_deref(), Some("pending"));
+    assert!(seeded.run_temp.is_dir());
+    assert!(!seeded.marker_path.exists());
+
+    let sentinel = seeded.run_temp.join("backward-status-retained");
+    fs::write(&sentinel, b"retain-original-generation").unwrap();
+    let first_db_snapshot = startup_recovery_db_snapshot(
+        &harness.db,
+        &seeded.campaign_id,
+        &seeded.review_id,
+        seeded.event_id,
+        seeded.run_id,
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE agent_runs SET status = 'starting' WHERE run_id = ?1",
+            [seeded.run_id],
+        )
+        .unwrap();
+
+    let second_report = Box::pin(daemon.run_once()).await.unwrap();
+    assert_eq!(second_report.research_started, 0);
+    assert_eq!(second_report.diagnoses, 0);
+    let second_snapshot = research_crash_snapshot(&harness.db, &seeded.review_id);
+    assert_eq!(second_snapshot.review_state, first_snapshot.review_state);
+    assert_eq!(second_snapshot.event_status, first_snapshot.event_status);
+    assert_eq!(second_snapshot.agent_run_id, first_snapshot.agent_run_id);
+    assert_eq!(second_snapshot.run_count, first_snapshot.run_count);
+    assert_eq!(second_snapshot.reservation_count, first_snapshot.reservation_count);
+    assert_eq!(second_snapshot.run_status.as_deref(), Some("starting"));
+    assert_eq!(second_snapshot.run_pid, None);
+    assert_eq!(second_snapshot.gate_state.as_deref(), Some("pending"));
+    assert_eq!(second_snapshot.cleanup_phase.as_deref(), Some("pending"));
+    assert!(seeded.run_temp.is_dir());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"retain-original-generation");
+    assert!(!seeded.marker_path.exists());
+    let second_db_snapshot = startup_recovery_db_snapshot(
+        &harness.db,
+        &seeded.campaign_id,
+        &seeded.review_id,
+        seeded.event_id,
+        seeded.run_id,
+    );
+    assert_ne!(second_db_snapshot, first_db_snapshot);
+    assert_eq!(second_db_snapshot.review, first_db_snapshot.review);
+    assert_eq!(second_db_snapshot.event, first_db_snapshot.event);
+    assert_eq!(second_db_snapshot.reservations, first_db_snapshot.reservations);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state(&seeded.campaign_id)
+            .unwrap()
+            .blocked_reason
+            .as_deref(),
+        Some("research_recovery_required")
+    );
 }
 
 #[cfg(target_os = "linux")]
