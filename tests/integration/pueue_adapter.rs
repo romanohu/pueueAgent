@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -52,12 +52,29 @@ use pueue_agent::execution_policy::{
     PolicyViolationStage, StartupEnvironment,
 };
 #[cfg(all(unix, target_os = "linux"))]
-use pueue_agent::models::{MetricDirection, ObjectiveMetric};
+use pueue_agent::models::{MetricDirection, ObjectiveMetric, TerminationRequestStatus};
 use pueue_agent::process::MAX_FIELD_SIZE;
 #[cfg(all(unix, debug_assertions))]
 use pueue_agent::pueue_process::PueueProcessRunner;
 #[cfg(all(unix, target_os = "linux"))]
 use pueue_agent::reconcile::Reconciler;
+#[cfg(all(unix, target_os = "linux"))]
+use pueue_agent::{
+    db::{
+        AgentDecisionReservation, ResearchLaunchBinding, ResearchRepository,
+        TerminationRequestRepository,
+    },
+    decision_evidence::{
+        DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
+    },
+    environment::PrivateRunTemp,
+    models::ExecutionProjection,
+    reconcile::managed_task_run_signature,
+    research_actions::advance_research_actions,
+    research_evidence::build_research_evidence,
+    retry::{EventResolution, RetryPolicy},
+    termination::TerminationManager,
+};
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     batches::{self, BatchJobResult},
@@ -865,6 +882,7 @@ fn secure_executable(path: &std::path::Path) {
 struct CountingFakePueue {
     inner: FakePueue,
     add_calls: Arc<AtomicUsize>,
+    observed_tasks: Arc<Mutex<Vec<PueueTask>>>,
 }
 
 impl CountingFakePueue {
@@ -872,7 +890,20 @@ impl CountingFakePueue {
         Self {
             inner: FakePueue::new(),
             add_calls: Arc::new(AtomicUsize::new(0)),
+            observed_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn with_tasks(tasks: Vec<PueueTask>) -> Self {
+        let pueue = Self::new();
+        *pueue.observed_tasks.lock().unwrap() = tasks;
+        pueue
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn set_tasks(&self, tasks: Vec<PueueTask>) {
+        *self.observed_tasks.lock().unwrap() = tasks;
     }
 
     fn last_add_args(&self) -> Vec<OsString> {
@@ -899,7 +930,12 @@ impl CountingFakePueue {
 #[async_trait]
 impl PueueApi for CountingFakePueue {
     async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
-        self.inner.status_json().await
+        let mut tasks = self.inner.status_json().await?;
+        for observed in self.observed_tasks.lock().unwrap().iter().cloned() {
+            tasks.retain(|task| task.id != observed.id);
+            tasks.push(observed);
+        }
+        Ok(tasks)
     }
 
     async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
@@ -1140,6 +1176,10 @@ struct CandidateSubmissionFixture {
     project: pueue_agent::models::Project,
     run_id: String,
     candidate_root: PathBuf,
+    attached_review_id: Option<String>,
+    decision_proposal_id: Option<String>,
+    decision_experiment_id: Option<String>,
+    decision_submission_id: Option<String>,
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -1208,6 +1248,28 @@ async fn candidate_submission_fixture_with_runtime_git(
     install_runtime_git_wrapper: bool,
 ) -> CandidateSubmissionFixture {
     let harness = DecisionHarness::with_ready_code_change();
+    candidate_submission_fixture_from_harness(
+        harness,
+        working_directory,
+        install_runtime_git_wrapper,
+    )
+    .await
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn attached_candidate_submission_fixture(
+    working_directory: &str,
+) -> CandidateSubmissionFixture {
+    let harness = DecisionHarness::with_ready_attached_code_change(working_directory).await;
+    candidate_submission_fixture_from_harness(harness, working_directory, false).await
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn candidate_submission_fixture_from_harness(
+    harness: DecisionHarness,
+    working_directory: &str,
+    install_runtime_git_wrapper: bool,
+) -> CandidateSubmissionFixture {
     let config_path = harness.root.join(".pueue-agent/config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
     fs::write(
@@ -1330,9 +1392,14 @@ fn main() {
         harness.temp.path(),
         &[("decision-project", &project.root_path, Path::new("codex"))],
     );
+    let candidate_now = if harness.attached_review_id.is_some() {
+        800
+    } else {
+        300
+    };
     DecisionCoordinator::new(&harness.db, &harness.pueue, policy.campaign_limits)
         .with_policy(&policy)
-        .apply_ready(300, 10)
+        .apply_ready(candidate_now, 10)
         .await
         .unwrap();
     let proposal = ProposalRepository::new(&harness.db)
@@ -1409,7 +1476,7 @@ fn main() {
             &run.code_change_run_id,
             CodeChangeState::Reserved,
             CodeChangeState::PreparingWorktree,
-            301,
+            candidate_now + 1,
         )
         .unwrap();
     let mut candidate = code_change::prepare_code_change_worktree_for_run(
@@ -1426,7 +1493,7 @@ fn main() {
             &run.code_change_run_id,
             CodeChangeState::PreparingWorktree,
             CodeChangeState::Editing,
-            302,
+            candidate_now + 2,
         )
         .unwrap();
     let candidate_root = candidate.path().to_owned();
@@ -1442,7 +1509,7 @@ fn main() {
             &run.code_change_run_id,
             CodeChangeState::Editing,
             CodeChangeState::Checking,
-            303,
+            candidate_now + 3,
         )
         .unwrap();
     repository
@@ -1451,7 +1518,7 @@ fn main() {
             facts.persisted_digest(),
             i64::try_from(facts.file_count).unwrap(),
             i64::try_from(facts.diff_bytes).unwrap(),
-            303,
+            candidate_now + 3,
         )
         .unwrap();
     repository
@@ -1459,7 +1526,7 @@ fn main() {
             &run.code_change_run_id,
             CodeChangeState::Checking,
             CodeChangeState::Committing,
-            304,
+            candidate_now + 4,
         )
         .unwrap();
     let candidate_sha = candidate.commit().await.unwrap();
@@ -1470,7 +1537,7 @@ fn main() {
             facts.persisted_digest(),
             i64::try_from(facts.file_count).unwrap(),
             i64::try_from(facts.diff_bytes).unwrap(),
-            305,
+            candidate_now + 5,
         )
         .unwrap();
     repository
@@ -1478,16 +1545,33 @@ fn main() {
             &run.code_change_run_id,
             CodeChangeState::Committing,
             CodeChangeState::CandidateReady,
-            305,
+            candidate_now + 5,
         )
         .unwrap();
     drop(candidate);
+    let attached_review_id = harness.attached_review_id.clone();
+    let decision_proposal_id = harness
+        .attached_reservation
+        .as_ref()
+        .map(|reservation| decision_resource_id_for_test("proposal", reservation));
+    let decision_experiment_id = harness
+        .attached_reservation
+        .as_ref()
+        .map(|reservation| decision_resource_id_for_test("experiment", reservation));
+    let decision_submission_id = harness
+        .attached_reservation
+        .as_ref()
+        .map(|reservation| decision_resource_id_for_test("submission", reservation));
     CandidateSubmissionFixture {
         harness,
         policy,
         project,
         run_id: run.code_change_run_id,
         candidate_root,
+        attached_review_id,
+        decision_proposal_id,
+        decision_experiment_id,
+        decision_submission_id,
     }
 }
 
@@ -1506,6 +1590,274 @@ async fn submit_legacy_control<P: PueueApi + ?Sized>(
         pueue,
     )
     .await
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn running_decision_source_task() -> PueueTask {
+    PueueTask {
+        id: 40,
+        group: "decision-group".to_owned(),
+        command: "python train.py".to_owned(),
+        state: "Running".to_owned(),
+        enqueued_at: Some("110".to_owned()),
+        started_at: Some("120".to_owned()),
+        ended_at: None,
+        result: None,
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+async fn prepare_attached_research(
+    harness: &mut DecisionHarness,
+    policy: &Arc<pueue_agent::execution_policy::ResolvedExecutionPolicy>,
+) -> String {
+    let task = running_decision_source_task();
+    let managed = managed_task_run_signature(&task).unwrap();
+    let research = ResearchRepository::new(&harness.db);
+    research.ensure_campaign(&harness.campaign_id).unwrap();
+    research
+        .schedule_running(&harness.campaign_id, 100, 1, 200)
+        .unwrap();
+    Reconciler::new(&harness.db, harness.pueue.clone())
+        .with_campaign_limits(CampaignLimits::default())
+        .run_once_at(130)
+        .await
+        .unwrap();
+    let claimed = research
+        .claim_due(
+            &harness.campaign_id,
+            &harness.source_experiment_id,
+            &managed,
+            300,
+        )
+        .unwrap()
+        .expect("running source must claim one research review");
+    let reservation = match CampaignRepository::new(&harness.db)
+        .reserve_agent_run(
+            &harness.campaign_id,
+            &format!("research:{}:attempt:1", claimed.review_id),
+            &CampaignLimits::default(),
+            301,
+        )
+        .unwrap()
+    {
+        AgentDecisionReservation::Reserved(reservation) => reservation,
+        other => panic!("attached research budget must admit: {other:?}"),
+    };
+    let claimed = research
+        .prepare_attempt(
+            &claimed.review_id,
+            &reservation.reservation_id,
+            CampaignLimits::default().max_decision_attempts_per_cycle,
+            302,
+        )
+        .unwrap()
+        .expect("attached research attempt must be admitted");
+    let evidence = build_research_evidence(&harness.db, &claimed, 303).unwrap();
+    let event_id = research.event_id(&claimed.review_id).unwrap();
+    EventRepository::new(&harness.db)
+        .claim_by_id("decision-project", event_id, 304)
+        .unwrap()
+        .expect("research event must be claimable");
+    let run = AgentRunRepository::new(&harness.db)
+        .insert_with_events(
+            &NewAgentRun::new(
+                "decision-project",
+                event_id,
+                None,
+                AgentRunStatus::Starting,
+                304,
+                harness.root.join(".pueue-agent/logs/research-run.log"),
+            )
+            .with_execution(
+                ExecutionProjection::new("campaign_research", "/bin/echo", "fixture")
+                    .unwrap(),
+            ),
+            &[event_id],
+        )
+        .unwrap();
+    let session_id = "11111111-1111-4111-8111-111111111111".to_owned();
+    let binding = ResearchLaunchBinding {
+        review_id: claimed.review_id.clone(),
+        campaign_id: claimed.campaign_id.clone(),
+        experiment_id: claimed.experiment_id.clone(),
+        attempt: claimed.attempt,
+        session_generation: claimed.session_generation,
+        prior_session_generation: claimed.session_generation,
+        session_id: session_id.clone(),
+        prior_session_id: None,
+        context_json: evidence.json.clone(),
+        context_digest: evidence.digest.clone(),
+        budget_reservation_id: reservation.reservation_id.clone(),
+        recovery_reason: None,
+    };
+    research
+        .bind_agent_run(&binding, run.run_id, "decision-project", 305)
+        .unwrap();
+    let verified_root = policy
+        .project_root_anchor(&harness.root)
+        .unwrap()
+        .verify_identity()
+        .unwrap();
+    let mut private_temp = PrivateRunTemp::create(&verified_root, run.run_id).unwrap();
+    let recovery_identity = private_temp.recovery_identity(&verified_root).unwrap();
+    research
+        .record_native_recovery_authority(&binding, run.run_id, &recovery_identity, true, 306)
+        .unwrap();
+    AgentRunRepository::new(&harness.db)
+        .mark_running_and_apply_interventions("decision-project", run.run_id, 9_041, 307)
+        .unwrap();
+    AgentRunRepository::new(&harness.db)
+        .mark_gate_release_requested("decision-project", run.run_id)
+        .unwrap();
+    AgentRunRepository::new(&harness.db)
+        .acknowledge_dispatch("decision-project", run.run_id)
+        .unwrap();
+    research
+        .confirm_agent_run_session(&binding, run.run_id, &session_id, 308)
+        .unwrap();
+    let answer = json!({
+        "schema_version": 1,
+        "review_id": claimed.review_id,
+        "experiment_id": claimed.experiment_id,
+        "context_digest": evidence.digest,
+        "action": "stop_and_next",
+        "reason": "the baseline should be pruned",
+        "evidence_refs": [format!("research:{}", claimed.review_id)],
+        "notes": "save this bounded advice",
+        "next_direction": "try a smaller learning rate",
+        "checkpoint": null,
+    })
+    .to_string();
+    research
+        .finish_agent_run(&binding, run.run_id, &session_id, &answer, false, 309)
+        .unwrap();
+    AgentRunRepository::new(&harness.db)
+        .finish_and_resolve_events(
+            "decision-project",
+            run.run_id,
+            AgentRunStatus::Completed,
+            310,
+            Some(0),
+            None,
+            EventResolution::RetryPolicy(RetryPolicy { max_retries: 0 }),
+        )
+        .unwrap();
+    private_temp.cleanup_contents_before(None).unwrap();
+    let cleaned_identity = private_temp.recovery_identity(&verified_root).unwrap();
+    research
+        .mark_native_cleanup_complete(&binding, run.run_id, &cleaned_identity, true, 311)
+        .unwrap();
+
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, policy, 400, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let review = research.recent(&harness.campaign_id, 1).unwrap().pop().unwrap();
+    let request_id = review
+        .termination_request_id
+        .expect("research handoff must own a termination request");
+    TerminationManager::new(&harness.db, harness.pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+    let request = TerminationRequestRepository::new(&harness.db)
+        .find_by_id(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.status, TerminationRequestStatus::Sent);
+
+    let mut killed = task;
+    killed.state = "Killed".to_owned();
+    killed.ended_at = Some("500".to_owned());
+    killed.result = Some(json!({"Success": 0}));
+    harness.pueue.set_tasks(vec![killed]);
+    Reconciler::new(&harness.db, harness.pueue.clone())
+        .with_campaign_limits(CampaignLimits::default())
+        .run_once_at(500)
+        .await
+        .unwrap();
+
+    let mut disabled_policy = (**policy).clone();
+    disabled_policy.campaign_limits.research_interval_minutes = 0;
+    assert_eq!(
+        advance_research_actions(
+            &harness.db,
+            &harness.pueue,
+            &disabled_policy,
+            600,
+            1,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let attached = research.find(&review.review_id).unwrap();
+    assert_eq!(attached.state, "completed");
+    let connection = harness.db.connect().unwrap();
+    harness.cycle_id = connection
+        .query_row(
+            "SELECT decision_cycle_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    review.review_id
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn decision_resource_id_for_test(
+    kind: &str,
+    reservation: &pueue_agent::db::DecisionReservation,
+) -> String {
+    format!(
+        "decision-{kind}:{:x}",
+        Sha256::digest(
+            format!(
+                "campaign-decision-intent:v1\0{}\0{}\0{kind}",
+                reservation.cycle_id, reservation.attempt_number
+            )
+            .as_bytes()
+        )
+    )
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn attached_candidate_counts(db: &Db, campaign_id: &str) -> (i64, i64, i64, i64, i64) {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM proposals WHERE campaign_id = ?1),
+                 (SELECT COUNT(*) FROM submissions WHERE project_id = campaign.project_id),
+                 (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?1),
+                 (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1),
+                 (SELECT COUNT(*) FROM events
+                    WHERE campaign_id = ?1 AND kind = 'code_change')
+             FROM campaigns AS campaign
+             WHERE campaign.campaign_id = ?1",
+            [campaign_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap()
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn attached_review_link(
+    db: &Db,
+    review_id: &str,
+) -> (Option<String>, String, Option<String>) {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT successor_experiment_id, state, operation_stage
+             FROM research_reviews WHERE review_id = ?1",
+            [review_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
 }
 
 struct TimeoutPueue {
@@ -1564,6 +1916,10 @@ struct DecisionHarness {
     source_experiment_id: String,
     cycle_id: String,
     decision_json: String,
+    #[cfg(all(unix, target_os = "linux"))]
+    attached_review_id: Option<String>,
+    #[cfg(all(unix, target_os = "linux"))]
+    attached_reservation: Option<pueue_agent::db::DecisionReservation>,
 }
 
 impl DecisionHarness {
@@ -1634,6 +1990,23 @@ impl DecisionHarness {
         harness
     }
 
+    #[cfg(all(unix, target_os = "linux"))]
+    async fn with_ready_attached_code_change(working_directory: &str) -> Self {
+        let mut harness = Self::with_running_source();
+        let policy = execution_policy_fixture::resolved_policy(
+            harness.temp.path(),
+            &[("decision-project", &harness.root, Path::new("codex"))],
+        );
+        let review_id = prepare_attached_research(&mut harness, &policy).await;
+        harness.attached_review_id = Some(review_id.clone());
+        let decision = harness.code_change_decision_in_directory(working_directory);
+        let reservation = harness.persist_attached_ready_decision(&decision, 700);
+        harness.decision_json = decision;
+        harness.attached_review_id = Some(review_id);
+        harness.attached_reservation = Some(reservation);
+        harness
+    }
+
     fn with_ready_malformed_decision() -> Self {
         let mut harness = Self::with_terminal_source(ExperimentStatus::Succeeded, None);
         let decision =
@@ -1646,6 +2019,32 @@ impl DecisionHarness {
     fn with_terminal_source(
         status: ExperimentStatus,
         trusted_failure_fingerprint: Option<&str>,
+    ) -> Self {
+        Self::with_source(
+            Some(status),
+            trusted_failure_fingerprint,
+            "pueue-task:v1:decision-source",
+            CountingFakePueue::new(),
+        )
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn with_running_source() -> Self {
+        let task = running_decision_source_task();
+        let task_signature = managed_task_run_signature(&task).unwrap();
+        Self::with_source(
+            None,
+            None,
+            &task_signature,
+            CountingFakePueue::with_tasks(vec![task]),
+        )
+    }
+
+    fn with_source(
+        status: Option<ExperimentStatus>,
+        trusted_failure_fingerprint: Option<&str>,
+        source_task_signature: &str,
+        pueue: CountingFakePueue,
     ) -> Self {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("decision-project");
@@ -1746,22 +2145,24 @@ max_experiments = 20
             .mark_accepted(
                 &source_experiment_id,
                 40,
-                "pueue-task:v1:decision-source",
+                source_task_signature,
                 120,
             )
             .unwrap();
-        let outcome = match status {
-            ExperimentStatus::Succeeded => ExperimentTerminalOutcome::Succeeded,
-            ExperimentStatus::Failed => ExperimentTerminalOutcome::Failed {
-                failure_code: "training_failed",
-                failure_fingerprint: "trusted-fingerprint",
-            },
-            ExperimentStatus::Cancelled => ExperimentTerminalOutcome::Cancelled,
-            _ => panic!("decision source must be terminal"),
-        };
-        experiments
-            .project_terminal_submission(&source_experiment_id, 40, outcome, 150)
-            .unwrap();
+        if let Some(status) = status {
+            let outcome = match status {
+                ExperimentStatus::Succeeded => ExperimentTerminalOutcome::Succeeded,
+                ExperimentStatus::Failed => ExperimentTerminalOutcome::Failed {
+                    failure_code: "training_failed",
+                    failure_fingerprint: "trusted-fingerprint",
+                },
+                ExperimentStatus::Cancelled => ExperimentTerminalOutcome::Cancelled,
+                _ => panic!("decision source must be terminal"),
+            };
+            experiments
+                .project_terminal_submission(&source_experiment_id, 40, outcome, 150)
+                .unwrap();
+        }
         db.connect()
             .unwrap()
             .execute(
@@ -1769,23 +2170,36 @@ max_experiments = 20
                 rusqlite::params![trusted_failure_fingerprint, source_experiment_id],
             )
             .unwrap();
-        let cycle_id = DecisionRepository::new(&db)
-            .ensure_cycle_for_terminal(&campaign_id, &source_experiment_id, 160)
-            .unwrap()
-            .cycle_id;
+        let cycle_id = status
+            .map(|_| {
+                DecisionRepository::new(&db)
+                    .ensure_cycle_for_terminal(&campaign_id, &source_experiment_id, 160)
+                    .unwrap()
+                    .cycle_id
+            })
+            .unwrap_or_default();
         Self {
             temp,
             db,
             root,
-            pueue: CountingFakePueue::new(),
+            pueue,
             campaign_id,
             source_experiment_id,
             cycle_id,
             decision_json: String::new(),
+            #[cfg(all(unix, target_os = "linux"))]
+            attached_review_id: None,
+            #[cfg(all(unix, target_os = "linux"))]
+            attached_reservation: None,
         }
     }
 
-    fn persist_ready_decision(&self, decision_json: &str, kind: &str, now: i64) {
+    fn persist_ready_decision(
+        &self,
+        decision_json: &str,
+        kind: &str,
+        now: i64,
+    ) -> pueue_agent::db::DecisionReservation {
         let decisions = DecisionRepository::new(&self.db);
         let reservation = decisions
             .reserve_next_attempt("decision-project", &self.cycle_id, now)
@@ -1839,6 +2253,141 @@ max_experiments = 20
                 None,
             )
             .unwrap();
+        reservation
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    fn persist_attached_ready_decision(
+        &self,
+        decision_json: &str,
+        now: i64,
+    ) -> pueue_agent::db::DecisionReservation {
+        let connection = self.db.connect().unwrap();
+        let decision_event_id: i64 = connection
+            .query_row(
+                "SELECT event_id FROM events
+                 WHERE project_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+                   AND kind = 'campaign_decision'
+                 ORDER BY event_id DESC LIMIT 1",
+                rusqlite::params![
+                    "decision-project",
+                    self.campaign_id,
+                    self.source_experiment_id,
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+
+        EventRepository::new(&self.db)
+            .claim_by_id("decision-project", decision_event_id, now + 1)
+            .unwrap()
+            .expect("attached decision event must be claimable");
+        let reservation = DecisionRepository::new(&self.db)
+            .reserve_next_attempt("decision-project", &self.cycle_id, now + 2)
+            .unwrap()
+            .expect("attached decision cycle must reserve one attempt");
+        let project = ProjectRepository::new(&self.db)
+            .find_by_id("decision-project")
+            .unwrap()
+            .unwrap();
+        let root_anchor = ProjectRootAnchor::resolve(&project.root_path).unwrap();
+        let task = {
+            let mut task = running_decision_source_task();
+            task.state = "Killed".to_owned();
+            task.ended_at = Some("500".to_owned());
+            task.result = Some(json!({"Success": 0}));
+            task
+        };
+        let projection = DecisionPueueTaskProjection {
+            task_id: task.id,
+            task_signature: managed_task_run_signature(&task).unwrap(),
+            group: task.group.clone(),
+            state: task.state.clone(),
+            enqueued_at: task
+                .enqueued_at
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            started_at: task
+                .started_at
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            ended_at: task
+                .ended_at
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            exit_code: Some(0),
+        };
+        let context = DecisionEvidenceBuilder::new(&self.db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &[projection],
+                observed_at: now + 3,
+            })
+            .unwrap();
+        DecisionRepository::new(&self.db)
+            .store_evidence(&reservation, &context.json, &context.digest, now + 4)
+            .unwrap();
+
+        let run = AgentRunRepository::new(&self.db)
+            .insert_with_events(
+                &NewAgentRun::new(
+                    "decision-project",
+                    decision_event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    now + 4,
+                    project
+                        .root_path
+                        .join(format!(".pueue-agent/logs/decision-{now}.log")),
+                )
+                .with_execution(
+                    ExecutionProjection::new("codex", "/bin/echo", "fixture").unwrap(),
+                ),
+                &[decision_event_id],
+            )
+            .unwrap();
+        DecisionRepository::new(&self.db)
+            .bind_agent_run(&reservation, run.run_id, now + 5)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .mark_running_and_apply_interventions(
+                "decision-project",
+                run.run_id,
+                9_999,
+                now + 5,
+            )
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .mark_gate_release_requested("decision-project", run.run_id)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .acknowledge_dispatch("decision-project", run.run_id)
+            .unwrap();
+        let digest = parse_and_validate_decision(
+            decision_json.as_bytes(),
+            &self.objective_digest(),
+            CampaignLimits::default(),
+        )
+        .unwrap()
+        .canonical_digest()
+        .to_owned();
+        DecisionRepository::new(&self.db)
+            .store_decision(run.run_id, decision_json, &digest, "proposal", now + 6)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .finish_and_resolve_events(
+                "decision-project",
+                run.run_id,
+                AgentRunStatus::Completed,
+                now + 7,
+                Some(0),
+                None,
+                EventResolution::RetryPolicy(RetryPolicy { max_retries: 0 }),
+            )
+            .unwrap();
+        reservation
     }
 
     fn objective_digest(&self) -> String {
@@ -2051,6 +2600,10 @@ max_experiments = 20
     }
 
     fn code_change_decision(&self) -> String {
+        self.code_change_decision_in_directory(".")
+    }
+
+    fn code_change_decision_in_directory(&self, working_directory: &str) -> String {
         json!({
             "schema_version": 1,
             "decision": "proposal",
@@ -2059,7 +2612,7 @@ max_experiments = 20
                 "hypothesis": "Edit the training source",
                 "source_experiment_id": self.source_experiment_id,
                 "argv": ["python", "train.py"],
-                "working_directory": ".",
+                "working_directory": working_directory,
                 "expected_evidence": []
             }
         })
@@ -3997,6 +4550,127 @@ async fn campaign_submit_candidate_uses_nested_candidate_cwd_and_durable_argv() 
     };
     assert_eq!(replay.submission_id, submission.submission_id);
     assert_eq!(fixture.harness.pueue.add_calls(), 1);
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn campaign_submit_attached_candidate_links_deterministic_successor_and_replays_without_duplicate_add() {
+    let fixture = attached_candidate_submission_fixture("nested").await;
+    let review_id = fixture
+        .attached_review_id
+        .as_deref()
+        .expect("attached candidate fixture review");
+    let expected_proposal_id = fixture
+        .decision_proposal_id
+        .as_deref()
+        .expect("attached candidate fixture proposal");
+    let expected_experiment_id = fixture
+        .decision_experiment_id
+        .as_deref()
+        .expect("attached candidate fixture experiment");
+    let expected_submission_id = fixture
+        .decision_submission_id
+        .as_deref()
+        .expect("attached candidate fixture submission");
+    let before_counts = attached_candidate_counts(&fixture.harness.db, &fixture.harness.campaign_id);
+    let before_run = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before_run.proposal_id, expected_proposal_id);
+    assert_eq!(before_run.state, CodeChangeState::CandidateReady);
+    assert!(before_run.experiment_id.is_none());
+    assert_eq!(
+        attached_review_link(&fixture.harness.db, review_id),
+        (None, "completed".to_owned(), None)
+    );
+
+    let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
+    let coordinator = CampaignCoordinator::new(
+        &fixture.harness.db,
+        &fixture.harness.pueue,
+        CampaignLimits::default(),
+    )
+    .with_root_anchor(root_anchor)
+    .with_execution_policy(&fixture.policy);
+
+    let first = match coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 806)
+        .await
+        .unwrap()
+    {
+        CampaignSubmission::Submitted(submission) => submission,
+        CampaignSubmission::Deferred => panic!("attached candidate submission unexpectedly deferred"),
+    };
+    assert_eq!(first.submission_id, expected_submission_id);
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+
+    let run = CodeChangeRepository::new(&fixture.harness.db)
+        .find_by_id(&fixture.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.proposal_id, expected_proposal_id);
+    assert_eq!(run.state, CodeChangeState::ExperimentSubmitted);
+    assert_eq!(run.experiment_id.as_deref(), Some(expected_experiment_id));
+    let experiment = ExperimentRepository::new(&fixture.harness.db)
+        .find_by_id(expected_experiment_id)
+        .unwrap()
+        .unwrap();
+    let proposal = ProposalRepository::new(&fixture.harness.db)
+        .find_for_campaign(&fixture.harness.campaign_id, expected_proposal_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Accepted);
+    let submitted = SubmissionRepository::new(&fixture.harness.db)
+        .find_by_id(expected_submission_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(submitted.submission_id, first.submission_id);
+    assert_eq!(submitted.status, SubmissionStatus::Accepted);
+    assert_eq!(submitted.pueue_task_id, Some(41));
+    assert_eq!(experiment.status, ExperimentStatus::Accepted);
+    assert_eq!(experiment.pueue_task_id, Some(41));
+    assert_eq!(experiment.parent_experiment_id.as_deref(), Some(fixture.harness.source_experiment_id.as_str()));
+    assert!(experiment.resume_of_experiment_id.is_none());
+    assert_eq!(
+        attached_review_link(&fixture.harness.db, review_id),
+        (Some(expected_experiment_id.to_owned()), "completed".to_owned(), None)
+    );
+    assert_eq!(
+        attached_candidate_counts(&fixture.harness.db, &fixture.harness.campaign_id),
+        (
+            before_counts.0,
+            before_counts.1 + 1,
+            before_counts.2 + 1,
+            before_counts.3 + 1,
+            before_counts.4 + 1,
+        )
+    );
+
+    let replay = match coordinator
+        .submit_candidate_intent(&fixture.run_id, &fixture.project, 807)
+        .await
+        .unwrap()
+    {
+        CampaignSubmission::Submitted(submission) => submission,
+        CampaignSubmission::Deferred => panic!("attached candidate replay unexpectedly deferred"),
+    };
+    assert_eq!(replay.submission_id, first.submission_id);
+    assert_eq!(fixture.harness.pueue.add_calls(), 1);
+    assert_eq!(
+        attached_candidate_counts(&fixture.harness.db, &fixture.harness.campaign_id),
+        (
+            before_counts.0,
+            before_counts.1 + 1,
+            before_counts.2 + 1,
+            before_counts.3 + 1,
+            before_counts.4 + 1,
+        )
+    );
+    assert_eq!(
+        attached_review_link(&fixture.harness.db, review_id),
+        (Some(expected_experiment_id.to_owned()), "completed".to_owned(), None)
+    );
 }
 
 #[cfg(all(unix, target_os = "linux"))]
