@@ -11,19 +11,20 @@ use async_trait::async_trait;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     codex_command::CodexCapabilities,
-    decision_protocol::parse_and_validate_decision,
     execution_policy::{load_existing_policy, PolicyLoadInput},
     scheduler::{Scheduler, SchedulerConfig},
 };
 use pueue_agent::{
     db::{
         AgentRunRepository, CampaignRepository, Db, DecisionRepository, EventRepository,
-        ExperimentRepository, IncidentRepository, ProjectRepository, ResearchRepository,
-        StartCampaignRequest, TerminationRequestRepository,
+        DecisionReservation, ExperimentRepository, IncidentRepository, ProjectRepository,
+        ResearchRepository, StartCampaignRequest, TerminationRequestRepository,
     },
+    decision::DecisionCoordinator,
     decision_evidence::{
         DecisionEvidenceBuilder, DecisionEvidenceRequest, DecisionPueueTaskProjection,
     },
+    decision_protocol::parse_and_validate_decision,
     environment::PrivateRunTemp,
     execution_policy::{CampaignLimits, ResolvedExecutionPolicy},
     models::{
@@ -530,6 +531,189 @@ fn main() {
             .unwrap();
         assert_eq!(request.status, TerminationRequestStatus::Sent);
         review
+    }
+
+    async fn prepare_stored_decision_attempt(
+        &self,
+    ) -> (
+        pueue_agent::db::ResearchReview,
+        DecisionReservation,
+        String,
+        i64,
+        PueueTask,
+    ) {
+        let review = self.prepare_sent_handoff().await;
+        let mut task = self.pueue.task(self.task_id);
+        task.state = "Killed".to_owned();
+        task.ended_at = Some("500".to_owned());
+        task.result = Some(json!({"Success": 0}));
+        self.set_task(task.clone());
+        Reconciler::new(&self.db, self.pueue.clone())
+            .with_campaign_limits(CampaignLimits::default())
+            .run_once_at(500)
+            .await
+            .unwrap();
+
+        let mut disabled_policy = (*self.policy).clone();
+        disabled_policy.campaign_limits.research_interval_minutes = 0;
+        assert_eq!(
+            advance_research_actions(&self.db, &self.pueue, &disabled_policy, 600, 1)
+                .await
+                .unwrap(),
+            1
+        );
+        let attached = ResearchRepository::new(&self.db)
+            .find(&review.review_id)
+            .unwrap();
+        assert_eq!(attached.state, "completed");
+
+        let connection = self.db.connect().unwrap();
+        let cycle_id: String = connection
+            .query_row(
+                "SELECT decision_cycle_id FROM research_reviews WHERE review_id = ?1",
+                [&review.review_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let decision_event_id: i64 = connection
+            .query_row(
+                "SELECT event_id FROM events
+                 WHERE project_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+                   AND kind = 'campaign_decision'",
+                rusqlite::params![self.project_id, self.campaign_id, self.experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+
+        EventRepository::new(&self.db)
+            .claim_by_id(&self.project_id, decision_event_id, 601)
+            .unwrap()
+            .expect("attached decision event must be claimable");
+        let reservation = DecisionRepository::new(&self.db)
+            .reserve_next_attempt(&self.project_id, &cycle_id, 602)
+            .unwrap()
+            .expect("terminal cycle must reserve one decision attempt");
+        let project = ProjectRepository::new(&self.db)
+            .find_by_id(&self.project_id)
+            .unwrap()
+            .unwrap();
+        let root_anchor = self
+            .policy
+            .project_root_anchor(&project.root_path)
+            .unwrap();
+        let task_signature = managed_task_run_signature(&task).unwrap();
+        let projection = DecisionPueueTaskProjection {
+            task_id: task.id,
+            task_signature,
+            group: task.group.clone(),
+            state: task.state.clone(),
+            enqueued_at: task
+                .enqueued_at
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            started_at: task
+                .started_at
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            ended_at: task
+                .ended_at
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            exit_code: Some(0),
+        };
+        let context = DecisionEvidenceBuilder::new(&self.db)
+            .build(&DecisionEvidenceRequest {
+                reservation: &reservation,
+                root_anchor: &root_anchor,
+                pueue_tasks: &[projection],
+                observed_at: 603,
+            })
+            .unwrap();
+        DecisionRepository::new(&self.db)
+            .store_evidence(&reservation, &context.json, &context.digest, 604)
+            .unwrap();
+
+        (
+            review,
+            reservation,
+            cycle_id,
+            decision_event_id,
+            task,
+        )
+    }
+
+    fn persist_decision_outcome(
+        &self,
+        reservation: &DecisionReservation,
+        event_id: i64,
+        decision_json: &str,
+        decision_kind: &str,
+        now: i64,
+    ) -> String {
+        let project = ProjectRepository::new(&self.db)
+            .find_by_id(&self.project_id)
+            .unwrap()
+            .unwrap();
+        let run = AgentRunRepository::new(&self.db)
+            .insert_with_events(
+                &NewAgentRun::new(
+                    &self.project_id,
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    now,
+                    project
+                        .root_path
+                        .join(".pueue-agent/logs/decision-outcome.log"),
+                )
+                .with_execution(
+                    ExecutionProjection::new("codex", "/bin/echo", "fixture")
+                        .unwrap(),
+                ),
+                &[event_id],
+            )
+            .unwrap();
+        DecisionRepository::new(&self.db)
+            .bind_agent_run(reservation, run.run_id, now + 1)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .mark_running_and_apply_interventions(
+                &self.project_id,
+                run.run_id,
+                9_999,
+                now + 2,
+            )
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .mark_gate_release_requested(&self.project_id, run.run_id)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .acknowledge_dispatch(&self.project_id, run.run_id)
+            .unwrap();
+
+        let validated = parse_and_validate_decision(
+            decision_json.as_bytes(),
+            "objective-digest-research-actions",
+            CampaignLimits::default(),
+        )
+        .unwrap();
+        let digest = validated.canonical_digest().to_owned();
+        DecisionRepository::new(&self.db)
+            .store_decision(run.run_id, decision_json, &digest, decision_kind, now + 3)
+            .unwrap();
+        AgentRunRepository::new(&self.db)
+            .finish_and_resolve_events(
+                &self.project_id,
+                run.run_id,
+                AgentRunStatus::Completed,
+                now + 4,
+                Some(0),
+                None,
+                EventResolution::RetryPolicy(RetryPolicy { max_retries: 0 }),
+            )
+            .unwrap();
+        digest
     }
 
     fn insert_deferred_rotation_review(&self, suffix: &str) -> String {
@@ -1206,6 +1390,319 @@ async fn confirmed_research_handoff_feeds_claimed_decision_context_v2_without_su
     assert_eq!(event_count, 1);
     assert_eq!(attempt_count, 1);
     assert!(harness.pueue.add_calls().is_empty());
+}
+
+#[tokio::test]
+async fn stored_research_wait_schedules_bounded_wake_without_releasing_attachment() {
+    let harness = Harness::new().await;
+    let (review, reservation, cycle_id, event_id, _task) =
+        harness.prepare_stored_decision_attempt().await;
+    let wait_json = json!({
+        "schema_version": 1,
+        "decision": "wait",
+        "proposal": null,
+        "reason": "wait for the next bounded observation",
+        "requested_wait_minutes": 1,
+        "expected_evidence": ["next checkpoint"],
+        "evidence_ref": null,
+    })
+    .to_string();
+    harness.persist_decision_outcome(
+        &reservation,
+        event_id,
+        &wait_json,
+        "wait",
+        700,
+    );
+
+    let before = harness.db.connect().unwrap().query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM experiment_metrics m
+                JOIN experiments e ON e.experiment_id = m.experiment_id
+              WHERE e.campaign_id = ?1)",
+        [&harness.campaign_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+    ).unwrap();
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, CampaignLimits::default())
+        .apply_ready(800, 1)
+        .await
+        .unwrap();
+    assert_eq!(report.waits_scheduled, 1);
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(report.degraded, 0);
+
+    let cycle = DecisionRepository::new(&harness.db)
+        .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cycle.cycle_id, cycle_id);
+    assert_eq!(cycle.state, pueue_agent::models::DecisionCycleState::Waiting);
+    assert_eq!(cycle.next_wake_at, Some(860));
+    let attached = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(attached.state, "completed");
+    assert!(attached.successor_experiment_id.is_none());
+    let persisted_cycle_id: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT decision_cycle_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_cycle_id, cycle_id);
+
+    let after = harness.db.connect().unwrap().query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM experiment_metrics m
+                JOIN experiments e ON e.experiment_id = m.experiment_id
+              WHERE e.campaign_id = ?1)",
+        [&harness.campaign_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+    ).unwrap();
+    assert_eq!(after, before);
+
+    let attempt_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = ?1",
+            [&cycle_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+               AND kind = 'campaign_decision'",
+            rusqlite::params![harness.project_id, harness.campaign_id, harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 1);
+    assert_eq!(event_count, 1);
+    assert!(harness.pueue.add_calls().is_empty());
+
+    let replay = DecisionCoordinator::new(&harness.db, &harness.pueue, CampaignLimits::default())
+        .apply_ready(801, 1)
+        .await
+        .unwrap();
+    assert_eq!(replay.waits_scheduled, 0);
+    assert_eq!(replay.proposals_applied, 0);
+    assert_eq!(replay.deferred, 0);
+    assert_eq!(replay.degraded, 0);
+    let replay_cycle = DecisionRepository::new(&harness.db)
+        .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay_cycle, cycle);
+    let replay_attempt_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = ?1",
+            [&cycle_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let replay_event_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+               AND kind = 'campaign_decision'",
+            rusqlite::params![harness.project_id, harness.campaign_id, harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replay_attempt_count, 1);
+    assert_eq!(replay_event_count, 1);
+    assert_eq!(harness.pueue.add_calls().len(), 0);
+}
+
+#[tokio::test]
+async fn rejected_persisted_proposal_keeps_research_attachment_without_side_effects() {
+    let harness = Harness::new().await;
+    let (review, reservation, cycle_id, event_id, _task) =
+        harness.prepare_stored_decision_attempt().await;
+    let rejected_json = json!({
+        "schema_version": 1,
+        "decision": "proposal",
+        "proposal": {
+            "kind": "experiment",
+            "hypothesis": "proposal with the wrong terminal source",
+            "source_experiment_id": "foreign-source-experiment",
+            "argv": ["python", "train.py", "--lr", "0.001"],
+            "working_directory": ".",
+            "expected_evidence": ["validation loss"]
+        },
+        "reason": null,
+        "requested_wait_minutes": null,
+        "expected_evidence": null,
+        "evidence_ref": null,
+    })
+    .to_string();
+    harness.persist_decision_outcome(
+        &reservation,
+        event_id,
+        &rejected_json,
+        "proposal",
+        700,
+    );
+
+    let before = harness.db.connect().unwrap().query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM experiment_metrics m
+                JOIN experiments e ON e.experiment_id = m.experiment_id
+              WHERE e.campaign_id = ?1),
+             (SELECT COUNT(*) FROM proposals WHERE campaign_id = ?1)",
+        [&harness.campaign_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    ).unwrap();
+
+    let report = DecisionCoordinator::new(&harness.db, &harness.pueue, CampaignLimits::default())
+        .apply_ready(800, 1)
+        .await
+        .unwrap();
+    assert_eq!(report.waits_scheduled, 0);
+    assert_eq!(report.proposals_applied, 0);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(report.degraded, 0);
+
+    let cycle = DecisionRepository::new(&harness.db)
+        .find_cycle_for_source(&harness.campaign_id, &harness.experiment_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cycle.cycle_id, cycle_id);
+    assert_eq!(cycle.state, pueue_agent::models::DecisionCycleState::Pending);
+    assert!(cycle.next_wake_at.is_none());
+    assert_eq!(cycle.last_failure_code.as_deref(), Some("decision_rejected"));
+    let attached = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(attached.state, "completed");
+    assert!(attached.successor_experiment_id.is_none());
+    let persisted_cycle_id: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT decision_cycle_id FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_cycle_id, cycle_id);
+
+    let after = harness.db.connect().unwrap().query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?1),
+             (SELECT COUNT(*) FROM experiment_metrics m
+                JOIN experiments e ON e.experiment_id = m.experiment_id
+              WHERE e.campaign_id = ?1),
+             (SELECT COUNT(*) FROM proposals WHERE campaign_id = ?1)",
+        [&harness.campaign_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    ).unwrap();
+    assert_eq!(after, before);
+
+    let attempt_state: (String, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT state, failure_code FROM decision_attempts
+             WHERE cycle_id = ?1 AND attempt_number = 1",
+            [&cycle_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempt_state, ("failed".to_owned(), Some("decision_rejected".to_owned())));
+    let event_state: (String, Option<i64>, Option<i64>, Option<String>) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status, completed_at, lease_until, last_error FROM events
+             WHERE project_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+               AND kind = 'campaign_decision'",
+            rusqlite::params![harness.project_id, harness.campaign_id, harness.experiment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(event_state.0, "pending");
+    assert!(event_state.1.is_none());
+    assert!(event_state.2.is_none());
+    assert!(event_state.3.is_none());
+    assert!(harness.pueue.add_calls().is_empty());
+
+    let replay = DecisionCoordinator::new(&harness.db, &harness.pueue, CampaignLimits::default())
+        .apply_ready(801, 1)
+        .await
+        .unwrap();
+    assert_eq!(replay.waits_scheduled, 0);
+    assert_eq!(replay.proposals_applied, 0);
+    assert_eq!(replay.deferred, 0);
+    assert_eq!(replay.degraded, 0);
+    let replay_attempt_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = ?1",
+            [&cycle_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let replay_event_count: i64 = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE project_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+               AND kind = 'campaign_decision'",
+            rusqlite::params![harness.project_id, harness.campaign_id, harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replay_attempt_count, 1);
+    assert_eq!(replay_event_count, 1);
+    assert_eq!(harness.pueue.add_calls().len(), 0);
 }
 
 #[cfg(target_os = "linux")]
