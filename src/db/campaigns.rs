@@ -13,9 +13,9 @@ use crate::{
     execution_policy::CampaignLimits,
     models::{
         BudgetDimension, BudgetReservation, BudgetReservationStatus, Campaign, CampaignState,
-        CodeChangeState, EventKind, Experiment, ExperimentStatus, ExperimentTerminalOutcome,
-        NewCodeChangeRun, NewEvent, ObjectiveMetric, Proposal, ProposalKind, ProposalStatus,
-        Submission, SubmissionKind, SubmissionStatus,
+        CodeChangeRun, CodeChangeState, EventKind, Experiment, ExperimentStatus,
+        ExperimentTerminalOutcome, NewCodeChangeRun, NewEvent, ObjectiveMetric, Proposal,
+        ProposalKind, ProposalStatus, Submission, SubmissionKind, SubmissionStatus,
     },
     output::bounded_redacted_text,
     proposals::ValidatedProposal,
@@ -23,7 +23,10 @@ use crate::{
     AppError,
 };
 
-use super::{code_changes::validate_sha, database_error, Db};
+use super::{
+    code_changes::validate_sha, database_error, research_ownership_in_transaction, Db,
+    ResearchOwnership,
+};
 
 const ROLLING_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 const AGENT_RUN_WINDOW_SECONDS: i64 = 60 * 60;
@@ -46,6 +49,17 @@ const EXPERIMENT_SELECT: &str = "SELECT experiment_id, campaign_id, proposal_id,
 const SUBMISSION_SELECT: &str = "SELECT submission_id, project_id, argv_json, created_at,
         pueue_task_id, task_signature, status, kind, metadata_json, origin_agent_run_id
     FROM submissions";
+const CODE_CHANGE_SELECT: &str = "SELECT code_change_run_id, proposal_id, campaign_id, state,
+        base_sha, candidate_sha, candidate_ref, best_ref, worktree_id,
+        worktree_relative_path, editor_session_id, editor_attempts, diff_digest,
+        changed_file_count, diff_bytes, experiment_id, rejection_code,
+        rejection_summary, promotion_outcome, promotion_expected_best_experiment_id,
+        promotion_expected_old_sha, promotion_target_sha, cleanup_completed_at,
+        state_root_identity, worktrees_identity, campaign_identity,
+        candidate_root_identity, candidate_admin_identity, candidate_common_identity,
+        candidate_admin_path, candidate_common_path, protected_ref_digest,
+        candidate_working_directory_identity, remote_config_digest, created_at, updated_at
+    FROM code_change_runs";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedSubmissionIntent {
@@ -68,6 +82,14 @@ pub enum ProposalAcceptance {
     PendingCodeChange,
     BudgetWaiting { next_eligible_at: i64 },
     CapacityDeferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodeChangeReentry {
+    Missing,
+    Deferred,
+    Rejected(Proposal),
+    Run(CodeChangeRun),
 }
 
 impl ProposalAcceptance {
@@ -449,6 +471,132 @@ impl<'db> CampaignRepository<'db> {
         )
     }
 
+    pub(crate) fn resolve_code_change_reentry(
+        &self,
+        campaign_id: &str,
+        proposal_id: &str,
+        canonical_digest: &str,
+        now: i64,
+    ) -> Result<CodeChangeReentry, AppError> {
+        validate_code_change_identifier("proposal_id", proposal_id)?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin code-change reentry"))?;
+        let campaign = read_campaign(&transaction, campaign_id)?;
+        let proposal_by_id = transaction
+            .query_row(
+                &format!(
+                    "{PROPOSAL_SELECT} WHERE campaign_id = ?1 AND proposal_id = ?2"
+                ),
+                params![campaign_id, proposal_id],
+                proposal_from_row,
+            )
+            .optional()
+            .map_err(database_error("find code-change proposal reentry by ID"))?;
+        let proposal = match proposal_by_id {
+            Some(proposal) => {
+                if proposal.canonical_digest != canonical_digest {
+                    return Err(validation_error(
+                        "proposal_id",
+                        "conflicts with a different canonical proposal digest",
+                    ));
+                }
+                if proposal.kind != ProposalKind::CodeChange {
+                    return Err(validation_error(
+                        "proposal.kind",
+                        "proposal ID belongs to a non-code proposal",
+                    ));
+                }
+                proposal
+            }
+            None => match find_proposal_by_digest(&transaction, campaign_id, canonical_digest)? {
+                Some(proposal) => {
+                    if proposal.kind != ProposalKind::CodeChange {
+                        return Err(validation_error(
+                            "proposal.canonical_digest",
+                            "matches a non-code proposal",
+                        ));
+                    }
+                    proposal
+                }
+                None => {
+                    transaction
+                        .commit()
+                        .map_err(database_error("commit missing code-change reentry"))?;
+                    return Ok(CodeChangeReentry::Missing);
+                }
+            },
+        };
+        let source_experiment_id = proposal.source_experiment_id.as_deref().ok_or_else(|| {
+            validation_error(
+                "source_experiment_id",
+                "is required for a persisted code-change proposal",
+            )
+        })?;
+        if research_owner_blocks_admission(
+            &transaction,
+            &campaign.project_id,
+            campaign_id,
+            Some(source_experiment_id),
+        )? {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred code-change reentry"))?;
+            return Ok(CodeChangeReentry::Deferred);
+        }
+        if proposal.status == ProposalStatus::Rejected {
+            transaction
+                .commit()
+                .map_err(database_error("commit rejected code-change reentry"))?;
+            return Ok(CodeChangeReentry::Rejected(proposal));
+        }
+        let run = transaction
+            .query_row(
+                &format!(
+                    "{CODE_CHANGE_SELECT}
+                     WHERE campaign_id = ?1 AND proposal_id = ?2"
+                ),
+                params![campaign_id, proposal.proposal_id],
+                code_change_run_from_row,
+            )
+            .optional()
+            .map_err(database_error("find code-change reentry run"))?;
+        if let Some(run) = run {
+            let rejected = run.state == CodeChangeState::Rejected;
+            transaction
+                .commit()
+                .map_err(database_error("commit existing code-change reentry"))?;
+            return if rejected {
+                Ok(CodeChangeReentry::Rejected(proposal))
+            } else {
+                Ok(CodeChangeReentry::Run(run))
+            };
+        }
+        if proposal.status != ProposalStatus::Pending {
+            return Err(validation_error(
+                "proposal",
+                "must be a pending code-change proposal in the campaign",
+            ));
+        }
+        reject_code_change_in_transaction(
+            &transaction,
+            campaign_id,
+            &proposal.proposal_id,
+            &campaign.project_id,
+            "orphan_code_change_run",
+            now,
+        )?;
+        let mut rejected = proposal;
+        rejected.status = ProposalStatus::Rejected;
+        rejected.reject_reason = Some(bounded_redacted_text("orphan_code_change_run"));
+        rejected.updated_at = now;
+        transaction
+            .commit()
+            .map_err(database_error("commit orphan code-change reentry"))?;
+        Ok(CodeChangeReentry::Rejected(rejected))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn accept_code_change_candidate(
         &self,
@@ -526,6 +674,14 @@ impl<'db> CampaignRepository<'db> {
                 "code_change.run",
                 "must belong to a code-change proposal in the campaign",
             ));
+        }
+        if research_owner_blocks_admission(
+            &transaction,
+            &campaign.project_id,
+            &run_campaign_id,
+            proposal.source_experiment_id.as_deref(),
+        )? {
+            return Ok(ProposalAcceptance::CapacityDeferred);
         }
         let expected_candidate_ref =
             code_change::candidate_ref(&run_campaign_id, &run_proposal_id)?;
@@ -848,6 +1004,14 @@ impl<'db> CampaignRepository<'db> {
                 "must be active to accept a proposal",
             ));
         }
+        if research_owner_blocks_admission(
+            &transaction,
+            &campaign.project_id,
+            campaign_id,
+            proposal.source_experiment_id(),
+        )? {
+            return Ok(ProposalAcceptance::CapacityDeferred);
+        }
         validate_project_available(&transaction, &campaign.project_id)?;
         if proposal.objective_digest() != campaign.objective_digest {
             return Err(validation_error(
@@ -1136,6 +1300,14 @@ impl<'db> CampaignRepository<'db> {
             transaction
                 .commit()
                 .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
+        if research_owner_blocks_admission(
+            &transaction,
+            &campaign.project_id,
+            campaign_id,
+            proposal.source_experiment_id(),
+        )? {
             return Ok(None);
         }
         validate_project_available(&transaction, &campaign.project_id)?;
@@ -3355,6 +3527,26 @@ pub(crate) fn count_live_reservations(
         .map_err(database_error("count live rolling budget reservations"))
 }
 
+fn research_owner_blocks_admission(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    campaign_id: &str,
+    source_experiment_id: Option<&str>,
+) -> Result<bool, AppError> {
+    let Some(source_experiment_id) = source_experiment_id else {
+        return Ok(false);
+    };
+    Ok(!matches!(
+        research_ownership_in_transaction(
+            transaction,
+            project_id,
+            campaign_id,
+            source_experiment_id,
+        )?,
+        ResearchOwnership::None
+    ))
+}
+
 /// Total resume repairs across the whole `resume_of_experiment_id` lineage,
 /// counted from the origin experiment of `experiment_id` so repeated
 /// single-resume generations exhaust a cumulative chain-depth budget.
@@ -3385,6 +3577,329 @@ pub(crate) fn count_live_repair_descendants(
         [experiment_id],
         |row| row.get(0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        db::{ExperimentRepository, ProjectRepository},
+        models::{EventKind, ExperimentTerminalOutcome, NewCodeChangeRun, NewEvent, NewProject},
+        proposals::{self, ProposalInput},
+        state::ObjectiveSnapshot,
+    };
+    use rusqlite::TransactionBehavior;
+    use tempfile::TempDir;
+
+    struct FenceFixture {
+        db: Db,
+        _root: TempDir,
+    }
+
+    impl FenceFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let project_root = root.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let db = Db::open(&root.path().join("state.sqlite3")).unwrap();
+            ProjectRepository::new(&db)
+                .register(&NewProject::new(
+                    "project-1",
+                    &project_root,
+                    "project-1-group",
+                    project_root.join("config.toml"),
+                    100,
+                ))
+                .unwrap();
+            let baseline = proposals::validate_initial_baseline(
+                ProposalInput {
+                    kind: ProposalKind::Experiment,
+                    hypothesis: "baseline".to_owned(),
+                    source_experiment_id: None,
+                    argv: vec!["python".to_owned(), "train.py".to_owned()],
+                    working_directory: ".".to_owned(),
+                    expected_evidence: vec!["metric".to_owned()],
+                },
+                "objective-digest",
+            )
+            .unwrap();
+            CampaignRepository::new(&db)
+                .start_with_baseline(
+                    StartCampaignRequest {
+                        campaign_id: "campaign-1",
+                        project_id: "project-1",
+                        objective: &ObjectiveSnapshot {
+                            text: "objective".to_owned(),
+                            digest: "objective-digest".to_owned(),
+                        },
+                        initial_argv: baseline.argv(),
+                        baseline: &baseline,
+                        submission_id: "submission-source",
+                        experiment_id: "experiment-source",
+                        proposal_id: "proposal-source",
+                        metadata: &serde_json::json!({}),
+                        origin_agent_run_id: None,
+                        objective_metric: None,
+                        now: 100,
+                    },
+                    &CampaignLimits::default(),
+                )
+                .unwrap();
+            let experiments = ExperimentRepository::new(&db);
+            experiments
+                .mark_submitting("experiment-source", 101)
+                .unwrap();
+            experiments
+                .mark_accepted("experiment-source", 7, "pueue-managed-run:v1:source", 102)
+                .unwrap();
+            experiments
+                .project_terminal_submission(
+                    "experiment-source",
+                    7,
+                    ExperimentTerminalOutcome::Succeeded,
+                    103,
+                )
+                .unwrap();
+            Self { db, _root: root }
+        }
+
+        fn proposal(&self, hypothesis: &str) -> ValidatedProposal {
+            proposals::validate(
+                ProposalInput {
+                    kind: ProposalKind::Experiment,
+                    hypothesis: hypothesis.to_owned(),
+                    source_experiment_id: Some("experiment-source".to_owned()),
+                    argv: vec!["python".to_owned(), hypothesis.to_owned(), ".py".to_owned()],
+                    working_directory: ".".to_owned(),
+                    expected_evidence: vec!["metric".to_owned()],
+                },
+                "objective-digest",
+            )
+            .unwrap()
+        }
+
+        fn insert_malformed_open_owner(&self) {
+            let mut connection = self.db.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let event = NewEvent::new(
+                "project-1",
+                EventKind::CampaignResearch,
+                "research-owner-event",
+                serde_json::json!({"review_id":"review-1"}),
+                104,
+                104,
+            )
+            .with_campaign_lineage("campaign-1", Some("experiment-source"));
+            let (stored, _) =
+                super::super::insert_event_completed_in_transaction(&transaction, &event).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO research_reviews (
+                        review_id, campaign_id, experiment_id, task_signature, attempt,
+                        state, operation_stage, agent_run_id, context_json, context_digest,
+                        response_json, termination_request_id, successor_experiment_id,
+                        evidence_schema_version, session_generation, event_id, not_before,
+                        notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                        created_at, started_at, finished_at, updated_at
+                     ) VALUES (
+                        'review-1', 'campaign-1', 'experiment-source',
+                        'pueue-managed-run:v1:source', 1, 'ready', 'intent', NULL,
+                        NULL, NULL, NULL, NULL, NULL, NULL, 0, ?1, 104, NULL, NULL,
+                        NULL, NULL, 104, NULL, NULL, 104
+                     )",
+                    [stored.event_id],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        fn counts(&self) -> (i64, i64, i64) {
+            let connection = self.db.connect().unwrap();
+            (
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM proposals WHERE campaign_id = 'campaign-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM experiments WHERE campaign_id = 'campaign-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = 'campaign-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+            )
+        }
+    }
+
+    #[test]
+    fn open_research_owner_defers_proposal_and_resume_without_mutating_rows() {
+        let fixture = FenceFixture::new();
+        fixture.insert_malformed_open_owner();
+        let before = fixture.counts();
+        let proposal = fixture.proposal("generic");
+        let acceptance = CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-generic",
+                "experiment-generic",
+                "submission-generic",
+                &proposal,
+                &CampaignLimits::default(),
+                105,
+            )
+            .unwrap();
+        assert!(matches!(acceptance, ProposalAcceptance::CapacityDeferred));
+        assert_eq!(fixture.counts(), before);
+
+        let resume = fixture.proposal("resume");
+        let resumed = CampaignRepository::new(&fixture.db)
+            .accept_resume_proposal(
+                "campaign-1",
+                "proposal-resume",
+                "experiment-resume",
+                "submission-resume",
+                &resume,
+                "checkpoint note",
+                &CampaignLimits::default(),
+                106,
+            )
+            .unwrap();
+        assert!(resumed.is_none());
+        assert_eq!(fixture.counts(), before);
+    }
+
+    #[test]
+    fn open_research_owner_blocks_idempotent_proposal_reuse() {
+        let fixture = FenceFixture::new();
+        let proposal = fixture.proposal("idempotent");
+        let accepted = CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-idempotent",
+                "experiment-idempotent",
+                "submission-idempotent",
+                &proposal,
+                &CampaignLimits::default(),
+                105,
+            )
+            .unwrap();
+        assert!(matches!(accepted, ProposalAcceptance::Accepted(_)));
+        fixture.insert_malformed_open_owner();
+        let before = fixture.counts();
+        let reentry = CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-idempotent",
+                "experiment-idempotent",
+                "submission-idempotent",
+                &proposal,
+                &CampaignLimits::default(),
+                106,
+            )
+            .unwrap();
+        assert!(matches!(reentry, ProposalAcceptance::CapacityDeferred));
+        assert_eq!(fixture.counts(), before);
+    }
+
+    #[test]
+    fn open_research_owner_defers_code_change_candidate_before_experiment_reservation() {
+        let fixture = FenceFixture::new();
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::CodeChange,
+                hypothesis: "code change".to_owned(),
+                source_experiment_id: Some("experiment-source".to_owned()),
+                argv: vec!["python".to_owned(), "train.py".to_owned()],
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["metric".to_owned()],
+            },
+            "objective-digest",
+        )
+        .unwrap();
+        let candidate_ref = code_change::candidate_ref("campaign-1", "proposal-code").unwrap();
+        let run = NewCodeChangeRun::new(
+            "code-run-1",
+            "proposal-code",
+            "campaign-1",
+            "a".repeat(40),
+            candidate_ref,
+            "campaign/campaign-1/best",
+            "worktree-code-run-1",
+            ".pueue-agent/worktrees/campaign-1/proposal-code",
+            105,
+        );
+        let pending = CampaignRepository::new(&fixture.db)
+            .accept_code_change_proposal(
+                "campaign-1",
+                "proposal-code",
+                "experiment-code",
+                "submission-code",
+                &proposal,
+                &CampaignLimits::default(),
+                105,
+                Some(&run),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(pending, ProposalAcceptance::PendingCodeChange));
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE code_change_runs
+                 SET state = 'candidate_ready', candidate_sha = ?1,
+                     diff_digest = ?2, changed_file_count = 0, diff_bytes = 0,
+                     updated_at = 106
+                 WHERE code_change_run_id = 'code-run-1'",
+                rusqlite::params!["b".repeat(40), "c".repeat(64)],
+            )
+            .unwrap();
+        fixture.insert_malformed_open_owner();
+        let before = fixture.counts();
+        let acceptance = CampaignRepository::new(&fixture.db)
+            .accept_code_change_candidate(
+                "code-run-1",
+                "experiment-code",
+                "submission-code",
+                107,
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        assert!(matches!(acceptance, ProposalAcceptance::CapacityDeferred));
+        assert_eq!(fixture.counts(), before);
+    }
+
+    #[test]
+    fn no_research_owner_preserves_proposal_admission() {
+        let fixture = FenceFixture::new();
+        let proposal = fixture.proposal("baseline");
+        let acceptance = CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-baseline-next",
+                "experiment-baseline-next",
+                "submission-baseline-next",
+                &proposal,
+                &CampaignLimits::default(),
+                105,
+            )
+            .unwrap();
+        assert!(matches!(acceptance, ProposalAcceptance::Accepted(_)));
+        assert_eq!(fixture.counts(), (2, 2, 2));
+    }
 }
 
 fn earliest_live_reservation_expiry(
@@ -3743,6 +4258,47 @@ fn proposal_from_row(row: &Row<'_>) -> rusqlite::Result<Proposal> {
         reject_reason: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+    })
+}
+
+fn code_change_run_from_row(row: &Row<'_>) -> rusqlite::Result<CodeChangeRun> {
+    Ok(CodeChangeRun {
+        code_change_run_id: row.get(0)?,
+        proposal_id: row.get(1)?,
+        campaign_id: row.get(2)?,
+        state: row.get(3)?,
+        base_sha: row.get(4)?,
+        candidate_sha: row.get(5)?,
+        candidate_ref: row.get(6)?,
+        best_ref: row.get(7)?,
+        worktree_id: row.get(8)?,
+        worktree_relative_path: row.get(9)?,
+        editor_session_id: row.get(10)?,
+        editor_attempts: row.get(11)?,
+        diff_digest: row.get(12)?,
+        changed_file_count: row.get(13)?,
+        diff_bytes: row.get(14)?,
+        experiment_id: row.get(15)?,
+        rejection_code: row.get(16)?,
+        rejection_summary: row.get(17)?,
+        promotion_outcome: row.get(18)?,
+        promotion_expected_best_experiment_id: row.get(19)?,
+        promotion_expected_old_sha: row.get(20)?,
+        promotion_target_sha: row.get(21)?,
+        cleanup_completed_at: row.get(22)?,
+        state_root_identity: row.get(23)?,
+        worktrees_identity: row.get(24)?,
+        campaign_identity: row.get(25)?,
+        candidate_root_identity: row.get(26)?,
+        candidate_admin_identity: row.get(27)?,
+        candidate_common_identity: row.get(28)?,
+        candidate_admin_path: row.get(29)?,
+        candidate_common_path: row.get(30)?,
+        protected_ref_digest: row.get(31)?,
+        candidate_working_directory_identity: row.get(32)?,
+        remote_config_digest: row.get(33)?,
+        created_at: row.get(34)?,
+        updated_at: row.get(35)?,
     })
 }
 

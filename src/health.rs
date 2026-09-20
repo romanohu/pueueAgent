@@ -3,15 +3,16 @@ use std::{
     path::Path,
 };
 
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::{
     db::{
         count_live_repair_descendants, database_error,
         running_health::HealthRepository,
+        insert_event_idempotent_in_transaction, research_ownership_in_transaction,
         CampaignRepository, Db, EventRepository, IncidentRepository, ProposalRepository,
-        ProjectRepository, SubmissionRepository,
+        ProjectRepository, ResearchOwnership, SubmissionRepository,
     },
     execution_policy::CampaignLimits,
     health_diagnosis::{parse_and_validate_diagnosis, RecommendedAction, ValidatedDiagnosis},
@@ -388,15 +389,31 @@ fn escalate_after_terminal(
     reason: &str,
     now: i64,
 ) -> Result<(), AppError> {
-    let connection = db.connect()?;
-    let degraded = connection
+    let mut connection = db.connect()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error("begin health escalation"))?;
+    if !matches!(
+        research_ownership_in_transaction(
+            &transaction,
+            &row.project_id,
+            &row.campaign_id,
+            &row.experiment_id,
+        )?,
+        ResearchOwnership::None
+    ) {
+        transaction
+            .commit()
+            .map_err(database_error("commit deferred health escalation"))?;
+        return Ok(());
+    }
+    let degraded = transaction
         .execute(
             "UPDATE campaigns SET state = 'degraded', state_reason = ?1, updated_at = ?2
              WHERE campaign_id = ?3 AND state IN ('active','budget_waiting')",
             rusqlite::params![reason, now, row.campaign_id],
         )
         .map_err(database_error("degrade campaign after health escalation"))?;
-    drop(connection);
     if degraded == 1 {
         let event = NewEvent::new(
             &row.project_id,
@@ -413,9 +430,11 @@ fn escalate_after_terminal(
             now,
         )
         .with_campaign_lineage(row.campaign_id.as_str(), Some(row.experiment_id.as_str()));
-        EventRepository::new(db).insert_idempotent(&event)?;
+        insert_event_idempotent_in_transaction(&transaction, &event)?;
     }
-    Ok(())
+    transaction
+        .commit()
+        .map_err(database_error("commit health escalation"))
 }
 
 fn record_refused_action(
@@ -550,5 +569,177 @@ fn summary_entry(signal: &SignalObservation) -> SignalSummaryEntry {
         source: source_label(&signal.source).to_owned(),
         evidence_digest: signal.evidence_digest.clone(),
         observed_at: signal.observed_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        db::{
+            insert_event_completed_in_transaction, ExperimentRepository, ProjectRepository,
+            StartCampaignRequest,
+        },
+        models::{ExperimentTerminalOutcome, NewProject},
+        proposals::{self, ProposalInput},
+        state::ObjectiveSnapshot,
+    };
+    use rusqlite::TransactionBehavior;
+    use tempfile::TempDir;
+
+    struct FenceFixture {
+        db: Db,
+        _root: TempDir,
+    }
+
+    impl FenceFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let project_root = root.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let db = Db::open(&root.path().join("state.sqlite3")).unwrap();
+            ProjectRepository::new(&db)
+                .register(&NewProject::new(
+                    "project-1",
+                    &project_root,
+                    "project-1-group",
+                    project_root.join("config.toml"),
+                    100,
+                ))
+                .unwrap();
+            let baseline = proposals::validate_initial_baseline(
+                ProposalInput {
+                    kind: ProposalKind::Experiment,
+                    hypothesis: "baseline".to_owned(),
+                    source_experiment_id: None,
+                    argv: vec!["python".to_owned(), "train.py".to_owned()],
+                    working_directory: ".".to_owned(),
+                    expected_evidence: vec!["metric".to_owned()],
+                },
+                "objective-digest",
+            )
+            .unwrap();
+            CampaignRepository::new(&db)
+                .start_with_baseline(
+                    StartCampaignRequest {
+                        campaign_id: "campaign-1",
+                        project_id: "project-1",
+                        objective: &ObjectiveSnapshot {
+                            text: "objective".to_owned(),
+                            digest: "objective-digest".to_owned(),
+                        },
+                        initial_argv: baseline.argv(),
+                        baseline: &baseline,
+                        submission_id: "submission-source",
+                        experiment_id: "experiment-source",
+                        proposal_id: "proposal-source",
+                        metadata: &serde_json::json!({}),
+                        origin_agent_run_id: None,
+                        objective_metric: None,
+                        now: 100,
+                    },
+                    &CampaignLimits::default(),
+                )
+                .unwrap();
+            let experiments = ExperimentRepository::new(&db);
+            experiments
+                .mark_submitting("experiment-source", 101)
+                .unwrap();
+            experiments
+                .mark_accepted("experiment-source", 7, "pueue-managed-run:v1:source", 102)
+                .unwrap();
+            experiments
+                .project_terminal_submission(
+                    "experiment-source",
+                    7,
+                    ExperimentTerminalOutcome::Succeeded,
+                    103,
+                )
+                .unwrap();
+
+            let mut connection = db.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let event = NewEvent::new(
+                "project-1",
+                EventKind::CampaignResearch,
+                "research-owner-event",
+                serde_json::json!({"review_id":"review-1"}),
+                104,
+                104,
+            )
+            .with_campaign_lineage("campaign-1", Some("experiment-source"));
+            let (stored, _) = insert_event_completed_in_transaction(&transaction, &event).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO research_reviews (
+                        review_id, campaign_id, experiment_id, task_signature, attempt,
+                        state, operation_stage, agent_run_id, context_json, context_digest,
+                        response_json, termination_request_id, successor_experiment_id,
+                        evidence_schema_version, session_generation, event_id, not_before,
+                        notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                        created_at, started_at, finished_at, updated_at
+                     ) VALUES (
+                        'review-1', 'campaign-1', 'experiment-source',
+                        'pueue-managed-run:v1:source', 1, 'ready', 'intent', NULL,
+                        NULL, NULL, NULL, NULL, NULL, NULL, 0, ?1, 104, NULL, NULL,
+                        NULL, NULL, 104, NULL, NULL, 104
+                     )",
+                    [stored.event_id],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            Self { db, _root: root }
+        }
+
+        fn row(&self) -> RunningHealthRow {
+            RunningHealthRow {
+                experiment_id: "experiment-source".to_owned(),
+                campaign_id: "campaign-1".to_owned(),
+                project_id: "project-1".to_owned(),
+                pueue_task_id: 7,
+                state: HealthState::ActionPending,
+                observation_count: 1,
+                last_observed_at: 104,
+                signal_summary_json: "[]".to_owned(),
+                diagnosis_json: None,
+                created_at: 104,
+                updated_at: 104,
+            }
+        }
+    }
+
+    #[test]
+    fn research_owner_defers_health_escalation_before_campaign_or_event_mutation() {
+        let fixture = FenceFixture::new();
+        let row = fixture.row();
+        escalate_after_terminal(
+            &fixture.db,
+            &row,
+            RecommendedAction::KillAndEscalate,
+            "research_owner_open",
+            105,
+        )
+        .unwrap();
+
+        let connection = fixture.db.connect().unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM campaigns WHERE campaign_id = 'campaign-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "active");
+        let wake_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE project_id = 'project-1' AND kind = 'operator_wake'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wake_events, 0);
     }
 }

@@ -12,6 +12,7 @@ pub use campaigns::{
     CampaignStatusProjection, ExperimentRepository, ManagedSubmissionIntent, ProposalRepository,
     ProposalAcceptance, StartCampaignRequest,
 };
+pub(crate) use campaigns::CodeChangeReentry;
 pub use code_changes::{CodeChangeRepository, NewCodeChangeCheck};
 pub(crate) use campaigns::{count_live_repair_descendants, count_live_reservations};
 pub(crate) use repositories::{insert_event_completed_in_transaction, insert_event_idempotent_in_transaction};

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     code_change,
     db::{
-        CampaignRepository, CodeChangeRepository, Db, ExperimentRepository,
+        CampaignRepository, CodeChangeReentry, CodeChangeRepository, Db, ExperimentRepository,
         ManagedSubmissionIntent, ProjectRepository, ProposalAcceptance, ProposalRepository,
         StartCampaignRequest, SubmissionRepository,
     },
@@ -21,8 +21,8 @@ use crate::{
         VerifiedProjectRoot, VerifiedWorkingDirectory,
     },
     models::{
-        Campaign, CampaignState, CodeChangeRun, CodeChangeState, Experiment, ExperimentStatus,
-        NewCodeChangeRun, ObjectiveMetric, Project, Proposal, ProposalKind, ProposalStatus,
+        Campaign, CampaignState, CodeChangeRun, Experiment, ExperimentStatus, NewCodeChangeRun,
+        ObjectiveMetric, Project, Proposal, ProposalKind,
         Submission,
     },
     output::{
@@ -668,10 +668,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 ))
             }
             ProposalAcceptance::BudgetWaiting { .. } => Ok(CampaignProposalAdmission::Deferred),
-            ProposalAcceptance::CapacityDeferred => Err(AppError::Validation {
-                field: "proposal.kind",
-                message: "unexpected capacity deferral for an experiment proposal",
-            }),
+            ProposalAcceptance::CapacityDeferred => Ok(CampaignProposalAdmission::Deferred),
             ProposalAcceptance::PendingCodeChange => Err(AppError::Validation {
                 field: "proposal.kind",
                 message: "unexpected code-change acceptance for an experiment proposal",
@@ -692,31 +689,18 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         now: i64,
     ) -> Result<CampaignProposalAdmission, AppError> {
         let proposals_repository = ProposalRepository::new(self.db);
-        if let Some(existing) = proposals_repository.find_for_campaign(campaign_id, proposal_id)? {
-            if existing.canonical_digest != proposal.canonical_digest() {
-                return Err(AppError::Validation {
-                    field: "proposal_id",
-                    message: "conflicts with a different canonical proposal digest",
-                });
+        match CampaignRepository::new(self.db).resolve_code_change_reentry(
+            campaign_id,
+            proposal_id,
+            proposal.canonical_digest(),
+            now,
+        )? {
+            CodeChangeReentry::Missing => {}
+            CodeChangeReentry::Deferred => return Ok(CampaignProposalAdmission::Deferred),
+            CodeChangeReentry::Rejected(proposal) => {
+                return Ok(CampaignProposalAdmission::CodeChangeRejected(proposal))
             }
-            if existing.kind != ProposalKind::CodeChange {
-                return Err(AppError::Validation {
-                    field: "proposal.kind",
-                    message: "proposal ID belongs to a non-code proposal",
-                });
-            }
-            return self.existing_code_change_outcome(existing, now);
-        }
-        if let Some(existing) =
-            proposals_repository.find_by_digest(campaign_id, proposal.canonical_digest())?
-        {
-            if existing.kind != ProposalKind::CodeChange {
-                return Err(AppError::Validation {
-                    field: "proposal.canonical_digest",
-                    message: "matches a non-code proposal",
-                });
-            }
-            return self.existing_code_change_outcome(existing, now);
+            CodeChangeReentry::Run(run) => return Ok(CampaignProposalAdmission::CodeChange(run)),
         }
         let live_code_change: i64 = self
             .db
@@ -810,31 +794,6 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 }
             }
         }
-    }
-
-    fn existing_code_change_outcome(
-        &self,
-        proposal: Proposal,
-        now: i64,
-    ) -> Result<CampaignProposalAdmission, AppError> {
-        if proposal.status == ProposalStatus::Rejected {
-            return Ok(CampaignProposalAdmission::CodeChangeRejected(proposal));
-        }
-        if let Some(run) =
-            CodeChangeRepository::new(self.db).find_by_proposal(&proposal.proposal_id)?
-        {
-            if run.state == CodeChangeState::Rejected {
-                return Ok(CampaignProposalAdmission::CodeChangeRejected(proposal));
-            }
-            return Ok(CampaignProposalAdmission::CodeChange(run));
-        }
-        let rejected = CampaignRepository::new(self.db).reject_orphan_code_change(
-            &proposal.campaign_id,
-            &proposal.proposal_id,
-            "orphan_code_change_run",
-            now,
-        )?;
-        Ok(CampaignProposalAdmission::CodeChangeRejected(rejected))
     }
 
     async fn capture_clean_head(&self, project_root: &Path) -> Option<String> {
@@ -2084,7 +2043,299 @@ fn reconciliation_required() -> AppError {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::execution_policy::ExecutableAnchor;
+    use crate::{
+        db::{
+            CodeChangeRepository, DecisionRepository, ExperimentRepository,
+        },
+        execution_policy::ExecutableAnchor,
+        models::{EventKind, ExperimentTerminalOutcome, NewCodeChangeRun, NewEvent, NewProject},
+        proposals::{self, ProposalInput},
+        state::ObjectiveSnapshot,
+    };
+    use rusqlite::TransactionBehavior;
+    use tempfile::TempDir;
+
+    struct CoordinatorFenceFixture {
+        db: Db,
+        _root: TempDir,
+        project: Project,
+    }
+
+    impl CoordinatorFenceFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let project_root = root.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let db = Db::open(&root.path().join("state.sqlite3")).unwrap();
+            ProjectRepository::new(&db)
+                .register(&NewProject::new(
+                    "project-1",
+                    &project_root,
+                    "project-1-group",
+                    project_root.join("config.toml"),
+                    100,
+                ))
+                .unwrap();
+            let project = ProjectRepository::new(&db)
+                .find_by_id("project-1")
+                .unwrap()
+                .unwrap();
+            let baseline = proposals::validate_initial_baseline(
+                ProposalInput {
+                    kind: ProposalKind::Experiment,
+                    hypothesis: "baseline".to_owned(),
+                    source_experiment_id: None,
+                    argv: vec!["python".to_owned(), "train.py".to_owned()],
+                    working_directory: ".".to_owned(),
+                    expected_evidence: vec!["metric".to_owned()],
+                },
+                "objective-digest",
+            )
+            .unwrap();
+            CampaignRepository::new(&db)
+                .start_with_baseline(
+                    StartCampaignRequest {
+                        campaign_id: "campaign-1",
+                        project_id: "project-1",
+                        objective: &ObjectiveSnapshot {
+                            text: "objective".to_owned(),
+                            digest: "objective-digest".to_owned(),
+                        },
+                        initial_argv: baseline.argv(),
+                        baseline: &baseline,
+                        submission_id: "submission-source",
+                        experiment_id: "experiment-source",
+                        proposal_id: "proposal-source",
+                        metadata: &serde_json::json!({}),
+                        origin_agent_run_id: None,
+                        objective_metric: None,
+                        now: 100,
+                    },
+                    &CampaignLimits::default(),
+                )
+                .unwrap();
+            let experiments = ExperimentRepository::new(&db);
+            experiments
+                .mark_submitting("experiment-source", 101)
+                .unwrap();
+            experiments
+                .mark_accepted("experiment-source", 7, "pueue-managed-run:v1:source", 102)
+                .unwrap();
+            experiments
+                .project_terminal_submission(
+                    "experiment-source",
+                    7,
+                    ExperimentTerminalOutcome::Succeeded,
+                    103,
+                )
+                .unwrap();
+            let cycle = DecisionRepository::new(&db)
+                .ensure_cycle_for_terminal("campaign-1", "experiment-source", 104)
+                .unwrap();
+            DecisionRepository::new(&db)
+                .reserve_next_attempt("project-1", &cycle.cycle_id, 104)
+                .unwrap()
+                .unwrap();
+            Self {
+                db,
+                _root: root,
+                project,
+            }
+        }
+
+        fn proposal(&self, kind: ProposalKind, hypothesis: &str) -> proposals::ValidatedProposal {
+            proposals::validate(
+                ProposalInput {
+                    kind,
+                    hypothesis: hypothesis.to_owned(),
+                    source_experiment_id: Some("experiment-source".to_owned()),
+                    argv: vec!["python".to_owned(), hypothesis.to_owned(), ".py".to_owned()],
+                    working_directory: ".".to_owned(),
+                    expected_evidence: vec!["metric".to_owned()],
+                },
+                "objective-digest",
+            )
+            .unwrap()
+        }
+
+        fn insert_malformed_open_owner(&self) {
+            let mut connection = self.db.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let event = NewEvent::new(
+                "project-1",
+                EventKind::CampaignResearch,
+                "research-owner-event",
+                serde_json::json!({"review_id":"review-1"}),
+                105,
+                105,
+            )
+            .with_campaign_lineage("campaign-1", Some("experiment-source"));
+            let (stored, _) = crate::db::insert_event_completed_in_transaction(
+                &transaction,
+                &event,
+            )
+            .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO research_reviews (
+                        review_id, campaign_id, experiment_id, task_signature, attempt,
+                        state, operation_stage, agent_run_id, context_json, context_digest,
+                        response_json, termination_request_id, successor_experiment_id,
+                        evidence_schema_version, session_generation, event_id, not_before,
+                        notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                        created_at, started_at, finished_at, updated_at
+                     ) VALUES (
+                        'review-1', 'campaign-1', 'experiment-source',
+                        'pueue-managed-run:v1:source', 1, 'ready', 'intent', NULL,
+                        NULL, NULL, NULL, NULL, NULL, NULL, 0, ?1, ?2, NULL, NULL,
+                        NULL, NULL, 105, NULL, NULL, 105
+                     )",
+                    rusqlite::params![stored.event_id, 105],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        fn snapshot(&self) -> (
+            Campaign,
+            Option<Proposal>,
+            Option<CodeChangeRun>,
+            (i64, i64, i64, i64, i64, i64, i64),
+            Vec<(String, String, Option<i64>, i64)>,
+        ) {
+            let connection = self.db.connect().unwrap();
+            let decision_cycles = connection
+                .prepare(
+                    "SELECT cycle_id, state, next_wake_at, updated_at
+                     FROM decision_cycles ORDER BY cycle_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let row_counts = connection
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM proposals WHERE campaign_id = 'campaign-1'),
+                         (SELECT COUNT(*) FROM experiments WHERE campaign_id = 'campaign-1'),
+                         (SELECT COUNT(*) FROM submissions WHERE project_id = 'project-1'),
+                         (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = 'campaign-1'),
+                         (SELECT COUNT(*) FROM code_change_runs WHERE campaign_id = 'campaign-1'),
+                         (SELECT COUNT(*) FROM decision_attempts
+                          WHERE cycle_id IN (SELECT cycle_id FROM decision_cycles
+                                             WHERE campaign_id = 'campaign-1')),
+                         (SELECT COUNT(*) FROM events WHERE project_id = 'project-1')",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            (
+                CampaignRepository::new(&self.db)
+                    .find_by_id("campaign-1")
+                    .unwrap()
+                    .unwrap(),
+                ProposalRepository::new(&self.db)
+                    .find_for_campaign("campaign-1", "proposal-code")
+                    .unwrap(),
+                CodeChangeRepository::new(&self.db)
+                    .find_by_proposal("proposal-code")
+                    .unwrap(),
+                row_counts,
+                decision_cycles,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_defers_normal_experiment_when_research_owns_source() {
+        let fixture = CoordinatorFenceFixture::new();
+        fixture.insert_malformed_open_owner();
+        let before = fixture.snapshot();
+        let proposal = fixture.proposal(ProposalKind::Experiment, "generic");
+        let pueue = crate::pueue::CommandPueue::default();
+        let admission = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default())
+            .admit_proposal(
+                &fixture.project,
+                "campaign-1",
+                "proposal-generic",
+                "experiment-generic",
+                "submission-generic",
+                &proposal,
+                106,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, CampaignProposalAdmission::Deferred));
+        assert_eq!(fixture.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn coordinator_defers_code_change_id_and_digest_reentry_before_reuse() {
+        let fixture = CoordinatorFenceFixture::new();
+        let proposal = fixture.proposal(ProposalKind::CodeChange, "code-change");
+        let run = NewCodeChangeRun::new(
+            "code-run-1",
+            "proposal-code",
+            "campaign-1",
+            "a".repeat(40),
+            code_change::candidate_ref("campaign-1", "proposal-code").unwrap(),
+            code_change::best_ref("campaign-1").unwrap(),
+            "worktree-code-run-1",
+            ".pueue-agent/worktrees/campaign-1/proposal-code",
+            105,
+        );
+        assert!(matches!(
+            CampaignRepository::new(&fixture.db)
+                .accept_code_change_proposal(
+                    "campaign-1",
+                    "proposal-code",
+                    "experiment-code",
+                    "submission-code",
+                    &proposal,
+                    &CampaignLimits::default(),
+                    105,
+                    Some(&run),
+                    None,
+                )
+                .unwrap(),
+            ProposalAcceptance::PendingCodeChange
+        ));
+        fixture.insert_malformed_open_owner();
+        let before = fixture.snapshot();
+        let pueue = crate::pueue::CommandPueue::default();
+        let coordinator = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default());
+        for proposal_id in ["proposal-code", "proposal-code-retry"] {
+            let admission = coordinator
+                .admit_proposal(
+                    &fixture.project,
+                    "campaign-1",
+                    proposal_id,
+                    "experiment-code-retry",
+                    "submission-code-retry",
+                    &proposal,
+                    106,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(admission, CampaignProposalAdmission::Deferred));
+            assert_eq!(fixture.snapshot(), before);
+        }
+    }
 
     #[test]
     fn candidate_submission_cwd_is_descriptor_bound_to_the_candidate_root() {
