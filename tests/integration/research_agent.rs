@@ -1155,7 +1155,7 @@ max_agent_runs = 10
         }
     }
 
-    fn prepare_secondary_campaign(&self) -> ClaimedReview {
+    fn prepare_secondary_campaign(&self) -> String {
         let project = ProjectRepository::new(&self.db)
             .register(&NewProject::new(
                 &self.secondary_project_id,
@@ -1233,17 +1233,7 @@ max_agent_runs = 10
         ResearchRepository::new(&self.db)
             .schedule_running(&campaign_id, NOW + 22, 1, NOW + 25)
             .unwrap();
-        let review = ResearchRepository::new(&self.db)
-            .claim_due(&campaign_id, &experiment_id, &task_signature, NOW + 26)
-            .unwrap()
-            .expect("secondary campaign baseline must produce a research review");
-        let evidence = build_research_evidence(&self.db, &review, NOW + 26).unwrap();
-        ClaimedReview {
-            event_id: review_event_id(&self.db, &review.review_id),
-            review,
-            evidence,
-            claimed_at: NOW + 26,
-        }
+        campaign_id
     }
 }
 
@@ -3821,19 +3811,7 @@ async fn research_coordinator_prioritizes_due_retries_before_new_campaign_claims
         .not_before;
     let wake = review_wake.max(event_wake);
 
-    let new_campaign = harness.prepare_secondary_campaign();
-    assert_eq!(new_campaign.review.state, "pending");
-    let new_review_not_before: i64 = harness
-        .db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT not_before FROM research_reviews WHERE review_id = ?1",
-            [&new_campaign.review.review_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(new_review_not_before <= wake);
+    let new_campaign_id = harness.prepare_secondary_campaign();
 
     let report = run_due_research(
         &harness.db,
@@ -3856,10 +3834,13 @@ async fn research_coordinator_prioritizes_due_retries_before_new_campaign_claims
         )
         .unwrap();
     assert_eq!(started_review_id, durable.review.review_id);
-    let new_pending = ResearchRepository::new(&harness.db)
-        .find(&new_campaign.review.review_id)
-        .unwrap();
-    assert_eq!(new_pending.state, "pending");
+    assert!(
+        ResearchRepository::new(&harness.db)
+            .recent(&new_campaign_id, 1)
+            .unwrap()
+            .is_empty(),
+        "a new campaign must not be claimed while a durable retry consumes the slot"
+    );
 
     let mut retry_handle = report
         .started
