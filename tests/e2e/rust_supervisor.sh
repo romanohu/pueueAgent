@@ -711,6 +711,7 @@ max_same_spec_retries = 2
 max_repairs_per_failure_fingerprint = 2
 max_proposals_per_cycle = 1
 observer_interval_minutes = 1
+research_interval_minutes = 0
 max_decision_attempts_per_cycle = 3
 max_decision_wait_minutes = 1440
 

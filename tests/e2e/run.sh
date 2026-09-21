@@ -2,4 +2,5 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/rust_supervisor.sh" "$@"
+"$SCRIPT_DIR/rust_supervisor.sh" "$@"
+exec "$SCRIPT_DIR/research_supervisor.sh" "$@"

@@ -4659,6 +4659,178 @@ async fn research_policy_evidence_persists_complete_loader_and_distinct_candidat
 }
 
 #[tokio::test]
+async fn research_fake_protocol_parses_all_actions_from_real_available_support() {
+    let harness = ResearchHarness::new("fake-protocol-real-support", FIRST_SESSION);
+    harness.write_checkpoint_fixture(
+        "train.py",
+        b"# durable trainer source\nprint('ok')\n",
+        &[
+            ("first.json", b"first checkpoint"),
+            ("second.json", b"second checkpoint"),
+        ],
+    );
+
+    let (started, review) = harness.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    let support = &context["operations"]["checkpoint_support"];
+    assert_eq!(support["status"], "available");
+    let loader_reference = support["loader_support"][0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let candidate = &support["checkpoint_candidates"][0];
+    let candidate_reference = candidate["reference"].as_str().unwrap().to_owned();
+    let candidate_path = candidate["argv_path"].as_str().unwrap().to_owned();
+    let target_argv = context["facts"]["target"]["argv"].as_array().unwrap();
+    let expected_resume_argv = target_argv
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .chain(["--resume".to_owned(), candidate_path.clone()])
+        .collect::<Vec<_>>();
+    let context_json = review.context_json.clone().unwrap();
+    let context_digest = review.context_digest.clone().unwrap();
+
+    let fake_home = harness._temp.path().join("fake-codex-home");
+    fs::create_dir_all(fake_home.join(".pueue-agent")).unwrap();
+    fs::set_permissions(&fake_home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(
+        fake_home.join(".pueue-agent"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let schema = fake_home.join("research-schema.json");
+    fs::write(&schema, b"{}").unwrap();
+    fs::set_permissions(&schema, fs::Permissions::from_mode(0o600)).unwrap();
+    let scenario = fake_home.join(".pueue-agent/research-scenario.json");
+    let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_codex.sh");
+    let prompt = format!(
+        "{}{}",
+        pueue_agent::research_evidence::RESEARCH_PROMPT_PREFIX,
+        context_json
+    );
+    let path_value = fake_home.to_string_lossy().into_owned();
+    let codex_home = harness.codex_home.clone();
+    let project_root = harness.project.root_path.clone();
+
+    let invoke =
+        |scenario_value: serde_json::Value, output_path: &Path, resume_id: Option<&str>| {
+            fs::write(&scenario, serde_json::to_vec(&scenario_value).unwrap()).unwrap();
+            let mut command = Command::new(&fake);
+            command
+                .env_clear()
+                .env("HOME", &path_value)
+                .env("CODEX_HOME", &codex_home)
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .arg("--ask-for-approval")
+                .arg("never")
+                .arg("exec")
+                .arg("-C")
+                .arg(&project_root)
+                .arg("--json");
+            if let Some(resume_id) = resume_id {
+                command.arg("resume").arg(resume_id);
+            }
+            let output = command
+                .arg("--output-schema")
+                .arg(&schema)
+                .arg("--output-last-message")
+                .arg(output_path)
+                .arg("--")
+                .arg(&prompt)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fake Codex failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+
+    let continue_id = "11111111-1111-4111-b111-111111111111";
+    let continue_output = fake_home.join("continue/research.json");
+    fs::create_dir_all(continue_output.parent().unwrap()).unwrap();
+    let continue_process = invoke(
+        serde_json::json!({
+            "session_id": continue_id,
+            "action": "continue",
+            "reason": "continue from real support",
+            "notes": "continue note",
+        }),
+        &continue_output,
+        None,
+    );
+    let continue_answer =
+        pueue_agent::research_protocol::parse_research_answer(&fs::read(&continue_output).unwrap())
+            .unwrap();
+    assert_eq!(continue_answer.context_digest, context_digest);
+    assert_eq!(continue_answer.action, "continue");
+    assert_eq!(
+        pueue_agent::research_protocol::parse_research_thread_id(&continue_process.stdout).unwrap(),
+        continue_id
+    );
+
+    let stop_id = "11111111-1111-4111-a111-111111111111";
+    let stop_output = fake_home.join("stop/research.json");
+    fs::create_dir_all(stop_output.parent().unwrap()).unwrap();
+    let stop_process = invoke(
+        serde_json::json!({
+            "session_id": stop_id,
+            "action": "stop_and_next",
+            "reason": "stop from real support",
+            "notes": "stop note",
+            "next_direction": "inspect the next target",
+        }),
+        &stop_output,
+        None,
+    );
+    let stop_answer =
+        pueue_agent::research_protocol::parse_research_answer(&fs::read(&stop_output).unwrap())
+            .unwrap();
+    assert_eq!(stop_answer.context_digest, context_digest);
+    assert_eq!(stop_answer.action, "stop_and_next");
+    assert_eq!(
+        stop_answer.next_direction.as_deref(),
+        Some("inspect the next target")
+    );
+    assert_eq!(
+        pueue_agent::research_protocol::parse_research_thread_id(&stop_process.stdout).unwrap(),
+        stop_id
+    );
+
+    let resume_output = fake_home.join("resume/research.json");
+    fs::create_dir_all(resume_output.parent().unwrap()).unwrap();
+    let resume_process = invoke(
+        serde_json::json!({
+            "session_id": continue_id,
+            "action": "resume_from_checkpoint",
+            "reason": "resume from real support",
+            "notes": "resume note",
+        }),
+        &resume_output,
+        Some(continue_id),
+    );
+    let resume_answer =
+        pueue_agent::research_protocol::parse_research_answer(&fs::read(&resume_output).unwrap())
+            .unwrap();
+    assert_eq!(resume_answer.context_digest, context_digest);
+    assert_eq!(resume_answer.action, "resume_from_checkpoint");
+    let checkpoint = resume_answer.checkpoint.unwrap();
+    assert_eq!(checkpoint.path, candidate_path);
+    assert_eq!(checkpoint.argv, expected_resume_argv);
+    assert_eq!(checkpoint.working_directory, ".");
+    assert_eq!(
+        checkpoint.support_evidence_refs,
+        vec![loader_reference, candidate_reference]
+    );
+    assert_eq!(
+        pueue_agent::research_protocol::parse_research_thread_id(&resume_process.stdout).unwrap(),
+        continue_id
+    );
+}
+
+#[tokio::test]
 async fn research_policy_evidence_rejects_observation_command_mismatch_before_support_reads() {
     let harness = ResearchHarness::new("checkpoint-command-mismatch", FIRST_SESSION);
     harness.rewrite_target_command_without_observation(&["python", "different.py"], ".");
