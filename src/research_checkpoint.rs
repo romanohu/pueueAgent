@@ -9,7 +9,21 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    environment::{ResearchDirectoryRecord, ResearchFileRecord},
+    db::{
+        checkpoint_source_authority_for_preparation, CheckpointSourceAuthorityRead, Db,
+        ReadyResearchAction,
+    },
+    environment::{
+        cleanup_retained_research_file, open_verified_research_file,
+        read_verified_research_file, record_verified_research_directory,
+        reopen_retained_research_file, retain_verified_research_file,
+        reverify_retained_research_file, ResearchDirectoryRecord, ResearchFileRecord,
+        RetainedResearchFile,
+    },
+    execution_policy::{
+        PolicyViolationDetail, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
+        TempUnsafeReason,
+    },
     models::ProposalKind,
     output::permits_lossless_evidence_text,
     proposals::{self, ProposalInput},
@@ -205,6 +219,498 @@ pub(crate) struct PreparedCheckpoint {
     pub(crate) retained_argv: Vec<String>,
 
     pub(crate) successor_ids: CheckpointSuccessorIds,
+}
+
+pub(crate) struct VerifiedPreparedCheckpoint {
+    checkpoint: PreparedCheckpoint,
+    retained: RetainedResearchFile,
+}
+
+#[derive(Debug)]
+pub(crate) enum PrepareCheckpointError {
+    Unsupported { reason: String },
+    OrphanedRetainedCheckpoint,
+    Failed(AppError),
+}
+
+impl VerifiedPreparedCheckpoint {
+    pub(crate) fn checkpoint(&self) -> &PreparedCheckpoint {
+        &self.checkpoint
+    }
+
+    pub(crate) fn reverify(
+        &self,
+        policy: &ResolvedExecutionPolicy,
+    ) -> Result<(), AppError> {
+        reverify_prepared_checkpoint(policy, &self.checkpoint, &self.retained)
+    }
+
+    pub(crate) fn release_lease(self) -> PreparedCheckpoint {
+        let Self {
+            checkpoint,
+            retained,
+        } = self;
+        drop(retained);
+        checkpoint
+    }
+}
+
+pub(crate) fn prepare_checkpoint(
+    db: &Db,
+    action: &ReadyResearchAction,
+    request: &CheckpointRequest,
+    policy: &ResolvedExecutionPolicy,
+    project_policy: &ResolvedProjectExecutionPolicy,
+) -> Result<VerifiedPreparedCheckpoint, PrepareCheckpointError> {
+    let authority = match checkpoint_source_authority_for_preparation(db, action, request)
+        .map_err(PrepareCheckpointError::Failed)?
+    {
+        CheckpointSourceAuthorityRead::Supported(authority) => authority,
+        CheckpointSourceAuthorityRead::Unsupported { reason } => {
+            return Err(PrepareCheckpointError::Unsupported { reason })
+        }
+    };
+    let source = &authority.source;
+    if authority.project.project_id != project_policy.project_id
+        || source.campaign.project_id != authority.project.project_id
+    {
+        return Err(PrepareCheckpointError::Failed(validation_error(
+            "checkpoint.project",
+            "does not match the project policy",
+        )));
+    }
+    let root_anchor = policy
+        .project_root_anchor(&authority.project.root_path)
+        .map_err(AppError::from)
+        .map_err(PrepareCheckpointError::Failed)?;
+    if root_anchor != project_policy.root_anchor
+        || root_anchor.canonical_path != project_policy.root_anchor.canonical_path
+    {
+        return Err(PrepareCheckpointError::Failed(validation_error(
+            "checkpoint.project_root",
+            "does not match the project policy",
+        )));
+    }
+
+    let selected = select_checkpoint_support(&authority.support, request)
+        .map_err(PrepareCheckpointError::Failed)?;
+    let selected_working_directory_record = match &authority.support {
+        CheckpointSupportEvidenceV1::Available {
+            working_directory_record,
+            ..
+        } => working_directory_record,
+        CheckpointSupportEvidenceV1::Unavailable { .. } => {
+            return Err(PrepareCheckpointError::Failed(validation_error(
+                "checkpoint.support",
+                "is not available for preparation",
+            )))
+        }
+    };
+    let layout = checkpoint_source_layout(&source.proposal.argv, &source.proposal.working_directory)
+        .map_err(PrepareCheckpointError::Failed)?;
+    let command = validate_checkpoint_command(
+        &source.proposal.argv,
+        &source.proposal.working_directory,
+        request,
+    )
+    .map_err(PrepareCheckpointError::Failed)?;
+    let learning_spec_digest = checkpoint_learning_spec_digest(
+        &source.proposal.argv,
+        &layout.normalized_working_directory,
+    )
+    .map_err(PrepareCheckpointError::Failed)?;
+    let successor_ids = checkpoint_successor_ids(&action.owner.review_id, action.owner.attempt)
+        .map_err(PrepareCheckpointError::Failed)?;
+    let source_root_record = record_verified_research_directory(policy, &root_anchor, Path::new("."))
+        .map_err(|error| PrepareCheckpointError::Failed(error.into()))?;
+    let source_working_directory_record = record_verified_research_directory(
+        policy,
+        &root_anchor,
+        Path::new(&layout.normalized_working_directory),
+    )
+    .map_err(|error| PrepareCheckpointError::Failed(error.into()))?;
+    verify_selected_support_records(
+        selected,
+        &source_root_record,
+        &source_working_directory_record,
+        selected_working_directory_record,
+    )
+    .map_err(PrepareCheckpointError::Failed)?;
+    let loader_file = open_verified_research_file(
+        policy,
+        &root_anchor,
+        Path::new(&layout.entrypoint_root_relative_path),
+        MAX_CHECKPOINT_SOURCE_BYTES as u64,
+    )
+    .map_err(|error| PrepareCheckpointError::Failed(error.into()))?;
+    let loader_bytes = read_verified_research_file(
+        &loader_file,
+        MAX_CHECKPOINT_SOURCE_BYTES as u64,
+    )
+    .map_err(|error| PrepareCheckpointError::Failed(error.into()))?;
+    verify_loader_runtime(
+        selected.loader,
+        &loader_file,
+        &loader_bytes,
+        &source_root_record,
+        &source_working_directory_record,
+        &layout,
+    )
+    .map_err(PrepareCheckpointError::Failed)?;
+    let candidate_file = open_verified_research_file(
+        policy,
+        &root_anchor,
+        Path::new(&selected.candidate.root_relative_path),
+        crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+    )
+    .map_err(|error| PrepareCheckpointError::Failed(error.into()))?;
+    verify_candidate_runtime(selected.candidate, &candidate_file, &source_root_record)
+        .map_err(PrepareCheckpointError::Failed)?;
+
+    let retained = retain_verified_research_file(
+        policy,
+        &action.owner.campaign_id,
+        &action.owner.review_id,
+        &candidate_file,
+    )
+    .map_err(map_retention_failure)?;
+    let retained_record = retained.record().clone();
+    let prepared_result = build_prepared_checkpoint(
+        policy,
+        action,
+        request,
+        source,
+        selected,
+        &layout,
+        &command,
+        &source_root_record,
+        &source_working_directory_record,
+        &retained_record,
+        &root_anchor,
+        learning_spec_digest,
+        successor_ids,
+    );
+    match prepared_result {
+        Ok(checkpoint) => {
+            let verified = VerifiedPreparedCheckpoint { checkpoint, retained };
+            if let Err(error) = verified.reverify(policy) {
+                let VerifiedPreparedCheckpoint {
+                    checkpoint: _,
+                    retained,
+                } = verified;
+                return cleanup_after_preparation_failure(
+                    policy,
+                    &action.owner.campaign_id,
+                    &action.owner.review_id,
+                    retained,
+                    error,
+                );
+            }
+            Ok(verified)
+        }
+        Err(error) => cleanup_after_preparation_failure(
+            policy,
+            &action.owner.campaign_id,
+            &action.owner.review_id,
+            retained,
+            error,
+        ),
+    }
+}
+
+pub(crate) fn verify_prepared_checkpoint(
+    policy: &ResolvedExecutionPolicy,
+    checkpoint: &PreparedCheckpoint,
+) -> Result<VerifiedPreparedCheckpoint, AppError> {
+    validate_prepared_checkpoint(checkpoint)?;
+    verified_checkpoint_root(policy, checkpoint)?;
+    let retained = reopen_retained_research_file(
+        policy,
+        &checkpoint.campaign_id,
+        &checkpoint.review_id,
+        &checkpoint.retained_checkpoint,
+    )?;
+    if let Err(error) = reverify_prepared_checkpoint(policy, checkpoint, &retained) {
+        drop(retained);
+        return Err(error);
+    }
+    Ok(VerifiedPreparedCheckpoint {
+        checkpoint: checkpoint.clone(),
+        retained,
+    })
+}
+
+fn reverify_prepared_checkpoint(
+    policy: &ResolvedExecutionPolicy,
+    checkpoint: &PreparedCheckpoint,
+    retained: &RetainedResearchFile,
+) -> Result<(), AppError> {
+    validate_prepared_checkpoint(checkpoint)?;
+    let root_anchor = verified_checkpoint_root(policy, checkpoint)?;
+    let root_record = record_verified_research_directory(policy, &root_anchor, Path::new("."))?;
+    if root_record != checkpoint.source_root_record {
+        return Err(validation_error(
+            "checkpoint.source_root_record",
+            "does not match the current project root",
+        ));
+    }
+    let cwd_record = record_verified_research_directory(
+        policy,
+        &root_anchor,
+        Path::new(&checkpoint.source_working_directory),
+    )?;
+    if cwd_record != checkpoint.source_working_directory_record {
+        return Err(validation_error(
+            "checkpoint.source_working_directory_record",
+            "does not match the current working directory",
+        ));
+    }
+    let layout = checkpoint_source_layout(
+        &checkpoint.source_argv,
+        &checkpoint.source_working_directory,
+    )?;
+    let command = validate_checkpoint_command(
+        &checkpoint.source_argv,
+        &checkpoint.source_working_directory,
+        &checkpoint.request,
+    )?;
+    let loader_file = open_verified_research_file(
+        policy,
+        &root_anchor,
+        Path::new(&layout.entrypoint_root_relative_path),
+        MAX_CHECKPOINT_SOURCE_BYTES as u64,
+    )?;
+    let loader_bytes = read_verified_research_file(
+        &loader_file,
+        MAX_CHECKPOINT_SOURCE_BYTES as u64,
+    )?;
+    verify_loader_runtime(
+        &checkpoint.loader,
+        &loader_file,
+        &loader_bytes,
+        &root_record,
+        &cwd_record,
+        &layout,
+    )?;
+    let candidate_file = open_verified_research_file(
+        policy,
+        &root_anchor,
+        Path::new(&checkpoint.source_checkpoint.root_relative_path),
+        crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+    )?;
+    verify_candidate_runtime(&checkpoint.source_checkpoint, &candidate_file, &root_record)?;
+    reverify_retained_research_file(policy, retained)?;
+    let retained_path = policy
+        .code_change_state_root_path()
+        .join(&checkpoint.retained_checkpoint.relative_path);
+    let retained_path = retained_path.to_str().ok_or_else(|| {
+        validation_error(
+            "checkpoint.retained_checkpoint",
+            "retained path is not valid UTF-8",
+        )
+    })?;
+    if command.reapply_retained_path(retained_path)? != checkpoint.retained_argv {
+        return Err(validation_error(
+            "checkpoint.retained_argv",
+            "does not reproduce the current retained path",
+        ));
+    }
+    Ok(())
+}
+
+fn verified_checkpoint_root(
+    policy: &ResolvedExecutionPolicy,
+    checkpoint: &PreparedCheckpoint,
+) -> Result<crate::execution_policy::ProjectRootAnchor, AppError> {
+    let root = Path::new(&checkpoint.source_root_canonical_path);
+    let anchor = policy.project_root_anchor(root)?;
+    if anchor.resolution_fingerprint != checkpoint.source_root_resolution_fingerprint {
+        return Err(validation_error(
+            "checkpoint.source_root_resolution_fingerprint",
+            "does not match the current project root",
+        ));
+    }
+    Ok(anchor)
+}
+
+fn verify_loader_runtime(
+    loader: &CheckpointLoaderEvidenceV1,
+    actual: &crate::environment::VerifiedResearchFile,
+    bytes: &[u8],
+    source_root_record: &ResearchDirectoryRecord,
+    working_directory_record: &ResearchDirectoryRecord,
+    layout: &CheckpointSourceLayout,
+) -> Result<(), AppError> {
+    if actual.record() != &loader.file
+        || loader.argv_index != layout.entrypoint_index
+        || loader.argv_token != layout.entrypoint_token
+        || loader.root_relative_path != layout.entrypoint_root_relative_path
+        || loader.file.root != *source_root_record
+        || (loader_is_direct_child_of_cwd(loader, &layout.normalized_working_directory)
+            && loader.file.parent != *working_directory_record)
+        || bytes != loader.content.as_bytes()
+    {
+        return Err(validation_error(
+            "checkpoint.loader",
+            "does not match the current source file",
+        ));
+    }
+    let content = std::str::from_utf8(bytes).map_err(|_| {
+        validation_error(
+            "checkpoint.loader.content",
+            "must be complete UTF-8 text",
+        )
+    })?;
+    if !permits_lossless_evidence_text(content) {
+        return Err(validation_error(
+            "checkpoint.loader.content",
+            "contains unsupported control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_selected_support_records(
+    selected: SelectedCheckpointSupport<'_>,
+    source_root_record: &ResearchDirectoryRecord,
+    source_working_directory_record: &ResearchDirectoryRecord,
+    selected_working_directory_record: &ResearchDirectoryRecord,
+) -> Result<(), AppError> {
+    if selected.loader.file.root != *source_root_record
+        || selected.candidate.file.root != *source_root_record
+    {
+        return Err(validation_error(
+            "checkpoint.support.root",
+            "does not match the current project root",
+        ));
+    }
+    if selected_working_directory_record != source_working_directory_record {
+        return Err(validation_error(
+            "checkpoint.support.working_directory_record",
+            "does not match the current source working directory",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_candidate_runtime(
+    candidate: &CheckpointCandidateEvidenceV1,
+    actual: &crate::environment::VerifiedResearchFile,
+    source_root_record: &ResearchDirectoryRecord,
+) -> Result<(), AppError> {
+    if actual.record() != &candidate.file || candidate.file.root != *source_root_record {
+        return Err(validation_error(
+            "checkpoint.source_checkpoint",
+            "does not match the current candidate file",
+        ));
+    }
+    Ok(())
+}
+
+fn build_prepared_checkpoint(
+    policy: &ResolvedExecutionPolicy,
+    action: &ReadyResearchAction,
+    request: &CheckpointRequest,
+    source: &crate::db::ManagedSubmissionIntent,
+    selected: SelectedCheckpointSupport<'_>,
+    layout: &CheckpointSourceLayout,
+    command: &ValidatedCheckpointCommand,
+    source_root_record: &ResearchDirectoryRecord,
+    source_working_directory_record: &ResearchDirectoryRecord,
+    retained_record: &ResearchFileRecord,
+    root_anchor: &crate::execution_policy::ProjectRootAnchor,
+    learning_spec_digest: String,
+    successor_ids: CheckpointSuccessorIds,
+) -> Result<PreparedCheckpoint, AppError> {
+    let review_agent_run_id = action.owner.agent_run_id.ok_or_else(|| {
+        validation_error("research.agent_run_id", "is missing from the ready authority")
+    })?;
+    let review_event_id = action.owner.event_id.ok_or_else(|| {
+        validation_error("research.event_id", "is missing from the ready authority")
+    })?;
+    let source_task_id = action.owner.source_task_id.ok_or_else(|| {
+        validation_error("research.source_task_id", "is missing from the ready authority")
+    })?;
+    let retained_path = policy
+        .code_change_state_root_path()
+        .join(&retained_record.relative_path);
+    let retained_path = retained_path.to_str().ok_or_else(|| {
+        validation_error(
+            "checkpoint.retained_checkpoint",
+            "retained path is not valid UTF-8",
+        )
+    })?;
+    let retained_argv = command.reapply_retained_path(retained_path)?;
+    let response_digest = format!("{:x}", Sha256::digest(action.response_json.as_bytes()));
+    let checkpoint = PreparedCheckpoint {
+        schema_version: PREPARED_CHECKPOINT_VERSION,
+        project_id: action.owner.project_id.clone(),
+        campaign_id: action.owner.campaign_id.clone(),
+        review_id: action.owner.review_id.clone(),
+        review_attempt: action.owner.attempt,
+        review_session_generation: action.owner.session_generation,
+        review_agent_run_id,
+        review_event_id,
+        source_experiment_id: source.experiment.experiment_id.clone(),
+        source_proposal_id: source.proposal.proposal_id.clone(),
+        source_submission_id: source.submission.submission_id.clone(),
+        source_task_id,
+        source_managed_task_signature: action.owner.managed_task_signature.clone(),
+        source_raw_task_signature: action.raw_task_signature.clone(),
+        context_digest: action.context_digest.clone(),
+        response_digest,
+        campaign_objective_digest: action.campaign_objective_digest.clone(),
+        source_proposal_canonical_digest: source.proposal.canonical_digest.clone(),
+        learning_spec_digest,
+        source_runtime: CheckpointSourceRuntimeV1::OriginalProjectRoot,
+        source_root_canonical_path: root_anchor.canonical_path.to_str().ok_or_else(|| {
+            validation_error("checkpoint.source_root_canonical_path", "is not valid UTF-8")
+        })?.to_owned(),
+        source_root_resolution_fingerprint: root_anchor.resolution_fingerprint.clone(),
+        source_root_record: source_root_record.clone(),
+        source_working_directory_record: source_working_directory_record.clone(),
+        support_version: CHECKPOINT_SUPPORT_VERSION,
+        loader: selected.loader.clone(),
+        source_checkpoint: selected.candidate.clone(),
+        retained_checkpoint: retained_record.clone(),
+        source_argv: source.proposal.argv.clone(),
+        source_working_directory: layout.normalized_working_directory.clone(),
+        request: request.clone(),
+        delta: command.delta().clone(),
+        retained_argv,
+        successor_ids,
+    };
+    serialize_prepared_checkpoint(&checkpoint)?;
+    Ok(checkpoint)
+}
+
+fn cleanup_after_preparation_failure(
+    policy: &ResolvedExecutionPolicy,
+    campaign_id: &str,
+    review_id: &str,
+    retained: RetainedResearchFile,
+    error: AppError,
+) -> Result<VerifiedPreparedCheckpoint, PrepareCheckpointError> {
+    let expected = retained.record().clone();
+    drop(retained);
+    match cleanup_retained_research_file(policy, campaign_id, review_id, &expected) {
+        Ok(()) => Err(PrepareCheckpointError::Failed(error)),
+        Err(_) => Err(PrepareCheckpointError::OrphanedRetainedCheckpoint),
+    }
+}
+
+fn map_retention_failure(error: crate::execution_policy::PolicyViolation) -> PrepareCheckpointError {
+    if matches!(
+        error.detail,
+        PolicyViolationDetail::TempUnsafe(
+            TempUnsafeReason::ExistingEntry
+                | TempUnsafeReason::RetainedPublicationRecoveryRequired
+        )
+    ) {
+        PrepareCheckpointError::OrphanedRetainedCheckpoint
+    } else {
+        PrepareCheckpointError::Failed(error.into())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1853,8 +2359,37 @@ fn prepared_checkpoint_error(message: &'static str) -> AppError {
     }
 }
 
+fn validation_error(field: &'static str, message: &'static str) -> AppError {
+    AppError::Validation { field, message }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::{Path, PathBuf}};
+
+    use tempfile::TempDir;
+
+    use crate::{
+        db::{
+            CampaignRepository, EventRepository, ExperimentRepository, ProjectRepository,
+            ResearchRepository, StartCampaignRequest, TaskObservationRepository,
+        },
+        environment::campaign_experiment_runtime_argv,
+        execution_policy::CampaignLimits,
+        models::{AgentContextMode, AgentRunStatus, ExecutionProjection, NewAgentRun, NewProject},
+        proposals::{self, ProposalInput},
+        pueue::PueueTask,
+        reconcile::{managed_task_run_signature, task_signature, try_canonical_command_display_os},
+        research_protocol::parse_research_answer,
+        state::ObjectiveSnapshot,
+    };
+
+    use crate::environment::{
+        cleanup_retained_research_file, open_verified_research_file,
+        record_verified_research_directory, reopen_retained_research_file,
+        retain_verified_research_file,
+    };
+
     use super::*;
 
     fn request(path: &str, argv: &[&str], working_directory: &str) -> CheckpointRequest {
@@ -3094,5 +3629,1389 @@ mod tests {
         for invalid in cases {
             assert!(serialize_prepared_checkpoint(&invalid).is_err());
         }
+    }
+
+    struct RuntimeCheckpointFixture {
+        _temporary: TempDir,
+        policy: crate::execution_policy::ResolvedExecutionPolicy,
+        checkpoint: PreparedCheckpoint,
+    }
+
+    fn runtime_policy_fixture() -> (
+        TempDir,
+        crate::execution_policy::ResolvedExecutionPolicy,
+        crate::execution_policy::ProjectRootAnchor,
+        crate::models::Project,
+        crate::execution_policy::ResolvedProjectExecutionPolicy,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let state_dir = base.join("state");
+        let project_root = base.join("project");
+        let trusted_bin = base.join("trusted-bin");
+        let codex_home = base.join("codex-home");
+        for directory in [&state_dir, &project_root, &trusted_bin, &codex_home] {
+            fs::create_dir(directory).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        for name in ["codex", "pueue", "launcher"] {
+            let path = trusted_bin.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let pueue_config = base.join("pueue.yml");
+        fs::write(&pueue_config, b"fixture: true\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let input = crate::execution_policy::PolicyLoadInput {
+            state_dir,
+            project_roots: vec![project_root.clone()],
+            inherited_path: trusted_bin.into_os_string(),
+            startup_environment: crate::execution_policy::StartupEnvironment::from_pairs([
+                ("HOME", base.as_os_str()),
+                ("PUEUE_AGENT_STATE_DIR", base.join("state").as_os_str()),
+            ]),
+            codex_home,
+            pueue_config,
+            launcher_path: base.join("trusted-bin/launcher"),
+        };
+        let policy = crate::execution_policy::load_or_create_policy(&input).unwrap();
+        let anchor = policy.project_root_anchor(&project_root).unwrap();
+        let config_path = project_root.join(".pueue-agent/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "project_id = \"project\"\npueue_group = \"research\"\n\n[agent]\nprogram = \"codex\"\ntimeout_minutes = 60\nmax_retries = 0\n\n[check]\ninterval_minutes = 1\nstall_minutes = 1\n\n[guardrails]\nmax_consecutive_failures = 1\nmax_experiments = 1\n",
+        )
+        .unwrap();
+        let project = crate::models::Project {
+            project_id: "project".to_owned(),
+            root_path: project_root,
+            pueue_group: "research".to_owned(),
+            config_path: config_path.clone(),
+            enabled: true,
+            paused: false,
+            halted_reason: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let project_config = crate::config::load(&config_path).unwrap();
+        let project_policy = crate::execution_policy::resolve_project_policy(
+            &policy,
+            &project,
+            &project_config,
+        )
+        .unwrap();
+        (temporary, policy, anchor, project, project_policy)
+    }
+
+    fn runtime_checkpoint_fixture() -> RuntimeCheckpointFixture {
+        let (temporary, policy, anchor, project, _project_policy) = runtime_policy_fixture();
+        let source = b"print('trainer')\n";
+        let source_path = project.root_path.join("train.py");
+        fs::write(&source_path, source).unwrap();
+        let artifact_directory = project
+            .root_path
+            .join(".pueue-agent/artifacts/experiment");
+        fs::create_dir_all(&artifact_directory).unwrap();
+        let candidate_path = artifact_directory.join("step-1.json");
+        let candidate = b"{\"step\":1,\"weight\":0.5}\n";
+        fs::write(&candidate_path, candidate).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600)).unwrap();
+            for directory in [
+                project.root_path.join(".pueue-agent"),
+                project.root_path.join(".pueue-agent/artifacts"),
+                artifact_directory.clone(),
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::set_permissions(&candidate_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let loader_file = open_verified_research_file(
+            &policy,
+            &anchor,
+            Path::new("train.py"),
+            MAX_CHECKPOINT_SOURCE_BYTES as u64,
+        )
+        .unwrap();
+        let candidate_file = open_verified_research_file(
+            &policy,
+            &anchor,
+            Path::new(".pueue-agent/artifacts/experiment/step-1.json"),
+            crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+        )
+        .unwrap();
+        let root_record = record_verified_research_directory(&policy, &anchor, Path::new("."))
+            .unwrap();
+        let loader_record = loader_file.record().clone();
+        let candidate_record = candidate_file.record().clone();
+        let loader_sha256 = format!("{:x}", Sha256::digest(source));
+        let candidate_sha256 = format!("{:x}", Sha256::digest(candidate));
+        let loader_reference = format!("loader-source:{loader_sha256}");
+        let candidate_reference =
+            format!("checkpoint:experiment:0:{candidate_sha256}");
+        let source_argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--lr".to_owned(),
+            "0.001".to_owned(),
+        ];
+        let request_path = ".pueue-agent/artifacts/experiment/step-1.json".to_owned();
+        let request_argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--resume".to_owned(),
+            request_path.clone(),
+            "--lr".to_owned(),
+            "0.001".to_owned(),
+        ];
+        let request = CheckpointRequest {
+            path: request_path,
+            argv: request_argv.clone(),
+            working_directory: ".".to_owned(),
+            support_evidence_refs: vec![loader_reference.clone(), candidate_reference.clone()],
+        };
+        let command = validate_checkpoint_command(&source_argv, ".", &request).unwrap();
+        let retained = retain_verified_research_file(
+            &policy,
+            "campaign",
+            "review",
+            &candidate_file,
+        )
+        .unwrap();
+        let retained_record = retained.record().clone();
+        drop(retained);
+        let retained_path = policy
+            .code_change_state_root_path()
+            .join(&retained_record.relative_path);
+        let retained_argv = command
+            .reapply_retained_path(retained_path.to_str().unwrap())
+            .unwrap();
+        let learning_spec_digest =
+            checkpoint_learning_spec_digest(&source_argv, ".").unwrap();
+        let checkpoint = PreparedCheckpoint {
+            schema_version: PREPARED_CHECKPOINT_VERSION,
+            project_id: "project".to_owned(),
+            campaign_id: "campaign".to_owned(),
+            review_id: "review".to_owned(),
+            review_attempt: 1,
+            review_session_generation: 0,
+            review_agent_run_id: 7,
+            review_event_id: 8,
+            source_experiment_id: "experiment".to_owned(),
+            source_proposal_id: "proposal".to_owned(),
+            source_submission_id: "submission".to_owned(),
+            source_task_id: 0,
+            source_managed_task_signature: "managed-task".to_owned(),
+            source_raw_task_signature: "raw-task".to_owned(),
+            context_digest: "a".repeat(64),
+            response_digest: "b".repeat(64),
+            campaign_objective_digest: "c".repeat(64),
+            source_proposal_canonical_digest: "d".repeat(64),
+            learning_spec_digest,
+            source_runtime: CheckpointSourceRuntimeV1::OriginalProjectRoot,
+            source_root_canonical_path: anchor.canonical_path.to_str().unwrap().to_owned(),
+            source_root_resolution_fingerprint: anchor.resolution_fingerprint.clone(),
+            source_root_record: root_record.clone(),
+            source_working_directory_record: root_record,
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            loader: CheckpointLoaderEvidenceV1 {
+                reference: loader_reference,
+                role: CheckpointLoaderRole::Entrypoint,
+                argv_index: 1,
+                argv_token: "train.py".to_owned(),
+                root_relative_path: "train.py".to_owned(),
+                length: source.len() as u64,
+                sha256: loader_sha256,
+                file: loader_record,
+                content: String::from_utf8(source.to_vec()).unwrap(),
+            },
+            source_checkpoint: CheckpointCandidateEvidenceV1 {
+                reference: candidate_reference,
+                source_experiment_id: "experiment".to_owned(),
+                argv_path: ".pueue-agent/artifacts/experiment/step-1.json".to_owned(),
+                root_relative_path: ".pueue-agent/artifacts/experiment/step-1.json".to_owned(),
+                length: candidate.len() as u64,
+                sha256: candidate_sha256,
+                file: candidate_record,
+            },
+            retained_checkpoint: retained_record,
+            source_argv,
+            source_working_directory: ".".to_owned(),
+            request,
+            delta: command.delta().clone(),
+            retained_argv,
+            successor_ids: checkpoint_successor_ids("review", 1).unwrap(),
+        };
+        RuntimeCheckpointFixture {
+            _temporary: temporary,
+            policy,
+            checkpoint,
+        }
+    }
+
+    struct RuntimeAuthorityFixture {
+        _temporary: TempDir,
+        db: crate::db::Db,
+        policy: crate::execution_policy::ResolvedExecutionPolicy,
+        project_policy: crate::execution_policy::ResolvedProjectExecutionPolicy,
+        action: crate::db::ReadyResearchAction,
+        request: CheckpointRequest,
+        project_root: PathBuf,
+        candidate_path: PathBuf,
+    }
+
+    fn runtime_authority_fixture(nested_working_directory: bool) -> RuntimeAuthorityFixture {
+        let (temporary, policy, anchor, project, project_policy) = runtime_policy_fixture();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project.project_id,
+                project.root_path.clone(),
+                &project.pueue_group,
+                project.config_path.clone(),
+                900,
+            ))
+            .unwrap();
+
+        let working_directory = if nested_working_directory {
+            ".pueue-agent"
+        } else {
+            "."
+        };
+        let source = b"print('trainer')\n";
+        let loader_root_relative_path = if nested_working_directory {
+            ".pueue-agent/trainer/train.py"
+        } else {
+            "train.py"
+        };
+        let entrypoint_token = if nested_working_directory {
+            "trainer/train.py"
+        } else {
+            "train.py"
+        };
+        let loader_path = project.root_path.join(loader_root_relative_path);
+        fs::create_dir_all(loader_path.parent().unwrap()).unwrap();
+        fs::write(&loader_path, source).unwrap();
+        let artifact_directory = project
+            .root_path
+            .join(".pueue-agent/artifacts/experiment");
+        fs::create_dir_all(&artifact_directory).unwrap();
+        let candidate_path = artifact_directory.join("step-1.json");
+        let candidate = b"{\"step\":1,\"weight\":0.5}\n";
+        fs::write(&candidate_path, candidate).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&loader_path, fs::Permissions::from_mode(0o600)).unwrap();
+            for directory in [
+                project.root_path.join(".pueue-agent"),
+                project.root_path.join(".pueue-agent/artifacts"),
+                artifact_directory.clone(),
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::set_permissions(&candidate_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let loader_file = open_verified_research_file(
+            &policy,
+            &anchor,
+            Path::new(loader_root_relative_path),
+            MAX_CHECKPOINT_SOURCE_BYTES as u64,
+        )
+        .unwrap();
+        let candidate_root_relative_path = ".pueue-agent/artifacts/experiment/step-1.json";
+        let candidate_file = open_verified_research_file(
+            &policy,
+            &anchor,
+            Path::new(candidate_root_relative_path),
+            crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+        )
+        .unwrap();
+        let working_directory_record = record_verified_research_directory(
+            &policy,
+            &anchor,
+            Path::new(working_directory),
+        )
+        .unwrap();
+        let loader_sha256 = format!("{:x}", Sha256::digest(source));
+        let candidate_sha256 = format!("{:x}", Sha256::digest(candidate));
+        let loader_reference = format!("loader-source:{loader_sha256}");
+        let candidate_argv_path = if nested_working_directory {
+            "artifacts/experiment/step-1.json"
+        } else {
+            candidate_root_relative_path
+        };
+        let candidate_reference = format!("checkpoint:experiment:0:{candidate_sha256}");
+        let support = CheckpointSupportEvidenceV1::Available {
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            source_experiment_id: "experiment".to_owned(),
+            source_proposal_id: "proposal".to_owned(),
+            source_submission_id: "submission".to_owned(),
+            normalized_working_directory: working_directory.to_owned(),
+            working_directory_record: working_directory_record.clone(),
+            loader_support: vec![CheckpointLoaderEvidenceV1 {
+                reference: loader_reference.clone(),
+                role: CheckpointLoaderRole::Entrypoint,
+                argv_index: 1,
+                argv_token: entrypoint_token.to_owned(),
+                root_relative_path: loader_root_relative_path.to_owned(),
+                length: source.len() as u64,
+                sha256: loader_sha256,
+                file: loader_file.record().clone(),
+                content: String::from_utf8(source.to_vec()).unwrap(),
+            }],
+            checkpoint_candidates: vec![CheckpointCandidateEvidenceV1 {
+                reference: candidate_reference.clone(),
+                source_experiment_id: "experiment".to_owned(),
+                argv_path: candidate_argv_path.to_owned(),
+                root_relative_path: candidate_root_relative_path.to_owned(),
+                length: candidate.len() as u64,
+                sha256: candidate_sha256,
+                file: candidate_file.record().clone(),
+            }],
+            candidates_complete: true,
+            candidates_omitted_at_least: 0,
+            candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+        };
+        let objective_digest = "a".repeat(64);
+        let context = serde_json::json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {
+                    "review_id": "pending",
+                    "experiment_id": "experiment",
+                    "task_signature": "pending"
+                },
+                "campaign": {"campaign_id": "campaign"},
+                "project": {"project_id": "project"},
+                "objective": {"digest": objective_digest},
+                "target": {
+                    "experiment_id": "experiment",
+                    "pueue_task_id": 41,
+                    "task_signature": "pending",
+                    "proposal_id": "proposal",
+                    "submission_id": "submission"
+                }
+            },
+            "operations": {"checkpoint_support": support}
+        });
+
+        let user_argv = vec!["python".to_owned(), entrypoint_token.to_owned()];
+        let objective = ObjectiveSnapshot {
+            text: "runtime wrapper objective".to_owned(),
+            digest: objective_digest,
+        };
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: crate::models::ProposalKind::Experiment,
+                hypothesis: "runtime wrapper baseline".to_owned(),
+                source_experiment_id: None,
+                argv: user_argv.clone(),
+                working_directory: working_directory.to_owned(),
+                expected_evidence: vec!["loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .unwrap();
+        CampaignRepository::new(&db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: "campaign",
+                    project_id: "project",
+                    objective: &objective,
+                    initial_argv: &user_argv,
+                    baseline: &baseline,
+                    submission_id: "submission",
+                    experiment_id: "experiment",
+                    proposal_id: "proposal",
+                    metadata: &serde_json::json!({}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: 900,
+                },
+                &CampaignLimits::default(),
+            )
+            .unwrap();
+        ExperimentRepository::new(&db)
+            .mark_submitting("experiment", 901)
+            .unwrap();
+        let runtime_argv = campaign_experiment_runtime_argv(
+            &project.root_path,
+            "campaign",
+            "experiment",
+            &user_argv,
+        );
+        let runtime_command = try_canonical_command_display_os(&runtime_argv).unwrap();
+        let task = PueueTask {
+            id: 41,
+            group: project.pueue_group.clone(),
+            command: runtime_command.clone(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("900".to_owned()),
+            started_at: Some("1000".to_owned()),
+            ended_at: None,
+            result: None,
+        };
+        let raw_task_signature = task_signature(&task);
+        let managed_task_signature = managed_task_run_signature(&task).unwrap();
+        ExperimentRepository::new(&db)
+            .mark_accepted("experiment", task.id, &managed_task_signature, 902)
+            .unwrap();
+        TaskObservationRepository::new(&db)
+            .upsert(&crate::models::NewTaskObservation::new(
+                &project.project_id,
+                &raw_task_signature,
+                task.id,
+                &task.group,
+                vec![runtime_command],
+                "Running",
+                Some(900),
+                Some(1_000),
+                None,
+                None,
+                1_002,
+            ))
+            .unwrap();
+        let research = ResearchRepository::new(&db);
+        research.ensure_campaign("campaign").unwrap();
+        research.schedule_running("campaign", 1_000, 1, 2_799).unwrap();
+        let review = research
+            .claim_due("campaign", "experiment", &managed_task_signature, 2_800)
+            .unwrap()
+            .expect("runtime wrapper review claim");
+        let event_id = research.event_id(&review.review_id).unwrap();
+        EventRepository::new(&db)
+            .claim_by_id(&project.project_id, event_id, 2_900)
+            .unwrap()
+            .expect("runtime wrapper event claim");
+        let run = crate::db::AgentRunRepository::new(&db)
+            .insert_with_events(
+                &NewAgentRun::with_context(
+                    &project.project_id,
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    2_901,
+                    temporary.path().join("agent.log"),
+                    AgentContextMode::Fresh,
+                    None,
+                    Vec::new(),
+                )
+                .with_execution(
+                    ExecutionProjection::new("campaign_research", "/bin/sh", "fixture")
+                        .unwrap(),
+                ),
+                &[event_id],
+            )
+            .unwrap();
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let authority = serde_json::json!({
+            "version": 1,
+            "run_id": run.run_id,
+            "review_id": review.review_id,
+            "campaign_id": "campaign",
+            "experiment_id": "experiment",
+            "attempt": 1,
+            "session_generation": 0,
+            "fresh_launch": true,
+            "session_id": session_id,
+            "service_root_identity": {
+                "device": 1, "inode": 2, "owner": 3, "mode": 448,
+                "resolution": "fixture-root"
+            },
+            "temp_identity": {
+                "device": 1, "inode": 4, "owner": 3, "mode": 448,
+                "mount": [1, 2],
+                "service_identity": {"device": 1, "inode": 5, "owner": 3, "mode": 448},
+                "parent_identity": {"device": 1, "inode": 6, "owner": 3, "mode": 448}
+            },
+            "cleanup": {"phase": "complete", "completed_at": 3_000}
+        });
+        let notes_json = serde_json::json!({
+            "native_recovery": authority,
+            "planned_session_id": session_id,
+            "confirmed_session_id": session_id,
+            "session_binding": "confirmed"
+        })
+        .to_string();
+        let context_json_template = context.to_string();
+        let mut context_value: serde_json::Value =
+            serde_json::from_str(&context_json_template).unwrap();
+        context_value["facts"]["review"]["review_id"] =
+            serde_json::Value::String(review.review_id.clone());
+        context_value["facts"]["review"]["task_signature"] =
+            serde_json::Value::String(managed_task_signature.clone());
+        context_value["facts"]["target"]["task_signature"] =
+            serde_json::Value::String(managed_task_signature.clone());
+        let context_json = context_value.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let request_path = candidate_argv_path.to_owned();
+        let request_argv = vec![
+            "python".to_owned(),
+            entrypoint_token.to_owned(),
+            "--resume".to_owned(),
+            request_path.clone(),
+        ];
+        let request = CheckpointRequest {
+            path: request_path,
+            argv: request_argv.clone(),
+            working_directory: working_directory.to_owned(),
+            support_evidence_refs: vec![loader_reference.clone(), candidate_reference.clone()],
+        };
+        let response_json = serde_json::json!({
+            "schema_version": 1,
+            "review_id": review.review_id,
+            "experiment_id": "experiment",
+            "context_digest": context_digest,
+            "action": "resume_from_checkpoint",
+            "reason": "use the verified checkpoint evidence",
+            "evidence_refs": [loader_reference, candidate_reference],
+            "notes": "runtime wrapper fixture",
+            "checkpoint": request,
+        })
+        .to_string();
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', finished_at = 3_001,
+                     launch_gate_state = 'failed'
+                 WHERE run_id = ?1",
+                [run.run_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, session_generation = 0
+                 WHERE campaign_id = 'campaign'",
+                [session_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', lease_until = NULL,
+                     completed_at = 3_002
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'ready', attempt = 1, operation_stage = NULL,
+                     agent_run_id = ?1, context_json = ?2, context_digest = ?3,
+                     response_json = ?4, termination_request_id = NULL,
+                     successor_experiment_id = NULL, decision_cycle_id = NULL,
+                     failure_code = NULL, notes_json = ?5, checkpoint_json = NULL,
+                     not_before = 3_003, finished_at = NULL, updated_at = 3_003
+                 WHERE review_id = ?6",
+                rusqlite::params![
+                    run.run_id,
+                    context_json,
+                    context_digest,
+                    response_json,
+                    notes_json,
+                    review.review_id,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut connection = db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let action = crate::db::ready_research_action_in_transaction(
+            &transaction,
+            &project.project_id,
+            &review.review_id,
+            &task,
+        )
+        .unwrap()
+        .expect("runtime wrapper ready action");
+        transaction.commit().unwrap();
+        RuntimeAuthorityFixture {
+            _temporary: temporary,
+            db,
+            policy,
+            project_policy,
+            action,
+            request,
+            project_root: project.root_path,
+            candidate_path,
+        }
+    }
+
+    #[test]
+    fn prepare_checkpoint_supported_authority_returns_a_live_verified_lease() {
+        let fixture = runtime_authority_fixture(false);
+        let verified = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        )
+        .unwrap();
+        let checkpoint = verified.checkpoint();
+        assert_eq!(checkpoint.request, fixture.request);
+        assert_eq!(checkpoint.source_argv, ["python", "train.py"]);
+        assert_eq!(checkpoint.source_working_directory, ".");
+        assert_eq!(checkpoint.loader.argv_token, "train.py");
+        assert_eq!(checkpoint.loader.root_relative_path, "train.py");
+        assert_eq!(
+            checkpoint.source_checkpoint.root_relative_path,
+            ".pueue-agent/artifacts/experiment/step-1.json"
+        );
+        assert_eq!(checkpoint.source_checkpoint.file.root, checkpoint.source_root_record);
+        assert_eq!(
+            checkpoint.source_working_directory_record,
+            checkpoint.source_root_record
+        );
+        assert_eq!(
+            checkpoint.successor_ids,
+            checkpoint_successor_ids(&checkpoint.review_id, checkpoint.review_attempt).unwrap()
+        );
+        assert_eq!(
+            checkpoint.learning_spec_digest,
+            checkpoint_learning_spec_digest(&checkpoint.source_argv, ".").unwrap()
+        );
+        verified.reverify(&fixture.policy).unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&checkpoint.retained_checkpoint.relative_path);
+        assert!(retained_path.exists(), "retained final must exist while leased");
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        assert!(!retained_path.exists(), "released final must be removable");
+    }
+
+    #[test]
+    fn prepare_checkpoint_returns_prior_source_unsupported_before_filesystem_io() {
+        let fixture = runtime_authority_fixture(false);
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET resume_of_experiment_id = experiment_id
+                 WHERE experiment_id = 'experiment'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let retired_project_root = fixture.project_root.with_file_name("project-retired");
+        fs::rename(&fixture.project_root, &retired_project_root).unwrap();
+
+        let result = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        );
+        fs::rename(&retired_project_root, &fixture.project_root).unwrap();
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Unsupported { reason })
+                if reason == "prior checkpoint sources require a durable checkpoint authority"
+        ));
+        let retention_final = fixture
+            .policy
+            .code_change_state_root_path()
+            .join("research-checkpoints")
+            .join(&fixture.action.owner.campaign_id)
+            .join(&fixture.action.owner.review_id)
+            .join("checkpoint");
+        assert!(!retention_final.exists());
+    }
+
+    #[test]
+    fn prepare_checkpoint_returns_candidate_source_unsupported_before_filesystem_io() {
+        let fixture = runtime_authority_fixture(false);
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET code_revision_sha = ?1
+                 WHERE experiment_id = 'experiment'",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        drop(connection);
+        let retired_project_root = fixture.project_root.with_file_name("project-retired");
+        fs::rename(&fixture.project_root, &retired_project_root).unwrap();
+
+        let result = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        );
+        fs::rename(&retired_project_root, &fixture.project_root).unwrap();
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Unsupported { reason })
+                if reason == "code-change experiments have no ordinary trainer source"
+        ));
+        let retention_final = fixture
+            .policy
+            .code_change_state_root_path()
+            .join("research-checkpoints")
+            .join(&fixture.action.owner.campaign_id)
+            .join(&fixture.action.owner.review_id)
+            .join("checkpoint");
+        assert!(!retention_final.exists());
+    }
+
+    #[test]
+    fn prepare_checkpoint_returns_defensive_unavailable_unsupported_before_filesystem_io() {
+        // Strict ready selection normally settles Unavailable before this API;
+        // this exercises the public wrapper's defensive classification path.
+        let mut fixture = runtime_authority_fixture(false);
+        let mut context: serde_json::Value =
+            serde_json::from_str(&fixture.action.context_json).unwrap();
+        context["operations"]["checkpoint_support"] = serde_json::to_value(
+            CheckpointSupportEvidenceV1::Unavailable {
+                support_version: CHECKPOINT_SUPPORT_VERSION,
+                reason: "fixture unavailable".to_owned(),
+                loader_support: Vec::new(),
+                checkpoint_candidates: Vec::new(),
+                candidates_complete: false,
+                candidates_omitted_at_least: 0,
+                candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+            },
+        )
+        .unwrap();
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut response: serde_json::Value =
+            serde_json::from_str(&fixture.action.response_json).unwrap();
+        response["context_digest"] = serde_json::Value::String(context_digest.clone());
+        let response_json = response.to_string();
+        let answer = parse_research_answer(response_json.as_bytes()).unwrap();
+        fixture.action.context_json = context_json.clone();
+        fixture.action.context_digest = context_digest.clone();
+        fixture.action.response_json = response_json.clone();
+        fixture.action.answer = answer;
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET context_json = ?1, context_digest = ?2, response_json = ?3
+                 WHERE review_id = ?4",
+                rusqlite::params![
+                    context_json,
+                    context_digest,
+                    response_json,
+                    fixture.action.owner.review_id,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let retired_project_root = fixture.project_root.with_file_name("project-retired");
+        fs::rename(&fixture.project_root, &retired_project_root).unwrap();
+
+        let result = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        );
+        fs::rename(&retired_project_root, &fixture.project_root).unwrap();
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Unsupported { reason })
+                if reason == "fixture unavailable"
+        ));
+        let retention_final = fixture
+            .policy
+            .code_change_state_root_path()
+            .join("research-checkpoints")
+            .join(&fixture.action.owner.campaign_id)
+            .join(&fixture.action.owner.review_id)
+            .join("checkpoint");
+        assert!(!retention_final.exists());
+    }
+
+    #[test]
+    fn prepare_checkpoint_rejects_stale_ready_authority_before_filesystem_io() {
+        let mut fixture = runtime_authority_fixture(false);
+        fixture.action.owner.managed_task_signature.push('x');
+        fs::remove_file(fixture.project_root.join("train.py")).unwrap();
+        fs::remove_file(&fixture.candidate_path).unwrap();
+        let result = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        );
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Failed(AppError::Validation {
+                field: "research.review",
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prepare_checkpoint_rejects_nested_cwd_support_before_retention_publication() {
+        let mut fixture = runtime_authority_fixture(true);
+        let mut context: serde_json::Value =
+            serde_json::from_str(&fixture.action.context_json).unwrap();
+        let advertised_inode = context["operations"]["checkpoint_support"]
+            ["working_directory_record"]["inode"]
+            .as_u64()
+            .unwrap();
+        context["operations"]["checkpoint_support"]["working_directory_record"]["inode"] =
+            serde_json::json!(advertised_inode.saturating_add(1));
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut response: serde_json::Value =
+            serde_json::from_str(&fixture.action.response_json).unwrap();
+        response["context_digest"] = serde_json::Value::String(context_digest.clone());
+        let response_json = response.to_string();
+        fixture.action.context_json = context_json.clone();
+        fixture.action.context_digest = context_digest.clone();
+        fixture.action.response_json = response_json.clone();
+        fixture.action.answer.context_digest = context_digest.clone();
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET context_json = ?1, context_digest = ?2, response_json = ?3
+                 WHERE review_id = ?4",
+                rusqlite::params![
+                    context_json,
+                    context_digest,
+                    response_json,
+                    fixture.action.owner.review_id,
+                ],
+            )
+            .unwrap();
+
+        let result = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        );
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Failed(AppError::Validation {
+                field: "checkpoint.support.working_directory_record",
+                ..
+            }))
+        ));
+        let unpublished = fixture
+            .policy
+            .code_change_state_root_path()
+            .join("research-checkpoints")
+            .join(&fixture.action.owner.campaign_id)
+            .join(&fixture.action.owner.review_id)
+            .join("checkpoint");
+        assert!(!unpublished.exists(), "cwd mismatch must precede retention");
+    }
+
+    #[test]
+    fn preparation_failure_cleanup_removes_published_final_after_lease_drop() {
+        let fixture = runtime_checkpoint_fixture();
+        let retained = reopen_retained_research_file(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            &fixture.checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&fixture.checkpoint.retained_checkpoint.relative_path);
+        let result = cleanup_after_preparation_failure(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            retained,
+            validation_error("runtime_fixture", "post-publication construction failed"),
+        );
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Failed(AppError::Validation {
+                field: "runtime_fixture",
+                ..
+            }))
+        ));
+        assert!(!retained_path.exists());
+    }
+
+    #[test]
+    fn preparation_failure_cleanup_reports_orphan_while_shared_reader_is_live() {
+        let fixture = runtime_checkpoint_fixture();
+        let retained = reopen_retained_research_file(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            &fixture.checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        let competing_reader = reopen_retained_research_file(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            &fixture.checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&fixture.checkpoint.retained_checkpoint.relative_path);
+        let result = cleanup_after_preparation_failure(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            retained,
+            validation_error("runtime_fixture", "post-publication reverify failed"),
+        );
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::OrphanedRetainedCheckpoint)
+        ));
+        assert!(retained_path.exists());
+        drop(competing_reader);
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            &fixture.checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        assert!(!retained_path.exists());
+    }
+
+    #[test]
+    fn existing_retained_final_maps_to_orphan_without_adoption() {
+        let fixture = runtime_authority_fixture(false);
+        let first = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        )
+        .unwrap();
+        let retained = first.checkpoint().retained_checkpoint.clone();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&retained.relative_path);
+        assert!(retained_path.exists());
+        let original_bytes = fs::read(&retained_path).unwrap();
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&retained_path).unwrap().ino()
+        };
+        let first_checkpoint = first.release_lease();
+        let result = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        );
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::OrphanedRetainedCheckpoint)
+        ));
+        assert_eq!(fs::read(&retained_path).unwrap(), original_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&retained_path).unwrap().ino(), original_inode);
+        }
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &first_checkpoint.campaign_id,
+            &first_checkpoint.review_id,
+            &retained,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retained_publication_error_mapping_preserves_only_orphan_details() {
+        let existing = crate::execution_policy::PolicyViolation::with_detail(
+            crate::execution_policy::PolicyViolationCode::TempUnsafe,
+            crate::execution_policy::PolicyViolationStage::Finalized,
+            crate::execution_policy::PolicyViolationDetail::TempUnsafe(
+                crate::execution_policy::TempUnsafeReason::ExistingEntry,
+            ),
+        );
+        assert!(matches!(
+            map_retention_failure(existing),
+            PrepareCheckpointError::OrphanedRetainedCheckpoint
+        ));
+        let recovery = crate::execution_policy::PolicyViolation::with_detail(
+            crate::execution_policy::PolicyViolationCode::TempUnsafe,
+            crate::execution_policy::PolicyViolationStage::Finalized,
+            crate::execution_policy::PolicyViolationDetail::TempUnsafe(
+                crate::execution_policy::TempUnsafeReason::RetainedPublicationRecoveryRequired,
+            ),
+        );
+        assert!(matches!(
+            map_retention_failure(recovery),
+            PrepareCheckpointError::OrphanedRetainedCheckpoint
+        ));
+        let ordinary = crate::execution_policy::PolicyViolation::with_detail(
+            crate::execution_policy::PolicyViolationCode::TempUnsafe,
+            crate::execution_policy::PolicyViolationStage::Finalized,
+            crate::execution_policy::PolicyViolationDetail::TempUnsafe(
+                crate::execution_policy::TempUnsafeReason::IoFailure,
+            ),
+        );
+        let mapped = map_retention_failure(ordinary);
+        assert!(matches!(
+            mapped,
+            PrepareCheckpointError::Failed(AppError::PolicyViolation { violation })
+                if violation == ordinary
+        ));
+    }
+
+    #[test]
+    fn verify_prepared_checkpoint_keeps_cleanup_blocked_until_lease_release() {
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&fixture.checkpoint.retained_checkpoint.relative_path);
+        let blocked = cleanup_retained_research_file(
+            &fixture.policy,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.review_id,
+            &fixture.checkpoint.retained_checkpoint,
+        );
+        assert!(blocked.is_err());
+        assert!(retained_path.exists());
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        assert!(!retained_path.exists());
+    }
+
+    #[test]
+    fn verify_prepared_checkpoint_rejects_stale_root_cwd_loader_candidate_and_leaf() {
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        let root = PathBuf::from(&fixture.checkpoint.source_root_canonical_path);
+        let retired_root = root.with_file_name("runtime-root-retired");
+        fs::rename(&root, &retired_root).unwrap();
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(verified.reverify(&fixture.policy).is_err());
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&retired_root, &root).unwrap();
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+
+        let fixture = runtime_authority_fixture(true);
+        let verified = prepare_checkpoint(
+            &fixture.db,
+            &fixture.action,
+            &fixture.request,
+            &fixture.policy,
+            &fixture.project_policy,
+        )
+        .unwrap();
+        let cwd = fixture.project_root.join(".pueue-agent");
+        let retired_cwd = fixture.project_root.join(".pueue-agent-retired");
+        fs::rename(&cwd, &retired_cwd).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(verified.reverify(&fixture.policy).is_err());
+        fs::remove_dir(&cwd).unwrap();
+        fs::rename(&retired_cwd, &cwd).unwrap();
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+
+        let fixture = runtime_checkpoint_fixture();
+        let mut loader_stale = fixture.checkpoint.clone();
+        loader_stale.loader.file.inode = loader_stale.loader.file.inode.saturating_add(1);
+        assert!(verify_prepared_checkpoint(&fixture.policy, &loader_stale).is_err());
+
+        let fixture = runtime_checkpoint_fixture();
+        let mut candidate_stale = fixture.checkpoint.clone();
+        candidate_stale.source_checkpoint.file.inode = candidate_stale
+            .source_checkpoint
+            .file
+            .inode
+            .saturating_add(1);
+        assert!(verify_prepared_checkpoint(&fixture.policy, &candidate_stale).is_err());
+
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        let loader_path = Path::new(&fixture.checkpoint.source_root_canonical_path).join("train.py");
+        fs::write(&loader_path, b"changed-loader\n").unwrap();
+        assert!(verified.reverify(&fixture.policy).is_err());
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        let candidate_path = Path::new(&fixture.checkpoint.source_root_canonical_path)
+            .join(&fixture.checkpoint.source_checkpoint.root_relative_path);
+        fs::write(&candidate_path, b"changed-candidate\n").unwrap();
+        assert!(verified.reverify(&fixture.policy).is_err());
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&fixture.checkpoint.retained_checkpoint.relative_path);
+        let replaced_path = retained_path.with_extension("replaced");
+        fs::rename(&retained_path, &replaced_path).unwrap();
+        fs::write(&retained_path, b"replacement\n").unwrap();
+        assert!(verified.reverify(&fixture.policy).is_err());
+        let _ = verified.release_lease();
+    }
+
+    #[test]
+    fn nested_loader_support_requires_exact_working_directory_record_before_retention() {
+        let fixture = runtime_checkpoint_fixture();
+        let root = Path::new(&fixture.checkpoint.source_root_canonical_path);
+        let nested_loader_path = root.join(".pueue-agent/train.py");
+        fs::write(&nested_loader_path, b"print('nested')\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&nested_loader_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let anchor = fixture.policy.project_root_anchor(root).unwrap();
+        let loader_file = open_verified_research_file(
+            &fixture.policy,
+            &anchor,
+            Path::new(".pueue-agent/train.py"),
+            MAX_CHECKPOINT_SOURCE_BYTES as u64,
+        )
+        .unwrap();
+        let working_directory_record = record_verified_research_directory(
+            &fixture.policy,
+            &anchor,
+            Path::new(".pueue-agent"),
+        )
+        .unwrap();
+        let mut advertised_working_directory_record = working_directory_record.clone();
+        advertised_working_directory_record.inode =
+            advertised_working_directory_record.inode.saturating_add(1);
+
+        let loader_bytes = fs::read(&nested_loader_path).unwrap();
+        let loader_sha256 = format!("{:x}", Sha256::digest(&loader_bytes));
+        let mut loader = fixture.checkpoint.loader.clone();
+        loader.reference = format!("loader-source:{loader_sha256}");
+        loader.root_relative_path = ".pueue-agent/train.py".to_owned();
+        loader.length = loader_bytes.len() as u64;
+        loader.sha256 = loader_sha256;
+        loader.file = loader_file.record().clone();
+        loader.content = String::from_utf8(loader_bytes).unwrap();
+
+        let mut candidate = fixture.checkpoint.source_checkpoint.clone();
+        candidate.argv_path = "artifacts/experiment/step-1.json".to_owned();
+        let mut request = fixture.checkpoint.request.clone();
+        request.path = candidate.argv_path.clone();
+        request.working_directory = ".pueue-agent".to_owned();
+        request.support_evidence_refs = vec![loader.reference.clone(), candidate.reference.clone()];
+        let support = CheckpointSupportEvidenceV1::Available {
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            source_experiment_id: "experiment".to_owned(),
+            source_proposal_id: "proposal".to_owned(),
+            source_submission_id: "submission".to_owned(),
+            normalized_working_directory: ".pueue-agent".to_owned(),
+            working_directory_record: advertised_working_directory_record,
+            loader_support: vec![loader],
+            checkpoint_candidates: vec![candidate],
+            candidates_complete: true,
+            candidates_omitted_at_least: 0,
+            candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+        };
+        let selected = select_checkpoint_support(&support, &request).unwrap();
+        let result = verify_selected_support_records(
+            selected,
+            &fixture.checkpoint.source_root_record,
+            &working_directory_record,
+            match &support {
+                CheckpointSupportEvidenceV1::Available {
+                    working_directory_record,
+                    ..
+                } => working_directory_record,
+                CheckpointSupportEvidenceV1::Unavailable { .. } => unreachable!(),
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::Validation {
+                field: "checkpoint.support.working_directory_record",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_prepared_checkpoint_reopens_live_lease_and_cleanup_after_release() {
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        assert_eq!(verified.checkpoint(), &fixture.checkpoint);
+        verified.reverify(&fixture.policy).unwrap();
+        let checkpoint = verified.release_lease();
+        cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_prepared_checkpoint_rejects_retained_tampering_on_reverify() {
+        let fixture = runtime_checkpoint_fixture();
+        let verified = verify_prepared_checkpoint(&fixture.policy, &fixture.checkpoint).unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&fixture.checkpoint.retained_checkpoint.relative_path);
+        fs::write(&retained_path, b"tampered\n").unwrap();
+        assert!(verified.reverify(&fixture.policy).is_err());
+        let _ = verified.release_lease();
+    }
+
+    #[test]
+    fn prepare_checkpoint_reports_db_error_before_source_filesystem_io() {
+        let (temporary, policy, _anchor, _project, project_policy) = runtime_policy_fixture();
+        let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
+        let action = crate::db::ReadyResearchAction {
+            owner: crate::db::ResearchOwnershipSnapshot {
+                review_id: "missing-review".to_owned(),
+                project_id: "project".to_owned(),
+                campaign_id: "campaign".to_owned(),
+                source_experiment_id: "experiment".to_owned(),
+                managed_task_signature: "managed-task".to_owned(),
+                source_task_id: Some(0),
+                attempt: 1,
+                session_generation: 0,
+                event_id: Some(1),
+                operation_stage: None,
+                agent_run_id: Some(7),
+                termination_request_id: None,
+                decision_cycle_id: None,
+                successor_experiment_id: None,
+                recovery_required: false,
+            },
+            context_json: "{}".to_owned(),
+            context_digest: "a".repeat(64),
+            response_json: "{}".to_owned(),
+            answer: crate::research_protocol::ResearchAnswer {
+                schema_version: 1,
+                review_id: "missing-review".to_owned(),
+                experiment_id: "experiment".to_owned(),
+                context_digest: "a".repeat(64),
+                action: "resume_from_checkpoint".to_owned(),
+                reason: "fixture".to_owned(),
+                evidence_refs: Vec::new(),
+                notes: "fixture".to_owned(),
+                next_direction: None,
+                checkpoint: None,
+            },
+            notes_json: "{}".to_owned(),
+            campaign_objective_digest: "objective".to_owned(),
+            raw_task_signature: "raw-task".to_owned(),
+        };
+        let request = CheckpointRequest {
+            path: "checkpoint.json".to_owned(),
+            argv: vec!["python".to_owned(), "train.py".to_owned()],
+            working_directory: ".".to_owned(),
+            support_evidence_refs: vec!["loader".to_owned(), "candidate".to_owned()],
+        };
+        let result = prepare_checkpoint(
+            &db,
+            &action,
+            &request,
+            &policy,
+            &project_policy,
+        );
+        assert!(matches!(
+            result,
+            Err(PrepareCheckpointError::Failed(AppError::Validation {
+                field: "research.review",
+                ..
+            }))
+        ));
     }
 }
